@@ -258,4 +258,19 @@ describe("layer node", () => {
       dependencies: [],
     })
   })
+
+  // A bundled circular import can leave a `.node` binding undefined at
+  // module-evaluation time; the walk must name the chain instead of throwing
+  // an obscure TypeError inside a compiled binary.
+  test("names the parent chain when a dependency is undefined", () => {
+    const missing = undefined as unknown as typeof value
+    const broken = { ...greeting, dependencies: [value, missing] }
+    expect(() => LayerNode.compile(LayerNode.group([broken]))).toThrow("Undefined dependency in layer tree")
+
+    const untagged = LayerNode.make({ service: Greeting, layer: greetingLayer, deps: [value] })
+    const brokenUntagged = { ...untagged, dependencies: [value, missing] }
+    expect(() => LayerNode.hoist(LayerNode.group([brokenUntagged]), tags.values.app)).toThrow(
+      "Undefined dependency in layer tree; parent chain: group -> test/LayerNodeGreeting; parent deps: [test/LayerNodeValue, undefined@1]",
+    )
+  })
 })
