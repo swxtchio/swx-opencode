@@ -182,6 +182,15 @@ function walk<Result>(
   const stack: AnyNode[] = []
 
   const recur = (node: AnyNode): Result => {
+    // Bundled circular imports can leave a dependency binding uninitialized
+    // (undefined) at module-evaluation time; fail with a named chain instead
+    // of an obscure TypeError deep inside a compiled binary.
+    if (node === undefined || node === null) {
+      const parent = stack.at(-1)
+      const chain = stack.map((item) => item.name).join(" -> ") || "(root)"
+      const siblings = parent?.dependencies.map((dep, index) => dep?.name ?? `undefined@${index}`).join(", ")
+      throw new Error(`Undefined dependency in layer tree; parent chain: ${chain}; parent deps: [${siblings}]`)
+    }
     const target = options.resolve?.(node) ?? node
     const cached = cache.get(target)
     if (cached !== undefined || cache.has(target)) return cached!
@@ -327,6 +336,7 @@ export function hasUnbound(root: Node<unknown, unknown, any>, source: AnyNode): 
 }
 
 function flatten(node: AnyNode): readonly AnyNode[] {
+  if (node === undefined || node === null) throw new Error("Undefined dependency in layer tree")
   return node.kind === "group" ? node.dependencies.flatMap(flatten) : [node]
 }
 
