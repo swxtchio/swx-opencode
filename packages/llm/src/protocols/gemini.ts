@@ -132,11 +132,16 @@ const GeminiCandidate = Schema.Struct({
 const GeminiEvent = Schema.Struct({
   candidates: optionalArray(GeminiCandidate),
   usageMetadata: Schema.optional(GeminiUsage),
+  // Gemini reports the serving model as `modelVersion`, which can be more
+  // specific than the requested alias (a dated build behind a floating name).
+  modelVersion: Schema.optional(Schema.String),
 })
 type GeminiEvent = Schema.Schema.Type<typeof GeminiEvent>
 
 interface ParserState {
   readonly finishReason?: string
+  /** Serving model from the response's `modelVersion`, when reported. */
+  readonly responseModelID?: string
   readonly hasToolCalls: boolean
   readonly nextToolCallId: number
   readonly usage?: Usage
@@ -391,15 +396,19 @@ const finish = (state: ParserState): ReadonlyArray<LLMEvent> =>
         Lifecycle.finish(lifecycle, events, {
           reason: mapFinishReason(state.finishReason, state.hasToolCalls),
           usage: state.usage,
+          responseModelID: state.responseModelID,
         })
         return events
       })()
     : []
 
 const step = (state: ParserState, event: GeminiEvent) => {
+  const servedModel = event.modelVersion?.trim()
   const nextState = {
     ...state,
     usage: event.usageMetadata ? (mapUsage(event.usageMetadata) ?? state.usage) : state.usage,
+    // Later chunks may omit it; keep the first non-empty value.
+    responseModelID: servedModel && servedModel.length > 0 ? servedModel : state.responseModelID,
   }
   const candidate = event.candidates?.[0]
   if (!candidate?.content)

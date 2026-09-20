@@ -476,6 +476,70 @@ describe("OpenAI Chat route", () => {
     }),
   )
 
+  // A ROUTED model (Fireworks FireRouter, Azure model-router) is requested by route
+  // and served by a member the router picks per request, so the response `model`
+  // field is the only thing that says who actually answered. Verified on the wire:
+  // `firerouter/glm-5p3/glm-5p3-flash` returns model `glm-5p3-flash`.
+  it.effect("reports the served model from the response when it differs from the request", () =>
+    Effect.gen(function* () {
+      const served = { id: "chatcmpl_fixture", model: "glm-5p3-flash", choices: [], usage: null }
+      const body = sseEvents(
+        served,
+        deltaChunk({ role: "assistant", content: "ok" }),
+        deltaChunk({}, "stop"),
+      )
+      const response = yield* LLMClient.generate(request).pipe(Effect.provide(fixedResponse(body)))
+      const stepFinish = response.events.find((event) => event.type === "step-finish")
+      const finish = response.events.find((event) => event.type === "finish")
+      // The REQUESTED model is gpt-4o-mini; the SERVED model must not be assumed equal to it.
+      expect(model.id as string).toBe("gpt-4o-mini")
+      expect(stepFinish).toMatchObject({ responseModelID: "glm-5p3-flash" })
+      expect(finish).toMatchObject({ responseModelID: "glm-5p3-flash" })
+    }),
+  )
+
+  // Absent must mean "the provider did not report one", never "same as requested":
+  // a reader that cannot tell those apart will silently price a routed turn wrong.
+  it.effect("leaves the served model unset when the provider reports none", () =>
+    Effect.gen(function* () {
+      const body = sseEvents(deltaChunk({ role: "assistant", content: "ok" }), deltaChunk({}, "stop"))
+      const response = yield* LLMClient.generate(request).pipe(Effect.provide(fixedResponse(body)))
+      const stepFinish = response.events.find((event) => event.type === "step-finish")
+      expect((stepFinish as { responseModelID?: string }).responseModelID).toBeUndefined()
+    }),
+  )
+
+  // An empty string is not an identity. Encoding it as one would let a reader treat
+  // "" as a real model and stop falling back to the requested id.
+  it.effect("treats an empty served model as not reported", () =>
+    Effect.gen(function* () {
+      const body = sseEvents(
+        { id: "chatcmpl_fixture", model: "   ", choices: [], usage: null },
+        deltaChunk({ role: "assistant", content: "ok" }),
+        deltaChunk({}, "stop"),
+      )
+      const response = yield* LLMClient.generate(request).pipe(Effect.provide(fixedResponse(body)))
+      const stepFinish = response.events.find((event) => event.type === "step-finish")
+      expect((stepFinish as { responseModelID?: string }).responseModelID).toBeUndefined()
+    }),
+  )
+
+  // Only the first chunk carries `model` in practice; a later chunk without it must
+  // not erase what was already reported.
+  it.effect("keeps the served model when later chunks omit it", () =>
+    Effect.gen(function* () {
+      const body = sseEvents(
+        { id: "chatcmpl_fixture", model: "glm-5p3-flash", choices: [], usage: null },
+        deltaChunk({ role: "assistant", content: "a" }),
+        deltaChunk({ content: "b" }),
+        deltaChunk({}, "stop"),
+      )
+      const response = yield* LLMClient.generate(request).pipe(Effect.provide(fixedResponse(body)))
+      const stepFinish = response.events.find((event) => event.type === "step-finish")
+      expect(stepFinish).toMatchObject({ responseModelID: "glm-5p3-flash" })
+    }),
+  )
+
   it.effect("parses text and usage stream fixtures", () =>
     Effect.gen(function* () {
       const body = sseEvents(

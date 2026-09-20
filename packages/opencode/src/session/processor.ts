@@ -457,6 +457,15 @@ const layer = Layer.effect(
             ctx.assistantMessage.finish = value.reason
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
+            // Record who actually served this step. Appended as a distinct ordered
+            // set rather than overwritten: a router can pick a different member per
+            // step, and keeping only the last would misreport a mixed turn as if one
+            // model had served all of it.
+            if (value.responseModelID !== undefined) {
+              const seen = ctx.assistantMessage.responseModelIDs ?? []
+              if (!seen.includes(value.responseModelID))
+                ctx.assistantMessage.responseModelIDs = [...seen, value.responseModelID]
+            }
             yield* session.updatePart({
               id: PartID.ascending(),
               reason: value.reason,
@@ -464,6 +473,7 @@ const layer = Layer.effect(
               messageID: ctx.assistantMessage.id,
               sessionID: ctx.assistantMessage.sessionID,
               type: "step-finish",
+              responseModelID: value.responseModelID,
               tokens: usage.tokens,
               cost: usage.cost,
             })

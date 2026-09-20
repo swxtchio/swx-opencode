@@ -206,7 +206,12 @@ const AnthropicStreamDelta = Schema.Struct({
 const AnthropicEvent = Schema.Struct({
   type: Schema.String,
   index: Schema.optional(Schema.Number),
-  message: Schema.optional(Schema.Struct({ usage: Schema.optional(AnthropicUsage) })),
+  // `model` on message_start is the model that actually served the response.
+  // For a routed model (Fireworks FireRouter over the Anthropic-compatible
+  // route) the request names a route and this names the member that answered.
+  message: Schema.optional(
+    Schema.Struct({ usage: Schema.optional(AnthropicUsage), model: Schema.optional(Schema.String) }),
+  ),
   content_block: Schema.optional(AnthropicStreamBlock),
   delta: Schema.optional(AnthropicStreamDelta),
   usage: Schema.optional(AnthropicUsage),
@@ -222,6 +227,8 @@ type AnthropicEvent = Schema.Schema.Type<typeof AnthropicEvent>
 
 interface ParserState {
   readonly tools: ToolStream.State<number>
+  /** Model the provider reported on message_start; see AnthropicEvent.message.model. */
+  readonly responseModelID?: string
   readonly usage?: Usage
   readonly lifecycle: Lifecycle.State
 }
@@ -651,7 +658,13 @@ const NO_EVENTS: StepResult["1"] = []
 
 const onMessageStart = (state: ParserState, event: AnthropicEvent): StepResult => {
   const usage = mapUsage(event.message?.usage)
-  return [usage ? { ...state, usage: mergeUsage(state.usage, usage) } : state, NO_EVENTS]
+  const served = event.message?.model?.trim()
+  const responseModelID = served && served.length > 0 ? served : state.responseModelID
+  const next =
+    usage || responseModelID !== state.responseModelID
+      ? { ...state, usage: usage ? mergeUsage(state.usage, usage) : state.usage, responseModelID }
+      : state
+  return [next, NO_EVENTS]
 }
 
 const onContentBlockStart = (state: ParserState, event: AnthropicEvent): StepResult => {
@@ -785,6 +798,7 @@ const onMessageDelta = (state: ParserState, event: AnthropicEvent): StepResult =
   const lifecycle = Lifecycle.finish(state.lifecycle, events, {
     reason: mapFinishReason(event.delta?.stop_reason),
     usage,
+    responseModelID: state.responseModelID,
     providerMetadata: event.delta?.stop_sequence
       ? anthropicMetadata({ stopSequence: event.delta.stop_sequence })
       : undefined,
