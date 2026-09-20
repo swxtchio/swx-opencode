@@ -84,6 +84,12 @@ export const finish = (
     readonly reason: FinishReason
     readonly usage?: Usage
     readonly providerMetadata?: ProviderMetadata
+    /**
+     * The model the provider reported as serving this response, when the wire
+     * format carries one. Differs from the REQUESTED model for routed models,
+     * where the request names a route and the provider picks a member.
+     */
+    readonly responseModelID?: string
   },
 ): State => {
   const stepped = closeOpenBlocks(stepStart(state, events), events)
@@ -93,6 +99,7 @@ export const finish = (
       reason: input.reason,
       usage: input.usage,
       providerMetadata: input.providerMetadata,
+      responseModelID: input.responseModelID,
     }),
     LLMEvent.finish(input),
   )

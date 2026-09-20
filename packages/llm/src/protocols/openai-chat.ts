@@ -156,6 +156,10 @@ const OpenAIChatChoice = Schema.Struct({
 const OpenAIChatEvent = Schema.Struct({
   choices: Schema.Array(OpenAIChatChoice),
   usage: optionalNull(OpenAIChatUsage),
+  // The model that actually served the response. For a ROUTED model (Fireworks
+  // FireRouter, Azure model-router) the request names a route and this names the
+  // member the router chose, so it is the only field that says who answered.
+  model: optionalNull(Schema.String),
 })
 type OpenAIChatEvent = Schema.Schema.Type<typeof OpenAIChatEvent>
 type OpenAIChatRequestMessage = LLMRequest["messages"][number]
@@ -166,6 +170,8 @@ interface ParserState {
   readonly usage?: Usage
   readonly finishReason?: FinishReason
   readonly lifecycle: Lifecycle.State
+  /** Model the provider reported as serving this response; see OpenAIChatEvent.model. */
+  readonly responseModelID?: string
 }
 
 const invalid = ProviderShared.invalidRequest
@@ -408,6 +414,12 @@ const step = (state: ParserState, event: OpenAIChatEvent) =>
   Effect.gen(function* () {
     const events: LLMEvent[] = []
     const usage = mapUsage(event.usage) ?? state.usage
+    // Chunks after the first frequently omit `model`; keep the first non-empty
+    // value rather than letting a later empty chunk erase it. Trim and reject
+    // blanks: an empty string is not an identity, and encoding it as one would
+    // let a reader treat "" as a real model instead of falling back.
+    const servedModel = event.model?.trim()
+    const responseModelID = servedModel && servedModel.length > 0 ? servedModel : state.responseModelID
     const choice = event.choices[0]
     const finishReason = choice?.finish_reason ? mapFinishReason(choice.finish_reason) : state.finishReason
     const delta = choice?.delta
@@ -454,6 +466,7 @@ const step = (state: ParserState, event: OpenAIChatEvent) =>
         usage,
         finishReason,
         lifecycle,
+        responseModelID,
       },
       events,
     ] as const
@@ -465,7 +478,12 @@ const finishEvents = (state: ParserState): ReadonlyArray<LLMEvent> => {
   const reason = state.finishReason === "stop" && hasToolCalls ? "tool-calls" : state.finishReason
   const lifecycle = state.toolCallEvents.length ? Lifecycle.stepStart(state.lifecycle, events) : state.lifecycle
   events.push(...state.toolCallEvents)
-  if (reason) Lifecycle.finish(lifecycle, events, { reason, usage: state.usage })
+  if (reason)
+    Lifecycle.finish(lifecycle, events, {
+      reason,
+      usage: state.usage,
+      responseModelID: state.responseModelID,
+    })
   return events
 }
 

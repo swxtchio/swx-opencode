@@ -16,7 +16,29 @@ export function adapterState() {
     currentReasoningID: undefined as string | undefined,
     toolNames: {} as Record<string, string>,
     copilotTotalNanoAiu: undefined as number | undefined,
+    // Last model the provider reported as serving a step. The AI SDK puts
+    // response.modelId on `finish-step` but NOT on `finish`, so `finish` can only
+    // report a served model by carrying the last step's value forward.
+    lastResponseModelID: undefined as string | undefined,
   }
+}
+
+/**
+ * The model the provider says served this step, from the AI SDK's
+ * `finish-step` response metadata.
+ *
+ * Read defensively rather than off the type: a provider that omits the field, or
+ * returns an empty string, must yield undefined ("not reported") instead of an
+ * empty identity that a reader could mistake for a real model.
+ */
+function responseModelID(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const response = (value as Record<string, unknown>).response
+  if (!response || typeof response !== "object") return undefined
+  const id = (response as Record<string, unknown>).modelId
+  if (typeof id !== "string") return undefined
+  const trimmed = id.trim()
+  return trimmed.length > 0 ? trimmed : undefined
 }
 
 function finishReason(value: string | undefined): FinishReason {
@@ -101,12 +123,15 @@ export function toLLMEvents(
                 },
               }
         state.copilotTotalNanoAiu = undefined
+        const served = responseModelID(event)
+        if (served !== undefined) state.lastResponseModelID = served
         return [
           LLMEvent.stepFinish({
             index: state.step++,
             reason: finishReason(event.finishReason),
             usage: usage(event.usage),
             providerMetadata: metadata,
+            responseModelID: served,
           }),
         ]
       })
@@ -118,6 +143,7 @@ export function toLLMEvents(
             reason: finishReason(event.finishReason),
             usage: usage(event.totalUsage),
             providerMetadata: "providerMetadata" in event ? providerMetadata(event.providerMetadata) : undefined,
+            responseModelID: state.lastResponseModelID,
           }),
         ]
         // Reset so the adapter can be reused for a follow-up stream without leaking

@@ -242,6 +242,13 @@ export const StepFinishPart = Schema.Struct({
   type: Schema.Literal("step-finish"),
   reason: Schema.String,
   snapshot: Schema.optional(Schema.String),
+  /**
+   * The model the PROVIDER reported as serving THIS step, when it reports one.
+   * Distinct from the requested model: for a routed model the request names a
+   * route and the provider picks a member, possibly a different one per step.
+   * Absent means "not reported", never "same as requested".
+   */
+  responseModelID: Schema.optional(Schema.String),
   cost: Schema.Finite,
   tokens: Schema.Struct({
     total: Schema.optional(Schema.Finite),
@@ -468,6 +475,20 @@ export const Assistant = Schema.Struct({
     root: Schema.String,
   }),
   summary: Schema.optional(Schema.Boolean),
+  /**
+   * Models the PROVIDER reported as serving this turn, in first-seen order.
+   *
+   * Distinct from `modelID`, which is what was REQUESTED. For a routed model
+   * (Fireworks FireRouter, Azure model-router) the request names a route and the
+   * provider picks a member per request, so `modelID` alone cannot say who
+   * answered - and pricing a routed turn from `modelID` is wrong by construction.
+   *
+   * An ARRAY because a router may pick differently between steps of one turn;
+   * collapsing that to a single id would silently misreport a mixed turn. Usually
+   * length 1. Per-step values are on each StepFinishPart. Absent means "not
+   * reported", never "same as requested".
+   */
+  responseModelIDs: Schema.optional(Schema.Array(Schema.String)),
   cost: Schema.Finite,
   tokens: Schema.Struct({
     total: Schema.optional(Schema.Finite),

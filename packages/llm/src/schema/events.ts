@@ -186,6 +186,19 @@ export const StepFinish = Schema.Struct({
   reason: FinishReason,
   usage: Schema.optional(Usage),
   providerMetadata: Schema.optional(ProviderMetadata),
+  /**
+   * The model the PROVIDER reports as having served this step, when it reports one.
+   *
+   * This is NOT the requested model. For a router (Fireworks FireRouter, Azure
+   * model-router) the request names a route and the provider picks a member per
+   * request, so the two differ and only this one says who actually answered.
+   * A router may also pick differently between steps of a single turn, which is
+   * why it belongs on the step rather than only on the finish.
+   *
+   * Optional because not every provider or runtime reports it; absent means
+   * "not reported", never "same as requested".
+   */
+  responseModelID: Schema.optional(Schema.String),
 }).annotate({ identifier: "LLM.Event.StepFinish" })
 export type StepFinish = Schema.Schema.Type<typeof StepFinish>
 
@@ -194,6 +207,8 @@ export const Finish = Schema.Struct({
   reason: FinishReason,
   usage: Schema.optional(Usage),
   providerMetadata: Schema.optional(ProviderMetadata),
+  /** See {@link StepFinish.responseModelID}. The model serving the final step. */
+  responseModelID: Schema.optional(Schema.String),
 }).annotate({ identifier: "LLM.Event.Finish" })
 export type Finish = Schema.Schema.Type<typeof Finish>
 

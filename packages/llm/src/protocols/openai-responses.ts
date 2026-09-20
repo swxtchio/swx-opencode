@@ -219,6 +219,9 @@ const OpenAIResponsesEvent = Schema.Struct({
     Schema.StructWithRest(
       Schema.Struct({
         id: Schema.optional(Schema.String),
+        // The model that actually served the response. For a ROUTED model the
+        // request names a route and this names the member that answered.
+        model: optionalNull(Schema.String),
         service_tier: optionalNull(Schema.String),
         incomplete_details: optionalNull(Schema.Struct({ reason: Schema.String })),
         usage: optionalNull(OpenAIResponsesUsage),
@@ -874,9 +877,11 @@ const onOutputItemDone = Effect.fn("OpenAIResponses.onOutputItemDone")(function*
 
 const onResponseFinish = (state: ParserState, event: OpenAIResponsesEvent): StepResult => {
   const events: LLMEvent[] = []
+  const served = event.response?.model?.trim()
   const lifecycle = Lifecycle.finish(state.lifecycle, events, {
     reason: mapFinishReason(event, state.hasFunctionCall),
     usage: mapUsage(event.response?.usage),
+    responseModelID: served && served.length > 0 ? served : undefined,
     providerMetadata:
       event.response?.id || event.response?.service_tier
         ? openaiMetadata({
