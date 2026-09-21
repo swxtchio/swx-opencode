@@ -194,6 +194,107 @@ describe("tool.registry", () => {
     }),
   )
 
+  // A tool file runs arbitrary project code and resolves ITS imports from
+  // project space, so it fails for ordinary reasons - a syntax error, or a
+  // dependency the project never declared. The registry is built before the
+  // model is contacted, so an unguarded failure here killed the entire prompt:
+  // 0 parts, 0 tokens, no actionable error. See swxtchio/swx-opencode#16.
+  it.instance("keeps the other tools when one tool file cannot be imported", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const tool = path.join(test.directory, ".opencode", "tool")
+      yield* Effect.promise(() => fs.mkdir(tool, { recursive: true }))
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(tool, "broken.ts"),
+          // exactly the real-world shape: an import the project never provides
+          ["import { tool } from '@definitely-not-installed/plugin'", "export default tool({})", ""].join("\n"),
+        ),
+      )
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(tool, "healthy.ts"),
+          [
+            "export default {",
+            "  description: 'healthy tool',",
+            "  args: {},",
+            "  execute: async () => 'ok',",
+            "}",
+            "",
+          ].join("\n"),
+        ),
+      )
+      const registry = yield* ToolRegistry.Service
+      const ids = yield* registry.ids()
+      expect(ids).toContain("healthy")
+      expect(ids).not.toContain("broken")
+    }),
+  )
+
+  // Raised in review: importing is not the only step that runs project code.
+  // fromPlugin() converts the exported definition, so a malformed one throws
+  // AFTER a clean import - and a guard covering only the import let that take
+  // down the whole registry again.
+  it.instance("keeps the other tools when a tool imports cleanly but cannot be registered", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const tool = path.join(test.directory, ".opencode", "tool")
+      yield* Effect.promise(() => fs.mkdir(tool, { recursive: true }))
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(tool, "unregisterable.ts"),
+          // Imports fine and passes the isPluginTool shape check, then blows up
+          // when its args are converted.
+          [
+            "export default {",
+            "  description: 'looks like a tool',",
+            "  get args() {",
+            "    throw new Error('args getter explodes during registration')",
+            "  },",
+            "  execute: async () => 'ok',",
+            "}",
+            "",
+          ].join("\n"),
+        ),
+      )
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(tool, "fine.ts"),
+          [
+            "export default {",
+            "  description: 'fine tool',",
+            "  args: {},",
+            "  execute: async () => 'ok',",
+            "}",
+            "",
+          ].join("\n"),
+        ),
+      )
+      const registry = yield* ToolRegistry.Service
+      const ids = yield* registry.ids()
+      expect(ids).toContain("fine")
+      expect(ids).toContain("read")
+    }),
+  )
+
+  it.instance("still serves the builtin tools when every custom tool file is broken", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const tool = path.join(test.directory, ".opencode", "tool")
+      yield* Effect.promise(() => fs.mkdir(tool, { recursive: true }))
+      for (const name of ["a", "b", "c"]) {
+        yield* Effect.promise(() =>
+          Bun.write(path.join(tool, name + ".ts"), "import '@definitely-not-installed/plugin'\n"),
+        )
+      }
+      const registry = yield* ToolRegistry.Service
+      const ids = yield* registry.ids()
+      // the whole point: the session is degraded, never dead
+      expect(ids).toContain("read")
+      expect(ids.length).toBeGreaterThan(1)
+    }),
+  )
+
   it.instance("ignores non-tool exports in .opencode/tool files", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance

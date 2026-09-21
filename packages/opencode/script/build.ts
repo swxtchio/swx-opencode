@@ -15,6 +15,9 @@ const generated = await import("./generate.ts")
 
 import { Script } from "@opencode-ai/script"
 import pkg from "../package.json"
+// Version of the @opencode-ai/plugin SDK this tree ships, injected below so the
+// runtime pins projects to an SDK that matches the binary AND exists on npm.
+import pluginPkg from "../../plugin/package.json"
 
 const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
@@ -192,6 +195,12 @@ for (const item of targets) {
     define: {
       FFF_LIBC: JSON.stringify(item.abi === "musl" ? "musl" : "gnu"),
       OPENCODE_VERSION: `'${Script.version}'`,
+      // The plugin SDK version THIS TREE was built against, taken from the
+      // workspace package rather than from Script.version. They differ for any
+      // fork or local build: Script.version may never have been published to
+      // npm, and pinning the SDK to it produced "No matching version found",
+      // which left every project without the SDK its `.opencode` tools import.
+      OPENCODE_SDK_VERSION: `'${pluginPkg.version}'`,
       OPENCODE_MODELS_DEV: generated.modelsData,
       OTUI_TREE_SITTER_WORKER_PATH: bunfsRoot + treeSitterWorkerPath,
       OPENCODE_WORKER_PATH: workerPath,

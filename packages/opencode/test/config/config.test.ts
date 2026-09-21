@@ -5,7 +5,7 @@ import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { Cause, Effect, Exit, Layer, Logger, Option } from "effect"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/unstable/http"
-import { Config } from "@/config/config"
+import { Config, installPluginSdk, isMissingVersion, pluginSdkPin } from "@/config/config"
 import { ConfigManaged } from "@/config/managed"
 import { ConfigParse } from "../../src/config/parse"
 import { ConfigV2Compat } from "../../src/config/v2-compat"
@@ -2231,4 +2231,124 @@ test("parseManagedPlist handles empty config", async () => {
     "test:mobileconfig",
   )
   expect(config.$schema).toBe("https://opencode.ai/config.json")
+})
+
+// A build whose own version was never published to npm - any fork or local
+// release - used to pin @opencode-ai/plugin to that nonexistent version. The
+// install 404'd, the package was never present, and every `.opencode` tool
+// import then died, taking the whole prompt with it. swxtchio/swx-opencode#16
+describe("installPluginSdk", () => {
+  // These cover the RUNG ORDER. That the pin itself comes from the SDK version
+  // this tree ships (InstallationSdkVersion) rather than the build's own
+  // version is a call-site choice fed by a build-time define, so it is not
+  // reachable from here - it is verified against a real build instead, by
+  // confirming the pinned version in the log is the workspace SDK version and
+  // not the -swxtch build version.
+  const record = (failPinned: boolean) => {
+    const calls: (string | undefined)[] = []
+    return {
+      calls,
+      install: (version: string | undefined) => {
+        calls.push(version)
+        return failPinned && version !== undefined
+          ? Effect.fail(`No matching version found for @opencode-ai/plugin@${version}.`)
+          : Effect.void
+      },
+    }
+  }
+
+  test("retries unpinned when the pinned version is not published, and says so", async () => {
+    const r = record(true)
+    const logged: string[] = []
+    await Effect.runPromise(
+      installPluginSdk({ pinned: "1.18.32-swxtch.1", dir: "/tmp/x", install: r.install }).pipe(
+        Effect.provide(Logger.layer([Logger.make((o) => logged.push(String(o.message)))])),
+      ),
+    )
+    expect(logged.join(" ")).toContain("not published")
+    // NOT toEqual: it treats ["x"] and ["x", undefined] as equal, so a missing
+    // retry would pass. Length first, then each slot.
+    expect(r.calls.length).toBe(2)
+    expect(r.calls[0]).toBe("1.18.32-swxtch.1")
+    expect(r.calls[1]).toBeUndefined()
+  })
+
+  test("does not retry when the pinned install succeeds", async () => {
+    const r = record(false)
+    await Effect.runPromise(installPluginSdk({ pinned: "1.18.31", dir: "/tmp/x", install: r.install }))
+    expect(r.calls.length).toBe(1)
+    expect(r.calls[0]).toBe("1.18.31")
+  })
+
+  test("installs once, unpinned, for a build with no version to pin", async () => {
+    const r = record(false)
+    await Effect.runPromise(installPluginSdk({ pinned: undefined, dir: "/tmp/x", install: r.install }))
+    expect(r.calls.length).toBe(1)
+    expect(r.calls[0]).toBeUndefined()
+  })
+
+  // Raised in review: a transient fault is not a verdict on the pinned
+  // version. Falling back on ANY failure would swap a correct pin for an
+  // arbitrarily newer SDK because the network blipped, and leave it installed.
+  test("keeps the pin and does not fall back when the failure is not a missing version", async () => {
+    const calls: (string | undefined)[] = []
+    await Effect.runPromise(
+      installPluginSdk({
+        pinned: "1.18.31",
+        dir: "/tmp/x",
+        install: (version) => {
+          calls.push(version)
+          return Effect.fail("ENEEDAUTH: registry authentication required")
+        },
+      }),
+    )
+    expect(calls.length).toBe(1)
+    expect(calls[0]).toBe("1.18.31")
+  })
+
+  test("recognises a missing version across npm and bun wordings", () => {
+    expect(isMissingVersion("No matching version found for @opencode-ai/plugin@1.18.32-swxtch.1.")).toBe(true)
+    expect(isMissingVersion("error code ETARGET")).toBe(true)
+    expect(isMissingVersion("ENEEDAUTH: registry authentication required")).toBe(false)
+    expect(isMissingVersion("ETIMEDOUT")).toBe(false)
+  })
+
+  // The install failing is not a shrug: the very next thing that happens is a
+  // tool import that needs the package. It must not fail the effect (that
+  // would take down config load) but it MUST be reported - an earlier version
+  // of this test asserted only completion, so deleting the logError passed.
+  test("reports, and survives, both attempts failing", async () => {
+    const calls: (string | undefined)[] = []
+    const logged: string[] = []
+    await Effect.runPromise(
+      installPluginSdk({
+        pinned: "1.18.32-swxtch.1",
+        dir: "/tmp/x",
+        install: (version) => {
+          calls.push(version)
+          return Effect.fail("No matching version found for @opencode-ai/plugin@x.")
+        },
+      }).pipe(Effect.provide(Logger.layer([Logger.make((o) => logged.push(String(o.message)))]))),
+    )
+    expect(calls.length).toBe(2)
+    expect(calls[1]).toBeUndefined()
+    expect(logged.join(" ")).toContain("custom tools in this directory will not load")
+  })
+})
+
+describe("pluginSdkPin", () => {
+  // The entire outage was this one token: the BUILD's version where the SDK's
+  // belonged. Nothing else can catch that substitution, because the
+  // installation globals are not settable under test.
+  test("pins the SDK version for a released build", () => {
+    expect(pluginSdkPin(false, "1.18.31")).toBe("1.18.31")
+  })
+
+  test("pins nothing for a from-source run", () => {
+    expect(pluginSdkPin(true, "1.18.31")).toBeUndefined()
+  })
+
+  test("pins nothing when the build carries no SDK version", () => {
+    expect(pluginSdkPin(false, undefined)).toBeUndefined()
+  })
 })

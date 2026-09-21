@@ -11,7 +11,7 @@ import { Flag } from "@opencode-ai/core/flag/flag"
 import { Auth } from "../auth"
 import { Env } from "../env"
 import { applyEdits, modify } from "jsonc-parser"
-import { InstallationLocal, InstallationVersion } from "@opencode-ai/core/installation/version"
+import { InstallationLocal, InstallationSdkVersion } from "@opencode-ai/core/installation/version"
 import { existsSync } from "fs"
 import { Account } from "@/account/account"
 import { isRecord } from "@/util/record"
@@ -449,25 +449,11 @@ const layer = Layer.effect(
 
           yield* ensureGitignore(dir).pipe(Effect.orDie)
 
-          const dep = yield* npmSvc
-            .install(dir, {
-              add: [
-                {
-                  name: "@opencode-ai/plugin",
-                  version: InstallationLocal ? undefined : InstallationVersion,
-                },
-              ],
-            })
-            .pipe(
-              Effect.exit,
-              Effect.tap((exit) =>
-                Exit.isFailure(exit)
-                  ? Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) })
-                  : Effect.void,
-              ),
-              Effect.asVoid,
-              Effect.forkDetach,
-            )
+          const dep = yield* installPluginSdk({
+            pinned: pluginSdkPin(InstallationLocal, InstallationSdkVersion),
+            dir,
+            install: (version) => npmSvc.install(dir, { add: [{ name: "@opencode-ai/plugin", version }] }),
+          }).pipe(Effect.forkDetach)
           deps.push(dep)
 
           result.command = mergeDeep(result.command ?? {}, yield* Effect.promise(() => ConfigCommand.load(dir)))
@@ -699,3 +685,89 @@ export const node = LayerNode.make({
 })
 
 export * as Config from "./config"
+
+// Install the plugin SDK for one `.opencode` directory.
+//
+// Three rungs, each strictly better than having no SDK at all:
+//
+//   1. the SDK version THIS BUILD ships (InstallationSdkVersion, injected from
+//      the workspace package). Correct by construction - it is the SDK the
+//      binary was compiled against - and it is a version that actually exists,
+//      which is precisely what the old pin to the BUILD's own version was not.
+//   2. the newest published SDK, if rung 1 is somehow absent from npm (an
+//      in-tree SDK bump that has not been released yet).
+//   3. neither worked: report it loudly, naming the consequence.
+//
+// The old behaviour pinned to the build's own version, so any fork or local
+// build - e.g. 1.18.32-swxtch.1 - got "No matching version found" and the
+// package was never installed. Every file under `.opencode/{tool,tools}`
+// imports it, so that killed EVERY prompt, not just the first.
+//
+// A DRIFTING SDK IS NOT THE SAME RISK AS A MISSING ONE. Rung 2 can install an
+// SDK newer than the binary, which may drift in behaviour; rung 1 exists so
+// that is the rare path rather than the normal one. Having no SDK is a
+// guaranteed total failure, so the ordering here is deliberate.
+//
+// `pinned` and `install` are inputs rather than globals read inside, because
+// the previous shape was untestable: under test the channel is "local", so the
+// pinned branch never executed.
+// swxtchio/swx-opencode#16
+export function installPluginSdk(input: {
+  pinned: string | undefined
+  dir: string
+  install: (version: string | undefined) => Effect.Effect<void, unknown>
+}) {
+  return Effect.gen(function* () {
+    if (input.pinned !== undefined) {
+      const pinnedExit = yield* input.install(input.pinned).pipe(Effect.exit)
+      if (!Exit.isFailure(pinnedExit)) return
+      const reason = String(pinnedExit.cause)
+      // Fall back ONLY for "that version does not exist". Every other failure -
+      // offline, auth, permissions, a broken lockfile, registry config - says
+      // nothing about the pin, and treating it as one would swap a correct pin
+      // for an arbitrarily newer SDK on the strength of a transient blip, then
+      // leave that SDK installed. Those cases keep the pin and report.
+      if (!isMissingVersion(reason)) {
+        yield* Effect.logError("plugin SDK install failed; custom tools in this directory will not load", {
+          dir: input.dir,
+          version: input.pinned,
+          error: reason,
+        })
+        return
+      }
+      yield* Effect.logWarning("pinned plugin SDK version is not published, falling back to latest", {
+        dir: input.dir,
+        version: input.pinned,
+        error: reason,
+      })
+    }
+    const latestExit = yield* input.install(undefined).pipe(Effect.exit)
+    if (Exit.isFailure(latestExit)) {
+      // Loud, and it names the CONSEQUENCE rather than only the fault: after
+      // this, every custom tool in this directory fails to load.
+      yield* Effect.logError("dependency install failed; custom tools in this directory will not load", {
+        dir: input.dir,
+        error: String(latestExit.cause),
+      })
+    }
+  })
+}
+
+// Does this install failure mean "the requested version does not exist"?
+//
+// npm reports it as ETARGET / "No matching version found"; bun's wording
+// differs, so both shapes are matched. Anything else is a DIFFERENT fault and
+// must not be read as a verdict on the pinned version.
+export function isMissingVersion(reason: string): boolean {
+  return /ETARGET|notarget|No matching version|No version matching|not found in registry/i.test(reason)
+}
+
+// Which version to pin the plugin SDK to.
+//
+// Trivial by design, and extracted purely so the choice is testable: the whole
+// outage came down to this one token being the BUILD's version instead of the
+// SDK's, and that substitution is invisible to every other test because the
+// installation globals are not settable under test.
+export function pluginSdkPin(local: boolean, sdkVersion: string | undefined): string | undefined {
+  return local ? undefined : sdkVersion
+}
