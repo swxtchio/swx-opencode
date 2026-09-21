@@ -2239,6 +2239,12 @@ test("parseManagedPlist handles empty config", async () => {
 // install 404'd, the package was never present, and every `.opencode` tool
 // import then died, taking the whole prompt with it. swxtchio/swx-opencode#16
 describe("installPluginSdk", () => {
+  // These cover the RUNG ORDER. That the pin itself comes from the SDK version
+  // this tree ships (InstallationSdkVersion) rather than the build's own
+  // version is a call-site choice fed by a build-time define, so it is not
+  // reachable from here - it is verified against a real build instead, by
+  // confirming the pinned version in the log is the workspace SDK version and
+  // not the -swxtch build version.
   const record = (failPinned: boolean) => {
     const calls: (string | undefined)[] = []
     return {

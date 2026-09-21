@@ -11,7 +11,7 @@ import { Flag } from "@opencode-ai/core/flag/flag"
 import { Auth } from "../auth"
 import { Env } from "../env"
 import { applyEdits, modify } from "jsonc-parser"
-import { InstallationLocal, InstallationVersion } from "@opencode-ai/core/installation/version"
+import { InstallationLocal, InstallationSdkVersion } from "@opencode-ai/core/installation/version"
 import { existsSync } from "fs"
 import { Account } from "@/account/account"
 import { isRecord } from "@/util/record"
@@ -450,7 +450,7 @@ const layer = Layer.effect(
           yield* ensureGitignore(dir).pipe(Effect.orDie)
 
           const dep = yield* installPluginSdk({
-            pinned: InstallationLocal ? undefined : InstallationVersion,
+            pinned: InstallationLocal ? undefined : InstallationSdkVersion,
             dir,
             install: (version) => npmSvc.install(dir, { add: [{ name: "@opencode-ai/plugin", version }] }),
           }).pipe(Effect.forkDetach)
@@ -686,22 +686,31 @@ export const node = LayerNode.make({
 
 export * as Config from "./config"
 
-// Install the plugin SDK for one `.opencode` directory, pinned to this build's
-// version when it has one.
+// Install the plugin SDK for one `.opencode` directory.
 //
-// The pin is an OPTIMISATION, not a requirement: it keeps the types a project
-// compiles against aligned with the binary loading them. A build whose version
-// was never published to npm - any fork or local release, e.g.
-// 1.18.32-swxtch.1 - gets "No matching version found", and the package then
-// does not exist AT ALL. Everything under `.opencode/{tool,tools}` imports it,
-// so that turned into every prompt dying on an unresolvable import.
+// Three rungs, each strictly better than having no SDK at all:
 //
-// Falling back to the newest published SDK is strictly better than having
-// none: worst case the types drift slightly, and the usual case is that it is
-// the very package the pin asked for.
+//   1. the SDK version THIS BUILD ships (InstallationSdkVersion, injected from
+//      the workspace package). Correct by construction - it is the SDK the
+//      binary was compiled against - and it is a version that actually exists,
+//      which is precisely what the old pin to the BUILD's own version was not.
+//   2. the newest published SDK, if rung 1 is somehow absent from npm (an
+//      in-tree SDK bump that has not been released yet).
+//   3. neither worked: report it loudly, naming the consequence.
 //
-// Takes `pinned` and `install` as inputs rather than reading the installation
-// globals, so the pin-then-fallback order is directly testable.
+// The old behaviour pinned to the build's own version, so any fork or local
+// build - e.g. 1.18.32-swxtch.1 - got "No matching version found" and the
+// package was never installed. Every file under `.opencode/{tool,tools}`
+// imports it, so that killed EVERY prompt, not just the first.
+//
+// A DRIFTING SDK IS NOT THE SAME RISK AS A MISSING ONE. Rung 2 can install an
+// SDK newer than the binary, which may drift in behaviour; rung 1 exists so
+// that is the rare path rather than the normal one. Having no SDK is a
+// guaranteed total failure, so the ordering here is deliberate.
+//
+// `pinned` and `install` are inputs rather than globals read inside, because
+// the previous shape was untestable: under test the channel is "local", so the
+// pinned branch never executed.
 // swxtchio/swx-opencode#16
 export function installPluginSdk(input: {
   pinned: string | undefined
@@ -710,21 +719,21 @@ export function installPluginSdk(input: {
 }) {
   return Effect.gen(function* () {
     if (input.pinned !== undefined) {
-      const first = yield* input.install(input.pinned).pipe(Effect.exit)
-      if (!Exit.isFailure(first)) return
+      const pinnedExit = yield* input.install(input.pinned).pipe(Effect.exit)
+      if (!Exit.isFailure(pinnedExit)) return
       yield* Effect.logWarning("pinned plugin SDK version is not published, falling back to latest", {
         dir: input.dir,
         version: input.pinned,
-        error: String(first.cause),
+        error: String(pinnedExit.cause),
       })
     }
-    const fallback = yield* input.install(undefined).pipe(Effect.exit)
-    if (Exit.isFailure(fallback)) {
+    const latestExit = yield* input.install(undefined).pipe(Effect.exit)
+    if (Exit.isFailure(latestExit)) {
       // Loud, and it names the CONSEQUENCE rather than only the fault: after
       // this, every custom tool in this directory fails to load.
       yield* Effect.logError("dependency install failed; custom tools in this directory will not load", {
         dir: input.dir,
-        error: String(fallback.cause),
+        error: String(latestExit.cause),
       })
     }
   })
