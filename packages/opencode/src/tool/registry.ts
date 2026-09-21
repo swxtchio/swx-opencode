@@ -18,6 +18,7 @@ import { InvalidTool } from "./invalid"
 import { SkillTool } from "./skill"
 import * as Tool from "./tool"
 import { Config } from "@/config/config"
+import { errorMessage } from "@/util/error"
 import { type ToolContext as PluginToolContext, type ToolDefinition } from "@opencode-ai/plugin"
 import type { JSONSchema7, JSONSchema7Definition } from "@ai-sdk/provider"
 import { Schema } from "effect"
@@ -189,7 +190,28 @@ const layer = Layer.effect(
           const namespace = path.basename(match, path.extname(match))
           // `match` is an absolute filesystem path from `Glob.scanSync(..., { absolute: true })`.
           // Import it as `file://` so Node on Windows accepts the dynamic import.
-          const mod = yield* Effect.promise(() => import(pathToFileURL(match).href))
+          //
+          // One tool file must never take down the registry. This import runs
+          // arbitrary project code and resolves its imports from project space,
+          // so it fails for ordinary reasons - a syntax error, or a dependency
+          // the project never declared. Because the registry is built BEFORE the
+          // model is contacted, an unguarded throw here killed the whole prompt:
+          // prompt accepted, assistant message created, zero parts, zero tokens,
+          // no error a user could act on. A repo shipping `.opencode/tools/*.js`
+          // that import an undeclared `@opencode-ai/plugin` reproduced exactly
+          // that in any checkout without a resolvable copy.
+          //
+          // So a broken file is skipped and reported by name, mirroring how
+          // plugin loading already tolerates one bad plugin. The session keeps
+          // its other tools instead of losing every one of them.
+          const mod = yield* Effect.tryPromise({
+            try: () => import(pathToFileURL(match).href),
+            catch: errorMessage,
+          }).pipe(
+            Effect.tapError((error) => Effect.logError("failed to load custom tool", { path: match, error })),
+            Effect.catch(() => Effect.succeed(undefined)),
+          )
+          if (!mod) continue
           for (const [id, def] of Object.entries(mod)) {
             if (!isPluginTool(def)) continue
             custom.push(fromPlugin(id === "default" ? namespace : `${namespace}_${id}`, def))
