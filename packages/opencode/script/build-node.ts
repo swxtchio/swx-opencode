@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { Script } from "@opencode-ai/script"
+import pluginPkg from "../../plugin/package.json"
 import path from "path"
 import { fileURLToPath } from "url"
 
@@ -22,6 +23,10 @@ await Bun.build({
   define: {
     OPENCODE_MODELS_DEV: generated.modelsData,
     OPENCODE_VERSION: `'${Script.version}'`,
+    // Same define as the standalone build: without it this entrypoint has no
+    // SDK version to pin and every project it serves takes the unpinned path,
+    // free to drift to an SDK newer than this binary.
+    OPENCODE_SDK_VERSION: `'${pluginPkg.version}'`,
     OPENCODE_CHANNEL: `'${Script.channel}'`,
   },
   files: {

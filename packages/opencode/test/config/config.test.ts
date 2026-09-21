@@ -5,7 +5,7 @@ import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { Cause, Effect, Exit, Layer, Logger, Option } from "effect"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/unstable/http"
-import { Config, installPluginSdk } from "@/config/config"
+import { Config, installPluginSdk, isMissingVersion, pluginSdkPin } from "@/config/config"
 import { ConfigManaged } from "@/config/managed"
 import { ConfigParse } from "../../src/config/parse"
 import { ConfigV2Compat } from "../../src/config/v2-compat"
@@ -98,13 +98,12 @@ const configLayer = (
     auth?: Layer.Layer<Auth.Service>
     account?: Layer.Layer<Account.Service>
     client?: HttpClient.HttpClient
-    npm?: Layer.Layer<Npm.Service>
   } = {},
 ) =>
   LayerNode.compile(LayerNode.group([Config.node, FSUtil.node, Env.node, CrossSpawnSpawner.node]), [
     [Auth.node, options.auth ?? AuthTest.empty],
     [Account.node, options.account ?? AccountTest.empty],
-    [Npm.node, options.npm ?? NpmTest.noop],
+    [Npm.node, NpmTest.noop],
     [httpClient, Layer.succeed(HttpClient.HttpClient, options.client ?? unexpectedHttp)],
   ])
 
@@ -2258,9 +2257,15 @@ describe("installPluginSdk", () => {
     }
   }
 
-  test("retries unpinned when the pinned version is not published", async () => {
+  test("retries unpinned when the pinned version is not published, and says so", async () => {
     const r = record(true)
-    await Effect.runPromise(installPluginSdk({ pinned: "1.18.32-swxtch.1", dir: "/tmp/x", install: r.install }))
+    const logged: string[] = []
+    await Effect.runPromise(
+      installPluginSdk({ pinned: "1.18.32-swxtch.1", dir: "/tmp/x", install: r.install }).pipe(
+        Effect.provide(Logger.layer([Logger.make((o) => logged.push(String(o.message)))])),
+      ),
+    )
+    expect(logged.join(" ")).toContain("not published")
     // NOT toEqual: it treats ["x"] and ["x", undefined] as equal, so a missing
     // retry would pass. Length first, then each slot.
     expect(r.calls.length).toBe(2)
@@ -2282,24 +2287,68 @@ describe("installPluginSdk", () => {
     expect(r.calls[0]).toBeUndefined()
   })
 
+  // Raised in review: a transient fault is not a verdict on the pinned
+  // version. Falling back on ANY failure would swap a correct pin for an
+  // arbitrarily newer SDK because the network blipped, and leave it installed.
+  test("keeps the pin and does not fall back when the failure is not a missing version", async () => {
+    const calls: (string | undefined)[] = []
+    await Effect.runPromise(
+      installPluginSdk({
+        pinned: "1.18.31",
+        dir: "/tmp/x",
+        install: (version) => {
+          calls.push(version)
+          return Effect.fail("ENEEDAUTH: registry authentication required")
+        },
+      }),
+    )
+    expect(calls.length).toBe(1)
+    expect(calls[0]).toBe("1.18.31")
+  })
+
+  test("recognises a missing version across npm and bun wordings", () => {
+    expect(isMissingVersion("No matching version found for @opencode-ai/plugin@1.18.32-swxtch.1.")).toBe(true)
+    expect(isMissingVersion("error code ETARGET")).toBe(true)
+    expect(isMissingVersion("ENEEDAUTH: registry authentication required")).toBe(false)
+    expect(isMissingVersion("ETIMEDOUT")).toBe(false)
+  })
+
   // The install failing is not a shrug: the very next thing that happens is a
   // tool import that needs the package. It must not fail the effect (that
-  // would take down config load) but it must be reported.
-  test("survives both attempts failing rather than failing config load", async () => {
+  // would take down config load) but it MUST be reported - an earlier version
+  // of this test asserted only completion, so deleting the logError passed.
+  test("reports, and survives, both attempts failing", async () => {
     const calls: (string | undefined)[] = []
-    const exit = await Effect.runPromiseExit(
+    const logged: string[] = []
+    await Effect.runPromise(
       installPluginSdk({
         pinned: "1.18.32-swxtch.1",
         dir: "/tmp/x",
         install: (version) => {
           calls.push(version)
-          return Effect.fail("registry unreachable")
+          return Effect.fail("No matching version found for @opencode-ai/plugin@x.")
         },
-      }),
+      }).pipe(Effect.provide(Logger.layer([Logger.make((o) => logged.push(String(o.message)))]))),
     )
-    expect(Exit.isSuccess(exit)).toBe(true)
     expect(calls.length).toBe(2)
-    expect(calls[0]).toBe("1.18.32-swxtch.1")
     expect(calls[1]).toBeUndefined()
+    expect(logged.join(" ")).toContain("custom tools in this directory will not load")
+  })
+})
+
+describe("pluginSdkPin", () => {
+  // The entire outage was this one token: the BUILD's version where the SDK's
+  // belonged. Nothing else can catch that substitution, because the
+  // installation globals are not settable under test.
+  test("pins the SDK version for a released build", () => {
+    expect(pluginSdkPin(false, "1.18.31")).toBe("1.18.31")
+  })
+
+  test("pins nothing for a from-source run", () => {
+    expect(pluginSdkPin(true, "1.18.31")).toBeUndefined()
+  })
+
+  test("pins nothing when the build carries no SDK version", () => {
+    expect(pluginSdkPin(false, undefined)).toBeUndefined()
   })
 })

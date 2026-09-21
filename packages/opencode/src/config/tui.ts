@@ -16,11 +16,12 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CurrentWorkingDirectory } from "./tui-cwd"
 import { ConfigPlugin } from "@/config/plugin"
 import { TuiKeybind } from "@opencode-ai/tui/config/keybind"
-import { InstallationLocal, InstallationVersion } from "@opencode-ai/core/installation/version"
+import { InstallationLocal, InstallationSdkVersion } from "@opencode-ai/core/installation/version"
 import { makeRuntime } from "@opencode-ai/core/effect/runtime"
 import { Filesystem } from "@/util/filesystem"
 import { ConfigVariable } from "@/config/variable"
 import { Npm } from "@opencode-ai/core/npm"
+import { installPluginSdk, pluginSdkPin } from "./config"
 import { FormatError, FormatUnknownError } from "@/cli/error"
 import { TuiConfig } from "@opencode-ai/tui/config"
 
@@ -234,16 +235,11 @@ const layer = Layer.effect(
     const deps = yield* Effect.forEach(
       data.dirs,
       (dir) =>
-        npm
-          .install(dir, {
-            add: [
-              {
-                name: "@opencode-ai/plugin",
-                version: InstallationLocal ? undefined : InstallationVersion,
-              },
-            ],
-          })
-          .pipe(Effect.forkScoped),
+        installPluginSdk({
+          pinned: pluginSdkPin(InstallationLocal, InstallationSdkVersion),
+          dir,
+          install: (version) => npm.install(dir, { add: [{ name: "@opencode-ai/plugin", version }] }),
+        }).pipe(Effect.forkScoped),
       {
         concurrency: "unbounded",
       },

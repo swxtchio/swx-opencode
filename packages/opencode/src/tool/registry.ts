@@ -204,24 +204,50 @@ const layer = Layer.effect(
           // So a broken file is skipped and reported by name, mirroring how
           // plugin loading already tolerates one bad plugin. The session keeps
           // its other tools instead of losing every one of them.
-          const mod = yield* Effect.tryPromise({
-            try: () => import(pathToFileURL(match).href),
+          // NOTE: this scan runs once per instance (the registry is memoized),
+          // so a file skipped for a TRANSIENT reason stays absent for the
+          // instance's lifetime. That is the accepted cost of not dying: the
+          // old behaviour failed loudly and a retry might have succeeded.
+          //
+          // The guard spans import AND registration. Importing is not the only
+          // step that runs project-controlled code: fromPlugin() converts the
+          // file's exported definition, so a malformed or unsupported one
+          // throws here just as readily - and would have taken the whole
+          // registry down again, past a guard that only covered the import.
+          const loaded = yield* Effect.tryPromise({
+            try: async () => {
+              const mod = await import(pathToFileURL(match).href)
+              const found: Tool.Def[] = []
+              for (const [id, def] of Object.entries(mod)) {
+                if (!isPluginTool(def)) continue
+                found.push(fromPlugin(id === "default" ? namespace : `${namespace}_${id}`, def))
+              }
+              return found
+            },
             catch: errorMessage,
           }).pipe(
             Effect.tapError((error) => Effect.logError("failed to load custom tool", { path: match, error })),
             Effect.catch(() => Effect.succeed(undefined)),
           )
-          if (!mod) continue
-          for (const [id, def] of Object.entries(mod)) {
-            if (!isPluginTool(def)) continue
-            custom.push(fromPlugin(id === "default" ? namespace : `${namespace}_${id}`, def))
-          }
+          if (!loaded) continue
+          custom.push(...loaded)
         }
 
+        // Same guard for plugin-supplied tool defs. The plugin loader validated
+        // these enough to IMPORT them; it never validated their tool-def shape,
+        // so fromPlugin can throw here exactly as it can for a file tool - and
+        // an unguarded throw takes the registry, and the prompt, with it.
         const plugins = yield* plugin.list()
         for (const p of plugins) {
           for (const [id, def] of Object.entries(p.tool ?? {})) {
-            custom.push(fromPlugin(id, def))
+            const converted = yield* Effect.try({
+              try: () => fromPlugin(id, def),
+              catch: errorMessage,
+            }).pipe(
+              Effect.tapError((error) => Effect.logError("failed to register plugin tool", { tool: id, error })),
+              Effect.catch(() => Effect.succeed(undefined)),
+            )
+            if (converted) custom.push(converted)
           }
         }
 

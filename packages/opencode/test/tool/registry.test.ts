@@ -231,6 +231,52 @@ describe("tool.registry", () => {
     }),
   )
 
+  // Raised in review: importing is not the only step that runs project code.
+  // fromPlugin() converts the exported definition, so a malformed one throws
+  // AFTER a clean import - and a guard covering only the import let that take
+  // down the whole registry again.
+  it.instance("keeps the other tools when a tool imports cleanly but cannot be registered", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const tool = path.join(test.directory, ".opencode", "tool")
+      yield* Effect.promise(() => fs.mkdir(tool, { recursive: true }))
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(tool, "unregisterable.ts"),
+          // Imports fine and passes the isPluginTool shape check, then blows up
+          // when its args are converted.
+          [
+            "export default {",
+            "  description: 'looks like a tool',",
+            "  get args() {",
+            "    throw new Error('args getter explodes during registration')",
+            "  },",
+            "  execute: async () => 'ok',",
+            "}",
+            "",
+          ].join("\n"),
+        ),
+      )
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(tool, "fine.ts"),
+          [
+            "export default {",
+            "  description: 'fine tool',",
+            "  args: {},",
+            "  execute: async () => 'ok',",
+            "}",
+            "",
+          ].join("\n"),
+        ),
+      )
+      const registry = yield* ToolRegistry.Service
+      const ids = yield* registry.ids()
+      expect(ids).toContain("fine")
+      expect(ids).toContain("read")
+    }),
+  )
+
   it.instance("still serves the builtin tools when every custom tool file is broken", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
