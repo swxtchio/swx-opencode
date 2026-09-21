@@ -1,6 +1,7 @@
 import * as Locale from "@/util/locale"
 import type { SessionMessages } from "./session.shared"
 import type { RunProvider, StreamCommit } from "./types"
+import { servedAcrossTurn, servedModelLabel } from "./variant.shared"
 
 export function turnSummaryCommit(input: {
   agent: string
@@ -25,6 +26,7 @@ export function turnSummaryCommit(input: {
 export function messageTurnSummaryCommit(
   message: SessionMessages[number],
   providers?: RunProvider[],
+  all?: SessionMessages,
 ): StreamCommit | undefined {
   const info = message.info
   if (info.role !== "assistant") {
@@ -36,11 +38,13 @@ export function messageTurnSummaryCommit(
     return
   }
 
-  const model = providers?.find((item) => item.id === info.providerID)?.models[info.modelID]?.name
+  // One prompt produces one assistant message per step and the summary renders
+  // on the last of them, so gather the whole turn rather than that one message.
+  const model = servedModelLabel(providers, info.providerID, info.modelID, servedAcrossTurn(all, info))
 
   return turnSummaryCommit({
     agent: Locale.titlecase(info.agent),
-    model: model ?? info.modelID,
+    model,
     duration: Locale.duration(completed - info.time.created),
     messageID: info.id,
   })

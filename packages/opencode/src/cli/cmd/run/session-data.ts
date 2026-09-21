@@ -843,6 +843,20 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
       next = { status: "assistant responding" }
     }
 
+    // Report THIS message's model record. Accumulation across the turn is the
+    // footer's job, because the turn boundary (turn.send) is a footer event
+    // this reducer never sees - and deriving the boundary here from parentID
+    // was wrong: auto-compaction mints a synthetic user message mid-turn, so a
+    // parentID change does not mean a new turn.
+    next = {
+      ...next,
+      turnModel: {
+        providerID: info.providerID,
+        modelID: info.modelID,
+        served: [...(info.responseModelIDs ?? [])],
+      },
+    }
+
     const usage = formatUsage(
       info.tokens,
       input.limits[modelKey(info.providerID, info.modelID)],

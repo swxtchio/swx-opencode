@@ -36,7 +36,7 @@ import { PROMPT_MAX_ROWS, TEXTAREA_MIN_ROWS } from "./footer.prompt"
 import { RunFooterView } from "./footer.view"
 import { RunScrollbackStream } from "./scrollback.surface"
 import { RUN_THEME_FALLBACK, resolveRunTheme, type RunTheme } from "./theme"
-import { modelInfo } from "./variant.shared"
+import { reduceTurnModel, turnSummaryModel } from "./variant.shared"
 import type {
   FooterApi,
   FooterEvent,
@@ -58,6 +58,7 @@ import type {
   RunResource,
   RunTuiConfig,
   StreamCommit,
+  TurnModel,
 } from "./types"
 
 type CycleResult = {
@@ -119,7 +120,9 @@ function createEmptySubagentState(): FooterSubagentState {
   }
 }
 
-function eventPatch(next: FooterEvent): FooterPatch | undefined {
+// Exported for tests: the turn.send reset below is what stops one turn's model
+// from labelling the next, and it is only observable through this mapping.
+export function eventPatch(next: FooterEvent): FooterPatch | undefined {
   if (next.type === "queue") {
     return { queue: next.queue }
   }
@@ -241,6 +244,7 @@ export class RunFooter implements FooterApi {
       status: "",
       queue: 0,
       model: options.modelLabel,
+      turnModel: undefined,
       duration: "",
       usage: "",
       first: options.first,
@@ -389,13 +393,13 @@ export class RunFooter implements FooterApi {
 
   public event(next: FooterEvent): void {
     if (next.type === "turn.duration") {
-      const current = this.currentModel()
+      const turnModel = this.state().turnModel
       this.flush()
       this.flushing = this.flushing
         .then(() =>
           this.scrollback.writeTurnSummary({
             agent: this.options.agentLabel,
-            model: current ? modelInfo(this.providers(), current).model : this.state().model,
+            model: turnSummaryModel({ turnModel, providers: this.providers() }),
             duration: next.duration,
           }),
         )
@@ -456,6 +460,13 @@ export class RunFooter implements FooterApi {
         this.clearExitTimer()
       }
       this.patch(patch)
+      if (next.type === "turn.send") {
+        // Start this turn's model record, REPLACING the last turn's outright.
+        // Seeded with the identity being dispatched so a turn that fails before
+        // producing any assistant message is still labelled with the model that
+        // was sent, rather than whatever is selected when it finishes.
+        this.resetTurnModel(reduceTurnModel(undefined, { kind: "send", dispatched: this.currentModel() }))
+      }
       return
     }
 
@@ -474,6 +485,13 @@ export class RunFooter implements FooterApi {
     }
   }
 
+  // Replace the turn's model record outright. Kept off the patch path on
+  // purpose: patch() accumulates, and a new turn must not inherit the old one.
+  private resetTurnModel(next: TurnModel | undefined): void {
+    if (this.isGone) return
+    this.setState({ ...this.state(), turnModel: next })
+  }
+
   private patch(next: FooterPatch): void {
     if (this.isGone) {
       return
@@ -488,6 +506,11 @@ export class RunFooter implements FooterApi {
       status: typeof next.status === "string" ? next.status : prev.status,
       queue: typeof next.queue === "number" ? Math.max(0, next.queue) : prev.queue,
       model: typeof next.model === "string" ? next.model : prev.model,
+      // Accumulates: session-data reports ONE assistant message at a time and a
+      // prompt produces one per step. The turn boundary is not expressed here
+      // at all - turn.send resets the record directly through resetTurnModel(),
+      // bypassing this merge, so a new turn can never accumulate onto the last.
+      turnModel: reduceTurnModel(prev.turnModel, { kind: "observe", observed: next.turnModel }),
       duration: typeof next.duration === "string" ? next.duration : prev.duration,
       usage: typeof next.usage === "string" ? next.usage : prev.usage,
       first: typeof next.first === "boolean" ? next.first : prev.first,

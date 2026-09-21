@@ -591,3 +591,58 @@ describe("run session data", () => {
     ])
   })
 })
+
+describe("each assistant message reports its own model record", () => {
+  // session-data reports ONE message; the footer accumulates across the turn,
+  // because only the footer sees the turn boundary (turn.send).
+  test("carries the dispatched identity and that message's served models", () => {
+    const out = reduce(
+      createSessionData(),
+      assistant("msg-1", { parentID: "user-1", responseModelIDs: ["glm-5p3-flash", "glm-5p3"] }),
+    )
+    expect(out.footer?.patch?.turnModel).toEqual({
+      providerID: "openai",
+      modelID: "gpt-5",
+      served: ["glm-5p3-flash", "glm-5p3"],
+    })
+  })
+
+  test("reports an empty served list when the provider recorded nothing", () => {
+    const out = reduce(createSessionData(), assistant("msg-1", { parentID: "user-1" }))
+    expect(out.footer?.patch?.turnModel).toEqual({ providerID: "openai", modelID: "gpt-5", served: [] })
+  })
+
+  test("reports the model the turn was dispatched to", () => {
+    const out = reduce(
+      createSessionData(),
+      assistant("msg-1", { parentID: "user-1", providerID: "firerouter", modelID: "route" }),
+    )
+    expect(out.footer?.patch?.turnModel).toMatchObject({ providerID: "firerouter", modelID: "route" })
+  })
+})
+
+describe("a subagent cannot relabel the main turn", () => {
+  // Raised in review as a suspected blocker. It does not happen, because a
+  // subagent runs in its OWN session and this reducer is scoped to one
+  // sessionID - but nothing pinned that, so it is pinned now.
+  test("ignores an assistant message from another session", () => {
+    const data = createSessionData()
+    reduce(data, assistant("msg-1", { parentID: "user-1", responseModelIDs: ["glm-5p3-flash"] }))
+    const child = reduce(data, {
+      type: "message.updated",
+      properties: {
+        sessionID: "session-child",
+        info: {
+          id: "msg-child",
+          role: "assistant",
+          parentID: "user-child",
+          providerID: "anthropic",
+          modelID: "claude-opus-5",
+          responseModelIDs: ["claude-opus-5"],
+          tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+        },
+      },
+    })
+    expect(child.footer?.patch?.turnModel).toBeUndefined()
+  })
+})

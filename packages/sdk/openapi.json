@@ -16321,6 +16321,12 @@
           "summary": {
             "type": "boolean"
           },
+          "responseModelIDs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "cost": {
             "type": "number"
           },
@@ -16928,6 +16934,9 @@
             "type": "string"
           },
           "snapshot": {
+            "type": "string"
+          },
+          "responseModelID": {
             "type": "string"
           },
           "cost": {
