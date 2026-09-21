@@ -5,7 +5,7 @@ import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { Cause, Effect, Exit, Layer, Logger, Option } from "effect"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/unstable/http"
-import { Config } from "@/config/config"
+import { Config, installPluginSdk } from "@/config/config"
 import { ConfigManaged } from "@/config/managed"
 import { ConfigParse } from "../../src/config/parse"
 import { ConfigV2Compat } from "../../src/config/v2-compat"
@@ -98,12 +98,13 @@ const configLayer = (
     auth?: Layer.Layer<Auth.Service>
     account?: Layer.Layer<Account.Service>
     client?: HttpClient.HttpClient
+    npm?: Layer.Layer<Npm.Service>
   } = {},
 ) =>
   LayerNode.compile(LayerNode.group([Config.node, FSUtil.node, Env.node, CrossSpawnSpawner.node]), [
     [Auth.node, options.auth ?? AuthTest.empty],
     [Account.node, options.account ?? AccountTest.empty],
-    [Npm.node, NpmTest.noop],
+    [Npm.node, options.npm ?? NpmTest.noop],
     [httpClient, Layer.succeed(HttpClient.HttpClient, options.client ?? unexpectedHttp)],
   ])
 
@@ -2231,4 +2232,68 @@ test("parseManagedPlist handles empty config", async () => {
     "test:mobileconfig",
   )
   expect(config.$schema).toBe("https://opencode.ai/config.json")
+})
+
+// A build whose own version was never published to npm - any fork or local
+// release - used to pin @opencode-ai/plugin to that nonexistent version. The
+// install 404'd, the package was never present, and every `.opencode` tool
+// import then died, taking the whole prompt with it. swxtchio/swx-opencode#16
+describe("installPluginSdk", () => {
+  const record = (failPinned: boolean) => {
+    const calls: (string | undefined)[] = []
+    return {
+      calls,
+      install: (version: string | undefined) => {
+        calls.push(version)
+        return failPinned && version !== undefined
+          ? Effect.fail(`No matching version found for @opencode-ai/plugin@${version}.`)
+          : Effect.void
+      },
+    }
+  }
+
+  test("retries unpinned when the pinned version is not published", async () => {
+    const r = record(true)
+    await Effect.runPromise(installPluginSdk({ pinned: "1.18.32-swxtch.1", dir: "/tmp/x", install: r.install }))
+    // NOT toEqual: it treats ["x"] and ["x", undefined] as equal, so a missing
+    // retry would pass. Length first, then each slot.
+    expect(r.calls.length).toBe(2)
+    expect(r.calls[0]).toBe("1.18.32-swxtch.1")
+    expect(r.calls[1]).toBeUndefined()
+  })
+
+  test("does not retry when the pinned install succeeds", async () => {
+    const r = record(false)
+    await Effect.runPromise(installPluginSdk({ pinned: "1.18.31", dir: "/tmp/x", install: r.install }))
+    expect(r.calls.length).toBe(1)
+    expect(r.calls[0]).toBe("1.18.31")
+  })
+
+  test("installs once, unpinned, for a build with no version to pin", async () => {
+    const r = record(false)
+    await Effect.runPromise(installPluginSdk({ pinned: undefined, dir: "/tmp/x", install: r.install }))
+    expect(r.calls.length).toBe(1)
+    expect(r.calls[0]).toBeUndefined()
+  })
+
+  // The install failing is not a shrug: the very next thing that happens is a
+  // tool import that needs the package. It must not fail the effect (that
+  // would take down config load) but it must be reported.
+  test("survives both attempts failing rather than failing config load", async () => {
+    const calls: (string | undefined)[] = []
+    const exit = await Effect.runPromiseExit(
+      installPluginSdk({
+        pinned: "1.18.32-swxtch.1",
+        dir: "/tmp/x",
+        install: (version) => {
+          calls.push(version)
+          return Effect.fail("registry unreachable")
+        },
+      }),
+    )
+    expect(Exit.isSuccess(exit)).toBe(true)
+    expect(calls.length).toBe(2)
+    expect(calls[0]).toBe("1.18.32-swxtch.1")
+    expect(calls[1]).toBeUndefined()
+  })
 })

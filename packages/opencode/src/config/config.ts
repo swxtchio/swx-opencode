@@ -449,25 +449,11 @@ const layer = Layer.effect(
 
           yield* ensureGitignore(dir).pipe(Effect.orDie)
 
-          const dep = yield* npmSvc
-            .install(dir, {
-              add: [
-                {
-                  name: "@opencode-ai/plugin",
-                  version: InstallationLocal ? undefined : InstallationVersion,
-                },
-              ],
-            })
-            .pipe(
-              Effect.exit,
-              Effect.tap((exit) =>
-                Exit.isFailure(exit)
-                  ? Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) })
-                  : Effect.void,
-              ),
-              Effect.asVoid,
-              Effect.forkDetach,
-            )
+          const dep = yield* installPluginSdk({
+            pinned: InstallationLocal ? undefined : InstallationVersion,
+            dir,
+            install: (version) => npmSvc.install(dir, { add: [{ name: "@opencode-ai/plugin", version }] }),
+          }).pipe(Effect.forkDetach)
           deps.push(dep)
 
           result.command = mergeDeep(result.command ?? {}, yield* Effect.promise(() => ConfigCommand.load(dir)))
@@ -699,3 +685,47 @@ export const node = LayerNode.make({
 })
 
 export * as Config from "./config"
+
+// Install the plugin SDK for one `.opencode` directory, pinned to this build's
+// version when it has one.
+//
+// The pin is an OPTIMISATION, not a requirement: it keeps the types a project
+// compiles against aligned with the binary loading them. A build whose version
+// was never published to npm - any fork or local release, e.g.
+// 1.18.32-swxtch.1 - gets "No matching version found", and the package then
+// does not exist AT ALL. Everything under `.opencode/{tool,tools}` imports it,
+// so that turned into every prompt dying on an unresolvable import.
+//
+// Falling back to the newest published SDK is strictly better than having
+// none: worst case the types drift slightly, and the usual case is that it is
+// the very package the pin asked for.
+//
+// Takes `pinned` and `install` as inputs rather than reading the installation
+// globals, so the pin-then-fallback order is directly testable.
+// swxtchio/swx-opencode#16
+export function installPluginSdk(input: {
+  pinned: string | undefined
+  dir: string
+  install: (version: string | undefined) => Effect.Effect<void, unknown>
+}) {
+  return Effect.gen(function* () {
+    if (input.pinned !== undefined) {
+      const first = yield* input.install(input.pinned).pipe(Effect.exit)
+      if (!Exit.isFailure(first)) return
+      yield* Effect.logWarning("pinned plugin SDK version is not published, falling back to latest", {
+        dir: input.dir,
+        version: input.pinned,
+        error: String(first.cause),
+      })
+    }
+    const fallback = yield* input.install(undefined).pipe(Effect.exit)
+    if (Exit.isFailure(fallback)) {
+      // Loud, and it names the CONSEQUENCE rather than only the fault: after
+      // this, every custom tool in this directory fails to load.
+      yield* Effect.logError("dependency install failed; custom tools in this directory will not load", {
+        dir: input.dir,
+        error: String(fallback.cause),
+      })
+    }
+  })
+}
