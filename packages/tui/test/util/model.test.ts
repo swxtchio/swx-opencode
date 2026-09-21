@@ -58,7 +58,12 @@ describe("util.model", () => {
     )
   })
 
-  test("suppresses a served id that resolves to the configured name anyway", () => {
-    expect(servedName(providers, "fireworks", "accounts/fireworks/models/glm-5p3", ["glm-5p3"])).toBe("GLM-5.3")
+  // Raised in review: two DIFFERENT ids that share a display name are still
+  // different models - different versions, routes or prices - so the served id
+  // is shown. Only an id identical to the requested one is redundant.
+  test("still reports a different served id that happens to share a display name", () => {
+    expect(servedName(providers, "fireworks", "accounts/fireworks/models/glm-5p3", ["glm-5p3"])).toBe(
+      "GLM-5.3 (GLM-5.3)",
+    )
   })
 })

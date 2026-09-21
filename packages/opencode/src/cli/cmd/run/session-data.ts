@@ -72,6 +72,10 @@ type ShellCall = {
 export type SessionData = {
   includeUserText: boolean
   announced: boolean
+  // The turn's model record, accumulated across every assistant message that
+  // shares one parent user message. Keyed by that parentID so a new prompt
+  // starts a new record without needing to observe any footer event.
+  turn: { parentID: string; providerID: string; modelID: string; served: string[] } | undefined
   ids: Set<string>
   tools: Set<string>
   call: Map<string, Dict>
@@ -110,6 +114,7 @@ export function createSessionData(
   return {
     includeUserText: input.includeUserText ?? false,
     announced: false,
+    turn: undefined,
     ids: new Set(),
     tools: new Set(),
     call: new Map(),
@@ -843,19 +848,26 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
       next = { status: "assistant responding" }
     }
 
-    // Carry this turn's model identity to the footer, which renders the turn
-    // summary but never sees the assistant message itself. The identity is
-    // what the turn was actually dispatched to, so the summary no longer
-    // labels it with whatever model happens to be selected in the composer
-    // when it finishes. Served ids are always set, including to empty, so a
-    // routed turn cannot leave its models decorating a later one.
+    // Carry this turn's model record to the footer, which renders the turn
+    // summary but never sees the assistant message itself.
+    //
+    // One prompt produces one assistant message PER STEP (session/prompt.ts
+    // loops and creates a new Assistant each pass) while the footer prints one
+    // summary for the whole prompt, so served ids accumulate across every
+    // message sharing this parentID instead of the last message winning. A
+    // different parentID is a different prompt and starts the record over,
+    // which is also what keeps one turn's models off the next turn's summary.
+    const parentID = typeof info.parentID === "string" ? info.parentID : info.id
+    const carried =
+      data.turn && data.turn.parentID === parentID && data.turn.modelID === info.modelID ? data.turn.served : []
+    const served = [...carried]
+    for (const id of info.responseModelIDs ?? []) {
+      if (!served.includes(id)) served.push(id)
+    }
+    data.turn = { parentID, providerID: info.providerID, modelID: info.modelID, served }
     next = {
       ...next,
-      turnModel: {
-        providerID: info.providerID,
-        modelID: info.modelID,
-        served: info.responseModelIDs ? [...info.responseModelIDs] : [],
-      },
+      turnModel: { providerID: info.providerID, modelID: info.modelID, served: [...served] },
     }
 
     const usage = formatUsage(

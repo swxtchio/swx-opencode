@@ -119,7 +119,9 @@ function createEmptySubagentState(): FooterSubagentState {
   }
 }
 
-function eventPatch(next: FooterEvent): FooterPatch | undefined {
+// Exported for tests: the turn.send reset below is what stops one turn's model
+// from labelling the next, and it is only observable through this mapping.
+export function eventPatch(next: FooterEvent): FooterPatch | undefined {
   if (next.type === "queue") {
     return { queue: next.queue }
   }
@@ -392,18 +394,12 @@ export class RunFooter implements FooterApi {
   public event(next: FooterEvent): void {
     if (next.type === "turn.duration") {
       const turnModel = this.state().turnModel
-      const current = this.currentModel()
       this.flush()
       this.flushing = this.flushing
         .then(() =>
           this.scrollback.writeTurnSummary({
             agent: this.options.agentLabel,
-            model: turnSummaryModel({
-              turnModel,
-              current,
-              fallback: this.state().model,
-              providers: this.providers(),
-            }),
+            model: turnSummaryModel({ turnModel, providers: this.providers() }),
             duration: next.duration,
           }),
         )
@@ -462,6 +458,20 @@ export class RunFooter implements FooterApi {
       if (next.type === "turn.send") {
         this.clearInterruptTimer()
         this.clearExitTimer()
+        // Snapshot the identity this turn is being dispatched to. The composer
+        // selection is mutable while the turn runs, so capturing it here is the
+        // only point at which it is still the truth - and it means a turn that
+        // fails before producing any assistant message is still labelled with
+        // the model that was actually sent, not whatever is selected when it
+        // finishes. eventPatch already cleared the field, so this replaces it.
+        const dispatched = this.currentModel()
+        if (dispatched) {
+          patch.turnModel = {
+            providerID: dispatched.providerID,
+            modelID: dispatched.modelID,
+            served: [],
+          }
+        }
       }
       this.patch(patch)
       return
@@ -498,6 +508,9 @@ export class RunFooter implements FooterApi {
       model: typeof next.model === "string" ? next.model : prev.model,
       // Presence-based, not value-based: turn.send resets this by sending an
       // explicit undefined, which a `!== undefined` test would silently ignore.
+      // A plain replace is correct here because the producer (session-data)
+      // already accumulates across the turn's steps; accumulating again here
+      // would fold the PREVIOUS turn's models into the seed turn.send writes.
       turnModel: "turnModel" in next ? next.turnModel : prev.turnModel,
       duration: typeof next.duration === "string" ? next.duration : prev.duration,
       usage: typeof next.usage === "string" ? next.usage : prev.usage,

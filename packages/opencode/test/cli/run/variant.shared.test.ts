@@ -261,32 +261,20 @@ describe("servedModelLabel", () => {
 })
 
 describe("turnSummaryModel", () => {
-  // The regression this exists for: the composer selection can change while a
-  // turn is in flight, and labelling the finished turn with the NEW selection
-  // is a confident misattribution.
-  test("names the model the turn ran on, not one selected afterwards", () => {
+  test("labels the turn from its own recorded model", () => {
     expect(
       turnSummaryModel({
         turnModel: { providerID: "firerouter", modelID: "firerouter/glm-5p3/glm-5p3-flash", served: ["glm-5p3"] },
-        current: { providerID: "openai", modelID: "gpt-5" },
-        fallback: "GPT-5",
         providers: [...providers, ...routed],
       }),
     ).toBe("Firerouter glm (GLM-5.3)")
   })
 
-  test("falls back to the composer selection only when the turn recorded no model", () => {
-    expect(
-      turnSummaryModel({
-        turnModel: undefined,
-        current: { providerID: "openai", modelID: "gpt-5" },
-        fallback: "stale label",
-        providers,
-      }),
-    ).toBe("GPT-5")
-  })
-
-  test("falls back to the rendered label when there is no model at all", () => {
-    expect(turnSummaryModel({ turnModel: undefined, current: undefined, fallback: "GPT-5", providers })).toBe("GPT-5")
+  // Raised in review: the composer selection is mutable while a turn runs, so
+  // a turn that failed before recording a model must NOT borrow it. Saying
+  // "unknown model" is the honest answer; naming the current selection would
+  // reproduce the misattribution this change exists to remove.
+  test("says the model is unknown rather than borrowing the current selection", () => {
+    expect(turnSummaryModel({ turnModel: undefined, providers })).toBe("unknown model")
   })
 })

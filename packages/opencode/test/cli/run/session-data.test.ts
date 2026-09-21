@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { Event } from "@opencode-ai/sdk/v2"
 import { createSessionData, flushInterrupted, reduceSessionData } from "@/cli/cmd/run/session-data"
+import { eventPatch } from "@/cli/cmd/run/footer"
 import type { StreamCommit } from "@/cli/cmd/run/types"
 
 function reduce(data: ReturnType<typeof createSessionData>, event: unknown, thinking = true) {
@@ -595,9 +596,12 @@ describe("run session data", () => {
 describe("the turn's own model reaches the footer", () => {
   // The footer renders the turn summary but never sees the assistant message,
   // so this patch is the only route by which a finished turn can report the
-  // model it was actually dispatched to and which model answered.
+  // model it was dispatched to and which models answered.
   test("carries the dispatched identity and the recorded served models", () => {
-    const out = reduce(createSessionData(), assistant("msg-1", { responseModelIDs: ["glm-5p3-flash", "glm-5p3"] }))
+    const out = reduce(
+      createSessionData(),
+      assistant("msg-1", { parentID: "user-1", responseModelIDs: ["glm-5p3-flash", "glm-5p3"] }),
+    )
     expect(out.footer?.patch?.turnModel).toEqual({
       providerID: "openai",
       modelID: "gpt-5",
@@ -606,21 +610,80 @@ describe("the turn's own model reaches the footer", () => {
   })
 
   test("reports an empty served list when the provider recorded nothing", () => {
-    const out = reduce(createSessionData(), assistant("msg-1"))
+    const out = reduce(createSessionData(), assistant("msg-1", { parentID: "user-1" }))
     expect(out.footer?.patch?.turnModel).toEqual({ providerID: "openai", modelID: "gpt-5", served: [] })
   })
 
-  // Without this a route's models would keep decorating later turns that a
-  // different model served - a wrong attribution that looks authoritative.
-  test("clears a previous turn's served models rather than leaving them set", () => {
+  // One prompt produces one assistant message per step, and the footer prints
+  // ONE summary for the prompt. Keeping only the last message would report a
+  // tool-calling turn that routed A then B as just B.
+  test("accumulates served models across the steps of one prompt", () => {
     const data = createSessionData()
-    reduce(data, assistant("msg-1", { responseModelIDs: ["glm-5p3-flash"] }))
-    const second = reduce(data, assistant("msg-2"))
-    expect(second.footer?.patch?.turnModel?.served).toEqual([])
+    reduce(data, assistant("msg-1", { parentID: "user-1", responseModelIDs: ["glm-5p3-flash"] }))
+    const second = reduce(data, assistant("msg-2", { parentID: "user-1", responseModelIDs: ["glm-5p3"] }))
+    expect(second.footer?.patch?.turnModel?.served).toEqual(["glm-5p3-flash", "glm-5p3"])
+  })
+
+  test("does not repeat a model that served more than one step", () => {
+    const data = createSessionData()
+    reduce(data, assistant("msg-1", { parentID: "user-1", responseModelIDs: ["glm-5p3-flash"] }))
+    const second = reduce(data, assistant("msg-2", { parentID: "user-1", responseModelIDs: ["glm-5p3-flash"] }))
+    expect(second.footer?.patch?.turnModel?.served).toEqual(["glm-5p3-flash"])
+  })
+
+  // A different parent user message is a different prompt, so the record must
+  // start over - otherwise one turn's models decorate the next turn's summary.
+  test("starts a new record for a new prompt", () => {
+    const data = createSessionData()
+    reduce(data, assistant("msg-1", { parentID: "user-1", responseModelIDs: ["glm-5p3-flash"] }))
+    const next = reduce(data, assistant("msg-2", { parentID: "user-2", responseModelIDs: ["glm-5p3"] }))
+    expect(next.footer?.patch?.turnModel?.served).toEqual(["glm-5p3"])
   })
 
   test("reports the model the turn was dispatched to, not a later selection", () => {
-    const out = reduce(createSessionData(), assistant("msg-1", { providerID: "firerouter", modelID: "route" }))
+    const out = reduce(
+      createSessionData(),
+      assistant("msg-1", { parentID: "user-1", providerID: "firerouter", modelID: "route" }),
+    )
     expect(out.footer?.patch?.turnModel).toMatchObject({ providerID: "firerouter", modelID: "route" })
+  })
+})
+
+describe("a new turn clears the previous turn's model", () => {
+  // The reset is what keeps a crashed or model-less turn from inheriting the
+  // previous turn's label. It is only observable through this mapping, and a
+  // value-based merge in patch() would drop it silently, so it is pinned here
+  // as an explicit key carrying undefined rather than an absent key.
+  test("turn.send emits turnModel as a present key set to undefined", () => {
+    const patch = eventPatch({ type: "turn.send", queue: 0 })
+    expect(patch).toBeDefined()
+    expect("turnModel" in patch!).toBe(true)
+    expect(patch!.turnModel).toBeUndefined()
+  })
+})
+
+describe("a subagent cannot relabel the main turn", () => {
+  // Raised in review as a suspected blocker. It does not happen, because a
+  // subagent runs in its OWN session and this reducer is scoped to one
+  // sessionID - but nothing pinned that, so it is pinned now.
+  test("ignores an assistant message from another session", () => {
+    const data = createSessionData()
+    reduce(data, assistant("msg-1", { parentID: "user-1", responseModelIDs: ["glm-5p3-flash"] }))
+    const child = reduce(data, {
+      type: "message.updated",
+      properties: {
+        sessionID: "session-child",
+        info: {
+          id: "msg-child",
+          role: "assistant",
+          parentID: "user-child",
+          providerID: "anthropic",
+          modelID: "claude-opus-5",
+          responseModelIDs: ["claude-opus-5"],
+          tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+        },
+      },
+    })
+    expect(child.footer?.patch?.turnModel).toBeUndefined()
   })
 })

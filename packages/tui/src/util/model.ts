@@ -35,7 +35,10 @@ export function name(
 // name on its own hides both what actually ran and what actually got billed.
 // A direct provider echoes its own id straight back, which is why the
 // single-and-equal case below returns the bare name: every non-routed footer
-// stays byte-identical to what it rendered before.
+// stays byte-identical to what it rendered before. That test compares raw IDS,
+// never resolved display names - two DIFFERENT ids sharing a friendly name are
+// different models, versions or prices, and hiding one behind the other would
+// misreport the turn.
 //
 // Served ids are joined in the order they first appeared, so a multi-step turn
 // that switched models reads as the sequence it actually was rather than
@@ -47,8 +50,8 @@ export function servedName(
   responseModelIDs: readonly string[] | undefined,
 ) {
   const base = name(list, providerID, modelID)
-  const served = (responseModelIDs ?? []).map((id) => name(list, providerID, id))
+  const served = responseModelIDs ?? []
   if (served.length === 0) return base
-  if (served.length === 1 && served[0] === base) return base
-  return `${base} (${served.join(" → ")})`
+  if (served.length === 1 && served[0] === modelID) return base
+  return `${base} (${served.map((id) => name(list, providerID, id)).join(" → ")})`
 }

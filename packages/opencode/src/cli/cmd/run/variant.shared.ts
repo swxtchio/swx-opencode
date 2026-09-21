@@ -14,7 +14,7 @@ import { makeRuntime } from "@/effect/run-service"
 import { Global } from "@opencode-ai/core/global"
 import { isRecord } from "@/util/record"
 import { createSession, sessionVariant, type RunSession, type SessionMessages } from "./session.shared"
-import type { RunInput, RunProvider } from "./types"
+import type { RunInput, RunProvider, TurnModel } from "./types"
 
 const MODEL_FILE = path.join(Global.Path.state, "model.json")
 
@@ -215,18 +215,6 @@ export function saveVariant(model: RunInput["model"], variant: string | undefine
   void runtime.saveVariant(model, variant)
 }
 
-// Join a configured model label with the model(s) that actually served the
-// turn.
-//
-// A served list that resolves to the same single label is dropped rather than
-// repeated: a direct provider echoes its own id back on every response, so
-// without this every non-routed turn would grow a redundant parenthetical.
-function joinServed(base: string, served: string[]): string {
-  if (served.length === 0) return base
-  if (served.length === 1 && served[0] === base) return base
-  return `${base} (${served.join(" \u2192 ")})`
-}
-
 // The configured model label, decorated with the model(s) that actually served
 // the turn whenever those differ. See the sibling helper in
 // packages/tui/src/util/model.ts (servedName) - the two render the same string
@@ -238,6 +226,11 @@ function joinServed(base: string, served: string[]): string {
 // name on its own hides both what actually ran and what actually got billed.
 // Served ids are joined in the order they first appeared, so a multi-step turn
 // that switched models reads as the sequence it actually was.
+//
+// Suppression compares raw IDS, never resolved display names: a direct provider
+// echoes its own id back, which is the redundancy worth hiding, whereas two
+// DIFFERENT ids that happen to share a friendly name are different models,
+// versions or prices and hiding one behind the other would misreport the turn.
 export function servedModelLabel(
   providers: RunProvider[] | undefined,
   providerID: string,
@@ -246,30 +239,26 @@ export function servedModelLabel(
 ): string {
   const provider = providers?.find((item) => item.id === providerID)
   const resolve = (id: string) => provider?.models[id]?.name ?? id
-  return joinServed(resolve(modelID), (responseModelIDs ?? []).map(resolve))
+  const base = resolve(modelID)
+  const served = responseModelIDs ?? []
+  if (served.length === 0) return base
+  if (served.length === 1 && served[0] === modelID) return base
+  return `${base} (${served.map(resolve).join(" → ")})`
 }
 
 // Which model label a finished turn's summary should carry.
 //
-// The turn's OWN recorded identity wins. The composer selection is only a
-// fallback for a turn that produced no assistant message at all, because the
-// selection can be changed while a turn is in flight - and when it is, naming
-// the newly selected model on the finished turn is a confident misattribution,
-// the same failure the served ids above exist to prevent.
+// The turn's OWN recorded identity is the only acceptable answer. The composer
+// selection is deliberately NOT a fallback: it is mutable while a turn is in
+// flight, so a turn that failed before producing any assistant message would be
+// confidently labelled with a model the user picked afterwards - the exact
+// misattribution this whole change exists to remove. turn.send seeds the
+// dispatched identity, so an absent record means the identity is genuinely
+// unknown and the summary says so.
 export function turnSummaryModel(input: {
-  turnModel: { providerID: string; modelID: string; served: string[] } | undefined
-  current: { providerID: string; modelID: string } | undefined
-  fallback: string
+  turnModel: TurnModel | undefined
   providers: RunProvider[] | undefined
 }): string {
-  if (input.turnModel) {
-    return servedModelLabel(
-      input.providers,
-      input.turnModel.providerID,
-      input.turnModel.modelID,
-      input.turnModel.served,
-    )
-  }
-  if (input.current) return modelInfo(input.providers, input.current).model
-  return input.fallback
+  if (!input.turnModel) return "unknown model"
+  return servedModelLabel(input.providers, input.turnModel.providerID, input.turnModel.modelID, input.turnModel.served)
 }

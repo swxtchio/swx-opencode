@@ -80,6 +80,15 @@ export type FooterPhase = "idle" | "running"
 
 // Full snapshot of footer status bar state. Every update replaces the whole
 // object in the SolidJS signal so the view re-renders atomically.
+// What one turn recorded about its model: the identity it was dispatched to,
+// plus every model that served it, accumulated in first-seen order across the
+// turn's steps.
+export type TurnModel = {
+  providerID: string
+  modelID: string
+  served: string[]
+}
+
 export type FooterState = {
   phase: FooterPhase
   status: string
@@ -95,7 +104,7 @@ export type FooterState = {
   // authoritative identity for a finished turn - the model SELECTED in the
   // composer is only a fallback, and disagrees whenever the selection changed
   // while the turn was in flight.
-  turnModel: { providerID: string; modelID: string; served: string[] } | undefined
+  turnModel: TurnModel | undefined
   duration: string
   usage: string
   first: boolean
