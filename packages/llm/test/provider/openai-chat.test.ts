@@ -483,11 +483,7 @@ describe("OpenAI Chat route", () => {
   it.effect("reports the served model from the response when it differs from the request", () =>
     Effect.gen(function* () {
       const served = { id: "chatcmpl_fixture", model: "glm-5p3-flash", choices: [], usage: null }
-      const body = sseEvents(
-        served,
-        deltaChunk({ role: "assistant", content: "ok" }),
-        deltaChunk({}, "stop"),
-      )
+      const body = sseEvents(served, deltaChunk({ role: "assistant", content: "ok" }), deltaChunk({}, "stop"))
       const response = yield* LLMClient.generate(request).pipe(Effect.provide(fixedResponse(body)))
       const stepFinish = response.events.find((event) => event.type === "step-finish")
       const finish = response.events.find((event) => event.type === "finish")

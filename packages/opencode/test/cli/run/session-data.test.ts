@@ -591,3 +591,27 @@ describe("run session data", () => {
     ])
   })
 })
+
+describe("served models reach the footer", () => {
+  // The footer renders the turn summary but never sees the assistant message,
+  // so this patch is the only route by which a routed turn can report which
+  // model actually answered.
+  test("carries the recorded served models on message.updated", () => {
+    const out = reduce(createSessionData(), assistant("msg-1", { responseModelIDs: ["glm-5p3-flash", "glm-5p3"] }))
+    expect(out.footer?.patch?.served).toEqual(["glm-5p3-flash", "glm-5p3"])
+  })
+
+  test("reports an empty list when the provider recorded nothing", () => {
+    const out = reduce(createSessionData(), assistant("msg-1"))
+    expect(out.footer?.patch?.served).toEqual([])
+  })
+
+  // Without this a route's models would keep decorating later turns that a
+  // different model served - a wrong attribution that looks authoritative.
+  test("clears a previous turn's served models rather than leaving them set", () => {
+    const data = createSessionData()
+    reduce(data, assistant("msg-1", { responseModelIDs: ["glm-5p3-flash"] }))
+    const second = reduce(data, assistant("msg-2"))
+    expect(second.footer?.patch?.served).toEqual([])
+  })
+})

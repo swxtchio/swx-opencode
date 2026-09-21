@@ -1,6 +1,7 @@
 import * as Locale from "@/util/locale"
 import type { SessionMessages } from "./session.shared"
 import type { RunProvider, StreamCommit } from "./types"
+import { servedModelLabel } from "./variant.shared"
 
 export function turnSummaryCommit(input: {
   agent: string
@@ -36,11 +37,11 @@ export function messageTurnSummaryCommit(
     return
   }
 
-  const model = providers?.find((item) => item.id === info.providerID)?.models[info.modelID]?.name
+  const model = servedModelLabel(providers, info.providerID, info.modelID, info.responseModelIDs)
 
   return turnSummaryCommit({
     agent: Locale.titlecase(info.agent),
-    model: model ?? info.modelID,
+    model,
     duration: Locale.duration(completed - info.time.created),
     messageID: info.id,
   })

@@ -214,3 +214,45 @@ export async function resolveSavedVariant(model: RunInput["model"]): Promise<str
 export function saveVariant(model: RunInput["model"], variant: string | undefined): void {
   void runtime.saveVariant(model, variant)
 }
+
+// Join a configured model label with the model(s) that actually served the
+// turn. Kept separate from the lookup so both callers below - one that can
+// resolve display names and one that only holds a label - format identically.
+//
+// A served list that resolves to the same single label is dropped rather than
+// repeated: a direct provider echoes its own id back on every response, so
+// without this every non-routed turn would grow a redundant parenthetical.
+function joinServed(base: string, served: string[]): string {
+  if (served.length === 0) return base
+  if (served.length === 1 && served[0] === base) return base
+  return `${base} (${served.join(" \u2192 ")})`
+}
+
+// The configured model label, decorated with the model(s) that actually served
+// the turn whenever those differ. See the sibling helper in
+// packages/tui/src/util/model.ts (servedName) - the two render the same string
+// for the two different provider shapes each package already has, and any
+// change to the format belongs in both.
+//
+// A router provider (Fireworks FireRouter, Azure model-router) is sent a route
+// slug and answers with whichever member model it picked, so the configured
+// name on its own hides both what actually ran and what actually got billed.
+// Served ids are joined in the order they first appeared, so a multi-step turn
+// that switched models reads as the sequence it actually was.
+export function servedModelLabel(
+  providers: RunProvider[] | undefined,
+  providerID: string,
+  modelID: string,
+  responseModelIDs: readonly string[] | undefined,
+): string {
+  const provider = providers?.find((item) => item.id === providerID)
+  const resolve = (id: string) => provider?.models[id]?.name ?? id
+  return joinServed(resolve(modelID), (responseModelIDs ?? []).map(resolve))
+}
+
+// Same decoration for the live-turn path, which holds only a rendered label and
+// so cannot resolve a served id to its display name. Raw ids are shown instead
+// of guessing; the ids a router returns are already short names.
+export function appendServedLabel(base: string, responseModelIDs: readonly string[] | undefined): string {
+  return joinServed(base, [...(responseModelIDs ?? [])])
+}

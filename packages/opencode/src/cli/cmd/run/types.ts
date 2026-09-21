@@ -85,6 +85,11 @@ export type FooterState = {
   status: string
   queue: number
   model: string
+  // Models that actually served the current turn, in the order they first
+  // appeared. Empty for a direct provider; a router fills it with whichever
+  // member model(s) it picked. Reset at turn.send so one turn's route never
+  // decorates the next turn's summary.
+  served: string[]
   duration: string
   usage: string
   first: boolean

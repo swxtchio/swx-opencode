@@ -36,7 +36,7 @@ import { PROMPT_MAX_ROWS, TEXTAREA_MIN_ROWS } from "./footer.prompt"
 import { RunFooterView } from "./footer.view"
 import { RunScrollbackStream } from "./scrollback.surface"
 import { RUN_THEME_FALLBACK, resolveRunTheme, type RunTheme } from "./theme"
-import { modelInfo } from "./variant.shared"
+import { appendServedLabel, servedModelLabel } from "./variant.shared"
 import type {
   FooterApi,
   FooterEvent,
@@ -137,6 +137,7 @@ function eventPatch(next: FooterEvent): FooterPatch | undefined {
       phase: "running",
       status: "sending prompt",
       queue: next.queue,
+      served: [],
       interrupt: 0,
       exit: 0,
     }
@@ -241,6 +242,7 @@ export class RunFooter implements FooterApi {
       status: "",
       queue: 0,
       model: options.modelLabel,
+      served: [],
       duration: "",
       usage: "",
       first: options.first,
@@ -390,12 +392,15 @@ export class RunFooter implements FooterApi {
   public event(next: FooterEvent): void {
     if (next.type === "turn.duration") {
       const current = this.currentModel()
+      const served = this.state().served
       this.flush()
       this.flushing = this.flushing
         .then(() =>
           this.scrollback.writeTurnSummary({
             agent: this.options.agentLabel,
-            model: current ? modelInfo(this.providers(), current).model : this.state().model,
+            model: current
+              ? servedModelLabel(this.providers(), current.providerID, current.modelID, served)
+              : appendServedLabel(this.state().model, served),
             duration: next.duration,
           }),
         )
@@ -488,6 +493,7 @@ export class RunFooter implements FooterApi {
       status: typeof next.status === "string" ? next.status : prev.status,
       queue: typeof next.queue === "number" ? Math.max(0, next.queue) : prev.queue,
       model: typeof next.model === "string" ? next.model : prev.model,
+      served: Array.isArray(next.served) ? [...next.served] : prev.served,
       duration: typeof next.duration === "string" ? next.duration : prev.duration,
       usage: typeof next.usage === "string" ? next.usage : prev.usage,
       first: typeof next.first === "boolean" ? next.first : prev.first,

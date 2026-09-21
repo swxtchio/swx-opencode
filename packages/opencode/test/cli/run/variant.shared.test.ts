@@ -11,6 +11,8 @@ import {
   formatModelLabel,
   pickVariant,
   resolveVariant,
+  appendServedLabel,
+  servedModelLabel,
 } from "@/cli/cmd/run/variant.shared"
 import type { SessionMessages } from "@/cli/cmd/run/session.shared"
 import type { RunProvider } from "@/cli/cmd/run/types"
@@ -215,4 +217,60 @@ describe("run variant shared", () => {
       })
     }),
   )
+})
+
+// A router provider is sent a route slug and answers with whichever member
+// model it picked, so the configured label alone hides what ran and what it
+// cost. Only the two name lookups matter here, so the catalog is trimmed to
+// them rather than repeating the full RunProvider fixture above.
+const routed = [
+  {
+    id: "firerouter",
+    models: {
+      "firerouter/glm-5p3/glm-5p3-flash": { name: "Firerouter glm" },
+      "glm-5p3": { name: "GLM-5.3" },
+    },
+  },
+] as unknown as RunProvider[]
+
+describe("servedModelLabel", () => {
+  test("shows only the configured name when nothing recorded what served the turn", () => {
+    expect(servedModelLabel(routed, "firerouter", "firerouter/glm-5p3/glm-5p3-flash", undefined)).toBe("Firerouter glm")
+    expect(servedModelLabel(routed, "firerouter", "firerouter/glm-5p3/glm-5p3-flash", [])).toBe("Firerouter glm")
+  })
+
+  test("stays byte-identical when the provider echoed its own id back", () => {
+    expect(servedModelLabel(providers, "openai", "gpt-5", ["gpt-5"])).toBe("GPT-5")
+  })
+
+  test("appends the model a router actually picked", () => {
+    expect(servedModelLabel(routed, "firerouter", "firerouter/glm-5p3/glm-5p3-flash", ["glm-5p3-flash"])).toBe(
+      "Firerouter glm (glm-5p3-flash)",
+    )
+  })
+
+  test("appends every model a multi-step turn used, in the order they ran", () => {
+    expect(
+      servedModelLabel(routed, "firerouter", "firerouter/glm-5p3/glm-5p3-flash", ["glm-5p3-flash", "glm-5p3"]),
+    ).toBe("Firerouter glm (glm-5p3-flash \u2192 GLM-5.3)")
+  })
+
+  test("falls back to the raw id for an unknown provider rather than dropping it", () => {
+    expect(servedModelLabel(undefined, "firerouter", "route", ["glm-5p3-flash"])).toBe("route (glm-5p3-flash)")
+  })
+})
+
+describe("appendServedLabel", () => {
+  test("leaves a label untouched when nothing served or the one served id matches", () => {
+    expect(appendServedLabel("GPT-5", undefined)).toBe("GPT-5")
+    expect(appendServedLabel("GPT-5", [])).toBe("GPT-5")
+    expect(appendServedLabel("GPT-5", ["GPT-5"])).toBe("GPT-5")
+  })
+
+  test("appends served ids it cannot resolve to display names", () => {
+    expect(appendServedLabel("Firerouter glm", ["glm-5p3-flash"])).toBe("Firerouter glm (glm-5p3-flash)")
+    expect(appendServedLabel("Firerouter glm", ["glm-5p3-flash", "glm-5p3"])).toBe(
+      "Firerouter glm (glm-5p3-flash \u2192 glm-5p3)",
+    )
+  })
 })

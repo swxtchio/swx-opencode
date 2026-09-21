@@ -357,6 +357,7 @@ export type AssistantMessage = {
     root: string
   }
   summary?: boolean
+  responseModelIDs?: Array<string>
   cost: number
   tokens: {
     total?: number
@@ -559,6 +560,7 @@ export type StepFinishPart = {
   type: "step-finish"
   reason: string
   snapshot?: string
+  responseModelID?: string
   cost: number
   tokens: {
     total?: number

@@ -843,6 +843,15 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
       next = { status: "assistant responding" }
     }
 
+    // Carry the models that actually served this turn to the footer, which
+    // renders the turn summary but never sees the assistant message itself.
+    // Always set it, including to empty, so a routed turn cannot leave its
+    // models decorating a later turn served by something else.
+    next = {
+      ...next,
+      served: info.responseModelIDs ? [...info.responseModelIDs] : [],
+    }
+
     const usage = formatUsage(
       info.tokens,
       input.limits[modelKey(info.providerID, info.modelID)],
