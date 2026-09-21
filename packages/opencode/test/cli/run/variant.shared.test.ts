@@ -11,6 +11,8 @@ import {
   formatModelLabel,
   pickVariant,
   resolveVariant,
+  reduceTurnModel,
+  servedAcrossTurn,
   servedModelLabel,
   turnSummaryModel,
 } from "@/cli/cmd/run/variant.shared"
@@ -276,5 +278,97 @@ describe("turnSummaryModel", () => {
   // reproduce the misattribution this change exists to remove.
   test("says the model is unknown rather than borrowing the current selection", () => {
     expect(turnSummaryModel({ turnModel: undefined, providers })).toBe("unknown model")
+  })
+})
+
+describe("reduceTurnModel", () => {
+  const a = { providerID: "firerouter", modelID: "route", served: ["glm-5p3-flash"] }
+  const observe = (prev: any, observed: any) => reduceTurnModel(prev, { kind: "observe", observed })
+
+  test("takes the first record when there is nothing to fold into", () => {
+    expect(observe(undefined, a)).toEqual(a)
+  })
+
+  // One prompt produces one assistant message per step; keeping only the last
+  // would report a turn routed A then B as just B.
+  test("accumulates served models in first-seen order", () => {
+    const out = observe(a, { ...a, served: ["glm-5p3"] })
+    expect(out?.served).toEqual(["glm-5p3-flash", "glm-5p3"])
+  })
+
+  test("does not repeat a model that served more than one step", () => {
+    expect(observe(a, { ...a, served: ["glm-5p3-flash"] })?.served).toEqual(["glm-5p3-flash"])
+  })
+
+  test("starts over when the model identity itself changes", () => {
+    const out = observe(a, { providerID: "openai", modelID: "gpt-5", served: ["gpt-5"] })
+    expect(out).toEqual({ providerID: "openai", modelID: "gpt-5", served: ["gpt-5"] })
+  })
+
+  // The turn boundary is NOT expressed through this function - the footer
+  // resets directly - so an undefined observation must leave the record alone
+  // rather than silently wiping a live turn.
+  test("leaves the record untouched when there is nothing to fold in", () => {
+    expect(observe(a, undefined)).toEqual(a)
+  })
+
+  // The regression this pins: a new turn must REPLACE, never accumulate. If
+  // "send" were routed through the accumulating path, the previous turn's
+  // models would ride along and label work they never did.
+  test("a new turn replaces the previous turn's record outright", () => {
+    const out = reduceTurnModel(a, { kind: "send", dispatched: { providerID: "openai", modelID: "gpt-5" } })
+    expect(out).toEqual({ providerID: "openai", modelID: "gpt-5", served: [] })
+  })
+
+  test("a new turn with no known model clears the record rather than keeping the old one", () => {
+    expect(reduceTurnModel(a, { kind: "send", dispatched: undefined })).toBeUndefined()
+  })
+})
+
+describe("servedAcrossTurn", () => {
+  const msg = (id: string, parentID: string, served: string[], extra: Record<string, unknown> = {}) => ({
+    info: {
+      id,
+      role: "assistant",
+      parentID,
+      providerID: "firerouter",
+      modelID: "route",
+      responseModelIDs: served,
+      ...extra,
+    },
+  })
+
+  // The summary renders on the LAST message of a turn, so reading only that
+  // message reported just the final step's model.
+  test("gathers every step of the turn in first-seen order", () => {
+    const all = [msg("m1", "u1", ["glm-5p3-flash"]), msg("m2", "u1", ["glm-5p3"])]
+    expect(servedAcrossTurn(all, all[1]!.info)).toEqual(["glm-5p3-flash", "glm-5p3"])
+  })
+
+  test("ignores messages from other turns", () => {
+    const all = [msg("m1", "u0", ["kimi-k3"]), msg("m2", "u1", ["glm-5p3"])]
+    expect(servedAcrossTurn(all, all[1]!.info)).toEqual(["glm-5p3"])
+  })
+
+  test("falls back to the message's own record when the turn is unknown", () => {
+    expect(servedAcrossTurn(undefined, { responseModelIDs: ["glm-5p3"] })).toEqual(["glm-5p3"])
+  })
+
+  // Auto-compaction mints an assistant message under the SAME parent, on the
+  // compaction agent's own model. Folding it in would bill its work to the
+  // user's turn.
+  test("excludes a compaction summary sharing the turn's parent", () => {
+    const all = [
+      msg("m1", "u1", ["glm-5p3-flash"]),
+      msg("m2", "u1", ["kimi-k3"], { summary: true, modelID: "compactor" }),
+      msg("m3", "u1", ["glm-5p3"]),
+    ]
+    expect(servedAcrossTurn(all, all[2]!.info)).toEqual(["glm-5p3-flash", "glm-5p3"])
+  })
+
+  // Subtask dispatch can override the model on the same parent.
+  test("excludes a message dispatched to a different model", () => {
+    const all = [msg("m1", "u1", ["glm-5p3-flash"]), msg("m2", "u1", ["gpt-5"], { modelID: "gpt-5" })]
+    expect(servedAcrossTurn(all, all[0]!.info)).toEqual(["glm-5p3-flash"])
   })
 })

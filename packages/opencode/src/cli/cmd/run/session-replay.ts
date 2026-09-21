@@ -17,6 +17,9 @@ type ReplayConfig = {
   limits: Record<string, number>
   providers?: RunProvider[]
   summaries: ReadonlySet<string>
+  // The whole transcript, so a turn summary can gather the models that served
+  // EVERY step of its turn rather than only the message it renders on.
+  messages: SessionMessages
 }
 
 export type SessionReplay = {
@@ -218,7 +221,7 @@ function replayMessage(
   }
 
   const summary = config.summaries.has(message.info.id)
-    ? messageTurnSummaryCommit(message, config.providers)
+    ? messageTurnSummaryCommit(message, config.providers, config.messages)
     : undefined
   if (summary) {
     commits.push(summary)
@@ -248,6 +251,7 @@ export function replaySession(input: ReplayInput): SessionReplay {
       limits: input.limits,
       providers: input.providers,
       summaries,
+      messages: input.messages,
     })
     commits.push(...next.commits)
     patch = mergePatch(patch, next.patch)

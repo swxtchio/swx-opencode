@@ -53,5 +53,50 @@ export function servedName(
   const served = responseModelIDs ?? []
   if (served.length === 0) return base
   if (served.length === 1 && served[0] === modelID) return base
-  return `${base} (${served.map((id) => name(list, providerID, id)).join(" → ")})`
+  const resolve = (id: string) => name(list, providerID, id)
+  // When two DIFFERENT ids resolve to the same friendly name, the name alone
+  // cannot tell them apart - and they may differ in version, route or price -
+  // so the raw id is appended to the colliding entries.
+  const labels = served.map((id) => {
+    const label = resolve(id)
+    const collides = label === base || served.some((other) => other !== id && resolve(other) === label)
+    return collides ? `${label} [${id}]` : label
+  })
+  return `${base} (${labels.join(" → ")})`
+}
+
+// Every model that served one TURN, in first-seen order.
+//
+// A turn is not one assistant message: opencode creates a new assistant
+// message per step, and the footer renders only on the last of them (the
+// earlier ones finish with "tool-calls", so they are not `final`). Reading
+// that one message would therefore report only the last step's model and hide
+// the very sequence a router turn exists to show, so every assistant message
+// sharing this one's parent user message is folded in.
+export function servedAcrossTurn(
+  messages: readonly TurnMessage[],
+  message: TurnMessage & { parentID?: string },
+): string[] {
+  if (message.parentID === undefined) return [...(message.responseModelIDs ?? [])]
+  const out: string[] = []
+  for (const item of messages) {
+    if (item.role !== "assistant" || item.parentID !== message.parentID) continue
+    if (item.summary === true) continue
+    if (item.providerID !== message.providerID || item.modelID !== message.modelID) continue
+    for (const id of item.responseModelIDs ?? []) {
+      if (!out.includes(id)) out.push(id)
+    }
+  }
+  return out
+}
+
+type TurnMessage = {
+  role: string
+  parentID?: string
+  providerID?: string
+  modelID?: string
+  // A user message carries an OBJECT here and an assistant a boolean, so this
+  // stays wide and the check below is an explicit `=== true`.
+  summary?: unknown
+  responseModelIDs?: readonly string[]
 }

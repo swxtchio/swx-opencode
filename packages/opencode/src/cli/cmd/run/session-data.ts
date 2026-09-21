@@ -72,10 +72,6 @@ type ShellCall = {
 export type SessionData = {
   includeUserText: boolean
   announced: boolean
-  // The turn's model record, accumulated across every assistant message that
-  // shares one parent user message. Keyed by that parentID so a new prompt
-  // starts a new record without needing to observe any footer event.
-  turn: { parentID: string; providerID: string; modelID: string; served: string[] } | undefined
   ids: Set<string>
   tools: Set<string>
   call: Map<string, Dict>
@@ -114,7 +110,6 @@ export function createSessionData(
   return {
     includeUserText: input.includeUserText ?? false,
     announced: false,
-    turn: undefined,
     ids: new Set(),
     tools: new Set(),
     call: new Map(),
@@ -848,26 +843,18 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
       next = { status: "assistant responding" }
     }
 
-    // Carry this turn's model record to the footer, which renders the turn
-    // summary but never sees the assistant message itself.
-    //
-    // One prompt produces one assistant message PER STEP (session/prompt.ts
-    // loops and creates a new Assistant each pass) while the footer prints one
-    // summary for the whole prompt, so served ids accumulate across every
-    // message sharing this parentID instead of the last message winning. A
-    // different parentID is a different prompt and starts the record over,
-    // which is also what keeps one turn's models off the next turn's summary.
-    const parentID = typeof info.parentID === "string" ? info.parentID : info.id
-    const carried =
-      data.turn && data.turn.parentID === parentID && data.turn.modelID === info.modelID ? data.turn.served : []
-    const served = [...carried]
-    for (const id of info.responseModelIDs ?? []) {
-      if (!served.includes(id)) served.push(id)
-    }
-    data.turn = { parentID, providerID: info.providerID, modelID: info.modelID, served }
+    // Report THIS message's model record. Accumulation across the turn is the
+    // footer's job, because the turn boundary (turn.send) is a footer event
+    // this reducer never sees - and deriving the boundary here from parentID
+    // was wrong: auto-compaction mints a synthetic user message mid-turn, so a
+    // parentID change does not mean a new turn.
     next = {
       ...next,
-      turnModel: { providerID: info.providerID, modelID: info.modelID, served: [...served] },
+      turnModel: {
+        providerID: info.providerID,
+        modelID: info.modelID,
+        served: [...(info.responseModelIDs ?? [])],
+      },
     }
 
     const usage = formatUsage(

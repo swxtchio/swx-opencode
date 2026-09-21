@@ -36,7 +36,7 @@ import { PROMPT_MAX_ROWS, TEXTAREA_MIN_ROWS } from "./footer.prompt"
 import { RunFooterView } from "./footer.view"
 import { RunScrollbackStream } from "./scrollback.surface"
 import { RUN_THEME_FALLBACK, resolveRunTheme, type RunTheme } from "./theme"
-import { turnSummaryModel } from "./variant.shared"
+import { reduceTurnModel, turnSummaryModel } from "./variant.shared"
 import type {
   FooterApi,
   FooterEvent,
@@ -58,6 +58,7 @@ import type {
   RunResource,
   RunTuiConfig,
   StreamCommit,
+  TurnModel,
 } from "./types"
 
 type CycleResult = {
@@ -139,7 +140,6 @@ export function eventPatch(next: FooterEvent): FooterPatch | undefined {
       phase: "running",
       status: "sending prompt",
       queue: next.queue,
-      turnModel: undefined,
       interrupt: 0,
       exit: 0,
     }
@@ -458,22 +458,15 @@ export class RunFooter implements FooterApi {
       if (next.type === "turn.send") {
         this.clearInterruptTimer()
         this.clearExitTimer()
-        // Snapshot the identity this turn is being dispatched to. The composer
-        // selection is mutable while the turn runs, so capturing it here is the
-        // only point at which it is still the truth - and it means a turn that
-        // fails before producing any assistant message is still labelled with
-        // the model that was actually sent, not whatever is selected when it
-        // finishes. eventPatch already cleared the field, so this replaces it.
-        const dispatched = this.currentModel()
-        if (dispatched) {
-          patch.turnModel = {
-            providerID: dispatched.providerID,
-            modelID: dispatched.modelID,
-            served: [],
-          }
-        }
       }
       this.patch(patch)
+      if (next.type === "turn.send") {
+        // Start this turn's model record, REPLACING the last turn's outright.
+        // Seeded with the identity being dispatched so a turn that fails before
+        // producing any assistant message is still labelled with the model that
+        // was sent, rather than whatever is selected when it finishes.
+        this.resetTurnModel(reduceTurnModel(undefined, { kind: "send", dispatched: this.currentModel() }))
+      }
       return
     }
 
@@ -492,6 +485,13 @@ export class RunFooter implements FooterApi {
     }
   }
 
+  // Replace the turn's model record outright. Kept off the patch path on
+  // purpose: patch() accumulates, and a new turn must not inherit the old one.
+  private resetTurnModel(next: TurnModel | undefined): void {
+    if (this.isGone) return
+    this.setState({ ...this.state(), turnModel: next })
+  }
+
   private patch(next: FooterPatch): void {
     if (this.isGone) {
       return
@@ -506,12 +506,11 @@ export class RunFooter implements FooterApi {
       status: typeof next.status === "string" ? next.status : prev.status,
       queue: typeof next.queue === "number" ? Math.max(0, next.queue) : prev.queue,
       model: typeof next.model === "string" ? next.model : prev.model,
-      // Presence-based, not value-based: turn.send resets this by sending an
-      // explicit undefined, which a `!== undefined` test would silently ignore.
-      // A plain replace is correct here because the producer (session-data)
-      // already accumulates across the turn's steps; accumulating again here
-      // would fold the PREVIOUS turn's models into the seed turn.send writes.
-      turnModel: "turnModel" in next ? next.turnModel : prev.turnModel,
+      // Accumulates: session-data reports ONE assistant message at a time and a
+      // prompt produces one per step. The turn boundary is not expressed here
+      // at all - turn.send resets the record directly through resetTurnModel(),
+      // bypassing this merge, so a new turn can never accumulate onto the last.
+      turnModel: reduceTurnModel(prev.turnModel, { kind: "observe", observed: next.turnModel }),
       duration: typeof next.duration === "string" ? next.duration : prev.duration,
       usage: typeof next.usage === "string" ? next.usage : prev.usage,
       first: typeof next.first === "boolean" ? next.first : prev.first,

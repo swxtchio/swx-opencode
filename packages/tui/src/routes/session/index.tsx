@@ -1473,7 +1473,12 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
   const sync = useSync()
   const messages = createMemo(() => sync.data.message[props.message.sessionID] ?? [])
   const model = createMemo(() =>
-    Model.servedName(ctx.providers(), props.message.providerID, props.message.modelID, props.message.responseModelIDs),
+    Model.servedName(
+      ctx.providers(),
+      props.message.providerID,
+      props.message.modelID,
+      Model.servedAcrossTurn(messages(), props.message),
+    ),
   )
 
   const final = createMemo(() => {
