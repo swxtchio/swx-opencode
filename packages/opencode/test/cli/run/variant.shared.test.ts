@@ -11,8 +11,8 @@ import {
   formatModelLabel,
   pickVariant,
   resolveVariant,
-  appendServedLabel,
   servedModelLabel,
+  turnSummaryModel,
 } from "@/cli/cmd/run/variant.shared"
 import type { SessionMessages } from "@/cli/cmd/run/session.shared"
 import type { RunProvider } from "@/cli/cmd/run/types"
@@ -260,17 +260,33 @@ describe("servedModelLabel", () => {
   })
 })
 
-describe("appendServedLabel", () => {
-  test("leaves a label untouched when nothing served or the one served id matches", () => {
-    expect(appendServedLabel("GPT-5", undefined)).toBe("GPT-5")
-    expect(appendServedLabel("GPT-5", [])).toBe("GPT-5")
-    expect(appendServedLabel("GPT-5", ["GPT-5"])).toBe("GPT-5")
+describe("turnSummaryModel", () => {
+  // The regression this exists for: the composer selection can change while a
+  // turn is in flight, and labelling the finished turn with the NEW selection
+  // is a confident misattribution.
+  test("names the model the turn ran on, not one selected afterwards", () => {
+    expect(
+      turnSummaryModel({
+        turnModel: { providerID: "firerouter", modelID: "firerouter/glm-5p3/glm-5p3-flash", served: ["glm-5p3"] },
+        current: { providerID: "openai", modelID: "gpt-5" },
+        fallback: "GPT-5",
+        providers: [...providers, ...routed],
+      }),
+    ).toBe("Firerouter glm (GLM-5.3)")
   })
 
-  test("appends served ids it cannot resolve to display names", () => {
-    expect(appendServedLabel("Firerouter glm", ["glm-5p3-flash"])).toBe("Firerouter glm (glm-5p3-flash)")
-    expect(appendServedLabel("Firerouter glm", ["glm-5p3-flash", "glm-5p3"])).toBe(
-      "Firerouter glm (glm-5p3-flash \u2192 glm-5p3)",
-    )
+  test("falls back to the composer selection only when the turn recorded no model", () => {
+    expect(
+      turnSummaryModel({
+        turnModel: undefined,
+        current: { providerID: "openai", modelID: "gpt-5" },
+        fallback: "stale label",
+        providers,
+      }),
+    ).toBe("GPT-5")
+  })
+
+  test("falls back to the rendered label when there is no model at all", () => {
+    expect(turnSummaryModel({ turnModel: undefined, current: undefined, fallback: "GPT-5", providers })).toBe("GPT-5")
   })
 })

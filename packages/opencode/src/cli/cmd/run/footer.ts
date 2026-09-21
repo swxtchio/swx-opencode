@@ -36,7 +36,7 @@ import { PROMPT_MAX_ROWS, TEXTAREA_MIN_ROWS } from "./footer.prompt"
 import { RunFooterView } from "./footer.view"
 import { RunScrollbackStream } from "./scrollback.surface"
 import { RUN_THEME_FALLBACK, resolveRunTheme, type RunTheme } from "./theme"
-import { appendServedLabel, servedModelLabel } from "./variant.shared"
+import { turnSummaryModel } from "./variant.shared"
 import type {
   FooterApi,
   FooterEvent,
@@ -137,7 +137,7 @@ function eventPatch(next: FooterEvent): FooterPatch | undefined {
       phase: "running",
       status: "sending prompt",
       queue: next.queue,
-      served: [],
+      turnModel: undefined,
       interrupt: 0,
       exit: 0,
     }
@@ -242,7 +242,7 @@ export class RunFooter implements FooterApi {
       status: "",
       queue: 0,
       model: options.modelLabel,
-      served: [],
+      turnModel: undefined,
       duration: "",
       usage: "",
       first: options.first,
@@ -391,16 +391,19 @@ export class RunFooter implements FooterApi {
 
   public event(next: FooterEvent): void {
     if (next.type === "turn.duration") {
+      const turnModel = this.state().turnModel
       const current = this.currentModel()
-      const served = this.state().served
       this.flush()
       this.flushing = this.flushing
         .then(() =>
           this.scrollback.writeTurnSummary({
             agent: this.options.agentLabel,
-            model: current
-              ? servedModelLabel(this.providers(), current.providerID, current.modelID, served)
-              : appendServedLabel(this.state().model, served),
+            model: turnSummaryModel({
+              turnModel,
+              current,
+              fallback: this.state().model,
+              providers: this.providers(),
+            }),
             duration: next.duration,
           }),
         )
@@ -493,7 +496,9 @@ export class RunFooter implements FooterApi {
       status: typeof next.status === "string" ? next.status : prev.status,
       queue: typeof next.queue === "number" ? Math.max(0, next.queue) : prev.queue,
       model: typeof next.model === "string" ? next.model : prev.model,
-      served: Array.isArray(next.served) ? [...next.served] : prev.served,
+      // Presence-based, not value-based: turn.send resets this by sending an
+      // explicit undefined, which a `!== undefined` test would silently ignore.
+      turnModel: "turnModel" in next ? next.turnModel : prev.turnModel,
       duration: typeof next.duration === "string" ? next.duration : prev.duration,
       usage: typeof next.usage === "string" ? next.usage : prev.usage,
       first: typeof next.first === "boolean" ? next.first : prev.first,

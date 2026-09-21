@@ -592,18 +592,22 @@ describe("run session data", () => {
   })
 })
 
-describe("served models reach the footer", () => {
+describe("the turn's own model reaches the footer", () => {
   // The footer renders the turn summary but never sees the assistant message,
-  // so this patch is the only route by which a routed turn can report which
-  // model actually answered.
-  test("carries the recorded served models on message.updated", () => {
+  // so this patch is the only route by which a finished turn can report the
+  // model it was actually dispatched to and which model answered.
+  test("carries the dispatched identity and the recorded served models", () => {
     const out = reduce(createSessionData(), assistant("msg-1", { responseModelIDs: ["glm-5p3-flash", "glm-5p3"] }))
-    expect(out.footer?.patch?.served).toEqual(["glm-5p3-flash", "glm-5p3"])
+    expect(out.footer?.patch?.turnModel).toEqual({
+      providerID: "openai",
+      modelID: "gpt-5",
+      served: ["glm-5p3-flash", "glm-5p3"],
+    })
   })
 
-  test("reports an empty list when the provider recorded nothing", () => {
+  test("reports an empty served list when the provider recorded nothing", () => {
     const out = reduce(createSessionData(), assistant("msg-1"))
-    expect(out.footer?.patch?.served).toEqual([])
+    expect(out.footer?.patch?.turnModel).toEqual({ providerID: "openai", modelID: "gpt-5", served: [] })
   })
 
   // Without this a route's models would keep decorating later turns that a
@@ -612,6 +616,11 @@ describe("served models reach the footer", () => {
     const data = createSessionData()
     reduce(data, assistant("msg-1", { responseModelIDs: ["glm-5p3-flash"] }))
     const second = reduce(data, assistant("msg-2"))
-    expect(second.footer?.patch?.served).toEqual([])
+    expect(second.footer?.patch?.turnModel?.served).toEqual([])
+  })
+
+  test("reports the model the turn was dispatched to, not a later selection", () => {
+    const out = reduce(createSessionData(), assistant("msg-1", { providerID: "firerouter", modelID: "route" }))
+    expect(out.footer?.patch?.turnModel).toMatchObject({ providerID: "firerouter", modelID: "route" })
   })
 })

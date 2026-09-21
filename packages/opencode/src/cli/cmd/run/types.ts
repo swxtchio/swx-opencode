@@ -85,11 +85,17 @@ export type FooterState = {
   status: string
   queue: number
   model: string
-  // Models that actually served the current turn, in the order they first
-  // appeared. Empty for a direct provider; a router fills it with whichever
-  // member model(s) it picked. Reset at turn.send so one turn's route never
-  // decorates the next turn's summary.
-  served: string[]
+  // What the assistant message for the CURRENT turn recorded about its model:
+  // the identity it was actually dispatched to, plus the model(s) that served
+  // it in the order they first appeared (empty for a direct provider; a router
+  // fills it with whichever member model it picked).
+  //
+  // Undefined until an assistant message arrives, and reset at turn.send, so
+  // one turn's model can never label the next turn's summary. This is the
+  // authoritative identity for a finished turn - the model SELECTED in the
+  // composer is only a fallback, and disagrees whenever the selection changed
+  // while the turn was in flight.
+  turnModel: { providerID: string; modelID: string; served: string[] } | undefined
   duration: string
   usage: string
   first: boolean

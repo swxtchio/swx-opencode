@@ -216,8 +216,7 @@ export function saveVariant(model: RunInput["model"], variant: string | undefine
 }
 
 // Join a configured model label with the model(s) that actually served the
-// turn. Kept separate from the lookup so both callers below - one that can
-// resolve display names and one that only holds a label - format identically.
+// turn.
 //
 // A served list that resolves to the same single label is dropped rather than
 // repeated: a direct provider echoes its own id back on every response, so
@@ -250,9 +249,27 @@ export function servedModelLabel(
   return joinServed(resolve(modelID), (responseModelIDs ?? []).map(resolve))
 }
 
-// Same decoration for the live-turn path, which holds only a rendered label and
-// so cannot resolve a served id to its display name. Raw ids are shown instead
-// of guessing; the ids a router returns are already short names.
-export function appendServedLabel(base: string, responseModelIDs: readonly string[] | undefined): string {
-  return joinServed(base, [...(responseModelIDs ?? [])])
+// Which model label a finished turn's summary should carry.
+//
+// The turn's OWN recorded identity wins. The composer selection is only a
+// fallback for a turn that produced no assistant message at all, because the
+// selection can be changed while a turn is in flight - and when it is, naming
+// the newly selected model on the finished turn is a confident misattribution,
+// the same failure the served ids above exist to prevent.
+export function turnSummaryModel(input: {
+  turnModel: { providerID: string; modelID: string; served: string[] } | undefined
+  current: { providerID: string; modelID: string } | undefined
+  fallback: string
+  providers: RunProvider[] | undefined
+}): string {
+  if (input.turnModel) {
+    return servedModelLabel(
+      input.providers,
+      input.turnModel.providerID,
+      input.turnModel.modelID,
+      input.turnModel.served,
+    )
+  }
+  if (input.current) return modelInfo(input.providers, input.current).model
+  return input.fallback
 }

@@ -843,13 +843,19 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
       next = { status: "assistant responding" }
     }
 
-    // Carry the models that actually served this turn to the footer, which
-    // renders the turn summary but never sees the assistant message itself.
-    // Always set it, including to empty, so a routed turn cannot leave its
-    // models decorating a later turn served by something else.
+    // Carry this turn's model identity to the footer, which renders the turn
+    // summary but never sees the assistant message itself. The identity is
+    // what the turn was actually dispatched to, so the summary no longer
+    // labels it with whatever model happens to be selected in the composer
+    // when it finishes. Served ids are always set, including to empty, so a
+    // routed turn cannot leave its models decorating a later one.
     next = {
       ...next,
-      served: info.responseModelIDs ? [...info.responseModelIDs] : [],
+      turnModel: {
+        providerID: info.providerID,
+        modelID: info.modelID,
+        served: info.responseModelIDs ? [...info.responseModelIDs] : [],
+      },
     }
 
     const usage = formatUsage(
