@@ -199,7 +199,21 @@ export async function checkPluginCompatibility(target: string, opencodeVersion: 
   if (!isRecord(engines)) return
   const range = engines.opencode
   if (typeof range !== "string") return
-  if (!semver.satisfies(opencodeVersion, range)) {
+  // includePrerelease, because a prerelease satisfies no ordinary range under
+  // plain semver - so EVERY plugin declaring engines.opencode was rejected on a
+  // fork or prerelease build, with a message blaming the plugin:
+  //
+  //   1.18.32-swxtch.1  >=1.18.0  -> false
+  //   1.18.32-swxtch.1  ^1.18.0   -> false
+  //   1.18.31           >=1.18.0  -> true
+  //
+  // Not semver.coerce(), which #21 offered as the alternative: coercing
+  // 1.19.0-beta.1 to 1.19.0 would SATISFY a plugin requiring >=1.19.0, letting
+  // it load against a build of a release that is not out yet. Measured both -
+  // includePrerelease returns false for that case, coerce returns true. This
+  // fix removes the "prereleases match nothing" rule without disturbing
+  // version ordering.
+  if (!semver.satisfies(opencodeVersion, range, { includePrerelease: true })) {
     throw new Error(`Plugin requires opencode ${range} but running ${opencodeVersion}`)
   }
 }
