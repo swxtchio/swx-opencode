@@ -1,4 +1,5 @@
 import { createScrollbackWriter } from "@opentui/solid"
+import { fitSummaryModel } from "./summary-fit"
 import { TextRenderable, type ColorInput, type ScrollbackRenderContext, type ScrollbackWriter } from "@opentui/core"
 import { Match, Switch, createMemo } from "solid-js"
 import { entryBody, entryFlags } from "./entry.body"
@@ -335,14 +336,19 @@ export function spacerWriter(): ScrollbackWriter {
 
 export function turnSummaryWriter(input: { agent: string; model: string; duration: string; theme: RunTheme }) {
   return createScrollbackWriter(
-    () => (
+    (ctx) => (
+      // The model is fitted to the width rather than letting `truncate` cut
+      // the line from the right, which removed the duration first and the
+      // served models second - see summary-fit.ts for the ordering and #13
+      // for how it was found. `truncate` stays as a backstop for a width so
+      // small that even the fitted line cannot fit.
       <box width="100%" height={1}>
         <text wrapMode="none" truncate>
           <span style={{ fg: input.theme.block.highlight }}>▣ </span>
           <span style={{ fg: input.theme.block.text }}>{input.agent}</span>
           <span style={{ fg: input.theme.block.muted }}>
             {" "}
-            · {input.model} · {input.duration}
+            · {fitSummaryModel(input, Math.max(1, Math.trunc(ctx.width)))} · {input.duration}
           </span>
         </text>
       </box>
