@@ -77,6 +77,14 @@ jobs:
       # survived and produced a test that failed three attempts in one run.
       # This config promotes only rules where a hit is almost certainly a bug,
       # and runs with typeAware off so it costs ~2s rather than OOMing.
+      # #11: dependabot on this repository uses the npm ecosystem, which does
+      # not maintain bun.lock, so a bump can land package.json alone and the
+      # lockfile silently drifts. Nothing caught it before, because no workflow
+      # used --frozen-lockfile. The drift it reported has since been
+      # reconciled; this is what stops the next one.
+      - name: Verify the lockfile matches the manifests
+        run: bun install --frozen-lockfile
+
       - name: Lint for correctness bugs
         # Through the script so it uses the pinned oxlint devDependency
         # rather than whatever `bunx` would fetch.
