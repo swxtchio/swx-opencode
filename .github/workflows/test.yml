@@ -120,6 +120,56 @@ jobs:
         working-directory: packages/opencode
         run: bun run test:httpapi
 
+  docs:
+    # packages/web is built nowhere else: deploy.yml is gated on
+    # `github.repository == 'anomalyco/opencode'`, so it is skipped on this
+    # fork. That gap let the docs site stay broken across an Astro major bump
+    # without any red check. A separate job runs alongside unit and e2e, so it
+    # adds no wall-clock.
+    name: docs (${{ matrix.settings.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - name: linux
+            host: ubuntu-latest
+    runs-on: ${{ matrix.settings.host }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Build the docs site
+        working-directory: packages/web
+        run: bun run build
+        timeout-minutes: 25
+
+      - name: Check the docs site actually rendered
+        # `astro build` exiting 0 is not proof the site built: the Sätteri
+        # prerender failure produced a server bundle, zero HTML and no sitemap,
+        # and still needed the exit code to be read to notice. Assert the
+        # artefacts a working build must leave behind.
+        working-directory: packages/web
+        run: |
+          set -euo pipefail
+          pages=$(find dist -name '*.html' | wc -l)
+          echo "prerendered pages: $pages"
+          if [ "$pages" -lt 500 ]; then
+            echo "::error::expected at least 500 prerendered pages, found $pages"
+            exit 1
+          fi
+          if [ ! -f dist/client/docs/sitemap-index.xml ]; then
+            echo "::error::sitemap-index.xml is missing, so prerendering did not complete"
+            exit 1
+          fi
+
   e2e:
     name: e2e (${{ matrix.settings.name }})
     strategy:

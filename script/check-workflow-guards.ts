@@ -35,6 +35,7 @@ const GUARD = "github.repository == 'anomalyco/opencode'"
 const ALLOWED = new Map([
   ["test.yml::unit", "bb8f511805a6d646"],
   ["test.yml::e2e", "b945108295daf472"],
+  ["test.yml::docs", "9cde31d44a6f40be"],
   ["typecheck.yml::typecheck", "b82d5ddbd87d3df7"],
 ])
 

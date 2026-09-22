@@ -3,7 +3,7 @@ import { defineConfig } from "astro/config"
 import starlight from "@astrojs/starlight"
 import solidJs from "@astrojs/solid-js"
 import cloudflare from "@astrojs/cloudflare"
-import theme from "toolbeam-docs-theme"
+import theme from "./src/theme"
 import config from "./config.mjs"
 import { rehypeHeadingIds } from "@astrojs/markdown-remark"
 import rehypeAutolinkHeadings from "rehype-autolink-headings"
@@ -16,6 +16,10 @@ export default defineConfig({
   output: "server",
   adapter: cloudflare({
     imageService: "passthrough",
+    // Sätteri (Starlight 0.42's highlighter) reaches for WASI during prerender,
+    // which workerd does not implement. Prerender under node instead.
+    // https://github.com/withastro/astro/issues/17404
+    prerenderEnvironment: "node",
   }),
   devToolbar: {
     enabled: false,
