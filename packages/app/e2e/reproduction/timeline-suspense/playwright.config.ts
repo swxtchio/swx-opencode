@@ -1,4 +1,5 @@
 import { defineConfig, devices } from "@playwright/test"
+import { deadline } from "../../utils/deadline"
 
 const port = Number(process.env.PLAYWRIGHT_TIMELINE_SUSPENSE_PORT ?? 4317)
 
@@ -10,9 +11,9 @@ export default defineConfig({
   workers: 1,
   retries: 0,
   reporter: "line",
-  timeout: 30_000,
+  timeout: deadline(30_000),
   expect: {
-    timeout: 10_000,
+    timeout: deadline(10_000),
   },
   webServer: {
     command: `bunx vite --config vite.config.ts --host 127.0.0.1 --port ${port} --strictPort`,

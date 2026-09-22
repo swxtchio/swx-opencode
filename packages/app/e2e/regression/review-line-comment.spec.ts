@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { mockOpenCodeServer } from "../utils/mock-server"
 import { expectAppVisible, expectSessionTitle } from "../utils/waits"
+import { deadline } from "../utils/deadline"
 
 const directory = "C:/OpenCode/ReviewLineCommentRegression"
 const sessionID = "ses_review_line_comment_regression"
@@ -57,7 +58,7 @@ test("shows a comment button when a line number is hovered", async ({ page }) =>
     await expect(comment).toHaveCSS("pointer-events", "auto")
     await comment.focus()
     await expect(comment).toBeFocused()
-  }).toPass({ timeout: 10_000 })
+  }).toPass({ timeout: deadline(10_000) })
   await comment.press("Enter")
   await expect(review.getByRole("textbox")).toBeVisible()
   await expect(review.locator('[data-slot="line-comment-editor-label"]')).toHaveText("Commenting on line 1")

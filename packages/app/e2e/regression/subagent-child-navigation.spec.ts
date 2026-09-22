@@ -2,6 +2,7 @@ import { base64Encode } from "@opencode-ai/core/util/encode"
 import { expect, test, type Page } from "@playwright/test"
 import { currentSession, mockOpenCodeServer } from "../utils/mock-server"
 import { expectSessionTitle } from "../utils/waits"
+import { deadline } from "../utils/deadline"
 
 const directory = "C:/OpenCode/SubagentNavigation"
 const projectID = "proj_subagent_navigation"
@@ -98,7 +99,7 @@ async function openChildFromParent(page: Page) {
   await expect(card).toBeVisible()
   await card.click()
 
-  await expect(page).toHaveURL(new RegExp(`/server/.+/session/${childID}$`), { timeout: 15_000 })
+  await expect(page).toHaveURL(new RegExp(`/server/.+/session/${childID}$`), { timeout: deadline(15_000) })
 }
 
 function session(id: string, title: string, created: number, extra?: Record<string, unknown>) {
