@@ -645,12 +645,28 @@ const layer = Layer.effect(
 
       const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
+      // Also fetched when a variant was requested explicitly, so it can be
+      // validated. Without this an unknown name reached request.ts, where
+      // `input.model.variants[variant]` is undefined and merges as nothing -
+      // so `--effort hgih` changed the request in no way and said nothing.
+      const wantsVariantCheck = !!input.variant && input.variant !== "default"
       const full =
-        !input.variant && ag.variant && same
+        wantsVariantCheck || (!input.variant && ag.variant && same)
           ? yield* provider
               .getModel(model.providerID, model.modelID)
               .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
           : undefined
+
+      if (wantsVariantCheck && full?.variants && !full.variants[input.variant!]) {
+        const available = Object.keys(full.variants).sort()
+        const hint = available.length ? ` Available: ${available.join(", ")}` : " This model declares none."
+        const error = new NamedError.Unknown({
+          message: `Unknown effort "${input.variant}" for ${model.providerID}/${model.modelID}.${hint}`,
+        })
+        yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
+        throw error
+      }
+
       const variant = input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
 
       const info: SessionV1.User = {

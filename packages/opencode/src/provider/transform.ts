@@ -574,6 +574,14 @@ const WIDELY_SUPPORTED_EFFORTS = ["low", "medium", "high"]
 const OPENAI_EFFORTS = ["none", "minimal", ...WIDELY_SUPPORTED_EFFORTS, "xhigh"]
 const OPENAI_GPT5_1_EFFORTS = ["none", ...WIDELY_SUPPORTED_EFFORTS]
 const OPENAI_GPT5_2_PLUS_EFFORTS = [...OPENAI_GPT5_1_EFFORTS, "xhigh"]
+// GPT-5.6 accepts `max`. Measured on the swx-azure Foundry deployment and
+// recorded in #15: a direct POST /responses with {"reasoning":{"effort":"max"}}
+// returns 200 completed, and a bogus value is rejected with the endpoint's own
+// supported list - none, minimal, low, medium, high, xhigh, max. Before this,
+// the fallback list stopped at xhigh, so `max` was unreachable for any model
+// whose models.dev metadata does not declare reasoning_options. Metadata still
+// wins where it exists: effortVariants builds from the declared values.
+const OPENAI_GPT5_6_PLUS_EFFORTS = [...OPENAI_GPT5_2_PLUS_EFFORTS, "max"]
 const OPENAI_GPT5_PRO_EFFORTS = ["high"]
 const OPENAI_GPT5_PRO_2_PLUS_EFFORTS = ["medium", "high", "xhigh"]
 const OPENAI_GPT5_CHAT_EFFORTS = ["medium"]
@@ -605,6 +613,7 @@ function versionedGpt5ReasoningEfforts(apiId: string) {
   const version = gpt5Version(apiId)
   if (version === undefined) return undefined
   if (version === 1) return OPENAI_GPT5_1_EFFORTS
+  if (version >= 6) return OPENAI_GPT5_6_PLUS_EFFORTS
   return OPENAI_GPT5_2_PLUS_EFFORTS
 }
 

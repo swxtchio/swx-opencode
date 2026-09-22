@@ -6209,3 +6209,40 @@ describe("ProviderTransform.options - kimi family adaptive thinking", () => {
     expect(result.thinking).toBeUndefined()
   })
 })
+
+describe("ProviderTransform.variants openai effort tiers", () => {
+  const model = (id: string, npm = "@ai-sdk/azure") =>
+    ({
+      id: `openai/${id}`,
+      providerID: "openai",
+      api: { id, npm, url: "https://example.invalid/v1" },
+      release_date: "2026-01-01",
+      capabilities: { reasoning: true },
+      limit: { context: 400_000, output: 128_000 },
+      options: {},
+    }) as never
+
+  // GOAL: #15. The fallback effort list stopped at xhigh, so `max` was
+  // unreachable for any model whose models.dev metadata does not declare
+  // reasoning_options - which is the case for the swx-azure Foundry
+  // deployment. Measured there and recorded in #15: a direct POST /responses
+  // with effort "max" returns 200 completed, and a bogus value is rejected
+  // with the endpoint's supported list, which includes max.
+  test.each(["gpt-5.6", "gpt-5.6-luna", "gpt-5.7"])("offers max for %s", (id) => {
+    expect(Object.keys(ProviderTransform.variants(model(id)))).toContain("max")
+  })
+
+  // GOAL: and not for the versions where there is no evidence for it, so this
+  // is a targeted addition rather than a blanket one.
+  test.each(["gpt-5.2", "gpt-5.5", "gpt-5.1"])("does not offer max for %s", (id) => {
+    expect(Object.keys(ProviderTransform.variants(model(id)))).not.toContain("max")
+  })
+
+  // GOAL: the existing tiers are untouched - xhigh still present from 5.2, and
+  // 5.1 still has none rather than minimal.
+  test("keeps the existing tiers", () => {
+    expect(Object.keys(ProviderTransform.variants(model("gpt-5.2")))).toContain("xhigh")
+    expect(Object.keys(ProviderTransform.variants(model("gpt-5.1")))).toContain("none")
+    expect(Object.keys(ProviderTransform.variants(model("gpt-5.1")))).not.toContain("xhigh")
+  })
+})

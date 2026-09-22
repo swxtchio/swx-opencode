@@ -209,9 +209,10 @@ export const RunCommand = effectCmd({
         type: "number",
         describe: "port for the local server (defaults to random port if no value provided)",
       })
-      .option("variant", {
+      .option("effort", {
         type: "string",
-        describe: "model variant (provider-specific reasoning effort, e.g., high, max, minimal)",
+        alias: "variant",
+        describe: "reasoning effort / model variant, e.g. medium, high, xhigh, max (provider-specific)",
       })
       .option("thinking", {
         type: "boolean",
@@ -849,7 +850,7 @@ export const RunCommand = effectCmd({
               model: args.model,
               command: args.command,
               arguments: message,
-              variant: args.variant,
+              variant: args.effort,
             })
             if (result.error) {
               if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
@@ -865,7 +866,7 @@ export const RunCommand = effectCmd({
             sessionID,
             agent,
             model,
-            variant: args.variant,
+            variant: args.effort,
             parts: [...files, { type: "text", text: message }],
           })
           if (result.error) {
@@ -890,7 +891,7 @@ export const RunCommand = effectCmd({
             replayLimit: args["replay-limit"],
             agent,
             model,
-            variant: args.variant,
+            variant: args.effort,
             files,
             initialInput,
             createSession: createFreshSession,
@@ -926,7 +927,7 @@ export const RunCommand = effectCmd({
             createSession: createFreshSession,
             agent: args.agent,
             model,
-            variant: args.variant,
+            variant: args.effort,
             replay,
             replayLimit: args["replay-limit"],
             files,
@@ -1000,6 +1001,9 @@ export async function runMini(input: MiniCommandInput) {
     username: input.username,
     dir: input.directory,
     port: undefined,
+    // Both spellings: yargs mirrors the alias onto argv at runtime, and the
+    // inferred type carries both, so a synthetic args object has to supply them.
+    effort: undefined,
     variant: undefined,
     thinking: undefined,
     mini: true,
