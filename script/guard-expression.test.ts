@@ -151,3 +151,35 @@ describe("guardVerdict", () => {
     expect(guardVerdict(GUARD, GUARD)).toBe("guarded")
   })
 })
+
+describe("parenthesised leading guard", () => {
+  // GOAL: accept the forms codex raised. A guard wrapped in its own brackets is
+  // still the leading term, and rejecting it would push a maintainer toward
+  // allowlisting the job instead of writing a correct condition.
+  test.each([
+    `(${GUARD}) && github.event.action == 'opened'`,
+    `(${GUARD} && github.event.action == 'opened')`,
+    `((${GUARD})) && github.event.action == 'opened'`,
+    `(${GUARD})`,
+  ])("accepts %s", (condition) => {
+    expect(guardVerdict(condition, GUARD)).toBe("guarded")
+  })
+
+  // GOAL: the reason this is parsed rather than pattern-matched. The obvious
+  // regex - optional brackets either side of the guard - accepts the first case
+  // below, where the guard sits INSIDE a disjunction and the job runs in any
+  // repository. The bracket counts are what distinguish it from `(GUARD) && x`.
+  test.each([
+    `(${GUARD} && a) || true`,
+    `(${GUARD}) || true`,
+    `(${GUARD} && a) || github.repository == 'swxtchio/swx-opencode'`,
+    `((${GUARD} && a)) || true`,
+  ])("rejects %s, where the guard is subordinate to a disjunction", (condition) => {
+    expect(guardVerdict(condition, GUARD)).toBe("unguarded")
+  })
+
+  // GOAL: bracket counting must not be fooled by brackets inside literals.
+  test("does not treat a bracket inside a literal as structure", () => {
+    expect(guardVerdict(`(${GUARD}) && x == '(' || true`, GUARD)).toBe("unguarded")
+  })
+})

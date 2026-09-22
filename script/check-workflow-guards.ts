@@ -37,6 +37,30 @@ const ALLOWED = new Map([
 ])
 
 /**
+ * Digest of the workflow ENVELOPE - everything except `jobs` - for each
+ * workflow with an allowlisted job.
+ *
+ * The per-job digest does not cover `on`, `permissions`, `env` or `defaults`.
+ * That leaves the audit able to be switched off without any digest changing:
+ * add a `paths:` filter to test.yml and workflow-only changes stop being
+ * audited, silently.
+ */
+const ALLOWED_ENVELOPES = new Map([
+  ["test.yml", "3fc9bf50af782993"],
+  ["typecheck.yml", "91a87487fd18a357"],
+])
+
+/**
+ * The workflow carrying this audit, and the property that has to hold for the
+ * audit to mean anything: it must run on every pull request and every push to
+ * the default branch, with nothing narrowing which paths trigger it.
+ *
+ * Checked structurally rather than by digest alone, because the digest only
+ * says "someone changed this" - it does not say which change would be harmful.
+ */
+const AUDIT_WORKFLOW = "test.yml"
+
+/**
  * Digest of an allowlisted job's definition.
  *
  * An allowlist keyed only by name trusts the job's CONTENTS forever: a future
@@ -86,20 +110,41 @@ export type Verdict = "guarded" | "unguarded" | "malformed"
  */
 export function guardVerdict(condition: string, guard: string): Verdict {
   // Block scalars arrive with newlines; GitHub treats them as one expression.
-  const normalised = condition.replace(/\s+/g, " ").trim()
+  const normalised = stripWrappingParens(condition.replace(/\s+/g, " ").trim())
 
   const scan = scanTopLevel(normalised)
   if (scan === "malformed") return "malformed"
 
-  if (normalised === guard) return "guarded"
+  // The guard must be the leading term of a top-level conjunction. Parsed
+  // rather than pattern-matched, because the obvious regex - optional parens
+  // either side - accepts `(GUARD && x) || y`, where the guard is subordinate
+  // to a disjunction and the job runs in any repository. Counting the brackets
+  // is what distinguishes the two: in that expression the guard is followed by
+  // `&&` with its opening bracket still unclosed.
+  let rest = normalised
+  let opened = 0
+  while (rest.startsWith("(")) {
+    opened++
+    rest = rest.slice(1).trim()
+  }
 
-  // Tolerate any spacing around the conjunction. Rejecting `GUARD&& x` would
-  // be a false positive, and a check that rejects valid conditions gets worked
-  // around rather than fixed.
-  const leading = new RegExp(`^${escapeRegExp(guard)}\\s*&&`)
-  if (!leading.test(normalised)) return "unguarded"
+  if (!rest.startsWith(guard)) return "unguarded"
+  rest = rest.slice(guard.length).trim()
 
-  return scanTopLevel(normalised.replace(leading, "")) === "has-or" ? "unguarded" : "guarded"
+  let closed = 0
+  while (rest.startsWith(")")) {
+    closed++
+    rest = rest.slice(1).trim()
+  }
+  // Unequal brackets mean the guard is not a self-contained leading term.
+  if (closed !== opened) return "unguarded"
+
+  // Tolerate any spacing around the conjunction: GitHub does not care, and a
+  // check that rejects valid conditions gets worked around rather than fixed.
+  if (rest === "") return "guarded"
+  if (!rest.startsWith("&&")) return "unguarded"
+
+  return scanTopLevel(rest.slice(2)) === "has-or" ? "unguarded" : "guarded"
 }
 
 /** Kept for readability at call sites that only care whether a job is safe. */
@@ -107,8 +152,38 @@ export function isGuarded(condition: string, guard: string): boolean {
   return guardVerdict(condition, guard) === "guarded"
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+/**
+ * Remove parentheses that wrap the entire expression, so `(GUARD && x)` reads
+ * as `GUARD && x`. Only a pair whose opening bracket matches the very last
+ * character is removed - in `(GUARD && x) || y` the first bracket closes early,
+ * so nothing is stripped and the top-level `||` stays visible.
+ */
+function stripWrappingParens(expression: string): string {
+  let current = expression
+  while (current.startsWith("(") && current.endsWith(")")) {
+    let depth = 0
+    let closesAtEnd = false
+    let inString = false
+    for (let i = 0; i < current.length; i++) {
+      const char = current[i]
+      if (char === "'") {
+        inString = !inString
+        continue
+      }
+      if (inString) continue
+      if (char === "(") depth++
+      else if (char === ")") {
+        depth--
+        if (depth === 0) {
+          closesAtEnd = i === current.length - 1
+          break
+        }
+      }
+    }
+    if (!closesAtEnd) return current
+    current = current.slice(1, -1).trim()
+  }
+  return current
 }
 
 function scanTopLevel(expression: string): "has-or" | "no-or" | "malformed" {
@@ -139,6 +214,41 @@ function scanTopLevel(expression: string): "has-or" | "no-or" | "malformed" {
   return "no-or"
 }
 
+/**
+ * The audit is only worth anything if it actually runs. Its own workflow must
+ * fire on every pull request and every push, unnarrowed by a path filter -
+ * otherwise a workflow-only change, which is exactly what this audits, would
+ * sail through untested.
+ */
+function auditWorkflowViolations(file: string, on: unknown): Violation[] {
+  const problem = (reason: string): Violation => ({ workflow: file, job: "-", reason, found: "" })
+
+  if (!on || typeof on !== "object") return [problem("this audit's own workflow declares no triggers")]
+
+  const triggers = on as Record<string, unknown>
+  const found: Violation[] = []
+
+  for (const event of ["push", "pull_request"]) {
+    if (!(event in triggers)) {
+      found.push(problem(`this audit's own workflow no longer runs on ${event}, so changes can bypass it`))
+      continue
+    }
+    const config = triggers[event]
+    if (!config || typeof config !== "object") continue
+    for (const filter of ["paths", "paths-ignore"]) {
+      if (filter in (config as Record<string, unknown>))
+        found.push(
+          problem(
+            `this audit's own workflow has a \`${filter}\` filter on \`${event}\`, ` +
+              `so a workflow-only change may not be audited`,
+          ),
+        )
+    }
+  }
+
+  return found
+}
+
 async function main() {
   const dir = new URL("../.github/workflows/", import.meta.url)
   const files = [...new Bun.Glob("*.{yml,yaml}").scanSync({ cwd: Bun.fileURLToPath(dir) })].sort()
@@ -153,7 +263,26 @@ async function main() {
   for (const file of files) {
     const parsed = Bun.YAML.parse(await Bun.file(new URL(file, dir)).text()) as {
       jobs?: Record<string, { if?: unknown }>
+      on?: unknown
     }
+
+    const expectedEnvelope = ALLOWED_ENVELOPES.get(file)
+    if (expectedEnvelope !== undefined) {
+      const { jobs: _jobs, ...envelope } = parsed ?? {}
+      const actualEnvelope = digest(envelope)
+      if (expectedEnvelope !== actualEnvelope)
+        violations.push({
+          workflow: file,
+          job: "-",
+          reason:
+            `the triggers or permissions of an allowlisted workflow changed. ` +
+            `Confirm it still runs on every change, then set its envelope digest to ${actualEnvelope}`,
+          found: "",
+        })
+    }
+
+    if (file === AUDIT_WORKFLOW) violations.push(...auditWorkflowViolations(file, parsed?.on))
+
     const jobs = parsed?.jobs
     if (!jobs || typeof jobs !== "object") {
       violations.push({ workflow: file, job: "-", reason: "workflow declares no jobs", found: "" })
