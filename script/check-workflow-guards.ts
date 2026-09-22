@@ -57,49 +57,71 @@ function canonical(_key: string, value: unknown) {
 
 type Violation = { workflow: string; job: string; reason: string; found: string }
 
+export type Verdict = "guarded" | "unguarded" | "malformed"
+
 /**
- * True when `condition` cannot be true outside the guarded repository.
+ * Whether `condition` can be true outside the guarded repository.
  *
- * A substring test is not enough, and the difference is exploitable rather than
- * theoretical. `&&` binds tighter than `||` in GitHub expressions, so both of
- * these contain the guard verbatim and both still run here:
+ * A substring test is not enough, and the difference is exploitable rather
+ * than theoretical. `&&` binds tighter than `||` in GitHub expressions, so all
+ * of these contain the guard verbatim and all still run here:
  *
  *   github.repository == 'anomalyco/opencode' || github.repository == 'swxtchio/swx-opencode'
  *   github.repository == 'anomalyco/opencode' && github.event.action == 'opened' || true
+ *   github.repository == 'anomalyco/opencode' && github.event.issue.title == '(' || true
  *
- * So the guard must be the leading term of a top-level conjunction: the whole
- * condition, or `GUARD && rest` where `rest` contains no `||` outside
- * parentheses. `GUARD && (a || b)` is fine - the disjunction is subordinate to
- * the guard.
+ * The third hides the `||` behind a paren inside a string literal, so the
+ * scanner must know about literals rather than merely counting brackets.
+ *
+ * The rule: the guard must be the whole condition, or the leading term of a
+ * top-level conjunction whose remainder has no `||` outside parentheses.
+ * `GUARD && (a || b)` is fine - the disjunction is subordinate to the guard,
+ * and deploy.yml already relies on that.
+ *
+ * A condition whose quotes or parentheses do not balance is reported as
+ * `malformed` rather than guessed at. GitHub would fail to evaluate it, so it
+ * is not an exposure, but scanning it cannot be trusted either: an
+ * unterminated quote makes the scanner treat the rest of the expression as
+ * string data and miss a real top-level `||`.
  */
-export function isGuarded(condition: string, guard: string): boolean {
+export function guardVerdict(condition: string, guard: string): Verdict {
   // Block scalars arrive with newlines; GitHub treats them as one expression.
   const normalised = condition.replace(/\s+/g, " ").trim()
-  if (normalised === guard) return true
 
-  const prefix = `${guard} &&`
-  if (!normalised.startsWith(prefix)) return false
+  const scan = scanTopLevel(normalised)
+  if (scan === "malformed") return "malformed"
 
-  return !hasTopLevelOr(normalised.slice(prefix.length))
+  if (normalised === guard) return "guarded"
+
+  // Tolerate any spacing around the conjunction. Rejecting `GUARD&& x` would
+  // be a false positive, and a check that rejects valid conditions gets worked
+  // around rather than fixed.
+  const leading = new RegExp(`^${escapeRegExp(guard)}\\s*&&`)
+  if (!leading.test(normalised)) return "unguarded"
+
+  return scanTopLevel(normalised.replace(leading, "")) === "has-or" ? "unguarded" : "guarded"
 }
 
-function hasTopLevelOr(expression: string): boolean {
+/** Kept for readability at call sites that only care whether a job is safe. */
+export function isGuarded(condition: string, guard: string): boolean {
+  return guardVerdict(condition, guard) === "guarded"
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function scanTopLevel(expression: string): "has-or" | "no-or" | "malformed" {
   let depth = 0
   let inString = false
 
   for (let i = 0; i < expression.length; i++) {
     const char = expression[i]
 
-    // String literals must be skipped, not just counted through. A literal
-    // containing an unbalanced paren would otherwise raise the depth for the
-    // rest of the expression and hide a genuine top-level `||`:
-    //
-    //   guard && github.event.issue.title == '(' || true
-    //
-    // which GitHub parses as `(guard && title == '(') || true` - true in every
-    // repository. GitHub's single-quoted strings have no escape sequences and
-    // represent a literal quote as '', so a plain toggle is exact: the two
-    // quotes of '' toggle out and straight back in.
+    // String literals are skipped, not counted through. GitHub's single-quoted
+    // strings have no escape sequences and write a literal quote as '', so a
+    // plain toggle is exact: the two quotes of '' toggle out and straight back
+    // in.
     if (char === "'") {
       inString = !inString
       continue
@@ -108,10 +130,13 @@ function hasTopLevelOr(expression: string): boolean {
 
     if (char === "(") depth++
     else if (char === ")") depth--
-    else if (char === "|" && expression[i + 1] === "|" && depth === 0) return true
+    else if (char === "|" && expression[i + 1] === "|" && depth === 0) return "has-or"
+
+    if (depth < 0) return "malformed"
   }
 
-  return false
+  if (inString || depth !== 0) return "malformed"
+  return "no-or"
 }
 
 async function main() {
@@ -159,16 +184,20 @@ async function main() {
         disabled++
         continue
       }
-      if (isGuarded(condition, GUARD)) {
+      const verdict = guardVerdict(condition, GUARD)
+      if (verdict === "guarded") {
         guarded++
         continue
       }
       violations.push({
         workflow: file,
         job,
-        reason: condition
-          ? "the repository guard is not the leading term of a top-level conjunction"
-          : "no condition at all",
+        reason:
+          verdict === "malformed"
+            ? "condition has unbalanced quotes or parentheses, so it cannot be checked"
+            : condition
+              ? "the repository guard is not the leading term of a top-level conjunction"
+              : "no condition at all",
         found: condition,
       })
     }

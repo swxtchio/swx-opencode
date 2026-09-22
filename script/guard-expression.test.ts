@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { digest, isGuarded } from "./check-workflow-guards"
+import { digest, guardVerdict, isGuarded } from "./check-workflow-guards"
 
 const GUARD = "github.repository == 'anomalyco/opencode'"
 
@@ -110,5 +110,44 @@ describe("isGuarded string-literal handling", () => {
   test("handles a doubled quote inside a literal", () => {
     expect(isGuarded(`${GUARD} && github.event.issue.title == 'it''s (' || true`, GUARD)).toBe(false)
     expect(isGuarded(`${GUARD} && github.event.issue.title == 'it''s fine'`, GUARD)).toBe(true)
+  })
+})
+
+describe("guardVerdict", () => {
+  // GOAL: a condition that cannot be parsed must not be reported as guarded.
+  // An unterminated quote made the scanner treat the rest of the expression as
+  // string data, so a real top-level `||` was invisible and the job was
+  // counted as protected. GitHub would fail to evaluate these, so they are not
+  // an exposure - but "I could not check this" must not read as "this is
+  // fine".
+  test.each([
+    `${GUARD} && x == 'abc || true`,
+    `${GUARD} && ( a || true`,
+    `${GUARD} && a ) || true`,
+    `${GUARD} && x == 'a`,
+  ])("reports a condition with unbalanced quotes or parens as malformed", (condition) => {
+    expect(guardVerdict(condition, GUARD)).toBe("malformed")
+    // Whatever the reason, it must never count as guarded.
+    expect(isGuarded(condition, GUARD)).toBe(false)
+  })
+
+  // GOAL: spacing around the conjunction is not meaningful to GitHub, so it
+  // must not be meaningful here either. Rejecting these would be a false
+  // positive, and a check that rejects valid conditions gets worked around
+  // rather than fixed.
+  test.each([`${GUARD}&& github.event.action == 'opened'`, `${GUARD}  &&  github.event.action == 'opened'`])(
+    "accepts any spacing around the conjunction",
+    (condition) => {
+      expect(guardVerdict(condition, GUARD)).toBe("guarded")
+    },
+  )
+
+  // GOAL: the three verdicts stay distinct, so the failure message can say
+  // which problem it is. "Unbalanced quotes" and "guard is not the leading
+  // term" call for different fixes.
+  test("distinguishes unguarded from malformed", () => {
+    expect(guardVerdict(`${GUARD} || github.repository == 'swxtchio/swx-opencode'`, GUARD)).toBe("unguarded")
+    expect(guardVerdict("always()", GUARD)).toBe("unguarded")
+    expect(guardVerdict(GUARD, GUARD)).toBe("guarded")
   })
 })
