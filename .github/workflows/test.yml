@@ -20,6 +20,13 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+  # Turborepo telemetry is on by default and POSTs anonymous usage data to
+  # Vercel. This fork runs only these two workflows, so opting out here is the
+  # whole surface. Raised by sol during the #22 review as the one outward-facing
+  # action still reachable from this fork.
+  TURBO_TELEMETRY_DISABLED: 1
+  DO_NOT_TRACK: 1
+
 jobs:
   unit:
     name: unit (${{ matrix.settings.name }})
@@ -46,6 +53,23 @@ jobs:
 
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
+
+      - name: Check workflow repository guards
+        run: bun run script/check-workflow-guards.ts
+
+      - name: Test the fork guards
+        # The root bunfig.toml deliberately points `bun test` at a
+        # non-existent directory to stop tests running from the repository
+        # root, so these run from the script directory. Named explicitly rather
+        # than letting bun scan: a bare `bun test` here would also collect
+        # translate-app.test.ts, which is not part of this gate.
+        working-directory: script
+        # `ls` first: bun ignores a positional filter that matches nothing as
+        # long as another matches, so a renamed test file would silently drop
+        # out of this gate instead of failing it.
+        run: |
+          ls audit-checks.test.ts audit-cli.test.ts guard-expression.test.ts github/same-repo-guard.test.ts github/close-scripts-guard.test.ts github/write-guard-coverage.test.ts > /dev/null
+          bun test audit-checks.test.ts audit-cli.test.ts guard-expression.test.ts github/same-repo-guard.test.ts github/close-scripts-guard.test.ts github/write-guard-coverage.test.ts
 
       - name: Configure git identity
         run: |

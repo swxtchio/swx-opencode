@@ -1,0 +1,242 @@
+import { describe, expect, test } from "bun:test"
+import { branchesCover, digest, guardVerdict, isGuarded } from "./check-workflow-guards"
+
+const GUARD = "github.repository == 'anomalyco/opencode'"
+
+describe("isGuarded", () => {
+  // GOAL: the shapes actually present in this repository are accepted, so the
+  // check does not force a rewrite of conditions that are already correct.
+  test.each([
+    GUARD,
+    `${GUARD} && (github.event.action == 'opened')`,
+    `${GUARD} && (always() && !failure() && !cancelled())`,
+    `${GUARD} && (github.ref_name == 'dev' || github.ref_name == 'production')`,
+    // Block scalars arrive with newlines and indentation.
+    `${GUARD} &&\n      github.event.issue.pull_request &&\n      startsWith(github.event.comment.body, '/review')`,
+  ])("accepts %s", (condition) => {
+    expect(isGuarded(condition, GUARD)).toBe(true)
+  })
+
+  // GOAL: close the bypass codex found in the original substring check. Each of
+  // these CONTAINS the guard verbatim and still runs on this fork, so a
+  // substring test reports them as guarded. `&&` binds tighter than `||` in
+  // GitHub expressions, which is what makes the second and third dangerous.
+  test.each([
+    `${GUARD} || github.repository == 'swxtchio/swx-opencode'`,
+    `${GUARD} && github.event.action == 'opened' || true`,
+    `${GUARD} && (a) || github.repository == 'swxtchio/swx-opencode'`,
+    `github.repository == 'swxtchio/swx-opencode' || ${GUARD}`,
+  ])("rejects %s, which contains the guard but still runs here", (condition) => {
+    expect(isGuarded(condition, GUARD)).toBe(false)
+  })
+
+  // GOAL: a disjunction nested inside parentheses is subordinate to the guard
+  // and must stay allowed - otherwise the check rejects legitimate conditions
+  // and gets worked around rather than fixed.
+  test("accepts a disjunction nested under the guard at any depth", () => {
+    expect(isGuarded(`${GUARD} && ((a || b) && (c || d))`, GUARD)).toBe(true)
+  })
+
+  // GOAL: the guard must be the leading term. A trailing guard is a
+  // conjunction too, but accepting it would mean parsing precedence for the
+  // terms before it; requiring leading position keeps the rule checkable.
+  test.each([
+    "",
+    "always()",
+    `github.event.action == 'opened' && ${GUARD}`,
+    "github.repository == 'anomalyco/opencode-fork'",
+  ])("rejects %s", (condition) => {
+    expect(isGuarded(condition, GUARD)).toBe(false)
+  })
+})
+
+describe("digest", () => {
+  // GOAL: the digest tracks what a job DOES, not how the YAML happens to be
+  // ordered. Without this, a cosmetic reordering upstream would fail the check
+  // and train whoever hits it to bump the digest without reading the diff -
+  // which defeats the point of pinning it.
+  test("is stable under key reordering", () => {
+    const a = { "runs-on": "ubuntu-latest", steps: [{ run: "echo hi" }] }
+    const b = { steps: [{ run: "echo hi" }], "runs-on": "ubuntu-latest" }
+    expect(digest(a)).toBe(digest(b))
+  })
+
+  // GOAL: the mutation sol described - a publishing step added to an
+  // allowlisted job - must change the digest.
+  test("changes when a step is added", () => {
+    const before = { "runs-on": "ubuntu-latest", steps: [{ run: "bun test" }] }
+    const after = { "runs-on": "ubuntu-latest", steps: [{ run: "bun test" }, { run: "npm publish" }] }
+    expect(digest(after)).not.toBe(digest(before))
+  })
+
+  // GOAL: array order is meaningful - steps run in sequence - so reordering
+  // steps must not be treated as the same job.
+  test("changes when steps are reordered", () => {
+    const a = { steps: [{ run: "one" }, { run: "two" }] }
+    const b = { steps: [{ run: "two" }, { run: "one" }] }
+    expect(digest(a)).not.toBe(digest(b))
+  })
+})
+
+describe("isGuarded string-literal handling", () => {
+  // GOAL: close the bypass glm-5.3 found. A paren inside a string literal used
+  // to raise the paren depth for the remainder of the expression, hiding a
+  // genuine top-level `||`. GitHub parses this as `(guard && title == '(')
+  // || true`, which is true in every repository.
+  test.each([
+    `github.repository == 'anomalyco/opencode' && github.event.issue.title == '(' || true`,
+    `github.repository == 'anomalyco/opencode' && contains(github.event.head_commit.message, '(') || true`,
+    // Closing paren in a literal: drives depth negative, so a later `||` at
+    // depth -1 was also missed.
+    `github.repository == 'anomalyco/opencode' && github.event.issue.title == ')' || true`,
+  ])("rejects a condition hiding a top-level || behind a quoted paren", (condition) => {
+    expect(isGuarded(condition, GUARD)).toBe(false)
+  })
+
+  // GOAL: the mirror-image false positive. A `||` INSIDE a literal is data,
+  // not an operator, so the condition is genuinely guarded and must be
+  // accepted - otherwise the check rejects valid conditions and gets worked
+  // around rather than fixed.
+  test.each([
+    `github.repository == 'anomalyco/opencode' && contains(github.event.head_commit.message, 'a||b')`,
+    `github.repository == 'anomalyco/opencode' && github.event.issue.title != '||'`,
+  ])("accepts a || that is inside a string literal", (condition) => {
+    expect(isGuarded(condition, GUARD)).toBe(true)
+  })
+
+  // GOAL: GitHub writes a literal quote as '' with no escapes, so the toggle
+  // must survive it - '' toggles out and straight back in, leaving the scanner
+  // correctly inside the string.
+  test("handles a doubled quote inside a literal", () => {
+    expect(isGuarded(`${GUARD} && github.event.issue.title == 'it''s (' || true`, GUARD)).toBe(false)
+    expect(isGuarded(`${GUARD} && github.event.issue.title == 'it''s fine'`, GUARD)).toBe(true)
+  })
+})
+
+describe("guardVerdict", () => {
+  // GOAL: a condition that cannot be parsed must not be reported as guarded.
+  // An unterminated quote made the scanner treat the rest of the expression as
+  // string data, so a real top-level `||` was invisible and the job was
+  // counted as protected. GitHub would fail to evaluate these, so they are not
+  // an exposure - but "I could not check this" must not read as "this is
+  // fine".
+  test.each([
+    `${GUARD} && x == 'abc || true`,
+    `${GUARD} && ( a || true`,
+    `${GUARD} && a ) || true`,
+    `${GUARD} && x == 'a`,
+  ])("reports a condition with unbalanced quotes or parens as malformed", (condition) => {
+    expect(guardVerdict(condition, GUARD)).toBe("malformed")
+    // Whatever the reason, it must never count as guarded.
+    expect(isGuarded(condition, GUARD)).toBe(false)
+  })
+
+  // GOAL: spacing around the conjunction is not meaningful to GitHub, so it
+  // must not be meaningful here either. Rejecting these would be a false
+  // positive, and a check that rejects valid conditions gets worked around
+  // rather than fixed.
+  test.each([`${GUARD}&& github.event.action == 'opened'`, `${GUARD}  &&  github.event.action == 'opened'`])(
+    "accepts any spacing around the conjunction",
+    (condition) => {
+      expect(guardVerdict(condition, GUARD)).toBe("guarded")
+    },
+  )
+
+  // GOAL: the three verdicts stay distinct, so the failure message can say
+  // which problem it is. "Unbalanced quotes" and "guard is not the leading
+  // term" call for different fixes.
+  test("distinguishes unguarded from malformed", () => {
+    expect(guardVerdict(`${GUARD} || github.repository == 'swxtchio/swx-opencode'`, GUARD)).toBe("unguarded")
+    expect(guardVerdict("always()", GUARD)).toBe("unguarded")
+    expect(guardVerdict(GUARD, GUARD)).toBe("guarded")
+  })
+})
+
+describe("parenthesised leading guard", () => {
+  // GOAL: accept the forms codex raised. A guard wrapped in its own brackets is
+  // still the leading term, and rejecting it would push a maintainer toward
+  // allowlisting the job instead of writing a correct condition.
+  test.each([
+    `(${GUARD}) && github.event.action == 'opened'`,
+    `(${GUARD} && github.event.action == 'opened')`,
+    `((${GUARD})) && github.event.action == 'opened'`,
+    `(${GUARD})`,
+  ])("accepts %s", (condition) => {
+    expect(guardVerdict(condition, GUARD)).toBe("guarded")
+  })
+
+  // GOAL: the reason this is parsed rather than pattern-matched. The obvious
+  // regex - optional brackets either side of the guard - accepts the first case
+  // below, where the guard sits INSIDE a disjunction and the job runs in any
+  // repository. The bracket counts are what distinguish it from `(GUARD) && x`.
+  test.each([
+    `(${GUARD} && a) || true`,
+    `(${GUARD}) || true`,
+    `(${GUARD} && a) || github.repository == 'swxtchio/swx-opencode'`,
+    `((${GUARD} && a)) || true`,
+  ])("rejects %s, where the guard is subordinate to a disjunction", (condition) => {
+    expect(guardVerdict(condition, GUARD)).toBe("unguarded")
+  })
+
+  // GOAL: bracket counting must not be fooled by brackets inside literals.
+  test("does not treat a bracket inside a literal as structure", () => {
+    expect(guardVerdict(`(${GUARD}) && x == '(' || true`, GUARD)).toBe("unguarded")
+  })
+})
+
+describe("${{ }}-wrapped conditions", () => {
+  // GOAL: GitHub treats a bare condition and a `${{ }}`-wrapped one
+  // identically, so the audit must too. glm-5.3 noted that a wrapped guard was
+  // reported "unguarded" - a correct condition given a reason that
+  // misdescribes it, which is how a future upstream merge gets diagnosed
+  // wrongly.
+  test.each([`\${{ ${GUARD} }}`, `\${{${GUARD}}}`, `\${{ ${GUARD} && github.event.action == 'opened' }}`])(
+    "accepts %s",
+    (condition) => {
+      expect(guardVerdict(condition, GUARD)).toBe("guarded")
+    },
+  )
+
+  // GOAL: unwrapping must not become a way in. The disjunction is still
+  // top-level once the wrapper is removed.
+  test.each([`\${{ ${GUARD} || true }}`, `\${{ ${GUARD} && a || true }}`])("rejects %s", (condition) => {
+    expect(guardVerdict(condition, GUARD)).toBe("unguarded")
+  })
+})
+
+describe("branchesCover", () => {
+  // GOAL: GitHub evaluates branch filters as ORDERED globs where the last
+  // matching pattern wins, so textual membership is the wrong test. sol's
+  // case: the branch is listed and then excluded.
+  test("a later negation excludes a branch that is listed earlier", () => {
+    expect(branchesCover(["swxtch", "!swxtch"], "swxtch")).toBe(false)
+  })
+
+  // GOAL: and the reverse order re-includes it, which is why order matters
+  // rather than merely the presence of a negation.
+  test("a later positive re-includes a branch excluded earlier", () => {
+    expect(branchesCover(["!swxtch", "swxtch"], "swxtch")).toBe(true)
+  })
+
+  test.each([
+    [["swxtch"], true],
+    [["main", "swxtch"], true],
+    [["main"], false],
+    [[], false],
+    // `*` does not cross a slash, `**` does - GitHub's filter-pattern subset.
+    [["*"], true],
+    [["swx*"], true],
+    [["release/*"], false],
+    [["**"], true],
+  ] as [string[], boolean][])("covers %p -> %p", (patterns, expected) => {
+    expect(branchesCover(patterns, "swxtch")).toBe(expected)
+  })
+
+  // GOAL: a glob that stops at a slash must not match a nested branch name,
+  // or the check would accept a filter that misses the real branch.
+  test("* does not cross a slash", () => {
+    expect(branchesCover(["release/*"], "release/1.0")).toBe(true)
+    expect(branchesCover(["release/*"], "release/1.0/final")).toBe(false)
+    expect(branchesCover(["release/**"], "release/1.0/final")).toBe(true)
+  })
+})
