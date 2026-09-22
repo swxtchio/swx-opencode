@@ -57,6 +57,7 @@ describe("the audit stays wired into CI", () => {
     // from the step would have gone unnoticed.
     for (const file of [
       "audit-checks.test.ts",
+      "audit-cli.test.ts",
       "guard-expression.test.ts",
       "github/same-repo-guard.test.ts",
       "github/close-scripts-guard.test.ts",

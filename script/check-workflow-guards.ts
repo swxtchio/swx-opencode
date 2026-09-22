@@ -33,7 +33,7 @@ const GUARD = "github.repository == 'anomalyco/opencode'"
  * guarded on four jobs out of five.
  */
 const ALLOWED = new Map([
-  ["test.yml::unit", "b0da023771bf7e68"],
+  ["test.yml::unit", "c8ce2714c491ebb7"],
   ["test.yml::e2e", "b945108295daf472"],
   ["typecheck.yml::typecheck", "b82d5ddbd87d3df7"],
 ])
@@ -594,7 +594,18 @@ export function swallowsFailure(run: string): boolean {
   // word boundary requires a word character on one side and `:` is not one.
   if (/\|\|\s*(?:true\b|:(?:\s|$))/.test(run)) return true
   if (/;\s*(?:true|:)\s*$/m.test(run)) return true
+
+  // `|| exit 0` and `; exit 0` discard failure exactly as `|| true` does, and
+  // codex found that only the `true`/`:` spellings were matched. `exit 1` is
+  // deliberately excluded: it PROPAGATES failure.
+  if (/(?:\|\||;)\s*exit\s+0\b/.test(run)) return true
+
+  // A bare `exit 0` line in a gating step's script is unconditional success,
+  // whether it precedes the command or follows it.
+  if (/(?:^|\n)\s*exit\s+0\s*(?:$|\n)/.test(run)) return true
+
   if (/\bset\s+\+e\b/.test(run)) return true
+  if (/\bset\s+\+o\s+errexit\b/.test(run)) return true
   return false
 }
 

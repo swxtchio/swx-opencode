@@ -78,11 +78,26 @@ describe("swallowsFailure", () => {
     expect(swallowsFailure(run)).toBe(true)
   })
 
+  // GOAL: the spellings codex found unmatched. `|| exit 0` discards failure
+  // exactly as `|| true` does, and a bare `exit 0` line makes a gating step
+  // unconditionally successful.
+  test.each([
+    "bun run script/check-workflow-guards.ts || exit 0",
+    "bun run script/check-workflow-guards.ts; exit 0",
+    "exit 0\nbun run script/check-workflow-guards.ts",
+    "bun run script/check-workflow-guards.ts\nexit 0",
+    "set +o errexit\nbun run script/check-workflow-guards.ts",
+  ])("detects %p", (run) => {
+    expect(swallowsFailure(run)).toBe(true)
+  })
+
   test.each([
     "bun run script/check-workflow-guards.ts",
     "ls a b > /dev/null\nbun test a b",
     // `|| exit 1` propagates failure rather than discarding it.
     "bun run script/check-workflow-guards.ts || exit 1",
+    // `exit 1` as a line is a failure path, not a swallow.
+    "bun test a || exit 1\nexit 1",
   ])("does not fire on %p", (run) => {
     expect(swallowsFailure(run)).toBe(false)
   })
