@@ -52,10 +52,15 @@ describe("the audit stays wired into CI", () => {
     const workflow = readFileSync(join(WORKFLOWS, "test.yml"), "utf8")
     const step = workflow.split("Test the fork guards")[1] ?? ""
     expect(step).toContain("ls ")
+    // Every gate file, INCLUDING this one - glm-5.3 noted that this test
+    // asserted the other files were listed but not itself, so its own removal
+    // from the step would have gone unnoticed.
     for (const file of [
+      "audit-checks.test.ts",
       "guard-expression.test.ts",
       "github/same-repo-guard.test.ts",
       "github/close-scripts-guard.test.ts",
+      "github/write-guard-coverage.test.ts",
     ])
       expect(step).toContain(file)
   })
@@ -88,13 +93,21 @@ function writesViaFetch(source: string): boolean {
   const WRITE = /method:\s*["'](POST|PATCH|PUT|DELETE)["']/g
 
   for (const match of source.matchAll(WRITE)) {
-    const window = source.slice(Math.max(0, match.index - WINDOW), match.index)
+    // Behind: a bounded window, since the URL is normally the request's first
+    // argument. Ahead: only as far as the end of this options object, NOT a
+    // second fixed window - a forward window re-created the very false
+    // positive this detector was fixed for, matching an unrelated GitHub URL
+    // further down the file.
+    const before = source.slice(Math.max(0, match.index - WINDOW), match.index)
+    const rest = source.slice(match.index)
+    const after = rest.slice(0, rest.indexOf("}") === -1 ? 0 : rest.indexOf("}"))
     // Bare paths have to be extractable too, or a bare-path write has no
     // "nearest URL" at all and is skipped rather than matched.
     const url = /https?:\/\/[^"'`\s]+|\/(?:repos|graphql)[^"'`\s]*/g
-    const nearest = [...window.matchAll(url)].at(-1)?.[0]
-    if (!nearest) continue
-    if (isGitHubTarget(nearest)) return true
+    const behind = [...before.matchAll(url)].at(-1)?.[0]
+    const ahead = [...after.matchAll(new RegExp(url.source, url.flags))].at(0)?.[0]
+    if (behind && isGitHubTarget(behind)) return true
+    if (ahead && isGitHubTarget(ahead)) return true
   }
 
   return false
@@ -105,7 +118,12 @@ function writesViaFetch(source: string): boolean {
  * writes with no request options for the first shape to find.
  */
 function writesViaGhCli(source: string): boolean {
-  return /gh\s+api\b[^`"'\n]*(?:--method|-X)\s+(POST|PATCH|PUT|DELETE)\b/i.test(source)
+  // Punctuation is flattened first so both shapes match: the shell string
+  // `gh api --method PATCH ...` and the spawn array
+  // `["gh", "api", "-X", "POST"]`, which glm-5.3 pointed out this directory
+  // already uses elsewhere.
+  const flattened = source.replace(/["'`,\[\]]/g, " ")
+  return /\bgh\s+api\b[^\n]{0,200}?(?:--method|-X)\s+(POST|PATCH|PUT|DELETE)\b/i.test(flattened)
 }
 
 /**
@@ -184,6 +202,31 @@ describe("every GitHub-writing script carries the repository guard", () => {
     `await fetch("https://api.github.com/repos/a/b/releases")`,
   ])("does not fire on a non-GitHub write or a GitHub read", (sample) => {
     expect(githubWrites(sample)).toBe(false)
+  })
+
+  // GOAL: the URL may be named AFTER the method within the same options
+  // object, which glm-5.3 raised as a false negative.
+  test("fires when the target is named after the method in the same object", () => {
+    expect(githubWrites(`fetch(u, { method: "POST", url: "https://api.github.com/repos/a/b/issues/1" })`)).toBe(true)
+  })
+
+  // GOAL: but looking ahead must stop at that object. A forward window of
+  // fixed size re-created the original false positive by matching an unrelated
+  // GitHub URL further down the file, so the look-ahead ends at the closing
+  // brace.
+  test("does not fire on a non-GitHub write followed later by a GitHub read", () => {
+    const sample = [
+      `fetch("https://us.i.posthog.com/e/", { method: "POST" })`,
+      "\n".repeat(60),
+      `fetch("https://api.github.com/repos/a/b/releases")`,
+    ].join("")
+    expect(githubWrites(sample)).toBe(false)
+  })
+
+  // GOAL: the spawn-array form of the gh CLI, which this directory already
+  // uses elsewhere, has no `method:` literal at all.
+  test("fires on a gh api write spawned as an argument array", () => {
+    expect(githubWrites(`Bun.spawn(["gh","api","-X","POST","/repos/a/b/issues/1/comments"])`)).toBe(true)
   })
 
   // GOAL: confirm it is scanning the real directory, not an empty set.

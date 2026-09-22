@@ -33,7 +33,7 @@ const GUARD = "github.repository == 'anomalyco/opencode'"
  * guarded on four jobs out of five.
  */
 const ALLOWED = new Map([
-  ["test.yml::unit", "37089be17c89d0f4"],
+  ["test.yml::unit", "b0da023771bf7e68"],
   ["test.yml::e2e", "b945108295daf472"],
   ["typecheck.yml::typecheck", "b82d5ddbd87d3df7"],
 ])
@@ -160,6 +160,35 @@ function canonical(_key: string, value: unknown) {
 }
 
 type Violation = { workflow: string; job: string; reason: string; found: string }
+
+/**
+ * Whether a job is switched off by its `if` value, rather than merely
+ * unguarded.
+ *
+ * Only a YAML boolean `false` counts. Two reviewers disagreed about why, and
+ * sol is the one who is right: GitHub evaluates an `if` value as an expression
+ * even without `${{ }}`, so `if: 'false'` is the expression `false` and IS
+ * falsy - kimi's claim that the quoted form runs was wrong. `if: ${{ 'false' }}`
+ * is the truthy case, because there the expression source is a string literal.
+ *
+ * The strictness is kept deliberately. Disabling a job by relying on how a
+ * quoted scalar is re-parsed as an expression is fragile enough that it should
+ * be written as a guard, and demanding one is the safe direction: the cost is a
+ * false positive carrying a remediation message, where the opposite error lets
+ * a job run unaudited.
+ *
+ * Known limit, raised by glm-5.3: `if: False` and `if: FALSE` also parse to
+ * boolean false and are indistinguishable from `false` after parsing, so they
+ * are exempted too. No workflow uses them.
+ */
+export function isDisabled(value: unknown): boolean {
+  return value === false
+}
+
+/** The `if` value as an expression string, or "" when there is none. */
+export function conditionOf(value: unknown): string {
+  return typeof value === "string" ? value : ""
+}
 
 export type Verdict = "guarded" | "unguarded" | "malformed"
 
@@ -314,7 +343,7 @@ function scanTopLevel(expression: string): "has-or" | "no-or" | "malformed" {
  * otherwise a workflow-only change, which is exactly what this audits, would
  * sail through untested.
  */
-function auditWorkflowViolations(file: string, on: unknown): Violation[] {
+export function auditWorkflowViolations(file: string, on: unknown): Violation[] {
   const problem = (reason: string): Violation => ({ workflow: file, job: "-", reason, found: "" })
 
   // Prefer what GitHub reports over what this file says, and say so when they
@@ -357,8 +386,12 @@ function auditWorkflowViolations(file: string, on: unknown): Violation[] {
     // A branch filter that excludes the default branch is the same hole as a
     // path filter, and the envelope digest only reports that something
     // changed - which is precisely where a change gets rubber-stamped.
-    const branches = filters["branches"]
-    if (Array.isArray(branches) && !branchesCover(branches, defaultBranch))
+    // GitHub's schema accepts a scalar here, and `Array.isArray` skipped it -
+    // so `branches: dev` was a real filter that the structural check ignored,
+    // routing branch changes back onto the envelope digest, which is the
+    // rubber-stamp this check exists to bypass. glm-5.3's finding.
+    const branches = asList(filters["branches"])
+    if (branches && !branchesCover(branches, defaultBranch))
       found.push(
         problem(
           `this audit's own workflow no longer runs on \`${event}\` for ` +
@@ -380,6 +413,13 @@ function auditWorkflowViolations(file: string, on: unknown): Violation[] {
  * textually while excluding it in practice - sol's finding. Patterns are
  * therefore walked in order and the final match decides.
  */
+/** A GitHub filter value, which may be a scalar or a sequence. */
+export function asList(value: unknown): unknown[] | undefined {
+  if (Array.isArray(value)) return value
+  if (typeof value === "string") return [value]
+  return undefined
+}
+
 export function branchesCover(patterns: unknown[], branch: string): boolean {
   let covered = false
 
@@ -439,9 +479,42 @@ export function auditStepViolations(file: string, job: unknown): Violation[] {
     const run = typeof step.run === "string" ? step.run : ""
     if (!run.includes(expected.runs))
       found.push(problem(`the step "${expected.name}" no longer runs \`${expected.runs}\``))
+
+    // glm-5.3's second bypass: the step runs, prints its violations to the log,
+    // and CI stays green because the exit code was swallowed. The audit then
+    // looks alive while controlling nothing - which is worse than its absence,
+    // since a green check is taken as evidence.
+    if (swallowsFailure(run))
+      found.push(
+        problem(
+          `the step "${expected.name}" discards its exit code, so this check reports ` +
+            `problems without failing the build`,
+        ),
+      )
+    if ("continue-on-error" in step)
+      found.push(problem(`the step "${expected.name}" sets continue-on-error, so its failure does not fail CI`))
   }
 
+  if (typeof job === "object" && job !== null && "continue-on-error" in job)
+    found.push(problem("the audit's own job sets continue-on-error, so nothing it finds can fail CI"))
+
   return found
+}
+
+/**
+ * Whether a shell snippet discards a failing exit status.
+ *
+ * `cmd || true`, `cmd || :`, `cmd; true` and `set +e` all keep a step green
+ * while its command fails. This is the reflex edit made to get a branch green,
+ * so it is the likeliest way the audit ends up running but not gating.
+ */
+export function swallowsFailure(run: string): boolean {
+  // `:` needs its own alternative: `\b` after a colon never matches, since a
+  // word boundary requires a word character on one side and `:` is not one.
+  if (/\|\|\s*(?:true\b|:(?:\s|$))/.test(run)) return true
+  if (/;\s*(?:true|:)\s*$/m.test(run)) return true
+  if (/\bset\s+\+e\b/.test(run)) return true
+  return false
 }
 
 /** The local actions a job's steps call, as bare names. */
@@ -461,7 +534,7 @@ function localActionsIn(job: unknown): string[] {
  * and their file lives at `<name>/action.yml`. Pinning them closes the gap
  * between "this job's YAML is unchanged" and "this job does the same thing".
  */
-function localActionViolations(workflowsDir: URL, used: Set<string>): Violation[] {
+export function localActionViolations(workflowsDir: URL, used: Set<string>): Violation[] {
   const found: Violation[] = []
 
   // Discovered from the allowlisted jobs rather than listed by hand: a NEW
@@ -576,21 +649,8 @@ async function main() {
     }
 
     for (const [job, body] of Object.entries(jobs)) {
-      // Only a YAML boolean `false` counts as disabled.
-      //
-      // Two reviewers disagreed about why, and sol is the one who is right:
-      // GitHub evaluates an `if` value as an expression even without `${{ }}`,
-      // so `if: 'false'` is the expression `false` and IS falsy - kimi's claim
-      // that the quoted form runs was wrong. `if: ${{ 'false' }}` is the
-      // truthy case, because there the expression source is a string literal.
-      //
-      // The strictness is kept deliberately. Disabling a job by relying on how
-      // a quoted scalar is re-parsed as an expression is fragile enough that it
-      // should be written as a guard instead, and demanding one is the safe
-      // direction: the cost is a false positive with a remediation message,
-      // where the opposite error would let a job run unaudited.
-      const disabled = body?.if === false
-      const condition = typeof body?.if === "string" ? body.if : ""
+      const disabled = isDisabled(body?.if)
+      const condition = conditionOf(body?.if)
 
       const key = `${file}::${job}`
       if (ALLOWED.has(key)) {
