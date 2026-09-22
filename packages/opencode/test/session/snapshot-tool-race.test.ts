@@ -26,6 +26,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { provideTmpdirServer } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { TestLLMServer } from "../lib/llm-server"
+import { deadline, scaleNote } from "../lib/deadline"
 
 import { LSP } from "@/lsp/lsp"
 import { MCP } from "../../src/mcp"
@@ -123,67 +124,98 @@ const providerCfg = (url: string) => ({
   },
 })
 
-it.live("tool execution produces non-empty session diff (snapshot race)", () =>
-  provideTmpdirServer(
-    Effect.fnUntraced(function* ({ dir, llm }) {
-      const prompt = yield* SessionPrompt.Service
-      const sessions = yield* Session.Service
-      const summary = yield* SessionSummary.Service
+it.live(
+  "tool execution produces non-empty session diff (snapshot race)",
+  () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ dir, llm }) {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const summary = yield* SessionSummary.Service
 
-      const session = yield* sessions.create({
-        title: "snapshot race test",
-        permission: [{ permission: "*", pattern: "*", action: "allow" }],
-      })
+        const session = yield* sessions.create({
+          title: "snapshot race test",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
 
-      // Use bash tool (always registered) to create a file
-      const command = `echo 'snapshot race test content' > ${path.join(dir, "race-test.txt")}`
-      yield* llm.toolMatch((hit) => JSON.stringify(hit.body).includes("create the file"), "bash", {
-        command,
-      })
-      yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes("bash"), "done")
+        // Use bash tool (always registered) to create a file
+        const command = `echo 'snapshot race test content' > ${path.join(dir, "race-test.txt")}`
+        yield* llm.toolMatch((hit) => JSON.stringify(hit.body).includes("create the file"), "bash", {
+          command,
+        })
+        yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes("bash"), "done")
 
-      // Seed user message
-      yield* prompt.prompt({
-        sessionID: session.id,
-        agent: "build",
-        noReply: true,
-        parts: [{ type: "text", text: "create the file" }],
-      })
+        // Seed user message
+        yield* prompt.prompt({
+          sessionID: session.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: "create the file" }],
+        })
 
-      // Run the agent loop
-      const result = yield* prompt.loop({ sessionID: session.id })
-      expect(result.info.role).toBe("assistant")
+        // Run the agent loop
+        const result = yield* prompt.loop({ sessionID: session.id })
+        expect(result.info.role).toBe("assistant")
 
-      // Verify the file was created
-      const filePath = path.join(dir, "race-test.txt")
-      const fileExists = yield* Effect.promise(() =>
-        fs
-          .access(filePath)
-          .then(() => true)
-          .catch(() => false),
-      )
-      expect(fileExists).toBe(true)
+        // Verify the file was created
+        const filePath = path.join(dir, "race-test.txt")
+        const fileExists = yield* Effect.promise(() =>
+          fs
+            .access(filePath)
+            .then(() => true)
+            .catch(() => false),
+        )
+        expect(fileExists).toBe(true)
 
-      // Verify the tool call completed (in the first assistant message)
-      const allMsgs = yield* MessageV2.filterCompactedEffect(session.id)
-      const user = allMsgs.find(
-        (msg): msg is SessionV1.WithParts & { info: SessionV1.User } => msg.info.role === "user",
-      )
-      const tool = allMsgs
-        .flatMap((m) => m.parts)
-        .find((p): p is SessionV1.ToolPart => p.type === "tool" && p.tool === "bash")
-      expect(tool?.state.status).toBe("completed")
-      if (!user) throw new Error("Expected user message")
+        // Verify the tool call completed (in the first assistant message)
+        const allMsgs = yield* MessageV2.filterCompactedEffect(session.id)
+        const user = allMsgs.find(
+          (msg): msg is SessionV1.WithParts & { info: SessionV1.User } => msg.info.role === "user",
+        )
+        const tool = allMsgs
+          .flatMap((m) => m.parts)
+          .find((p): p is SessionV1.ToolPart => p.type === "tool" && p.tool === "bash")
+        expect(tool?.state.status).toBe("completed")
+        if (!user) throw new Error("Expected user message")
 
-      // Poll for the turn diff — summarize() is fire-and-forget.
-      let diff: Array<{ file?: string }> = []
-      for (let i = 0; i < 50; i++) {
-        diff = yield* summary.diff({ sessionID: session.id, messageID: user.info.id })
-        if (diff.length > 0) break
-        yield* Effect.sleep("100 millis")
-      }
-      expect(diff.length).toBeGreaterThan(0)
-    }),
-    { git: true, config: providerCfg },
-  ),
+        // Poll for the turn diff — summarize() is fire-and-forget, so there is no
+        // completion event to await and polling for the observable result is the
+        // right shape. What was wrong was the budget: 50 attempts at 100ms is 5
+        // seconds, which is ample on an idle machine and not ample in a full
+        // concurrent suite. #10 records this test passing in isolation and
+        // failing in a full run, which is that and not a race in the code.
+        const budgetMs = deadline(15_000)
+        const intervalMs = 100
+        const attempts = Math.ceil(budgetMs / intervalMs)
+
+        let diff: Array<{ file?: string }> = []
+        let polls = 0
+        for (; polls < attempts; polls++) {
+          diff = yield* summary.diff({ sessionID: session.id, messageID: user.info.id })
+          if (diff.length > 0) break
+          yield* Effect.sleep(`${intervalMs} millis`)
+        }
+
+        // Attribute an exhausted budget rather than reporting `0 is not > 0`,
+        // which reads as "the diff is empty" when it may mean "the diff had not
+        // been computed yet". The file itself, and its tool call, are already
+        // asserted above, so reaching here with no diff after the full budget is
+        // the only ambiguous outcome left.
+        if (diff.length === 0)
+          throw new Error(
+            `no turn diff after ${polls} polls over ${budgetMs}ms${scaleNote()}. The file was created and the ` +
+              `bash tool completed, so the tool ran: this is either summarize() being slower than the budget ` +
+              `under load, or the snapshot race this test guards. Raise OPENCODE_TEST_TIMEOUT_SCALE to tell them ` +
+              `apart before concluding it is the race.`,
+          )
+        expect(diff.length).toBeGreaterThan(0)
+      }),
+      { git: true, config: providerCfg },
+    ),
+  // The bun-test budget has to comfortably contain the poll budget above, or
+  // the poll can never exhaust and report its diagnostic - it just gets killed
+  // by the outer timeout with "this test timed out after 5000ms", which says
+  // nothing about what was being waited for. Measured: with only the poll
+  // raised, that is exactly what happened.
+  deadline(45_000),
 )
