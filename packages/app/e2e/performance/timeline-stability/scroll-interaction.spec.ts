@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test"
-import {
 import { deadline } from "../../utils/deadline"
+import {
   defineVisualRegions,
   reportVisualStability,
   startVisualProbe,
