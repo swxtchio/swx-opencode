@@ -240,3 +240,41 @@ describe("branchesCover", () => {
     expect(branchesCover(["release/**"], "release/1.0/final")).toBe(true)
   })
 })
+
+describe("reversed guard operands", () => {
+  const REVERSED = "'anomalyco/opencode' == github.repository"
+
+  // GOAL: #23. GitHub evaluates the reversed spelling identically, so
+  // rejecting it was a false positive on a correct condition. Fail-closed, so
+  // never an exposure - but a check that rejects valid input gets worked
+  // around rather than fixed, which is the whole reason this file exists.
+  test.each([
+    REVERSED,
+    `${REVERSED} && github.event.action == 'opened'`,
+    `\${{ ${REVERSED} }}`,
+    `(${REVERSED}) && github.event.action == 'opened'`,
+  ])("accepts %s", (condition) => {
+    expect(guardVerdict(condition, GUARD)).toBe("guarded")
+  })
+
+  // GOAL: accepting the reversed form must not widen anything else. Each of
+  // these is a way the comparison could be made to look like the guard while
+  // not being it, and every bypass closed in #22 must stay closed.
+  test.each([
+    [`${REVERSED} || true`, "a top-level disjunction"],
+    [`(${REVERSED} && a) || b`, "the guard subordinate to a disjunction"],
+    ["'swxtchio/swx-opencode' == github.repository", "a different repository"],
+    ["'anomalyco/opencode' == github.repository_owner", "a different field"],
+    [`github.event_name == 'push' && ${GUARD}`, "the guard not leading"],
+    ["github.repository == github.repository", "a self-comparison"],
+    [`${REVERSED} && github.event.issue.title == '(' || true`, "a quoted paren hiding a disjunction"],
+  ])("rejects %s (%s)", (condition) => {
+    expect(guardVerdict(condition, GUARD)).toBe("unguarded")
+  })
+
+  // GOAL: the canonical spelling is unaffected - this is an addition, not a
+  // replacement.
+  test.each([GUARD, `${GUARD} && github.event.action == 'opened'`])("still accepts the canonical %s", (condition) => {
+    expect(guardVerdict(condition, GUARD)).toBe("guarded")
+  })
+})

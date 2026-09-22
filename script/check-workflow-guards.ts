@@ -233,6 +233,106 @@ export type Verdict = "guarded" | "unguarded" | "malformed"
  * unterminated quote makes the scanner treat the rest of the expression as
  * string data and miss a real top-level `||`.
  */
+/**
+ * How many characters of `rest` the guard occupies, if `rest` STARTS with a
+ * comparison equivalent to it - or undefined.
+ *
+ * Compares the two operands as a set rather than matching the guard's exact
+ * text, so the reversed spelling is accepted:
+ *
+ *   github.repository == 'anomalyco/opencode'
+ *   'anomalyco/opencode' == github.repository
+ *
+ * GitHub evaluates those identically. The previous exact-prefix match rejected
+ * the second as unguarded - fail-closed, so never an exposure, but a false
+ * positive on a correct condition, and #23 records why that matters: a check
+ * which rejects valid input gets worked around rather than fixed.
+ *
+ * Deliberately a set comparison and not a second accepted literal. Two of the
+ * eleven defects found in #22's review came from extending this parser by
+ * adding a pattern, so this adds a rule instead: the leading term must be an
+ * equality between the guard's own two operands, in either order.
+ */
+function leadingGuardLength(rest: string, guard: string): number | undefined {
+  const wanted = splitComparison(guard)
+  if (!wanted) return undefined
+
+  const found = splitComparison(rest, { partial: true })
+  if (!found) return undefined
+  if (found.left !== wanted.left && found.left !== wanted.right) return undefined
+  if (found.right !== wanted.left && found.right !== wanted.right) return undefined
+  if (found.left === found.right) return undefined
+
+  return found.length
+}
+
+/**
+ * Split `a == b` into its operands, ignoring `==` inside strings or brackets.
+ *
+ * With `partial`, the right operand ends at the first top-level `&&`, `||` or
+ * `)` instead of requiring the whole input to be the comparison - which is how
+ * the leading term of a longer condition is read.
+ */
+function splitComparison(
+  expression: string,
+  options?: { readonly partial?: boolean },
+): { left: string; right: string; length: number } | undefined {
+  let depth = 0
+  let inString = false
+  let eq = -1
+
+  for (let i = 0; i < expression.length; i++) {
+    const char = expression[i]
+    if (char === "'") {
+      inString = !inString
+      continue
+    }
+    if (inString) continue
+    if (char === "(") depth++
+    else if (char === ")") {
+      if (depth === 0) break
+      depth--
+    } else if (depth === 0 && char === "=" && expression[i + 1] === "=") {
+      eq = i
+      break
+    }
+  }
+
+  if (eq === -1) return undefined
+
+  const left = expression.slice(0, eq).trim()
+  let end = expression.length
+  depth = 0
+  inString = false
+
+  for (let i = eq + 2; i < expression.length; i++) {
+    const char = expression[i]
+    if (char === "'") {
+      inString = !inString
+      continue
+    }
+    if (inString) continue
+    if (char === "(") depth++
+    else if (char === ")") {
+      if (depth === 0) {
+        end = i
+        break
+      }
+      depth--
+    } else if (
+      depth === 0 &&
+      ((char === "&" && expression[i + 1] === "&") || (char === "|" && expression[i + 1] === "|"))
+    ) {
+      end = i
+      break
+    }
+  }
+
+  if (!options?.partial && end !== expression.length) return undefined
+
+  return { left, right: expression.slice(eq + 2, end).trim(), length: end }
+}
+
 export function guardVerdict(condition: string, guard: string): Verdict {
   // Block scalars arrive with newlines; GitHub treats them as one expression.
   const normalised = stripWrappingParens(stripExpressionSyntax(condition.replace(/\s+/g, " ").trim()))
@@ -253,8 +353,9 @@ export function guardVerdict(condition: string, guard: string): Verdict {
     rest = rest.slice(1).trim()
   }
 
-  if (!rest.startsWith(guard)) return "unguarded"
-  rest = rest.slice(guard.length).trim()
+  const consumed = leadingGuardLength(rest, guard)
+  if (consumed === undefined) return "unguarded"
+  rest = rest.slice(consumed).trim()
 
   let closed = 0
   while (rest.startsWith(")")) {
