@@ -328,11 +328,11 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
  * `/provider` route serves, so a spec configures providers once and both
  * protocols agree.
  */
-function providerCatalog(config: MockServerConfig) {
+export function providerCatalog(config: MockServerConfig) {
   const raw = typeof config.provider === "function" ? config.provider() : config.provider
   const source = (raw ?? {}) as {
     all?: { id?: string; name?: string; options?: unknown; models?: Record<string, unknown> }[]
-    default?: unknown
+    default?: { providerID?: string; modelID?: string }
   }
   const all = Array.isArray(source.all) ? source.all : []
   const providers = all.map((provider) => ({
@@ -340,9 +340,22 @@ function providerCatalog(config: MockServerConfig) {
     name: provider.name ?? provider.id,
     settings: provider.options ?? {},
   }))
+  // normalizeProviderList reads every one of these unconditionally -- notably
+  // `model.time.released`, `model.variants.map` and `cost.cache` -- so a
+  // partial model here throws inside the app instead of failing a route.
   const models = all.flatMap((provider) =>
     Object.entries(provider.models ?? {}).map(([id, model]) => {
       const value = model as Record<string, any>
+      const cost = value.cost
+        ? [
+            {
+              tier: value.cost.tier,
+              input: value.cost.input ?? 0,
+              output: value.cost.output ?? 0,
+              cache: { read: value.cost.cache?.read ?? 0, write: value.cost.cache?.write ?? 0 },
+            },
+          ]
+        : []
       return {
         id,
         providerID: provider.id,
@@ -351,12 +364,24 @@ function providerCatalog(config: MockServerConfig) {
         family: value.family ?? "",
         package: value.api?.npm,
         status: value.status,
-        cost: value.cost ? [value.cost] : [],
+        cost,
+        limit: value.limit,
+        settings: value.options ?? {},
+        headers: value.headers ?? {},
+        time: { released: value.release_date ?? "1970-01-01" },
+        variants: Object.entries(value.variants ?? {}).map(([variantID, settings]) => ({
+          id: variantID,
+          settings: settings ?? {},
+        })),
         capabilities: value.capabilities ?? { input: ["text"], output: ["text"], tools: true },
       }
     }),
   )
-  return { providers, models, defaultModel: source.default ?? null }
+  const fallback = models[0]
+  const chosen = source.default?.modelID
+    ? models.find((model) => model.id === source.default!.modelID && model.providerID === source.default!.providerID)
+    : undefined
+  return { providers, models, defaultModel: chosen ?? fallback ?? null }
 }
 
 function location(config: MockServerConfig) {
