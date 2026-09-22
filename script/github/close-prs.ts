@@ -2,6 +2,8 @@
 
 import { parseArgs } from "util"
 
+import { requireSameRepository } from "./same-repo-guard"
+
 const defaultRepo = "anomalyco/opencode"
 const defaultAgeMonths = 1
 const defaultThreshold = 2
@@ -62,6 +64,8 @@ if (values.execute && values["dry-run"]) {
 
 const token = await requireToken()
 const repo = requireRepo(values.repo)
+
+requireSameRepository(`${repo.owner}/${repo.name}`)
 const threshold = requirePositiveInteger("threshold", values.threshold)
 const ageMonths = requirePositiveInteger("age-months", values["age-months"])
 const maxClose =

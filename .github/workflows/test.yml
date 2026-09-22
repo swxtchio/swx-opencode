@@ -47,6 +47,16 @@ jobs:
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
 
+      - name: Check workflow repository guards
+        run: bun run script/check-workflow-guards.ts
+
+      - name: Test the repository write guard
+        # The root bunfig.toml deliberately points `bun test` at a
+        # non-existent directory to stop tests running from the repository
+        # root, so these run from the script directory instead.
+        working-directory: script/github
+        run: bun test
+
       - name: Configure git identity
         run: |
           git config --global user.email "bot@opencode.ai"
