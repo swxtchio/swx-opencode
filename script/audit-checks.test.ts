@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
+  AUDIT_STEPS,
   asList,
   auditJobModeViolations,
   auditStepViolations,
@@ -104,12 +105,10 @@ describe("swallowsFailure", () => {
 })
 
 describe("auditStepViolations", () => {
-  const good = {
-    steps: [
-      { name: "Check workflow repository guards", run: "bun run script/check-workflow-guards.ts" },
-      { name: "Test the fork guards", run: "ls x > /dev/null\nbun test x" },
-    ],
-  }
+  // Built from the pinned definitions, not retyped: the run text is now
+  // compared for exact equality, so a hand-written fixture would drift from
+  // the thing under test and fail for the wrong reason.
+  const good = { steps: AUDIT_STEPS.map((step) => ({ name: step.name, run: step.run })) }
 
   test("passes a correctly wired job", () => {
     expect(auditStepViolations("test.yml", good)).toEqual([])
@@ -120,6 +119,27 @@ describe("auditStepViolations", () => {
     ["a missing step", { steps: [good.steps[0]] }],
     ["a step made conditional", { steps: [{ ...good.steps[0], if: false }, good.steps[1]] }],
     ["a step whose command was replaced", { steps: [{ ...good.steps[0], run: "echo skipped" }, good.steps[1]] }],
+    // glm-5.3's shapes: substring presence passed all three of these.
+    [
+      "a step that only cats the script",
+      { steps: [{ ...good.steps[0], run: "cat script/check-workflow-guards.ts" }, good.steps[1]] },
+    ],
+    [
+      "a step that pipes failure into echo",
+      { steps: [{ ...good.steps[0], run: `${AUDIT_STEPS[0].run} || echo "findings above"` }, good.steps[1]] },
+    ],
+    [
+      "a gate file dropped from the invocation but left in the ls line",
+      {
+        steps: [
+          good.steps[0],
+          {
+            ...good.steps[1],
+            run: good.steps[1].run.replace(" audit-cli.test.ts", "").replace("ls ", "ls audit-cli.test.ts "),
+          },
+        ],
+      },
+    ],
     [
       "a step that discards its exit code",
       { steps: [{ ...good.steps[0], run: "bun run script/check-workflow-guards.ts || true" }, good.steps[1]] },
@@ -227,5 +247,32 @@ describe("auditWorkflowViolations trigger shapes", () => {
     expect(auditWorkflowViolations("test.yml", { ...on, pull_request: { types: ["opened", "synchronize"] } })).toEqual(
       [],
     )
+  })
+})
+
+describe("auditJobModeViolations skip vectors", () => {
+  // GOAL: the audit's job must produce a RUNNING instance in this fork, which
+  // is a behaviour - not merely "carries no `if` key", which is a structure.
+  // glm-5.3's #1: a one-line guarded `gate` job plus `needs: gate` skips this
+  // job, and GitHub reports a job whose dependency was skipped as SUCCESS, so
+  // the whole audit retires without its `if` ever being touched.
+  test("reports a `needs` dependency", () => {
+    expect(auditJobModeViolations("test.yml", { needs: ["gate"], steps: [] }, true).length).toBe(1)
+  })
+
+  // GOAL: a matrix expanding to nothing skips the job too, with no `if` and no
+  // `needs`.
+  test.each([
+    ["an empty dimension", { settings: [] }],
+    ["a dynamically computed matrix", "${{ fromJSON(needs.x.outputs.m) }}"],
+  ] as [string, unknown][])("reports %s", (_name, matrix) => {
+    expect(auditJobModeViolations("test.yml", { strategy: { matrix }, steps: [] }, true).length).toBe(1)
+  })
+
+  // GOAL: and the real matrix, which has one static entry, must still pass -
+  // otherwise this is just a stricter false positive on the live tree.
+  test("accepts a static non-empty matrix", () => {
+    const job = { strategy: { "fail-fast": false, matrix: { settings: [{ name: "linux" }] } }, steps: [] }
+    expect(auditJobModeViolations("test.yml", job, true)).toEqual([])
   })
 })

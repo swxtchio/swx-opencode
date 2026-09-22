@@ -122,6 +122,16 @@ function reportedDefaultBranch(): string | undefined {
  */
 const AUDIT_JOB = "unit"
 
+/** The test files the gate must actually invoke, in one place so the `ls` existence check and the `bun test` invocation cannot drift apart. */
+const GATE_FILES = [
+  "audit-checks.test.ts",
+  "audit-cli.test.ts",
+  "guard-expression.test.ts",
+  "github/same-repo-guard.test.ts",
+  "github/close-scripts-guard.test.ts",
+  "github/write-guard-coverage.test.ts",
+].join(" ")
+
 /**
  * Each step is identified by name and checked for what it actually runs.
  *
@@ -130,9 +140,15 @@ const AUDIT_JOB = "unit"
  * job's digest cannot help because the disabled step is what computes it. So a
  * step must also carry no condition and still invoke its command.
  */
-const AUDIT_STEPS = [
-  { name: "Check workflow repository guards", runs: "script/check-workflow-guards.ts" },
-  { name: "Test the fork guards", runs: "bun test" },
+export const AUDIT_STEPS = [
+  {
+    name: "Check workflow repository guards",
+    run: "bun run script/check-workflow-guards.ts",
+  },
+  {
+    name: "Test the fork guards",
+    run: [`ls ${GATE_FILES} > /dev/null`, `bun test ${GATE_FILES}`].join("\n"),
+  },
 ]
 
 /**
@@ -514,6 +530,44 @@ export function auditJobModeViolations(file: string, job: unknown, allowlisted: 
   // when required. Every other control - the step attestation, the digests,
   // these tests - runs INSIDE this job, so a skip takes all of them with it and
   // the check reports nothing.
+  // `needs` skips this job when the needed job is skipped, and GitHub reports
+  // THAT as success too - so a guarded one-line `gate` job upstream of this one
+  // retires the whole audit without ever touching its `if`. glm-5.3's finding,
+  // and the eleventh instance: the fix for the ninth asserted the absence of an
+  // `if` KEY where the requirement is that this job produces a running
+  // instance in this fork.
+  if (job !== null && typeof job === "object" && "needs" in job)
+    found.push(
+      problem(
+        "the audit's own job declares `needs`. A job whose dependency is skipped is itself " +
+          "skipped and reported as success, so this check must not depend on another job",
+      ),
+    )
+
+  // A matrix that expands to nothing skips the job as well, with no `if` and no
+  // `needs`. A dynamically computed matrix cannot be checked from here at all.
+  const matrix = (job as { strategy?: { matrix?: unknown } } | undefined)?.strategy?.matrix
+  if (matrix !== undefined) {
+    if (typeof matrix === "string")
+      found.push(
+        problem("the audit's own job computes its matrix dynamically, so whether it runs cannot be verified here"),
+      )
+    else if (matrix === null || typeof matrix !== "object")
+      found.push(problem("the audit's own job has an unreadable matrix"))
+    else {
+      const dimensions = Object.entries(matrix as Record<string, unknown>).filter(([key]) => key !== "include")
+      const empty = dimensions.filter(([, value]) => !Array.isArray(value) || value.length === 0)
+      if (dimensions.length && empty.length)
+        found.push(
+          problem(
+            `the audit's own job has an empty matrix dimension (${empty
+              .map(([key]) => key)
+              .join(", ")}), so it expands to no jobs and is skipped`,
+          ),
+        )
+    }
+  }
+
   if (job !== null && typeof job === "object" && "if" in job) {
     const condition = conditionOf((job as { if?: unknown }).if)
     found.push(
@@ -557,21 +611,23 @@ export function auditStepViolations(file: string, job: unknown): Violation[] {
     if ("if" in step)
       found.push(problem(`the step "${expected.name}" has a condition, so it can be skipped without being removed`))
 
-    const run = typeof step.run === "string" ? step.run : ""
-    if (!run.includes(expected.runs))
-      found.push(problem(`the step "${expected.name}" no longer runs \`${expected.runs}\``))
-
-    // glm-5.3's second bypass: the step runs, prints its violations to the log,
-    // and CI stays green because the exit code was swallowed. The audit then
-    // looks alive while controlling nothing - which is worse than its absence,
-    // since a green check is taken as evidence.
-    if (swallowsFailure(run))
+    // EXACT equality, not "contains the command".
+    //
+    // Substring presence let `cat script/check-workflow-guards.ts` and
+    // `... || echo "findings above"` both pass while the audit stopped gating,
+    // and every fix for one spelling invited the next: `|| true`, then
+    // `|| exit 0`, then `|| echo`. glm-5.3's point is that a blacklist of
+    // spellings is the wrong shape - so the step's script is pinned, the way
+    // the job digests are. Any deliberate change updates this constant.
+    const run = normaliseRun(typeof step.run === "string" ? step.run : "")
+    if (run !== normaliseRun(expected.run))
       found.push(
         problem(
-          `the step "${expected.name}" discards its exit code, so this check reports ` +
-            `problems without failing the build`,
+          `the step "${expected.name}" no longer runs exactly what it should. ` +
+            `Expected:\n${expected.run}\nFound:\n${run || "(nothing)"}`,
         ),
       )
+
     if ("continue-on-error" in step)
       found.push(problem(`the step "${expected.name}" sets continue-on-error, so its failure does not fail CI`))
   }
@@ -588,6 +644,21 @@ export function auditStepViolations(file: string, job: unknown): Violation[] {
  * `cmd || true`, `cmd || :`, `cmd; true` and `set +e` all keep a step green
  * while its command fails. This is the reflex edit made to get a branch green,
  * so it is the likeliest way the audit ends up running but not gating.
+ */
+/** Collapse incidental whitespace so formatting is not a violation. */
+export function normaliseRun(run: string): string {
+  return run
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n")
+}
+
+/**
+ * Retained as a second, independent signal. The exact-equality pin above is
+ * what actually closes this family - a blacklist of spellings loses to the next
+ * spelling - but this still catches the shape in any run text that is compared
+ * less strictly.
  */
 export function swallowsFailure(run: string): boolean {
   // `:` needs its own alternative: `\b` after a colon never matches, since a

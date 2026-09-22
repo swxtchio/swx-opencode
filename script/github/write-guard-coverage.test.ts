@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { AUDIT_STEPS, normaliseRun } from "../check-workflow-guards"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 
@@ -14,6 +15,15 @@ const WORKFLOWS = join(SCRIPT_DIR, "../.github/workflows")
  * wired in. Dropping either step is then caught by the other.
  */
 
+type Step = { name?: string; run?: string; if?: unknown }
+
+function auditJob(): Record<string, unknown> & { steps?: Step[] } {
+  const workflow = Bun.YAML.parse(readFileSync(join(WORKFLOWS, "test.yml"), "utf8")) as {
+    jobs?: { unit?: Record<string, unknown> & { steps?: Step[] } }
+  }
+  return workflow.jobs?.unit ?? {}
+}
+
 function scriptFiles(): string[] {
   return [...new Bun.Glob("**/*.ts").scanSync({ cwd: SCRIPT_DIR })]
     .filter((file) => !file.endsWith(".test.ts"))
@@ -25,22 +35,27 @@ describe("the audit stays wired into CI", () => {
   // merge conflict resolution. check-workflow-guards.ts asserts both steps
   // exist, but it can only do so while it is still being run - so this
   // asserts it from the other side.
-  test.each([
-    ["Check workflow repository guards", "script/check-workflow-guards.ts"],
-    ["Test the fork guards", "bun test"],
-  ])('test.yml still runs the step "%s", unconditionally', (name, runs) => {
-    const workflow = Bun.YAML.parse(readFileSync(join(WORKFLOWS, "test.yml"), "utf8")) as {
-      jobs?: { unit?: { steps?: { name?: string; run?: string; if?: unknown }[] } }
-    }
-    const step = (workflow.jobs?.unit?.steps ?? []).find((candidate) => candidate?.name === name)
+  // GOAL: the other half of the attestation, and it must be as strict as the
+  // script's half. glm-5.3 showed both legs were substring checks, so they
+  // passed together against `cat script/check-workflow-guards.ts` and against
+  // `... || echo "findings above"`. Comparing the step's whole script to the
+  // pinned value closes that family - and also closes the hole where a gate
+  // file stayed in the `ls` line while being dropped from the `bun test`
+  // invocation, because the invocation is part of the pinned text.
+  test.each(AUDIT_STEPS)('test.yml runs the step "$name" exactly as pinned', ({ name, run }) => {
+    const step = auditJob().steps?.find((candidate) => candidate?.name === name)
 
     expect(step).toBeDefined()
-    // Names alone are not enough - sol's finding. `if: false` on the step
-    // disables the audit while leaving the name for a name-only check to find,
-    // and the allowlisted job's digest cannot catch it because the disabled
-    // step is what computes that digest.
     expect(step && "if" in step).toBe(false)
-    expect(step?.run ?? "").toContain(runs)
+    expect(normaliseRun(step?.run ?? "")).toBe(normaliseRun(run))
+  })
+
+  // GOAL: and the job itself must be able to run at all - no condition, and no
+  // dependency on a job that could be skipped, which reports success too.
+  test("the audit's own job is unconditional and independent", () => {
+    const job = auditJob()
+    expect("if" in job).toBe(false)
+    expect("needs" in job).toBe(false)
   })
 
   // GOAL: `bun test` ignores a positional filter that matches nothing as long
