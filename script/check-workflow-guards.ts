@@ -28,6 +28,43 @@ const ALLOWED = new Set(["test.yml::unit", "test.yml::e2e", "typecheck.yml::type
 
 type Violation = { workflow: string; job: string; reason: string; found: string }
 
+/**
+ * True when `condition` cannot be true outside the guarded repository.
+ *
+ * A substring test is not enough, and the difference is exploitable rather than
+ * theoretical. `&&` binds tighter than `||` in GitHub expressions, so both of
+ * these contain the guard verbatim and both still run here:
+ *
+ *   github.repository == 'anomalyco/opencode' || github.repository == 'swxtchio/swx-opencode'
+ *   github.repository == 'anomalyco/opencode' && github.event.action == 'opened' || true
+ *
+ * So the guard must be the leading term of a top-level conjunction: the whole
+ * condition, or `GUARD && rest` where `rest` contains no `||` outside
+ * parentheses. `GUARD && (a || b)` is fine - the disjunction is subordinate to
+ * the guard.
+ */
+export function isGuarded(condition: string, guard: string): boolean {
+  // Block scalars arrive with newlines; GitHub treats them as one expression.
+  const normalised = condition.replace(/\s+/g, " ").trim()
+  if (normalised === guard) return true
+
+  const prefix = `${guard} &&`
+  if (!normalised.startsWith(prefix)) return false
+
+  return !hasTopLevelOr(normalised.slice(prefix.length))
+}
+
+function hasTopLevelOr(expression: string): boolean {
+  let depth = 0
+  for (let i = 0; i < expression.length; i++) {
+    const char = expression[i]
+    if (char === "(") depth++
+    else if (char === ")") depth--
+    else if (char === "|" && expression[i + 1] === "|" && depth === 0) return true
+  }
+  return false
+}
+
 async function main() {
   const dir = new URL("../.github/workflows/", import.meta.url)
   const files = [...new Bun.Glob("*.{yml,yaml}").scanSync({ cwd: Bun.fileURLToPath(dir) })].sort()
@@ -62,14 +99,16 @@ async function main() {
         disabled++
         continue
       }
-      if (condition.includes(GUARD)) {
+      if (isGuarded(condition, GUARD)) {
         guarded++
         continue
       }
       violations.push({
         workflow: file,
         job,
-        reason: condition ? "condition does not include the repository guard" : "no condition at all",
+        reason: condition
+          ? "the repository guard is not the leading term of a top-level conjunction"
+          : "no condition at all",
         found: condition,
       })
     }
@@ -101,9 +140,14 @@ async function main() {
     console.error(`      ${v.reason}`)
     if (v.found) console.error(`      if: ${v.found}`)
   }
-  console.error(`\nAdd  if: ${GUARD}  to each job, or add the workflow to ALLOWED in this script`)
-  console.error(`with a reason if this fork genuinely needs it to run.`)
+  console.error(`\nEach job needs  if: ${GUARD}  on its own, or as`)
+  console.error(`  if: ${GUARD} && (<the existing condition>)`)
+  console.error(`Otherwise add the job to ALLOWED in this script as <workflow>::<job>,`)
+  console.error(`with a reason, if this fork genuinely needs it to run.`)
   process.exit(1)
 }
 
-await main()
+// Only audit when run as a command. Without this the module cannot be imported
+// for testing: the audit would execute on import, and its process.exit(1) on
+// failure would kill the test run rather than fail a test.
+if (import.meta.main) await main()

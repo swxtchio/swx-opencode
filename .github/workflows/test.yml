@@ -50,12 +50,14 @@ jobs:
       - name: Check workflow repository guards
         run: bun run script/check-workflow-guards.ts
 
-      - name: Test the repository write guard
+      - name: Test the fork guards
         # The root bunfig.toml deliberately points `bun test` at a
         # non-existent directory to stop tests running from the repository
-        # root, so these run from the script directory instead.
-        working-directory: script/github
-        run: bun test
+        # root, so these run from the script directory. Named explicitly rather
+        # than letting bun scan: a bare `bun test` here would also collect
+        # translate-app.test.ts, which is not part of this gate.
+        working-directory: script
+        run: bun test guard-expression.test.ts github/same-repo-guard.test.ts
 
       - name: Configure git identity
         run: |
