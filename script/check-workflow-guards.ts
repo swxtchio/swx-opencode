@@ -59,8 +59,8 @@ const ALLOWED_ACTIONS = new Map([["setup-bun", "0b8495c0a438973b"]])
  * RUNS is part of what is being trusted.
  */
 const ALLOWED_ENVELOPES = new Map([
-  ["test.yml", "3fc9bf50af782993"],
-  ["typecheck.yml", "91a87487fd18a357"],
+  ["test.yml", "0e4560dca190d1b3"],
+  ["typecheck.yml", "783bae590157a011"],
 ])
 
 /**

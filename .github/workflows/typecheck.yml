@@ -7,6 +7,14 @@ on:
     branches: [swxtch]
   workflow_dispatch:
 
+env:
+  # Turborepo telemetry is on by default and POSTs anonymous usage data to
+  # Vercel. This fork runs only these two workflows, so opting out here is the
+  # whole surface. Raised by sol during the #22 review as the one outward-facing
+  # action still reachable from this fork.
+  TURBO_TELEMETRY_DISABLED: 1
+  DO_NOT_TRACK: 1
+
 jobs:
   typecheck:
     runs-on: ubuntu-latest
