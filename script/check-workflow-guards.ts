@@ -504,14 +504,28 @@ export function auditJobModeViolations(file: string, job: unknown, allowlisted: 
       ),
     )
 
-  const condition = conditionOf((job as { if?: unknown } | undefined)?.if)
-  if (condition.includes(GUARD))
+  // Unconditional, not merely unguarded.
+  //
+  // This first checked whether the condition contained the guard - asserting
+  // one spelling where the requirement is a behaviour, which is the ninth
+  // instance of this branch's recurring defect and the second inside a fix for
+  // the eighth. sol found it: `if: false` on this job, or any condition at all,
+  // skips it, and GitHub reports a job skipped by its own `if` as SUCCESS even
+  // when required. Every other control - the step attestation, the digests,
+  // these tests - runs INSIDE this job, so a skip takes all of them with it and
+  // the check reports nothing.
+  if (job !== null && typeof job === "object" && "if" in job) {
+    const condition = conditionOf((job as { if?: unknown }).if)
     found.push(
       problem(
-        "the audit's own job carries the repository guard, so it never runs in this fork " +
-          "and neither does this check. Allowlist it instead",
+        condition.includes(GUARD)
+          ? "the audit's own job carries the repository guard, so it never runs in this fork " +
+              "and neither does this check. Allowlist it instead"
+          : "the audit's own job has a condition. It must be unconditional: a job skipped by its " +
+              "own `if` reports success, and every check in this file runs inside it",
       ),
     )
+  }
 
   return found
 }

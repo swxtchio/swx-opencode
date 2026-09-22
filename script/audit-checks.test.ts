@@ -167,6 +167,22 @@ describe("auditJobModeViolations", () => {
     expect(auditJobModeViolations("test.yml", job, true).length).toBe(1)
     expect(auditJobModeViolations("test.yml", job, false).length).toBe(2)
   })
+
+  // GOAL: the requirement is that this job is UNCONDITIONAL, not that its
+  // condition avoids one spelling. sol found that the first version asserted
+  // the spelling: `if: false`, an owner check, or an event check all skip the
+  // job, GitHub reports a job skipped by its own `if` as SUCCESS even when
+  // required, and every control in this file runs inside that job - so a skip
+  // takes the step attestation, the digests and these tests with it.
+  test.each([
+    ["if: false", false],
+    ["an owner check", "github.repository_owner == 'anomalyco'"],
+    ["an event check", "github.event_name == 'schedule'"],
+    ["if: true, which is still a condition", true],
+    ["an empty condition", ""],
+  ] as [string, unknown][])("reports %s on the audit's own job", (_name, condition) => {
+    expect(auditJobModeViolations("test.yml", { if: condition, steps: [] }, true).length).toBeGreaterThan(0)
+  })
 })
 
 describe("auditWorkflowViolations trigger shapes", () => {
