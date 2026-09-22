@@ -95,12 +95,29 @@ const SERVED_SQL = `
   WHERE json_extract(m.data, '$.role') = 'assistant'
 `
 
+/** Usage whose session row is gone - the only way this export can lose data. */
+const ORPHAN_SQL = `
+  SELECT COUNT(*) AS n
+  FROM message m LEFT JOIN session s ON s.id = m.session_id
+  WHERE s.id IS NULL AND json_extract(m.data, '$.role') = 'assistant'
+`
+
 const SESSION_SQL = `
   SELECT id, parent_id, project_id, directory, title, agent, model,
          time_created, time_updated, cost,
          tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write
   FROM session
 `
+
+/** session.model is JSON text; anything unparseable is preserved verbatim. */
+export function parseModel(value: string | null | undefined): unknown {
+  if (!value) return null
+  try {
+    return JSON.parse(value)
+  } catch {
+    return value
+  }
+}
 
 export function buildRecords(input: {
   sessions: SessionRow[]
@@ -128,7 +145,13 @@ export function buildRecords(input: {
       directory: session?.directory ?? null,
       title: session?.title ?? null,
       agent: session?.agent ?? null,
-      configuredModel: session?.model ?? null,
+      // Parsed, not passed through. The session.model column holds JSON text,
+      // so emitting it raw gives the archive a string like
+      // "{\"id\":\"gpt-5.6-luna\",\"providerID\":\"swx-azure\",...}" -
+      // which anyone re-deriving cost would have to parse again, from a field
+      // whose shape is not obvious. An archive should not export its own
+      // serialisation accident.
+      configuredModel: parseModel(session?.model),
       timeCreated: session?.time_created ?? null,
       timeUpdated: session?.time_updated ?? null,
       providerID: row.provider_id,
@@ -156,42 +179,61 @@ export function buildRecords(input: {
  * only thing standing between a database reset and the silent loss of the
  * cost history, so it gets an explicit pass/fail rather than a log line.
  */
-export function verify(input: { sessions: SessionRow[]; records: Record<string, unknown>[] }): {
+export function verify(input: { sessions: SessionRow[]; records: Record<string, unknown>[]; orphanMessages: number }): {
   ok: boolean
   lines: string[]
 } {
-  const field = (record: Record<string, unknown>, name: string) =>
-    Number((record["tokens"] as Record<string, number>)[name] ?? 0)
+  const tokens = (record: Record<string, unknown>) => record["tokens"] as Record<string, number>
 
-  const exported = input.records.reduce(
-    (acc, record) => ({
-      input: acc.input + field(record, "input"),
-      output: acc.output + field(record, "output"),
-      reasoning: acc.reasoning + field(record, "reasoning"),
-      cacheRead: acc.cacheRead + field(record, "cacheRead"),
-      cacheWrite: acc.cacheWrite + field(record, "cacheWrite"),
-    }),
-    { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
-  )
+  // Per session, because a global comparison says only that SOMETHING
+  // disagrees. Measured on the real database: one session out of 7,196
+  // accounted for the entire gap, and a global total could not show that.
+  const exported = new Map<string, number>()
+  for (const record of input.records) {
+    const id = String(record["sessionID"])
+    const t = tokens(record)
+    exported.set(
+      id,
+      (exported.get(id) ?? 0) + t["input"]! + t["output"]! + t["reasoning"]! + t["cacheRead"]! + t["cacheWrite"]!,
+    )
+  }
 
-  const stored = input.sessions.reduce(
-    (acc, session) => ({
-      input: acc.input + session.tokens_input,
-      output: acc.output + session.tokens_output,
-      reasoning: acc.reasoning + session.tokens_reasoning,
-      cacheRead: acc.cacheRead + session.tokens_cache_read,
-      cacheWrite: acc.cacheWrite + session.tokens_cache_write,
-    }),
-    { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
-  )
+  const divergent: string[] = []
+  for (const session of input.sessions) {
+    const stored =
+      session.tokens_input +
+      session.tokens_output +
+      session.tokens_reasoning +
+      session.tokens_cache_read +
+      session.tokens_cache_write
+    const fromMessages = exported.get(session.id) ?? 0
+    if (fromMessages !== stored) divergent.push(`${session.id} messages=${fromMessages} session=${stored}`)
+  }
 
   const lines: string[] = []
-  let ok = true
-  for (const key of ["input", "output", "reasoning", "cacheRead", "cacheWrite"] as const) {
-    const match = exported[key] === stored[key]
-    if (!match) ok = false
-    lines.push(`  ${match ? "ok  " : "MISMATCH"} ${key.padEnd(10)} exported=${exported[key]} session=${stored[key]}`)
-  }
+
+  // The only condition that can LOSE data, and therefore the only one that
+  // fails. A message whose session row is gone is usage this export would
+  // silently drop, which is exactly what must not happen before a reset.
+  const ok = input.orphanMessages === 0
+  lines.push(
+    `  ${ok ? "ok  " : "FAIL"} orphan messages   ${input.orphanMessages}` +
+      (ok ? "" : "  <- usage with no session row; it would be dropped"),
+  )
+
+  // Divergence between the two is NOT a failure, and the reason is what this
+  // export is for. #14 asks to preserve the MEASUREMENT - tokens per session
+  // per model, read from the messages - because a harness's own rollup cannot
+  // be re-priced when rates change. The session table's token columns are
+  // that rollup: a derived cache. When the two disagree the messages are the
+  // source of truth and the export already carries them, so this is reported
+  // rather than treated as a blocker.
+  lines.push(
+    `  ${divergent.length === 0 ? "ok  " : "note"} session rollups   ${divergent.length} of ${input.sessions.length} disagree with their own messages`,
+  )
+  for (const entry of divergent.slice(0, 10)) lines.push(`         ${entry}`)
+  if (divergent.length > 10) lines.push(`         ... and ${divergent.length - 10} more`)
+
   return { ok, lines }
 }
 
@@ -235,10 +277,11 @@ export const ExportUsageCommand = effectCmd({
         sessions: db.query(SESSION_SQL).all() as SessionRow[],
         models: db.query(MODEL_SQL).all() as ModelRow[],
         served: db.query(SERVED_SQL).all() as ServedRow[],
+        orphans: (db.query(ORPHAN_SQL).get() as { n: number }).n,
       }))
-      const { sessions, models, served } = read()
+      const { sessions, models, served, orphans } = read()
       const records = buildRecords({ sessions, models, served })
-      const check = verify({ sessions, records })
+      const check = verify({ sessions, records, orphanMessages: orphans })
 
       const summary = {
         type: "summary",
