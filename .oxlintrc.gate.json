@@ -1,0 +1,22 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicolo-ribaudo/oxc-project.github.io/refs/heads/json-schema/src/public/.oxlintrc.schema.json",
+  "options": {
+    "typeAware": false
+  },
+  "categories": {},
+  "rules": {
+    "no-dupe-keys": "error",
+    "no-dupe-class-members": "error",
+    "no-dupe-else-if": "error",
+    "no-duplicate-case": "error",
+    "no-self-assign": "error",
+    "no-self-compare": "error",
+    "no-unsafe-negation": "error",
+    "use-isnan": "error",
+    "no-constant-binary-expression": "error",
+    "getter-return": "error",
+    "no-import-assign": "error",
+    "no-setter-return": "error",
+    "no-unreachable": "error"
+  }
+}
