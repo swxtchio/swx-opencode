@@ -31,7 +31,7 @@ const GUARD = "github.repository == 'anomalyco/opencode'"
  * guarded on four jobs out of five.
  */
 const ALLOWED = new Map([
-  ["test.yml::unit", "318e0d4c46ed1743"],
+  ["test.yml::unit", "37089be17c89d0f4"],
   ["test.yml::e2e", "b945108295daf472"],
   ["typecheck.yml::typecheck", "b82d5ddbd87d3df7"],
 ])
@@ -67,6 +67,22 @@ const AUDIT_WORKFLOW = "test.yml"
  * is named here and asserted rather than assumed.
  */
 const DEFAULT_BRANCH = "swxtch"
+
+/**
+ * The two steps that run this audit and its tests, and the job they live in.
+ *
+ * They attest to each other. This script asserts both steps exist; the test
+ * suite the second step runs asserts the same thing. So dropping either one -
+ * the likeliest accident, a conflict resolution during an upstream merge -
+ * is caught by the other.
+ *
+ * The residual is honest: removing BOTH in one edit leaves nothing running to
+ * notice, because the digest that would change is computed only by the step
+ * being removed. That is a bootstrap limit of any in-CI check, and it takes a
+ * deliberate two-part edit that is plainly visible in a diff.
+ */
+const AUDIT_JOB = "unit"
+const AUDIT_STEPS = ["Check workflow repository guards", "Test the fork guards"]
 
 /**
  * Digest of an allowlisted job's definition.
@@ -292,10 +308,31 @@ function auditWorkflowViolations(file: string, on: unknown): Violation[] {
   return found
 }
 
+/**
+ * Half of the mutual attestation described at AUDIT_STEPS. If an upstream
+ * merge drops the step that runs this audit, nothing would run to notice - the
+ * job digest that changes is computed only by the step that was removed. So
+ * the audit asserts its own wiring while it still has the chance.
+ */
+export function auditStepViolations(file: string, job: unknown): Violation[] {
+  const steps = (job as { steps?: { name?: unknown }[] } | undefined)?.steps
+  if (!Array.isArray(steps))
+    return [{ workflow: file, job: AUDIT_JOB, reason: "the audit's own job has no steps", found: "" }]
+
+  const names = new Set(steps.map((step) => step?.name).filter((name): name is string => typeof name === "string"))
+
+  return AUDIT_STEPS.filter((step) => !names.has(step)).map((step) => ({
+    workflow: file,
+    job: AUDIT_JOB,
+    reason: `the step "${step}" is gone, so this check no longer runs in CI`,
+    found: "",
+  }))
+}
+
 async function main() {
   const dir = new URL("../.github/workflows/", import.meta.url)
   const files = [...new Bun.Glob("*.{yml,yaml}").scanSync({ cwd: Bun.fileURLToPath(dir) })].sort()
-  if (files.length === 0) throw new Error("no workflows found - is this running from the repository root?")
+  if (files.length === 0) throw new Error(`no workflows found in ${Bun.fileURLToPath(dir)}`)
 
   const violations: Violation[] = []
 
@@ -314,7 +351,7 @@ async function main() {
       found: "",
     })
   let guarded = 0
-  let disabled = 0
+  let disabledJobs = 0
   let allowed = 0
   const matched: string[] = []
 
@@ -339,7 +376,10 @@ async function main() {
         })
     }
 
-    if (file === AUDIT_WORKFLOW) violations.push(...auditWorkflowViolations(file, parsed?.on))
+    if (file === AUDIT_WORKFLOW) {
+      violations.push(...auditWorkflowViolations(file, parsed?.on))
+      violations.push(...auditStepViolations(file, parsed?.jobs?.[AUDIT_JOB]))
+    }
 
     const jobs = parsed?.jobs
     if (!jobs || typeof jobs !== "object") {
@@ -348,8 +388,12 @@ async function main() {
     }
 
     for (const [job, body] of Object.entries(jobs)) {
-      // `if:` may parse as a boolean when written bare, e.g. `if: false`.
-      const condition = typeof body?.if === "string" ? body.if : body?.if === false ? "false" : ""
+      // `if: false` parses as a YAML boolean; `if: 'false'` parses as a string
+      // and GitHub treats a non-empty string as TRUTHY, so that job runs. Only
+      // the boolean counts as disabled - conflating them fails open, which is
+      // the wrong direction for an audit whose whole job is to fail closed.
+      const disabled = body?.if === false
+      const condition = typeof body?.if === "string" ? body.if : ""
 
       const key = `${file}::${job}`
       if (ALLOWED.has(key)) {
@@ -367,8 +411,8 @@ async function main() {
           })
         continue
       }
-      if (condition.trim() === "false") {
-        disabled++
+      if (disabled) {
+        disabledJobs++
         continue
       }
       const verdict = guardVerdict(condition, GUARD)
@@ -391,7 +435,7 @@ async function main() {
   }
 
   console.log(
-    `checked ${files.length} workflows: ${guarded} guarded, ${disabled} disabled, ` +
+    `checked ${files.length} workflows: ${guarded} guarded, ${disabledJobs} disabled, ` +
       `${allowed}/${ALLOWED.size} allowed (${[...ALLOWED.keys()].join(", ")})`,
   )
 

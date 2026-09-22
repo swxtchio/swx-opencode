@@ -57,7 +57,12 @@ jobs:
         # than letting bun scan: a bare `bun test` here would also collect
         # translate-app.test.ts, which is not part of this gate.
         working-directory: script
-        run: bun test guard-expression.test.ts github/same-repo-guard.test.ts github/close-scripts-guard.test.ts
+        # `ls` first: bun ignores a positional filter that matches nothing as
+        # long as another matches, so a renamed test file would silently drop
+        # out of this gate instead of failing it.
+        run: |
+          ls guard-expression.test.ts github/same-repo-guard.test.ts github/close-scripts-guard.test.ts github/write-guard-coverage.test.ts > /dev/null
+          bun test guard-expression.test.ts github/same-repo-guard.test.ts github/close-scripts-guard.test.ts github/write-guard-coverage.test.ts
 
       - name: Configure git identity
         run: |
