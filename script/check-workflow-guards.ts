@@ -121,7 +121,19 @@ function reportedDefaultBranch(): string | undefined {
  * deliberate two-part edit that is plainly visible in a diff.
  */
 const AUDIT_JOB = "unit"
-const AUDIT_STEPS = ["Check workflow repository guards", "Test the fork guards"]
+
+/**
+ * Each step is identified by name and checked for what it actually runs.
+ *
+ * Names alone are not enough: sol pointed out that adding `if: false` to the
+ * audit step disables it while both names remain present, and the allowlisted
+ * job's digest cannot help because the disabled step is what computes it. So a
+ * step must also carry no condition and still invoke its command.
+ */
+const AUDIT_STEPS = [
+  { name: "Check workflow repository guards", runs: "script/check-workflow-guards.ts" },
+  { name: "Test the fork guards", runs: "bun test" },
+]
 
 /**
  * Digest of an allowlisted job's definition.
@@ -346,7 +358,7 @@ function auditWorkflowViolations(file: string, on: unknown): Violation[] {
     // path filter, and the envelope digest only reports that something
     // changed - which is precisely where a change gets rubber-stamped.
     const branches = filters["branches"]
-    if (Array.isArray(branches) && !branches.includes(defaultBranch))
+    if (Array.isArray(branches) && !branchesCover(branches, defaultBranch))
       found.push(
         problem(
           `this audit's own workflow no longer runs on \`${event}\` for ` +
@@ -361,24 +373,75 @@ function auditWorkflowViolations(file: string, on: unknown): Violation[] {
 }
 
 /**
+ * Whether a GitHub branch filter list actually includes `branch`.
+ *
+ * Membership is not enough. GitHub evaluates these as ORDERED globs where the
+ * last matching pattern wins, so `[swxtch, "!swxtch"]` contains the branch
+ * textually while excluding it in practice - sol's finding. Patterns are
+ * therefore walked in order and the final match decides.
+ */
+export function branchesCover(patterns: unknown[], branch: string): boolean {
+  let covered = false
+
+  for (const pattern of patterns) {
+    if (typeof pattern !== "string") continue
+    const negated = pattern.startsWith("!")
+    const glob = negated ? pattern.slice(1) : pattern
+    if (!matchesGlob(glob, branch)) continue
+    covered = !negated
+  }
+
+  return covered
+}
+
+/** GitHub's filter-pattern subset: `*` stops at `/`, `**` does not. */
+function matchesGlob(pattern: string, value: string): boolean {
+  const source = pattern
+    .split("**")
+    .map((part) =>
+      part
+        .split("*")
+        .map((literal) => literal.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+        .join("[^/]*"),
+    )
+    .join(".*")
+
+  return new RegExp(`^${source}$`).test(value)
+}
+
+/**
  * Half of the mutual attestation described at AUDIT_STEPS. If an upstream
  * merge drops the step that runs this audit, nothing would run to notice - the
  * job digest that changes is computed only by the step that was removed. So
  * the audit asserts its own wiring while it still has the chance.
  */
 export function auditStepViolations(file: string, job: unknown): Violation[] {
-  const steps = (job as { steps?: { name?: unknown }[] } | undefined)?.steps
+  const steps = (job as { steps?: { name?: unknown; run?: unknown; if?: unknown }[] } | undefined)?.steps
   if (!Array.isArray(steps))
     return [{ workflow: file, job: AUDIT_JOB, reason: "the audit's own job has no steps", found: "" }]
 
-  const names = new Set(steps.map((step) => step?.name).filter((name): name is string => typeof name === "string"))
+  const problem = (reason: string): Violation => ({ workflow: file, job: AUDIT_JOB, reason, found: "" })
+  const found: Violation[] = []
 
-  return AUDIT_STEPS.filter((step) => !names.has(step)).map((step) => ({
-    workflow: file,
-    job: AUDIT_JOB,
-    reason: `the step "${step}" is gone, so this check no longer runs in CI`,
-    found: "",
-  }))
+  for (const expected of AUDIT_STEPS) {
+    const step = steps.find((candidate) => candidate?.name === expected.name)
+
+    if (!step) {
+      found.push(problem(`the step "${expected.name}" is gone, so this check no longer runs in CI`))
+      continue
+    }
+
+    // A condition on the step is the single-edit way to switch the audit off
+    // while leaving its name in place for a name-only assertion to find.
+    if ("if" in step)
+      found.push(problem(`the step "${expected.name}" has a condition, so it can be skipped without being removed`))
+
+    const run = typeof step.run === "string" ? step.run : ""
+    if (!run.includes(expected.runs))
+      found.push(problem(`the step "${expected.name}" no longer runs \`${expected.runs}\``))
+  }
+
+  return found
 }
 
 /** The local actions a job's steps call, as bare names. */
@@ -513,10 +576,19 @@ async function main() {
     }
 
     for (const [job, body] of Object.entries(jobs)) {
-      // `if: false` parses as a YAML boolean; `if: 'false'` parses as a string
-      // and GitHub treats a non-empty string as TRUTHY, so that job runs. Only
-      // the boolean counts as disabled - conflating them fails open, which is
-      // the wrong direction for an audit whose whole job is to fail closed.
+      // Only a YAML boolean `false` counts as disabled.
+      //
+      // Two reviewers disagreed about why, and sol is the one who is right:
+      // GitHub evaluates an `if` value as an expression even without `${{ }}`,
+      // so `if: 'false'` is the expression `false` and IS falsy - kimi's claim
+      // that the quoted form runs was wrong. `if: ${{ 'false' }}` is the
+      // truthy case, because there the expression source is a string literal.
+      //
+      // The strictness is kept deliberately. Disabling a job by relying on how
+      // a quoted scalar is re-parsed as an expression is fragile enough that it
+      // should be written as a guard instead, and demanding one is the safe
+      // direction: the cost is a false positive with a remediation message,
+      // where the opposite error would let a job run unaudited.
       const disabled = body?.if === false
       const condition = typeof body?.if === "string" ? body.if : ""
 

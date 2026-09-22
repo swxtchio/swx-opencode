@@ -25,16 +25,23 @@ describe("the audit stays wired into CI", () => {
   // merge conflict resolution. check-workflow-guards.ts asserts both steps
   // exist, but it can only do so while it is still being run - so this
   // asserts it from the other side.
-  test.each(["Check workflow repository guards", "Test the fork guards"])(
-    'test.yml still runs the step "%s"',
-    (step) => {
-      const workflow = Bun.YAML.parse(readFileSync(join(WORKFLOWS, "test.yml"), "utf8")) as {
-        jobs?: { unit?: { steps?: { name?: string; run?: string }[] } }
-      }
-      const names = (workflow.jobs?.unit?.steps ?? []).map((s) => s?.name)
-      expect(names).toContain(step)
-    },
-  )
+  test.each([
+    ["Check workflow repository guards", "script/check-workflow-guards.ts"],
+    ["Test the fork guards", "bun test"],
+  ])('test.yml still runs the step "%s", unconditionally', (name, runs) => {
+    const workflow = Bun.YAML.parse(readFileSync(join(WORKFLOWS, "test.yml"), "utf8")) as {
+      jobs?: { unit?: { steps?: { name?: string; run?: string; if?: unknown }[] } }
+    }
+    const step = (workflow.jobs?.unit?.steps ?? []).find((candidate) => candidate?.name === name)
+
+    expect(step).toBeDefined()
+    // Names alone are not enough - sol's finding. `if: false` on the step
+    // disables the audit while leaving the name for a name-only check to find,
+    // and the allowlisted job's digest cannot catch it because the disabled
+    // step is what computes that digest.
+    expect(step && "if" in step).toBe(false)
+    expect(step?.run ?? "").toContain(runs)
+  })
 
   // GOAL: `bun test` ignores a positional filter that matches nothing as long
   // as another one matches, so renaming a test file would silently drop it
@@ -55,16 +62,29 @@ describe("the audit stays wired into CI", () => {
 })
 
 /**
- * Whether a source file issues a WRITE to the GitHub API.
+ * Whether a source file issues a WRITE to GitHub.
  *
- * The verb has to be associated with its URL. A first attempt asked only
- * whether the file contained a write verb anywhere and mentioned
- * api.github.com anywhere, and flagged script/stats.ts - whose only write is a
- * POST to PostHog, with an unrelated GitHub read sixty lines away. A detector
- * that cries wolf gets deleted, so the verb is matched against the nearest
- * preceding URL instead.
+ * Two shapes, because there are two ways these scripts reach GitHub:
+ *
+ * 1. `fetch`/request options carrying a write method, matched against the
+ *    nearest preceding URL. An earlier version asked only whether a file
+ *    contained a write verb anywhere and mentioned api.github.com anywhere,
+ *    and flagged script/stats.ts - whose only write is a POST to PostHog, with
+ *    an unrelated GitHub read sixty lines below. A detector that cries wolf
+ *    gets deleted, so the verb has to be associated with its target.
+ * 2. The `gh` CLI with an explicit write method, which sol pointed out has no
+ *    `method:` property at all and so bypassed the first shape entirely.
+ *
+ * Known residual: a request whose URL is a variable is invisible to a regex,
+ * and `gh` subcommands that write without naming a method (`gh issue close`)
+ * are not detected. This is a backstop for a future oversight, not a
+ * containment boundary - the workflow guards are that.
  */
 export function githubWrites(source: string): boolean {
+  return writesViaFetch(source) || writesViaGhCli(source)
+}
+
+function writesViaFetch(source: string): boolean {
   const WRITE = /method:\s*["'](POST|PATCH|PUT|DELETE)["']/g
 
   for (const match of source.matchAll(WRITE)) {
@@ -72,17 +92,33 @@ export function githubWrites(source: string): boolean {
     // Bare paths have to be extractable too, or a bare-path write has no
     // "nearest URL" at all and is skipped rather than matched.
     const url = /https?:\/\/[^"'`\s]+|\/(?:repos|graphql)[^"'`\s]*/g
-    const urls = [...window.matchAll(url)]
-    const nearest = urls.at(-1)?.[0]
+    const nearest = [...window.matchAll(url)].at(-1)?.[0]
     if (!nearest) continue
-    // `/graphql` as well as `/repos/`: GraphQL mutations are a full GitHub
-    // write surface. A full `https://api.github.com/graphql` URL is already
-    // caught by the host test, but the bare-path form is not.
-    if (nearest.includes("api.github.com")) return true
-    if (nearest.startsWith("/repos/") || nearest.startsWith("/graphql")) return true
+    if (isGitHubTarget(nearest)) return true
   }
 
   return false
+}
+
+/**
+ * `gh api --method PATCH /repos/...` and `gh api -X POST ...` are GitHub
+ * writes with no request options for the first shape to find.
+ */
+function writesViaGhCli(source: string): boolean {
+  return /gh\s+api\b[^`"'\n]*(?:--method|-X)\s+(POST|PATCH|PUT|DELETE)\b/i.test(source)
+}
+
+/**
+ * Any github.com host, not just api.github.com: uploads.github.com takes
+ * release-asset uploads, which are writes.
+ */
+function isGitHubTarget(url: string): boolean {
+  if (/^https?:\/\/[^/]*\bgithub\.com\b/i.test(url)) return true
+  return url.startsWith("/repos/") || url.startsWith("/graphql")
+}
+
+export function importsGuard(source: string): boolean {
+  return /(?:^|\n)\s*import\s[^\n]*["'][^"'\n]*same-repo-guard["']/.test(source)
 }
 
 /** Characters to look back for the URL a request is aimed at. */
@@ -97,7 +133,9 @@ describe("every GitHub-writing script carries the repository guard", () => {
   test("no unguarded script issues a GitHub write", () => {
     const offenders = scriptFiles()
       .filter((file) => githubWrites(readFileSync(file, "utf8")))
-      .filter((file) => !readFileSync(file, "utf8").includes("same-repo-guard"))
+      // An IMPORT, not a mention: sol noted that a comment naming the guard
+      // would otherwise exempt an unguarded writer.
+      .filter((file) => !importsGuard(readFileSync(file, "utf8")))
       .map((file) => file.replace(SCRIPT_DIR, ""))
 
     expect(offenders).toEqual([])
@@ -112,8 +150,29 @@ describe("every GitHub-writing script carries the repository guard", () => {
     // full-URL form was already caught, the bare-path form was not.
     `await fetch("https://api.github.com/graphql", { method: "POST" })`,
     `await githubRequest("/graphql", { method: "POST" })`,
+    // The gh CLI shapes, which have no request options at all.
+    "await $`gh api --method PATCH /repos/${repo}/issues/1 -f state=closed`",
+    "await $`gh api -X POST /repos/a/b/issues/1/comments -f body=hi`",
+    // Release-asset uploads go to a different host.
+    `await fetch("https://uploads.github.com/repos/a/b/releases/1/assets", { method: "POST" })`,
   ])("fires on a GitHub write", (sample) => {
     expect(githubWrites(sample)).toBe(true)
+  })
+
+  // GOAL: a comment or string mentioning the guard must not exempt a writer -
+  // only a real import does.
+  test.each(["// this file deliberately does not use same-repo-guard\n", `const note = "same-repo-guard"`])(
+    "does not accept a mere mention of the guard as importing it",
+    (sample) => {
+      expect(importsGuard(sample)).toBe(false)
+    },
+  )
+
+  test.each([
+    `import { requireSameRepository } from "./same-repo-guard"`,
+    `import {requireSameRepository} from './same-repo-guard'`,
+  ])("accepts a real import of the guard", (sample) => {
+    expect(importsGuard(sample)).toBe(true)
   })
 
   // GOAL: and that it does not fire on the shapes that are NOT GitHub writes -

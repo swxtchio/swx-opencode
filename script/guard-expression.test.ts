@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { digest, guardVerdict, isGuarded } from "./check-workflow-guards"
+import { branchesCover, digest, guardVerdict, isGuarded } from "./check-workflow-guards"
 
 const GUARD = "github.repository == 'anomalyco/opencode'"
 
@@ -201,5 +201,42 @@ describe("${{ }}-wrapped conditions", () => {
   // top-level once the wrapper is removed.
   test.each([`\${{ ${GUARD} || true }}`, `\${{ ${GUARD} && a || true }}`])("rejects %s", (condition) => {
     expect(guardVerdict(condition, GUARD)).toBe("unguarded")
+  })
+})
+
+describe("branchesCover", () => {
+  // GOAL: GitHub evaluates branch filters as ORDERED globs where the last
+  // matching pattern wins, so textual membership is the wrong test. sol's
+  // case: the branch is listed and then excluded.
+  test("a later negation excludes a branch that is listed earlier", () => {
+    expect(branchesCover(["swxtch", "!swxtch"], "swxtch")).toBe(false)
+  })
+
+  // GOAL: and the reverse order re-includes it, which is why order matters
+  // rather than merely the presence of a negation.
+  test("a later positive re-includes a branch excluded earlier", () => {
+    expect(branchesCover(["!swxtch", "swxtch"], "swxtch")).toBe(true)
+  })
+
+  test.each([
+    [["swxtch"], true],
+    [["main", "swxtch"], true],
+    [["main"], false],
+    [[], false],
+    // `*` does not cross a slash, `**` does - GitHub's filter-pattern subset.
+    [["*"], true],
+    [["swx*"], true],
+    [["release/*"], false],
+    [["**"], true],
+  ] as [string[], boolean][])("covers %p -> %p", (patterns, expected) => {
+    expect(branchesCover(patterns, "swxtch")).toBe(expected)
+  })
+
+  // GOAL: a glob that stops at a slash must not match a nested branch name,
+  // or the check would accept a filter that misses the real branch.
+  test("* does not cross a slash", () => {
+    expect(branchesCover(["release/*"], "release/1.0")).toBe(true)
+    expect(branchesCover(["release/*"], "release/1.0/final")).toBe(false)
+    expect(branchesCover(["release/**"], "release/1.0/final")).toBe(true)
   })
 })
