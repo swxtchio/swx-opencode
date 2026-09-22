@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { providerCatalog } from "../../../e2e/utils/mock-server"
-import { normalizeProviderList } from "./utils"
+import { providerCatalog } from "./mock-server"
+import { normalizeProviderList } from "../../src/context/global-sync/utils"
 
 /**
  * GOAL: the e2e mock's v2 catalog routes must return something
@@ -58,7 +58,7 @@ describe("mock server v2 catalog", () => {
       connected: ["opencode"],
       default: { providerID: "opencode", modelID: "thinking-model" },
     })
-    expect(Object.keys(result.all.get("opencode")!.models["thinking-model"]!.variants)).toEqual(["high"])
+    expect(Object.keys(result.all.get("opencode")!.models["thinking-model"]!.variants ?? {})).toEqual(["high"])
   })
 
   test("a function-valued provider config is resolved", () => {
