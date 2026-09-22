@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 /**
  * GOAL: prove the enforcement is WIRED, not merely that the comparison helper
@@ -23,10 +26,15 @@ const UPSTREAM = "anomalyco/opencode"
 const THIS_FORK = "swxtchio/swx-opencode"
 
 async function run(script: string, args: string[], env: Record<string, string | undefined>) {
+  // HOME must be a throwaway directory. The environment is replaced rather than
+  // inherited, and with HOME unset the gh CLI - which close-prs.ts may invoke
+  // for a token - writes its state relative to the cwd, which committed
+  // script/.local/state/gh/device-id into the repository once already.
+  const home = mkdtempSync(join(tmpdir(), "guard-test-home-"))
   const proc = Bun.spawn(["bun", new URL(script, import.meta.url).pathname, ...args], {
     // A dummy token is supplied so a failure to refuse shows up as a
     // credentials error from the API rather than a missing-token exit.
-    env: { PATH: process.env.PATH ?? "", GITHUB_TOKEN: "dummy-not-a-real-token", ...env },
+    env: { PATH: process.env.PATH ?? "", HOME: home, GITHUB_TOKEN: "dummy-not-a-real-token", ...env },
     stdout: "pipe",
     stderr: "pipe",
   })
@@ -35,6 +43,7 @@ async function run(script: string, args: string[], env: Record<string, string | 
     new Response(proc.stderr).text(),
     proc.exited,
   ])
+  rmSync(home, { recursive: true, force: true })
   return { stdout, stderr, exitCode }
 }
 

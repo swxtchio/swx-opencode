@@ -35,10 +35,7 @@ describe("checkSameRepository", () => {
   // GOAL: an empty or whitespace value is absence, not a repository name.
   // Without this, `GITHUB_REPOSITORY=""` would compare unequal to the target
   // and produce the "while running in " message with a blank name.
-  test.each([
-    ["", "empty"],
-    ["   ", "whitespace"],
-  ])("refuses a %s GITHUB_REPOSITORY as unset (%s)", (value) => {
+  test.each(["", "   "])("refuses a blank GITHUB_REPOSITORY (%p) as unset", (value) => {
     const result = checkSameRepository(TARGET, { GITHUB_REPOSITORY: value })
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error("unreachable")

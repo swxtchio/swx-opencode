@@ -77,3 +77,38 @@ describe("digest", () => {
     expect(digest(a)).not.toBe(digest(b))
   })
 })
+
+describe("isGuarded string-literal handling", () => {
+  // GOAL: close the bypass glm-5.3 found. A paren inside a string literal used
+  // to raise the paren depth for the remainder of the expression, hiding a
+  // genuine top-level `||`. GitHub parses this as `(guard && title == '(')
+  // || true`, which is true in every repository.
+  test.each([
+    `github.repository == 'anomalyco/opencode' && github.event.issue.title == '(' || true`,
+    `github.repository == 'anomalyco/opencode' && contains(github.event.head_commit.message, '(') || true`,
+    // Closing paren in a literal: drives depth negative, so a later `||` at
+    // depth -1 was also missed.
+    `github.repository == 'anomalyco/opencode' && github.event.issue.title == ')' || true`,
+  ])("rejects a condition hiding a top-level || behind a quoted paren", (condition) => {
+    expect(isGuarded(condition, GUARD)).toBe(false)
+  })
+
+  // GOAL: the mirror-image false positive. A `||` INSIDE a literal is data,
+  // not an operator, so the condition is genuinely guarded and must be
+  // accepted - otherwise the check rejects valid conditions and gets worked
+  // around rather than fixed.
+  test.each([
+    `github.repository == 'anomalyco/opencode' && contains(github.event.head_commit.message, 'a||b')`,
+    `github.repository == 'anomalyco/opencode' && github.event.issue.title != '||'`,
+  ])("accepts a || that is inside a string literal", (condition) => {
+    expect(isGuarded(condition, GUARD)).toBe(true)
+  })
+
+  // GOAL: GitHub writes a literal quote as '' with no escapes, so the toggle
+  // must survive it - '' toggles out and straight back in, leaving the scanner
+  // correctly inside the string.
+  test("handles a doubled quote inside a literal", () => {
+    expect(isGuarded(`${GUARD} && github.event.issue.title == 'it''s (' || true`, GUARD)).toBe(false)
+    expect(isGuarded(`${GUARD} && github.event.issue.title == 'it''s fine'`, GUARD)).toBe(true)
+  })
+})

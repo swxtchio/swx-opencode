@@ -3,6 +3,12 @@
  * GOAL: prove that no inherited upstream workflow can take an outward-facing
  * action from this fork.
  *
+ * Delivery path: this runs as a step in test.yml::unit, which today has no
+ * `paths:` filter, so every push to the default branch and every pull request
+ * is audited. Adding a `paths:` filter to test.yml, or moving this step, would
+ * silently stop auditing workflow-only changes - the failure mode being
+ * silence rather than a red check.
+ *
  * Every job in every workflow must either
  *   - carry the canonical repository guard, so it evaluates false here, or
  *   - be permanently disabled (`if: false`), or
@@ -79,12 +85,32 @@ export function isGuarded(condition: string, guard: string): boolean {
 
 function hasTopLevelOr(expression: string): boolean {
   let depth = 0
+  let inString = false
+
   for (let i = 0; i < expression.length; i++) {
     const char = expression[i]
+
+    // String literals must be skipped, not just counted through. A literal
+    // containing an unbalanced paren would otherwise raise the depth for the
+    // rest of the expression and hide a genuine top-level `||`:
+    //
+    //   guard && github.event.issue.title == '(' || true
+    //
+    // which GitHub parses as `(guard && title == '(') || true` - true in every
+    // repository. GitHub's single-quoted strings have no escape sequences and
+    // represent a literal quote as '', so a plain toggle is exact: the two
+    // quotes of '' toggle out and straight back in.
+    if (char === "'") {
+      inString = !inString
+      continue
+    }
+    if (inString) continue
+
     if (char === "(") depth++
     else if (char === ")") depth--
     else if (char === "|" && expression[i + 1] === "|" && depth === 0) return true
   }
+
   return false
 }
 
