@@ -69,11 +69,17 @@ export function githubWrites(source: string): boolean {
 
   for (const match of source.matchAll(WRITE)) {
     const window = source.slice(Math.max(0, match.index - WINDOW), match.index)
-    const url = /https?:\/\/[^"'`\s]+|\/repos\/[^"'`\s]+/g
+    // Bare paths have to be extractable too, or a bare-path write has no
+    // "nearest URL" at all and is skipped rather than matched.
+    const url = /https?:\/\/[^"'`\s]+|\/(?:repos|graphql)[^"'`\s]*/g
     const urls = [...window.matchAll(url)]
     const nearest = urls.at(-1)?.[0]
     if (!nearest) continue
-    if (nearest.includes("api.github.com") || nearest.startsWith("/repos/")) return true
+    // `/graphql` as well as `/repos/`: GraphQL mutations are a full GitHub
+    // write surface. A full `https://api.github.com/graphql` URL is already
+    // caught by the host test, but the bare-path form is not.
+    if (nearest.includes("api.github.com")) return true
+    if (nearest.startsWith("/repos/") || nearest.startsWith("/graphql")) return true
   }
 
   return false
@@ -102,6 +108,10 @@ describe("every GitHub-writing script carries the repository guard", () => {
   test.each([
     `await fetch("https://api.github.com/repos/x/y/issues/1", { method: "PATCH" })`,
     `await githubRequest(\`/repos/\${owner}/\${name}/issues/1/comments\`, { method: "POST" })`,
+    // GraphQL mutations are a write surface too. codex raised this; the
+    // full-URL form was already caught, the bare-path form was not.
+    `await fetch("https://api.github.com/graphql", { method: "POST" })`,
+    `await githubRequest("/graphql", { method: "POST" })`,
   ])("fires on a GitHub write", (sample) => {
     expect(githubWrites(sample)).toBe(true)
   })

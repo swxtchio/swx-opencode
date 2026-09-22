@@ -1,4 +1,6 @@
 #!/usr/bin/env bun
+
+import { existsSync, readFileSync } from "node:fs"
 /**
  * GOAL: prove that no inherited upstream workflow can take an outward-facing
  * action from this fork.
@@ -45,6 +47,17 @@ const ALLOWED = new Map([
  * add a `paths:` filter to test.yml and workflow-only changes stop being
  * audited, silently.
  */
+const ALLOWED_ACTIONS = new Map([["setup-bun", "0b8495c0a438973b"]])
+
+/**
+ * Digest of each local composite action an allowlisted job calls out to.
+ *
+ * codex raised this as the third drift axis: the job digest pins a job's own
+ * YAML and the envelope digest pins everything but the jobs, so both can pass
+ * while `./.github/actions/setup-bun` - which every allowlisted job uses -
+ * changes underneath them with an upstream merge. What an allowlisted job
+ * RUNS is part of what is being trusted.
+ */
 const ALLOWED_ENVELOPES = new Map([
   ["test.yml", "3fc9bf50af782993"],
   ["typecheck.yml", "91a87487fd18a357"],
@@ -61,12 +74,38 @@ const ALLOWED_ENVELOPES = new Map([
 const AUDIT_WORKFLOW = "test.yml"
 
 /**
- * This fork's default branch. Scheduled workflows only ever fire from the
- * default branch, and it is the branch the audit has to cover on push -
- * `github.event.repository.default_branch` is not available to a script, so it
- * is named here and asserted rather than assumed.
+ * This fork's default branch, as a fallback for local runs.
+ *
+ * Scheduled workflows only ever fire from the default branch, and it is the
+ * branch the audit has to cover on push. A hardcoded name rots silently: if
+ * the default branch were renamed, a stale `branches: [swxtch]` would keep
+ * satisfying the assertion while no longer covering anything, which codex
+ * raised. So in CI the real value is read from the event payload and the
+ * constant is checked against it.
  */
 const DEFAULT_BRANCH = "swxtch"
+
+/**
+ * The default branch GitHub itself reports, or undefined outside Actions.
+ *
+ * `github.event.repository.default_branch` is not an environment variable, but
+ * the whole event payload is on disk at GITHUB_EVENT_PATH, so the authoritative
+ * value is available rather than assumed.
+ */
+function reportedDefaultBranch(): string | undefined {
+  const path = process.env.GITHUB_EVENT_PATH
+  if (!path) return undefined
+  try {
+    const event = JSON.parse(readFileSync(path, "utf8")) as { repository?: { default_branch?: unknown } }
+    const branch = event?.repository?.default_branch
+    return typeof branch === "string" && branch ? branch : undefined
+  } catch {
+    // A malformed or unreadable payload must not fail the audit for an
+    // unrelated reason; the constant still applies and its staleness simply
+    // goes unchecked on this run.
+    return undefined
+  }
+}
 
 /**
  * The two steps that run this audit and its tests, and the job they live in.
@@ -266,10 +305,23 @@ function scanTopLevel(expression: string): "has-or" | "no-or" | "malformed" {
 function auditWorkflowViolations(file: string, on: unknown): Violation[] {
   const problem = (reason: string): Violation => ({ workflow: file, job: "-", reason, found: "" })
 
-  if (!on || typeof on !== "object") return [problem("this audit's own workflow declares no triggers")]
+  // Prefer what GitHub reports over what this file says, and say so when they
+  // disagree - a stale constant would otherwise be satisfied by an equally
+  // stale branch filter, and neither would be covering the default branch.
+  const reported = reportedDefaultBranch()
+  const defaultBranch = reported ?? DEFAULT_BRANCH
+  const found: Violation[] = []
+  if (reported && reported !== DEFAULT_BRANCH)
+    found.push(
+      problem(
+        `DEFAULT_BRANCH in this script is "${DEFAULT_BRANCH}" but GitHub reports ` +
+          `"${reported}". Update the constant, then re-check which branches the audit covers`,
+      ),
+    )
+
+  if (!on || typeof on !== "object") return [...found, problem("this audit's own workflow declares no triggers")]
 
   const triggers = on as Record<string, unknown>
-  const found: Violation[] = []
 
   for (const event of ["push", "pull_request"]) {
     if (!(event in triggers)) {
@@ -294,11 +346,11 @@ function auditWorkflowViolations(file: string, on: unknown): Violation[] {
     // path filter, and the envelope digest only reports that something
     // changed - which is precisely where a change gets rubber-stamped.
     const branches = filters["branches"]
-    if (Array.isArray(branches) && !branches.includes(DEFAULT_BRANCH))
+    if (Array.isArray(branches) && !branches.includes(defaultBranch))
       found.push(
         problem(
           `this audit's own workflow no longer runs on \`${event}\` for ` +
-            `\`${DEFAULT_BRANCH}\`, so changes to the default branch are not audited`,
+            `\`${defaultBranch}\`, so changes to the default branch are not audited`,
         ),
       )
     if ("branches-ignore" in filters)
@@ -329,6 +381,78 @@ export function auditStepViolations(file: string, job: unknown): Violation[] {
   }))
 }
 
+/** The local actions a job's steps call, as bare names. */
+function localActionsIn(job: unknown): string[] {
+  const steps = (job as { steps?: { uses?: unknown }[] } | undefined)?.steps
+  if (!Array.isArray(steps)) return []
+
+  return steps
+    .map((step) => step?.uses)
+    .filter((uses): uses is string => typeof uses === "string")
+    .map((uses) => /^\.\/\.github\/actions\/([^/]+)\/?$/.exec(uses)?.[1])
+    .filter((name): name is string => Boolean(name))
+}
+
+/**
+ * Local composite actions are referenced as `uses: ./.github/actions/<name>`
+ * and their file lives at `<name>/action.yml`. Pinning them closes the gap
+ * between "this job's YAML is unchanged" and "this job does the same thing".
+ */
+function localActionViolations(workflowsDir: URL, used: Set<string>): Violation[] {
+  const found: Violation[] = []
+
+  // Discovered from the allowlisted jobs rather than listed by hand: a NEW
+  // `uses: ./.github/actions/...` added to an allowlisted job would otherwise
+  // be unpinned, which is the same gap one level down.
+  for (const name of used)
+    if (!ALLOWED_ACTIONS.has(name))
+      found.push({
+        workflow: `actions/${name}`,
+        job: "-",
+        reason:
+          "an allowlisted job uses a local action that is not pinned. Review what it does, " +
+          "then add it to ALLOWED_ACTIONS with the digest a pinned entry prints",
+        found: "",
+      })
+
+  for (const [name, expected] of ALLOWED_ACTIONS) {
+    if (!used.has(name)) {
+      found.push({
+        workflow: `actions/${name}`,
+        job: "-",
+        reason: "a local action is pinned but no allowlisted job uses it any more, so the pin guards nothing",
+        found: "",
+      })
+      continue
+    }
+    const candidates = ["action.yml", "action.yaml"].map((file) => new URL(`../actions/${name}/${file}`, workflowsDir))
+    const path = candidates.find((candidate) => existsSync(candidate))
+
+    if (!path) {
+      found.push({
+        workflow: `actions/${name}`,
+        job: "-",
+        reason: "a pinned local action is missing, so an allowlisted job calls something that is not there",
+        found: "",
+      })
+      continue
+    }
+
+    const actual = digest(Bun.YAML.parse(readFileSync(path, "utf8")))
+    if (actual !== expected)
+      found.push({
+        workflow: `actions/${name}`,
+        job: "-",
+        reason:
+          `a local action used by an allowlisted job changed. Review what it now does, ` +
+          `then set its digest to ${actual}`,
+        found: "",
+      })
+  }
+
+  return found
+}
+
 async function main() {
   const dir = new URL("../.github/workflows/", import.meta.url)
   const files = [...new Bun.Glob("*.{yml,yaml}").scanSync({ cwd: Bun.fileURLToPath(dir) })].sort()
@@ -354,6 +478,7 @@ async function main() {
   let disabledJobs = 0
   let allowed = 0
   const matched: string[] = []
+  const usedLocalActions = new Set<string>()
 
   for (const file of files) {
     const parsed = Bun.YAML.parse(await Bun.file(new URL(file, dir)).text()) as {
@@ -399,6 +524,7 @@ async function main() {
       if (ALLOWED.has(key)) {
         allowed++
         matched.push(key)
+        for (const name of localActionsIn(body)) usedLocalActions.add(name)
         const actual = digest(body)
         if (ALLOWED.get(key) !== actual)
           violations.push({
@@ -486,6 +612,8 @@ async function main() {
       found: "",
     })
   }
+
+  violations.push(...localActionViolations(dir, usedLocalActions))
 
   if (violations.length === 0) return
 
