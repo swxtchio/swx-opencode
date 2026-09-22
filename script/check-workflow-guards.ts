@@ -15,8 +15,16 @@
 
 const GUARD = "github.repository == 'anomalyco/opencode'"
 
-/** Workflows this fork adapted for its own use and must keep running. */
-const ALLOWED = new Set(["test.yml", "typecheck.yml"])
+/**
+ * Jobs this fork adapted for its own use and must keep running, keyed
+ * `<workflow>::<job>`.
+ *
+ * Deliberately per-job rather than per-workflow: if it were per-workflow, a job
+ * added to test.yml by a future upstream merge would be allowed silently, which
+ * is the same shape as the bug this check exists to catch - publish.yml was
+ * guarded on four jobs out of five.
+ */
+const ALLOWED = new Set(["test.yml::unit", "test.yml::e2e", "typecheck.yml::typecheck"])
 
 type Violation = { workflow: string; job: string; reason: string; found: string }
 
@@ -29,6 +37,7 @@ async function main() {
   let guarded = 0
   let disabled = 0
   let allowed = 0
+  const matched: string[] = []
 
   for (const file of files) {
     const parsed = Bun.YAML.parse(await Bun.file(new URL(file, dir)).text()) as {
@@ -44,8 +53,9 @@ async function main() {
       // `if:` may parse as a boolean when written bare, e.g. `if: false`.
       const condition = typeof body?.if === "string" ? body.if : body?.if === false ? "false" : ""
 
-      if (ALLOWED.has(file)) {
+      if (ALLOWED.has(`${file}::${job}`)) {
         allowed++
+        matched.push(`${file}::${job}`)
         continue
       }
       if (condition.trim() === "false") {
@@ -66,8 +76,22 @@ async function main() {
   }
 
   console.log(
-    `checked ${files.length} workflows: ${guarded} guarded, ${disabled} disabled, ${allowed} allowed (${[...ALLOWED].join(", ")})`,
+    `checked ${files.length} workflows: ${guarded} guarded, ${disabled} disabled, ` +
+      `${allowed}/${ALLOWED.size} allowed (${[...ALLOWED].join(", ")})`,
   )
+
+  // An allowlist entry that matches nothing is stale - the job was renamed or
+  // removed - and a stale entry silently stops protecting whatever replaced it.
+  if (allowed !== ALLOWED.size) {
+    const seen = new Set(matched)
+    const stale = [...ALLOWED].filter((entry) => !seen.has(entry))
+    violations.push({
+      workflow: "-",
+      job: "-",
+      reason: `allowlist entries match no job, so they no longer protect anything: ${stale.join(", ")}`,
+      found: "",
+    })
+  }
 
   if (violations.length === 0) return
 
