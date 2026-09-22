@@ -2468,3 +2468,120 @@ noLLMServer.instance(
     }),
   30_000,
 )
+
+// GOAL: #18. An unknown effort used to reach request.ts, where
+// `input.model.variants[variant]` is undefined and merges as nothing - so
+// `--effort hgih` changed the request in no way and reported nothing. The
+// issue's own words: a silently ignored effort level is worse than a rejected
+// one.
+it.instance("rejects an unknown effort and lists the ones the model has", () =>
+  Effect.gen(function* () {
+    yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Effort",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    // Effect.exit + Cause.squash, matching compaction.test.ts. Effect.either
+    // does not exist in this Effect version (4.0.0-beta.83).
+    const exit = yield* Effect.exit(
+      prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        variant: "hgih",
+        parts: [{ type: "text", text: "hello" }],
+      }),
+    )
+
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) throw new Error("unreachable")
+    const error = Cause.squash(exit.cause)
+    // The text lives in `data.message`, not `.message` - matching the
+    // "Agent not found" assertion earlier in this file. Reading `.message`
+    // gives the tag, "UnknownError", which passes no useful assertion.
+    expect(NamedError.Unknown.isInstance(error)).toBe(true)
+    if (!NamedError.Unknown.isInstance(error)) throw new Error("unreachable")
+    expect(error.data.message).toContain('Unknown effort "hgih"')
+    expect(error.data.message).toContain("test/test-model")
+    // The test model declares no variants, so an effort could never have done
+    // anything for it - which is worth saying rather than ignoring.
+    expect(error.data.message).toContain("declares none")
+  }),
+)
+
+// GOAL: and the sentinel still works. "default" means "no variant" elsewhere
+// in this file, so validating it would break the selector's own reset path.
+it.instance("accepts the default sentinel without checking it", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Default effort",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      variant: "default",
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.text("ok")
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    expect(result.info.role).toBe("assistant")
+  }),
+)
+
+// GOAL: the other branch - #18 asks for the available levels, not a bare
+// rejection, so a model that DOES declare variants must list them.
+it.instance("lists the available efforts when the model declares some", () =>
+  Effect.gen(function* () {
+    yield* useServerConfig((url) => {
+      const base = providerCfg(url)
+      return {
+        ...base,
+        provider: {
+          ...base.provider,
+          test: {
+            ...base.provider.test,
+            models: {
+              "test-model": {
+                ...base.provider.test.models["test-model"],
+                variants: { low: { reasoningEffort: "low" }, high: { reasoningEffort: "high" } },
+              },
+            },
+          },
+        },
+      } as Partial<ConfigV1.Info>
+    })
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Effort list",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+
+    const exit = yield* Effect.exit(
+      prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        variant: "nope",
+        parts: [{ type: "text", text: "hello" }],
+      }),
+    )
+
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) throw new Error("unreachable")
+    const error = Cause.squash(exit.cause)
+    expect(NamedError.Unknown.isInstance(error)).toBe(true)
+    if (!NamedError.Unknown.isInstance(error)) throw new Error("unreachable")
+    expect(error.data.message).toContain("Available:")
+    expect(error.data.message).toContain("high")
+    expect(error.data.message).toContain("low")
+  }),
+)
