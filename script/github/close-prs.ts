@@ -62,10 +62,13 @@ if (values.execute && values["dry-run"]) {
   process.exit(1)
 }
 
-const token = await requireToken()
 const repo = requireRepo(values.repo)
 
+// Before requireToken(): that may shell out to `gh auth token`, and a refusal
+// must not depend on credentials being obtainable.
 requireSameRepository(`${repo.owner}/${repo.name}`)
+
+const token = await requireToken()
 const threshold = requirePositiveInteger("threshold", values.threshold)
 const ageMonths = requirePositiveInteger("age-months", values["age-months"])
 const maxClose =

@@ -57,7 +57,7 @@ jobs:
         # than letting bun scan: a bare `bun test` here would also collect
         # translate-app.test.ts, which is not part of this gate.
         working-directory: script
-        run: bun test guard-expression.test.ts github/same-repo-guard.test.ts
+        run: bun test guard-expression.test.ts github/same-repo-guard.test.ts github/close-scripts-guard.test.ts
 
       - name: Configure git identity
         run: |

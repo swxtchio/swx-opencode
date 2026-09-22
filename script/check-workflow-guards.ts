@@ -24,7 +24,30 @@ const GUARD = "github.repository == 'anomalyco/opencode'"
  * is the same shape as the bug this check exists to catch - publish.yml was
  * guarded on four jobs out of five.
  */
-const ALLOWED = new Set(["test.yml::unit", "test.yml::e2e", "typecheck.yml::typecheck"])
+const ALLOWED = new Map([
+  ["test.yml::unit", "318e0d4c46ed1743"],
+  ["test.yml::e2e", "b945108295daf472"],
+  ["typecheck.yml::typecheck", "b82d5ddbd87d3df7"],
+])
+
+/**
+ * Digest of an allowlisted job's definition.
+ *
+ * An allowlist keyed only by name trusts the job's CONTENTS forever: a future
+ * upstream merge could add a publishing step, a `uses:` reusable workflow or
+ * `secrets: inherit` to test.yml::unit and this check would still pass. Pinning
+ * the definition means any change to an allowed job fails until someone looks
+ * at it and updates the digest deliberately.
+ */
+export function digest(job: unknown): string {
+  return Bun.SHA256.hash(JSON.stringify(job, canonical), "hex").slice(0, 16)
+}
+
+/** Sort object keys so key order in the YAML cannot change the digest. */
+function canonical(_key: string, value: unknown) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)))
+}
 
 type Violation = { workflow: string; job: string; reason: string; found: string }
 
@@ -90,9 +113,20 @@ async function main() {
       // `if:` may parse as a boolean when written bare, e.g. `if: false`.
       const condition = typeof body?.if === "string" ? body.if : body?.if === false ? "false" : ""
 
-      if (ALLOWED.has(`${file}::${job}`)) {
+      const key = `${file}::${job}`
+      if (ALLOWED.has(key)) {
         allowed++
-        matched.push(`${file}::${job}`)
+        matched.push(key)
+        const actual = digest(body)
+        if (ALLOWED.get(key) !== actual)
+          violations.push({
+            workflow: file,
+            job,
+            reason:
+              `allowlisted job changed. Review what it now does - an allowed job is ` +
+              `unguarded - then set its digest to ${actual}`,
+            found: "",
+          })
         continue
       }
       if (condition.trim() === "false") {
@@ -116,14 +150,14 @@ async function main() {
 
   console.log(
     `checked ${files.length} workflows: ${guarded} guarded, ${disabled} disabled, ` +
-      `${allowed}/${ALLOWED.size} allowed (${[...ALLOWED].join(", ")})`,
+      `${allowed}/${ALLOWED.size} allowed (${[...ALLOWED.keys()].join(", ")})`,
   )
 
   // An allowlist entry that matches nothing is stale - the job was renamed or
   // removed - and a stale entry silently stops protecting whatever replaced it.
   if (allowed !== ALLOWED.size) {
     const seen = new Set(matched)
-    const stale = [...ALLOWED].filter((entry) => !seen.has(entry))
+    const stale = [...ALLOWED.keys()].filter((entry) => !seen.has(entry))
     violations.push({
       workflow: "-",
       job: "-",

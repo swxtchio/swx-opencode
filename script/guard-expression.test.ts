@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { isGuarded } from "./check-workflow-guards"
+import { digest, isGuarded } from "./check-workflow-guards"
 
 const GUARD = "github.repository == 'anomalyco/opencode'"
 
@@ -47,5 +47,33 @@ describe("isGuarded", () => {
     "github.repository == 'anomalyco/opencode-fork'",
   ])("rejects %s", (condition) => {
     expect(isGuarded(condition, GUARD)).toBe(false)
+  })
+})
+
+describe("digest", () => {
+  // GOAL: the digest tracks what a job DOES, not how the YAML happens to be
+  // ordered. Without this, a cosmetic reordering upstream would fail the check
+  // and train whoever hits it to bump the digest without reading the diff -
+  // which defeats the point of pinning it.
+  test("is stable under key reordering", () => {
+    const a = { "runs-on": "ubuntu-latest", steps: [{ run: "echo hi" }] }
+    const b = { steps: [{ run: "echo hi" }], "runs-on": "ubuntu-latest" }
+    expect(digest(a)).toBe(digest(b))
+  })
+
+  // GOAL: the mutation sol described - a publishing step added to an
+  // allowlisted job - must change the digest.
+  test("changes when a step is added", () => {
+    const before = { "runs-on": "ubuntu-latest", steps: [{ run: "bun test" }] }
+    const after = { "runs-on": "ubuntu-latest", steps: [{ run: "bun test" }, { run: "npm publish" }] }
+    expect(digest(after)).not.toBe(digest(before))
+  })
+
+  // GOAL: array order is meaningful - steps run in sequence - so reordering
+  // steps must not be treated as the same job.
+  test("changes when steps are reordered", () => {
+    const a = { steps: [{ run: "one" }, { run: "two" }] }
+    const b = { steps: [{ run: "two" }, { run: "one" }] }
+    expect(digest(a)).not.toBe(digest(b))
   })
 })
