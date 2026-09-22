@@ -79,6 +79,15 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
     if (path === "/experimental/capabilities") return json(route, { backgroundSubagents: true })
     if (path === "/provider")
       return json(route, typeof config.provider === "function" ? config.provider() : config.provider)
+    // The v2 catalog routes. Without these, `/api/provider` fell through to the
+    // catch-all `{}` at the bottom of this handler, so `providers.data` was
+    // undefined and `normalizeProviderList` threw
+    // "Cannot read properties of undefined (reading 'all')" on every v2 spec
+    // that boots a project. That surfaced as a "Failed to reload" toast and a
+    // review panel whose interaction layer never came up (#26).
+    if (path === "/api/provider") return json(route, { location: location(config), data: providerCatalog(config).providers })
+    if (path === "/api/model") return json(route, { location: location(config), data: providerCatalog(config).models })
+    if (path === "/api/model/default") return json(route, { location: location(config), data: providerCatalog(config).defaultModel })
     if (path === "/provider/auth") return json(route, config.integrationMethods ?? {})
     const legacyAuth = path.match(/^\/auth\/([^/]+)$/)?.[1]
     if (legacyAuth && route.request().method() === "PUT") {
@@ -312,6 +321,42 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
     if (url.port === targetPort && targetPort !== appPort) return json(route, {})
     return route.fallback()
   })
+}
+
+/**
+ * Derive the v2 catalog responses from the same `config.provider` the v1
+ * `/provider` route serves, so a spec configures providers once and both
+ * protocols agree.
+ */
+function providerCatalog(config: MockServerConfig) {
+  const raw = typeof config.provider === "function" ? config.provider() : config.provider
+  const source = (raw ?? {}) as {
+    all?: { id?: string; name?: string; options?: unknown; models?: Record<string, unknown> }[]
+    default?: unknown
+  }
+  const all = Array.isArray(source.all) ? source.all : []
+  const providers = all.map((provider) => ({
+    id: provider.id,
+    name: provider.name ?? provider.id,
+    settings: provider.options ?? {},
+  }))
+  const models = all.flatMap((provider) =>
+    Object.entries(provider.models ?? {}).map(([id, model]) => {
+      const value = model as Record<string, any>
+      return {
+        id,
+        providerID: provider.id,
+        modelID: value.api?.id ?? id,
+        name: value.name ?? id,
+        family: value.family ?? "",
+        package: value.api?.npm,
+        status: value.status,
+        cost: value.cost ? [value.cost] : [],
+        capabilities: value.capabilities ?? { input: ["text"], output: ["text"], tools: true },
+      }
+    }),
+  )
+  return { providers, models, defaultModel: source.default ?? null }
 }
 
 function location(config: MockServerConfig) {
