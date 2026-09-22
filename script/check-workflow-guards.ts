@@ -61,6 +61,14 @@ const ALLOWED_ENVELOPES = new Map([
 const AUDIT_WORKFLOW = "test.yml"
 
 /**
+ * This fork's default branch. Scheduled workflows only ever fire from the
+ * default branch, and it is the branch the audit has to cover on push -
+ * `github.event.repository.default_branch` is not available to a script, so it
+ * is named here and asserted rather than assumed.
+ */
+const DEFAULT_BRANCH = "swxtch"
+
+/**
  * Digest of an allowlisted job's definition.
  *
  * An allowlist keyed only by name trusts the job's CONTENTS forever: a future
@@ -76,7 +84,12 @@ export function digest(job: unknown): string {
 /** Sort object keys so key order in the YAML cannot change the digest. */
 function canonical(_key: string, value: unknown) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return value
-  return Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)))
+  // Codepoint order, not localeCompare: collation is locale-dependent in
+  // principle, and a different collation would reorder keys and break every
+  // pinned digest with a message that explains nothing.
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+  )
 }
 
 type Violation = { workflow: string; job: string; reason: string; found: string }
@@ -110,7 +123,7 @@ export type Verdict = "guarded" | "unguarded" | "malformed"
  */
 export function guardVerdict(condition: string, guard: string): Verdict {
   // Block scalars arrive with newlines; GitHub treats them as one expression.
-  const normalised = stripWrappingParens(condition.replace(/\s+/g, " ").trim())
+  const normalised = stripWrappingParens(stripExpressionSyntax(condition.replace(/\s+/g, " ").trim()))
 
   const scan = scanTopLevel(normalised)
   if (scan === "malformed") return "malformed"
@@ -147,9 +160,23 @@ export function guardVerdict(condition: string, guard: string): Verdict {
   return scanTopLevel(rest.slice(2)) === "has-or" ? "unguarded" : "guarded"
 }
 
-/** Kept for readability at call sites that only care whether a job is safe. */
+/**
+ * Convenience wrapper used by the tests. The audit itself calls guardVerdict,
+ * so it can report WHICH problem a condition has rather than just that it
+ * failed.
+ */
 export function isGuarded(condition: string, guard: string): boolean {
   return guardVerdict(condition, guard) === "guarded"
+}
+
+/**
+ * A job condition may be written either bare or wrapped in `${{ }}`; GitHub
+ * treats them identically. Without this, `${{ github.repository == ... }}` is
+ * reported as unguarded, with a reason that misdescribes a correct condition.
+ */
+function stripExpressionSyntax(expression: string): string {
+  const wrapped = /^\$\{\{(.*)\}\}$/.exec(expression)
+  return wrapped ? wrapped[1].trim() : expression
 }
 
 /**
@@ -235,8 +262,10 @@ function auditWorkflowViolations(file: string, on: unknown): Violation[] {
     }
     const config = triggers[event]
     if (!config || typeof config !== "object") continue
+    const filters = config as Record<string, unknown>
+
     for (const filter of ["paths", "paths-ignore"]) {
-      if (filter in (config as Record<string, unknown>))
+      if (filter in filters)
         found.push(
           problem(
             `this audit's own workflow has a \`${filter}\` filter on \`${event}\`, ` +
@@ -244,6 +273,20 @@ function auditWorkflowViolations(file: string, on: unknown): Violation[] {
           ),
         )
     }
+
+    // A branch filter that excludes the default branch is the same hole as a
+    // path filter, and the envelope digest only reports that something
+    // changed - which is precisely where a change gets rubber-stamped.
+    const branches = filters["branches"]
+    if (Array.isArray(branches) && !branches.includes(DEFAULT_BRANCH))
+      found.push(
+        problem(
+          `this audit's own workflow no longer runs on \`${event}\` for ` +
+            `\`${DEFAULT_BRANCH}\`, so changes to the default branch are not audited`,
+        ),
+      )
+    if ("branches-ignore" in filters)
+      found.push(problem(`this audit's own workflow has a \`branches-ignore\` filter on \`${event}\``))
   }
 
   return found
@@ -255,6 +298,21 @@ async function main() {
   if (files.length === 0) throw new Error("no workflows found - is this running from the repository root?")
 
   const violations: Violation[] = []
+
+  // GitHub only runs workflow files directly in .github/workflows, so the flat
+  // glob above matches what actually executes; scanning subdirectories instead
+  // would report inert files as violations. But a nested file must not be
+  // merely invisible to the audit either, so its presence is itself reported.
+  const nested = [...new Bun.Glob("*/**/*.{yml,yaml}").scanSync({ cwd: Bun.fileURLToPath(dir) })].sort()
+  for (const file of nested)
+    violations.push({
+      workflow: file,
+      job: "-",
+      reason:
+        "a workflow file in a subdirectory of .github/workflows is not audited by this check. " +
+        "GitHub does not run nested workflow files today; move it to the top level or extend this audit",
+      found: "",
+    })
   let guarded = 0
   let disabled = 0
   let allowed = 0
@@ -337,6 +395,41 @@ async function main() {
       `${allowed}/${ALLOWED.size} allowed (${[...ALLOWED.keys()].join(", ")})`,
   )
 
+  // An envelope entry naming a workflow that no longer exists, or one with no
+  // allowlisted job, protects nothing. The pairing matters in both directions:
+  // an allowlisted job needs its workflow's envelope pinned, and a pinned
+  // envelope without an allowlisted job is a leftover that hides that fact.
+  for (const workflow of ALLOWED_ENVELOPES.keys()) {
+    if (!files.includes(workflow)) {
+      violations.push({
+        workflow,
+        job: "-",
+        reason: "an envelope digest is pinned for a workflow that no longer exists",
+        found: "",
+      })
+      continue
+    }
+    if (![...ALLOWED.keys()].some((key) => key.startsWith(`${workflow}::`)))
+      violations.push({
+        workflow,
+        job: "-",
+        reason: "an envelope digest is pinned for a workflow with no allowlisted job, so it guards nothing",
+        found: "",
+      })
+  }
+  for (const key of ALLOWED.keys()) {
+    const [workflow, job] = key.split("::")
+    if (!ALLOWED_ENVELOPES.has(workflow))
+      violations.push({
+        workflow,
+        job: job ?? "-",
+        reason:
+          "this job is allowlisted but its workflow's envelope is not pinned, so its triggers " +
+          "and permissions could change unnoticed",
+        found: "",
+      })
+  }
+
   // An allowlist entry that matches nothing is stale - the job was renamed or
   // removed - and a stale entry silently stops protecting whatever replaced it.
   if (allowed !== ALLOWED.size) {
@@ -360,8 +453,8 @@ async function main() {
   }
   console.error(`\nEach job needs  if: ${GUARD}  on its own, or as`)
   console.error(`  if: ${GUARD} && (<the existing condition>)`)
-  console.error(`Otherwise add the job to ALLOWED in this script as <workflow>::<job>,`)
-  console.error(`with a reason, if this fork genuinely needs it to run.`)
+  console.error(`Otherwise add the job to ALLOWED in this script, keyed <workflow>::<job>`)
+  console.error(`with the digest the failure above prints, if this fork genuinely needs it to run.`)
   process.exit(1)
 }
 

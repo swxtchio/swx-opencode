@@ -183,3 +183,23 @@ describe("parenthesised leading guard", () => {
     expect(guardVerdict(`(${GUARD}) && x == '(' || true`, GUARD)).toBe("unguarded")
   })
 })
+
+describe("${{ }}-wrapped conditions", () => {
+  // GOAL: GitHub treats a bare condition and a `${{ }}`-wrapped one
+  // identically, so the audit must too. glm-5.3 noted that a wrapped guard was
+  // reported "unguarded" - a correct condition given a reason that
+  // misdescribes it, which is how a future upstream merge gets diagnosed
+  // wrongly.
+  test.each([`\${{ ${GUARD} }}`, `\${{${GUARD}}}`, `\${{ ${GUARD} && github.event.action == 'opened' }}`])(
+    "accepts %s",
+    (condition) => {
+      expect(guardVerdict(condition, GUARD)).toBe("guarded")
+    },
+  )
+
+  // GOAL: unwrapping must not become a way in. The disjunction is still
+  // top-level once the wrapper is removed.
+  test.each([`\${{ ${GUARD} || true }}`, `\${{ ${GUARD} && a || true }}`])("rejects %s", (condition) => {
+    expect(guardVerdict(condition, GUARD)).toBe("unguarded")
+  })
+})
