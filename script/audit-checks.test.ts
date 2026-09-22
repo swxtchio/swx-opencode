@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   asList,
+  auditJobModeViolations,
   auditStepViolations,
   auditWorkflowViolations,
   conditionOf,
@@ -143,5 +144,57 @@ describe("auditWorkflowViolations", () => {
   // normalisation would just be a stricter false positive.
   test("accepts a scalar branches filter naming the default branch", () => {
     expect(auditWorkflowViolations("test.yml", { ...on, push: { branches: "swxtch" } })).toEqual([])
+  })
+})
+
+describe("auditJobModeViolations", () => {
+  // GOAL: the audit's own job must run in this fork, which means allowlisted
+  // and NOT guarded. kimi-k3's E2 was the purest instance of this branch's
+  // recurring defect: guard the audit's own job and drop its allowlist row,
+  // and the check reports "33 guarded" and exits 0 while never running here.
+  test("passes an allowlisted, unguarded audit job", () => {
+    expect(auditJobModeViolations("test.yml", { steps: [] }, true)).toEqual([])
+  })
+
+  test("reports an audit job that is not allowlisted", () => {
+    expect(auditJobModeViolations("test.yml", { steps: [] }, false).length).toBe(1)
+  })
+
+  // GOAL: the exact E2 edit - both halves at once - must be reported, and by
+  // both clauses, since either half alone is also wrong.
+  test("reports an audit job that carries the repository guard", () => {
+    const job = { if: "github.repository == 'anomalyco/opencode'", steps: [] }
+    expect(auditJobModeViolations("test.yml", job, true).length).toBe(1)
+    expect(auditJobModeViolations("test.yml", job, false).length).toBe(2)
+  })
+})
+
+describe("auditWorkflowViolations trigger shapes", () => {
+  const on = { push: { branches: ["swxtch"] }, pull_request: null }
+
+  // GOAL: `on: [push, pull_request]` is valid YAML shorthand. Treating it as a
+  // map made `"push" in on` test array INDICES, so the shorthand was reported
+  // as missing both triggers - a false positive, the direction that gets a
+  // check worked around rather than fixed.
+  test("accepts the array shorthand for triggers", () => {
+    expect(auditWorkflowViolations("test.yml", ["push", "pull_request"])).toEqual([])
+  })
+
+  // GOAL: a push trigger restricted to tags never fires for branch pushes, so
+  // the absence of a `branches` key is not "all branches" once tags appear.
+  test("reports a push trigger restricted to tags", () => {
+    expect(auditWorkflowViolations("test.yml", { ...on, push: { tags: ["**"] } }).length).toBeGreaterThan(0)
+  })
+
+  // GOAL: narrowing `types` stops the trigger firing for the activity that
+  // matters - a pull request being opened or updated.
+  test.each([[["labeled"]], [["opened"]], [["synchronize"]]])("reports pull_request types %p", (types) => {
+    expect(auditWorkflowViolations("test.yml", { ...on, pull_request: { types } }).length).toBeGreaterThan(0)
+  })
+
+  test("accepts pull_request types that still cover opened and synchronize", () => {
+    expect(auditWorkflowViolations("test.yml", { ...on, pull_request: { types: ["opened", "synchronize"] } })).toEqual(
+      [],
+    )
   })
 })

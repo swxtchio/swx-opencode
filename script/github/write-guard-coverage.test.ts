@@ -90,16 +90,20 @@ export function githubWrites(source: string): boolean {
 }
 
 function writesViaFetch(source: string): boolean {
-  const WRITE = /method:\s*["'](POST|PATCH|PUT|DELETE)["']/g
+  // Backticks and a space before the colon are both legal and were both
+  // missed. Comments are stripped first: a doc comment mentioning a GitHub URL
+  // above an unrelated write was enough to flag it.
+  const code = stripComments(source)
+  const WRITE = /method\s*:\s*["'`](POST|PATCH|PUT|DELETE)["'`]/g
 
-  for (const match of source.matchAll(WRITE)) {
+  for (const match of code.matchAll(WRITE)) {
     // Behind: a bounded window, since the URL is normally the request's first
     // argument. Ahead: only as far as the end of this options object, NOT a
     // second fixed window - a forward window re-created the very false
     // positive this detector was fixed for, matching an unrelated GitHub URL
     // further down the file.
-    const before = source.slice(Math.max(0, match.index - WINDOW), match.index)
-    const rest = source.slice(match.index)
+    const before = code.slice(Math.max(0, match.index - WINDOW), match.index)
+    const rest = code.slice(match.index)
     const after = rest.slice(0, rest.indexOf("}") === -1 ? 0 : rest.indexOf("}"))
     // Bare paths have to be extractable too, or a bare-path write has no
     // "nearest URL" at all and is skipped rather than matched.
@@ -137,6 +141,11 @@ function isGitHubTarget(url: string): boolean {
 
 export function importsGuard(source: string): boolean {
   return /(?:^|\n)\s*import\s[^\n]*["'][^"'\n]*same-repo-guard["']/.test(source)
+}
+
+/** Remove comments so a URL mentioned in prose is not read as a request target. */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/[^\n]*/g, "$1")
 }
 
 /** Characters to look back for the URL a request is aimed at. */
@@ -227,6 +236,46 @@ describe("every GitHub-writing script carries the repository guard", () => {
   // uses elsewhere, has no `method:` literal at all.
   test("fires on a gh api write spawned as an argument array", () => {
     expect(githubWrites(`Bun.spawn(["gh","api","-X","POST","/repos/a/b/issues/1/comments"])`)).toBe(true)
+  })
+
+  // GOAL: record what this deliberately does NOT catch, so the boundary is
+  // asserted rather than assumed. kimi-k3's point: declining a class is
+  // defensible, but then the tests should pin it so it is acknowledged rather
+  // than silent. Each of these is a real GitHub write that this detector
+  // misses, and the reason it is acceptable is that the WORKFLOW guards are
+  // the containment boundary - this is a backstop for a future oversight.
+  //
+  // If one of these shapes ever appears in script/, this test goes red and
+  // whoever sees it has to extend the detector rather than discover the gap
+  // later.
+  test.each([
+    // SDK calls carry no method literal at all.
+    `await octokit.rest.issues.createComment({ owner, repo, issue_number: 1, body: "hi" })`,
+    `await axios.post("https://api.github.com/repos/a/b/issues/1/comments", { body: "hi" })`,
+    // The verb is a variable.
+    `await fetch(url, { method: verb })`,
+    // gh subcommands that write without naming a method.
+    "await $`gh issue close 1 --repo anomalyco/opencode`",
+  ])("is known NOT to detect %p", (sample) => {
+    expect(githubWrites(sample)).toBe(false)
+  })
+
+  // GOAL: the newly supported spellings, which were missed for no good reason.
+  test.each([
+    'await fetch("https://api.github.com/repos/a/b/issues/1", { method: `PATCH` })',
+    `await fetch("https://api.github.com/repos/a/b/issues/1", { method : "PATCH" })`,
+  ])("detects %p", (sample) => {
+    expect(githubWrites(sample)).toBe(true)
+  })
+
+  // GOAL: a GitHub URL inside a COMMENT must not attribute an unrelated write
+  // to GitHub - kimi-k3's false-positive case.
+  test("does not fire on a non-GitHub write under a comment mentioning GitHub", () => {
+    const sample = [
+      "/** mirrors https://api.github.com/repos/a/b/webhooks */",
+      `await fetch(endpoint, { method: "POST" })`,
+    ].join("\n")
+    expect(githubWrites(sample)).toBe(false)
   })
 
   // GOAL: confirm it is scanning the real directory, not an empty set.

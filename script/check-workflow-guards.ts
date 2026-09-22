@@ -362,7 +362,13 @@ export function auditWorkflowViolations(file: string, on: unknown): Violation[] 
 
   if (!on || typeof on !== "object") return [...found, problem("this audit's own workflow declares no triggers")]
 
-  const triggers = on as Record<string, unknown>
+  // `on: [push, pull_request]` is valid YAML shorthand. Treating it as a map
+  // made `"push" in on` test array INDICES, so the shorthand was reported as
+  // missing both triggers - fail-closed but a false positive, which is the
+  // direction that gets a check worked around.
+  const triggers: Record<string, unknown> = Array.isArray(on)
+    ? Object.fromEntries(on.filter((event): event is string => typeof event === "string").map((event) => [event, null]))
+    : (on as Record<string, unknown>)
 
   for (const event of ["push", "pull_request"]) {
     if (!(event in triggers)) {
@@ -390,6 +396,28 @@ export function auditWorkflowViolations(file: string, on: unknown): Violation[] 
     // so `branches: dev` was a real filter that the structural check ignored,
     // routing branch changes back onto the envelope digest, which is the
     // rubber-stamp this check exists to bypass. glm-5.3's finding.
+    // A push trigger restricted to tags does not fire for branch pushes at
+    // all, so the absence of a `branches` key is not the same as "all
+    // branches" once `tags` is present.
+    if (event === "push" && !("branches" in filters) && ("tags" in filters || "tags-ignore" in filters))
+      found.push(
+        problem("this audit's own workflow restricts `push` to tags, so pushes to the default branch are not audited"),
+      )
+
+    // Narrowing `types` stops the trigger firing for the activity that
+    // matters: a pull request being opened or updated.
+    const types = asList(filters["types"])
+    if (event === "pull_request" && types) {
+      const required = ["opened", "synchronize"].filter((type) => !types.includes(type))
+      if (required.length)
+        found.push(
+          problem(
+            `this audit's own workflow narrows \`pull_request\` types and no longer fires on ` +
+              `${required.join(" or ")}, so a change can reach a pull request unaudited`,
+          ),
+        )
+    }
+
     const branches = asList(filters["branches"])
     if (branches && !branchesCover(branches, defaultBranch))
       found.push(
@@ -447,6 +475,45 @@ function matchesGlob(pattern: string, value: string): boolean {
     .join(".*")
 
   return new RegExp(`^${source}$`).test(value)
+}
+
+/**
+ * The audit's own job must be ALLOWLISTED, not guarded.
+ *
+ * kimi-k3's E2, and the purest instance of this branch's recurring defect.
+ * Add the repository guard to `test.yml::unit` and drop its ALLOWED row, and
+ * this check reports "33 guarded" and exits 0 - while counting its OWN job as
+ * guarded, meaning that job never runs in this fork, meaning the audit never
+ * runs in this fork. Every other control stayed green: both step names were
+ * still there, the envelope digest excludes jobs, and both pairing checks
+ * passed.
+ *
+ * Worse, the failure message coaches the first half of the edit: it tells the
+ * reader that each job needs the guard. So the audit's own remediation text
+ * prescribed the change that retires it.
+ */
+export function auditJobModeViolations(file: string, job: unknown, allowlisted: boolean): Violation[] {
+  const problem = (reason: string): Violation => ({ workflow: file, job: AUDIT_JOB, reason, found: "" })
+  const found: Violation[] = []
+
+  if (!allowlisted)
+    found.push(
+      problem(
+        "the audit's own job is not in ALLOWED. It has to run in this fork, so it must be " +
+          "allowlisted rather than guarded - do not add the repository guard to this one",
+      ),
+    )
+
+  const condition = conditionOf((job as { if?: unknown } | undefined)?.if)
+  if (condition.includes(GUARD))
+    found.push(
+      problem(
+        "the audit's own job carries the repository guard, so it never runs in this fork " +
+          "and neither does this check. Allowlist it instead",
+      ),
+    )
+
+  return found
 }
 
 /**
@@ -640,6 +707,9 @@ async function main() {
     if (file === AUDIT_WORKFLOW) {
       violations.push(...auditWorkflowViolations(file, parsed?.on))
       violations.push(...auditStepViolations(file, parsed?.jobs?.[AUDIT_JOB]))
+      violations.push(
+        ...auditJobModeViolations(file, parsed?.jobs?.[AUDIT_JOB], ALLOWED.has(`${AUDIT_WORKFLOW}::${AUDIT_JOB}`)),
+      )
     }
 
     const jobs = parsed?.jobs
@@ -757,6 +827,8 @@ async function main() {
   }
   console.error(`\nEach job needs  if: ${GUARD}  on its own, or as`)
   console.error(`  if: ${GUARD} && (<the existing condition>)`)
+  console.error(`The one exception is ${AUDIT_WORKFLOW}::${AUDIT_JOB}, which runs this check: it must stay`)
+  console.error(`in ALLOWED and must NOT be guarded, or the check stops running in this fork.`)
   console.error(`Otherwise add the job to ALLOWED in this script, keyed <workflow>::<job>`)
   console.error(`with the digest the failure above prints, if this fork genuinely needs it to run.`)
   process.exit(1)
