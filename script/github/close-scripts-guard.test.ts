@@ -56,9 +56,12 @@ describe.each(SCRIPTS)("$name", ({ name, args }) => {
     // Exit 0: a fork skipping inherited maintenance is correct, not a nightly
     // failure to investigate.
     expect(result.exitCode).toBe(0)
-    // The decisive assertion. If enforcement were removed the script would
-    // reach the API with the dummy token and report an authentication
-    // failure, so the absence of one proves no request was attempted.
+    // Corroborating, not decisive - sol and glm-5.3 both made this point. With
+    // no network egress a guard-deleted script fails with neither string, and
+    // GitHub could reword a message. The three assertions together are the
+    // proof: delete the guard and the refusal text never prints; make the
+    // guard log-only and the exit code stops being 0, because every path after
+    // it throws on the dummy token.
     expect(`${result.stdout}${result.stderr}`).not.toContain("Unauthorized")
     expect(`${result.stdout}${result.stderr}`).not.toContain("Bad credentials")
   }, 30_000)
