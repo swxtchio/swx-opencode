@@ -1,6 +1,7 @@
 export * as Npm from "./npm"
 
 import path from "path"
+import semver from "semver"
 import npa from "npm-package-arg"
 import { Effect, Schema, Context, Layer, Option, FileSystem } from "effect"
 import { NodeFileSystem } from "@effect/platform-node"
@@ -12,6 +13,56 @@ import { filesystem } from "./effect/app-node-platform"
 import { LayerNode } from "./effect/layer-node"
 import { makeRuntime } from "./effect/runtime"
 import { NpmConfig } from "./npm-config"
+
+/** One `add` request: a package name with an optional version or range. */
+export type AddRequest = { readonly name: string; readonly version?: string }
+
+/**
+ * Whether an existing install satisfies what is being asked for.
+ *
+ * The check used to compare dependency NAMES only, so a directory that already
+ * had a package installed reported clean no matter which version was
+ * requested. Three consequences, all observed:
+ *
+ *  1. A requested pin was silently a no-op on any directory installed before.
+ *     `~/swx-model-router-saas/.opencode` is locked at @opencode-ai/plugin
+ *     1.18.25 while the binary now asks for 1.18.31 - and reported clean.
+ *  2. Updating opencode never upgraded an existing project's SDK.
+ *  3. It made a fallback permanent: #17 falls back to the latest published SDK
+ *     when a pinned version is unpublished, and nothing re-pinned afterwards,
+ *     so a transient publish lag became lasting drift recorded only as a
+ *     one-time warning.
+ *
+ * A request with no version, or one that is not a version or range - a
+ * dist-tag like `latest`, a URL, a git spec - cannot be judged from the
+ * lockfile, so it is left alone rather than guessed at. That keeps
+ * `@opencode-ai/plugin@latest` behaving as before.
+ */
+export function reifyReason(input: {
+  readonly declared: Iterable<string>
+  readonly locked: ReadonlySet<string>
+  readonly add: readonly AddRequest[]
+  readonly installed: (name: string) => string | undefined
+}): string | undefined {
+  for (const name of input.declared) {
+    if (!input.locked.has(name)) return `${name} is declared but not in the lockfile`
+  }
+
+  for (const request of input.add) {
+    if (!request.version) continue
+    if (!semver.valid(request.version) && !semver.validRange(request.version)) continue
+
+    const installed = input.installed(request.name)
+    if (!installed) return `${request.name}@${request.version} was requested but no installed version is recorded`
+
+    const matches = semver.valid(request.version)
+      ? installed === request.version
+      : semver.satisfies(installed, request.version, { includePrerelease: true })
+    if (!matches) return `${request.name}@${request.version} was requested but ${installed} is installed`
+  }
+
+  return undefined
+}
 
 export class InstallFailedError extends Schema.TaggedErrorClass<InstallFailedError>()("NpmInstallFailedError", {
   add: Schema.Array(Schema.String).pipe(Schema.optional),
@@ -178,11 +229,16 @@ const layer = Layer.effect(
           ...Object.keys(root?.optionalDependencies || {}),
         ])
 
-        for (const name of declared) {
-          if (!locked.has(name)) {
-            yield* reify({ dir, add })
-            return
-          }
+        const reason = reifyReason({
+          declared,
+          locked,
+          add: input?.add ?? [],
+          installed: (name) => lockAny?.packages?.[`node_modules/${name}`]?.version,
+        })
+        if (reason) {
+          yield* Effect.logDebug("npm install: reinstalling", { dir, reason })
+          yield* reify({ dir, add })
+          return
         }
       }).pipe(Effect.withSpan("Npm.checkDirty"))
 

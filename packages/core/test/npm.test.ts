@@ -82,3 +82,85 @@ describe("Npm.install", () => {
     await expect(fs.stat(path.join(tmp.path, "node_modules", "dev-pkg"))).rejects.toThrow()
   })
 })
+
+describe("reifyReason", () => {
+  const base = {
+    declared: ["@opencode-ai/plugin"],
+    locked: new Set(["@opencode-ai/plugin"]),
+    add: [] as { name: string; version?: string }[],
+    installed: () => "1.18.25",
+  }
+
+  // GOAL: the #19 defect. The check compared dependency NAMES only, so a
+  // directory that already had the package reported clean whatever version was
+  // asked for. This is the real case: ~/swx-model-router-saas/.opencode is
+  // locked at 1.18.25 while the binary now requests 1.18.31.
+  test("reinstalls when the installed version is not the requested one", () => {
+    const reason = Npm.reifyReason({ ...base, add: [{ name: "@opencode-ai/plugin", version: "1.18.31" }] })
+    expect(reason).toContain("1.18.31")
+    expect(reason).toContain("1.18.25")
+  })
+
+  // GOAL: and it must not reinstall when the pin is already satisfied, or every
+  // start-up would reify.
+  test("leaves an install that already matches", () => {
+    expect(Npm.reifyReason({ ...base, add: [{ name: "@opencode-ai/plugin", version: "1.18.25" }] })).toBeUndefined()
+  })
+
+  // GOAL: the pre-existing behaviour has to survive - a declared dependency
+  // missing from the lockfile still triggers a reinstall.
+  test("reinstalls when a declared dependency is absent from the lockfile", () => {
+    const reason = Npm.reifyReason({ ...base, locked: new Set<string>() })
+    expect(reason).toContain("@opencode-ai/plugin")
+  })
+
+  // GOAL: a request that cannot be judged from a lockfile must be left alone
+  // rather than guessed at. #17's fallback rung asks for `latest`, and turning
+  // that into a reinstall on every run would be a regression of its own.
+  test.each(["latest", "next", "https://example.com/plugin.tgz", "github:owner/repo"])(
+    "does not reinstall for the unjudgeable request %p",
+    (version) => {
+      expect(Npm.reifyReason({ ...base, add: [{ name: "@opencode-ai/plugin", version }] })).toBeUndefined()
+    },
+  )
+
+  // GOAL: a request with no version at all is the same case.
+  test("does not reinstall when no version is requested", () => {
+    expect(Npm.reifyReason({ ...base, add: [{ name: "@opencode-ai/plugin" }] })).toBeUndefined()
+  })
+
+  // GOAL: ranges are honoured as ranges, not compared as strings.
+  test.each([
+    ["^1.18.0", undefined],
+    [">=1.18.0", undefined],
+    ["^1.19.0", "reinstall"],
+    ["1.18.x", undefined],
+  ] as [string, string | undefined][])("treats the range %p correctly", (version, expected) => {
+    const reason = Npm.reifyReason({ ...base, add: [{ name: "@opencode-ai/plugin", version }] })
+    expect(reason === undefined ? undefined : "reinstall").toBe(expected)
+  })
+
+  // GOAL: a prerelease build of this fork must satisfy an ordinary range, the
+  // same reasoning as #21 - otherwise pinning to a fork build would reify on
+  // every single run.
+  test("accepts a prerelease installed version against a plain range", () => {
+    const reason = Npm.reifyReason({
+      ...base,
+      installed: () => "1.18.32-swxtch.1",
+      add: [{ name: "@opencode-ai/plugin", version: "^1.18.0" }],
+    })
+    expect(reason).toBeUndefined()
+  })
+
+  // GOAL: fail toward installing. If a version was requested but the lockfile
+  // records nothing installed, the safe move is to reinstall rather than assume
+  // the request is satisfied.
+  test("reinstalls when no installed version is recorded", () => {
+    const reason = Npm.reifyReason({
+      ...base,
+      installed: () => undefined,
+      add: [{ name: "@opencode-ai/plugin", version: "1.18.31" }],
+    })
+    expect(reason).toContain("no installed version")
+  })
+})
