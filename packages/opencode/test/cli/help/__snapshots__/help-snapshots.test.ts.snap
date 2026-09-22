@@ -390,8 +390,9 @@ exports[`opencode CLI help-text snapshots every documented command emits stable 
 database tools
 
 Commands:
-  opencode db [query]     open an interactive sqlite3 shell or run a query                 [default]
-  opencode db path        print the database path
+  opencode db [query]       open an interactive sqlite3 shell or run a query               [default]
+  opencode db path          print the database path
+  opencode db export-usage  export per-session token usage as JSONL, for archiving before a reset
 
 Positionals:
   query  SQL query to execute                                                               [string]
