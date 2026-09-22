@@ -173,16 +173,33 @@ describe("tool.write", () => {
   })
 
   describe("file permissions", () => {
-    it.instance("sets file permissions when writing sensitive data", () =>
+    // GOAL: the tool must NOT override the user's umask.
+    //
+    // This asserted 0o644 exactly, which is a umask assertion rather than a
+    // statement about the tool - `write.ts` sets no mode at all. It passed in
+    // CI (umask 0022 -> 0644) and failed on a dev box (umask 0002 -> 0664),
+    // which is how it came to be listed in #10. Measured both ways on the same
+    // commit: `umask 0022` passes, `umask 0002` fails.
+    //
+    // Forcing a fixed mode in the tool would be the wrong fix, and it is worth
+    // saying why: it would LOOSEN permissions for anyone with a stricter
+    // umask, where 0o077 should yield 0o600. Restricting a file is the umask's
+    // job. What is worth pinning is that the tool leaves that decision alone,
+    // so this fails if a chmod or a mode option is ever introduced.
+    it.instance("leaves file permissions to the process umask", () =>
       Effect.gen(function* () {
         const test = yield* TestInstance
         const filepath = path.join(test.directory, "sensitive.json")
         yield* run({ filePath: filepath, content: JSON.stringify({ secret: "data" }) })
 
-        if (process.platform !== "win32") {
-          const stats = yield* Effect.promise(() => fs.stat(filepath))
-          expect(stats.mode & 0o777).toBe(0o644)
-        }
+        // Windows does not implement POSIX mode bits.
+        if (process.platform === "win32") return
+
+        const stats = yield* Effect.promise(() => fs.stat(filepath))
+        // 0o666 is the creation mode for a regular file; the umask subtracts
+        // from it. Derived rather than hardcoded so the expectation moves with
+        // the environment instead of the test failing in it.
+        expect(stats.mode & 0o777).toBe(0o666 & ~process.umask())
       }),
     )
   })

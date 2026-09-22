@@ -71,6 +71,17 @@ jobs:
           ls audit-checks.test.ts audit-cli.test.ts guard-expression.test.ts github/same-repo-guard.test.ts github/close-scripts-guard.test.ts github/write-guard-coverage.test.ts > /dev/null
           bun test audit-checks.test.ts audit-cli.test.ts guard-expression.test.ts github/same-repo-guard.test.ts github/close-scripts-guard.test.ts github/write-guard-coverage.test.ts
 
+      # Correctness-only lint gate. `bun run lint` exits 0 on this repository
+      # because .oxlintrc.json sets almost everything to "warn" - including
+      # no-dupe-keys, which is how a duplicate key in an e2e mock config
+      # survived and produced a test that failed three attempts in one run.
+      # This config promotes only rules where a hit is almost certainly a bug,
+      # and runs with typeAware off so it costs ~2s rather than OOMing.
+      - name: Lint for correctness bugs
+        # Through the script so it uses the pinned oxlint devDependency
+        # rather than whatever `bunx` would fetch.
+        run: bun run lint:correctness
+
       - name: Configure git identity
         run: |
           git config --global user.email "bot@opencode.ai"

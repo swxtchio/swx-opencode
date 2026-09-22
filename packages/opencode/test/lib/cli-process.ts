@@ -29,6 +29,7 @@ import path from "node:path"
 import { TestLLMServer } from "./llm-server"
 import { testProviderConfig } from "./test-provider"
 import { it } from "./effect"
+import { deadline, scaleNote } from "./deadline"
 
 const opencodeRoot = path.resolve(import.meta.dir, "../../")
 const cliEntry = path.join(opencodeRoot, "src/index.ts")
@@ -82,7 +83,29 @@ export type RunResult = {
   readonly stdout: string
   readonly stderr: string
   readonly durationMs: number
+  /**
+   * True when the harness killed the run at its deadline, rather than the CLI
+   * exiting of its own accord.
+   *
+   * Without this the two are indistinguishable: a killed run was reported as
+   * `exitCode: -1`, so a slow-but-healthy run under parallel load failed as
+   * `expected 0, received -1` - which reads like a behavioural break. That
+   * ambiguity is the cost #10 describes, every author re-deriving whether a
+   * red job is real.
+   */
+  readonly timedOut: boolean
 }
+
+/**
+ * Whether an AppProcessError was the deadline firing rather than a spawn
+ * failure. Mirrors the predicate core already uses for the same distinction in
+ * packages/core/src/tool/bash.ts.
+ */
+function isTimeout(error: { readonly cause?: unknown }): boolean {
+  return error.cause instanceof Error && error.cause.message === "Timed out"
+}
+
+export { deadline, TIMEOUT_SCALE } from "./deadline"
 
 export type RunHandle = {
   readonly interrupt: () => void
@@ -206,7 +229,7 @@ export function withCliFixture<A, E>(
 
     const spawn = Effect.fn("opencode.spawn")(function* (args: string[], opts?: SpawnOpts) {
       const start = Date.now()
-      const timeoutMs = opts?.timeoutMs ?? 30_000
+      const timeoutMs = opts?.timeoutMs ?? deadline(30_000)
       // stdin: "ignore" so the child doesn't see a piped stdin and block
       // on `Bun.stdin.text()` (see src/cli/cmd/run.ts — non-TTY stdin is
       // consumed as the prompt). The old Process.run wrapper defaulted to
@@ -228,16 +251,20 @@ export function withCliFixture<A, E>(
       // Catch AppProcessError (timeout OR spawn failure) and synthesize a
       // non-zero result so the test sees it via the usual `expectExit`
       // path rather than as an unhandled Effect failure.
+      let killed = false
       const result = yield* appProc.run(command, { timeout: Duration.millis(timeoutMs) }).pipe(
         Effect.catchTag("AppProcessError", (err) =>
-          Effect.succeed({
-            command: err.command,
-            exitCode: err.exitCode ?? -1,
-            stdout: Buffer.alloc(0),
-            stderr: Buffer.from((err.stderr ?? String(err.cause ?? err.message)) + "\n"),
-            stdoutTruncated: false,
-            stderrTruncated: false,
-          } satisfies AppProcess.RunResult),
+          Effect.sync(() => {
+            killed = isTimeout(err)
+            return {
+              command: err.command,
+              exitCode: err.exitCode ?? -1,
+              stdout: Buffer.alloc(0),
+              stderr: Buffer.from((err.stderr ?? String(err.cause ?? err.message)) + "\n"),
+              stdoutTruncated: false,
+              stderrTruncated: false,
+            } satisfies AppProcess.RunResult
+          }),
         ),
       )
       return {
@@ -245,6 +272,7 @@ export function withCliFixture<A, E>(
         stdout: normalizeLines(result.stdout.toString()),
         stderr: normalizeLines(result.stderr.toString()),
         durationMs: Date.now() - start,
+        timedOut: killed,
       }
     })
 
@@ -307,6 +335,9 @@ export function withCliFixture<A, E>(
           stdout: normalizeLines(await stdout),
           stderr: normalizeLines(await stderr),
           durationMs: Date.now() - start,
+          // startRun has no harness deadline - the caller drives interruption
+          // itself - so a kill here is never the backstop firing.
+          timedOut: false,
         })),
       } satisfies RunHandle
     })
@@ -496,6 +527,21 @@ function normalizeLines(value: string) {
 // the exit code doesn't match — saves debugging time on CI failures.
 function expectExit(result: RunResult, expected: number, label = "opencode") {
   if (result.exitCode === expected) return
+
+  // Say which kind of failure this is. A deadline kill is the harness's
+  // backstop firing under load, not a statement about the code, and it needs a
+  // different response from a real non-zero exit - so it gets a different
+  // message rather than surfacing as `expected 0, got -1`.
+  if (result.timedOut) {
+    const scale = scaleNote()
+    throw new Error(
+      `${label}: the harness killed this run at its ${result.durationMs}ms deadline${scale}, so the CLI never ` +
+        `exited on its own. This is the timeout backstop, NOT a behavioural failure: the run was too slow, ` +
+        `most likely CPU contention from concurrent subprocess tests. Raise OPENCODE_TEST_TIMEOUT_SCALE to ` +
+        `confirm, and treat a behavioural diagnosis as unproven until it fails with a real exit code.`,
+    )
+  }
+
   const tail = (s: string, n: number) => (s.length > n ? "..." + s.slice(-n) : s)
   // eslint-disable-next-line no-console
   console.error(`[${label}] expected exit ${expected}, got ${result.exitCode} after ${result.durationMs}ms`)

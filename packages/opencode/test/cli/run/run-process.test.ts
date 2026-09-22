@@ -6,7 +6,7 @@
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
 import { reply } from "../../lib/llm-server"
-import { cliIt } from "../../lib/cli-process"
+import { cliIt, deadline } from "../../lib/cli-process"
 
 describe("opencode run (non-interactive subprocess)", () => {
   // Happy path: prompt completes, output reaches stdout, process exits 0.
@@ -20,7 +20,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         opencode.expectExit(result, 0)
         expect(result.stdout).toBe("hello from the test llm\n")
       }),
-    60_000,
+    deadline(60_000),
   )
 
   cliIt.concurrent(
@@ -42,7 +42,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         opencode.expectExit(result, 0)
         expect(result.stdout).toBe("before tool\nafter tool\n")
       }),
-    60_000,
+    deadline(60_000),
   )
 
   cliIt.concurrent(
@@ -59,7 +59,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         opencode.expectExit(plain, 0)
         expect(plain.stdout).toBe("visible\n")
       }),
-    60_000,
+    deadline(60_000),
   )
 
   // Regression for #27371: an unknown model used to hang the process forever
@@ -79,11 +79,11 @@ describe("opencode run (non-interactive subprocess)", () => {
       Effect.gen(function* () {
         const result = yield* opencode.run("say hi", {
           model: "test/nonexistent-model",
-          timeoutMs: 25_000,
+          timeoutMs: deadline(25_000),
         })
         expect(result.exitCode).toBeGreaterThan(0)
       }),
-    30_000,
+    deadline(30_000),
   )
 
   // The test provider's SSE error item is interpreted by the SDK as an unknown
@@ -101,12 +101,12 @@ describe("opencode run (non-interactive subprocess)", () => {
         )
         yield* llm.fail("upstream provider exploded mid-stream")
         yield* llm.text("recovered")
-        const result = yield* opencode.run("trigger midstream error", { timeoutMs: 30_000 })
-        expect(result.exitCode).toBe(0)
+        const result = yield* opencode.run("trigger midstream error", { timeoutMs: deadline(30_000) })
+        opencode.expectExit(result, 0)
         expect(result.stdout).toBe("partial response\nrecovered\n")
         expect(result.stderr).not.toContain("upstream provider exploded mid-stream")
       }),
-    60_000,
+    deadline(60_000),
   )
 
   // --format json puts one JSON object per line on stdout for each emitted
@@ -143,7 +143,7 @@ describe("opencode run (non-interactive subprocess)", () => {
             .every((line) => line.length > 0),
         ).toBe(true)
       }),
-    60_000,
+    deadline(60_000),
   )
 
   cliIt.concurrent(
@@ -166,7 +166,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         })
         expect(result.stdout.split("\n").filter(Boolean)).toHaveLength(1)
       }),
-    30_000,
+    deadline(30_000),
   )
 
   cliIt.concurrent(
@@ -186,7 +186,7 @@ describe("opencode run (non-interactive subprocess)", () => {
           extraArgs: ["--thinking", "--dangerously-skip-permissions"],
         })
 
-        expect(result.exitCode).toBe(0)
+        opencode.expectExit(result, 0)
         const events = opencode.parseJsonEvents(result.stdout)
         expect(events.map((event) => event.type)).toEqual([
           "step_start",
@@ -215,7 +215,7 @@ describe("opencode run (non-interactive subprocess)", () => {
             .every((line) => line.startsWith("{")),
         ).toBe(true)
       }),
-    60_000,
+    deadline(60_000),
   )
 
   cliIt.concurrent(
@@ -233,7 +233,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         const result = yield* opencode.run("fail after output", { format: "json" })
 
         const events = opencode.parseJsonEvents(result.stdout)
-        expect(result.exitCode).toBe(0)
+        opencode.expectExit(result, 0)
         expect(events.map((event) => event.type)).toEqual([
           "step_start",
           "text",
@@ -250,7 +250,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(events[7]?.part).toEqual(expect.objectContaining({ type: "text", text: "recovered" }))
         expect(events.at(-1)?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "stop" }))
       }),
-    60_000,
+    deadline(60_000),
   )
 
   cliIt.concurrent(
@@ -286,7 +286,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(explicitlyDenied.stdout).toContain("continued after explicit denial")
         expect(yield* Effect.promise(() => Bun.file(`${home}/explicitly-denied`).exists())).toBe(false)
       }),
-    60_000,
+    deadline(60_000),
   )
 
   cliIt.live(
@@ -308,7 +308,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(input).toContain(sentinel)
         expect(input).not.toContain(`file://${source}`)
       }),
-    60_000,
+    deadline(60_000),
   )
 
   cliIt.concurrent(
@@ -322,7 +322,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(result.exitCode).not.toBe(0)
         expect(result.stderr).toContain("Cannot attach local directory without a shared filesystem")
       }),
-    30_000,
+    deadline(30_000),
   )
 
   cliIt.live(
@@ -336,8 +336,12 @@ describe("opencode run (non-interactive subprocess)", () => {
         const result = yield* run.result
 
         expect(result.exitCode).not.toBe(0)
-        expect(result.durationMs).toBeLessThan(30_000)
+        // Promptness with real headroom: bounding this by the test budget
+        // itself (both were 30_000) meant the assertion could only fail by
+        // racing the thing that would already have killed the test. A third of
+        // the budget still catches a hang while leaving room for a slow run.
+        expect(result.durationMs).toBeLessThan(deadline(10_000))
       }),
-    30_000,
+    deadline(30_000),
   )
 })
