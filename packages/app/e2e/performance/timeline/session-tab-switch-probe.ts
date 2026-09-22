@@ -1,5 +1,6 @@
 import { expect, type Page } from "@playwright/test"
 import { classifySessionSwitch, isStableDestination, type SessionSwitchSample } from "./session-tab-switch-metrics"
+import { deadline } from "../../utils/deadline"
 
 type SessionSwitchProbe = {
   samples: SessionSwitchSample[]
@@ -220,7 +221,7 @@ export async function waitForStableTimeline(page: Page, lastID: string) {
         )
         return isStableDestination(samples.slice(-3))
       },
-      { timeout: 30_000, intervals: [0] },
+      { timeout: deadline(30_000), intervals: [0] },
     )
     .toBe(true)
 }

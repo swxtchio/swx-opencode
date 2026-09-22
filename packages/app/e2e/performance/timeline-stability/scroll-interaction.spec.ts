@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test"
 import {
+import { deadline } from "../../utils/deadline"
   defineVisualRegions,
   reportVisualStability,
   startVisualProbe,
@@ -104,7 +105,7 @@ test("does not pull a keyboard-scrolled user during shell remeasurement", async 
   }
   await expect
     .poll(() => scroller.evaluate((element) => element.scrollHeight - element.clientHeight - element.scrollTop), {
-      timeout: 20_000,
+      timeout: deadline(20_000),
     })
     .toBeGreaterThan(80)
   await page.waitForFunction(() => {

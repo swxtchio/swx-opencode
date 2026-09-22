@@ -1,6 +1,7 @@
 import { expect, test, type Locator, type Page } from "@playwright/test"
 import { mockOpenCodeServer } from "../utils/mock-server"
 import { expectAppVisible, expectSessionTitle } from "../utils/waits"
+import { deadline } from "../utils/deadline"
 
 const directory = "C:/OpenCode/TimelineStateRegression"
 const projectID = "proj_timeline_state_regression"
@@ -127,7 +128,9 @@ test.describe("regression: session timeline local row state", () => {
       },
     })
 
-    await expect(page.locator(`[data-timeline-part-id="${textPartID}"]`).first()).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator(`[data-timeline-part-id="${textPartID}"]`).first()).toBeVisible({
+      timeout: deadline(10_000),
+    })
 
     expect(await readToolState(page)).toEqual({
       expanded: false,
@@ -159,7 +162,9 @@ test.describe("regression: session timeline local row state", () => {
       },
     })
 
-    await expect(page.locator(`[data-timeline-part-id="${textPartID}"]`).first()).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator(`[data-timeline-part-id="${textPartID}"]`).first()).toBeVisible({
+      timeout: deadline(10_000),
+    })
     const siblingProbe = await readDiffProbe(page)
     expect(siblingProbe).toEqual({
       fileMarker: "before",
@@ -180,7 +185,7 @@ test.describe("regression: session timeline local row state", () => {
     })
 
     await expect(wrapper.locator('[data-slot="diff-changes-additions"]').filter({ hasText: "+2" }).first()).toBeVisible(
-      { timeout: 10_000 },
+      { timeout: deadline(10_000) },
     )
     expect(await readDiffProbe(page)).toEqual({
       fileMarker: "before",
