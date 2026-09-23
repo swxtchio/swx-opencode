@@ -3,7 +3,10 @@
   "compilerOptions": {
     "noEmit": true,
     "rootDir": "..",
-    "types": ["node", "bun"]
+    "types": [
+      "node",
+      "bun"
+    ]
   },
   "include": [
     "./performance/timeline-stability/**/*.spec.ts",
@@ -13,6 +16,8 @@
     "./reproduction/timeline-suspense/**/*.ts",
     "./reproduction/timeline-suspense/**/*.tsx",
     "../src/pages/session/timeline/observe-element-offset.ts",
+    "../src/utils/path-key.ts",
+    "../src/context/global-sync/utils.ts",
     "./regression/new-session-panel-corner.spec.ts",
     "./regression/session-timeline-context-resize.spec.ts",
     "./utils/**/*.ts"

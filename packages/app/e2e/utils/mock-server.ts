@@ -1,4 +1,5 @@
 import type { Page, Route } from "@playwright/test"
+import type { ModelDefaultOutput, ModelListOutput, ProviderListOutput } from "@opencode-ai/client/promise"
 
 const emptyList = new Set(["/skill", "/command", "/lsp", "/formatter", "/vcs/status", "/vcs/diff"])
 const emptyObject = new Set(["/global/config", "/config", "/provider/auth", "/mcp", "/experimental/resource"])
@@ -328,60 +329,76 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
  * `/provider` route serves, so a spec configures providers once and both
  * protocols agree.
  */
-export function providerCatalog(config: MockServerConfig) {
+export function providerCatalog(config: MockServerConfig): {
+  providers: ProviderListOutput["data"]
+  models: NonNullable<ModelListOutput["data"]>
+  defaultModel: ModelDefaultOutput["data"]
+} {
   const raw = typeof config.provider === "function" ? config.provider() : config.provider
   const source = (raw ?? {}) as {
     all?: { id?: string; name?: string; options?: unknown; models?: Record<string, unknown> }[]
+    connected?: string[]
     default?: { providerID?: string; modelID?: string }
   }
   const all = Array.isArray(source.all) ? source.all : []
+  // Typed against the client contract on purpose. The first version of this
+  // helper hand-rolled shapes and emitted an ISO string for a numeric
+  // `time.released`, no `status`, no `enabled` and no `limit.output` -- values
+  // no real server could return. normalizeProviderList tolerated them, so the
+  // specs passed while the payload was fiction. Annotating the return makes
+  // that a compile error instead of a latent trap.
   const providers = all.map((provider) => ({
-    id: provider.id,
-    name: provider.name ?? provider.id,
-    settings: provider.options ?? {},
-  }))
-  // normalizeProviderList reads every one of these unconditionally -- notably
-  // `model.time.released`, `model.variants.map` and `cost.cache` -- so a
-  // partial model here throws inside the app instead of failing a route.
+    id: provider.id ?? "",
+    name: provider.name ?? provider.id ?? "",
+    // required by ProviderV2Info
+    package: `@opencode-ai/${provider.id ?? "provider"}`,
+    settings: (provider.options ?? {}) as Record<string, never>,
+  })) as ProviderListOutput["data"]
   const models = all.flatMap((provider) =>
     Object.entries(provider.models ?? {}).map(([id, model]) => {
       const value = model as Record<string, any>
       const cost = value.cost
         ? [
             {
-              tier: value.cost.tier,
               input: value.cost.input ?? 0,
               output: value.cost.output ?? 0,
               cache: { read: value.cost.cache?.read ?? 0, write: value.cost.cache?.write ?? 0 },
             },
           ]
         : []
+      const capabilities = value.capabilities ?? {}
       return {
         id,
-        providerID: provider.id,
         modelID: value.api?.id ?? id,
+        providerID: provider.id ?? "",
         name: value.name ?? id,
         family: value.family ?? "",
         package: value.api?.npm,
-        status: value.status,
-        cost,
-        limit: value.limit,
-        settings: value.options ?? {},
+        settings: (value.options ?? {}) as Record<string, never>,
         headers: value.headers ?? {},
-        time: { released: value.release_date ?? "1970-01-01" },
+        capabilities: {
+          tools: capabilities.tools ?? true,
+          input: Array.isArray(capabilities.input) ? capabilities.input : ["text"],
+          output: Array.isArray(capabilities.output) ? capabilities.output : ["text"],
+        },
         variants: Object.entries(value.variants ?? {}).map(([variantID, settings]) => ({
           id: variantID,
-          settings: settings ?? {},
+          settings: (settings ?? {}) as Record<string, never>,
         })),
-        capabilities: value.capabilities ?? { input: ["text"], output: ["text"], tools: true },
+        // `released` is a number in the contract, not a date string.
+        time: { released: value.release_date ? Date.parse(value.release_date) : 0 },
+        cost,
+        status: value.status ?? "active",
+        enabled: value.enabled ?? true,
+        // `output` is required alongside `context`; fixtures only set context.
+        limit: { context: value.limit?.context ?? 0, output: value.limit?.output ?? 0 },
       }
     }),
-  )
-  const fallback = models[0]
+  ) as NonNullable<ModelListOutput["data"]>
   const chosen = source.default?.modelID
     ? models.find((model) => model.id === source.default!.modelID && model.providerID === source.default!.providerID)
     : undefined
-  return { providers, models, defaultModel: chosen ?? fallback ?? null }
+  return { providers, models, defaultModel: (chosen ?? models[0] ?? null) as ModelDefaultOutput["data"] }
 }
 
 function location(config: MockServerConfig) {
