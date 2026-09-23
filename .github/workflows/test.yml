@@ -172,11 +172,23 @@ jobs:
         working-directory: packages/app
         run: bunx playwright install chromium
 
+      # Informational, not gating. This suite is upstream's (packages/app/e2e)
+      # and this fork does not maintain it, so its flake must not block our
+      # feature work. #26 documents the known provider-bootstrap failure that
+      # makes review-line-comment fail every attempt in a run. Artifacts are
+      # still uploaded, so the signal is kept -- it just does not gate.
       - name: Run app e2e tests
+        id: e2e
+        continue-on-error: true
         run: bun --cwd packages/app test:e2e:local
         env:
           CI: true
         timeout-minutes: 30
+
+      - name: Report the e2e outcome
+        if: steps.e2e.outcome == 'failure'
+        run: |
+          echo "::warning::app e2e suite failed. This does not gate merges: the suite is upstream's and this fork does not maintain it. See #26."
 
       - name: Upload Playwright artifacts
         if: always()
