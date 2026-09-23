@@ -3,6 +3,10 @@
   "options": {
     "typeAware": false
   },
+  "ignorePatterns": [
+    "packages/console/**",
+    "artifacts/**"
+  ],
   "categories": {},
   "rules": {
     "no-dupe-keys": "error",
