@@ -93,14 +93,15 @@ opencode --version
 opencode db path
 ```
 
-Commit tracked changes first: the release version includes the current commit's
-first eight characters (`<package-version>-swxtch.<commit>`). Setting
+Commit or remove working-tree changes first: the release version includes the
+current commit's first eight characters (`<package-version>-swxtch.<commit>`). Setting
 `OPENCODE_VERSION` during the build keeps the binary on the same `swxtch`
 database instead of opening a database named after the current Git branch.
 Before installing, the script checks the built version and database path,
 backs up the previous executable as `opencode.<old-version>`, then replaces it
-atomically. Set `OPENCODE_LOCAL_BIN` to choose another installation path and
-`OPENCODE_DB_PATH` if your local installation uses a different database.
+atomically (restoring the backup if verification fails). Set `OPENCODE_LOCAL_BIN`
+to choose another installation path and `OPENCODE_DB_PATH` if your local
+installation uses a different database.
 Already-running OpenCode processes continue using their previous executable;
 start a new process to use the release.
 

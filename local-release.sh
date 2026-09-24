@@ -12,8 +12,8 @@ fi
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$root"
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  printf 'Commit tracked changes before creating a versioned local release.\n' >&2
+if ! git diff --quiet || ! git diff --cached --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+  printf 'Commit or remove working-tree changes before creating a versioned local release.\n' >&2
   exit 1
 fi
 
@@ -31,7 +31,11 @@ fi
 
 if command -v opencode >/dev/null 2>&1; then
   resolved=$(node -p 'require("fs").realpathSync(process.argv[1])' "$(command -v opencode)")
-  if [[ "$resolved" != "$target" ]]; then
+  installed="$target"
+  if [[ -e "$target" ]]; then
+    installed=$(node -p 'require("fs").realpathSync(process.argv[1])' "$target")
+  fi
+  if [[ "$resolved" != "$installed" ]]; then
     printf 'PATH resolves opencode to %s, not %s. Set OPENCODE_LOCAL_BIN to that binary or adjust PATH.\n' "$resolved" "$target" >&2
     exit 1
   fi
@@ -51,10 +55,12 @@ if [[ "$("$built" --version)" != "$release" || "$("$built" db path)" != "$databa
 fi
 
 mkdir -p "$(dirname "$target")"
+backup=""
 if [[ -f "$target" ]]; then
   old=$("$target" --version)
-  cp -p "$target" "$target.$old"
-  printf 'Previous binary backed up at %s\n' "$target.$old"
+  backup="$target.$old"
+  cp -p "$target" "$backup"
+  printf 'Previous binary backed up at %s\n' "$backup"
 fi
 
 temporary="$target.new.$$"
@@ -63,7 +69,13 @@ install -m 755 "$built" "$temporary"
 mv -f "$temporary" "$target"
 
 if [[ "$("$target" --version)" != "$release" || "$("$target" db path)" != "$database" ]]; then
-  printf 'Installed binary verification failed; restore the backup before continuing.\n' >&2
+  if [[ -n "$backup" ]]; then
+    cp -p "$backup" "$temporary"
+    mv -f "$temporary" "$target"
+    printf 'Installed binary verification failed; restored %s.\n' "$backup" >&2
+  else
+    printf 'Installed binary verification failed; no previous binary to restore.\n' >&2
+  fi
   exit 1
 fi
 printf 'Installed %s at %s (database: %s)\n' "$release" "$target" "$database"
