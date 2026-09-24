@@ -6232,6 +6232,22 @@ describe("ProviderTransform.variants openai effort tiers", () => {
     expect(Object.keys(ProviderTransform.variants(model(id)))).toContain("max")
   })
 
+  // GOAL: GPT-6 Sol and Luna expose max through each OpenAI-backed fallback
+  // path, including providers that use a different request shape for effort.
+  test.each([
+    ["@ai-sdk/azure", "gpt-6-sol"],
+    ["@ai-sdk/openai", "gpt-6-luna"],
+    ["@ai-sdk/gateway", "openai/gpt-6-sol"],
+    ["@openrouter/ai-sdk-provider", "openai/gpt-6-luna"],
+    ["ai-gateway-provider", "openai/gpt-6-sol"],
+  ])("offers max for %s %s", (npm, id) => {
+    expect(ProviderTransform.variants(model(id, npm))?.max).toBeDefined()
+  })
+
+  test.each(["gpt-60-sol", "other-gpt-6-sol"])("does not treat %s as GPT-6", (id) => {
+    expect(ProviderTransform.variants(model(id))?.max).toBeUndefined()
+  })
+
   // GOAL: and not for the versions where there is no evidence for it, so this
   // is a targeted addition rather than a blanket one.
   test.each(["gpt-5.2", "gpt-5.5", "gpt-5.1"])("does not offer max for %s", (id) => {
