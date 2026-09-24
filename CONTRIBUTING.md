@@ -76,6 +76,34 @@ Replace `<platform>` with your platform (e.g., `darwin-arm64`, `linux-x64`).
   - `packages/desktop`: The native desktop app, built with Electron (wraps `packages/app`)
   - `packages/plugin`: Source for `@opencode-ai/plugin`
 
+### Building and installing a local swxtch release
+
+From the repository root, run `./local-release.sh`. The script installs the
+repository's pinned Bun version through `npx`, installs locked dependencies,
+builds a native executable (including the web UI), and installs it at
+`~/.local/opencode-swxtch/bin/opencode` by default. The installed executable
+can be selected by adding that directory to `PATH` or linking it from a
+directory already on `PATH` (for example, `~/.bun/bin/opencode`). If `opencode`
+already resolves to a different binary, set `OPENCODE_LOCAL_BIN` to that path
+or adjust `PATH` before running the script.
+
+```bash
+./local-release.sh
+opencode --version
+opencode db path
+```
+
+Commit tracked changes first: the release version includes the current commit's
+first eight characters (`<package-version>-swxtch.<commit>`). Setting
+`OPENCODE_VERSION` during the build keeps the binary on the same `swxtch`
+database instead of opening a database named after the current Git branch.
+Before installing, the script checks the built version and database path,
+backs up the previous executable as `opencode.<old-version>`, then replaces it
+atomically. Set `OPENCODE_LOCAL_BIN` to choose another installation path and
+`OPENCODE_DB_PATH` if your local installation uses a different database.
+Already-running OpenCode processes continue using their previous executable;
+start a new process to use the release.
+
 ### Understanding bun dev vs opencode
 
 During development, `bun dev` is the local equivalent of the built `opencode` command. Both run the same CLI interface:
