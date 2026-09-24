@@ -21,6 +21,10 @@ version=$(node -p 'require("./packages/opencode/package.json").version')
 bun_version=$(node -p 'require("./package.json").packageManager.split("@")[1]')
 release="$version-swxtch.$(git rev-parse --short=8 HEAD)"
 platform=$(node -p 'process.platform + "-" + process.arch')
+if [[ "$platform" != linux-* && "$platform" != darwin-* ]]; then
+  printf 'Local release installs currently support Linux and macOS only.\n' >&2
+  exit 1
+fi
 built="$root/packages/opencode/dist/opencode-$platform/bin/opencode"
 target="${OPENCODE_LOCAL_BIN:-$HOME/.local/opencode-swxtch/bin/opencode}"
 database="${OPENCODE_DB_PATH:-$HOME/.local/share/opencode/opencode.db}"
@@ -29,8 +33,8 @@ if [[ "$target" != /* || "$database" != /* ]]; then
   exit 1
 fi
 
-if command -v opencode >/dev/null 2>&1; then
-  resolved=$(node -p 'require("fs").realpathSync(process.argv[1])' "$(command -v opencode)")
+if path_binary=$(type -P opencode); then
+  resolved=$(node -p 'require("fs").realpathSync(process.argv[1])' "$path_binary")
   installed="$target"
   if [[ -e "$target" ]]; then
     installed=$(node -p 'require("fs").realpathSync(process.argv[1])' "$target")
@@ -79,7 +83,7 @@ if [[ "$("$target" --version)" != "$release" || "$("$target" db path)" != "$data
   exit 1
 fi
 printf 'Installed %s at %s (database: %s)\n' "$release" "$target" "$database"
-if command -v opencode >/dev/null 2>&1; then
+if type -P opencode >/dev/null 2>&1; then
   printf 'PATH opencode: %s\n' "$(opencode --version)"
 else
   printf 'Add %s to PATH or symlink %s into a directory on PATH.\n' "$(dirname "$target")" "$target"

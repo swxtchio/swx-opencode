@@ -78,8 +78,8 @@ Replace `<platform>` with your platform (e.g., `darwin-arm64`, `linux-x64`).
 
 ### Building and installing a local swxtch release
 
-From the repository root, run `./local-release.sh`. The script installs the
-repository's pinned Bun version through `npx`, installs locked dependencies,
+On Linux or macOS, run `./local-release.sh` from the repository root. The
+script installs the repository's pinned Bun version through `npx`, installs locked dependencies,
 builds a native executable (including the web UI), and installs it at
 `~/.local/opencode-swxtch/bin/opencode` by default. The installed executable
 can be selected by adding that directory to `PATH` or linking it from a
