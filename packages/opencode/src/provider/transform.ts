@@ -603,6 +603,7 @@ const GPT5_FAMILY_RE = /(?:^|\/)gpt-5(?:[.-]|$)/
 const GPT5_VERSION_RE = /(?:^|\/)gpt-5[.-](\d+)(?:[.-]|$)/
 const GPT5_PRO_RE = /(?:^|\/)gpt-5[.-]?pro(?:[.-]|$)/
 const GPT5_VERSIONED_PRO_RE = /(?:^|\/)gpt-5[.-]\d+[.-]pro(?:[.-]|$)/
+const GPT6_FAMILY_RE = /(?:^|\/)gpt-6(?:[.-]|$)/
 
 function gpt5Version(apiId: string) {
   return Number(GPT5_VERSION_RE.exec(apiId)?.[1]) || undefined
@@ -641,6 +642,7 @@ function openaiReasoningEfforts(apiId: string, releaseDate: string) {
   if (GPT5_PRO_RE.test(id)) return OPENAI_GPT5_PRO_EFFORTS
   const codexEfforts = gpt5CodexReasoningEfforts(id)
   if (codexEfforts) return codexEfforts
+  if (GPT6_FAMILY_RE.test(id)) return OPENAI_GPT5_6_PLUS_EFFORTS
   const versionedEfforts = versionedGpt5ReasoningEfforts(id)
   // GPT-5.1 replaced GPT-5's `minimal` effort with `none`; GPT-5.2+
   // additionally accepts `xhigh`. Model pages list the supported subset.
@@ -657,6 +659,7 @@ function openaiCompatibleReasoningEfforts(id: string) {
   const chatEfforts = gpt5ChatReasoningEfforts(apiId)
   if (chatEfforts) return chatEfforts
   if (GPT5_PRO_RE.test(apiId)) return OPENAI_GPT5_PRO_EFFORTS
+  if (GPT6_FAMILY_RE.test(apiId)) return OPENAI_GPT5_6_PLUS_EFFORTS
   return gpt5CodexReasoningEfforts(apiId) ?? versionedGpt5ReasoningEfforts(apiId) ?? OPENAI_EFFORTS
 }
 
