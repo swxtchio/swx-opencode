@@ -256,7 +256,14 @@ export function syncUpstream(options: SyncOptions) {
       ]
     : [`--- upstream range --- (no common merge base with ${upstreamRef})`]
 
-  const merge = git("merge", "--no-ff", "--no-edit", upSha)
+  // An explicit message, since merging a bare sha would default to "Merge commit '<sha>'".
+  const merge = git(
+    "merge",
+    "--no-ff",
+    "-m",
+    `chore: sync ${base} with ${upstream}/${mirror} at ${short(upSha)}`,
+    upSha,
+  )
   const mergeOutput = [merge.stdout, merge.stderr].filter(Boolean).join("\n") || "<no output>"
   if (merge.code === 0) {
     // Phase 4 proved upstream is not contained, so a successful merge must create a commit;

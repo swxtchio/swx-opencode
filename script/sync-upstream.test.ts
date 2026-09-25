@@ -92,8 +92,8 @@ function rejectCleanMerge(calls: string[]) {
   return (real: Git): Git =>
     (...args) => {
       if (args[0] === "merge") calls.push(args.join(" "))
-      const target = args[3]
-      if (args[0] !== "merge" || args[1] !== "--no-ff" || args[2] !== "--no-edit" || !target) return real(...args)
+      const target = args[4]
+      if (args[0] !== "merge" || args[1] !== "--no-ff" || args[2] !== "-m" || !target) return real(...args)
       const merged = real("merge", "--no-ff", "--no-commit", target)
       if (merged.code !== 0) return merged
       return { code: 1, stdout: "", stderr: "TEST-REJECTED-CLEAN-MERGE" }
@@ -124,6 +124,9 @@ describe("syncUpstream", () => {
     expect(git(w.work, "symbolic-ref", "--short", "HEAD")).toBe("sync-upstream-20260925-123456")
     expect(git(w.work, "rev-parse", "HEAD^1")).toBe(swxtch)
     expect(git(w.work, "rev-parse", "HEAD^2")).toBe(upSha)
+    expect(git(w.work, "log", "-1", "--format=%s")).toBe(
+      `chore: sync swxtch with upstream/dev at ${git(w.work, "rev-parse", "--short", upSha)}`,
+    )
     expect(git(w.work, "rev-parse", "dev")).toBe(upSha)
     expect(git(w.origin, "rev-parse", "dev")).toBe(upSha)
     expect(result.out).toContain("upstream: feature.txt=new")
