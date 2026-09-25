@@ -261,6 +261,15 @@ describe("syncUpstream", () => {
       "could not read",
     ],
     [
+      "the marker is not under the sync heading",
+      (w: ReturnType<typeof world>) =>
+        writeFileSync(
+          path.join(w.work, "CHANGESET.md"),
+          `# Fork changeset\n\n## Fork changes\n\n${changesetMarker} -->\n`,
+        ),
+      'is not under "## Upstream syncs"',
+    ],
+    [
       "CHANGESET.md has no marker",
       (w: ReturnType<typeof world>) => writeFileSync(path.join(w.work, "CHANGESET.md"), "# Fork changeset\n"),
       'no "<!-- upstream-syncs:" line',
@@ -310,7 +319,7 @@ describe("syncUpstream", () => {
   // GOAL: the insertion handles a marker on the file's last line with no trailing newline.
   test("records the entry when the marker ends the file", () => {
     const w = world()
-    writeFileSync(path.join(w.work, "CHANGESET.md"), `# Fork changeset\n${changesetMarker} -->`)
+    writeFileSync(path.join(w.work, "CHANGESET.md"), `# Fork changeset\n\n## Upstream syncs\n${changesetMarker} -->`)
     git(w.work, "commit", "-qam", "marker at end of file")
     git(w.work, "push", "-q", "origin", "swxtch")
     advanceUpstream(w, "feature.txt", "new")
@@ -320,7 +329,7 @@ describe("syncUpstream", () => {
     // pins that the file ends in exactly one newline.
     expect(readFileSync(path.join(w.work, "CHANGESET.md"), "utf8")).toMatch(
       new RegExp(
-        `^# Fork changeset\\n${changesetMarker} -->\\n\\n- \\*\\*\\d{4}-\\d{2}-\\d{2}\\*\\* [^\\n]+Conflicts: none\\.\\n$`,
+        `^# Fork changeset\\n\\n## Upstream syncs\\n${changesetMarker} -->\\n\\n- \\*\\*\\d{4}-\\d{2}-\\d{2}\\*\\* [^\\n]+Conflicts: none\\.\\n$`,
       ),
     )
   })

@@ -55,6 +55,8 @@ import { readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
 
 export const changesetMarker = "<!-- upstream-syncs:"
+// The heading the marker must sit under; script/changeset-check.ts looks for sync entries there.
+export const changesetSyncHeading = "## Upstream syncs"
 
 export type Git = (...args: string[]) => { code: number; stdout: string; stderr: string }
 
@@ -373,6 +375,14 @@ function recordSync(
   const text = read.value
   const marker = text.indexOf(changesetMarker)
   if (marker === -1) return { ok: false, message: `no "${changesetMarker}" line in ${file} to record the sync under` }
+  // An entry outside the sync section would be written, reported clean, and then rejected
+  // by the CI check, so the marker's nearest heading must be the sync heading.
+  const heading = text
+    .slice(0, marker)
+    .split("\n")
+    .findLast((line) => line.startsWith("## "))
+  if (heading?.trim() !== changesetSyncHeading)
+    return { ok: false, message: `the "${changesetMarker}" line in ${file} is not under "${changesetSyncHeading}"` }
   const eol = text.indexOf("\n", marker)
   const rest = eol === -1 ? "" : text.slice(eol).replace(/^\n+/, "")
   const updated = `${text.slice(0, eol === -1 ? text.length : eol)}\n\n${line}\n${rest.startsWith("- ") || !rest ? "" : "\n"}${rest}`

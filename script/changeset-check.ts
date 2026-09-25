@@ -19,7 +19,7 @@
 // PR_NUMBER (a push or a manual run) there is nothing to check.
 
 import path from "node:path"
-import { localGit, type Git } from "./sync-upstream"
+import { changesetSyncHeading, localGit, type Git } from "./sync-upstream"
 
 export type PullRequest = { number?: string; author?: string; head?: string; base?: string }
 
@@ -34,7 +34,7 @@ export function checkChangeset(doc: string | undefined, pr: PullRequest, baseDoc
   const head = pr.head ?? ""
   // The head name is only interpolated once it matches this pattern, so it is regex-safe.
   const sync = /^sync-upstream-\d{8}-\d{6}$/.test(head)
-  const section = sync ? "Upstream syncs" : "Fork changes"
+  const section = sync ? changesetSyncHeading : "## Fork changes"
   const entry = sync
     ? new RegExp(`^\\*\\*\\d{4}-\\d{2}-\\d{2}\\*\\* .*\\(${head}\\)`)
     : new RegExp(`^\\*\\*#${number}\\*\\*`)
@@ -50,7 +50,7 @@ export function checkChangeset(doc: string | undefined, pr: PullRequest, baseDoc
     return {
       ok: false,
       reason:
-        `CHANGESET.md has no entry under "## Upstream syncs" naming ${head}. sync-upstream.ts writes it inside the ` +
+        `CHANGESET.md has no entry under "${changesetSyncHeading}" naming ${head}. sync-upstream.ts writes it inside the ` +
         `sync merge, or prints it when CHANGESET.md itself conflicted; add that entry.`,
     }
   return {
@@ -61,11 +61,11 @@ export function checkChangeset(doc: string | undefined, pr: PullRequest, baseDoc
   }
 }
 
-// The list items under a `## <section>` heading, each joined with its indented continuation
+// The list items under a section heading, each joined with its indented continuation
 // lines, so a wrapped entry matches the same as a one-line one.
 function listItems(doc: string, section: string) {
   const lines = doc.split("\n")
-  const start = lines.findIndex((line) => line.trim() === `## ${section}`)
+  const start = lines.findIndex((line) => line.trim() === section)
   if (start === -1) return []
   const end = lines.findIndex((line, index) => index > start && line.startsWith("## "))
   return lines.slice(start + 1, end === -1 ? undefined : end).reduce<string[]>((items, line) => {
