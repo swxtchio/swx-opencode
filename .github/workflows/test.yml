@@ -71,13 +71,25 @@ jobs:
           ls audit-checks.test.ts audit-cli.test.ts guard-expression.test.ts github/same-repo-guard.test.ts github/close-scripts-guard.test.ts github/write-guard-coverage.test.ts > /dev/null
           bun test audit-checks.test.ts audit-cli.test.ts guard-expression.test.ts github/same-repo-guard.test.ts github/close-scripts-guard.test.ts github/write-guard-coverage.test.ts
 
-      - name: Test the upstream sync script
-        # Kept out of the fork-guard gate above: the sync script is fork
-        # tooling, not a guard, and that gate's contents are pinned by the audit.
-        # A single filter that matches nothing fails, so a rename cannot drop
-        # these silently.
+      - name: Test the fork maintenance scripts
+        # Kept out of the fork-guard gate above: these are fork tooling, not
+        # guards, and that gate's contents are pinned by the audit. `ls` first
+        # for the same reason as there: a renamed file must fail, not vanish.
         working-directory: script
-        run: bun test sync-upstream.test.ts
+        run: |
+          ls sync-upstream.test.ts changeset-check.test.ts > /dev/null
+          bun test sync-upstream.test.ts changeset-check.test.ts
+
+      - name: Check the fork changeset
+        # A PR against swxtch must add its entry to CHANGESET.md. Passed through
+        # env, never interpolated into the script, since the head ref is
+        # attacker-chosen on a fork PR.
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_HEAD_REF: ${{ github.head_ref }}
+          PR_BASE_REF: ${{ github.base_ref }}
+        run: bun script/changeset-check.ts
 
       # Correctness-only lint gate. `bun run lint` exits 0 on this repository
       # because .oxlintrc.json sets almost everything to "warn" - including

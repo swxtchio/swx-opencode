@@ -1,8 +1,8 @@
 import { afterAll, describe, expect, test } from "bun:test"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { localGit, syncUpstream, type Git, type SyncOptions } from "./sync-upstream"
+import { changesetMarker, localGit, syncUpstream, type Git, type SyncOptions } from "./sync-upstream"
 
 // Every test builds a throwaway world with real git and no network: a bare `upstream`
 // (the upstream repository), a bare `origin` (the fork), and a `work` checkout wired to
@@ -45,11 +45,14 @@ function world() {
   git(paths.work, "remote", "rename", "origin", "upstream")
   git(paths.work, "checkout", "-q", "-b", "swxtch")
   commit(paths.work, "fork.txt", "f0", "fork-only commit on swxtch")
+  commit(paths.work, "CHANGESET.md", changeset, "fork changeset")
   git(dir, "clone", "-q", "--bare", paths.work, paths.origin)
   git(paths.work, "remote", "add", "origin", paths.origin)
   git(paths.work, "fetch", "-q", "origin")
   return paths
 }
+
+const changeset = `# Fork changeset\n\n## Upstream syncs\n\n${changesetMarker} entries below -->\n\n- **2026-01-01** earlier sync.\n\n## Fork changes\n`
 
 function commit(dir: string, file: string, content: string, message: string) {
   writeFileSync(path.join(dir, file), `${content}\n`)
@@ -85,18 +88,15 @@ function run(repo: string, options: Partial<SyncOptions> = {}, wrap?: (real: Git
 
 const syncBranches = (repo: string) => git(repo, "branch", "--list", "sync-upstream-*")
 
-// Let the exact sync merge populate MERGE_HEAD and the index, then fail before it
-// commits, the way a rejecting hook would. Records every merge call so the test can prove
-// the production cleanup ran.
-function rejectCleanMerge(calls: string[]) {
+// Let the sync merge populate MERGE_HEAD and the index, then reject the commit that would
+// record it, the way a failing pre-commit hook would. Records every merge call so the test
+// can prove the production cleanup ran.
+function rejectMergeCommit(calls: string[]) {
   return (real: Git): Git =>
     (...args) => {
       if (args[0] === "merge") calls.push(args.join(" "))
-      const target = args[4]
-      if (args[0] !== "merge" || args[1] !== "--no-ff" || args[2] !== "-m" || !target) return real(...args)
-      const merged = real("merge", "--no-ff", "--no-commit", target)
-      if (merged.code !== 0) return merged
-      return { code: 1, stdout: "", stderr: "TEST-REJECTED-CLEAN-MERGE" }
+      if (args[0] !== "commit") return real(...args)
+      return { code: 1, stdout: "", stderr: "TEST-REJECTED-MERGE-COMMIT" }
     }
 }
 
@@ -131,6 +131,11 @@ describe("syncUpstream", () => {
     expect(git(w.origin, "rev-parse", "dev")).toBe(upSha)
     expect(result.out).toContain("upstream: feature.txt=new")
     expect(result.out).toContain("--- changed files ---\nfeature.txt")
+    // The changeset entry is part of the merge commit, newest first above earlier entries.
+    const recorded = git(w.work, "show", "HEAD:CHANGESET.md")
+    const entry = `- **2026-09-25** \`${git(w.work, "rev-parse", "--short", git(w.work, "merge-base", "HEAD^1", "HEAD^2"))}..${git(w.work, "rev-parse", "--short", upSha)}\`, 1 upstream commit. Conflicts: none.`
+    expect(recorded).toContain(`entries below -->\n\n${entry}\n- **2026-01-01** earlier sync.`)
+    expect(git(w.work, "status", "--porcelain")).toBe("")
     // It prepares a branch for review; the fork's branch is never moved or pushed.
     expect(git(w.work, "rev-parse", "swxtch")).toBe(swxtch)
     expect(git(w.origin, "rev-parse", "swxtch")).toBe(originSwxtch)
@@ -148,6 +153,12 @@ describe("syncUpstream", () => {
     expect(result.token).toBe("SYNC_CONFLICTS")
     expect(result.code).toBe(3)
     expect(result.out).toContain("--- conflicted files ---\nfork.txt")
+    // The entry is staged with the in-progress merge, naming the file to resolve.
+    expect(git(w.work, "show", ":CHANGESET.md")).toContain("Conflicts: `fork.txt` - record how each was resolved.")
+    expect(git(w.work, "show", ":CHANGESET.md")).toContain("- **2026-01-01** earlier sync.")
+    // The resolver's `git commit` gets the conventional message, not "Merge commit '<sha>'".
+    const mergeMsg = git(w.work, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_MSG")
+    expect(readFileSync(mergeMsg, "utf8")).toStartWith("chore: sync swxtch with upstream/dev at ")
     expect(git(w.work, "rev-parse", "--verify", "MERGE_HEAD")).toBe(git(w.up, "rev-parse", "dev"))
     expect(git(w.work, "symbolic-ref", "--short", "HEAD")).toStartWith("sync-upstream-")
     expect(git(w.work, "rev-parse", "swxtch")).toBe(swxtch)
@@ -211,6 +222,21 @@ describe("syncUpstream", () => {
 
     expect(result.out).toContain("MIRROR: created dev")
     expect(git(w.work, "rev-parse", "dev")).toBe(git(w.up, "rev-parse", "dev"))
+    expect(result.token).toBe("SYNC_CLEAN")
+  })
+
+  // GOAL: a repository without the changeset still gets its merge prepared, with a warning
+  // telling the operator to record the sync by hand.
+  test("warns and still merges when CHANGESET.md is missing", () => {
+    const w = world()
+    git(w.work, "rm", "-q", "CHANGESET.md")
+    git(w.work, "commit", "-qm", "drop changeset")
+    git(w.work, "push", "-q", "origin", "swxtch")
+    advanceUpstream(w, "feature.txt", "new")
+
+    const result = run(w.work)
+
+    expect(result.out).toContain("CHANGESET: WARNING no CHANGESET.md")
     expect(result.token).toBe("SYNC_CLEAN")
   })
 
@@ -327,11 +353,11 @@ describe("syncUpstream", () => {
     advanceUpstream(w, "feature.txt", "new")
     const calls: string[] = []
 
-    const result = run(w.work, {}, rejectCleanMerge(calls))
+    const result = run(w.work, {}, rejectMergeCommit(calls))
 
     expect(result.token).toBe("SYNC_MERGE_FAILED")
     expect(result.code).toBe(5)
-    expect(result.out).toContain("TEST-REJECTED-CLEAN-MERGE")
+    expect(result.out).toContain("TEST-REJECTED-MERGE-COMMIT")
     expect(result.out).toContain("deleted the empty sync branch")
     expect(result.out).toContain("the dev mirror was advanced and pushed to origin")
     expect(calls).toContain("merge --abort")
@@ -347,7 +373,7 @@ describe("syncUpstream", () => {
     advanceUpstream(w, "feature.txt", "new")
     git(w.work, "remote", "set-url", "--push", "origin", path.join(w.dir, "missing.git"))
 
-    const result = run(w.work, {}, rejectCleanMerge([]))
+    const result = run(w.work, {}, rejectMergeCommit([]))
 
     expect(result.token).toBe("SYNC_MERGE_FAILED")
     expect(result.out).toContain("the push to origin FAILED")
@@ -361,7 +387,7 @@ describe("syncUpstream", () => {
     advanceUpstream(w, "feature.txt", "new")
     presyncMirror(w)
 
-    const result = run(w.work, {}, rejectCleanMerge([]))
+    const result = run(w.work, {}, rejectMergeCommit([]))
 
     expect(result.token).toBe("SYNC_ABORT")
     expect(result.out).toContain("the dev mirror was already current")

@@ -10,6 +10,9 @@
 - Sync with upstream by merging, never rebasing: run `bun script/sync-upstream.ts` from a dedicated worktree. It
   fast-forwards `dev` to `upstream/dev` and prepares a `--no-ff` merge onto a new branch off `swxtch` for a PR. Land
   that PR with a merge commit, never a squash; the script's header documents its report tokens and conflict handling.
+- `CHANGESET.md` at the root records every upstream sync and every change this fork carries. A PR against `swxtch`
+  adds its own `- **#<number>**` entry under the matching area in "Fork changes", which CI checks; the sync script
+  writes the sync entries.
 
 ## Branch Names
 

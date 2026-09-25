@@ -23,10 +23,12 @@
 //   2. Validates every abort condition before moving or pushing anything.
 //   3. Fast-forwards dev to upstream/dev (FF only) and pushes it to origin.
 //   4. Stops with SYNC_UPTODATE when swxtch already contains upstream/dev.
-//   5. Creates sync-upstream-<UTC timestamp> off swxtch and runs `git merge --no-ff`.
+//   5. Creates sync-upstream-<UTC timestamp> off swxtch, runs `git merge --no-ff`, and adds
+//      the sync's entry to CHANGESET.md inside that same merge.
 //
 // It never pushes swxtch, opens a PR, or resolves conflicts. On conflicts the merge is left
-// in progress so a resolver keeps git's partial auto-merge. Land the sync PR with a merge
+// in progress, with the CHANGESET.md entry staged, so a resolver keeps git's partial
+// auto-merge and records the resolutions in the entry and the commit message. Land the sync PR with a merge
 // commit, never a squash: squashing drops the upstream/dev parent, so the next run would
 // re-merge the same commits into an empty diff.
 //
@@ -40,6 +42,11 @@
 //
 // Every decision reads actual git state. The whole run pins one upstream and one base
 // commit, so a concurrent fetch or branch move cannot change what it acts on.
+
+import { existsSync, readFileSync, writeFileSync } from "node:fs"
+import path from "node:path"
+
+export const changesetMarker = "<!-- upstream-syncs:"
 
 export type Git = (...args: string[]) => { code: number; stdout: string; stderr: string }
 
@@ -256,43 +263,82 @@ export function syncUpstream(options: SyncOptions) {
       ]
     : [`--- upstream range --- (no common merge base with ${upstreamRef})`]
 
-  // An explicit message, since merging a bare sha would default to "Merge commit '<sha>'".
-  const merge = git(
-    "merge",
-    "--no-ff",
-    "-m",
-    `chore: sync ${base} with ${upstream}/${mirror} at ${short(upSha)}`,
-    upSha,
-  )
+  // Merge without committing, so the changeset entry lands inside the sync merge itself.
+  const merge = git("merge", "--no-ff", "--no-commit", upSha)
   const mergeOutput = [merge.stdout, merge.stderr].filter(Boolean).join("\n") || "<no output>"
-  if (merge.code === 0) {
-    // Phase 4 proved upstream is not contained, so a successful merge must create a commit;
-    // none means the base moved concurrently.
-    if (git("rev-parse", "HEAD").stdout === baseSha)
-      return fail(
-        `merge of ${upSha} reported success but created no commit (base moved concurrently?): ${mergeOutput}`,
-        owned,
-      )
-    range.forEach((line) => log(line))
-    const files = mergeBase ? git("diff", "--name-only", mergeBase, upSha).stdout : ""
-    log(files ? `--- changed files ---\n${files}` : "--- changed files --- (none)")
-    return finish("SYNC_CLEAN", `merged ${upstreamRef} into ${syncBranch} (committed, ready for review)`)
-  }
-
   // A real conflict leaves MERGE_HEAD and at least one unmerged path. Anything else, such
   // as a failing hook, or a classification probe that itself errored, is not a conflict.
+  const inProgress = !!commit("MERGE_HEAD")
   const conflicts = git("diff", "--name-only", "--diff-filter=U")
-  if (commit("MERGE_HEAD") && conflicts.code === 0 && conflicts.stdout) {
+  const conflicted = merge.code !== 0 && inProgress && conflicts.code === 0 && !!conflicts.stdout
+  // Phase 4 proved upstream is not contained, so a clean merge must leave one to commit;
+  // none means the base moved concurrently.
+  if (merge.code === 0 && !inProgress)
+    return fail(`merge of ${upSha} reported success but left nothing to commit (base moved concurrently?)`, owned)
+  if (merge.code !== 0 && !conflicted) {
+    git("merge", "--abort")
+    return fail(`merge of ${upSha} into ${syncBranch} failed without conflicts: ${mergeOutput}`, owned)
+  }
+
+  const count = mergeBase ? git("rev-list", "--count", `${mergeBase}..${upSha}`).stdout : "?"
+  const files = conflicted ? conflicts.stdout.split("\n") : []
+  log(
+    recordSync(git, {
+      date: (options.now ?? new Date()).toISOString().slice(0, 10),
+      range: `${mergeBase ? short(mergeBase) : "?"}..${short(upSha)}`,
+      count,
+      conflicts: files,
+    }),
+  )
+  // An explicit message, since merging a bare sha would default to "Merge commit '<sha>'".
+  // Written to MERGE_MSG so a resolver's `git commit` after conflicts picks it up too.
+  writeFileSync(
+    git("rev-parse", "--path-format=absolute", "--git-path", "MERGE_MSG").stdout,
+    `chore: sync ${base} with ${upstream}/${mirror} at ${short(upSha)}\n\nBrings in ${count} upstream commits.\n`,
+  )
+
+  if (conflicted) {
     log(`--- conflicted files ---\n${conflicts.stdout}`)
     range.forEach((line) => log(line))
     return finish(
       "SYNC_CONFLICTS",
-      `merge of ${upstreamRef} into ${syncBranch} left conflicts (merge IN PROGRESS - resolve, commit, then open the sync PR)`,
+      `merge of ${upstreamRef} into ${syncBranch} left conflicts (merge IN PROGRESS - resolve, record the resolutions in CHANGESET.md and the commit message, commit, then open the sync PR)`,
     )
   }
 
-  git("merge", "--abort")
-  return fail(`merge of ${upSha} into ${syncBranch} failed without conflicts: ${mergeOutput}`, owned)
+  const committed = git("commit", "--no-edit")
+  if (committed.code !== 0) {
+    git("merge", "--abort")
+    const output = [committed.stdout, committed.stderr].filter(Boolean).join("\n") || "<no output>"
+    return fail(`committing the merge of ${upSha} into ${syncBranch} failed: ${output}`, owned)
+  }
+  range.forEach((line) => log(line))
+  const changed = mergeBase ? git("diff", "--name-only", mergeBase, upSha).stdout : ""
+  log(changed ? `--- changed files ---\n${changed}` : "--- changed files --- (none)")
+  return finish("SYNC_CLEAN", `merged ${upstreamRef} into ${syncBranch} (committed, ready for review)`)
+}
+
+// Add this sync's entry to CHANGESET.md and stage it. A missing file or marker is reported
+// rather than fatal: the merge itself is still worth preparing.
+function recordSync(git: Git, entry: { date: string; range: string; count: string; conflicts: string[] }) {
+  const file = path.join(git("rev-parse", "--show-toplevel").stdout, "CHANGESET.md")
+  if (!existsSync(file)) return "CHANGESET: WARNING no CHANGESET.md at the repository root; record this sync by hand"
+  const text = readFileSync(file, "utf8")
+  const marker = text.indexOf(changesetMarker)
+  if (marker === -1) return `CHANGESET: WARNING no "${changesetMarker}" line in CHANGESET.md; record this sync by hand`
+  const eol = text.indexOf("\n", marker)
+  const rest = eol === -1 ? "" : text.slice(eol).replace(/^\n+/, "")
+  const conflicts = entry.conflicts.length
+    ? `Conflicts: ${entry.conflicts.map((name) => `\`${name}\``).join(", ")} - record how each was resolved.`
+    : "Conflicts: none."
+  const line = `- **${entry.date}** \`${entry.range}\`, ${entry.count} upstream ${entry.count === "1" ? "commit" : "commits"}. ${conflicts}`
+  writeFileSync(
+    file,
+    `${text.slice(0, eol === -1 ? text.length : eol)}\n\n${line}\n${rest.startsWith("- ") ? "" : "\n"}${rest}`,
+  )
+  if (git("add", "CHANGESET.md").code !== 0)
+    return "CHANGESET: WARNING recorded the sync in CHANGESET.md but could not stage it; `git add CHANGESET.md`"
+  return `CHANGESET: recorded ${entry.range}`
 }
 
 // Step off and delete a sync branch this run created. Every outcome is read back from git,

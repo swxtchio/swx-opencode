@@ -15,6 +15,7 @@
     "check-workflow-guards.ts",
     "guard-expression.test.ts",
     "sync-upstream*.ts",
+    "changeset-check*.ts",
     "github/*.ts"
   ]
 }
