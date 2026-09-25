@@ -267,11 +267,17 @@ export function syncUpstream(options: SyncOptions) {
   // mirror moved or a push landed (or may have), otherwise a true nothing-happened
   // SYNC_ABORT. The sync branch is cleaned up first, and the report says when HEAD could not
   // be moved off it or the tree is not provably clean.
+  // Without ownership nothing is deleted, but the report must not claim more than git shows:
+  // `checkout -b` creates the ref before switching the tree, so a checkout that fails
+  // switching can leave behind a branch this run did create, and a racing process can own
+  // one of the same name. Phase 2 proved the name free, so an existing ref is ambiguous.
+  const unownedBranchState = () =>
+    commit(`refs/heads/${syncBranch}`)
+      ? `the sync branch ${syncBranch} exists but this run cannot prove it created it (a failed checkout can leave one behind) - left untouched; delete it if stray`
+      : `the sync branch ${syncBranch} was never created`
   const failToken = mutated ? "SYNC_MERGE_FAILED" : "SYNC_ABORT"
   const fail = (message: string, owned: boolean) => {
-    const cleanup = owned
-      ? abandonBranch(git, syncBranch, startBranch, startSha)
-      : `the sync branch ${syncBranch} was not created by this run - left untouched`
+    const cleanup = owned ? abandonBranch(git, syncBranch, startBranch, startSha) : unownedBranchState()
     const tree = git("status", "--porcelain", "--untracked-files=all")
     const treeState =
       tree.code !== 0

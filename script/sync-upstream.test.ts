@@ -810,10 +810,32 @@ describe("syncUpstream", () => {
     })
 
     expect(result.token).toBe("SYNC_MERGE_FAILED")
-    expect(result.out).toContain("was not created by this run - left untouched")
+    expect(result.out).toContain("this run cannot prove it created it")
+    expect(result.out).toContain("left untouched")
     const raced = syncBranches(w.work).trim()
     expect(raced).toStartWith("sync-upstream-")
     expect(git(w.work, "rev-parse", raced)).toBe(racePoint)
+    expect(git(w.work, "symbolic-ref", "--short", "HEAD")).toBe("swxtch")
+  })
+
+  // GOAL: a checkout that creates the ref and then fails to switch the tree leaves a branch
+  // this run did create. The report must not claim otherwise, and must not delete what it
+  // cannot prove it owns.
+  test("a checkout that fails after creating the branch is reported as ambiguous", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+
+    const result = run(w.work, {}, (real) => (...args) => {
+      const name = args[3]
+      if (args[0] !== "checkout" || args[2] !== "-b" || !name) return real(...args)
+      real("branch", name, args[4] ?? "HEAD")
+      return { code: 1, stdout: "", stderr: "error: Your local changes would be overwritten by checkout" }
+    })
+
+    expect(result.token).toBe("SYNC_MERGE_FAILED")
+    expect(result.out).toContain("this run cannot prove it created it")
+    expect(result.out).not.toContain("was not created by this run")
+    expect(syncBranches(w.work)).toStartWith("sync-upstream-")
     expect(git(w.work, "symbolic-ref", "--short", "HEAD")).toBe("swxtch")
   })
 
