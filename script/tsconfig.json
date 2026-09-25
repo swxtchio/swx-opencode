@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "@tsconfig/bun/tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // The root has no @types/bun; the scripts helper package does.
+    "typeRoots": ["../packages/script/node_modules/@types"],
+    "types": ["bun"]
+  },
+  // Only the files this fork authors or has modified. The rest of script/ is
+  // identical to upstream, and fixing its type errors here would only add
+  // conflicts to every upstream sync.
+  "include": [
+    "audit-*.test.ts",
+    "check-workflow-guards.ts",
+    "guard-expression.test.ts",
+    "sync-upstream*.ts",
+    "github/*.ts"
+  ]
+}
