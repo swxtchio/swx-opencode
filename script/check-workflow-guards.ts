@@ -33,7 +33,7 @@ const GUARD = "github.repository == 'anomalyco/opencode'"
  * guarded on four jobs out of five.
  */
 const ALLOWED = new Map([
-  ["test.yml::unit", "bb8f511805a6d646"],
+  ["test.yml::unit", "3f876d7da5469565"],
   ["test.yml::e2e", "9f89116be327fa02"],
   ["typecheck.yml::typecheck", "b82d5ddbd87d3df7"],
 ])
