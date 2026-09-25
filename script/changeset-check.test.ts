@@ -144,5 +144,9 @@ describe("readBaseChangeset", () => {
     expect(readBaseChangeset(shallow, without)).toBe("")
     expect(readBaseChangeset(shallow, "0".repeat(40))).toBeUndefined()
     expect(readBaseChangeset(shallow, "not-a-sha")).toBeUndefined()
+    // A base that has the file but cannot be read is unknown, never "no file".
+    const failingShow = (...args: string[]) =>
+      args[0] === "show" ? { code: 128, stdout: "", stderr: "fatal: injected" } : shallow(...args)
+    expect(readBaseChangeset(failingShow, withFile)).toBeUndefined()
   })
 })

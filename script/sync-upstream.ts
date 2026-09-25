@@ -144,11 +144,12 @@ export function syncUpstream(options: SyncOptions) {
       `missing required remote '${missing}' (found: ${git("remote").stdout.split("\n").join(",") || "none"})`,
     )
 
-  // No --tags: nothing here uses tags, and a local tag that differs from upstream's would
-  // fail the whole fetch.
-  const upstreamFetch = git("fetch", upstream)
+  // --no-tags: nothing here uses tags, a fetch would otherwise auto-follow them (a local
+  // ref change an abort must not leave behind), and a local tag that differs from
+  // upstream's would fail the whole fetch.
+  const upstreamFetch = git("fetch", "--no-tags", upstream)
   if (upstreamFetch.code !== 0) return abort(`git fetch ${upstream} failed: ${firstLine(upstreamFetch.stderr)}`)
-  const originFetch = git("fetch", origin)
+  const originFetch = git("fetch", "--no-tags", origin)
   if (originFetch.code !== 0) return abort(`git fetch ${origin} failed: ${firstLine(originFetch.stderr)}`)
 
   const upstreamRef = `refs/remotes/${upstream}/${mirror}`

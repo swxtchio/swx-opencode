@@ -223,6 +223,23 @@ describe("syncUpstream", () => {
     expect(syncBranches(w.work)).toBe("")
   })
 
+  // GOAL: fetching never touches local tags. An abort leaves no new tag behind, and a local
+  // tag that clashes with upstream's does not block the sync.
+  test("fetches without tags", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    git(w.upsrc, "tag", "v-new")
+    git(w.upsrc, "tag", "v-clash")
+    git(w.upsrc, "push", "-q", w.up, "v-new", "v-clash")
+    git(w.work, "tag", "v-clash", "swxtch")
+
+    const result = run(w.work)
+
+    expect(result.token).toBe("SYNC_CLEAN")
+    expect(git(w.work, "tag", "--list")).toBe("v-clash")
+    expect(git(w.work, "rev-parse", "v-clash")).toBe(git(w.work, "rev-parse", "swxtch"))
+  })
+
   test("creates the local mirror when it does not exist yet", () => {
     const w = world()
     advanceUpstream(w, "feature.txt", "new")

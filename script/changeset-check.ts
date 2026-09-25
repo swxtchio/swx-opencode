@@ -82,8 +82,13 @@ export function readBaseChangeset(git: Git, sha: string) {
   if (git("cat-file", "-e", `${sha}^{commit}`).code !== 0 && git("fetch", "-q", "--depth=1", "origin", sha).code !== 0)
     return undefined
   if (git("cat-file", "-e", `${sha}^{commit}`).code !== 0) return undefined
+  // Only a base that provably lacks the file reads as empty; any other failure is unknown,
+  // or a reused sync branch name could pass against a base that does record it.
+  const listed = git("ls-tree", "--name-only", sha, "--", "CHANGESET.md")
+  if (listed.code !== 0) return undefined
+  if (!listed.stdout) return ""
   const file = git("show", `${sha}:CHANGESET.md`)
-  return file.code === 0 ? file.stdout : ""
+  return file.code === 0 ? file.stdout : undefined
 }
 
 if (import.meta.main) {
