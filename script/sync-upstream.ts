@@ -146,18 +146,20 @@ export function syncUpstream(options: SyncOptions) {
       `missing required remote '${missing}' (found: ${git("remote").stdout.split("\n").join(",") || "none"})`,
     )
 
-  // --no-tags: nothing here uses tags, a fetch would otherwise auto-follow them (a local
-  // ref change an abort must not leave behind), and a local tag that differs from
-  // upstream's would fail the whole fetch.
-  const upstreamFetch = git("fetch", "--no-tags", upstream)
+  // Fetch only the two branches the run needs, into remote-tracking refs by explicit
+  // refspec, so a configured refspec that writes a local branch cannot move one before an
+  // abort. --refmap= stops git also applying the configured refspecs as "opportunistic"
+  // updates alongside the explicit ones. --no-tags for the same reason: a fetch would otherwise auto-follow tags, and a
+  // local tag that differs from upstream's would fail the whole fetch.
+  const upstreamRef = `refs/remotes/${upstream}/${mirror}`
+  const baseRef = `refs/remotes/${origin}/${base}`
+  const upstreamFetch = git("fetch", "--no-tags", "--refmap=", upstream, `+refs/heads/${mirror}:${upstreamRef}`)
   if (upstreamFetch.code !== 0) return abort(`git fetch ${upstream} failed: ${firstLine(upstreamFetch.stderr)}`)
-  const originFetch = git("fetch", "--no-tags", origin)
+  const originFetch = git("fetch", "--no-tags", "--refmap=", origin, `+refs/heads/${base}:${baseRef}`)
   if (originFetch.code !== 0) return abort(`git fetch ${origin} failed: ${firstLine(originFetch.stderr)}`)
 
-  const upstreamRef = `refs/remotes/${upstream}/${mirror}`
   const upSha = commit(upstreamRef)
   if (!upSha) return abort(`${upstreamRef} does not exist after fetch (does ${upstream} have ${mirror}?)`)
-  const baseRef = `refs/remotes/${origin}/${base}`
   const baseSha = commit(baseRef)
   if (!baseSha) return abort(`${baseRef} does not exist after fetch (does ${origin} have ${base}?)`)
 
@@ -223,6 +225,8 @@ export function syncUpstream(options: SyncOptions) {
     // No readable destinations means the outcome is unknown, not vacuously "pushed".
     if (after.length === 0 || after.includes(undefined)) return "unknown"
     if (after.every((sha) => sha === upSha)) return "pushed"
+    // A destination unread before the push cannot show whether it moved.
+    if (before.includes(undefined)) return "unknown"
     return after.some((sha, index) => sha !== before[index]) ? "partial" : "failed"
   }
   const before = destinations()

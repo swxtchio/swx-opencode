@@ -249,6 +249,28 @@ describe("syncUpstream", () => {
     expect(git(w.work, "rev-parse", "v-clash")).toBe(git(w.work, "rev-parse", "swxtch"))
   })
 
+  // GOAL: an abort after the fetches leaves local branches where they were, even with a
+  // configured fetch refspec that writes a local branch.
+  test("fetching cannot move a local branch through a configured refspec", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    git(w.work, "config", "--add", "remote.upstream.fetch", "+refs/heads/dev:refs/heads/dev")
+    const dev = git(w.work, "rev-parse", "dev")
+
+    const result = run(
+      w.work,
+      {},
+      (real) =>
+        (...args) =>
+          args[0] === "fetch" && args.includes("origin")
+            ? { code: 128, stdout: "", stderr: "fatal: injected" }
+            : real(...args),
+    )
+
+    expect(result.token).toBe("SYNC_ABORT")
+    expect(git(w.work, "rev-parse", "dev")).toBe(dev)
+  })
+
   test("creates the local mirror when it does not exist yet", () => {
     const w = world()
     advanceUpstream(w, "feature.txt", "new")
@@ -424,6 +446,24 @@ describe("syncUpstream", () => {
     expect(result.token).toBe("SYNC_MERGE_FAILED")
   })
 
+  // GOAL: a destination that could not be read before the push cannot show whether it
+  // moved, so a rejected push is UNKNOWN rather than "partial".
+  test("a push with an unreadable pre-push destination is unknown", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    rejectPushes(w)
+    const reads: string[] = []
+
+    const result = run(w.work, {}, (real) => (...args) => {
+      if (args[0] === "ls-remote" && reads.push("ls-remote") === 1)
+        return { code: 128, stdout: "", stderr: "fatal: injected" }
+      return real(...args)
+    })
+
+    expect(result.out).toContain("is UNKNOWN")
+    expect(result.out).not.toContain("reached only some")
+  })
+
   // GOAL: when no push destination can be listed, a failed push is UNKNOWN, never a
   // vacuous "every destination is current".
   test("a failed push with no readable push URLs is unknown", () => {
@@ -482,7 +522,8 @@ describe("syncUpstream", () => {
     const result = run(w.work, { base: "missing" })
 
     expect(result.token).toBe("SYNC_ABORT")
-    expect(result.out).toContain("refs/remotes/origin/missing does not exist")
+    expect(result.out).toContain("git fetch origin failed")
+    expect(result.out).toContain("refs/heads/missing")
     expect(git(w.work, "rev-parse", "dev")).toBe(dev)
   })
 
