@@ -839,6 +839,59 @@ describe("syncUpstream", () => {
     expect(git(w.work, "symbolic-ref", "--short", "HEAD")).toBe("swxtch")
   })
 
+  // GOAL: a branch this run may have created is a possible mutation, so even with nothing
+  // pushed the token is not the nothing-happened SYNC_ABORT.
+  test("a leftover sync branch is not reported as SYNC_ABORT", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    presyncMirror(w)
+
+    const result = run(w.work, {}, (real) => (...args) => {
+      const name = args[3]
+      if (args[0] !== "checkout" || args[2] !== "-b" || !name) return real(...args)
+      real("branch", name, args[4] ?? "HEAD")
+      return { code: 1, stdout: "", stderr: "error: Your local changes would be overwritten by checkout" }
+    })
+
+    expect(result.out).toContain("the dev mirror was already current")
+    expect(result.token).toBe("SYNC_MERGE_FAILED")
+  })
+
+  // GOAL: a hook that switches HEAD back and exits 0 cannot make the merge land on swxtch.
+  test("a checkout that succeeds without landing on the sync branch fails", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    const swxtch = git(w.work, "rev-parse", "swxtch")
+
+    const result = run(w.work, {}, (real) => (...args) => {
+      if (args[0] !== "checkout" || args[2] !== "-b") return real(...args)
+      real(...args)
+      return real("checkout", "-q", "swxtch")
+    })
+
+    expect(result.token).not.toBe("SYNC_CLEAN")
+    expect(result.out).toContain("HEAD is not on the sync branch")
+    expect(git(w.work, "rev-parse", "swxtch")).toBe(swxtch)
+  })
+
+  // GOAL: the commit lands only on the sync branch; if HEAD moved mid-merge, nothing is
+  // committed.
+  test("does not commit when HEAD has left the sync branch", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    const merged: string[] = []
+
+    const result = run(w.work, {}, (real) => (...args) => {
+      if (args[0] === "merge" && args[1] === "--no-ff") merged.push("merge")
+      if (args[0] === "symbolic-ref" && merged.length > 0) return { code: 0, stdout: "swxtch", stderr: "" }
+      return real(...args)
+    })
+
+    expect(result.token).not.toBe("SYNC_CLEAN")
+    expect(result.out).toContain("nothing was committed")
+    expect(localGit(w.work, env)("rev-parse", "--verify", "--quiet", "MERGE_HEAD").code).toBe(0)
+  })
+
   // GOAL: the primary checkout is never left on a sync branch. The guard reads the real
   // worktree layout: refused in the primary, allowed in a linked worktree.
   test("refuses the primary checkout and runs in a linked worktree", () => {

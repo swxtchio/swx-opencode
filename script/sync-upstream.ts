@@ -38,13 +38,15 @@
 //
 // Report tokens (line-anchored) and exit codes:
 //   SYNC_CLEAN         0  merge committed on the sync branch, ready for review
-//   SYNC_ABORT         2  no local branch moved and nothing was pushed (a fetch may have
-//                         updated remote-tracking refs); fix the cause and re-run, after
-//                         any cleanup the report asks for (such as a failed merge --abort)
+//   SYNC_ABORT         2  no local branch moved or was left behind and nothing was pushed
+//                         (a fetch may have updated remote-tracking refs); fix the cause
+//                         and re-run
 //   SYNC_CONFLICTS     3  merge left in progress on the sync branch for a resolver
 //   SYNC_UPTODATE      4  origin/swxtch already contains upstream/dev; no sync branch
-//   SYNC_MERGE_FAILED  5  the mirror moved or was pushed (or may have), then the sync branch could not be
-//                         created or the merge could not be prepared and committed
+//   SYNC_MERGE_FAILED  5  something durable changed or may have (the mirror moved or was
+//                         pushed, or a sync branch was left behind), then the sync branch
+//                         could not be created or the merge could not be prepared and
+//                         committed; do the cleanup the report asks for before re-running
 // From the mirror step on, every final line also states what happened to the mirror, and a
 // failure states whether cleanup actually left the tree clean.
 //
@@ -263,10 +265,10 @@ export function syncUpstream(options: SyncOptions) {
 
   // --- phase 5: create the sync branch and merge the pinned upstream commit ---
 
-  // Any failure from here is reported by what ACTUALLY changed: SYNC_MERGE_FAILED when the
-  // mirror moved or a push landed (or may have), otherwise a true nothing-happened
-  // SYNC_ABORT. The sync branch is cleaned up first, and the report says when HEAD could not
-  // be moved off it or the tree is not provably clean.
+  // Any failure from here is reported by what ACTUALLY changed, decided after cleanup:
+  // SYNC_MERGE_FAILED when the mirror moved or a push landed (or may have), or a sync branch
+  // is still there; otherwise a true nothing-happened SYNC_ABORT. The report also says when
+  // HEAD could not be moved off the branch or the tree is not provably clean.
   // Without ownership nothing is deleted, but the report must not claim more than git shows:
   // `checkout -b` creates the ref before switching the tree, so a checkout that fails
   // switching can leave behind a branch this run did create, and a racing process can own
@@ -275,7 +277,7 @@ export function syncUpstream(options: SyncOptions) {
     commit(`refs/heads/${syncBranch}`)
       ? `the sync branch ${syncBranch} exists but this run cannot prove it created it (a failed checkout can leave one behind) - left untouched; delete it if stray`
       : `the sync branch ${syncBranch} was never created`
-  const failToken = mutated ? "SYNC_MERGE_FAILED" : "SYNC_ABORT"
+  const failToken = () => (mutated || commit(`refs/heads/${syncBranch}`) ? "SYNC_MERGE_FAILED" : "SYNC_ABORT")
   const fail = (message: string, owned: boolean) => {
     const cleanup = owned ? abandonBranch(git, syncBranch, startBranch, startSha) : unownedBranchState()
     const tree = git("status", "--porcelain", "--untracked-files=all")
@@ -285,7 +287,7 @@ export function syncUpstream(options: SyncOptions) {
         : tree.stdout
           ? "; the working tree is NOT clean - inspect it before re-running"
           : ""
-    return finish(failToken, `${message} (${cleanup}${treeState}; ${mirrorState})`)
+    return finish(failToken(), `${message} (${cleanup}${treeState}; ${mirrorState})`)
   }
   // Read the abort back rather than assume it: `merge --abort` is `reset --merge`, which
   // refuses when a file it must restore has unstaged changes. If the merge survives, stay on
@@ -295,19 +297,20 @@ export function syncUpstream(options: SyncOptions) {
     const aborted = git("merge", "--abort")
     if (!commit("MERGE_HEAD")) return fail(message, owned)
     return finish(
-      failToken,
+      failToken(),
       `${message}; merge --abort failed (${firstLine(aborted.stderr) || "no output"}), so the merge is STILL in progress on ${syncBranch} - run \`git merge --abort\` there, then delete the branch (${mirrorState})`,
     )
   }
 
   // Ownership comes from where HEAD landed, not the exit code: `checkout -b` fails before
-  // switching when the name is taken (a concurrent creator owns it), while a failing
-  // post-checkout hook exits nonzero after switching (this run owns it).
+  // switching when the name is taken (a concurrent creator owns it), a failing post-checkout
+  // hook exits nonzero after switching (this run owns it), and a hook can even switch back
+  // and exit 0, which must not let the merge land on whatever branch HEAD is on instead.
   const checkout = git("checkout", "-q", "-b", syncBranch, baseSha)
   const owned = currentBranch() === syncBranch
-  if (checkout.code !== 0)
+  if (checkout.code !== 0 || !owned)
     return fail(
-      `could not create sync branch ${syncBranch} off ${origin}/${base} @ ${short(baseSha)}: ${firstLine(checkout.stderr)}`,
+      `could not create sync branch ${syncBranch} off ${origin}/${base} @ ${short(baseSha)}: ${firstLine(checkout.stderr) || "the checkout reported success but HEAD is not on the sync branch"}`,
       owned,
     )
   log(`SYNC_BRANCH: ${syncBranch} (off ${origin}/${base} @ ${short(baseSha)})`)
@@ -363,6 +366,12 @@ export function syncUpstream(options: SyncOptions) {
     )
   }
 
+  // Commit only onto the sync branch. If something moved HEAD mid-merge, touch nothing.
+  if (currentBranch() !== syncBranch)
+    return finish(
+      failToken(),
+      `HEAD is no longer on ${syncBranch} with the merge of ${upSha} uncommitted - nothing was committed; inspect the repository by hand (${mirrorState})`,
+    )
   const committed = git("commit", "--no-edit")
   if (committed.code !== 0)
     return abandonMerge(
