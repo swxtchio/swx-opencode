@@ -9,8 +9,9 @@ How it stays current:
   itself, naming its `sync-upstream-<UTC timestamp>` branch. Record conflict resolutions in the sync merge commit
   message and summarize them in the entry.
 - **Fork changes** are added by the PR that makes them, under the matching area, newest first.
-- CI (`script/changeset-check.ts`) fails a PR against `swxtch` that does not record itself: a `- **#<number>**` entry
-  for a fork change, or the sync entry naming the branch for a sync PR. Only Dependabot PRs are exempt.
+- CI (`script/changeset-check.ts`) fails a PR against `swxtch` that does not add its own entry, compared with the
+  base: a `- **#<number>**` item under "Fork changes" for a fork change, or, for a sync PR, the item under "Upstream
+  syncs" naming its branch. Entries may wrap onto indented lines. Only Dependabot PRs are exempt.
 - When upstream adopts or supersedes a fork change, update its status instead of deleting the entry.
 
 Status: **fork-only** means the change exists only here; **upstreamable** means it fixes upstream's own code and

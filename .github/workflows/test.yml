@@ -89,6 +89,9 @@ jobs:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_HEAD_REF: ${{ github.head_ref }}
           PR_BASE_REF: ${{ github.base_ref }}
+          # The entry must be new against the base, which the depth-1 checkout
+          # lacks; the check fetches this commit to read it.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: bun script/changeset-check.ts
 
       # Correctness-only lint gate. `bun run lint` exits 0 on this repository

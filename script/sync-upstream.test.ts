@@ -463,6 +463,99 @@ describe("syncUpstream", () => {
     expectAbandoned(w)
   })
 
+  // GOAL: a staging failure after the entry is written leaves nothing behind. merge --abort
+  // is reset --merge, which refuses an unstaged change, so the file is restored first.
+  test("a failed stage of the changeset entry is cleaned up", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+
+    const result = run(
+      w.work,
+      {},
+      (real) =>
+        (...args) =>
+          args[0] === "add" ? { code: 128, stdout: "", stderr: "fatal: index.lock exists" } : real(...args),
+    )
+
+    expect(result.token).toBe("SYNC_MERGE_FAILED")
+    expect(result.out).toContain("could not stage")
+    expect(result.out).not.toContain("NOT clean")
+    expectAbandoned(w)
+  })
+
+  // GOAL: a failure to write the merge message is reported, not thrown past cleanup.
+  test("a failed merge message write is cleaned up", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+
+    const result = run(
+      w.work,
+      {},
+      (real) =>
+        (...args) =>
+          args.includes("--git-path") ? { code: 128, stdout: "", stderr: "fatal: injected" } : real(...args),
+    )
+
+    expect(result.token).toBe("SYNC_MERGE_FAILED")
+    expect(result.out).toContain("could not write the merge message")
+    expectAbandoned(w)
+  })
+
+  // GOAL: cleanup is read back, never assumed. A merge --abort that fails leaves the merge in
+  // progress, and the report says so instead of claiming the branch was cleaned up.
+  test("a failed merge --abort is reported, not claimed as cleanup", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+
+    const result = run(w.work, {}, (real) => (...args) => {
+      if (args[0] === "commit") return { code: 1, stdout: "", stderr: "TEST-REJECTED-MERGE-COMMIT" }
+      if (args[0] === "merge" && args[1] === "--abort") return { code: 128, stdout: "", stderr: "fatal: injected" }
+      return real(...args)
+    })
+
+    expect(result.token).toBe("SYNC_MERGE_FAILED")
+    expect(result.out).toContain("the merge is STILL in progress")
+    expect(result.out).not.toContain("deleted the empty sync branch")
+    // HEAD stays on the sync branch with the merge, never carried onto swxtch.
+    expect(git(w.work, "symbolic-ref", "--short", "HEAD")).toStartWith("sync-upstream-")
+    expect(localGit(w.work, env)("rev-parse", "--verify", "--quiet", "MERGE_HEAD").code).toBe(0)
+  })
+
+  // GOAL: the failure report says when cleanup left the tree dirty instead of implying it
+  // is clean.
+  test("reports a working tree that cleanup left dirty", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+
+    const result = run(w.work, {}, (real) => (...args) => {
+      if (args[0] === "commit") return { code: 1, stdout: "", stderr: "TEST-REJECTED-MERGE-COMMIT" }
+      const done = real(...args)
+      if (args[0] === "merge" && args[1] === "--abort") writeFileSync(path.join(w.work, "left-behind.txt"), "x\n")
+      return done
+    })
+
+    expect(result.token).toBe("SYNC_MERGE_FAILED")
+    expect(result.out).toContain("the working tree is NOT clean")
+  })
+
+  // GOAL: a run started detached (the documented worktree setup) returns to that commit on
+  // failure, since there is no branch to go back to.
+  test("a failure in a detached worktree returns HEAD to the start commit", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    const linked = path.join(w.dir, "linked")
+    git(w.work, "worktree", "add", "-q", "--detach", linked, "origin/swxtch")
+    const start = git(linked, "rev-parse", "HEAD")
+
+    const result = run(linked, { allowPrimary: false }, rejectMergeCommit([]))
+
+    expect(result.token).toBe("SYNC_MERGE_FAILED")
+    expect(result.out).toContain("deleted the empty sync branch")
+    expect(localGit(linked, env)("symbolic-ref", "-q", "HEAD").code).not.toBe(0)
+    expect(git(linked, "rev-parse", "HEAD")).toBe(start)
+    expect(syncBranches(w.work)).toBe("")
+  })
+
   // GOAL: the failure report states what actually happened, never overclaiming a push.
   test("SYNC_MERGE_FAILED reports a failed mirror push truthfully", () => {
     const w = world()

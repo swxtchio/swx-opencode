@@ -30,7 +30,9 @@
 //
 // It never pushes swxtch, opens a PR, or resolves conflicts. On conflicts the merge is left
 // in progress with the CHANGESET.md entry staged, so a resolver keeps git's partial
-// auto-merge and records the resolutions in that entry and the commit message. Land the
+// auto-merge and records the resolutions in that entry and the commit message. If
+// CHANGESET.md itself conflicted, it is left unmerged and the entry is printed for the
+// resolver to add after resolving it. Land the
 // sync PR with a merge commit, never a squash: squashing drops the upstream/dev parent, so
 // the next run would re-merge the same commits into an empty diff.
 //
@@ -42,7 +44,8 @@
 //   SYNC_UPTODATE      4  origin/swxtch already contains upstream/dev; no sync branch
 //   SYNC_MERGE_FAILED  5  the mirror moved or was pushed, then the sync branch could not be
 //                         created or the merge could not be prepared and committed
-// Every final line also states what happened to the mirror.
+// From the mirror step on, every final line also states what happened to the mirror, and a
+// failure states whether cleanup actually left the tree clean.
 //
 // Every decision reads actual git state. The whole run pins one upstream and one base
 // commit, so a concurrent fetch or branch move cannot change what it acts on.
@@ -229,14 +232,27 @@ export function syncUpstream(options: SyncOptions) {
   // mirror moved or a push landed, otherwise a true nothing-happened SYNC_ABORT. The sync
   // branch is cleaned up first, and if HEAD cannot be moved off it the report says so.
   const fail = (message: string, owned: boolean) => {
-    const cleanup = owned
-      ? abandonBranch(git, syncBranch, startBranch, startSha)
-      : `the sync branch ${syncBranch} was not created by this run - left untouched`
+    const cleanup = [
+      owned
+        ? abandonBranch(git, syncBranch, startBranch, startSha)
+        : `the sync branch ${syncBranch} was not created by this run - left untouched`,
+      ...(git("status", "--porcelain", "--untracked-files=all").stdout
+        ? ["the working tree is NOT clean - inspect it before re-running"]
+        : []),
+    ].join("; ")
     return finish(mirrorMoved || pushed ? "SYNC_MERGE_FAILED" : "SYNC_ABORT", `${message} (${cleanup}; ${mirrorState})`)
   }
+  // Read the abort back rather than assume it: `merge --abort` is `reset --merge`, which
+  // refuses when a file it must restore has unstaged changes. If the merge survives, stay on
+  // the sync branch: git would let a checkout carry the staged merge onto another branch,
+  // where the next ordinary commit would silently merge unreviewed upstream work.
   const abandonMerge = (message: string, owned: boolean) => {
-    git("merge", "--abort")
-    return fail(message, owned)
+    const aborted = git("merge", "--abort")
+    if (!commit("MERGE_HEAD")) return fail(message, owned)
+    return finish(
+      mirrorMoved || pushed ? "SYNC_MERGE_FAILED" : "SYNC_ABORT",
+      `${message}; merge --abort failed (${firstLine(aborted.stderr) || "no output"}), so the merge is STILL in progress on ${syncBranch} - run \`git merge --abort\` there, then delete the branch (${mirrorState})`,
+    )
   }
 
   // Ownership comes from where HEAD landed, not the exit code: `checkout -b` fails before
@@ -342,7 +358,12 @@ function recordSync(
   const rest = eol === -1 ? "" : text.slice(eol).replace(/^\n+/, "")
   const updated = `${text.slice(0, eol === -1 ? text.length : eol)}\n\n${line}\n${rest.startsWith("- ") || !rest ? "" : "\n"}${rest}`
   if (!attempt(() => writeFileSync(file, updated))) return { ok: false, message: `could not write ${file}` }
-  if (git("add", "--", file).code !== 0) return { ok: false, message: `could not stage ${file}` }
+  // Put the file back from the index when staging fails, so `merge --abort` has no unstaged
+  // change to trip over.
+  if (git("add", "--", file).code !== 0) {
+    git("checkout", "--", file)
+    return { ok: false, message: `could not stage ${file}` }
+  }
   return { ok: true, message: `CHANGESET: recorded ${entry.range}` }
 }
 
