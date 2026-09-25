@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test"
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { changesetMarker, localGit, syncUpstream, type Git, type SyncOptions } from "./sync-upstream"
@@ -88,6 +88,15 @@ function run(repo: string, options: Partial<SyncOptions> = {}, wrap?: (real: Git
 
 const syncBranches = (repo: string) => git(repo, "branch", "--list", "sync-upstream-*")
 
+// A failed sync leaves no merge in progress, a clean tree, no sync branch, and HEAD back
+// where it started.
+function expectAbandoned(w: ReturnType<typeof world>) {
+  expect(localGit(w.work, env)("rev-parse", "--verify", "--quiet", "MERGE_HEAD").code).not.toBe(0)
+  expect(git(w.work, "status", "--porcelain", "--untracked-files=all")).toBe("")
+  expect(syncBranches(w.work)).toBe("")
+  expect(git(w.work, "symbolic-ref", "--short", "HEAD")).toBe("swxtch")
+}
+
 // Let the sync merge populate MERGE_HEAD and the index, then reject the commit that would
 // record it, the way a failing pre-commit hook would. Records every merge call so the test
 // can prove the production cleanup ran.
@@ -130,10 +139,11 @@ describe("syncUpstream", () => {
     expect(git(w.work, "rev-parse", "dev")).toBe(upSha)
     expect(git(w.origin, "rev-parse", "dev")).toBe(upSha)
     expect(result.out).toContain("upstream: feature.txt=new")
+    expect(result.out).toContain("the dev mirror was advanced and pushed to origin")
     expect(result.out).toContain("--- changed files ---\nfeature.txt")
     // The changeset entry is part of the merge commit, newest first above earlier entries.
     const recorded = git(w.work, "show", "HEAD:CHANGESET.md")
-    const entry = `- **2026-09-25** \`${git(w.work, "rev-parse", "--short", git(w.work, "merge-base", "HEAD^1", "HEAD^2"))}..${git(w.work, "rev-parse", "--short", upSha)}\`, 1 upstream commit. Conflicts: none.`
+    const entry = `- **2026-09-25** \`${git(w.work, "rev-parse", "--short", git(w.work, "merge-base", "HEAD^1", "HEAD^2"))}..${git(w.work, "rev-parse", "--short", upSha)}\`, 1 upstream commit (sync-upstream-20260925-123456). Conflicts: none.`
     expect(recorded).toContain(`entries below -->\n\n${entry}\n- **2026-01-01** earlier sync.`)
     expect(git(w.work, "status", "--porcelain")).toBe("")
     // It prepares a branch for review; the fork's branch is never moved or pushed.
@@ -225,22 +235,80 @@ describe("syncUpstream", () => {
     expect(result.token).toBe("SYNC_CLEAN")
   })
 
-  // GOAL: a repository without the changeset still gets its merge prepared, with a warning
-  // telling the operator to record the sync by hand.
-  test("warns and still merges when CHANGESET.md is missing", () => {
+  // GOAL: a sync is never reported ready without its changeset entry. When the entry cannot
+  // be written, the merge is abandoned like any other non-conflict failure.
+  test.each([
+    [
+      "CHANGESET.md is missing",
+      (w: ReturnType<typeof world>) => git(w.work, "rm", "-q", "CHANGESET.md"),
+      "could not read",
+    ],
+    [
+      "CHANGESET.md has no marker",
+      (w: ReturnType<typeof world>) => writeFileSync(path.join(w.work, "CHANGESET.md"), "# Fork changeset\n"),
+      'no "<!-- upstream-syncs:" line',
+    ],
+  ])("fails without committing when %s", (_, breakChangeset, reason) => {
     const w = world()
-    git(w.work, "rm", "-q", "CHANGESET.md")
-    git(w.work, "commit", "-qm", "drop changeset")
+    breakChangeset(w)
+    git(w.work, "commit", "-qam", "break changeset")
     git(w.work, "push", "-q", "origin", "swxtch")
     advanceUpstream(w, "feature.txt", "new")
 
     const result = run(w.work)
 
-    expect(result.out).toContain("CHANGESET: WARNING no CHANGESET.md")
-    expect(result.token).toBe("SYNC_CLEAN")
+    expect(result.token).toBe("SYNC_MERGE_FAILED")
+    expect(result.out).toContain(reason)
+    expectAbandoned(w)
   })
 
-  // GOAL: update-ref never moves a branch out from under another worktree's HEAD.
+  // GOAL: a filesystem failure is reported through the same cleanup as a git failure,
+  // instead of throwing past it and leaving a half-merged sync branch.
+  test.skipIf(process.getuid?.() === 0)("fails without committing when CHANGESET.md cannot be written", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    chmodSync(path.join(w.work, "CHANGESET.md"), 0o444)
+
+    const result = run(w.work)
+
+    expect(result.token).toBe("SYNC_MERGE_FAILED")
+    expect(result.out).toContain("could not write")
+    expectAbandoned(w)
+  })
+
+  // GOAL: CHANGESET.md is never staged as resolved while it holds conflict markers. If it
+  // conflicts itself, it stays unmerged and the resolver gets the entry to add.
+  test("leaves a conflicted CHANGESET.md unmerged and hands over the entry", () => {
+    const w = world()
+    advanceUpstream(w, "CHANGESET.md", "upstream's own changeset")
+
+    const result = run(w.work, { now: new Date("2026-09-25T12:34:56Z") })
+
+    expect(result.token).toBe("SYNC_CONFLICTS")
+    expect(git(w.work, "diff", "--name-only", "--diff-filter=U")).toBe("CHANGESET.md")
+    expect(result.out).toContain("CHANGESET: WARNING CHANGESET.md itself conflicted")
+    expect(result.out).toContain("(sync-upstream-20260925-123456). Conflicts: `CHANGESET.md`")
+  })
+
+  // GOAL: the insertion handles a marker on the file's last line with no trailing newline.
+  test("records the entry when the marker ends the file", () => {
+    const w = world()
+    writeFileSync(path.join(w.work, "CHANGESET.md"), `# Fork changeset\n${changesetMarker} -->`)
+    git(w.work, "commit", "-qam", "marker at end of file")
+    git(w.work, "push", "-q", "origin", "swxtch")
+    advanceUpstream(w, "feature.txt", "new")
+
+    expect(run(w.work).token).toBe("SYNC_CLEAN")
+    // Read the checked-out file, not `git show`, whose output the helper trims: the test
+    // pins that the file ends in exactly one newline.
+    expect(readFileSync(path.join(w.work, "CHANGESET.md"), "utf8")).toMatch(
+      new RegExp(
+        `^# Fork changeset\\n${changesetMarker} -->\\n\\n- \\*\\*\\d{4}-\\d{2}-\\d{2}\\*\\* [^\\n]+Conflicts: none\\.\\n$`,
+      ),
+    )
+  })
+
+  // GOAL: the mirror is never moved out from under another worktree's HEAD.
   test("aborts when the mirror is checked out in another worktree", () => {
     const w = world()
     advanceUpstream(w, "feature.txt", "new")
@@ -299,22 +367,21 @@ describe("syncUpstream", () => {
     expect(result.out).toContain("missing required remote 'upstream'")
   })
 
-  test("aborts when the base branch does not exist", () => {
+  test("aborts when origin has no base branch", () => {
     const w = world()
     advanceUpstream(w, "feature.txt", "new")
-    git(w.work, "checkout", "-q", "--detach")
-    git(w.work, "branch", "-D", "swxtch")
     const dev = git(w.work, "rev-parse", "dev")
 
-    const result = run(w.work)
+    const result = run(w.work, { base: "missing" })
 
     expect(result.token).toBe("SYNC_ABORT")
-    expect(result.out).toContain("base branch swxtch does not exist")
+    expect(result.out).toContain("refs/remotes/origin/missing does not exist")
     expect(git(w.work, "rev-parse", "dev")).toBe(dev)
   })
 
-  // GOAL: a teammate's pushed fork work is not silently left out of the sync base.
-  test("warns when local swxtch is behind origin/swxtch", () => {
+  // GOAL: the sync PR targets origin, so its base is origin/swxtch. A teammate's pushed work
+  // is included even when local swxtch lags.
+  test("bases the sync on origin/swxtch when local swxtch is behind", () => {
     const w = world()
     advanceUpstream(w, "feature.txt", "new")
     const teammate = path.join(w.dir, "teammate")
@@ -322,18 +389,50 @@ describe("syncUpstream", () => {
     commit(teammate, "teammate.txt", "t", "teammate work")
     git(teammate, "push", "-q", "origin", "swxtch")
 
-    expect(run(w.work).out).toContain("BASE: WARNING local swxtch is behind origin/swxtch")
+    expect(run(w.work).token).toBe("SYNC_CLEAN")
+    expect(git(w.work, "rev-parse", "HEAD^1")).toBe(git(w.origin, "rev-parse", "swxtch"))
   })
 
-  test("does not warn when local swxtch matches origin/swxtch", () => {
+  // GOAL: unpushed local commits never ride into the sync PR unreviewed.
+  test("keeps unpushed local commits out of the sync", () => {
     const w = world()
     advanceUpstream(w, "feature.txt", "new")
+    commit(w.work, "local.txt", "l", "unpushed local work")
 
-    expect(run(w.work).out).not.toContain("BASE: WARNING")
+    expect(run(w.work).token).toBe("SYNC_CLEAN")
+    expect(git(w.work, "rev-parse", "HEAD^1")).toBe(git(w.origin, "rev-parse", "swxtch"))
+    expect(localGit(w.work, env)("cat-file", "-e", "HEAD:local.txt").code).not.toBe(0)
+  })
+
+  test("aborts when the sync branch name is already taken", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    const now = new Date("2026-09-25T12:34:56Z")
+    expect(run(w.work, { now }).token).toBe("SYNC_CLEAN")
+    git(w.work, "checkout", "-q", "swxtch")
+
+    const result = run(w.work, { now })
+
+    expect(result.token).toBe("SYNC_ABORT")
+    expect(result.out).toContain("sync-upstream-20260925-123456 already exists")
+  })
+
+  // GOAL: an up-to-date run still says the mirror moved when it did.
+  test("reports a moved mirror on an up-to-date run", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    git(w.work, "fetch", "-q", "upstream")
+    git(w.work, "merge", "-q", "--no-edit", "upstream/dev")
+    git(w.work, "push", "-q", "origin", "swxtch")
+
+    const result = run(w.work)
+
+    expect(result.token).toBe("SYNC_UPTODATE")
+    expect(result.out).toContain("the dev mirror was advanced and pushed to origin")
   })
 
   // GOAL: fail closed. A probe that errors must not be read as "clean" or "safe".
-  test.each(["status", "worktree"])("aborts when the %s probe itself fails", (probe) => {
+  test.each(["status", "fetch"])("aborts when git %s itself fails", (probe) => {
     const w = world()
     advanceUpstream(w, "feature.txt", "new")
     const dev = git(w.work, "rev-parse", "dev")
@@ -361,10 +460,7 @@ describe("syncUpstream", () => {
     expect(result.out).toContain("deleted the empty sync branch")
     expect(result.out).toContain("the dev mirror was advanced and pushed to origin")
     expect(calls).toContain("merge --abort")
-    expect(localGit(w.work, env)("rev-parse", "--verify", "--quiet", "MERGE_HEAD").code).not.toBe(0)
-    expect(git(w.work, "status", "--porcelain", "--untracked-files=all")).toBe("")
-    expect(syncBranches(w.work)).toBe("")
-    expect(git(w.work, "symbolic-ref", "--short", "HEAD")).toBe("swxtch")
+    expectAbandoned(w)
   })
 
   // GOAL: the failure report states what actually happened, never overclaiming a push.

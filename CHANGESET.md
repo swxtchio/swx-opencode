@@ -5,11 +5,12 @@ This file records both halves: every upstream sync merged in, and every change t
 
 How it stays current:
 
-- **Upstream syncs** are recorded by `bun script/sync-upstream.ts`, which adds the row inside the sync merge itself.
-  Record conflict resolutions in the sync merge commit message and summarize them in the row.
+- **Upstream syncs** are recorded by `bun script/sync-upstream.ts`, which writes the entry inside the sync merge
+  itself, naming its `sync-upstream-<UTC timestamp>` branch. Record conflict resolutions in the sync merge commit
+  message and summarize them in the entry.
 - **Fork changes** are added by the PR that makes them, under the matching area, newest first.
-  CI (`script/changeset-check.ts`) fails a PR against `swxtch` whose number is not in this file. Dependabot PRs and
-  `sync-upstream-*` branches are exempt.
+- CI (`script/changeset-check.ts`) fails a PR against `swxtch` that does not record itself: a `- **#<number>**` entry
+  for a fork change, or the sync entry naming the branch for a sync PR. Only Dependabot PRs are exempt.
 - When upstream adopts or supersedes a fork change, update its status instead of deleting the entry.
 
 Status: **fork-only** means the change exists only here; **upstreamable** means it fixes upstream's own code and

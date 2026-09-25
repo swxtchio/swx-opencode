@@ -3,8 +3,17 @@ import path from "node:path"
 import { checkChangeset } from "./changeset-check"
 import { changesetMarker } from "./sync-upstream"
 
-const doc =
-  "## Fork changes\n\n- **#46** Sync script. _Fork-only._\n- **#7** Something else. Mentions #47 in passing.\n"
+const doc = [
+  "## Upstream syncs",
+  "",
+  "- **2026-09-25** `aaa..bbb`, 3 upstream commits (sync-upstream-20260925-120000). Conflicts: none.",
+  "",
+  "## Fork changes",
+  "",
+  "- **#46** Sync script. _Fork-only._",
+  "- **#7** Something else. Mentions #47 in passing, and sync-upstream-20260926-000000.",
+  "",
+].join("\n")
 const pr = { number: "46", author: "someone", head: "feature", base: "swxtch" }
 
 describe("checkChangeset", () => {
@@ -24,20 +33,35 @@ describe("checkChangeset", () => {
     expect(checkChangeset(undefined, pr).ok).toBe(false)
   })
 
-  // GOAL: the exemptions stay narrow: Dependabot, sync branches, other bases, and runs that
-  // are not pull requests.
+  // GOAL: a sync PR is checked, not exempted. It passes only with the sync entry that
+  // names its branch, so a branch that merely looks like a sync cannot skip the check.
+  test("passes a sync branch whose entry names it", () => {
+    expect(checkChangeset(doc, { ...pr, number: "90", head: "sync-upstream-20260925-120000" }).ok).toBe(true)
+  })
+
+  test.each([
+    ["with no sync entry", "sync-upstream-20260101-000000"],
+    ["whose name only appears in prose", "sync-upstream-20260926-000000"],
+  ])("fails a sync-shaped branch %s", (_, head) => {
+    const result = checkChangeset(doc, { ...pr, number: "90", head })
+    expect(result.ok).toBe(false)
+    expect(result.reason).toContain(head)
+  })
+
+  // GOAL: a hand branch with the sync prefix is an ordinary PR and needs a PR entry.
+  test("treats a hand branch named sync-upstream-* as an ordinary PR", () => {
+    expect(checkChangeset(doc, { ...pr, head: "sync-upstream-script" }).ok).toBe(true)
+    expect(checkChangeset(doc, { ...pr, number: "90", head: "sync-upstream-script" }).ok).toBe(false)
+  })
+
+  // GOAL: the remaining exemptions stay narrow: Dependabot, other bases, and runs that are
+  // not pull requests.
   test.each([
     ["a push", { number: "" }],
     ["a PR to another base", { number: "9", base: "dev", head: "feature" }],
     ["Dependabot", { number: "9", author: "dependabot[bot]", base: "swxtch", head: "dependabot/npm/x" }],
-    ["an upstream sync", { number: "9", base: "swxtch", head: "sync-upstream-20260925-120000" }],
   ])("passes %s without an entry", (_, input) => {
     expect(checkChangeset("", input).ok).toBe(true)
-  })
-
-  // GOAL: a hand-named branch cannot opt out by starting with the sync prefix.
-  test("does not exempt a hand branch named sync-upstream-*", () => {
-    expect(checkChangeset("", { ...pr, head: "sync-upstream-script" }).ok).toBe(false)
   })
 
   // GOAL: the real file carries entries in the shape the check looks for, so a reformat that
