@@ -207,25 +207,32 @@ export function syncUpstream(options: SyncOptions) {
 
   // A failed push does not stop the sync, since the sync PR carries the same commits, but
   // it is reported here and in the final line. Only the mirror ref is pushed, never tags.
-  // The push destination is read directly, before and after: origin's fetch URL (and so
-  // origin/dev) can differ from its push URL, and a push can update the ref and still exit
-  // nonzero, while the report token depends on whether it moved.
-  const pushUrl = git("remote", "get-url", "--push", origin).stdout || origin
-  const destination = () => {
-    const remote = git("ls-remote", pushUrl, mirrorRef)
-    return remote.code === 0 ? (remote.stdout.split(/\s/)[0] ?? "") : undefined
-  }
-  const pushMirror = () => {
+  // Every push destination is read directly, before and after: origin's fetch URL (and so
+  // origin/dev) can differ from its push URLs, a remote can have several push URLs that
+  // `git push` writes to in turn, and a push can update a ref and still exit nonzero, while
+  // the report token depends on whether anything moved.
+  const pushUrls = git("remote", "get-url", "--push", "--all", origin).stdout.split("\n").filter(Boolean)
+  const destinations = () =>
+    pushUrls.map((url) => {
+      const remote = git("ls-remote", url, mirrorRef)
+      return remote.code === 0 ? (remote.stdout.split(/\s/)[0] ?? "") : undefined
+    })
+  const pushMirror = (before: (string | undefined)[]) => {
     if (git("push", "--no-follow-tags", origin, `${upSha}:${mirrorRef}`).code === 0) return "pushed"
-    const after = destination()
-    if (after === undefined) return "unknown"
-    return after === upSha ? "pushed" : "failed"
+    const after = destinations()
+    // No readable destinations means the outcome is unknown, not vacuously "pushed".
+    if (after.length === 0 || after.includes(undefined)) return "unknown"
+    if (after.every((sha) => sha === upSha)) return "pushed"
+    return after.some((sha, index) => sha !== before[index]) ? "partial" : "failed"
   }
-  const push = destination() === upSha ? "current" : pushMirror()
-  const mutated = mirrorMoved || push === "pushed" || push === "unknown"
+  const before = destinations()
+  const push = before.length > 0 && before.every((sha) => sha === upSha) ? "current" : pushMirror(before)
+  const mutated = mirrorMoved || push === "pushed" || push === "partial" || push === "unknown"
   if (push === "current") log(`MIRROR: ${origin}/${mirror} already current`)
   if (push === "pushed") log(`MIRROR: pushed ${mirror} to ${origin}`)
   if (push === "failed") log(`MIRROR: WARNING could not push ${mirror} to ${origin} - push it by hand`)
+  if (push === "partial")
+    log(`MIRROR: WARNING the push of ${mirror} reached only some of ${origin}'s push URLs - push it by hand`)
   if (push === "unknown")
     log(
       `MIRROR: WARNING the push of ${mirror} to ${origin} failed and whether ${origin}/${mirror} moved could not be read`,
@@ -237,6 +244,7 @@ export function syncUpstream(options: SyncOptions) {
       current: ` (${origin} was already current, nothing pushed)`,
       pushed: ` and pushed to ${origin}`,
       failed: ` but the push to ${origin} FAILED (push it by hand)`,
+      partial: ` but the push reached only some of ${origin}'s push URLs (push it by hand)`,
       unknown: ` but the push to ${origin} failed and whether ${origin}/${mirror} moved is UNKNOWN (check it by hand)`,
     }[push],
   ].join("")

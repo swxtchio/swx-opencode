@@ -386,6 +386,61 @@ describe("syncUpstream", () => {
     expect(result.token).toBe("SYNC_CLEAN")
   })
 
+  // GOAL: git pushes to every push URL of a remote, so every one is read. A current first
+  // URL must not hide a stale second one.
+  test("pushes when one of two push URLs is stale", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    const stale = path.join(w.dir, "stale.git")
+    git(w.dir, "clone", "-q", "--bare", w.origin, stale)
+    presyncMirror(w)
+    git(w.work, "remote", "set-url", "--push", "origin", w.origin)
+    git(w.work, "config", "--add", "remote.origin.pushurl", stale)
+
+    const result = run(w.work)
+
+    expect(result.out).toContain("MIRROR: pushed dev to origin")
+    expect(git(stale, "rev-parse", "dev")).toBe(git(w.up, "rev-parse", "dev"))
+    expect(result.token).toBe("SYNC_CLEAN")
+  })
+
+  // GOAL: a push that lands on some push URLs and is rejected by another moved a remote, so
+  // it is reported as partial and a later failure is SYNC_MERGE_FAILED, not SYNC_ABORT.
+  test("reports a push that reached only some push URLs", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    git(w.work, "fetch", "-q", "upstream")
+    git(w.work, "branch", "-f", "--no-track", "dev", "upstream/dev")
+    const rejecting = path.join(w.dir, "rejecting.git")
+    git(w.dir, "clone", "-q", "--bare", w.origin, rejecting)
+    git(w.work, "push", "-q", "-f", rejecting, "swxtch:refs/heads/dev")
+    git(w.work, "remote", "set-url", "--push", "origin", w.origin)
+    git(w.work, "config", "--add", "remote.origin.pushurl", rejecting)
+
+    const result = run(w.work, {}, rejectMergeCommit([]))
+
+    expect(result.out).toContain("reached only some of origin's push URLs")
+    expect(git(w.origin, "rev-parse", "dev")).toBe(git(w.up, "rev-parse", "dev"))
+    expect(result.token).toBe("SYNC_MERGE_FAILED")
+  })
+
+  // GOAL: when no push destination can be listed, a failed push is UNKNOWN, never a
+  // vacuous "every destination is current".
+  test("a failed push with no readable push URLs is unknown", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+
+    const result = run(w.work, {}, (real) => (...args) => {
+      if (args[0] === "commit") return { code: 1, stdout: "", stderr: "TEST-REJECTED-MERGE-COMMIT" }
+      if (args[0] === "remote" && args.includes("--all")) return { code: 2, stdout: "", stderr: "error: injected" }
+      if (args[0] === "push") return { code: 1, stdout: "", stderr: "error: failed to push some refs" }
+      return real(...args)
+    })
+
+    expect(result.out).toContain("is UNKNOWN")
+    expect(result.token).toBe("SYNC_MERGE_FAILED")
+  })
+
   test.each([
     ["an uncommitted edit", (w: ReturnType<typeof world>) => writeFileSync(path.join(w.work, "fork.txt"), "dirty\n")],
     [
