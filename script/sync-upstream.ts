@@ -206,16 +206,22 @@ export function syncUpstream(options: SyncOptions) {
   const mirrorMoved = mirrorAction !== "current"
 
   // A failed push does not stop the sync, since the sync PR carries the same commits, but
-  // it is reported here and in the final line. Only the mirror ref is pushed, never tags,
-  // and a nonzero exit is read back from the remote: a push can update the ref and still
-  // fail, and the report token depends on whether it did.
+  // it is reported here and in the final line. Only the mirror ref is pushed, never tags.
+  // The push destination is read directly, before and after: origin's fetch URL (and so
+  // origin/dev) can differ from its push URL, and a push can update the ref and still exit
+  // nonzero, while the report token depends on whether it moved.
+  const pushUrl = git("remote", "get-url", "--push", origin).stdout || origin
+  const destination = () => {
+    const remote = git("ls-remote", pushUrl, mirrorRef)
+    return remote.code === 0 ? (remote.stdout.split(/\s/)[0] ?? "") : undefined
+  }
   const pushMirror = () => {
     if (git("push", "--no-follow-tags", origin, `${upSha}:${mirrorRef}`).code === 0) return "pushed"
-    const remote = git("ls-remote", origin, mirrorRef)
-    if (remote.code !== 0) return "unknown"
-    return remote.stdout.startsWith(upSha) ? "pushed" : "failed"
+    const after = destination()
+    if (after === undefined) return "unknown"
+    return after === upSha ? "pushed" : "failed"
   }
-  const push = commit(`refs/remotes/${origin}/${mirror}`) === upSha ? "current" : pushMirror()
+  const push = destination() === upSha ? "current" : pushMirror()
   const mutated = mirrorMoved || push === "pushed" || push === "unknown"
   if (push === "current") log(`MIRROR: ${origin}/${mirror} already current`)
   if (push === "pushed") log(`MIRROR: pushed ${mirror} to ${origin}`)

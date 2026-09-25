@@ -88,6 +88,15 @@ function run(repo: string, options: Partial<SyncOptions> = {}, wrap?: (real: Git
 
 const syncBranches = (repo: string) => git(repo, "branch", "--list", "sync-upstream-*")
 
+// Point origin's push URL at a reachable copy whose dev has diverged, so the mirror push is
+// rejected as a non-fast-forward and the destination can be read back to confirm it.
+function rejectPushes(w: ReturnType<typeof world>) {
+  const destination = path.join(w.dir, "rejecting.git")
+  git(w.dir, "clone", "-q", "--bare", w.origin, destination)
+  git(w.work, "push", "-q", "-f", destination, "swxtch:refs/heads/dev")
+  git(w.work, "remote", "set-url", "--push", "origin", destination)
+}
+
 // A failed sync leaves no merge in progress, a clean tree, no sync branch, and HEAD back
 // where it started.
 function expectAbandoned(w: ReturnType<typeof world>) {
@@ -351,12 +360,29 @@ describe("syncUpstream", () => {
   test("a failed mirror push warns and the sync still completes", () => {
     const w = world()
     advanceUpstream(w, "feature.txt", "new")
-    git(w.work, "remote", "set-url", "--push", "origin", path.join(w.dir, "missing.git"))
+    rejectPushes(w)
 
     const result = run(w.work)
 
     expect(result.out).toContain("MIRROR: WARNING could not push dev")
     expect(git(w.work, "rev-parse", "dev")).toBe(git(w.up, "rev-parse", "dev"))
+    expect(result.token).toBe("SYNC_CLEAN")
+  })
+
+  // GOAL: the push decision reads the push destination, not origin/dev. With separate fetch
+  // and push URLs, a current fetch side must not hide a stale push destination.
+  test("pushes to a stale push URL even when the fetch URL is current", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    const destination = path.join(w.dir, "push-only.git")
+    git(w.dir, "clone", "-q", "--bare", w.origin, destination)
+    presyncMirror(w)
+    git(w.work, "remote", "set-url", "--push", "origin", destination)
+
+    const result = run(w.work)
+
+    expect(result.out).toContain("MIRROR: pushed dev to origin")
+    expect(git(destination, "rev-parse", "dev")).toBe(git(w.up, "rev-parse", "dev"))
     expect(result.token).toBe("SYNC_CLEAN")
   })
 
@@ -630,7 +656,7 @@ describe("syncUpstream", () => {
   test("SYNC_MERGE_FAILED reports a failed mirror push truthfully", () => {
     const w = world()
     advanceUpstream(w, "feature.txt", "new")
-    git(w.work, "remote", "set-url", "--push", "origin", path.join(w.dir, "missing.git"))
+    rejectPushes(w)
 
     const result = run(w.work, {}, rejectMergeCommit([]))
 
