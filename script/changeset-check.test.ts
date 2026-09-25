@@ -79,6 +79,13 @@ describe("checkChangeset", () => {
     expect(result.reason).toContain("base already records")
   })
 
+  // GOAL: newness against the base applies to fork entries too, not only sync entries.
+  test("fails a fork PR whose entry the base already has", () => {
+    const result = checkChangeset(doc, pr, doc)
+    expect(result.ok).toBe(false)
+    expect(result.reason).toContain("base already records #46")
+  })
+
   // GOAL: a hand branch with the sync prefix is an ordinary PR and needs a PR entry.
   test("treats a hand branch named sync-upstream-* as an ordinary PR", () => {
     expect(checkChangeset(doc, { ...pr, head: "sync-upstream-script" }, "").ok).toBe(true)

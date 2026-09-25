@@ -12,7 +12,8 @@ How it stays current:
 - CI (`script/changeset-check.ts`) fails a PR against `swxtch` that does not add its own entry, compared with the
   base: a `- **#<number>**` item under "Fork changes" for a fork change, or, for a sync PR, the item under "Upstream
   syncs" naming its branch. Entries may wrap onto indented lines. Only Dependabot PRs are exempt.
-- When upstream adopts or supersedes a fork change, update its status instead of deleting the entry.
+- When upstream adopts or supersedes a fork change, update its status instead of deleting the entry. That PR still
+  adds its own entry, since CI checks for one.
 
 Status: **fork-only** means the change exists only here; **upstreamable** means it fixes upstream's own code and
 could be offered back; **partly upstream** means upstream landed an equivalent for part of it.

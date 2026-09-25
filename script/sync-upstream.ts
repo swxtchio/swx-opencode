@@ -39,10 +39,11 @@
 // Report tokens (line-anchored) and exit codes:
 //   SYNC_CLEAN         0  merge committed on the sync branch, ready for review
 //   SYNC_ABORT         2  no local branch moved and nothing was pushed (a fetch may have
-//                         updated remote-tracking refs); fix the cause and re-run
+//                         updated remote-tracking refs); fix the cause and re-run, after
+//                         any cleanup the report asks for (such as a failed merge --abort)
 //   SYNC_CONFLICTS     3  merge left in progress on the sync branch for a resolver
 //   SYNC_UPTODATE      4  origin/swxtch already contains upstream/dev; no sync branch
-//   SYNC_MERGE_FAILED  5  the mirror moved or was pushed, then the sync branch could not be
+//   SYNC_MERGE_FAILED  5  the mirror moved or was pushed (or may have), then the sync branch could not be
 //                         created or the merge could not be prepared and committed
 // From the mirror step on, every final line also states what happened to the mirror, and a
 // failure states whether cleanup actually left the tree clean.
@@ -202,20 +203,33 @@ export function syncUpstream(options: SyncOptions) {
   const mirrorMoved = mirrorAction !== "current"
 
   // A failed push does not stop the sync, since the sync PR carries the same commits, but
-  // it is reported here and in the final line.
-  const pushNeeded = commit(`refs/remotes/${origin}/${mirror}`) !== upSha
-  const pushed = pushNeeded && git("push", origin, `${upSha}:${mirrorRef}`).code === 0
-  if (!pushNeeded) log(`MIRROR: ${origin}/${mirror} already current`)
-  if (pushed) log(`MIRROR: pushed ${mirror} to ${origin}`)
-  if (pushNeeded && !pushed) log(`MIRROR: WARNING could not push ${mirror} to ${origin} - push it by hand`)
+  // it is reported here and in the final line. Only the mirror ref is pushed, never tags,
+  // and a nonzero exit is read back from the remote: a push can update the ref and still
+  // fail, and the report token depends on whether it did.
+  const pushMirror = () => {
+    if (git("push", "--no-follow-tags", origin, `${upSha}:${mirrorRef}`).code === 0) return "pushed"
+    const remote = git("ls-remote", origin, mirrorRef)
+    if (remote.code !== 0) return "unknown"
+    return remote.stdout.startsWith(upSha) ? "pushed" : "failed"
+  }
+  const push = commit(`refs/remotes/${origin}/${mirror}`) === upSha ? "current" : pushMirror()
+  const mutated = mirrorMoved || push === "pushed" || push === "unknown"
+  if (push === "current") log(`MIRROR: ${origin}/${mirror} already current`)
+  if (push === "pushed") log(`MIRROR: pushed ${mirror} to ${origin}`)
+  if (push === "failed") log(`MIRROR: WARNING could not push ${mirror} to ${origin} - push it by hand`)
+  if (push === "unknown")
+    log(
+      `MIRROR: WARNING the push of ${mirror} to ${origin} failed and whether ${origin}/${mirror} moved could not be read`,
+    )
 
   const mirrorState = [
     mirrorMoved ? `the ${mirror} mirror was advanced` : `the ${mirror} mirror was already current`,
-    !pushNeeded
-      ? ` (${origin} was already current, nothing pushed)`
-      : pushed
-        ? ` and pushed to ${origin}`
-        : ` but the push to ${origin} FAILED (push it by hand)`,
+    {
+      current: ` (${origin} was already current, nothing pushed)`,
+      pushed: ` and pushed to ${origin}`,
+      failed: ` but the push to ${origin} FAILED (push it by hand)`,
+      unknown: ` but the push to ${origin} failed and whether ${origin}/${mirror} moved is UNKNOWN (check it by hand)`,
+    }[push],
   ].join("")
 
   // --- phase 4: nothing to merge ---
@@ -229,18 +243,22 @@ export function syncUpstream(options: SyncOptions) {
   // --- phase 5: create the sync branch and merge the pinned upstream commit ---
 
   // Any failure from here is reported by what ACTUALLY changed: SYNC_MERGE_FAILED when the
-  // mirror moved or a push landed, otherwise a true nothing-happened SYNC_ABORT. The sync
-  // branch is cleaned up first, and if HEAD cannot be moved off it the report says so.
+  // mirror moved or a push landed (or may have), otherwise a true nothing-happened
+  // SYNC_ABORT. The sync branch is cleaned up first, and the report says when HEAD could not
+  // be moved off it or the tree is not provably clean.
+  const failToken = mutated ? "SYNC_MERGE_FAILED" : "SYNC_ABORT"
   const fail = (message: string, owned: boolean) => {
-    const cleanup = [
-      owned
-        ? abandonBranch(git, syncBranch, startBranch, startSha)
-        : `the sync branch ${syncBranch} was not created by this run - left untouched`,
-      ...(git("status", "--porcelain", "--untracked-files=all").stdout
-        ? ["the working tree is NOT clean - inspect it before re-running"]
-        : []),
-    ].join("; ")
-    return finish(mirrorMoved || pushed ? "SYNC_MERGE_FAILED" : "SYNC_ABORT", `${message} (${cleanup}; ${mirrorState})`)
+    const cleanup = owned
+      ? abandonBranch(git, syncBranch, startBranch, startSha)
+      : `the sync branch ${syncBranch} was not created by this run - left untouched`
+    const tree = git("status", "--porcelain", "--untracked-files=all")
+    const treeState =
+      tree.code !== 0
+        ? "; whether the working tree is clean could NOT be verified - inspect it before re-running"
+        : tree.stdout
+          ? "; the working tree is NOT clean - inspect it before re-running"
+          : ""
+    return finish(failToken, `${message} (${cleanup}${treeState}; ${mirrorState})`)
   }
   // Read the abort back rather than assume it: `merge --abort` is `reset --merge`, which
   // refuses when a file it must restore has unstaged changes. If the merge survives, stay on
@@ -250,7 +268,7 @@ export function syncUpstream(options: SyncOptions) {
     const aborted = git("merge", "--abort")
     if (!commit("MERGE_HEAD")) return fail(message, owned)
     return finish(
-      mirrorMoved || pushed ? "SYNC_MERGE_FAILED" : "SYNC_ABORT",
+      failToken,
       `${message}; merge --abort failed (${firstLine(aborted.stderr) || "no output"}), so the merge is STILL in progress on ${syncBranch} - run \`git merge --abort\` there, then delete the branch (${mirrorState})`,
     )
   }

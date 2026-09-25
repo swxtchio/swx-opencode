@@ -538,6 +538,50 @@ describe("syncUpstream", () => {
     expect(result.out).toContain("the working tree is NOT clean")
   })
 
+  // GOAL: the token follows the remote, not the push exit code. A push that updated
+  // origin/dev and then exited nonzero still moved something, so a later failure is not the
+  // nothing-happened SYNC_ABORT; a push whose outcome cannot be read back is treated the same.
+  test.each([
+    ["landed despite a nonzero exit", "landed", "MIRROR: pushed dev to origin"],
+    ["could not be read back", "unknown", "whether origin/dev moved is UNKNOWN"],
+  ])("a push that %s counts as a possible mutation", (_, outcome, report) => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    git(w.work, "fetch", "-q", "upstream")
+    git(w.work, "branch", "-f", "--no-track", "dev", "upstream/dev")
+
+    const result = run(w.work, {}, (real) => (...args) => {
+      if (args[0] === "commit") return { code: 1, stdout: "", stderr: "TEST-REJECTED-MERGE-COMMIT" }
+      if (args[0] === "push") {
+        if (outcome === "landed") real(...args)
+        return { code: 1, stdout: "", stderr: "error: failed to push some refs" }
+      }
+      if (args[0] === "ls-remote" && outcome === "unknown") return { code: 128, stdout: "", stderr: "fatal: injected" }
+      return real(...args)
+    })
+
+    expect(result.out).toContain(report)
+    expect(result.token).toBe("SYNC_MERGE_FAILED")
+  })
+
+  // GOAL: a tree the cleanup cannot inspect is reported as unverified, never implied clean.
+  test("reports a working tree that cleanup could not inspect", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    const statuses: string[] = []
+
+    const result = run(w.work, {}, (real) => (...args) => {
+      if (args[0] === "commit") return { code: 1, stdout: "", stderr: "TEST-REJECTED-MERGE-COMMIT" }
+      // The first status is the precondition check, which must pass for the run to start.
+      if (args[0] === "status" && statuses.push("status") > 1)
+        return { code: 128, stdout: "", stderr: "fatal: injected" }
+      return real(...args)
+    })
+
+    expect(result.token).toBe("SYNC_MERGE_FAILED")
+    expect(result.out).toContain("whether the working tree is clean could NOT be verified")
+  })
+
   // GOAL: a run started detached (the documented worktree setup) returns to that commit on
   // failure, since there is no branch to go back to.
   test("a failure in a detached worktree returns HEAD to the start commit", () => {
