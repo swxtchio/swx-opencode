@@ -149,13 +149,35 @@ function effortProvider(): RunProvider {
 
 // Runs the interactive runtime with `variant` as --effort, and hands the test the lifecycle
 // callbacks plus everything the runtime sent to the footer.
-async function withEffort(variant: string, drive: (app: EffortApp) => Promise<void>) {
+async function withEffort(
+  variant: string,
+  drive: (app: EffortApp) => Promise<void>,
+  opts: { model?: boolean; sessionVariant?: string } = {},
+) {
   const sdk = new OpencodeClient()
   const ready = defer<void>()
   // Closing before the eager transport exists makes the runtime fail as "runtime closed".
   const transported = defer<void>()
   spyOn(sdk.config, "providers").mockImplementation(() => ok({ providers: [effortProvider()], default: {} }))
-  spyOn(sdk.session, "messages").mockImplementation(() => ok([]))
+  spyOn(sdk.session, "messages").mockImplementation(() =>
+    ok(
+      opts.sessionVariant === undefined
+        ? []
+        : [
+            {
+              info: {
+                id: "msg-user-1",
+                sessionID: "ses-1",
+                role: "user",
+                time: { created: 1 },
+                agent: "build",
+                model: { providerID: "openai", modelID: "gpt-5", variant: opts.sessionVariant },
+              },
+              parts: [{ id: "part-1", sessionID: "ses-1", messageID: "msg-user-1", type: "text", text: "hi" }],
+            } satisfies SessionMessage,
+          ],
+    ),
+  )
   spyOn(sdk.session, "get").mockRejectedValue(new Error("not needed"))
   spyOn(sdk.app, "agents").mockImplementation(() => ok([]))
   spyOn(sdk.experimental.resource, "list").mockImplementation(() => ok({}))
@@ -168,11 +190,11 @@ async function withEffort(variant: string, drive: (app: EffortApp) => Promise<vo
       directory: "/tmp",
       sessionID: "ses-1",
       sessionTitle: "Session",
-      resume: false,
+      resume: opts.sessionVariant !== undefined,
       replay: false,
       replayLimit: 100,
       agent: "build",
-      model: { providerID: "openai", modelID: "gpt-5" },
+      model: opts.model === false ? undefined : { providerID: "openai", modelID: "gpt-5" },
       variant,
       files: [],
       thinking: false,
@@ -241,6 +263,38 @@ describe("run interactive runtime --effort", () => {
     })
   })
 
+  // GOAL: an explicit "default" is kept, so it overrides an agent's configured effort the way
+  // it does for `run`, and is not reported as unknown.
+  test("keeps an explicit default effort", async () => {
+    await withEffort("default", async (app) => {
+      expect(app.variants.at(-1)).toBe("default")
+      expect(app.errors).toEqual([])
+    })
+  })
+
+  // GOAL: an explicit --effort wins over the effort a resumed session last used.
+  test("wins over a resumed session's effort", async () => {
+    await withEffort(
+      "high",
+      async (app) => {
+        expect(app.variants.at(-1)).toBe("high")
+      },
+      { sessionVariant: "low" },
+    )
+  })
+
+  // GOAL: with no --model the server picks the model, so the effort is kept as given for the
+  // server to validate, not dropped once model metadata loads.
+  test("keeps the effort when no model is chosen", async () => {
+    await withEffort(
+      "high",
+      async (app) => {
+        expect(app.variants.at(-1)).toBe("high")
+      },
+      { model: false },
+    )
+  })
+
   // GOAL: --effort applies to each model that declares it, is skipped (with a warning) for one
   // that does not, and stops applying once the user picks an effort in the app.
   test("follows models that declare it until an in-app choice", async () => {
@@ -249,6 +303,9 @@ describe("run interactive runtime --effort", () => {
       const other = await app.callbacks?.onModelSelect?.({ providerID: "openai", modelID: "gpt-4" })
       expect(other && "variant" in other ? other.variant : "missing").toBeUndefined()
       expect(app.errors).toEqual(['Unknown effort "high" for openai/gpt-4. Available: low'])
+      await app.callbacks?.onModelSelect?.({ providerID: "openai", modelID: "gpt-5" })
+      await app.callbacks?.onModelSelect?.({ providerID: "openai", modelID: "gpt-4" })
+      expect(app.errors).toHaveLength(1)
       const back = await app.callbacks?.onModelSelect?.({ providerID: "openai", modelID: "gpt-5" })
       expect(back && "variant" in back ? back.variant : "missing").toBe("high")
 

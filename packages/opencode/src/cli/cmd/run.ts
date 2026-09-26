@@ -865,7 +865,9 @@ export const RunCommand = effectCmd({
           // A generic 500 hides the real error behind a log ref, so wait for the session.error
           // the server published first and let the loop print that. The wait is only a
           // bounded backstop for failures that publish no event; errors that already carry
-          // their message print at once.
+          // their message print at once. When the event is shown the ref is dropped: for a
+          // validation error it points at nothing more useful. Events carry no request ID, so
+          // a different failure in the same turn can stand in; see #49.
           async function failed(error: unknown) {
             process.exitCode = 1
             const generic = isGenericServerError(error)
@@ -878,9 +880,21 @@ export const RunCommand = effectCmd({
             if (shown) return
             if (!emit("error", { error })) UI.error(formatRunError(error))
           }
+          // Send only once the event stream is confirmed live. Without it the response and any
+          // published error would go unseen (with --attach, finish() does not wait for the
+          // loop), so an unconfirmed stream fails the run instead of sending blind.
           async function send() {
-            await Promise.race([connected.promise, Bun.sleep(CONNECT_BACKSTOP_MS)])
+            const live = await Promise.race([
+              connected.promise.then(() => true),
+              Bun.sleep(CONNECT_BACKSTOP_MS).then(() => false),
+            ])
+            if (!live) {
+              UI.error("could not connect to the server's event stream; the prompt was not sent")
+              process.exitCode = 1
+              return false
+            }
             request.sent = true
+            return true
           }
           async function finish() {
             if (args.attach) return
@@ -889,7 +903,7 @@ export const RunCommand = effectCmd({
           }
 
           if (args.command) {
-            await send()
+            if (!(await send())) return
             const result = await client.session.command({
               sessionID,
               agent,
@@ -904,7 +918,7 @@ export const RunCommand = effectCmd({
           }
 
           const model = pick(args.model)
-          await send()
+          if (!(await send())) return
           const result = await client.session.prompt({
             sessionID,
             agent,

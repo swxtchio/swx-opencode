@@ -114,6 +114,23 @@ describe("opencode run (non-interactive subprocess)", () => {
     deadline(60_000),
   )
 
+  // GOAL: the attach path, where the event stream is a separate connection to another
+  // process, still shows the published error rather than the generic 500.
+  cliIt.live(
+    "prints the real error for an unknown effort in attach mode",
+    ({ opencode }) =>
+      Effect.gen(function* () {
+        const server = yield* opencode.serve()
+        const result = yield* opencode.run("say hi", {
+          extraArgs: ["--attach", server.url, "--effort", "no-such-effort", "--"],
+        })
+        expect(result.exitCode).toBeGreaterThan(0)
+        expect(result.stderr).toContain('Unknown effort "no-such-effort"')
+        expect(result.stderr).not.toContain("Unexpected server error")
+      }),
+    deadline(60_000),
+  )
+
   // GOAL: in json mode the one error record is the published error, not the 500 body.
   cliIt.concurrent(
     "emits the real error as the json error record for an unknown effort",

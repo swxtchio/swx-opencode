@@ -216,7 +216,10 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
   // one warning per model that does not.
   const warnedEffort = new Set<string>()
   const launchFor = (model: RuntimeState["model"], variants: string[]) => {
-    if (state.launchVariant === undefined || !model) return undefined
+    if (state.launchVariant === undefined) return undefined
+    // With no model chosen here the server picks it, so its variants are unknown: send the
+    // effort as given and let the server validate it (#29) rather than drop it.
+    if (!model) return state.launchVariant
     const key = `${model.providerID}/${model.modelID}`
     const decided = launchEffort(state.launchVariant, key, variants)
     if (decided.error !== undefined && !warnedEffort.has(key) && !footer.isClosed) {

@@ -326,8 +326,8 @@ export function Prompt(props: PromptProps) {
         if (!args.agent) local.agent.set(msg.agent)
         if (msg.model) {
           local.model.set(msg.model)
-          // Keep command line --effort if specified, like --agent above.
-          if (!args.variant) local.model.variant.set(msg.model.variant)
+          // Keep command line --effort while it still applies, like --agent above.
+          if (!local.model.variant.launched()) local.model.variant.set(msg.model.variant)
         }
       }
     }

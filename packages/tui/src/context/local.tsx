@@ -385,6 +385,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             const key = `${m.providerID}/${m.modelID}`
             return effortInForce(launchActive() ? args.variant : undefined, this.list(), modelStore.variant[key])
           },
+          // Whether --effort still applies, i.e. the user has not picked an effort in the app.
+          launched() {
+            return launchActive()
+          },
           current() {
             const v = this.selected()
             if (!v) return undefined
