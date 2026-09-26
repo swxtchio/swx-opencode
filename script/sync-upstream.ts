@@ -20,7 +20,9 @@
 // In order it:
 //   1. Requires a clean tree and the upstream/origin remotes, and fetches both.
 //   2. Validates every abort condition before moving or pushing anything.
-//   3. Fast-forwards dev to upstream/dev (FF only) and pushes it to origin.
+//   3. Fast-forwards dev to upstream/dev (FF only) and publishes it to origin: through
+//      GitHub's fork sync (`gh repo sync`) for a GitHub origin, since this repository's
+//      ruleset rejects pushes to dev, and a plain push otherwise.
 //   4. Stops with SYNC_UPTODATE when origin/swxtch already contains upstream/dev.
 //   5. Creates sync-upstream-<UTC timestamp> off origin/swxtch, runs `git merge --no-ff`, and
 //      adds the sync's entry to CHANGESET.md inside that same merge.
@@ -73,6 +75,10 @@ export type SyncOptions = {
   // repositories turn it off.
   allowPrimary?: boolean
   now?: Date
+  // Publishes the mirror at the pinned commit, reporting whether it claimed success and why
+  // not. The CLI uses GitHub's fork sync for a GitHub fork (see mirrorPublisher). Whatever it
+  // reports, the destinations are read back to decide what happened. Default: git push.
+  publishMirror?: (sha: string) => { ok: boolean; detail?: string }
 }
 
 export const exitCodes = {
@@ -209,39 +215,100 @@ export function syncUpstream(options: SyncOptions) {
   if (mirrorAction === "current") log(`MIRROR: ${mirror} already at ${upstreamRef} (${short(upSha)})`)
   const mirrorMoved = mirrorAction !== "current"
 
-  // A failed push does not stop the sync, since the sync PR carries the same commits, but
-  // it is reported here and in the final line. Only the mirror ref is pushed, never tags.
-  // Every push destination is read directly, before and after: origin's fetch URL (and so
-  // origin/dev) can differ from its push URLs, a remote can have several push URLs that
-  // `git push` writes to in turn, and a push can update a ref and still exit nonzero, while
-  // the report token depends on whether anything moved.
+  // A failed publish does not stop the sync, since the sync PR carries the same commits, but
+  // it is reported here and in the final line. Every push destination is read directly,
+  // before and after, whatever the publisher reports: origin's fetch URL (and so origin/dev)
+  // can differ from its push URLs, a remote can have several push URLs, and a publish can
+  // update a ref and still report failure (or the reverse), while the report token depends
+  // on whether anything moved.
+  const publish =
+    options.publishMirror ??
+    ((sha: string) => {
+      const pushed = git("push", "--no-follow-tags", origin, `${sha}:${mirrorRef}`)
+      return { ok: pushed.code === 0, detail: firstLine(pushed.stderr) }
+    })
   const pushUrls = git("remote", "get-url", "--push", "--all", origin).stdout.split("\n").filter(Boolean)
-  const destinations = () =>
+  const upstreamTip = once(() => {
+    const listed = git("ls-remote", upstream, mirrorRef)
+    const sha = listed.code === 0 ? listed.stdout.split(/\s/)[0] : undefined
+    return sha && (commit(sha) || fetchCommit(upstream, sha)) ? sha : undefined
+  })
+  // Where a destination's mirror stands against the pinned commit: "at" it (equal, or past it
+  // on upstream's own history, as GitHub's fork sync leaves it when upstream moved on),
+  // "behind" (fast-forwardable), "diverged" (holds commits upstream does not, so it is not a
+  // pure mirror), or undefined when that cannot be established.
+  const standing = (url: string, sha: string | undefined) => {
+    if (sha === undefined) return undefined
+    if (sha === "") return "behind"
+    if (sha === upSha) return "at"
+    if (!commit(sha) && !fetchCommit(url, sha)) return undefined
+    if (isAncestor(sha, upSha)) return "behind"
+    if (!isAncestor(upSha, sha)) return "diverged"
+    const tip = upstreamTip()
+    if (tip === undefined) return undefined
+    return isAncestor(sha, tip) ? "at" : "diverged"
+  }
+  const fetchCommit = (url: string, sha: string) =>
+    git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "--refmap=", url, sha).code === 0
+  const read = () =>
     pushUrls.map((url) => {
       const remote = git("ls-remote", url, mirrorRef)
-      return remote.code === 0 ? (remote.stdout.split(/\s/)[0] ?? "") : undefined
+      const sha = remote.code === 0 ? (remote.stdout.split(/\s/)[0] ?? "") : undefined
+      return { sha, standing: standing(url, sha) }
     })
-  const pushMirror = (before: (string | undefined)[]) => {
-    if (git("push", "--no-follow-tags", origin, `${upSha}:${mirrorRef}`).code === 0) return "pushed"
-    const after = destinations()
+  const before = read()
+  const outcome = (() => {
+    if (before.length > 0 && before.every((item) => item.standing === "at"))
+      return { push: "current", changed: false, published: false }
+    // Publishing onto a diverged mirror would at best be refused and, with fork sync, could
+    // merge into it; either way it is no longer a mirror, so leave it for a person. The same
+    // holds for a destination whose standing cannot be established: it may be diverged.
+    if (before.some((item) => item.standing === "diverged"))
+      return { push: "diverged", changed: false, published: false }
+    if (before.length === 0 || before.some((item) => item.standing === undefined))
+      return { push: "unverified", changed: false, published: false }
+    const published = publish(upSha)
+    const after = read()
+    const changed = after.some((item, index) => item.sha !== before[index]?.sha)
+    const detail = published.ok ? undefined : published.detail
     // No readable destinations means the outcome is unknown, not vacuously "pushed".
-    if (after.length === 0 || after.includes(undefined)) return "unknown"
-    if (after.every((sha) => sha === upSha)) return "pushed"
-    // A destination unread before the push cannot show whether it moved.
-    if (before.includes(undefined)) return "unknown"
-    return after.some((sha, index) => sha !== before[index]) ? "partial" : "failed"
-  }
-  const before = destinations()
-  const push = before.length > 0 && before.every((sha) => sha === upSha) ? "current" : pushMirror(before)
-  const mutated = mirrorMoved || push === "pushed" || push === "partial" || push === "unknown"
+    if (after.length === 0 || after.some((item) => item.standing === undefined))
+      return { push: "unknown", changed, detail, published: true, reportedOk: published.ok }
+    if (after.some((item) => item.standing === "diverged"))
+      return { push: "diverged", changed, detail: published.detail, published: true }
+    if (after.every((item) => item.standing === "at")) return { push: "pushed", changed, published: true }
+    return { push: changed ? "partial" : "failed", changed, detail, published: true }
+  })()
+  const push = outcome.push
+  const reason = outcome.detail ? `: ${outcome.detail}` : ""
+  const mutated =
+    mirrorMoved ||
+    push === "pushed" ||
+    push === "partial" ||
+    push === "unknown" ||
+    (push === "diverged" && outcome.published)
   if (push === "current") log(`MIRROR: ${origin}/${mirror} already current`)
   if (push === "pushed") log(`MIRROR: pushed ${mirror} to ${origin}`)
-  if (push === "failed") log(`MIRROR: WARNING could not push ${mirror} to ${origin} - push it by hand`)
+  if (push === "failed") log(`MIRROR: WARNING could not publish ${mirror} to ${origin}${reason} - publish it by hand`)
   if (push === "partial")
-    log(`MIRROR: WARNING the push of ${mirror} reached only some of ${origin}'s push URLs - push it by hand`)
+    log(
+      `MIRROR: WARNING the publish of ${mirror} reached only some of ${origin}'s push URLs${reason} - publish it by hand`,
+    )
   if (push === "unknown")
     log(
-      `MIRROR: WARNING the push of ${mirror} to ${origin} failed and whether ${origin}/${mirror} moved could not be read`,
+      `MIRROR: WARNING the publish of ${mirror} to ${origin} ${"reportedOk" in outcome && outcome.reportedOk ? "reported success" : `failed${reason}`}, but whether ${origin}/${mirror} moved could not be read back`,
+    )
+  if (push === "unverified")
+    log(
+      `MIRROR: WARNING could not establish where ${origin}/${mirror} stands against the pinned commit, so nothing was published - check it and publish by hand`,
+    )
+  if (push === "diverged" && !outcome.published)
+    log(
+      `MIRROR: WARNING ${origin}/${mirror} is not a pure mirror of ${upstream}/${mirror} (it holds commits upstream does not) - reset it by hand; nothing was published`,
+    )
+  if (push === "diverged" && outcome.published)
+    log(
+      `MIRROR: WARNING after publishing, ${origin}/${mirror} is not a pure mirror of ${upstream}/${mirror} (the publish ${outcome.changed ? "moved it" : "may have moved it"})${reason} - reset it by hand`,
     )
 
   const mirrorState = [
@@ -249,9 +316,13 @@ export function syncUpstream(options: SyncOptions) {
     {
       current: ` (${origin} was already current, nothing pushed)`,
       pushed: ` and pushed to ${origin}`,
-      failed: ` but the push to ${origin} FAILED (push it by hand)`,
-      partial: ` but the push reached only some of ${origin}'s push URLs (push it by hand)`,
-      unknown: ` but the push to ${origin} failed and whether ${origin}/${mirror} moved is UNKNOWN (check it by hand)`,
+      failed: ` but publishing to ${origin} FAILED (publish it by hand)`,
+      partial: ` but the publish reached only some of ${origin}'s push URLs (publish it by hand)`,
+      unknown: ` but whether publishing moved ${origin}/${mirror} is UNKNOWN (check it by hand)`,
+      unverified: ` but where ${origin}/${mirror} stands could not be established, so nothing was published (check it by hand)`,
+      diverged: outcome.published
+        ? ` but after publishing ${origin}/${mirror} is NOT a pure mirror (reset it by hand)`
+        : ` but ${origin}/${mirror} is NOT a pure mirror, so nothing was published (reset it by hand)`,
     }[push],
   ].join("")
 
@@ -429,6 +500,82 @@ function recordSync(
   return { ok: true, message: `CHANGESET: recorded ${entry.range}` }
 }
 
+// How the CLI publishes the mirror to a GitHub fork. A fork can protect its mirror branch with
+// a ruleset that allows only GitHub's own fetch-and-merge (this repository's `upstream`
+// ruleset does), which rejects any push, so a fork whose one push URL and upstream are both
+// on GitHub is synced with `gh repo sync`, once its GitHub parent is confirmed to be the
+// configured upstream. Anything else keeps syncUpstream's default git push.
+export function mirrorPublisher(
+  pushUrl: string,
+  upstreamUrl: string,
+  mirror: string,
+  env: Record<string, string | undefined> = process.env,
+) {
+  const destination = githubSlug(pushUrl)
+  const source = githubSlug(upstreamUrl)
+  if (!destination || !source) return undefined
+  // Host-qualified names and GH_HOST pin every call to github.com, whatever gh is set up for.
+  const gh = (...args: string[]) =>
+    attempt(() =>
+      Bun.spawnSync(["gh", ...args], { env: { ...env, GH_HOST: "github.com" }, stdout: "pipe", stderr: "pipe" }),
+    )
+  const text = (proc: { stdout: Buffer; stderr: Buffer }) =>
+    firstLine(`${proc.stderr.toString()}${proc.stdout.toString()}`)
+  const missing = { ok: false, detail: "gh could not be run (is the GitHub CLI installed?)" }
+  return (_sha: string) => {
+    // GitHub's merge-upstream syncs from the fork's recorded parent, and gh consults --source
+    // only if that fails, so --source cannot redirect it: require the parent to be upstream.
+    // A missing `gh` makes spawnSync throw; `attempt` turns that into a failed publish.
+    const viewed = gh(
+      "repo",
+      "view",
+      `github.com/${destination}`,
+      "--json",
+      "parent",
+      "--jq",
+      '.parent.owner.login + "/" + .parent.name',
+    )
+    if (!viewed) return missing
+    if (viewed.value.exitCode !== 0) return { ok: false, detail: text(viewed.value) }
+    const parent = viewed.value.stdout.toString().trim()
+    if (parent.toLowerCase() !== source.toLowerCase())
+      return {
+        ok: false,
+        detail: `the fork's GitHub parent is ${parent || "unknown"}, not the configured upstream ${source}`,
+      }
+    const synced = gh(
+      "repo",
+      "sync",
+      `github.com/${destination}`,
+      "--source",
+      `github.com/${source}`,
+      "--branch",
+      mirror,
+    )
+    if (!synced) return missing
+    return { ok: synced.value.exitCode === 0, detail: text(synced.value) }
+  }
+}
+
+// owner/repo for a github.com remote URL in HTTPS (with or without embedded credentials, as
+// automation checkouts carry) or SSH form, otherwise undefined.
+export function githubSlug(url: string) {
+  const match =
+    /^(?:https:\/\/(?:[^/@?#\s]+@)?github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(
+      url.trim(),
+    )
+  return match?.[1]
+}
+
+// A lazily computed value, read at most once.
+function once<T>(compute: () => T) {
+  const cell: { value?: { of: T } } = {}
+  return () => {
+    cell.value ??= { of: compute() }
+    return cell.value.of
+  }
+}
+
 // Step off and delete a sync branch this run created, returning to where the run started.
 // Every outcome is read back from git, so the report never claims a cleanup that did not
 // happen.
@@ -477,5 +624,11 @@ if (import.meta.main) {
     console.log("SYNC_ABORT: not inside a git repository")
     process.exit(2)
   }
-  process.exit(syncUpstream({ git: localGit(top.stdout) }).code)
+  const git = localGit(top.stdout)
+  const pushUrls = git("remote", "get-url", "--push", "--all", "origin").stdout.split("\n").filter(Boolean)
+  const publishMirror =
+    pushUrls.length === 1
+      ? mirrorPublisher(pushUrls[0] ?? "", git("remote", "get-url", "upstream").stdout, "dev")
+      : undefined
+  process.exit(syncUpstream({ git, publishMirror }).code)
 }

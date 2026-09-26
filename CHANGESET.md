@@ -38,6 +38,10 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Fork maintenance and CI
 
+- **#52** `sync-upstream.ts` publishes the `dev` mirror through GitHub's fork sync (`gh repo sync --source
+<upstream>`) for a GitHub fork, since the `upstream` ruleset allows only fetch-and-merge on `dev`; the first real
+  sync's push was refused. Every destination is read back: a mirror at or past the pinned commit on upstream's own
+  history counts as published, and a diverged mirror is refused rather than published onto. _Fork-only._
 - **#46** Upstream sync script and this changeset: `script/sync-upstream.ts` fast-forwards the `dev` mirror and prepares
   a `--no-ff` merge for review; `script/changeset-check.ts` keeps this file current; `script/` fork files are now
   typechecked. _Fork-only._
