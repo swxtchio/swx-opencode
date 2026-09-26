@@ -24,6 +24,7 @@ Newest first. Each entry names the upstream range brought in.
 
 <!-- upstream-syncs: sync-upstream.ts inserts new entries below this line -->
 
+- **2026-09-26** `2406400f0a..696f41bc8e`, 18 upstream commits (sync-upstream-20260926-095526). Conflicts: none.
 - **2026-09-22** `d870e22c70..2406400f0a`, 17 upstream commits (PR #38, merge `75eced9fee`). Conflicts:
   `packages/core/src/filesystem/search.ts` took upstream's, since #50439 fixes the same cycle as #2;
   `packages/core/src/npm.ts` kept both import sets; `bun.lock` regenerated.
