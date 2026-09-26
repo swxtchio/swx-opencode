@@ -1,6 +1,6 @@
 import { createStore } from "solid-js/store"
 import { createSimpleContext } from "./helper"
-import { batch, createEffect, createMemo } from "solid-js"
+import { batch, createEffect, createMemo, createSignal } from "solid-js"
 import { useSync } from "./sync"
 import { useEvent } from "./event"
 import path from "path"
@@ -30,6 +30,14 @@ export function parseModel(model: string) {
     providerID: providerID,
     modelID: rest.join("/"),
   }
+}
+
+// The effort `--effort` asks for at launch, checked against what the model declares. An
+// unknown one is refused with the choices, never silently dropped (#29's rule for `run`).
+export function launchEffort(requested: string, model: string, available: string[]) {
+  if (requested === "default" || available.includes(requested)) return { effort: requested }
+  const hint = available.length ? ` Available: ${[...available].sort().join(", ")}` : " This model declares none."
+  return { error: `Unknown effort "${requested}" for ${model}.${hint}` }
 }
 
 export function recentModels(
@@ -244,6 +252,22 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         )
       })
 
+      // --effort is a launch override for the model that is current at launch. It is never
+      // saved, and choosing an effort in the app replaces it.
+      const [launch, setLaunch] = createSignal<{ key: string; effort: string }>()
+      const launchState = { decided: !args.variant }
+      createEffect(() => {
+        if (launchState.decided || !args.variant) return
+        const m = currentModel()
+        const provider = m && sync.data.provider.find((item) => item.id === m.providerID)
+        if (!m || !provider) return
+        launchState.decided = true
+        const key = `${m.providerID}/${m.modelID}`
+        const decided = launchEffort(args.variant, key, Object.keys(provider.models[m.modelID]?.variants ?? {}))
+        if (decided.error !== undefined) return toast.show({ variant: "error", message: decided.error, duration: 8000 })
+        setLaunch({ key, effort: decided.effort })
+      })
+
       return {
         current: currentModel,
         get ready() {
@@ -364,6 +388,8 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             const m = currentModel()
             if (!m) return undefined
             const key = `${m.providerID}/${m.modelID}`
+            const override = launch()
+            if (override?.key === key) return override.effort
             return modelStore.variant[key]
           },
           current() {
@@ -384,6 +410,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             const m = currentModel()
             if (!m) return
             const key = `${m.providerID}/${m.modelID}`
+            setLaunch(undefined)
             setModelStore("variant", key, value ?? "default")
             save()
           },

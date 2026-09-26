@@ -83,6 +83,13 @@ function block(info: Inline, output?: string) {
   UI.empty()
 }
 
+// The HTTP error middleware's stand-in for an unhandled server error: a NamedError.Unknown
+// whose data carries only a log ref.
+function isGenericServerError(error: unknown) {
+  if (typeof error !== "object" || error === null || !("name" in error) || error.name !== "UnknownError") return false
+  return "data" in error && typeof error.data === "object" && error.data !== null && "ref" in error.data
+}
+
 function formatRunError(error: unknown) {
   return FormatError(error) ?? FormatUnknownError(error)
 }
@@ -691,6 +698,11 @@ export const RunCommand = effectCmd({
           return false
         }
 
+        // Settled once the loop has shown a session.error for this session. The server reports
+        // prompt validation errors (unknown effort, agent, command) by publishing that event
+        // and then failing the request, which reaches us only as a generic 500.
+        const sessionError = Promise.withResolvers<void>()
+
         // Consume one subscribed event stream for the active session and mirror it
         // to stdout/UI. `client` is passed explicitly because attach mode may
         // rebind the SDK to the session's directory after the subscription is
@@ -787,8 +799,9 @@ export const RunCommand = effectCmd({
                 err = String(props.error.data.message)
               }
               error = error ? error + EOL + err : err
-              if (emit("error", { error: props.error })) continue
-              UI.error(err)
+              if (!emit("error", { error: props.error })) UI.error(err)
+              sessionError.resolve()
+              continue
             }
 
             if (
@@ -837,6 +850,19 @@ export const RunCommand = effectCmd({
             console.error(e)
             process.exitCode = 1
           })
+          // A generic 500 hides the real error behind a log ref, so wait for the session.error
+          // the server published first and let the loop print that. The wait is only a
+          // bounded backstop for failures that publish no event; errors that already carry
+          // their message print at once.
+          async function failed(error: unknown) {
+            process.exitCode = 1
+            const generic = isGenericServerError(error)
+            const shown =
+              generic &&
+              (await Promise.race([sessionError.promise.then(() => true), Bun.sleep(3000).then(() => false)]))
+            if (shown) return
+            if (!emit("error", { error })) UI.error(formatRunError(error))
+          }
           async function finish() {
             if (args.attach) return
             const error = await completed
@@ -852,11 +878,7 @@ export const RunCommand = effectCmd({
               arguments: message,
               variant: args.effort,
             })
-            if (result.error) {
-              if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
-              process.exitCode = 1
-              return
-            }
+            if (result.error) return failed(result.error)
             await finish()
             return
           }
@@ -869,11 +891,7 @@ export const RunCommand = effectCmd({
             variant: args.effort,
             parts: [...files, { type: "text", text: message }],
           })
-          if (result.error) {
-            if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
-            process.exitCode = 1
-            return
-          }
+          if (result.error) return failed(result.error)
           await finish()
           return
         }
@@ -974,6 +992,7 @@ type MiniCommandInput = {
   fork?: boolean
   model?: string
   agent?: string
+  effort?: string
   prompt?: string
   replay?: boolean
   replayLimit?: number
@@ -1003,8 +1022,8 @@ export async function runMini(input: MiniCommandInput) {
     port: undefined,
     // Both spellings: yargs mirrors the alias onto argv at runtime, and the
     // inferred type carries both, so a synthetic args object has to supply them.
-    effort: undefined,
-    variant: undefined,
+    effort: input.effort,
+    variant: input.effort,
     thinking: undefined,
     mini: true,
     interactive: false,
