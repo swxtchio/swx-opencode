@@ -33,9 +33,9 @@ const GUARD = "github.repository == 'anomalyco/opencode'"
  * guarded on four jobs out of five.
  */
 const ALLOWED = new Map([
-  ["test.yml::unit", "bb8f511805a6d646"],
+  ["test.yml::unit", "820ee07c813fc7e3"],
   ["test.yml::e2e", "9f89116be327fa02"],
-  ["typecheck.yml::typecheck", "b82d5ddbd87d3df7"],
+  ["typecheck.yml::typecheck", "276be38badce0802"],
 ])
 
 /**
@@ -389,7 +389,7 @@ export function isGuarded(condition: string, guard: string): boolean {
  */
 function stripExpressionSyntax(expression: string): string {
   const wrapped = /^\$\{\{(.*)\}\}$/.exec(expression)
-  return wrapped ? wrapped[1].trim() : expression
+  return wrapped ? (wrapped[1] ?? "").trim() : expression
 }
 
 /**
@@ -987,7 +987,7 @@ async function main() {
       })
   }
   for (const key of ALLOWED.keys()) {
-    const [workflow, job] = key.split("::")
+    const [workflow = "", job] = key.split("::")
     if (!ALLOWED_ENVELOPES.has(workflow))
       violations.push({
         workflow,

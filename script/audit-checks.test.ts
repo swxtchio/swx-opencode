@@ -126,7 +126,7 @@ describe("auditStepViolations", () => {
     ],
     [
       "a step that pipes failure into echo",
-      { steps: [{ ...good.steps[0], run: `${AUDIT_STEPS[0].run} || echo "findings above"` }, good.steps[1]] },
+      { steps: [{ ...good.steps[0], run: `${AUDIT_STEPS[0]!.run} || echo "findings above"` }, good.steps[1]] },
     ],
     [
       "a gate file dropped from the invocation but left in the ls line",
@@ -135,7 +135,7 @@ describe("auditStepViolations", () => {
           good.steps[0],
           {
             ...good.steps[1],
-            run: good.steps[1].run.replace(" audit-cli.test.ts", "").replace("ls ", "ls audit-cli.test.ts "),
+            run: good.steps[1]!.run.replace(" audit-cli.test.ts", "").replace("ls ", "ls audit-cli.test.ts "),
           },
         ],
       },

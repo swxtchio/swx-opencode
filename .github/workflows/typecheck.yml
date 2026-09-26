@@ -27,3 +27,8 @@ jobs:
 
       - name: Run typecheck
         run: bun typecheck
+
+      - name: Typecheck the fork's scripts
+        # script/ is not a workspace package, so `bun typecheck` never reaches
+        # it. script/tsconfig.json scopes this to the files the fork owns.
+        run: bun run typecheck:script

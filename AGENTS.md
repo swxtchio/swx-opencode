@@ -1,11 +1,18 @@
 - To regenerate the legacy JavaScript SDK, run `./packages/sdk/js/script/build.ts`.
 - After changing the public Protocol or Server `HttpApi`, run `bun run generate` from `packages/client`. Do not edit `src/generated` or `src/generated-effect` directly.
 - Keep runtime dependencies directed from Schema to Core and Protocol, then from Core and Protocol to Server. Client runtime code may depend on Schema and Protocol but never Core or Server; `sdk-next` composes Client, Core, and Server.
-- The default branch in this **fork** (`swxtchio/swx-opencode`) is `swxtch`, not `dev`. `dev` and `main` are the
-  upstream repository's branches, inherited by the fork and not maintained here; a local
+- The default branch in this **fork** (`swxtchio/swx-opencode`) is `swxtch`, not `dev`. `dev` is a read-only mirror
+  of `upstream/dev` that only the sync script below advances; never commit to it. `main` is inherited from
+  upstream and not maintained here. A local
   `refs/remotes/origin/HEAD` cloned before the fork still points at `origin/dev` and is not to be trusted.
   Resolve it rather than assuming: `gh repo view swxtchio/swx-opencode --json defaultBranchRef`.
 - Use `swxtch` or `origin/swxtch` for diffs and as the base for branches and pull requests.
+- Sync with upstream by merging, never rebasing: run `bun script/sync-upstream.ts` from a dedicated worktree. It
+  fast-forwards `dev` to `upstream/dev` and prepares a `--no-ff` merge onto a new branch off `origin/swxtch`. Land
+  that PR with a merge commit, never a squash; the script's header documents its report tokens and conflict handling.
+- `CHANGESET.md` at the root records every upstream sync and every change this fork carries. A PR against `swxtch`
+  adds its own `- **#<number>**` entry under the matching area in "Fork changes", which CI checks; the sync script
+  writes the sync entries, and CI checks those too.
 
 ## Branch Names
 
