@@ -889,10 +889,8 @@ export const RunCommand = effectCmd({
               Bun.sleep(CONNECT_BACKSTOP_MS).then(() => false),
             ])
             if (!live) {
-              const error = new NamedError.Unknown({
-                message: "could not connect to the server's event stream; the prompt was not sent",
-              }).toObject()
-              if (!emit("error", { error })) UI.error(formatRunError(error))
+              const message = "could not connect to the server's event stream; the prompt was not sent"
+              if (!emit("error", { error: new NamedError.Unknown({ message }).toObject() })) UI.error(message)
               process.exitCode = 1
               return false
             }
