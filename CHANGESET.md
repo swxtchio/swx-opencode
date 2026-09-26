@@ -51,6 +51,10 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#49** `--effort` works on `opencode`, `--mini` and `attach` (one rule: it applies to whichever model declares
+  it, until an in-app choice, and is never saved); an unknown CLI argument is now named after the help; and `run`
+  prints the server's real validation error instead of a generic 500. _Fork-only; the unknown-argument message is
+  upstreamable._
 - **#41** Offer max reasoning variants for GPT-6 Sol and Luna through OpenAI, Azure and compatible gateways.
   _Upstreamable._
 - **#31** `run`: fit the turn summary to the terminal width instead of cutting its tail. _Upstreamable._
