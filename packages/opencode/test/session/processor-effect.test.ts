@@ -103,6 +103,7 @@ function routedConfig() {
           "served-a": { cost: { input: 1, output: 2 } },
           "served-b": { cost: { input: 3, output: 4 } },
           "unpriced-model": { name: "Unpriced Model" },
+          "free-model": { cost: { input: 0, output: 0 } },
         },
         options: { apiKey: "test-key", baseURL: "http://localhost:1/v1" },
       },
@@ -1225,6 +1226,7 @@ itRouted.live(
           { responseModelID: "missing-model", input: 1_000_000, output: 1_000_000 },
           { responseModelID: "unpriced-model", input: 1_000_000, output: 1_000_000 },
           { input: 1_000_000, output: 1_000_000 },
+          { responseModelID: "free-model", input: 1_000_000, output: 1_000_000 },
         ]
         routedEvents.splice(
           0,
@@ -1265,13 +1267,14 @@ itRouted.live(
         const stepParts = processed.parts.filter(
           (part): part is SessionV1.StepFinishPart => part.type === "step-finish",
         )
-        expect(stepParts.map((part) => part.cost)).toEqual([3, 10, 30, 30, 30])
+        expect(stepParts.map((part) => part.cost)).toEqual([3, 10, 30, 30, 30, 0])
         expect(stepParts.map((part) => part.responseModelID)).toEqual([
           "served-a",
           "served-b",
           "missing-model",
           "unpriced-model",
           undefined,
+          "free-model",
         ])
         expect(processed.info.cost).toBe(103)
         expect(processed.info.responseModelIDs).toEqual([
@@ -1279,6 +1282,7 @@ itRouted.live(
           "served-b",
           "missing-model",
           "unpriced-model",
+          "free-model",
         ])
 
         const historical = yield* assistant(chat.id, parent.id, path.resolve(dir))
@@ -1311,9 +1315,10 @@ itRouted.live(
         const info = yield* session.get(chat.id)
         const stats = yield* aggregateSessionStats()
         expect(stats.totalCost).toBe(110)
-        expect(stats.totalTokens.input).toBe(6_000_700)
-        expect(stats.totalTokens.output).toBe(5_000_300)
+        expect(stats.totalTokens.input).toBe(7_000_700)
+        expect(stats.totalTokens.output).toBe(6_000_300)
         expect(Object.keys(stats.modelUsage).sort()).toEqual([
+          "test/free-model",
           "test/missing-model",
           "test/request-model",
           "test/served-a",
@@ -1330,6 +1335,10 @@ itRouted.live(
         })
         expect(stats.modelUsage["test/missing-model"]?.cost).toBe(30)
         expect(stats.modelUsage["test/unpriced-model"]?.cost).toBe(30)
+        expect(stats.modelUsage["test/free-model"]).toMatchObject({
+          cost: 0,
+          tokens: { input: 1_000_000, output: 1_000_000 },
+        })
         expect(stats.modelUsage["test/request-model"]).toMatchObject({
           cost: 37,
           messages: 2,
@@ -1414,9 +1423,17 @@ itRouted.live(
         const records = buildRecords({ sessions: sessionRows, models: modelRows, served: servedRows, steps: stepRows })
         expect(records).toHaveLength(1)
         expect(records[0]).toMatchObject({
-          tokens: { input: 6_000_700, output: 5_000_300 },
+          tokens: { input: 7_000_700, output: 6_000_300 },
           reportedCost: 110,
-          servedModelIDs: ["missing-model", "old-served-a", "old-served-b", "served-a", "served-b", "unpriced-model"],
+          servedModelIDs: [
+            "free-model",
+            "missing-model",
+            "old-served-a",
+            "old-served-b",
+            "served-a",
+            "served-b",
+            "unpriced-model",
+          ],
         })
         const record = records[0]
         expect(record).toBeDefined()
@@ -1428,6 +1445,11 @@ itRouted.live(
         expect(Array.isArray(servedUsage)).toBe(true)
         if (!Array.isArray(servedUsage)) return
         expect(servedUsage).toEqual([
+          {
+            modelID: "free-model",
+            tokens: { input: 1_000_000, output: 1_000_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+            reportedCost: 0,
+          },
           {
             modelID: "missing-model",
             tokens: { input: 1_000_000, output: 1_000_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 },

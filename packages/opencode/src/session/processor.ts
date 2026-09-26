@@ -470,15 +470,21 @@ const layer = Layer.effect(
                 transformations: JSON.stringify(dropped),
               })
             }
+            const responseModelID = value.responseModelID
             const model = yield* (
-              value.responseModelID === undefined || value.responseModelID === ctx.model.id
+              responseModelID === undefined || responseModelID === ctx.model.id
                 ? Effect.succeed(ctx.model)
-                : provider
-                    .getModel(ctx.model.providerID, ModelV2.ID.make(value.responseModelID))
-                    .pipe(
-                      Effect.map((served) => (hasKnownPrice(served) ? served : ctx.model)),
-                      Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(ctx.model)),
-                    )
+                : Effect.gen(function* () {
+                    const served = yield* provider
+                      .getModel(ctx.model.providerID, ModelV2.ID.make(responseModelID))
+                      .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
+                    if (!served) return ctx.model
+                    if (hasKnownPrice(served)) return served
+                    const configuredCost = (yield* config.get()).provider?.[ctx.model.providerID]?.models?.[
+                      responseModelID
+                    ]?.cost
+                    return configuredCost ? served : ctx.model
+                  })
             )
             const usage = Session.getUsage({
               model,
