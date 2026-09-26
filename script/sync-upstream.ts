@@ -561,7 +561,7 @@ export function mirrorPublisher(
 // automation checkouts carry) or SSH form, otherwise undefined.
 export function githubSlug(url: string) {
   const match =
-    /^(?:https:\/\/(?:[^/@\s]+@)?github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(
+    /^(?:https:\/\/(?:[^/@?#\s]+@)?github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(
       url.trim(),
     )
   return match?.[1]

@@ -1119,6 +1119,9 @@ describe("githubSlug", () => {
     "https://gitlab.com/a/b",
     "https://github.com/only-owner",
     "https://evil.com@x/a/b",
+    // git ends the authority at ? or #, so these hosts are evil.com, not github.com.
+    "https://evil.com?x@github.com/a/b",
+    "https://evil.com#x@github.com/a/b",
     "",
   ])("rejects %p", (url) => {
     expect(githubSlug(url)).toBeUndefined()
