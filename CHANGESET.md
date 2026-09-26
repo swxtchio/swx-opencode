@@ -77,6 +77,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Features
 
+- **#54** Price each routed step at its configured serving model, show per-model cost shares in `opencode stats`, and export per-served-model token and cost splits, falling back to the requested model when the served identity or price is unavailable. (swxtchio/swx-opencode#54). _Fork-only._
 - **#34** Export per-session usage as JSONL, verified against the live database. _Fork-only._
 - **#29** `--effort` flag, which rejects an unknown value instead of ignoring it. _Upstreamable._
 - **#12** The TUI turn footer shows the model that actually served a routed turn. _Fork-only._
