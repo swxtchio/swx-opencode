@@ -1232,8 +1232,22 @@ itRouted.live(
         msg.modelID = requestModelRef.modelID
         yield* session.updateMessage(msg)
 
-        const steps: Array<{ responseModelID?: string; input: number; output: number }> = [
-          { responseModelID: "served-a", input: 1_000_000, output: 1_000_000 },
+        const steps: Array<{
+          responseModelID?: string
+          input: number
+          output: number
+          reasoning?: number
+          cacheRead?: number
+          cacheWrite?: number
+        }> = [
+          {
+            responseModelID: "served-a",
+            input: 1_000_000,
+            output: 1_000_000,
+            reasoning: 150,
+            cacheRead: 200,
+            cacheWrite: 100,
+          },
           { responseModelID: "served-b", input: 2_000_000, output: 1_000_000 },
           { responseModelID: "missing-model", input: 1_000_000, output: 1_000_000 },
           { responseModelID: "unpriced-model", input: 1_000_000, output: 1_000_000 },
@@ -1251,6 +1265,9 @@ itRouted.live(
               usage: new Usage({
                 inputTokens: step.input,
                 outputTokens: step.output,
+                reasoningTokens: step.reasoning ?? 0,
+                cacheReadInputTokens: step.cacheRead ?? 0,
+                cacheWriteInputTokens: step.cacheWrite ?? 0,
                 totalTokens: step.input + step.output,
               }),
               responseModelID: step.responseModelID,
@@ -1279,7 +1296,9 @@ itRouted.live(
         const stepParts = processed.parts.filter(
           (part): part is SessionV1.StepFinishPart => part.type === "step-finish",
         )
-        expect(stepParts.map((part) => part.cost)).toEqual([3, 10, 30, 30, 30, 0])
+        expect(stepParts).toHaveLength(6)
+        expect(stepParts[0]?.cost).toBeCloseTo(2.9997, 10)
+        expect(stepParts.slice(1).map((part) => part.cost)).toEqual([10, 30, 30, 30, 0])
         expect(stepParts.map((part) => part.responseModelID)).toEqual([
           "served-a",
           "served-b",
@@ -1288,7 +1307,7 @@ itRouted.live(
           undefined,
           "free-model",
         ])
-        expect(processed.info.cost).toBe(103)
+        expect(processed.info.cost).toBeCloseTo(102.9997, 10)
         expect(processed.info.responseModelIDs).toEqual([
           "served-a",
           "served-b",
@@ -1312,7 +1331,7 @@ itRouted.live(
 
         const database = yield* Database.Service
         const projected = yield* session.get(chat.id)
-        expect(projected.cost).toBe(103)
+        expect(projected.cost).toBeCloseTo(102.9997, 10)
         yield* database.db
           .update(SessionTable)
           .set({
@@ -1328,11 +1347,11 @@ itRouted.live(
           .pipe(Effect.orDie)
 
         const staleRollup = yield* session.get(chat.id)
-        expect(staleRollup.cost).toBe(115)
-        expect(staleRollup.tokens?.input).toBe(7_000_705)
-        expect(staleRollup.tokens?.output).toBe(6_000_304)
-        expect(staleRollup.tokens?.reasoning).toBe(3)
-        expect(staleRollup.tokens?.cache).toEqual({ read: 2, write: 1 })
+        expect(staleRollup.cost).toBeCloseTo(114.9997, 10)
+        expect(staleRollup.tokens?.input).toBe(7_000_405)
+        expect(staleRollup.tokens?.output).toBe(6_000_154)
+        expect(staleRollup.tokens?.reasoning).toBe(153)
+        expect(staleRollup.tokens?.cache).toEqual({ read: 202, write: 101 })
         const exportDatabase = new Sqlite(routedExportDbPath, { readonly: true })
         const exportSnapshot = (() => {
           try {
@@ -1342,9 +1361,10 @@ itRouted.live(
           }
         })()
         expect(exportSnapshot.records).toHaveLength(1)
-        expect(exportSnapshot.reportedCostTotal).toBe(110)
-        expect(exportSnapshot.reportedCostTotal).toBe(
+        expect(exportSnapshot.reportedCostTotal).toBeCloseTo(109.9997, 10)
+        expect(exportSnapshot.reportedCostTotal).toBeCloseTo(
           exportSnapshot.records.reduce((total, item) => total + Number(item["reportedCost"]), 0),
+          10,
         )
         expect(exportSnapshot.orphanMessages).toBe(0)
         expect(exportSnapshot.check.ok).toBe(true)
@@ -1355,8 +1375,13 @@ itRouted.live(
         if (!record) return
         expect(record).toMatchObject({
           modelID: "request-model",
-          tokens: { input: 7_000_700, output: 6_000_300 },
-          reportedCost: 110,
+          tokens: {
+            input: 7_000_400,
+            output: 6_000_150,
+            reasoning: 150,
+            cacheRead: 200,
+            cacheWrite: 100,
+          },
           servedModelIDs: [
             "free-model",
             "missing-model",
@@ -1367,6 +1392,7 @@ itRouted.live(
             "unpriced-model",
           ],
         })
+        expect(Number(record["reportedCost"])).toBeCloseTo(109.9997, 10)
         const servedUsage = record["servedModelUsage"]
         expect(Array.isArray(servedUsage)).toBe(true)
         if (!Array.isArray(servedUsage)) return
@@ -1388,8 +1414,8 @@ itRouted.live(
           },
           {
             modelID: "served-a",
-            tokens: { input: 1_000_000, output: 1_000_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
-            reportedCost: 3,
+            tokens: { input: 999_700, output: 999_850, reasoning: 150, cacheRead: 200, cacheWrite: 100 },
+            reportedCost: 2.9997,
           },
           {
             modelID: "served-b",
@@ -1402,7 +1428,10 @@ itRouted.live(
             reportedCost: 30,
           },
         ])
-        expect(servedUsage.reduce((total, item) => total + item.reportedCost, 0)).toBe(record["reportedCost"])
+        expect(servedUsage.reduce((total, item) => total + item.reportedCost, 0)).toBeCloseTo(
+          Number(record["reportedCost"]),
+          10,
+        )
 
         yield* database.db
           .insert(PartTable)
@@ -1421,12 +1450,12 @@ itRouted.live(
           .run()
           .pipe(Effect.orDie)
         const stats = yield* aggregateSessionStats()
-        expect(stats.totalCost).toBe(110)
-        expect(stats.costPerDay * stats.days).toBe(stats.totalCost)
-        expect(stats.totalTokens.input).toBe(7_000_700)
-        expect(stats.totalTokens.output).toBe(6_000_300)
-        expect(stats.totalTokens.reasoning).toBe(0)
-        expect(stats.totalTokens.cache).toEqual({ read: 0, write: 0 })
+        expect(stats.totalCost).toBeCloseTo(109.9997, 10)
+        expect(stats.costPerDay * stats.days).toBeCloseTo(stats.totalCost, 10)
+        expect(stats.totalTokens.input).toBe(7_000_400)
+        expect(stats.totalTokens.output).toBe(6_000_150)
+        expect(stats.totalTokens.reasoning).toBe(150)
+        expect(stats.totalTokens.cache).toEqual({ read: 200, write: 100 })
         expect(stats.tokensPerSession).toBe(13_001_000)
         expect(stats.medianTokensPerSession).toBe(13_001_000)
         expect(Object.keys(stats.modelUsage).sort()).toEqual([
@@ -1438,9 +1467,9 @@ itRouted.live(
           "test/served-b",
           "test/unpriced-model",
         ])
+        expect(stats.modelUsage["test/served-a"]?.cost).toBeCloseTo(2.9997, 10)
         expect(stats.modelUsage["test/served-a"]).toMatchObject({
-          cost: 3,
-          tokens: { input: 1_000_000, output: 1_000_000 },
+          tokens: { input: 999_700, output: 1_000_000, cache: { read: 200, write: 100 } },
         })
         expect(stats.modelUsage["test/served-b"]).toMatchObject({
           cost: 10,
@@ -1476,7 +1505,7 @@ itRouted.live(
           (total, item) => total + item.cost / stats.totalCost,
           0,
         )
-        expect(modeledCost).toBe(stats.totalCost)
+        expect(modeledCost).toBeCloseTo(stats.totalCost, 10)
         expect(modeledInput).toBe(stats.totalTokens.input)
         expect(modeledOutput).toBe(stats.totalTokens.output + stats.totalTokens.reasoning)
         expect(modeledCacheRead).toBe(stats.totalTokens.cache.read)
@@ -1490,6 +1519,8 @@ itRouted.live(
         expect(printed.join("\n")).not.toContain("$115.00")
         expect(printed.join("\n")).toContain("33.6%")
         expect(printed.join("\n")).not.toContain("test/served-a")
+        expect(printed.find((line) => line.startsWith("│Cache Read"))).toContain("200")
+        expect(printed.find((line) => line.startsWith("│Cache Write"))).toContain("100")
 
         const zeroCostStats = {
           ...stats,
