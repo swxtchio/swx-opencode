@@ -77,7 +77,7 @@ type UsageRecord = Record<string, unknown> & {
   reportedCost: number
 }
 
-/** Assistant-message totals. Step parts supply the per-serving-model attribution. */
+/** Keep assistant messages separate so step parts can supply totals without mixing legacy rows. */
 const MODEL_SQL = `
   SELECT
     m.id                                                       AS message_id,
@@ -113,6 +113,7 @@ const SERVED_SQL = `
   WHERE json_extract(m.data, '$.role') = 'assistant'
 `
 
+/** A step without a reported serving ID stays attributed to its requested model. */
 const STEP_USAGE_SQL = `
   SELECT
     p.message_id,
@@ -216,6 +217,7 @@ export function buildRecords(input: {
 
     group.record.messages += row.messages
     const stepRows = row.message_id ? stepsByMessage.get(row.message_id) : undefined
+    // Legacy messages lack step ownership, so preserve their totals under the requested model.
     const usageRows = stepRows?.length ? stepRows : [undefined]
     for (const step of usageRows) {
       const modelID = step?.served_model_id ?? row.model_id
@@ -259,7 +261,9 @@ export function buildRecords(input: {
   return [...records].map(([key, group]) => ({
     ...group.record,
     servedModelIDs: [...(servedBy.get(key) ?? [])].sort(),
-    servedModelUsage: [...group.servedModelUsage.values()].sort((a, b) => (a.modelID ?? "").localeCompare(b.modelID ?? "")),
+    servedModelUsage: [...group.servedModelUsage.values()].sort((a, b) =>
+      (a.modelID ?? "").localeCompare(b.modelID ?? ""),
+    ),
   }))
 }
 
@@ -369,7 +373,7 @@ export const ExportUsageCommand = effectCmd({
     const db = new Sqlite(file, { readonly: true })
 
     try {
-      const { sessions, records, orphanMessages, check } = readExport(db)
+      const { sessions, records, check } = readExport(db)
 
       const summary = {
         type: "summary",

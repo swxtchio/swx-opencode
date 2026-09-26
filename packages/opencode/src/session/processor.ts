@@ -471,21 +471,23 @@ const layer = Layer.effect(
               })
             }
             const responseModelID = value.responseModelID
-            const model = yield* (
-              responseModelID === undefined || responseModelID === ctx.model.id
-                ? Effect.succeed(ctx.model)
-                : Effect.gen(function* () {
-                    const served = yield* provider
-                      .getModel(ctx.model.providerID, ModelV2.ID.make(responseModelID))
-                      .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
-                    if (!served) return ctx.model
-                    if (hasKnownPrice(served)) return served
-                    const configuredCost = (yield* config.get()).provider?.[ctx.model.providerID]?.models?.[
-                      responseModelID
-                    ]?.cost
-                    return configuredCost ? served : ctx.model
-                  })
-            )
+            const model = yield* responseModelID === undefined || responseModelID === ctx.model.id
+              ? Effect.succeed(ctx.model)
+              : Effect.gen(function* () {
+                  const served = yield* provider.getModel(ctx.model.providerID, ModelV2.ID.make(responseModelID)).pipe(
+                    Effect.catchIf(
+                      (error) => Provider.ModelNotFoundError.isInstance(error),
+                      () => Effect.succeed(undefined),
+                    ),
+                  )
+                  if (!served) return ctx.model
+                  if (hasKnownPrice(served)) return served
+                  const configuredCost = (yield* config.get()).provider?.[ctx.model.providerID]?.models?.[
+                    responseModelID
+                  ]?.cost
+                  // Provider parsing fills absent prices with zero, so the raw config distinguishes free from unpriced.
+                  return configuredCost ? served : ctx.model
+                })
             const usage = Session.getUsage({
               model,
               usage: value.usage ?? new Usage({}),

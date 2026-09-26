@@ -212,10 +212,7 @@ const env = LayerNode.compile(
 const it = testEffect(env)
 
 const routedEvents: LLMEvent[] = []
-const routedLLM = Layer.succeed(
-  LLM.Service,
-  LLM.Service.of({ stream: () => Stream.fromIterable(routedEvents) }),
-)
+const routedLLM = Layer.succeed(LLM.Service, LLM.Service.of({ stream: () => Stream.fromIterable(routedEvents) }))
 const routedEnv = LayerNode.compile(root, [...replacements, [LLM.node, routedLLM]])
 const itRouted = testEffect(routedEnv)
 
@@ -1345,7 +1342,10 @@ itRouted.live(
           tokens: { input: 1_000_700, output: 1_000_300 },
         })
         const modeledCost = Object.values(stats.modelUsage).reduce((total, item) => total + item.cost, 0)
-        const totalShare = Object.values(stats.modelUsage).reduce((total, item) => total + item.cost / stats.totalCost, 0)
+        const totalShare = Object.values(stats.modelUsage).reduce(
+          (total, item) => total + item.cost / stats.totalCost,
+          0,
+        )
         expect(modeledCost).toBe(stats.totalCost)
         expect(totalShare).toBeCloseTo(1, 12)
 

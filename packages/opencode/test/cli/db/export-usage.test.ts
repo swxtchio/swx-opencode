@@ -178,9 +178,7 @@ describe("readExport", () => {
         CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
       `)
 
-      const insertSession = db.query(
-        `INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
+      const insertSession = db.query(`INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       insertSession.run("ses_mixed", null, "proj", "/w", "mixed", "build", null, 1, 2, 13, 3, 2, 0, 0, 0)
       insertSession.run("ses_legacy", null, "proj", "/w", "legacy", "build", null, 1, 2, 4, 5, 6, 1, 2, 3)
 
