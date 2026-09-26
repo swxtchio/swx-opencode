@@ -273,7 +273,7 @@ export function syncUpstream(options: SyncOptions) {
     const detail = published.ok ? undefined : published.detail
     // No readable destinations means the outcome is unknown, not vacuously "pushed".
     if (after.length === 0 || after.some((item) => item.standing === undefined))
-      return { push: "unknown", changed, detail, published: true }
+      return { push: "unknown", changed, detail, published: true, reportedOk: published.ok }
     if (after.some((item) => item.standing === "diverged"))
       return { push: "diverged", changed, detail: published.detail, published: true }
     if (after.every((item) => item.standing === "at")) return { push: "pushed", changed, published: true }
@@ -296,7 +296,7 @@ export function syncUpstream(options: SyncOptions) {
     )
   if (push === "unknown")
     log(
-      `MIRROR: WARNING the publish of ${mirror} to ${origin} failed${reason}, and whether ${origin}/${mirror} moved could not be read`,
+      `MIRROR: WARNING the publish of ${mirror} to ${origin} ${"reportedOk" in outcome && outcome.reportedOk ? "reported success" : `failed${reason}`}, but whether ${origin}/${mirror} moved could not be read back`,
     )
   if (push === "unverified")
     log(
@@ -318,7 +318,7 @@ export function syncUpstream(options: SyncOptions) {
       pushed: ` and pushed to ${origin}`,
       failed: ` but publishing to ${origin} FAILED (publish it by hand)`,
       partial: ` but the publish reached only some of ${origin}'s push URLs (publish it by hand)`,
-      unknown: ` but publishing to ${origin} failed and whether ${origin}/${mirror} moved is UNKNOWN (check it by hand)`,
+      unknown: ` but whether publishing moved ${origin}/${mirror} is UNKNOWN (check it by hand)`,
       unverified: ` but where ${origin}/${mirror} stands could not be established, so nothing was published (check it by hand)`,
       diverged: outcome.published
         ? ` but after publishing ${origin}/${mirror} is NOT a pure mirror (reset it by hand)`
@@ -557,10 +557,11 @@ export function mirrorPublisher(
   }
 }
 
-// owner/repo for a github.com remote URL in HTTPS or SSH form, otherwise undefined.
+// owner/repo for a github.com remote URL in HTTPS (with or without embedded credentials, as
+// automation checkouts carry) or SSH form, otherwise undefined.
 export function githubSlug(url: string) {
   const match =
-    /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(
+    /^(?:https:\/\/(?:[^/@\s]+@)?github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(
       url.trim(),
     )
   return match?.[1]

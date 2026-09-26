@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test"
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
@@ -846,7 +846,7 @@ describe("syncUpstream", () => {
   // nothing-happened SYNC_ABORT; a push whose outcome cannot be read back is treated the same.
   test.each([
     ["landed despite a nonzero exit", "landed", "MIRROR: pushed dev to origin"],
-    ["could not be read back", "unknown", "whether origin/dev moved is UNKNOWN"],
+    ["could not be read back", "unknown", "whether publishing moved origin/dev is UNKNOWN"],
   ])("a push that %s counts as a possible mutation", (_, outcome, report) => {
     const w = world()
     advanceUpstream(w, "feature.txt", "new")
@@ -1109,11 +1109,18 @@ describe("githubSlug", () => {
     ["git@github.com:swxtchio/swx-opencode.git", "swxtchio/swx-opencode"],
     ["ssh://git@github.com/swxtchio/swx-opencode.git", "swxtchio/swx-opencode"],
     ["https://GitHub.com/swxtchio/swx-opencode", "swxtchio/swx-opencode"],
+    ["https://x-access-token:secret@github.com/swxtchio/swx-opencode.git", "swxtchio/swx-opencode"],
   ])("reads %s as %s", (url, slug) => {
     expect(githubSlug(url)).toBe(slug)
   })
 
-  test.each(["/tmp/origin.git", "https://gitlab.com/a/b", "https://github.com/only-owner", ""])("rejects %p", (url) => {
+  test.each([
+    "/tmp/origin.git",
+    "https://gitlab.com/a/b",
+    "https://github.com/only-owner",
+    "https://evil.com@x/a/b",
+    "",
+  ])("rejects %p", (url) => {
     expect(githubSlug(url)).toBeUndefined()
   })
 })
