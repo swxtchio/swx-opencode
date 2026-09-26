@@ -456,10 +456,10 @@ describe("syncUpstream", () => {
 
   // GOAL: a destination that could not be read before the push cannot show whether it
   // moved, so a rejected push is UNKNOWN rather than "partial".
-  test("a push with an unreadable pre-push destination is unknown", () => {
+  test("a destination unreadable before publishing is not published onto", () => {
     const w = world()
     advanceUpstream(w, "feature.txt", "new")
-    rejectPushes(w)
+    const destination = rejectPushes(w)
     const reads: string[] = []
 
     const result = run(w.work, {}, (real) => (...args) => {
@@ -468,13 +468,14 @@ describe("syncUpstream", () => {
       return real(...args)
     })
 
-    expect(result.out).toContain("is UNKNOWN")
+    expect(result.out).toContain("could not establish where origin/dev stands")
     expect(result.out).not.toContain("reached only some")
+    expect(git(destination, "rev-parse", "dev")).not.toBe(git(w.up, "rev-parse", "dev"))
   })
 
-  // GOAL: when no push destination can be listed, a failed push is UNKNOWN, never a
+  // GOAL: when no push destination can be listed nothing is published, and it is never a
   // vacuous "every destination is current".
-  test("a failed push with no readable push URLs is unknown", () => {
+  test("no readable push URLs means nothing is published", () => {
     const w = world()
     advanceUpstream(w, "feature.txt", "new")
 
@@ -485,7 +486,8 @@ describe("syncUpstream", () => {
       return real(...args)
     })
 
-    expect(result.out).toContain("is UNKNOWN")
+    expect(result.out).toContain("could not establish where origin/dev stands")
+    // The local mirror still moved, so a later failure is not the nothing-happened token.
     expect(result.token).toBe("SYNC_MERGE_FAILED")
   })
 
@@ -569,6 +571,35 @@ describe("syncUpstream", () => {
     expect(result.out).toContain("is not a pure mirror")
   })
 
+  // GOAL: when a publish itself leaves the mirror impure (fork sync can merge), the report
+  // says the publish moved it and shows why, never "nothing was published", and the token
+  // counts it as a mutation.
+  test("a publish that leaves the mirror diverged is reported as a move", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    git(w.work, "fetch", "-q", "upstream")
+    git(w.work, "branch", "-f", "--no-track", "dev", "upstream/dev")
+
+    const result = run(
+      w.work,
+      {
+        publishMirror: () => {
+          const clone = path.join(w.dir, "merged")
+          git(w.dir, "clone", "-q", "--branch", "dev", w.up, clone)
+          commit(clone, "merge.txt", "m", "a merge commit fork sync might make")
+          git(clone, "push", "-q", "-f", w.origin, "dev:refs/heads/dev")
+          return { ok: true, detail: "merged" }
+        },
+      },
+      rejectMergeCommit([]),
+    )
+
+    expect(result.out).toContain("after publishing, origin/dev is not a pure mirror")
+    expect(result.out).toContain("the publish moved it")
+    expect(result.out).not.toContain("nothing was published")
+    expect(result.token).toBe("SYNC_MERGE_FAILED")
+  })
+
   // GOAL: a publisher that fails and moves nothing is a failed publish, with its reason shown.
   test("a publisher that fails without moving the mirror is a failed publish", () => {
     const w = world()
@@ -580,15 +611,16 @@ describe("syncUpstream", () => {
     expect(result.token).toBe("SYNC_CLEAN")
   })
 
-  // GOAL: a destination whose tip cannot be fetched to check ancestry is unknown, never read
-  // as "not current" or "published". Upstream moves on after the pinning fetch, so origin's
-  // tip is not local, and fetching it to check fails.
-  test("an unverifiable destination makes the publish outcome unknown", () => {
+  // GOAL: a destination whose tip cannot be fetched to check ancestry is unverified, never read
+  // as "not current" or "published", and is not published onto: it may be diverged. Upstream
+  // moves on after the pinning fetch, so origin's tip is not local, and fetching it fails.
+  test("an unverifiable destination is not published onto", () => {
     const w = world()
     advanceUpstream(w, "feature.txt", "new")
     const fetched: string[] = []
 
-    const result = run(w.work, { publishMirror: () => ({ ok: false }) }, (real) => (...args) => {
+    const published: string[] = []
+    const result = run(w.work, { publishMirror: (sha) => ({ ok: published.push(sha) > 0 }) }, (real) => (...args) => {
       if (args[0] === "fetch" && args.includes("--no-write-fetch-head"))
         return { code: 128, stdout: "", stderr: "fatal: injected" }
       const done = real(...args)
@@ -599,7 +631,8 @@ describe("syncUpstream", () => {
       return done
     })
 
-    expect(result.out).toContain("could not be read")
+    expect(published).toEqual([])
+    expect(result.out).toContain("could not establish where origin/dev stands")
     expect(result.token).toBe("SYNC_CLEAN")
   })
 
@@ -819,14 +852,18 @@ describe("syncUpstream", () => {
     advanceUpstream(w, "feature.txt", "new")
     git(w.work, "fetch", "-q", "upstream")
     git(w.work, "branch", "-f", "--no-track", "dev", "upstream/dev")
+    const pushed: string[] = []
 
     const result = run(w.work, {}, (real) => (...args) => {
       if (args[0] === "commit") return { code: 1, stdout: "", stderr: "TEST-REJECTED-MERGE-COMMIT" }
       if (args[0] === "push") {
+        pushed.push("push")
         if (outcome === "landed") real(...args)
         return { code: 1, stdout: "", stderr: "error: failed to push some refs" }
       }
-      if (args[0] === "ls-remote" && outcome === "unknown") return { code: 128, stdout: "", stderr: "fatal: injected" }
+      // Readable before the push, unreadable after it.
+      if (args[0] === "ls-remote" && outcome === "unknown" && pushed.length > 0)
+        return { code: 128, stdout: "", stderr: "fatal: injected" }
       return real(...args)
     })
 
@@ -1085,21 +1122,42 @@ describe("mirrorPublisher", () => {
   const root = mkdtempSync(path.join(tmpdir(), "mirror-publisher-"))
   afterAll(() => rmSync(root, { recursive: true, force: true }))
 
-  // GOAL: the CLI's publisher syncs the fork from the configured upstream, not whatever
-  // GitHub records as the fork's parent, and passes gh's reason through on failure.
-  test("runs gh repo sync against the fork, sourced from the configured upstream", () => {
-    const bin = path.join(root, "bin")
-    const calls = path.join(root, "calls")
-    mkdirSync(bin, { recursive: true })
-    writeFileSync(path.join(bin, "gh"), `#!/bin/sh\necho "$@" > ${calls}\necho "gh: refused" >&2\nexit 1\n`)
+  // A fake gh that answers `repo view` with `parent` and records `repo sync` calls with the
+  // GH_HOST they ran under, then fails the sync so its reason is passed through.
+  function fakeGh(parent: string) {
+    const bin = mkdtempSync(path.join(root, "bin-"))
+    const calls = path.join(bin, "calls")
+    writeFileSync(
+      path.join(bin, "gh"),
+      `#!/bin/sh\nif [ "$2" = view ]; then echo "${parent}"; exit 0; fi\necho "GH_HOST=$GH_HOST $@" >> ${calls}\necho "gh: refused" >&2\nexit 1\n`,
+    )
     chmodSync(path.join(bin, "gh"), 0o755)
-    const publish = mirrorPublisher("https://github.com/acme/fork.git", "https://github.com/up/stream", "dev", {
-      ...process.env,
-      PATH: `${bin}:${process.env.PATH}`,
-    })
+    return { env: { ...process.env, GH_HOST: "ghe.example.com", PATH: `${bin}:${process.env.PATH}` }, calls }
+  }
+
+  // GOAL: the CLI's publisher syncs the fork only from the configured upstream, pinned to
+  // github.com whatever gh is set up for, and passes gh's reason through on failure.
+  test("runs gh repo sync against the fork on github.com when its parent is the upstream", () => {
+    const gh = fakeGh("up/stream")
+    const publish = mirrorPublisher("https://github.com/acme/fork.git", "https://github.com/up/stream", "dev", gh.env)
 
     expect(publish?.("abc")).toEqual({ ok: false, detail: "gh: refused" })
-    expect(readFileSync(calls, "utf8").trim()).toBe("repo sync acme/fork --source up/stream --branch dev")
+    expect(readFileSync(gh.calls, "utf8").trim()).toBe(
+      "GH_HOST=github.com repo sync github.com/acme/fork --source github.com/up/stream --branch dev",
+    )
+  })
+
+  // GOAL: merge-upstream syncs from the fork's recorded parent regardless of --source, so a
+  // parent other than the configured upstream refuses the publish before any sync.
+  test("refuses to sync when the fork's parent is not the configured upstream", () => {
+    const gh = fakeGh("someone/else")
+    const publish = mirrorPublisher("https://github.com/acme/fork", "https://github.com/up/stream", "dev", gh.env)
+
+    expect(publish?.("abc")).toEqual({
+      ok: false,
+      detail: "the fork's GitHub parent is someone/else, not the configured upstream up/stream",
+    })
+    expect(() => readFileSync(gh.calls, "utf8")).toThrow()
   })
 
   // GOAL: a missing gh is a failed publish with a reason, not an exception past cleanup.
