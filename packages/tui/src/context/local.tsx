@@ -1,6 +1,6 @@
 import { createStore } from "solid-js/store"
 import { createSimpleContext } from "./helper"
-import { batch, createEffect, createMemo } from "solid-js"
+import { batch, createEffect, createMemo, createSignal } from "solid-js"
 import { useSync } from "./sync"
 import { useEvent } from "./event"
 import path from "path"
@@ -12,6 +12,7 @@ import { readJson, writeJsonAtomic } from "../util/persistence"
 import { useTheme } from "./theme"
 import { useToast } from "../ui/toast"
 import { useRoute } from "./route"
+import { effortInForce, launchEffort } from "../util/effort"
 import { usePermission } from "./permission"
 
 export type LocalTheme = {
@@ -244,6 +245,24 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         )
       })
 
+      // --effort overrides the saved effort for whichever model is current, while that model
+      // declares it, until the user picks an effort in the app (see util/effort). It is
+      // never saved. A model that does not declare it gets one warning.
+      const [launchActive, setLaunchActive] = createSignal(args.variant !== undefined)
+      const warned = new Set<string>()
+      createEffect(() => {
+        if (args.variant === undefined || !launchActive() || !modelStore.ready) return
+        const m = currentModel()
+        const provider = m && sync.data.provider.find((item) => item.id === m.providerID)
+        if (!m || !provider) return
+        const key = `${m.providerID}/${m.modelID}`
+        if (warned.has(key)) return
+        const decided = launchEffort(args.variant, key, Object.keys(provider.models[m.modelID]?.variants ?? {}))
+        if (decided.error === undefined) return
+        warned.add(key)
+        toast.show({ variant: "error", message: decided.error, duration: 8000 })
+      })
+
       return {
         current: currentModel,
         get ready() {
@@ -364,11 +383,14 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             const m = currentModel()
             if (!m) return undefined
             const key = `${m.providerID}/${m.modelID}`
-            return modelStore.variant[key]
+            return effortInForce(launchActive() ? args.variant : undefined, this.list(), modelStore.variant[key])
           },
           current() {
             const v = this.selected()
             if (!v) return undefined
+            // An explicit `--effort default` is sent as-is, so it overrides an agent's configured
+            // effort the same way it does for `run`.
+            if (v === "default") return launchActive() && args.variant === "default" ? v : undefined
             if (!this.list().includes(v)) return undefined
             return v
           },
@@ -381,6 +403,13 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             return Object.keys(info.variants)
           },
           set(value: string | undefined) {
+            setLaunchActive(false)
+            this.restore(value)
+          },
+          // Record an effort from session history without it counting as the user's choice: a
+          // still-active --effort keeps winning wherever the model declares it, and this effort
+          // applies everywhere else.
+          restore(value: string | undefined) {
             const m = currentModel()
             if (!m) return
             const key = `${m.providerID}/${m.modelID}`

@@ -326,7 +326,9 @@ export function Prompt(props: PromptProps) {
         if (!args.agent) local.agent.set(msg.agent)
         if (msg.model) {
           local.model.set(msg.model)
-          local.model.variant.set(msg.model.variant)
+          // Restore rather than set, so a command line --effort keeps applying where the
+          // session's model declares it, like --agent above.
+          local.model.variant.restore(msg.model.variant)
         }
       }
     }

@@ -86,6 +86,82 @@ describe("opencode run (non-interactive subprocess)", () => {
     deadline(30_000),
   )
 
+  // The server reports a prompt validation error by publishing session.error and then
+  // failing the request, which reaches the CLI only as a generic 500 ("Unexpected server
+  // error"). The CLI must print the published error instead, or #29's promise that an
+  // unknown effort names the valid choices is broken, and so is every other such error.
+  cliIt.concurrent(
+    "prints the real error for an unknown effort, not the generic server error",
+    ({ opencode }) =>
+      Effect.gen(function* () {
+        const result = yield* opencode.run("say hi", { extraArgs: ["--effort", "no-such-effort"] })
+        expect(result.exitCode).toBeGreaterThan(0)
+        expect(result.stderr).toContain('Unknown effort "no-such-effort"')
+        expect(result.stderr).not.toContain("Unexpected server error")
+      }),
+    deadline(60_000),
+  )
+
+  cliIt.concurrent(
+    "prints the real error for an unknown command, not the generic server error",
+    ({ opencode }) =>
+      Effect.gen(function* () {
+        const result = yield* opencode.run("x", { extraArgs: ["--command", "no-such-command"] })
+        expect(result.exitCode).toBeGreaterThan(0)
+        expect(result.stderr).toContain('Command not found: "no-such-command"')
+        expect(result.stderr).not.toContain("Unexpected server error")
+      }),
+    deadline(60_000),
+  )
+
+  // GOAL: the attach path, where the event stream is a separate connection to another
+  // process, still shows the published error rather than the generic 500.
+  cliIt.live(
+    "prints the real error for an unknown effort in attach mode",
+    ({ opencode }) =>
+      Effect.gen(function* () {
+        const server = yield* opencode.serve()
+        const result = yield* opencode.run("say hi", {
+          extraArgs: ["--attach", server.url, "--effort", "no-such-effort", "--"],
+        })
+        expect(result.exitCode).toBeGreaterThan(0)
+        expect(result.stderr).toContain('Unknown effort "no-such-effort"')
+        expect(result.stderr).not.toContain("Unexpected server error")
+      }),
+    deadline(60_000),
+  )
+
+  // GOAL: in json mode the one error record is the published error, not the 500 body.
+  cliIt.concurrent(
+    "emits the real error as the json error record for an unknown effort",
+    ({ opencode }) =>
+      Effect.gen(function* () {
+        const result = yield* opencode.run("say hi", { extraArgs: ["--format", "json", "--effort", "no-such-effort"] })
+        expect(result.exitCode).toBeGreaterThan(0)
+        const errors = result.stdout
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line))
+          .filter((record) => record.type === "error")
+        expect(errors).toHaveLength(1)
+        expect(JSON.stringify(errors[0])).toContain('Unknown effort \\"no-such-effort\\"')
+      }),
+    deadline(60_000),
+  )
+
+  // GOAL: --command forwards the effort into the same validation, and its error surfaces too.
+  cliIt.concurrent(
+    "prints the real error for an unknown effort on a --command run",
+    ({ opencode }) =>
+      Effect.gen(function* () {
+        const result = yield* opencode.run("x", { extraArgs: ["--command", "init", "--effort", "no-such-effort"] })
+        expect(result.exitCode).toBeGreaterThan(0)
+        expect(result.stderr).toContain('Unknown effort "no-such-effort"')
+        expect(result.stderr).not.toContain("Unexpected server error")
+      }),
+    deadline(60_000),
+  )
+
   // The test provider's SSE error item is interpreted by the SDK as an unknown
   // finish, not a fatal provider/session error. Unknown finishes should continue
   // the prompt loop so a subsequent response can complete the run.

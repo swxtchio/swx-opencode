@@ -42,6 +42,11 @@ export const AttachCommand = cmd({
         type: "string",
         describe: "basic auth username (defaults to OPENCODE_SERVER_USERNAME or 'opencode')",
       })
+      .option("effort", {
+        type: "string",
+        alias: "variant",
+        describe: "reasoning effort / model variant, e.g. medium, high, xhigh, max (provider-specific)",
+      })
       .option("mini", {
         type: "boolean",
         describe: "start the minimal interactive interface",
@@ -88,6 +93,7 @@ export const AttachCommand = cmd({
         continue: args.continue,
         session: args.session,
         fork: args.fork,
+        effort: args.effort,
         replay: noReplay ? false : undefined,
         replayLimit: args.replayLimit,
       })
@@ -139,6 +145,7 @@ export const AttachCommand = cmd({
           continue: args.continue,
           sessionID: args.session,
           fork: args.fork,
+          variant: args.effort,
         },
         directory,
         headers,

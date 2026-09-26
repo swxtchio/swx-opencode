@@ -109,6 +109,9 @@ const cli = yargs(args)
     ) {
       if (err) throw err
       cli.showHelp(show)
+      // yargs hands over the reason but prints nothing itself; without this the help appears
+      // with no hint of what was wrong. Printed last, so it is what stays on screen.
+      UI.error(msg)
     }
     if (err) throw err
     process.exit(1)

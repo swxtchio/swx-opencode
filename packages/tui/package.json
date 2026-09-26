@@ -36,6 +36,7 @@
     "./plugin/slots": "./src/plugin/slots.tsx",
     "./plugin/command-shim": "./src/plugin/command-shim.ts",
     "./parsers-config": "./src/parsers-config.ts",
+    "./util/effort": "./src/util/effort.ts",
     "./util/error": "./src/util/error.ts",
     "./util/locale": "./src/util/locale.ts",
     "./util/persistence": "./src/util/persistence.ts",

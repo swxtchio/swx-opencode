@@ -105,6 +105,11 @@ export const TuiThreadCommand = cmd({
         type: "string",
         describe: "agent to use",
       })
+      .option("effort", {
+        type: "string",
+        alias: "variant",
+        describe: "reasoning effort / model variant, e.g. medium, high, xhigh, max (provider-specific)",
+      })
       .option("auto", {
         type: "boolean",
         describe: "auto-approve permissions that are not explicitly denied (dangerous!)",
@@ -167,6 +172,7 @@ export const TuiThreadCommand = cmd({
         fork: args.fork,
         model: args.model,
         agent: args.agent,
+        effort: args.effort,
         prompt: args.prompt,
         replay: noReplay ? false : undefined,
         replayLimit: args.replayLimit,
@@ -289,6 +295,7 @@ export const TuiThreadCommand = cmd({
               sessionID: args.session,
               agent: args.agent,
               model: args.model,
+              variant: args.effort,
               prompt,
               fork: args.fork,
               auto: args.auto || args.yolo || args["dangerously-skip-permissions"],

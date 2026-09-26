@@ -23,6 +23,7 @@ import { effectCmd } from "../effect-cmd"
 import { EOL } from "os"
 import { Filesystem } from "@/util/filesystem"
 import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
+import { NamedError } from "@opencode-ai/core/util/error"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
 
@@ -81,6 +82,17 @@ function block(info: Inline, output?: string) {
   if (!output?.trim()) return
   UI.println(output)
   UI.empty()
+}
+
+// Bounded backstops only: the real signals are the events these wait for.
+const CONNECT_BACKSTOP_MS = 10_000
+const SESSION_ERROR_BACKSTOP_MS = 3_000
+
+// The HTTP error middleware's stand-in for an unhandled server error: a NamedError.Unknown
+// whose data carries only a log ref.
+function isGenericServerError(error: unknown) {
+  if (!NamedError.hasName(error, "UnknownError") || typeof error !== "object" || error === null) return false
+  return "data" in error && typeof error.data === "object" && error.data !== null && "ref" in error.data
 }
 
 function formatRunError(error: unknown) {
@@ -691,6 +703,16 @@ export const RunCommand = effectCmd({
           return false
         }
 
+        // Settled once the loop has shown a session.error for this session that arrived after
+        // the request was sent. The server reports prompt validation errors (unknown effort,
+        // agent, command) by publishing that event and then failing the request, which reaches
+        // us only as a generic 500. An earlier, unrelated session.error must not stand in for it.
+        const sessionError = Promise.withResolvers<void>()
+        const request = { sent: false }
+        // Settled when the event stream is live, so an error published during the request
+        // cannot go out before the loop is listening (a slow --attach connection).
+        const connected = Promise.withResolvers<void>()
+
         // Consume one subscribed event stream for the active session and mirror it
         // to stdout/UI. `client` is passed explicitly because attach mode may
         // rebind the SDK to the session's directory after the subscription is
@@ -701,6 +723,8 @@ export const RunCommand = effectCmd({
           let error: string | undefined
 
           for await (const event of events.stream) {
+            if (event.type === "server.connected") connected.resolve()
+
             if (event.type === "session.created" && event.properties.info.parentID) {
               if (sessions.has(event.properties.info.parentID)) sessions.add(event.properties.info.id)
             }
@@ -787,8 +811,9 @@ export const RunCommand = effectCmd({
                 err = String(props.error.data.message)
               }
               error = error ? error + EOL + err : err
-              if (emit("error", { error: props.error })) continue
-              UI.error(err)
+              if (!emit("error", { error: props.error })) UI.error(err)
+              if (request.sent) sessionError.resolve()
+              continue
             }
 
             if (
@@ -837,6 +862,41 @@ export const RunCommand = effectCmd({
             console.error(e)
             process.exitCode = 1
           })
+          // A generic 500 hides the real error behind a log ref, so wait for the session.error
+          // the server published first and let the loop print that. The wait is only a
+          // bounded backstop for failures that publish no event; errors that already carry
+          // their message print at once. When the event is shown the ref is dropped: for a
+          // validation error it points at nothing more useful. Events carry no request ID, so
+          // a different failure in the same turn can stand in; see #49.
+          async function failed(error: unknown) {
+            process.exitCode = 1
+            const generic = isGenericServerError(error)
+            const shown =
+              generic &&
+              (await Promise.race([
+                sessionError.promise.then(() => true),
+                Bun.sleep(SESSION_ERROR_BACKSTOP_MS).then(() => false),
+              ]))
+            if (shown) return
+            if (!emit("error", { error })) UI.error(formatRunError(error))
+          }
+          // Send only once the event stream is confirmed live. Without it the response and any
+          // published error would go unseen (with --attach, finish() does not wait for the
+          // loop), so an unconfirmed stream fails the run instead of sending blind.
+          async function send() {
+            const live = await Promise.race([
+              connected.promise.then(() => true),
+              Bun.sleep(CONNECT_BACKSTOP_MS).then(() => false),
+            ])
+            if (!live) {
+              const message = "could not connect to the server's event stream; the prompt was not sent"
+              if (!emit("error", { error: new NamedError.Unknown({ message }).toObject() })) UI.error(message)
+              process.exitCode = 1
+              return false
+            }
+            request.sent = true
+            return true
+          }
           async function finish() {
             if (args.attach) return
             const error = await completed
@@ -844,6 +904,7 @@ export const RunCommand = effectCmd({
           }
 
           if (args.command) {
+            if (!(await send())) return
             const result = await client.session.command({
               sessionID,
               agent,
@@ -852,16 +913,13 @@ export const RunCommand = effectCmd({
               arguments: message,
               variant: args.effort,
             })
-            if (result.error) {
-              if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
-              process.exitCode = 1
-              return
-            }
+            if (result.error) return failed(result.error)
             await finish()
             return
           }
 
           const model = pick(args.model)
+          if (!(await send())) return
           const result = await client.session.prompt({
             sessionID,
             agent,
@@ -869,11 +927,7 @@ export const RunCommand = effectCmd({
             variant: args.effort,
             parts: [...files, { type: "text", text: message }],
           })
-          if (result.error) {
-            if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
-            process.exitCode = 1
-            return
-          }
+          if (result.error) return failed(result.error)
           await finish()
           return
         }
@@ -974,6 +1028,7 @@ type MiniCommandInput = {
   fork?: boolean
   model?: string
   agent?: string
+  effort?: string
   prompt?: string
   replay?: boolean
   replayLimit?: number
@@ -1003,8 +1058,8 @@ export async function runMini(input: MiniCommandInput) {
     port: undefined,
     // Both spellings: yargs mirrors the alias onto argv at runtime, and the
     // inferred type carries both, so a synthetic args object has to supply them.
-    effort: undefined,
-    variant: undefined,
+    effort: input.effort,
+    variant: input.effort,
     thinking: undefined,
     mini: true,
     interactive: false,
