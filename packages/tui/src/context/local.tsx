@@ -385,10 +385,6 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             const key = `${m.providerID}/${m.modelID}`
             return effortInForce(launchActive() ? args.variant : undefined, this.list(), modelStore.variant[key])
           },
-          // Whether --effort still applies, i.e. the user has not picked an effort in the app.
-          launched() {
-            return launchActive()
-          },
           current() {
             const v = this.selected()
             if (!v) return undefined
@@ -407,10 +403,16 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             return Object.keys(info.variants)
           },
           set(value: string | undefined) {
+            setLaunchActive(false)
+            this.restore(value)
+          },
+          // Record an effort from session history without it counting as the user's choice: a
+          // still-active --effort keeps winning wherever the model declares it, and this effort
+          // applies everywhere else.
+          restore(value: string | undefined) {
             const m = currentModel()
             if (!m) return
             const key = `${m.providerID}/${m.modelID}`
-            setLaunchActive(false)
             setModelStore("variant", key, value ?? "default")
             save()
           },
