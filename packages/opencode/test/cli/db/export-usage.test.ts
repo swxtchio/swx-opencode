@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { buildRecords, parseModel, verify } from "@/cli/cmd/db-export-usage"
+import { Database as Sqlite } from "bun:sqlite"
+import { buildRecords, parseModel, readExport, verify } from "@/cli/cmd/db-export-usage"
 
 const session = (over: Record<string, unknown> = {}) =>
   ({
@@ -148,5 +149,137 @@ describe("verify", () => {
     })
     expect(result.ok).toBe(true)
     expect(result.lines.join("\n")).toContain("0 of 1 disagree")
+  })
+})
+
+describe("readExport", () => {
+  test("splits persisted step usage and falls back to requested-model totals for legacy messages", () => {
+    const db = new Sqlite(":memory:")
+    try {
+      db.exec(`
+        CREATE TABLE session (
+          id TEXT PRIMARY KEY,
+          parent_id TEXT,
+          project_id TEXT,
+          directory TEXT,
+          title TEXT,
+          agent TEXT,
+          model TEXT,
+          time_created INTEGER,
+          time_updated INTEGER,
+          cost REAL,
+          tokens_input INTEGER,
+          tokens_output INTEGER,
+          tokens_reasoning INTEGER,
+          tokens_cache_read INTEGER,
+          tokens_cache_write INTEGER
+        );
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+      `)
+
+      const insertSession = db.query(`INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      insertSession.run("ses_mixed", null, "proj", "/w", "mixed", "build", null, 1, 2, 13, 3, 2, 0, 0, 0)
+      insertSession.run("ses_legacy", null, "proj", "/w", "legacy", "build", null, 1, 2, 4, 5, 6, 1, 2, 3)
+
+      db.query("INSERT INTO message VALUES (?, ?, ?, ?)").run(
+        "msg_mixed",
+        "ses_mixed",
+        1,
+        JSON.stringify({
+          role: "assistant",
+          providerID: "test",
+          modelID: "requested",
+          responseModelIDs: ["served-a", "served-b"],
+          cost: 13,
+          tokens: { input: 2, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+        }),
+      )
+      db.query("INSERT INTO message VALUES (?, ?, ?, ?)").run(
+        "msg_legacy",
+        "ses_legacy",
+        1,
+        JSON.stringify({
+          role: "assistant",
+          providerID: "test",
+          modelID: "legacy-request",
+          responseModelIDs: ["old-served-a", "old-served-b"],
+          cost: 4,
+          tokens: { input: 5, output: 6, reasoning: 1, cache: { read: 2, write: 3 } },
+        }),
+      )
+
+      const insertPart = db.query("INSERT INTO part VALUES (?, ?, ?, ?, ?)")
+      insertPart.run(
+        "prt_a",
+        "msg_mixed",
+        "ses_mixed",
+        1,
+        JSON.stringify({
+          type: "step-finish",
+          responseModelID: "served-a",
+          cost: 3,
+          tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+        }),
+      )
+      insertPart.run(
+        "prt_b",
+        "msg_mixed",
+        "ses_mixed",
+        2,
+        JSON.stringify({
+          type: "step-finish",
+          responseModelID: "served-b",
+          cost: 10,
+          tokens: { input: 2, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+        }),
+      )
+
+      const snapshot = readExport(db)
+      const mixed = snapshot.records.find((record) => record["sessionID"] === "ses_mixed")
+      const legacy = snapshot.records.find((record) => record["sessionID"] === "ses_legacy")
+
+      expect(mixed).toMatchObject({
+        modelID: "requested",
+        tokens: { input: 3, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+        reportedCost: 13,
+        servedModelIDs: ["served-a", "served-b"],
+        servedModelUsage: [
+          {
+            modelID: "served-a",
+            tokens: { input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+            reportedCost: 3,
+          },
+          {
+            modelID: "served-b",
+            tokens: { input: 2, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+            reportedCost: 10,
+          },
+        ],
+      })
+      expect(legacy).toMatchObject({
+        modelID: "legacy-request",
+        tokens: { input: 5, output: 6, reasoning: 1, cacheRead: 2, cacheWrite: 3 },
+        reportedCost: 4,
+        servedModelIDs: ["old-served-a", "old-served-b"],
+        servedModelUsage: [
+          {
+            modelID: "legacy-request",
+            tokens: { input: 5, output: 6, reasoning: 1, cacheRead: 2, cacheWrite: 3 },
+            reportedCost: 4,
+          },
+        ],
+      })
+      expect(snapshot.check.ok).toBe(true)
+      expect(snapshot.check.lines.join("\n")).toContain("0 of 2 disagree")
+      expect(snapshot.check.lines.join("\n")).toContain("session cost rollups   0 of 2 disagree")
+      expect(snapshot.orphanMessages).toBe(0)
+      expect(snapshot.reportedCostTotal).toBe(17)
+      expect(snapshot.reportedCostTotal).toBe(
+        snapshot.records.reduce((total, record) => total + Number(record["reportedCost"]), 0),
+      )
+    } finally {
+      db.close()
+    }
   })
 })

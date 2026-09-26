@@ -1,10 +1,13 @@
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { expect } from "bun:test"
+import { afterAll, expect } from "bun:test"
+import { Database as Sqlite } from "bun:sqlite"
 import { tool } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { rm } from "node:fs/promises"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -24,8 +27,11 @@ import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { LLMEvent } from "@opencode-ai/llm"
+import { LLMEvent, Usage } from "@opencode-ai/llm"
+import { aggregateSessionStats, displayStats } from "@/cli/cmd/stats"
+import { readExport } from "@/cli/cmd/db-export-usage"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -81,6 +87,27 @@ function providerCfg(url: string) {
           ...cfg.provider.test.options,
           baseURL: url,
         },
+      },
+    },
+  }
+}
+
+function routedConfig() {
+  return {
+    provider: {
+      test: {
+        name: "Test",
+        id: "test",
+        env: [],
+        npm: "@ai-sdk/openai-compatible",
+        models: {
+          "request-model": { cost: { input: 10, output: 20 } },
+          "served-a": { cost: { input: 1, output: 2 } },
+          "served-b": { cost: { input: 3, output: 4 } },
+          "unpriced-model": { name: "Unpriced Model" },
+          "free-model": { cost: { input: 0, output: 0 } },
+        },
+        options: { apiKey: "test-key", baseURL: "http://localhost:1/v1" },
       },
     },
   }
@@ -185,6 +212,24 @@ const env = LayerNode.compile(
 )
 
 const it = testEffect(env)
+
+const routedEvents: LLMEvent[] = []
+const routedLLM = Layer.succeed(LLM.Service, LLM.Service.of({ stream: () => Stream.fromIterable(routedEvents) }))
+const routedExportDbPath = path.join(import.meta.dir, `.opencode-served-cost-${crypto.randomUUID()}.db`)
+const routedEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, routedLLM],
+  [Database.node, Database.layerFromPath(routedExportDbPath)],
+])
+const itRouted = testEffect(routedEnv)
+
+afterAll(async () => {
+  await Promise.all(
+    [routedExportDbPath, `${routedExportDbPath}-wal`, `${routedExportDbPath}-shm`].map((file) =>
+      rm(file, { force: true }),
+    ),
+  )
+})
 
 const providerErrorLLM = Layer.succeed(
   LLM.Service,
@@ -1167,5 +1212,331 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
         expect(seen.filter((type) => type.startsWith("session.next."))).toEqual([])
       }),
     { config: cfg },
+  ),
+)
+
+itRouted.live(
+  "prices and attributes persisted usage by the reported serving model",
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "routed usage")
+        const requestModelRef = { providerID: ref.providerID, modelID: ModelV2.ID.make("request-model") }
+        parent.model = requestModelRef
+        yield* session.updateMessage(parent)
+
+        const requestModel = yield* provider.getModel(requestModelRef.providerID, requestModelRef.modelID)
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        msg.modelID = requestModelRef.modelID
+        yield* session.updateMessage(msg)
+
+        const steps: Array<{
+          responseModelID?: string
+          input: number
+          output: number
+          reasoning?: number
+          cacheRead?: number
+          cacheWrite?: number
+        }> = [
+          {
+            responseModelID: "served-a",
+            input: 1_000_000,
+            output: 1_000_000,
+            reasoning: 150,
+            cacheRead: 200,
+            cacheWrite: 100,
+          },
+          { responseModelID: "served-b", input: 2_000_000, output: 1_000_000 },
+          { responseModelID: "missing-model", input: 1_000_000, output: 1_000_000 },
+          { responseModelID: "unpriced-model", input: 1_000_000, output: 1_000_000 },
+          { input: 1_000_000, output: 1_000_000 },
+          { responseModelID: "free-model", input: 1_000_000, output: 1_000_000 },
+        ]
+        routedEvents.splice(
+          0,
+          routedEvents.length,
+          ...steps.flatMap((step, index) => [
+            LLMEvent.stepStart({ index }),
+            LLMEvent.stepFinish({
+              index,
+              reason: "stop",
+              usage: new Usage({
+                inputTokens: step.input,
+                outputTokens: step.output,
+                reasoningTokens: step.reasoning ?? 0,
+                cacheReadInputTokens: step.cacheRead ?? 0,
+                cacheWriteInputTokens: step.cacheWrite ?? 0,
+                totalTokens: step.input + step.output,
+              }),
+              responseModelID: step.responseModelID,
+            }),
+          ]),
+          LLMEvent.finish({ reason: "stop" }),
+        )
+
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: requestModel })
+        expect(
+          yield* handle.process({
+            user: parent,
+            sessionID: chat.id,
+            model: requestModel,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "routed usage" }],
+            tools: {},
+          }),
+        ).toBe("continue")
+
+        const messages = yield* session.messages({ sessionID: chat.id })
+        const processed = messages.find((message) => message.info.id === msg.id)
+        expect(processed?.info.role).toBe("assistant")
+        if (!processed || processed.info.role !== "assistant") return
+        const stepParts = processed.parts.filter(
+          (part): part is SessionV1.StepFinishPart => part.type === "step-finish",
+        )
+        expect(stepParts).toHaveLength(6)
+        expect(stepParts[0]?.cost).toBeCloseTo(2.9997, 10)
+        expect(stepParts.slice(1).map((part) => part.cost)).toEqual([10, 30, 30, 30, 0])
+        expect(stepParts.map((part) => part.responseModelID)).toEqual([
+          "served-a",
+          "served-b",
+          "missing-model",
+          "unpriced-model",
+          undefined,
+          "free-model",
+        ])
+        expect(processed.info.cost).toBeCloseTo(102.9997, 10)
+        expect(processed.info.responseModelIDs).toEqual([
+          "served-a",
+          "served-b",
+          "missing-model",
+          "unpriced-model",
+          "free-model",
+        ])
+
+        const historical = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        historical.modelID = requestModelRef.modelID
+        historical.responseModelIDs = ["old-served-a", "old-served-b"]
+        historical.cost = 7
+        historical.tokens = {
+          total: 1_000,
+          input: 700,
+          output: 300,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        }
+        yield* session.updateMessage(historical)
+
+        const database = yield* Database.Service
+        const projected = yield* session.get(chat.id)
+        expect(projected.cost).toBeCloseTo(102.9997, 10)
+        yield* database.db
+          .update(SessionTable)
+          .set({
+            cost: (projected.cost ?? 0) + historical.cost + 5,
+            tokens_input: (projected.tokens?.input ?? 0) + historical.tokens.input + 5,
+            tokens_output: (projected.tokens?.output ?? 0) + historical.tokens.output + 4,
+            tokens_reasoning: (projected.tokens?.reasoning ?? 0) + historical.tokens.reasoning + 3,
+            tokens_cache_read: (projected.tokens?.cache.read ?? 0) + historical.tokens.cache.read + 2,
+            tokens_cache_write: (projected.tokens?.cache.write ?? 0) + historical.tokens.cache.write + 1,
+          })
+          .where(eq(SessionTable.id, chat.id))
+          .run()
+          .pipe(Effect.orDie)
+
+        const staleRollup = yield* session.get(chat.id)
+        expect(staleRollup.cost).toBeCloseTo(114.9997, 10)
+        expect(staleRollup.tokens?.input).toBe(7_000_405)
+        expect(staleRollup.tokens?.output).toBe(6_000_154)
+        expect(staleRollup.tokens?.reasoning).toBe(153)
+        expect(staleRollup.tokens?.cache).toEqual({ read: 202, write: 101 })
+        const exportDatabase = new Sqlite(routedExportDbPath, { readonly: true })
+        const exportSnapshot = (() => {
+          try {
+            return readExport(exportDatabase)
+          } finally {
+            exportDatabase.close()
+          }
+        })()
+        expect(exportSnapshot.records).toHaveLength(1)
+        expect(exportSnapshot.reportedCostTotal).toBeCloseTo(109.9997, 10)
+        expect(exportSnapshot.reportedCostTotal).toBeCloseTo(
+          exportSnapshot.records.reduce((total, item) => total + Number(item["reportedCost"]), 0),
+          10,
+        )
+        expect(exportSnapshot.orphanMessages).toBe(0)
+        expect(exportSnapshot.check.ok).toBe(true)
+        expect(exportSnapshot.check.lines.join("\n")).toContain("1 of 1 disagree with exported usage")
+        expect(exportSnapshot.check.lines.join("\n")).toContain("1 of 1 disagree with exported costs")
+        const record = exportSnapshot.records[0]
+        expect(record).toBeDefined()
+        if (!record) return
+        expect(record).toMatchObject({
+          modelID: "request-model",
+          tokens: {
+            input: 7_000_400,
+            output: 6_000_150,
+            reasoning: 150,
+            cacheRead: 200,
+            cacheWrite: 100,
+          },
+          servedModelIDs: [
+            "free-model",
+            "missing-model",
+            "old-served-a",
+            "old-served-b",
+            "served-a",
+            "served-b",
+            "unpriced-model",
+          ],
+        })
+        expect(Number(record["reportedCost"])).toBeCloseTo(109.9997, 10)
+        const servedUsage = record["servedModelUsage"]
+        expect(Array.isArray(servedUsage)).toBe(true)
+        if (!Array.isArray(servedUsage)) return
+        expect(servedUsage).toEqual([
+          {
+            modelID: "free-model",
+            tokens: { input: 1_000_000, output: 1_000_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+            reportedCost: 0,
+          },
+          {
+            modelID: "missing-model",
+            tokens: { input: 1_000_000, output: 1_000_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+            reportedCost: 30,
+          },
+          {
+            modelID: "request-model",
+            tokens: { input: 1_000_700, output: 1_000_300, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+            reportedCost: 37,
+          },
+          {
+            modelID: "served-a",
+            tokens: { input: 999_700, output: 999_850, reasoning: 150, cacheRead: 200, cacheWrite: 100 },
+            reportedCost: 2.9997,
+          },
+          {
+            modelID: "served-b",
+            tokens: { input: 2_000_000, output: 1_000_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+            reportedCost: 10,
+          },
+          {
+            modelID: "unpriced-model",
+            tokens: { input: 1_000_000, output: 1_000_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+            reportedCost: 30,
+          },
+        ])
+        expect(servedUsage.reduce((total, item) => total + item.reportedCost, 0)).toBeCloseTo(
+          Number(record["reportedCost"]),
+          10,
+        )
+
+        yield* database.db
+          .insert(PartTable)
+          .values({
+            id: PartID.ascending(),
+            message_id: processed.info.id,
+            session_id: chat.id,
+            time_created: Date.now(),
+            data: {
+              type: "step-finish",
+              reason: "stop",
+              responseModelID: "malformed-model",
+              tokens: {},
+            } as never,
+          })
+          .run()
+          .pipe(Effect.orDie)
+        const stats = yield* aggregateSessionStats()
+        expect(stats.totalCost).toBeCloseTo(109.9997, 10)
+        expect(stats.costPerDay * stats.days).toBeCloseTo(stats.totalCost, 10)
+        expect(stats.totalTokens.input).toBe(7_000_400)
+        expect(stats.totalTokens.output).toBe(6_000_150)
+        expect(stats.totalTokens.reasoning).toBe(150)
+        expect(stats.totalTokens.cache).toEqual({ read: 200, write: 100 })
+        expect(stats.tokensPerSession).toBe(13_001_000)
+        expect(stats.medianTokensPerSession).toBe(13_001_000)
+        expect(Object.keys(stats.modelUsage).sort()).toEqual([
+          "test/free-model",
+          "test/malformed-model",
+          "test/missing-model",
+          "test/request-model",
+          "test/served-a",
+          "test/served-b",
+          "test/unpriced-model",
+        ])
+        expect(stats.modelUsage["test/served-a"]?.cost).toBeCloseTo(2.9997, 10)
+        expect(stats.modelUsage["test/served-a"]).toMatchObject({
+          tokens: { input: 999_700, output: 1_000_000, cache: { read: 200, write: 100 } },
+        })
+        expect(stats.modelUsage["test/served-b"]).toMatchObject({
+          cost: 10,
+          tokens: { input: 2_000_000, output: 1_000_000 },
+        })
+        expect(stats.modelUsage["test/missing-model"]?.cost).toBe(30)
+        expect(stats.modelUsage["test/unpriced-model"]?.cost).toBe(30)
+        expect(stats.modelUsage["test/free-model"]).toMatchObject({
+          cost: 0,
+          tokens: { input: 1_000_000, output: 1_000_000 },
+        })
+        expect(stats.modelUsage["test/malformed-model"]).toMatchObject({
+          cost: 0,
+          tokens: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+        })
+        expect(stats.modelUsage["test/request-model"]).toMatchObject({
+          cost: 37,
+          messages: 2,
+          tokens: { input: 1_000_700, output: 1_000_300 },
+        })
+        const modeledCost = Object.values(stats.modelUsage).reduce((total, item) => total + item.cost, 0)
+        const modeledInput = Object.values(stats.modelUsage).reduce((total, item) => total + item.tokens.input, 0)
+        const modeledOutput = Object.values(stats.modelUsage).reduce((total, item) => total + item.tokens.output, 0)
+        const modeledCacheRead = Object.values(stats.modelUsage).reduce(
+          (total, item) => total + item.tokens.cache.read,
+          0,
+        )
+        const modeledCacheWrite = Object.values(stats.modelUsage).reduce(
+          (total, item) => total + item.tokens.cache.write,
+          0,
+        )
+        const totalShare = Object.values(stats.modelUsage).reduce(
+          (total, item) => total + item.cost / stats.totalCost,
+          0,
+        )
+        expect(modeledCost).toBeCloseTo(stats.totalCost, 10)
+        expect(modeledInput).toBe(stats.totalTokens.input)
+        expect(modeledOutput).toBe(stats.totalTokens.output + stats.totalTokens.reasoning)
+        expect(modeledCacheRead).toBe(stats.totalTokens.cache.read)
+        expect(modeledCacheWrite).toBe(stats.totalTokens.cache.write)
+        expect(totalShare).toBeCloseTo(1, 12)
+
+        const printed: string[] = []
+        const output: typeof console.log = (...values) => printed.push(values.map(String).join(" "))
+        displayStats(stats, undefined, 1, output)
+        expect(printed.join("\n")).toContain("$110.00")
+        expect(printed.join("\n")).not.toContain("$115.00")
+        expect(printed.join("\n")).toContain("33.6%")
+        expect(printed.join("\n")).not.toContain("test/served-a")
+        expect(printed.find((line) => line.startsWith("│Cache Read"))).toContain("200")
+        expect(printed.find((line) => line.startsWith("│Cache Write"))).toContain("100")
+
+        const zeroCostStats = {
+          ...stats,
+          totalCost: 0,
+          modelUsage: {
+            "test/free-model": {
+              messages: 1,
+              tokens: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+              cost: 0,
+            },
+          },
+        }
+        const zeroCostOutput: string[] = []
+        displayStats(zeroCostStats, undefined, 1, (...values) => zeroCostOutput.push(values.map(String).join(" ")))
+        expect(zeroCostOutput.join("\n")).toContain("0.0%")
+      }),
+    { config: routedConfig() },
   ),
 )
