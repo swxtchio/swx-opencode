@@ -60,7 +60,8 @@ export const StatsCommand = effectCmd({
         type: "number",
       })
       .option("models", {
-        describe: "show model statistics (default: hidden). Pass a number to show top N, otherwise shows all",
+        describe:
+          "show model statistics (default: hidden). A mixed assistant message counts under every model that served a step. Pass a number to show top N, otherwise shows all",
       })
       .option("project", {
         describe: "filter by project (default: all projects, empty string: current project)",
@@ -168,7 +169,6 @@ export const aggregateSessionStats = Effect.fn("Cli.stats.aggregate")(function* 
           .messages({ sessionID: session.id })
           .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed([])))
 
-        const sessionCost = session.cost ?? 0
         const sessionTokens = session.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
         let sessionToolUsage: Record<string, number> = {}
         let sessionModelUsage: Record<
@@ -187,14 +187,30 @@ export const aggregateSessionStats = Effect.fn("Cli.stats.aggregate")(function* 
             const modelUsages = steps.length
               ? steps.map((part) => ({
                   modelKey: `${info.providerID}/${part.responseModelID ?? info.modelID}`,
-                  cost: part.cost,
-                  tokens: part.tokens,
+                  cost: part.cost || 0,
+                  tokens: {
+                    input: part.tokens?.input || 0,
+                    output: part.tokens?.output || 0,
+                    reasoning: part.tokens?.reasoning || 0,
+                    cache: {
+                      read: part.tokens?.cache?.read || 0,
+                      write: part.tokens?.cache?.write || 0,
+                    },
+                  },
                 }))
               : [
                   {
                     modelKey: `${info.providerID}/${info.modelID}`,
-                    cost: info.cost,
-                    tokens: info.tokens,
+                    cost: info.cost || 0,
+                    tokens: {
+                      input: info.tokens?.input || 0,
+                      output: info.tokens?.output || 0,
+                      reasoning: info.tokens?.reasoning || 0,
+                      cache: {
+                        read: info.tokens?.cache?.read || 0,
+                        write: info.tokens?.cache?.write || 0,
+                      },
+                    },
                   },
                 ]
             const messageModels = new Set<string>()
@@ -228,7 +244,6 @@ export const aggregateSessionStats = Effect.fn("Cli.stats.aggregate")(function* 
 
         return {
           messageCount: messages.length,
-          sessionCost,
           sessionTokens,
           sessionTotalTokens:
             sessionTokens.input +
@@ -251,7 +266,6 @@ export const aggregateSessionStats = Effect.fn("Cli.stats.aggregate")(function* 
     sessionTotalTokens.push(result.sessionTotalTokens)
 
     stats.totalMessages += result.messageCount
-    stats.totalCost += result.sessionCost
     stats.totalTokens.input += result.sessionTokens.input
     stats.totalTokens.output += result.sessionTokens.output
     stats.totalTokens.reasoning += result.sessionTokens.reasoning
@@ -276,6 +290,7 @@ export const aggregateSessionStats = Effect.fn("Cli.stats.aggregate")(function* 
       stats.modelUsage[model].tokens.cache.read += usage.tokens.cache.read
       stats.modelUsage[model].tokens.cache.write += usage.tokens.cache.write
       stats.modelUsage[model].cost += usage.cost
+      stats.totalCost += usage.cost
     }
   }
 

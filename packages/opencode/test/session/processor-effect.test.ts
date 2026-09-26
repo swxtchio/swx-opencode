@@ -3,9 +3,11 @@ import { eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { expect } from "bun:test"
+import { afterAll, expect } from "bun:test"
+import { Database as Sqlite } from "bun:sqlite"
 import { tool } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { rm } from "node:fs/promises"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -25,11 +27,11 @@ import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
-import { SessionTable } from "@opencode-ai/core/session/sql"
+import { PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { LLMEvent, Usage } from "@opencode-ai/llm"
 import { aggregateSessionStats, displayStats } from "@/cli/cmd/stats"
-import { buildRecords, verify } from "@/cli/cmd/db-export-usage"
+import { readExport } from "@/cli/cmd/db-export-usage"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -213,8 +215,21 @@ const it = testEffect(env)
 
 const routedEvents: LLMEvent[] = []
 const routedLLM = Layer.succeed(LLM.Service, LLM.Service.of({ stream: () => Stream.fromIterable(routedEvents) }))
-const routedEnv = LayerNode.compile(root, [...replacements, [LLM.node, routedLLM]])
+const routedExportDbPath = path.join(import.meta.dir, `.opencode-served-cost-${crypto.randomUUID()}.db`)
+const routedEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, routedLLM],
+  [Database.node, Database.layerFromPath(routedExportDbPath)],
+])
 const itRouted = testEffect(routedEnv)
+
+afterAll(async () => {
+  await Promise.all(
+    [routedExportDbPath, `${routedExportDbPath}-wal`, `${routedExportDbPath}-shm`].map((file) =>
+      rm(file, { force: true }),
+    ),
+  )
+})
 
 const providerErrorLLM = Layer.succeed(
   LLM.Service,
@@ -1309,120 +1324,23 @@ itRouted.live(
           .run()
           .pipe(Effect.orDie)
 
-        const info = yield* session.get(chat.id)
-        const stats = yield* aggregateSessionStats()
-        expect(stats.totalCost).toBe(110)
-        expect(stats.totalTokens.input).toBe(7_000_700)
-        expect(stats.totalTokens.output).toBe(6_000_300)
-        expect(Object.keys(stats.modelUsage).sort()).toEqual([
-          "test/free-model",
-          "test/missing-model",
-          "test/request-model",
-          "test/served-a",
-          "test/served-b",
-          "test/unpriced-model",
-        ])
-        expect(stats.modelUsage["test/served-a"]).toMatchObject({
-          cost: 3,
-          tokens: { input: 1_000_000, output: 1_000_000 },
-        })
-        expect(stats.modelUsage["test/served-b"]).toMatchObject({
-          cost: 10,
-          tokens: { input: 2_000_000, output: 1_000_000 },
-        })
-        expect(stats.modelUsage["test/missing-model"]?.cost).toBe(30)
-        expect(stats.modelUsage["test/unpriced-model"]?.cost).toBe(30)
-        expect(stats.modelUsage["test/free-model"]).toMatchObject({
-          cost: 0,
-          tokens: { input: 1_000_000, output: 1_000_000 },
-        })
-        expect(stats.modelUsage["test/request-model"]).toMatchObject({
-          cost: 37,
-          messages: 2,
-          tokens: { input: 1_000_700, output: 1_000_300 },
-        })
-        const modeledCost = Object.values(stats.modelUsage).reduce((total, item) => total + item.cost, 0)
-        const totalShare = Object.values(stats.modelUsage).reduce(
-          (total, item) => total + item.cost / stats.totalCost,
-          0,
-        )
-        expect(modeledCost).toBe(stats.totalCost)
-        expect(totalShare).toBeCloseTo(1, 12)
-
-        const printed: string[] = []
-        const output: typeof console.log = (...values) => printed.push(values.map(String).join(" "))
-        displayStats(stats, undefined, 1, output)
-        expect(printed.join("\n")).toContain("33.6%")
-        expect(printed.join("\n")).not.toContain("test/served-a")
-
-        const zeroCostStats = {
-          ...stats,
-          totalCost: 0,
-          modelUsage: {
-            "test/free-model": {
-              messages: 1,
-              tokens: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-              cost: 0,
-            },
-          },
-        }
-        const zeroCostOutput: string[] = []
-        displayStats(zeroCostStats, undefined, 1, (...values) => zeroCostOutput.push(values.map(String).join(" ")))
-        expect(zeroCostOutput.join("\n")).toContain("0.0%")
-
-        const modelRows = [processed.info, historical].map((message) => ({
-          message_id: message.id,
-          session_id: message.sessionID,
-          provider_id: message.providerID,
-          model_id: message.modelID,
-          messages: 1,
-          tokens_input: message.tokens.input,
-          tokens_output: message.tokens.output,
-          tokens_reasoning: message.tokens.reasoning,
-          tokens_cache_read: message.tokens.cache.read,
-          tokens_cache_write: message.tokens.cache.write,
-          cost_reported: message.cost,
-        }))
-        const servedRows = [processed.info, historical].flatMap((message) =>
-          (message.responseModelIDs ?? []).map((served) => ({
-            session_id: message.sessionID,
-            provider_id: message.providerID,
-            model_id: message.modelID,
-            served,
-          })),
-        )
-        const stepRows = stepParts.map((part) => ({
-          message_id: processed.info.id,
-          served_model_id: part.responseModelID ?? null,
-          tokens_input: part.tokens.input,
-          tokens_output: part.tokens.output,
-          tokens_reasoning: part.tokens.reasoning,
-          tokens_cache_read: part.tokens.cache.read,
-          tokens_cache_write: part.tokens.cache.write,
-          cost_reported: part.cost,
-        }))
-        const sessionRows = [
-          {
-            id: info.id,
-            parent_id: info.parentID ?? null,
-            project_id: info.projectID,
-            directory: info.directory,
-            title: info.title,
-            agent: info.agent ?? null,
-            model: info.model ? JSON.stringify(info.model) : null,
-            time_created: info.time.created,
-            time_updated: info.time.updated,
-            cost: info.cost ?? 0,
-            tokens_input: info.tokens?.input ?? 0,
-            tokens_output: info.tokens?.output ?? 0,
-            tokens_reasoning: info.tokens?.reasoning ?? 0,
-            tokens_cache_read: info.tokens?.cache.read ?? 0,
-            tokens_cache_write: info.tokens?.cache.write ?? 0,
-          },
-        ]
-        const records = buildRecords({ sessions: sessionRows, models: modelRows, served: servedRows, steps: stepRows })
-        expect(records).toHaveLength(1)
-        expect(records[0]).toMatchObject({
+        const exportDatabase = new Sqlite(routedExportDbPath, { readonly: true })
+        const exportSnapshot = (() => {
+          try {
+            return readExport(exportDatabase)
+          } finally {
+            exportDatabase.close()
+          }
+        })()
+        expect(exportSnapshot.records).toHaveLength(1)
+        expect(exportSnapshot.orphanMessages).toBe(0)
+        expect(exportSnapshot.check.ok).toBe(true)
+        expect(exportSnapshot.check.lines.join("\n")).toContain("0 of 1 disagree")
+        const record = exportSnapshot.records[0]
+        expect(record).toBeDefined()
+        if (!record) return
+        expect(record).toMatchObject({
+          modelID: "request-model",
           tokens: { input: 7_000_700, output: 6_000_300 },
           reportedCost: 110,
           servedModelIDs: [
@@ -1435,12 +1353,6 @@ itRouted.live(
             "unpriced-model",
           ],
         })
-        const record = records[0]
-        expect(record).toBeDefined()
-        if (!record) return
-        const check = verify({ sessions: sessionRows, records, orphanMessages: 0 })
-        expect(check.ok).toBe(true)
-        expect(check.lines.join("\n")).toContain("0 of 1 disagree")
         const servedUsage = record["servedModelUsage"]
         expect(Array.isArray(servedUsage)).toBe(true)
         if (!Array.isArray(servedUsage)) return
@@ -1477,6 +1389,98 @@ itRouted.live(
           },
         ])
         expect(servedUsage.reduce((total, item) => total + item.reportedCost, 0)).toBe(record["reportedCost"])
+
+        const rollup = yield* session.get(chat.id)
+        yield* database.db
+          .update(SessionTable)
+          .set({ cost: (rollup.cost ?? 0) + 5 })
+          .where(eq(SessionTable.id, chat.id))
+          .run()
+          .pipe(Effect.orDie)
+        const staleRollup = yield* session.get(chat.id)
+        expect(staleRollup.cost).toBe(115)
+        yield* database.db
+          .insert(PartTable)
+          .values({
+            id: PartID.ascending(),
+            message_id: processed.info.id,
+            session_id: chat.id,
+            time_created: Date.now(),
+            data: {
+              type: "step-finish",
+              reason: "stop",
+              responseModelID: "malformed-model",
+              tokens: {},
+            } as never,
+          })
+          .run()
+          .pipe(Effect.orDie)
+        const stats = yield* aggregateSessionStats()
+        expect(stats.totalCost).toBe(110)
+        expect(stats.totalTokens.input).toBe(7_000_700)
+        expect(stats.totalTokens.output).toBe(6_000_300)
+        expect(Object.keys(stats.modelUsage).sort()).toEqual([
+          "test/free-model",
+          "test/malformed-model",
+          "test/missing-model",
+          "test/request-model",
+          "test/served-a",
+          "test/served-b",
+          "test/unpriced-model",
+        ])
+        expect(stats.modelUsage["test/served-a"]).toMatchObject({
+          cost: 3,
+          tokens: { input: 1_000_000, output: 1_000_000 },
+        })
+        expect(stats.modelUsage["test/served-b"]).toMatchObject({
+          cost: 10,
+          tokens: { input: 2_000_000, output: 1_000_000 },
+        })
+        expect(stats.modelUsage["test/missing-model"]?.cost).toBe(30)
+        expect(stats.modelUsage["test/unpriced-model"]?.cost).toBe(30)
+        expect(stats.modelUsage["test/free-model"]).toMatchObject({
+          cost: 0,
+          tokens: { input: 1_000_000, output: 1_000_000 },
+        })
+        expect(stats.modelUsage["test/malformed-model"]).toMatchObject({
+          cost: 0,
+          tokens: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+        })
+        expect(stats.modelUsage["test/request-model"]).toMatchObject({
+          cost: 37,
+          messages: 2,
+          tokens: { input: 1_000_700, output: 1_000_300 },
+        })
+        const modeledCost = Object.values(stats.modelUsage).reduce((total, item) => total + item.cost, 0)
+        const totalShare = Object.values(stats.modelUsage).reduce(
+          (total, item) => total + item.cost / stats.totalCost,
+          0,
+        )
+        expect(modeledCost).toBe(stats.totalCost)
+        expect(totalShare).toBeCloseTo(1, 12)
+
+        const printed: string[] = []
+        const output: typeof console.log = (...values) => printed.push(values.map(String).join(" "))
+        displayStats(stats, undefined, 1, output)
+        expect(printed.join("\n")).toContain("$110.00")
+        expect(printed.join("\n")).not.toContain("$115.00")
+        expect(printed.join("\n")).toContain("33.6%")
+        expect(printed.join("\n")).not.toContain("test/served-a")
+
+        const zeroCostStats = {
+          ...stats,
+          totalCost: 0,
+          modelUsage: {
+            "test/free-model": {
+              messages: 1,
+              tokens: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+              cost: 0,
+            },
+          },
+        }
+        const zeroCostOutput: string[] = []
+        displayStats(zeroCostStats, undefined, 1, (...values) => zeroCostOutput.push(values.map(String).join(" ")))
+        expect(zeroCostOutput.join("\n")).toContain("0.0%")
       }),
     { config: routedConfig() },
   ),

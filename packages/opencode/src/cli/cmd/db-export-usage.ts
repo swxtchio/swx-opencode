@@ -12,9 +12,9 @@ import { effectCmd } from "../effect-cmd"
  * bin/fm-usage-lib.sh ignores the `cost` column and re-derives dollars from
  * tokens against a dated per-provider rate table, because a harness's
  * self-reported total cannot be re-priced when rates change or turn out
- * wrong. So the export preserves tokens per session per model, and carries
- * opencode's cost alongside, clearly labelled as its figure, for
- * cross-checking only.
+ * wrong. Record totals use step-finish usage when present and fall back to
+ * message usage for legacy rows; per-served-model splits carry the same token
+ * components and reported cost alongside opencode's figure for cross-checking.
  *
  * Read-only by construction: the database is opened with `readonly`, so this
  * is safe to run against a live instance and can be re-run as often as
@@ -268,7 +268,7 @@ export function buildRecords(input: {
 }
 
 /**
- * Reconcile the per-model totals against the session table's own columns.
+ * Reconcile exported token totals against the session table's own columns.
  *
  * #14 makes this non-optional, and the reason is the sequencing: this is the
  * only thing standing between a database reset and the silent loss of the
@@ -280,9 +280,7 @@ export function verify(input: { sessions: SessionRow[]; records: Record<string, 
 } {
   const tokens = (record: Record<string, unknown>) => record["tokens"] as Record<string, number>
 
-  // Per session, because a global comparison says only that SOMETHING
-  // disagrees. Measured on the real database: one session out of 7,196
-  // accounted for the entire gap, and a global total could not show that.
+  // Per-session comparison identifies which rollup differs from exported usage.
   const exported = new Map<string, number>()
   for (const record of input.records) {
     const id = String(record["sessionID"])
@@ -301,8 +299,8 @@ export function verify(input: { sessions: SessionRow[]; records: Record<string, 
       session.tokens_reasoning +
       session.tokens_cache_read +
       session.tokens_cache_write
-    const fromMessages = exported.get(session.id) ?? 0
-    if (fromMessages !== stored) divergent.push(`${session.id} messages=${fromMessages} session=${stored}`)
+    const fromExport = exported.get(session.id) ?? 0
+    if (fromExport !== stored) divergent.push(`${session.id} export=${fromExport} session=${stored}`)
   }
 
   const lines: string[] = []
@@ -316,15 +314,12 @@ export function verify(input: { sessions: SessionRow[]; records: Record<string, 
       (ok ? "" : "  <- usage with no session row; it would be dropped"),
   )
 
-  // Divergence between the two is NOT a failure, and the reason is what this
-  // export is for. #14 asks to preserve the MEASUREMENT - tokens per session
-  // per model, read from the messages - because a harness's own rollup cannot
-  // be re-priced when rates change. The session table's token columns are
-  // that rollup: a derived cache. When the two disagree the messages are the
-  // source of truth and the export already carries them, so this is reported
-  // rather than treated as a blocker.
+  // Divergence is not a failure: the export prefers step-finish usage, then
+  // falls back to message fields for legacy messages. Session token columns
+  // are aggregate caches, so a difference is reported without blocking an
+  // otherwise complete archive.
   lines.push(
-    `  ${divergent.length === 0 ? "ok  " : "note"} session rollups   ${divergent.length} of ${input.sessions.length} disagree with their own messages`,
+    `  ${divergent.length === 0 ? "ok  " : "note"} session rollups   ${divergent.length} of ${input.sessions.length} disagree with exported usage`,
   )
   for (const entry of divergent.slice(0, 10)) lines.push(`         ${entry}`)
   if (divergent.length > 10) lines.push(`         ... and ${divergent.length - 10} more`)
@@ -349,7 +344,8 @@ export function readExport(db: Sqlite) {
 
 export const ExportUsageCommand = effectCmd({
   command: "export-usage",
-  describe: "export per-session token usage as JSONL, for archiving before a reset",
+  describe:
+    "export per-session usage as JSONL for archiving; step-finish totals take precedence, with message totals for legacy rows",
   instance: false,
   builder: (yargs: Argv) =>
     yargs
