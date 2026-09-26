@@ -1,4 +1,5 @@
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -24,8 +25,11 @@ import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { LLMEvent } from "@opencode-ai/llm"
+import { LLMEvent, Usage } from "@opencode-ai/llm"
+import { aggregateSessionStats, displayStats } from "@/cli/cmd/stats"
+import { buildRecords, verify } from "@/cli/cmd/db-export-usage"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -81,6 +85,26 @@ function providerCfg(url: string) {
           ...cfg.provider.test.options,
           baseURL: url,
         },
+      },
+    },
+  }
+}
+
+function routedConfig() {
+  return {
+    provider: {
+      test: {
+        name: "Test",
+        id: "test",
+        env: [],
+        npm: "@ai-sdk/openai-compatible",
+        models: {
+          "request-model": { cost: { input: 10, output: 20 } },
+          "served-a": { cost: { input: 1, output: 2 } },
+          "served-b": { cost: { input: 3, output: 4 } },
+          "unpriced-model": { name: "Unpriced Model" },
+        },
+        options: { apiKey: "test-key", baseURL: "http://localhost:1/v1" },
       },
     },
   }
@@ -185,6 +209,14 @@ const env = LayerNode.compile(
 )
 
 const it = testEffect(env)
+
+const routedEvents: LLMEvent[] = []
+const routedLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({ stream: () => Stream.fromIterable(routedEvents) }),
+)
+const routedEnv = LayerNode.compile(root, [...replacements, [LLM.node, routedLLM]])
+const itRouted = testEffect(routedEnv)
 
 const providerErrorLLM = Layer.succeed(
   LLM.Service,
@@ -1167,5 +1199,263 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
         expect(seen.filter((type) => type.startsWith("session.next."))).toEqual([])
       }),
     { config: cfg },
+  ),
+)
+
+itRouted.live(
+  "prices and attributes persisted usage by the reported serving model",
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "routed usage")
+        const requestModelRef = { providerID: ref.providerID, modelID: ModelV2.ID.make("request-model") }
+        parent.model = requestModelRef
+        yield* session.updateMessage(parent)
+
+        const requestModel = yield* provider.getModel(requestModelRef.providerID, requestModelRef.modelID)
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        msg.modelID = requestModelRef.modelID
+        yield* session.updateMessage(msg)
+
+        const steps: Array<{ responseModelID?: string; input: number; output: number }> = [
+          { responseModelID: "served-a", input: 1_000_000, output: 1_000_000 },
+          { responseModelID: "served-b", input: 2_000_000, output: 1_000_000 },
+          { responseModelID: "missing-model", input: 1_000_000, output: 1_000_000 },
+          { responseModelID: "unpriced-model", input: 1_000_000, output: 1_000_000 },
+          { input: 1_000_000, output: 1_000_000 },
+        ]
+        routedEvents.splice(
+          0,
+          routedEvents.length,
+          ...steps.flatMap((step, index) => [
+            LLMEvent.stepStart({ index }),
+            LLMEvent.stepFinish({
+              index,
+              reason: "stop",
+              usage: new Usage({
+                inputTokens: step.input,
+                outputTokens: step.output,
+                totalTokens: step.input + step.output,
+              }),
+              responseModelID: step.responseModelID,
+            }),
+          ]),
+          LLMEvent.finish({ reason: "stop" }),
+        )
+
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: requestModel })
+        expect(
+          yield* handle.process({
+            user: parent,
+            sessionID: chat.id,
+            model: requestModel,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "routed usage" }],
+            tools: {},
+          }),
+        ).toBe("continue")
+
+        const messages = yield* session.messages({ sessionID: chat.id })
+        const processed = messages.find((message) => message.info.id === msg.id)
+        expect(processed?.info.role).toBe("assistant")
+        if (!processed || processed.info.role !== "assistant") return
+        const stepParts = processed.parts.filter(
+          (part): part is SessionV1.StepFinishPart => part.type === "step-finish",
+        )
+        expect(stepParts.map((part) => part.cost)).toEqual([3, 10, 30, 30, 30])
+        expect(stepParts.map((part) => part.responseModelID)).toEqual([
+          "served-a",
+          "served-b",
+          "missing-model",
+          "unpriced-model",
+          undefined,
+        ])
+        expect(processed.info.cost).toBe(103)
+        expect(processed.info.responseModelIDs).toEqual([
+          "served-a",
+          "served-b",
+          "missing-model",
+          "unpriced-model",
+        ])
+
+        const historical = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        historical.modelID = requestModelRef.modelID
+        historical.responseModelIDs = ["old-served-a", "old-served-b"]
+        historical.cost = 7
+        historical.tokens = {
+          total: 1_000,
+          input: 700,
+          output: 300,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        }
+        yield* session.updateMessage(historical)
+
+        const database = yield* Database.Service
+        const projected = yield* session.get(chat.id)
+        expect(projected.cost).toBe(103)
+        yield* database.db
+          .update(SessionTable)
+          .set({
+            cost: (projected.cost ?? 0) + historical.cost,
+            tokens_input: (projected.tokens?.input ?? 0) + historical.tokens.input,
+            tokens_output: (projected.tokens?.output ?? 0) + historical.tokens.output,
+          })
+          .where(eq(SessionTable.id, chat.id))
+          .run()
+          .pipe(Effect.orDie)
+
+        const info = yield* session.get(chat.id)
+        const stats = yield* aggregateSessionStats()
+        expect(stats.totalCost).toBe(110)
+        expect(stats.totalTokens.input).toBe(6_000_700)
+        expect(stats.totalTokens.output).toBe(5_000_300)
+        expect(Object.keys(stats.modelUsage).sort()).toEqual([
+          "test/missing-model",
+          "test/request-model",
+          "test/served-a",
+          "test/served-b",
+          "test/unpriced-model",
+        ])
+        expect(stats.modelUsage["test/served-a"]).toMatchObject({
+          cost: 3,
+          tokens: { input: 1_000_000, output: 1_000_000 },
+        })
+        expect(stats.modelUsage["test/served-b"]).toMatchObject({
+          cost: 10,
+          tokens: { input: 2_000_000, output: 1_000_000 },
+        })
+        expect(stats.modelUsage["test/missing-model"]?.cost).toBe(30)
+        expect(stats.modelUsage["test/unpriced-model"]?.cost).toBe(30)
+        expect(stats.modelUsage["test/request-model"]).toMatchObject({
+          cost: 37,
+          messages: 2,
+          tokens: { input: 1_000_700, output: 1_000_300 },
+        })
+        const modeledCost = Object.values(stats.modelUsage).reduce((total, item) => total + item.cost, 0)
+        const totalShare = Object.values(stats.modelUsage).reduce((total, item) => total + item.cost / stats.totalCost, 0)
+        expect(modeledCost).toBe(stats.totalCost)
+        expect(totalShare).toBeCloseTo(1, 12)
+
+        const printed: string[] = []
+        const output: typeof console.log = (...values) => printed.push(values.map(String).join(" "))
+        displayStats(stats, undefined, 1, output)
+        expect(printed.join("\n")).toContain("33.6%")
+        expect(printed.join("\n")).not.toContain("test/served-a")
+
+        const zeroCostStats = {
+          ...stats,
+          totalCost: 0,
+          modelUsage: {
+            "test/free-model": {
+              messages: 1,
+              tokens: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+              cost: 0,
+            },
+          },
+        }
+        const zeroCostOutput: string[] = []
+        displayStats(zeroCostStats, undefined, 1, (...values) => zeroCostOutput.push(values.map(String).join(" ")))
+        expect(zeroCostOutput.join("\n")).toContain("0.0%")
+
+        const modelRows = [processed.info, historical].map((message) => ({
+          message_id: message.id,
+          session_id: message.sessionID,
+          provider_id: message.providerID,
+          model_id: message.modelID,
+          messages: 1,
+          tokens_input: message.tokens.input,
+          tokens_output: message.tokens.output,
+          tokens_reasoning: message.tokens.reasoning,
+          tokens_cache_read: message.tokens.cache.read,
+          tokens_cache_write: message.tokens.cache.write,
+          cost_reported: message.cost,
+        }))
+        const servedRows = [processed.info, historical].flatMap((message) =>
+          (message.responseModelIDs ?? []).map((served) => ({
+            session_id: message.sessionID,
+            provider_id: message.providerID,
+            model_id: message.modelID,
+            served,
+          })),
+        )
+        const stepRows = stepParts.map((part) => ({
+          message_id: processed.info.id,
+          served_model_id: part.responseModelID ?? null,
+          tokens_input: part.tokens.input,
+          tokens_output: part.tokens.output,
+          tokens_reasoning: part.tokens.reasoning,
+          tokens_cache_read: part.tokens.cache.read,
+          tokens_cache_write: part.tokens.cache.write,
+          cost_reported: part.cost,
+        }))
+        const sessionRows = [
+          {
+            id: info.id,
+            parent_id: info.parentID ?? null,
+            project_id: info.projectID,
+            directory: info.directory,
+            title: info.title,
+            agent: info.agent ?? null,
+            model: info.model ? JSON.stringify(info.model) : null,
+            time_created: info.time.created,
+            time_updated: info.time.updated,
+            cost: info.cost ?? 0,
+            tokens_input: info.tokens?.input ?? 0,
+            tokens_output: info.tokens?.output ?? 0,
+            tokens_reasoning: info.tokens?.reasoning ?? 0,
+            tokens_cache_read: info.tokens?.cache.read ?? 0,
+            tokens_cache_write: info.tokens?.cache.write ?? 0,
+          },
+        ]
+        const records = buildRecords({ sessions: sessionRows, models: modelRows, served: servedRows, steps: stepRows })
+        expect(records).toHaveLength(1)
+        expect(records[0]).toMatchObject({
+          tokens: { input: 6_000_700, output: 5_000_300 },
+          reportedCost: 110,
+          servedModelIDs: ["missing-model", "old-served-a", "old-served-b", "served-a", "served-b", "unpriced-model"],
+        })
+        const record = records[0]
+        expect(record).toBeDefined()
+        if (!record) return
+        const check = verify({ sessions: sessionRows, records, orphanMessages: 0 })
+        expect(check.ok).toBe(true)
+        expect(check.lines.join("\n")).toContain("0 of 1 disagree")
+        const servedUsage = record["servedModelUsage"]
+        expect(Array.isArray(servedUsage)).toBe(true)
+        if (!Array.isArray(servedUsage)) return
+        expect(servedUsage).toEqual([
+          {
+            modelID: "missing-model",
+            tokens: { input: 1_000_000, output: 1_000_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+            reportedCost: 30,
+          },
+          {
+            modelID: "request-model",
+            tokens: { input: 1_000_700, output: 1_000_300, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+            reportedCost: 37,
+          },
+          {
+            modelID: "served-a",
+            tokens: { input: 1_000_000, output: 1_000_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+            reportedCost: 3,
+          },
+          {
+            modelID: "served-b",
+            tokens: { input: 2_000_000, output: 1_000_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+            reportedCost: 10,
+          },
+          {
+            modelID: "unpriced-model",
+            tokens: { input: 1_000_000, output: 1_000_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+            reportedCost: 30,
+          },
+        ])
+        expect(servedUsage.reduce((total, item) => total + item.reportedCost, 0)).toBe(record["reportedCost"])
+      }),
+    { config: routedConfig() },
   ),
 )

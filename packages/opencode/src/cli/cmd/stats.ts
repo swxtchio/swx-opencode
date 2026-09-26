@@ -85,7 +85,7 @@ const getAllSessions = Effect.fnUntraced(function* () {
   return (yield* db.select().from(SessionTable).all().pipe(Effect.orDie)).map((row) => Session.fromRow(row))
 })
 
-const aggregateSessionStats = Effect.fn("Cli.stats.aggregate")(function* (
+export const aggregateSessionStats = Effect.fn("Cli.stats.aggregate")(function* (
   days?: number,
   projectFilter?: string,
   currentProject?: Project.Info,
@@ -182,24 +182,41 @@ const aggregateSessionStats = Effect.fn("Cli.stats.aggregate")(function* (
 
         for (const message of messages) {
           if (message.info.role === "assistant") {
-            const modelKey = `${message.info.providerID}/${message.info.modelID}`
-            if (!sessionModelUsage[modelKey]) {
-              sessionModelUsage[modelKey] = {
-                messages: 0,
-                tokens: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-                cost: 0,
-              }
-            }
-            sessionModelUsage[modelKey].messages++
-            sessionModelUsage[modelKey].cost += message.info.cost || 0
+            const info = message.info
+            const steps = message.parts.filter((part) => part.type === "step-finish")
+            const modelUsages = steps.length
+              ? steps.map((part) => ({
+                  modelKey: `${info.providerID}/${part.responseModelID ?? info.modelID}`,
+                  cost: part.cost,
+                  tokens: part.tokens,
+                }))
+              : [
+                  {
+                    modelKey: `${info.providerID}/${info.modelID}`,
+                    cost: info.cost,
+                    tokens: info.tokens,
+                  },
+                ]
+            const messageModels = new Set<string>()
 
-            if (message.info.tokens) {
-              sessionModelUsage[modelKey].tokens.input += message.info.tokens.input || 0
-              sessionModelUsage[modelKey].tokens.output +=
-                (message.info.tokens.output || 0) + (message.info.tokens.reasoning || 0)
-              sessionModelUsage[modelKey].tokens.cache.read += message.info.tokens.cache?.read || 0
-              sessionModelUsage[modelKey].tokens.cache.write += message.info.tokens.cache?.write || 0
+            for (const item of modelUsages) {
+              if (!sessionModelUsage[item.modelKey]) {
+                sessionModelUsage[item.modelKey] = {
+                  messages: 0,
+                  tokens: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+                  cost: 0,
+                }
+              }
+              const usage = sessionModelUsage[item.modelKey]
+              usage.cost += item.cost
+              usage.tokens.input += item.tokens.input
+              usage.tokens.output += item.tokens.output + item.tokens.reasoning
+              usage.tokens.cache.read += item.tokens.cache.read
+              usage.tokens.cache.write += item.tokens.cache.write
+              messageModels.add(item.modelKey)
             }
+
+            for (const modelKey of messageModels) sessionModelUsage[modelKey].messages++
           }
 
           for (const part of message.parts) {
@@ -289,7 +306,7 @@ const aggregateSessionStats = Effect.fn("Cli.stats.aggregate")(function* (
   return stats
 })
 
-export function displayStats(stats: SessionStats, toolLimit?: number, modelLimit?: number) {
+export function displayStats(stats: SessionStats, toolLimit?: number, modelLimit?: number, output = console.log) {
   const width = 56
 
   function renderRow(label: string, value: string): string {
@@ -300,67 +317,68 @@ export function displayStats(stats: SessionStats, toolLimit?: number, modelLimit
   }
 
   // Overview section
-  console.log("┌────────────────────────────────────────────────────────┐")
-  console.log("│                       OVERVIEW                         │")
-  console.log("├────────────────────────────────────────────────────────┤")
-  console.log(renderRow("Sessions", stats.totalSessions.toLocaleString()))
-  console.log(renderRow("Messages", stats.totalMessages.toLocaleString()))
-  console.log(renderRow("Days", stats.days.toString()))
-  console.log("└────────────────────────────────────────────────────────┘")
-  console.log()
+  output("┌────────────────────────────────────────────────────────┐")
+  output("│                       OVERVIEW                         │")
+  output("├────────────────────────────────────────────────────────┤")
+  output(renderRow("Sessions", stats.totalSessions.toLocaleString()))
+  output(renderRow("Messages", stats.totalMessages.toLocaleString()))
+  output(renderRow("Days", stats.days.toString()))
+  output("└────────────────────────────────────────────────────────┘")
+  output()
 
   // Cost & Tokens section
-  console.log("┌────────────────────────────────────────────────────────┐")
-  console.log("│                    COST & TOKENS                       │")
-  console.log("├────────────────────────────────────────────────────────┤")
+  output("┌────────────────────────────────────────────────────────┐")
+  output("│                    COST & TOKENS                       │")
+  output("├────────────────────────────────────────────────────────┤")
   const cost = isNaN(stats.totalCost) ? 0 : stats.totalCost
   const costPerDay = isNaN(stats.costPerDay) ? 0 : stats.costPerDay
   const tokensPerSession = isNaN(stats.tokensPerSession) ? 0 : stats.tokensPerSession
-  console.log(renderRow("Total Cost", `$${cost.toFixed(2)}`))
-  console.log(renderRow("Avg Cost/Day", `$${costPerDay.toFixed(2)}`))
-  console.log(renderRow("Avg Tokens/Session", formatNumber(Math.round(tokensPerSession))))
+  output(renderRow("Total Cost", `$${cost.toFixed(2)}`))
+  output(renderRow("Avg Cost/Day", `$${costPerDay.toFixed(2)}`))
+  output(renderRow("Avg Tokens/Session", formatNumber(Math.round(tokensPerSession))))
   const medianTokensPerSession = isNaN(stats.medianTokensPerSession) ? 0 : stats.medianTokensPerSession
-  console.log(renderRow("Median Tokens/Session", formatNumber(Math.round(medianTokensPerSession))))
-  console.log(renderRow("Input", formatNumber(stats.totalTokens.input)))
-  console.log(renderRow("Output", formatNumber(stats.totalTokens.output)))
-  console.log(renderRow("Cache Read", formatNumber(stats.totalTokens.cache.read)))
-  console.log(renderRow("Cache Write", formatNumber(stats.totalTokens.cache.write)))
-  console.log("└────────────────────────────────────────────────────────┘")
-  console.log()
+  output(renderRow("Median Tokens/Session", formatNumber(Math.round(medianTokensPerSession))))
+  output(renderRow("Input", formatNumber(stats.totalTokens.input)))
+  output(renderRow("Output", formatNumber(stats.totalTokens.output)))
+  output(renderRow("Cache Read", formatNumber(stats.totalTokens.cache.read)))
+  output(renderRow("Cache Write", formatNumber(stats.totalTokens.cache.write)))
+  output("└────────────────────────────────────────────────────────┘")
+  output()
 
   // Model Usage section
   if (modelLimit !== undefined && Object.keys(stats.modelUsage).length > 0) {
     const sortedModels = Object.entries(stats.modelUsage).sort(([, a], [, b]) => b.messages - a.messages)
     const modelsToDisplay = modelLimit === Infinity ? sortedModels : sortedModels.slice(0, modelLimit)
 
-    console.log("┌────────────────────────────────────────────────────────┐")
-    console.log("│                      MODEL USAGE                       │")
-    console.log("├────────────────────────────────────────────────────────┤")
+    output("┌────────────────────────────────────────────────────────┐")
+    output("│                      MODEL USAGE                       │")
+    output("├────────────────────────────────────────────────────────┤")
 
-    for (const [model, usage] of modelsToDisplay) {
-      console.log(`│ ${model.padEnd(54)} │`)
-      console.log(renderRow("  Messages", usage.messages.toLocaleString()))
-      console.log(renderRow("  Input Tokens", formatNumber(usage.tokens.input)))
-      console.log(renderRow("  Output Tokens", formatNumber(usage.tokens.output)))
-      console.log(renderRow("  Cache Read", formatNumber(usage.tokens.cache.read)))
-      console.log(renderRow("  Cache Write", formatNumber(usage.tokens.cache.write)))
-      console.log(renderRow("  Cost", `$${usage.cost.toFixed(4)}`))
-      console.log("├────────────────────────────────────────────────────────┤")
+    for (const [index, [model, usage]] of modelsToDisplay.entries()) {
+      output(`│ ${model.padEnd(54)} │`)
+      output(renderRow("  Messages", usage.messages.toLocaleString()))
+      output(renderRow("  Input Tokens", formatNumber(usage.tokens.input)))
+      output(renderRow("  Output Tokens", formatNumber(usage.tokens.output)))
+      output(renderRow("  Cache Read", formatNumber(usage.tokens.cache.read)))
+      output(renderRow("  Cache Write", formatNumber(usage.tokens.cache.write)))
+      output(renderRow("  Cost", `$${usage.cost.toFixed(4)}`))
+      const totalCost = Number.isFinite(stats.totalCost) ? stats.totalCost : 0
+      const share = totalCost > 0 ? (usage.cost / totalCost) * 100 : 0
+      output(renderRow("  Cost Share", `${share.toFixed(1)}%`))
+      if (index < modelsToDisplay.length - 1) output("├────────────────────────────────────────────────────────┤")
     }
-    // Remove last separator and add bottom border
-    process.stdout.write("\x1B[1A") // Move up one line
-    console.log("└────────────────────────────────────────────────────────┘")
+    output("└────────────────────────────────────────────────────────┘")
   }
-  console.log()
+  output()
 
   // Tool Usage section
   if (Object.keys(stats.toolUsage).length > 0) {
     const sortedTools = Object.entries(stats.toolUsage).sort(([, a], [, b]) => b - a)
     const toolsToDisplay = toolLimit ? sortedTools.slice(0, toolLimit) : sortedTools
 
-    console.log("┌────────────────────────────────────────────────────────┐")
-    console.log("│                      TOOL USAGE                        │")
-    console.log("├────────────────────────────────────────────────────────┤")
+    output("┌────────────────────────────────────────────────────────┐")
+    output("│                      TOOL USAGE                        │")
+    output("├────────────────────────────────────────────────────────┤")
 
     const maxCount = Math.max(...toolsToDisplay.map(([, count]) => count))
     const totalToolUsage = Object.values(stats.toolUsage).reduce((a, b) => a + b, 0)
@@ -376,11 +394,11 @@ export function displayStats(stats: SessionStats, toolLimit?: number, modelLimit
 
       const content = ` ${toolName} ${bar.padEnd(20)} ${count.toString().padStart(3)} (${percentage.padStart(4)}%)`
       const padding = Math.max(0, width - content.length - 1)
-      console.log(`│${content}${" ".repeat(padding)} │`)
+      output(`│${content}${" ".repeat(padding)} │`)
     }
-    console.log("└────────────────────────────────────────────────────────┘")
+    output("└────────────────────────────────────────────────────────┘")
   }
-  console.log()
+  output()
 }
 
 function formatNumber(num: number): string {

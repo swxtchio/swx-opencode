@@ -18,7 +18,8 @@ import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
 import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
-import type { Provider } from "@/provider/provider"
+import { Provider } from "@/provider/provider"
+import { ModelV2 } from "@opencode-ai/core/model"
 import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
@@ -28,6 +29,25 @@ import { Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
+
+function hasKnownPrice(model: Provider.Model) {
+  const cost = model.cost
+  return [
+    cost.input,
+    cost.output,
+    cost.cache.read,
+    cost.cache.write,
+    ...(cost.tiers ?? []).flatMap((tier) => [tier.input, tier.output, tier.cache.read, tier.cache.write]),
+    ...(cost.experimentalOver200K
+      ? [
+          cost.experimentalOver200K.input,
+          cost.experimentalOver200K.output,
+          cost.experimentalOver200K.cache.read,
+          cost.experimentalOver200K.cache.write,
+        ]
+      : []),
+  ].some((rate) => rate > 0)
+}
 
 export interface Handle {
   readonly message: SessionV1.Assistant
@@ -94,6 +114,7 @@ const layer = Layer.effect(
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
     const database = yield* Database.Service
+    const provider = yield* Provider.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -449,8 +470,18 @@ const layer = Layer.effect(
                 transformations: JSON.stringify(dropped),
               })
             }
+            const model = yield* (
+              value.responseModelID === undefined || value.responseModelID === ctx.model.id
+                ? Effect.succeed(ctx.model)
+                : provider
+                    .getModel(ctx.model.providerID, ModelV2.ID.make(value.responseModelID))
+                    .pipe(
+                      Effect.map((served) => (hasKnownPrice(served) ? served : ctx.model)),
+                      Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(ctx.model)),
+                    )
+            )
             const usage = Session.getUsage({
-              model: ctx.model,
+              model,
               usage: value.usage ?? new Usage({}),
               metadata: value.providerMetadata,
             })
@@ -736,6 +767,7 @@ export const node = LayerNode.make({
     Image.node,
     EventV2Bridge.node,
     Database.node,
+    Provider.node,
   ],
 })
 

@@ -42,6 +42,7 @@ type SessionRow = {
 }
 
 type ModelRow = {
+  message_id?: string
   session_id: string
   provider_id: string | null
   model_id: string | null
@@ -55,26 +56,43 @@ type ModelRow = {
 }
 
 type ServedRow = { session_id: string; provider_id: string | null; model_id: string | null; served: string }
+type StepUsageRow = {
+  message_id: string
+  served_model_id: string | null
+  tokens_input: number
+  tokens_output: number
+  tokens_reasoning: number
+  tokens_cache_read: number
+  tokens_cache_write: number
+  cost_reported: number
+}
 
-/**
- * Per session and model. Only assistant messages carry usage, and a session's
- * own row holds totals that this must reconcile against - see `verify`.
- */
+type UsageTokens = { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }
+type ServedModelUsage = { modelID: string | null; tokens: UsageTokens; reportedCost: number }
+type UsageRecord = Record<string, unknown> & {
+  messages: number
+  tokens: UsageTokens
+  servedModelIDs: string[]
+  servedModelUsage: ServedModelUsage[]
+  reportedCost: number
+}
+
+/** Assistant-message totals. Step parts supply the per-serving-model attribution. */
 const MODEL_SQL = `
   SELECT
-    session_id,
-    json_extract(data, '$.providerID') AS provider_id,
-    json_extract(data, '$.modelID')    AS model_id,
-    COUNT(*)                                                     AS messages,
-    SUM(COALESCE(json_extract(data, '$.tokens.input'), 0))       AS tokens_input,
-    SUM(COALESCE(json_extract(data, '$.tokens.output'), 0))      AS tokens_output,
-    SUM(COALESCE(json_extract(data, '$.tokens.reasoning'), 0))   AS tokens_reasoning,
-    SUM(COALESCE(json_extract(data, '$.tokens.cache.read'), 0))  AS tokens_cache_read,
-    SUM(COALESCE(json_extract(data, '$.tokens.cache.write'), 0)) AS tokens_cache_write,
-    SUM(COALESCE(json_extract(data, '$.cost'), 0))               AS cost_reported
-  FROM message
-  WHERE json_extract(data, '$.role') = 'assistant'
-  GROUP BY session_id, provider_id, model_id
+    m.id                                                       AS message_id,
+    m.session_id,
+    json_extract(m.data, '$.providerID')                       AS provider_id,
+    json_extract(m.data, '$.modelID')                          AS model_id,
+    1                                                          AS messages,
+    COALESCE(json_extract(m.data, '$.tokens.input'), 0)        AS tokens_input,
+    COALESCE(json_extract(m.data, '$.tokens.output'), 0)       AS tokens_output,
+    COALESCE(json_extract(m.data, '$.tokens.reasoning'), 0)    AS tokens_reasoning,
+    COALESCE(json_extract(m.data, '$.tokens.cache.read'), 0)   AS tokens_cache_read,
+    COALESCE(json_extract(m.data, '$.tokens.cache.write'), 0)  AS tokens_cache_write,
+    COALESCE(json_extract(m.data, '$.cost'), 0)                AS cost_reported
+  FROM message m
+  WHERE json_extract(m.data, '$.role') = 'assistant'
 `
 
 /**
@@ -93,6 +111,23 @@ const SERVED_SQL = `
     served.value                          AS served
   FROM message m, json_each(json_extract(m.data, '$.responseModelIDs')) AS served
   WHERE json_extract(m.data, '$.role') = 'assistant'
+`
+
+const STEP_USAGE_SQL = `
+  SELECT
+    p.message_id,
+    COALESCE(NULLIF(json_extract(p.data, '$.responseModelID'), ''), json_extract(m.data, '$.modelID')) AS served_model_id,
+    SUM(COALESCE(json_extract(p.data, '$.tokens.input'), 0))       AS tokens_input,
+    SUM(COALESCE(json_extract(p.data, '$.tokens.output'), 0))      AS tokens_output,
+    SUM(COALESCE(json_extract(p.data, '$.tokens.reasoning'), 0))   AS tokens_reasoning,
+    SUM(COALESCE(json_extract(p.data, '$.tokens.cache.read'), 0))  AS tokens_cache_read,
+    SUM(COALESCE(json_extract(p.data, '$.tokens.cache.write'), 0)) AS tokens_cache_write,
+    SUM(COALESCE(json_extract(p.data, '$.cost'), 0))               AS cost_reported
+  FROM part p
+  JOIN message m ON m.id = p.message_id AND m.session_id = p.session_id
+  WHERE json_extract(m.data, '$.role') = 'assistant'
+    AND json_extract(p.data, '$.type') = 'step-finish'
+  GROUP BY p.message_id, served_model_id
 `
 
 /** Usage whose session row is gone - the only way this export can lose data. */
@@ -123,6 +158,7 @@ export function buildRecords(input: {
   sessions: SessionRow[]
   models: ModelRow[]
   served: ServedRow[]
+  steps?: StepUsageRow[]
 }): Record<string, unknown>[] {
   const servedBy = new Map<string, Set<string>>()
   for (const row of input.served) {
@@ -132,44 +168,99 @@ export function buildRecords(input: {
     servedBy.set(key, set)
   }
 
-  const sessions = new Map(input.sessions.map((session) => [session.id, session]))
+  const stepsByMessage = new Map<string, StepUsageRow[]>()
+  for (const row of input.steps ?? []) {
+    const rows = stepsByMessage.get(row.message_id) ?? []
+    rows.push(row)
+    stepsByMessage.set(row.message_id, rows)
+  }
 
-  return input.models.map((row) => {
+  const sessions = new Map(input.sessions.map((session) => [session.id, session]))
+  const records = new Map<string, { record: UsageRecord; servedModelUsage: Map<string | null, ServedModelUsage> }>()
+
+  for (const row of input.models) {
     const session = sessions.get(row.session_id)
     const key = `${row.session_id}\u0000${row.provider_id}\u0000${row.model_id}`
-    return {
-      type: "usage",
-      sessionID: row.session_id,
-      parentID: session?.parent_id ?? null,
-      projectID: session?.project_id ?? null,
-      directory: session?.directory ?? null,
-      title: session?.title ?? null,
-      agent: session?.agent ?? null,
-      // Parsed, not passed through. The session.model column holds JSON text,
-      // so emitting it raw gives the archive a string like
-      // "{\"id\":\"gpt-5.6-luna\",\"providerID\":\"swx-azure\",...}" -
-      // which anyone re-deriving cost would have to parse again, from a field
-      // whose shape is not obvious. An archive should not export its own
-      // serialisation accident.
-      configuredModel: parseModel(session?.model),
-      timeCreated: session?.time_created ?? null,
-      timeUpdated: session?.time_updated ?? null,
-      providerID: row.provider_id,
-      modelID: row.model_id,
-      messages: row.messages,
-      tokens: {
-        input: row.tokens_input,
-        output: row.tokens_output,
-        reasoning: row.tokens_reasoning,
-        cacheRead: row.tokens_cache_read,
-        cacheWrite: row.tokens_cache_write,
-      },
-      servedModelIDs: [...(servedBy.get(key) ?? [])].sort(),
-      // opencode's own figure. Kept for cross-checking, NOT as the basis for
-      // billing - re-derive from the tokens above against a dated rate table.
-      reportedCost: row.cost_reported,
+    let group = records.get(key)
+    if (!group) {
+      group = {
+        record: {
+          type: "usage",
+          sessionID: row.session_id,
+          parentID: session?.parent_id ?? null,
+          projectID: session?.project_id ?? null,
+          directory: session?.directory ?? null,
+          title: session?.title ?? null,
+          agent: session?.agent ?? null,
+          // Parsed, not passed through. The session.model column holds JSON text,
+          // so emitting it raw gives the archive a string like
+          // "{\"id\":\"gpt-5.6-luna\",\"providerID\":\"swx-azure\",...}" -
+          // which anyone re-deriving cost would have to parse again, from a field
+          // whose shape is not obvious. An archive should not export its own
+          // serialisation accident.
+          configuredModel: parseModel(session?.model),
+          timeCreated: session?.time_created ?? null,
+          timeUpdated: session?.time_updated ?? null,
+          providerID: row.provider_id,
+          modelID: row.model_id,
+          messages: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+          servedModelIDs: [],
+          servedModelUsage: [],
+          reportedCost: 0,
+        },
+        servedModelUsage: new Map(),
+      }
+      records.set(key, group)
     }
-  })
+
+    group.record.messages += row.messages
+    const stepRows = row.message_id ? stepsByMessage.get(row.message_id) : undefined
+    const usageRows = stepRows?.length ? stepRows : [undefined]
+    for (const step of usageRows) {
+      const modelID = step?.served_model_id ?? row.model_id
+      const tokens = step
+        ? {
+            input: step.tokens_input,
+            output: step.tokens_output,
+            reasoning: step.tokens_reasoning,
+            cacheRead: step.tokens_cache_read,
+            cacheWrite: step.tokens_cache_write,
+          }
+        : {
+            input: row.tokens_input,
+            output: row.tokens_output,
+            reasoning: row.tokens_reasoning,
+            cacheRead: row.tokens_cache_read,
+            cacheWrite: row.tokens_cache_write,
+          }
+      const cost = step?.cost_reported ?? row.cost_reported
+      const served = group.servedModelUsage.get(modelID) ?? {
+        modelID,
+        tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+        reportedCost: 0,
+      }
+      served.tokens.input += tokens.input
+      served.tokens.output += tokens.output
+      served.tokens.reasoning += tokens.reasoning
+      served.tokens.cacheRead += tokens.cacheRead
+      served.tokens.cacheWrite += tokens.cacheWrite
+      served.reportedCost += cost
+      group.servedModelUsage.set(modelID, served)
+      group.record.tokens.input += tokens.input
+      group.record.tokens.output += tokens.output
+      group.record.tokens.reasoning += tokens.reasoning
+      group.record.tokens.cacheRead += tokens.cacheRead
+      group.record.tokens.cacheWrite += tokens.cacheWrite
+      group.record.reportedCost += cost
+    }
+  }
+
+  return [...records].map(([key, group]) => ({
+    ...group.record,
+    servedModelIDs: [...(servedBy.get(key) ?? [])].sort(),
+    servedModelUsage: [...group.servedModelUsage.values()].sort((a, b) => (a.modelID ?? "").localeCompare(b.modelID ?? "")),
+  }))
 }
 
 /**
@@ -237,6 +328,21 @@ export function verify(input: { sessions: SessionRow[]; records: Record<string, 
   return { ok, lines }
 }
 
+export function readExport(db: Sqlite) {
+  // One read transaction gives every exported value the same database snapshot.
+  const read = db.transaction(() => ({
+    sessions: db.query(SESSION_SQL).all() as SessionRow[],
+    models: db.query(MODEL_SQL).all() as ModelRow[],
+    served: db.query(SERVED_SQL).all() as ServedRow[],
+    steps: db.query(STEP_USAGE_SQL).all() as StepUsageRow[],
+    orphans: (db.query(ORPHAN_SQL).get() as { n: number }).n,
+  }))
+  const { sessions, models, served, steps, orphans } = read()
+  const records = buildRecords({ sessions, models, served, steps })
+  const check = verify({ sessions, records, orphanMessages: orphans })
+  return { sessions, records, orphanMessages: orphans, check }
+}
+
 export const ExportUsageCommand = effectCmd({
   command: "export-usage",
   describe: "export per-session token usage as JSONL, for archiving before a reset",
@@ -263,25 +369,7 @@ export const ExportUsageCommand = effectCmd({
     const db = new Sqlite(file, { readonly: true })
 
     try {
-      // One read transaction across all three queries.
-      //
-      // Without it they see different snapshots, and on a live database that
-      // is not theoretical: the first run of this against the real 59.86 GB
-      // file took 4m30s with crews actively writing, and reconciliation
-      // failed by +3 input, +583 output and +307,620 cache-read tokens -
-      // purely because the session table had moved on between queries.
-      //
-      // WAL gives a read transaction a stable snapshot without blocking
-      // writers, so this stays safe to run against a live instance.
-      const read = db.transaction(() => ({
-        sessions: db.query(SESSION_SQL).all() as SessionRow[],
-        models: db.query(MODEL_SQL).all() as ModelRow[],
-        served: db.query(SERVED_SQL).all() as ServedRow[],
-        orphans: (db.query(ORPHAN_SQL).get() as { n: number }).n,
-      }))
-      const { sessions, models, served, orphans } = read()
-      const records = buildRecords({ sessions, models, served })
-      const check = verify({ sessions, records, orphanMessages: orphans })
+      const { sessions, records, orphanMessages, check } = readExport(db)
 
       const summary = {
         type: "summary",
