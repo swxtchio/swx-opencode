@@ -272,7 +272,12 @@ describe("readExport", () => {
       })
       expect(snapshot.check.ok).toBe(true)
       expect(snapshot.check.lines.join("\n")).toContain("0 of 2 disagree")
+      expect(snapshot.check.lines.join("\n")).toContain("session cost rollups   0 of 2 disagree")
       expect(snapshot.orphanMessages).toBe(0)
+      expect(snapshot.reportedCostTotal).toBe(17)
+      expect(snapshot.reportedCostTotal).toBe(
+        snapshot.records.reduce((total, record) => total + Number(record["reportedCost"]), 0),
+      )
     } finally {
       db.close()
     }

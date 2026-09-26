@@ -1316,14 +1316,23 @@ itRouted.live(
         yield* database.db
           .update(SessionTable)
           .set({
-            cost: (projected.cost ?? 0) + historical.cost,
-            tokens_input: (projected.tokens?.input ?? 0) + historical.tokens.input,
-            tokens_output: (projected.tokens?.output ?? 0) + historical.tokens.output,
+            cost: (projected.cost ?? 0) + historical.cost + 5,
+            tokens_input: (projected.tokens?.input ?? 0) + historical.tokens.input + 5,
+            tokens_output: (projected.tokens?.output ?? 0) + historical.tokens.output + 4,
+            tokens_reasoning: (projected.tokens?.reasoning ?? 0) + historical.tokens.reasoning + 3,
+            tokens_cache_read: (projected.tokens?.cache.read ?? 0) + historical.tokens.cache.read + 2,
+            tokens_cache_write: (projected.tokens?.cache.write ?? 0) + historical.tokens.cache.write + 1,
           })
           .where(eq(SessionTable.id, chat.id))
           .run()
           .pipe(Effect.orDie)
 
+        const staleRollup = yield* session.get(chat.id)
+        expect(staleRollup.cost).toBe(115)
+        expect(staleRollup.tokens?.input).toBe(7_000_705)
+        expect(staleRollup.tokens?.output).toBe(6_000_304)
+        expect(staleRollup.tokens?.reasoning).toBe(3)
+        expect(staleRollup.tokens?.cache).toEqual({ read: 2, write: 1 })
         const exportDatabase = new Sqlite(routedExportDbPath, { readonly: true })
         const exportSnapshot = (() => {
           try {
@@ -1333,9 +1342,14 @@ itRouted.live(
           }
         })()
         expect(exportSnapshot.records).toHaveLength(1)
+        expect(exportSnapshot.reportedCostTotal).toBe(110)
+        expect(exportSnapshot.reportedCostTotal).toBe(
+          exportSnapshot.records.reduce((total, item) => total + Number(item["reportedCost"]), 0),
+        )
         expect(exportSnapshot.orphanMessages).toBe(0)
         expect(exportSnapshot.check.ok).toBe(true)
-        expect(exportSnapshot.check.lines.join("\n")).toContain("0 of 1 disagree")
+        expect(exportSnapshot.check.lines.join("\n")).toContain("1 of 1 disagree with exported usage")
+        expect(exportSnapshot.check.lines.join("\n")).toContain("1 of 1 disagree with exported costs")
         const record = exportSnapshot.records[0]
         expect(record).toBeDefined()
         if (!record) return
@@ -1390,15 +1404,6 @@ itRouted.live(
         ])
         expect(servedUsage.reduce((total, item) => total + item.reportedCost, 0)).toBe(record["reportedCost"])
 
-        const rollup = yield* session.get(chat.id)
-        yield* database.db
-          .update(SessionTable)
-          .set({ cost: (rollup.cost ?? 0) + 5 })
-          .where(eq(SessionTable.id, chat.id))
-          .run()
-          .pipe(Effect.orDie)
-        const staleRollup = yield* session.get(chat.id)
-        expect(staleRollup.cost).toBe(115)
         yield* database.db
           .insert(PartTable)
           .values({
@@ -1417,8 +1422,13 @@ itRouted.live(
           .pipe(Effect.orDie)
         const stats = yield* aggregateSessionStats()
         expect(stats.totalCost).toBe(110)
+        expect(stats.costPerDay * stats.days).toBe(stats.totalCost)
         expect(stats.totalTokens.input).toBe(7_000_700)
         expect(stats.totalTokens.output).toBe(6_000_300)
+        expect(stats.totalTokens.reasoning).toBe(0)
+        expect(stats.totalTokens.cache).toEqual({ read: 0, write: 0 })
+        expect(stats.tokensPerSession).toBe(13_001_000)
+        expect(stats.medianTokensPerSession).toBe(13_001_000)
         expect(Object.keys(stats.modelUsage).sort()).toEqual([
           "test/free-model",
           "test/malformed-model",
@@ -1452,11 +1462,25 @@ itRouted.live(
           tokens: { input: 1_000_700, output: 1_000_300 },
         })
         const modeledCost = Object.values(stats.modelUsage).reduce((total, item) => total + item.cost, 0)
+        const modeledInput = Object.values(stats.modelUsage).reduce((total, item) => total + item.tokens.input, 0)
+        const modeledOutput = Object.values(stats.modelUsage).reduce((total, item) => total + item.tokens.output, 0)
+        const modeledCacheRead = Object.values(stats.modelUsage).reduce(
+          (total, item) => total + item.tokens.cache.read,
+          0,
+        )
+        const modeledCacheWrite = Object.values(stats.modelUsage).reduce(
+          (total, item) => total + item.tokens.cache.write,
+          0,
+        )
         const totalShare = Object.values(stats.modelUsage).reduce(
           (total, item) => total + item.cost / stats.totalCost,
           0,
         )
         expect(modeledCost).toBe(stats.totalCost)
+        expect(modeledInput).toBe(stats.totalTokens.input)
+        expect(modeledOutput).toBe(stats.totalTokens.output + stats.totalTokens.reasoning)
+        expect(modeledCacheRead).toBe(stats.totalTokens.cache.read)
+        expect(modeledCacheWrite).toBe(stats.totalTokens.cache.write)
         expect(totalShare).toBeCloseTo(1, 12)
 
         const printed: string[] = []

@@ -15,6 +15,8 @@ import { effectCmd } from "../effect-cmd"
  * wrong. Record totals use step-finish usage when present and fall back to
  * message usage for legacy rows; per-served-model splits carry the same token
  * components and reported cost alongside opencode's figure for cross-checking.
+ * The summary's `reportedCostTotal` is the sum of exported record costs, not the
+ * session cost rollups.
  *
  * Read-only by construction: the database is opened with `readonly`, so this
  * is safe to run against a live instance and can be re-run as often as
@@ -282,6 +284,7 @@ export function verify(input: { sessions: SessionRow[]; records: Record<string, 
 
   // Per-session comparison identifies which rollup differs from exported usage.
   const exported = new Map<string, number>()
+  const exportedCost = new Map<string, number>()
   for (const record of input.records) {
     const id = String(record["sessionID"])
     const t = tokens(record)
@@ -289,9 +292,12 @@ export function verify(input: { sessions: SessionRow[]; records: Record<string, 
       id,
       (exported.get(id) ?? 0) + t["input"]! + t["output"]! + t["reasoning"]! + t["cacheRead"]! + t["cacheWrite"]!,
     )
+    const cost = record["reportedCost"]
+    if (typeof cost === "number") exportedCost.set(id, (exportedCost.get(id) ?? 0) + cost)
   }
 
   const divergent: string[] = []
+  const divergentCost: string[] = []
   for (const session of input.sessions) {
     const stored =
       session.tokens_input +
@@ -301,6 +307,10 @@ export function verify(input: { sessions: SessionRow[]; records: Record<string, 
       session.tokens_cache_write
     const fromExport = exported.get(session.id) ?? 0
     if (fromExport !== stored) divergent.push(`${session.id} export=${fromExport} session=${stored}`)
+    const fromExportCost = exportedCost.get(session.id) ?? 0
+    const costTolerance = 1e-9 * Math.max(1, Math.abs(fromExportCost), Math.abs(session.cost))
+    if (Math.abs(fromExportCost - session.cost) > costTolerance)
+      divergentCost.push(`${session.id} export=${fromExportCost} session=${session.cost}`)
   }
 
   const lines: string[] = []
@@ -323,6 +333,11 @@ export function verify(input: { sessions: SessionRow[]; records: Record<string, 
   )
   for (const entry of divergent.slice(0, 10)) lines.push(`         ${entry}`)
   if (divergent.length > 10) lines.push(`         ... and ${divergent.length - 10} more`)
+  lines.push(
+    `  ${divergentCost.length === 0 ? "ok  " : "note"} session cost rollups   ${divergentCost.length} of ${input.sessions.length} disagree with exported costs`,
+  )
+  for (const entry of divergentCost.slice(0, 10)) lines.push(`         ${entry}`)
+  if (divergentCost.length > 10) lines.push(`         ... and ${divergentCost.length - 10} more`)
 
   return { ok, lines }
 }
@@ -339,7 +354,11 @@ export function readExport(db: Sqlite) {
   const { sessions, models, served, steps, orphans } = read()
   const records = buildRecords({ sessions, models, served, steps })
   const check = verify({ sessions, records, orphanMessages: orphans })
-  return { sessions, records, orphanMessages: orphans, check }
+  const reportedCostTotal = records.reduce((total, record) => {
+    const cost = record["reportedCost"]
+    return total + (typeof cost === "number" ? cost : 0)
+  }, 0)
+  return { sessions, records, orphanMessages: orphans, reportedCostTotal, check }
 }
 
 export const ExportUsageCommand = effectCmd({
@@ -369,7 +388,7 @@ export const ExportUsageCommand = effectCmd({
     const db = new Sqlite(file, { readonly: true })
 
     try {
-      const { sessions, records, check } = readExport(db)
+      const { sessions, records, reportedCostTotal, check } = readExport(db)
 
       const summary = {
         type: "summary",
@@ -378,7 +397,7 @@ export const ExportUsageCommand = effectCmd({
         exportedAt: new Date().toISOString(),
         sessions: sessions.length,
         records: records.length,
-        reportedCostTotal: sessions.reduce((total, session) => total + session.cost, 0),
+        reportedCostTotal,
         verified: check.ok,
       }
 

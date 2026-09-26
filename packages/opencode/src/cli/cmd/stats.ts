@@ -169,7 +169,7 @@ export const aggregateSessionStats = Effect.fn("Cli.stats.aggregate")(function* 
           .messages({ sessionID: session.id })
           .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed([])))
 
-        const sessionTokens = session.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+        const sessionTokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
         let sessionToolUsage: Record<string, number> = {}
         let sessionModelUsage: Record<
           string,
@@ -229,6 +229,11 @@ export const aggregateSessionStats = Effect.fn("Cli.stats.aggregate")(function* 
               usage.tokens.output += item.tokens.output + item.tokens.reasoning
               usage.tokens.cache.read += item.tokens.cache.read
               usage.tokens.cache.write += item.tokens.cache.write
+              sessionTokens.input += item.tokens.input
+              sessionTokens.output += item.tokens.output
+              sessionTokens.reasoning += item.tokens.reasoning
+              sessionTokens.cache.read += item.tokens.cache.read
+              sessionTokens.cache.write += item.tokens.cache.write
               messageModels.add(item.modelKey)
             }
 
