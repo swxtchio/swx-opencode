@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
-import { launchEffort, parseModel, recentModels } from "../../src/context/local"
+import { parseModel, recentModels } from "../../src/context/local"
+import { effortInForce, launchEffort } from "../../src/util/effort"
 
 test("parses model IDs containing slashes", () => {
   expect(parseModel("provider/family/model")).toEqual({
@@ -33,4 +34,13 @@ test("refuses an unknown launch effort, naming the model and the choices", () =>
     error: 'Unknown effort "hgih" for p/m. Available: high, low',
   })
   expect(launchEffort("high", "p/m", [])).toEqual({ error: 'Unknown effort "high" for p/m. This model declares none.' })
+})
+
+// GOAL: the launch effort wins over the saved one only for a model that declares it, and an
+// explicit "default" always applies; otherwise the saved effort is in force.
+test("applies the launch effort only where the model declares it", () => {
+  expect(effortInForce("high", ["low", "high"], "low")).toBe("high")
+  expect(effortInForce("high", ["low"], "low")).toBe("low")
+  expect(effortInForce("default", [], "low")).toBe("default")
+  expect(effortInForce(undefined, ["low", "high"], "low")).toBe("low")
 })

@@ -12,6 +12,7 @@ import { readJson, writeJsonAtomic } from "../util/persistence"
 import { useTheme } from "./theme"
 import { useToast } from "../ui/toast"
 import { useRoute } from "./route"
+import { effortInForce, launchEffort } from "../util/effort"
 import { usePermission } from "./permission"
 
 export type LocalTheme = {
@@ -30,14 +31,6 @@ export function parseModel(model: string) {
     providerID: providerID,
     modelID: rest.join("/"),
   }
-}
-
-// The effort `--effort` asks for at launch, checked against what the model declares. An
-// unknown one is refused with the choices, never silently dropped (#29's rule for `run`).
-export function launchEffort(requested: string, model: string, available: string[]) {
-  if (requested === "default" || available.includes(requested)) return { effort: requested }
-  const hint = available.length ? ` Available: ${[...available].sort().join(", ")}` : " This model declares none."
-  return { error: `Unknown effort "${requested}" for ${model}.${hint}` }
 }
 
 export function recentModels(
@@ -252,20 +245,22 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         )
       })
 
-      // --effort is a launch override for the model that is current at launch. It is never
-      // saved, and choosing an effort in the app replaces it.
-      const [launch, setLaunch] = createSignal<{ key: string; effort: string }>()
-      const launchState = { decided: !args.variant }
+      // --effort overrides the saved effort for whichever model is current, while that model
+      // declares it, until the user picks an effort in the app (see util/effort). It is
+      // never saved. A model that does not declare it gets one warning.
+      const [launchActive, setLaunchActive] = createSignal(args.variant !== undefined)
+      const warned = new Set<string>()
       createEffect(() => {
-        if (launchState.decided || !args.variant) return
+        if (args.variant === undefined || !launchActive() || !modelStore.ready) return
         const m = currentModel()
         const provider = m && sync.data.provider.find((item) => item.id === m.providerID)
         if (!m || !provider) return
-        launchState.decided = true
         const key = `${m.providerID}/${m.modelID}`
+        if (warned.has(key)) return
         const decided = launchEffort(args.variant, key, Object.keys(provider.models[m.modelID]?.variants ?? {}))
-        if (decided.error !== undefined) return toast.show({ variant: "error", message: decided.error, duration: 8000 })
-        setLaunch({ key, effort: decided.effort })
+        if (decided.error === undefined) return
+        warned.add(key)
+        toast.show({ variant: "error", message: decided.error, duration: 8000 })
       })
 
       return {
@@ -388,13 +383,14 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             const m = currentModel()
             if (!m) return undefined
             const key = `${m.providerID}/${m.modelID}`
-            const override = launch()
-            if (override?.key === key) return override.effort
-            return modelStore.variant[key]
+            return effortInForce(launchActive() ? args.variant : undefined, this.list(), modelStore.variant[key])
           },
           current() {
             const v = this.selected()
             if (!v) return undefined
+            // An explicit `--effort default` is sent as-is, so it overrides an agent's configured
+            // effort the same way it does for `run`.
+            if (v === "default") return launchActive() && args.variant === "default" ? v : undefined
             if (!this.list().includes(v)) return undefined
             return v
           },
@@ -410,7 +406,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             const m = currentModel()
             if (!m) return
             const key = `${m.providerID}/${m.modelID}`
-            setLaunch(undefined)
+            setLaunchActive(false)
             setModelStore("variant", key, value ?? "default")
             save()
           },

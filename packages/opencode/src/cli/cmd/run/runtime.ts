@@ -19,6 +19,7 @@ import { createRunDemo } from "./demo"
 import { resolveModelInfo, resolveRunTuiConfig, resolveSessionInfo } from "./runtime.boot"
 import { createRuntimeLifecycle } from "./runtime.lifecycle"
 import { trace } from "./trace"
+import { effortInForce, launchEffort } from "@opencode-ai/tui/util/effort"
 import { cycleVariant, formatModelLabel, resolveSavedVariant, resolveVariant, saveVariant } from "./variant.shared"
 import type { LocalReplayAnchor, LocalReplayRow, RunInput, RunPrompt, RunProvider, StreamCommit } from "./types"
 
@@ -124,6 +125,8 @@ type RuntimeState = {
   variants: string[]
   limits: Record<string, number>
   activeVariant: string | undefined
+  // --effort while it still applies: cleared once the user picks an effort in the app.
+  launchVariant: string | undefined
   sessionID: string
   history: RunPrompt[]
   localRows: LocalReplayRow[]
@@ -202,11 +205,25 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
     variants: [],
     limits: {},
     activeVariant: resolveVariant(ctx.variant, session.variant, savedVariant, []),
+    launchVariant: ctx.variant,
     sessionID: ctx.sessionID,
     history: [...session.history],
     localRows: [],
     sessionTitle: ctx.sessionTitle,
     agent: ctx.agent,
+  }
+  // --effort for a model, applied only where the model declares it (see util/effort), with
+  // one warning per model that does not.
+  const warnedEffort = new Set<string>()
+  const launchFor = (model: RuntimeState["model"], variants: string[]) => {
+    if (state.launchVariant === undefined || !model) return undefined
+    const key = `${model.providerID}/${model.modelID}`
+    const decided = launchEffort(state.launchVariant, key, variants)
+    if (decided.error !== undefined && !warnedEffort.has(key) && !footer.isClosed) {
+      warnedEffort.add(key)
+      footer.append({ kind: "error", text: decided.error, phase: "final", source: "system" })
+    }
+    return effortInForce(state.launchVariant, variants, undefined)
   }
   const ensureSession = () => {
     if (!input.resolveSession || state.sessionID) {
@@ -273,6 +290,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
         }
       }
 
+      state.launchVariant = undefined
       state.activeVariant = cycleVariant(state.activeVariant, state.variants)
       saveVariant(state.model, state.activeVariant)
       return {
@@ -295,7 +313,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
           return
         }
 
-        state.activeVariant = resolveVariant(ctx.variant, undefined, saved, state.variants)
+        state.activeVariant = resolveVariant(launchFor(model, state.variants), undefined, saved, state.variants)
       })
       state.switching = switching
       await switching
@@ -328,6 +346,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
         }
       }
 
+      state.launchVariant = undefined
       state.activeVariant = variant
       saveVariant(state.model, state.activeVariant)
       return {
@@ -432,7 +451,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
     state.variants = variantsFor(state.providers, state.model)
     state.limits = info.limits
 
-    const next = resolveVariant(ctx.variant, session.variant, savedVariant, state.variants)
+    const next = resolveVariant(launchFor(state.model, state.variants), session.variant, savedVariant, state.variants)
     if (next !== state.activeVariant) {
       state.activeVariant = next
     }

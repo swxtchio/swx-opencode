@@ -23,6 +23,7 @@ import { effectCmd } from "../effect-cmd"
 import { EOL } from "os"
 import { Filesystem } from "@/util/filesystem"
 import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
+import { NamedError } from "@opencode-ai/core/util/error"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
 
@@ -83,10 +84,14 @@ function block(info: Inline, output?: string) {
   UI.empty()
 }
 
+// Bounded backstops only: the real signals are the events these wait for.
+const CONNECT_BACKSTOP_MS = 10_000
+const SESSION_ERROR_BACKSTOP_MS = 3_000
+
 // The HTTP error middleware's stand-in for an unhandled server error: a NamedError.Unknown
 // whose data carries only a log ref.
 function isGenericServerError(error: unknown) {
-  if (typeof error !== "object" || error === null || !("name" in error) || error.name !== "UnknownError") return false
+  if (!NamedError.hasName(error, "UnknownError") || typeof error !== "object" || error === null) return false
   return "data" in error && typeof error.data === "object" && error.data !== null && "ref" in error.data
 }
 
@@ -698,10 +703,15 @@ export const RunCommand = effectCmd({
           return false
         }
 
-        // Settled once the loop has shown a session.error for this session. The server reports
-        // prompt validation errors (unknown effort, agent, command) by publishing that event
-        // and then failing the request, which reaches us only as a generic 500.
+        // Settled once the loop has shown a session.error for this session that arrived after
+        // the request was sent. The server reports prompt validation errors (unknown effort,
+        // agent, command) by publishing that event and then failing the request, which reaches
+        // us only as a generic 500. An earlier, unrelated session.error must not stand in for it.
         const sessionError = Promise.withResolvers<void>()
+        const request = { sent: false }
+        // Settled when the event stream is live, so an error published during the request
+        // cannot go out before the loop is listening (a slow --attach connection).
+        const connected = Promise.withResolvers<void>()
 
         // Consume one subscribed event stream for the active session and mirror it
         // to stdout/UI. `client` is passed explicitly because attach mode may
@@ -713,6 +723,8 @@ export const RunCommand = effectCmd({
           let error: string | undefined
 
           for await (const event of events.stream) {
+            if (event.type === "server.connected") connected.resolve()
+
             if (event.type === "session.created" && event.properties.info.parentID) {
               if (sessions.has(event.properties.info.parentID)) sessions.add(event.properties.info.id)
             }
@@ -800,7 +812,7 @@ export const RunCommand = effectCmd({
               }
               error = error ? error + EOL + err : err
               if (!emit("error", { error: props.error })) UI.error(err)
-              sessionError.resolve()
+              if (request.sent) sessionError.resolve()
               continue
             }
 
@@ -859,9 +871,16 @@ export const RunCommand = effectCmd({
             const generic = isGenericServerError(error)
             const shown =
               generic &&
-              (await Promise.race([sessionError.promise.then(() => true), Bun.sleep(3000).then(() => false)]))
+              (await Promise.race([
+                sessionError.promise.then(() => true),
+                Bun.sleep(SESSION_ERROR_BACKSTOP_MS).then(() => false),
+              ]))
             if (shown) return
             if (!emit("error", { error })) UI.error(formatRunError(error))
+          }
+          async function send() {
+            await Promise.race([connected.promise, Bun.sleep(CONNECT_BACKSTOP_MS)])
+            request.sent = true
           }
           async function finish() {
             if (args.attach) return
@@ -870,6 +889,7 @@ export const RunCommand = effectCmd({
           }
 
           if (args.command) {
+            await send()
             const result = await client.session.command({
               sessionID,
               agent,
@@ -884,6 +904,7 @@ export const RunCommand = effectCmd({
           }
 
           const model = pick(args.model)
+          await send()
           const result = await client.session.prompt({
             sessionID,
             agent,

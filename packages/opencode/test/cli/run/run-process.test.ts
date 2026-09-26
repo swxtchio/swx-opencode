@@ -114,6 +114,37 @@ describe("opencode run (non-interactive subprocess)", () => {
     deadline(60_000),
   )
 
+  // GOAL: in json mode the one error record is the published error, not the 500 body.
+  cliIt.concurrent(
+    "emits the real error as the json error record for an unknown effort",
+    ({ opencode }) =>
+      Effect.gen(function* () {
+        const result = yield* opencode.run("say hi", { extraArgs: ["--format", "json", "--effort", "no-such-effort"] })
+        expect(result.exitCode).toBeGreaterThan(0)
+        const errors = result.stdout
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line))
+          .filter((record) => record.type === "error")
+        expect(errors).toHaveLength(1)
+        expect(JSON.stringify(errors[0])).toContain('Unknown effort \\"no-such-effort\\"')
+      }),
+    deadline(60_000),
+  )
+
+  // GOAL: --command forwards the effort into the same validation, and its error surfaces too.
+  cliIt.concurrent(
+    "prints the real error for an unknown effort on a --command run",
+    ({ opencode }) =>
+      Effect.gen(function* () {
+        const result = yield* opencode.run("x", { extraArgs: ["--command", "init", "--effort", "no-such-effort"] })
+        expect(result.exitCode).toBeGreaterThan(0)
+        expect(result.stderr).toContain('Unknown effort "no-such-effort"')
+        expect(result.stderr).not.toContain("Unexpected server error")
+      }),
+    deadline(60_000),
+  )
+
   // The test provider's SSE error item is interpreted by the SDK as an unknown
   // finish, not a fatal provider/session error. Unknown finishes should continue
   // the prompt loop so a subsequent response can complete the run.
