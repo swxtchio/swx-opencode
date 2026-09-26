@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test"
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { changesetMarker, localGit, syncUpstream, type Git, type SyncOptions } from "./sync-upstream"
+import { changesetMarker, githubSlug, localGit, syncUpstream, type Git, type SyncOptions } from "./sync-upstream"
 
 // Every test builds a throwaway world with real git and no network: a bare `upstream`
 // (the upstream repository), a bare `origin` (the fork), and a `work` checkout wired to
@@ -481,6 +481,56 @@ describe("syncUpstream", () => {
     expect(result.token).toBe("SYNC_MERGE_FAILED")
   })
 
+  // GOAL: a publisher like GitHub's fork sync, which moves the mirror to upstream's current tip
+  // rather than the pinned commit, counts as published when the mirror contains that commit.
+  test("a publisher that lands past the pinned commit counts as pushed", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    const published: string[] = []
+
+    const result = run(w.work, {
+      publishMirror: (sha) => {
+        published.push(sha)
+        advanceUpstream(w, "later.txt", "after the pin")
+        git(w.upsrc, "push", "-q", w.origin, "dev:refs/heads/dev")
+        return true
+      },
+    })
+
+    expect(published).toEqual([git(w.work, "rev-parse", "upstream/dev")])
+    expect(result.out).toContain("MIRROR: pushed dev to origin")
+    expect(result.token).toBe("SYNC_CLEAN")
+  })
+
+  // GOAL: a mirror already ahead of the pinned commit is current, and nothing is published;
+  // with a fork-sync-only ruleset a push of an older commit would only be refused.
+  test("a mirror already past the pinned commit is current", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+    advanceUpstream(w, "later.txt", "ahead")
+    git(w.upsrc, "push", "-q", w.origin, "dev:refs/heads/dev")
+    git(w.upsrc, "reset", "-q", "--hard", "HEAD^")
+    git(w.upsrc, "push", "-q", "-f", w.up, "dev")
+    const published: string[] = []
+
+    const result = run(w.work, { publishMirror: (sha) => published.push(sha) > 0 })
+
+    expect(published).toEqual([])
+    expect(result.out).toContain("MIRROR: origin/dev already current")
+    expect(result.token).toBe("SYNC_CLEAN")
+  })
+
+  // GOAL: a publisher that fails and moves nothing is reported as a failed push.
+  test("a publisher that fails without moving the mirror is a failed push", () => {
+    const w = world()
+    advanceUpstream(w, "feature.txt", "new")
+
+    const result = run(w.work, { publishMirror: () => false })
+
+    expect(result.out).toContain("MIRROR: WARNING could not push dev to origin")
+    expect(result.token).toBe("SYNC_CLEAN")
+  })
+
   test.each([
     ["an uncommitted edit", (w: ReturnType<typeof world>) => writeFileSync(path.join(w.work, "fork.txt"), "dirty\n")],
     [
@@ -939,5 +989,21 @@ describe("sync-upstream CLI", () => {
     expect(result.code).toBe(2)
     expect(result.out).toContain("refusing to run in the PRIMARY checkout")
     expect(syncBranches(w.work)).toBe("")
+  })
+})
+
+describe("githubSlug", () => {
+  // GOAL: the CLI picks GitHub's fork sync exactly for github.com remotes, in each URL form.
+  test.each([
+    ["https://github.com/swxtchio/swx-opencode", "swxtchio/swx-opencode"],
+    ["https://github.com/swxtchio/swx-opencode.git", "swxtchio/swx-opencode"],
+    ["git@github.com:swxtchio/swx-opencode.git", "swxtchio/swx-opencode"],
+    ["ssh://git@github.com/swxtchio/swx-opencode.git", "swxtchio/swx-opencode"],
+  ])("reads %s as %s", (url, slug) => {
+    expect(githubSlug(url)).toBe(slug)
+  })
+
+  test.each(["/tmp/origin.git", "https://gitlab.com/a/b", "https://github.com/only-owner", ""])("rejects %p", (url) => {
+    expect(githubSlug(url)).toBeUndefined()
   })
 })

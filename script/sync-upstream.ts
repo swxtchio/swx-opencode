@@ -20,7 +20,9 @@
 // In order it:
 //   1. Requires a clean tree and the upstream/origin remotes, and fetches both.
 //   2. Validates every abort condition before moving or pushing anything.
-//   3. Fast-forwards dev to upstream/dev (FF only) and pushes it to origin.
+//   3. Fast-forwards dev to upstream/dev (FF only) and publishes it to origin: through
+//      GitHub's fork sync (`gh repo sync`) for a GitHub origin, since this repository's
+//      ruleset rejects pushes to dev, and a plain push otherwise.
 //   4. Stops with SYNC_UPTODATE when origin/swxtch already contains upstream/dev.
 //   5. Creates sync-upstream-<UTC timestamp> off origin/swxtch, runs `git merge --no-ff`, and
 //      adds the sync's entry to CHANGESET.md inside that same merge.
@@ -73,6 +75,9 @@ export type SyncOptions = {
   // repositories turn it off.
   allowPrimary?: boolean
   now?: Date
+  // Publishes the mirror at the pinned commit; returns whether it reported success. The CLI
+  // uses GitHub's fork sync for a GitHub origin (see mirrorPublisher). Default: git push.
+  publishMirror?: (sha: string) => boolean
 }
 
 export const exitCodes = {
@@ -209,30 +214,41 @@ export function syncUpstream(options: SyncOptions) {
   if (mirrorAction === "current") log(`MIRROR: ${mirror} already at ${upstreamRef} (${short(upSha)})`)
   const mirrorMoved = mirrorAction !== "current"
 
-  // A failed push does not stop the sync, since the sync PR carries the same commits, but
-  // it is reported here and in the final line. Only the mirror ref is pushed, never tags.
-  // Every push destination is read directly, before and after: origin's fetch URL (and so
-  // origin/dev) can differ from its push URLs, a remote can have several push URLs that
-  // `git push` writes to in turn, and a push can update a ref and still exit nonzero, while
-  // the report token depends on whether anything moved.
+  // A failed publish does not stop the sync, since the sync PR carries the same commits, but
+  // it is reported here and in the final line. Every push destination is read directly,
+  // before and after: origin's fetch URL (and so origin/dev) can differ from its push URLs,
+  // a remote can have several push URLs that `git push` writes to in turn, and a publish can
+  // update a ref and still report failure, while the report token depends on whether
+  // anything moved.
+  const publish =
+    options.publishMirror ??
+    ((sha: string) => git("push", "--no-follow-tags", origin, `${sha}:${mirrorRef}`).code === 0)
   const pushUrls = git("remote", "get-url", "--push", "--all", origin).stdout.split("\n").filter(Boolean)
   const destinations = () =>
     pushUrls.map((url) => {
       const remote = git("ls-remote", url, mirrorRef)
       return remote.code === 0 ? (remote.stdout.split(/\s/)[0] ?? "") : undefined
     })
-  const pushMirror = (before: (string | undefined)[]) => {
-    if (git("push", "--no-follow-tags", origin, `${upSha}:${mirrorRef}`).code === 0) return "pushed"
+  // Published means the destination contains the pinned commit, not only equals it: GitHub's
+  // fork sync moves the mirror to upstream's current tip, which can be past the pinned one.
+  const reaches = (sha: string | undefined) => {
+    if (!sha) return false
+    if (sha === upSha) return true
+    if (!commit(sha)) git("fetch", "-q", "--no-tags", "--refmap=", origin, sha)
+    return isAncestor(upSha, sha)
+  }
+  const publishMirror = (before: (string | undefined)[]) => {
+    if (publish(upSha)) return "pushed"
     const after = destinations()
     // No readable destinations means the outcome is unknown, not vacuously "pushed".
     if (after.length === 0 || after.includes(undefined)) return "unknown"
-    if (after.every((sha) => sha === upSha)) return "pushed"
-    // A destination unread before the push cannot show whether it moved.
+    if (after.every(reaches)) return "pushed"
+    // A destination unread before the publish cannot show whether it moved.
     if (before.includes(undefined)) return "unknown"
     return after.some((sha, index) => sha !== before[index]) ? "partial" : "failed"
   }
   const before = destinations()
-  const push = before.length > 0 && before.every((sha) => sha === upSha) ? "current" : pushMirror(before)
+  const push = before.length > 0 && before.every(reaches) ? "current" : publishMirror(before)
   const mutated = mirrorMoved || push === "pushed" || push === "partial" || push === "unknown"
   if (push === "current") log(`MIRROR: ${origin}/${mirror} already current`)
   if (push === "pushed") log(`MIRROR: pushed ${mirror} to ${origin}`)
@@ -429,6 +445,26 @@ function recordSync(
   return { ok: true, message: `CHANGESET: recorded ${entry.range}` }
 }
 
+// How the CLI publishes the mirror. A GitHub fork can protect its mirror branch with a
+// ruleset that allows only GitHub's own fetch-and-merge (this repository's `upstream`
+// ruleset does), which rejects any push, so a GitHub origin is synced with `gh repo sync`.
+// Anything else keeps syncUpstream's default git push.
+export function mirrorPublisher(originUrl: string, mirror = "dev") {
+  const slug = githubSlug(originUrl)
+  if (!slug) return undefined
+  return () =>
+    Bun.spawnSync(["gh", "repo", "sync", slug, "--branch", mirror], { stdout: "pipe", stderr: "pipe" }).exitCode === 0
+}
+
+// owner/repo for a github.com remote URL in HTTPS or SSH form, otherwise undefined.
+export function githubSlug(url: string) {
+  const match =
+    /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/.exec(
+      url.trim(),
+    )
+  return match?.[1]
+}
+
 // Step off and delete a sync branch this run created, returning to where the run started.
 // Every outcome is read back from git, so the report never claims a cleanup that did not
 // happen.
@@ -477,5 +513,6 @@ if (import.meta.main) {
     console.log("SYNC_ABORT: not inside a git repository")
     process.exit(2)
   }
-  process.exit(syncUpstream({ git: localGit(top.stdout) }).code)
+  const git = localGit(top.stdout)
+  process.exit(syncUpstream({ git, publishMirror: mirrorPublisher(git("remote", "get-url", "origin").stdout) }).code)
 }
