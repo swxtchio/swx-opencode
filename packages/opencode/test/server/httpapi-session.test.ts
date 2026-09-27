@@ -1096,9 +1096,11 @@ describe("session HttpApi", () => {
   it.live(
     "serves the V1 prompt queue: list, withdraw, restore and send now",
     () => {
-      // Released on every exit before the fake LLM server shuts down, so a
-      // failing assertion cannot hold its reply open.
+      // On every exit, before the fake LLM server shuts down, abort the session
+      // and release its held reply, so a failing assertion ends the drain and
+      // the queued command request instead of leaving them retrying.
       const gate = Deferred.makeUnsafe<void>()
+      const stop: { abort?: Effect.Effect<unknown, unknown, HttpClient.HttpClient> } = {}
       return Effect.gen(function* () {
         const llm = yield* TestLLMServer
         yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
@@ -1110,6 +1112,7 @@ describe("session HttpApi", () => {
         const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
         const params = { sessionID: session.id }
         const model = { providerID: "test", modelID: "test-model" }
+        stop.abort = request(pathFor(SessionPaths.abort, params), { method: "POST", headers })
         const post = (path: string, body: unknown) =>
           request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
         const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
@@ -1207,7 +1210,12 @@ describe("session HttpApi", () => {
         expect(yield* responseJson(idle)).toMatchObject({ info: { role: "assistant" } })
         expect(lastUser((yield* llm.inputs)[3])).toEqual({ role: "user", content: "queued while idle" })
       }).pipe(
-        Effect.ensuring(Deferred.succeed(gate, void 0)),
+        Effect.ensuring(
+          Effect.suspend(() => stop.abort ?? Effect.void).pipe(
+            Effect.ignore,
+            Effect.andThen(Deferred.succeed(gate, void 0)),
+          ),
+        ),
         Effect.provide(TestLLMServer.layer),
         Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
       )
