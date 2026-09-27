@@ -29,6 +29,12 @@ export type PromotedInput = SessionPromptQueue.QueuedInput & {
   readonly messageID: MessageID
 }
 
+/** A prompt's own item was withdrawn, by an editor, before it could be delivered. */
+export class WithdrawnError extends Schema.TaggedErrorClass<WithdrawnError>()("SessionQueueWithdrawnError", {
+  sessionID: Schema.String,
+  itemID: Schema.String,
+}) {}
+
 export interface Interface {
   readonly admit: (input: AdmitInput) => Effect.Effect<Item>
   readonly list: (sessionID: SessionID) => Effect.Effect<Item[]>
@@ -78,6 +84,7 @@ export interface Interface {
   readonly park: (sessionID: SessionID, seen?: number) => Effect.Effect<void>
   /** The joiner re-check's signal: admitted work no drain has read yet, on a session that is not parked. */
   readonly awaitingDrain: (sessionID: SessionID) => Effect.Effect<boolean>
+  readonly withdrawn: (sessionID: SessionID, itemID: ItemID) => Effect.Effect<boolean>
   /** Whether no drain has read this item yet (withdrawn items excluded). */
   readonly unread: (sessionID: SessionID, itemID: ItemID) => Effect.Effect<boolean>
   /** The message an item became, once; lets its prompt find its own reply. */
@@ -519,6 +526,22 @@ const layer = Layer.effect(
       return row !== undefined
     })
 
+    const withdrawn = Effect.fn("SessionQueue.withdrawn")(function* (sessionID: SessionID, itemID: ItemID) {
+      const row = yield* db
+        .select({ id: SessionPromptQueueTable.id })
+        .from(SessionPromptQueueTable)
+        .where(
+          and(
+            eq(SessionPromptQueueTable.id, itemID),
+            eq(SessionPromptQueueTable.session_id, sessionID),
+            isNotNull(SessionPromptQueueTable.time_withdrawn),
+          ),
+        )
+        .get()
+        .pipe(Effect.orDie)
+      return row !== undefined
+    })
+
     const delivered = (itemID: ItemID) =>
       Effect.sync(() => {
         const id = messages.get(itemID)
@@ -536,6 +559,7 @@ const layer = Layer.effect(
       consume,
       park,
       awaitingDrain,
+      withdrawn,
       unread,
       delivered,
       exclusive,

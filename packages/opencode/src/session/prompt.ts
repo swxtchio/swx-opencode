@@ -103,10 +103,12 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
-  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
-  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly command: (
+    input: CommandInput,
+  ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
 }
 
@@ -1081,7 +1083,9 @@ const layer = Layer.effect(
 
     const createUserMessage = (input: PromptInput) => prepareUserMessage(input).pipe(Effect.flatMap(writeUserMessage))
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
+    const prompt: (
+      input: PromptInput,
+    ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError> = Effect.fn(
       "SessionPrompt.prompt",
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
@@ -1448,13 +1452,29 @@ const layer = Layer.effect(
       (effect, sessionID) => effect.pipe(Effect.onInterrupt(() => queue.park(sessionID))),
     )
 
-    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = (input) => drain(input.sessionID)
+    // Without an own item there is nothing that can be withdrawn from under it.
+    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = (input) =>
+      drain(input.sessionID).pipe(Effect.orDie)
 
     // Runs or joins the session's drain. With `own`, returns the reply to that
     // prompt: the drain's final message may answer another caller's prompt.
-    const drain: (sessionID: SessionID, own?: SessionQueue.ItemID) => Effect.Effect<SessionV1.WithParts> = Effect.fn(
-      "SessionPrompt.loop",
-    )(function* (sessionID: SessionID, own?: SessionQueue.ItemID) {
+    const drain: (
+      sessionID: SessionID,
+      own?: SessionQueue.ItemID,
+    ) => Effect.Effect<SessionV1.WithParts, SessionQueue.WithdrawnError> = Effect.fn("SessionPrompt.loop")(function* (
+      sessionID: SessionID,
+      own?: SessionQueue.ItemID,
+    ) {
+      const withdrawn = own
+        ? queue
+            .withdrawn(sessionID, own)
+            .pipe(
+              Effect.flatMap((gone) =>
+                gone ? Effect.fail(new SessionQueue.WithdrawnError({ sessionID, itemID: own })) : Effect.void,
+              ),
+            )
+        : Effect.void
+      yield* withdrawn
       const result = yield* state.ensureRunning(sessionID, lastAssistant(sessionID), runLoop(sessionID))
       // Work admitted after the joined run's last history read would otherwise
       // wait for another prompt. This caller's own prompt is drained before it
@@ -1471,7 +1491,7 @@ const layer = Layer.effect(
         )
       }
       const message = own ? yield* queue.delivered(own) : undefined
-      if (!message) return result
+      if (!message) return yield* withdrawn.pipe(Effect.as(result))
       const answer = yield* sessions
         .findMessage(sessionID, (m) => m.info.role === "assistant" && m.info.parentID === message)
         .pipe(Effect.orDie)
