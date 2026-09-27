@@ -27,6 +27,7 @@ import { Question } from "../../src/question"
 import { Todo } from "../../src/session/todo"
 import { Session } from "@/session/session"
 import { SessionMessageTable } from "@opencode-ai/core/session/sql"
+import { SessionPromptQueueSequenceTable, SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -1952,6 +1953,34 @@ it.instance(
         { role: "user", content: "wake up" },
         { role: "user", content: "survives the rebuild" },
       ])
+    }),
+  15_000,
+)
+
+it.instance(
+  "queued prompts disappear with their session",
+  () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const { prompt, sessions, chat, task, send } = yield* startHeld()
+      const held = yield* send("deleted with the session", { delivery: "queue" })
+      yield* queued(chat.id, 1)
+      yield* prompt.cancel(chat.id)
+      yield* finish(task, held)
+
+      yield* sessions.remove(chat.id)
+      const rows = yield* db
+        .select({ id: SessionPromptQueueTable.id })
+        .from(SessionPromptQueueTable)
+        .where(eq(SessionPromptQueueTable.session_id, chat.id))
+        .all()
+      const sequences = yield* db
+        .select({ seq: SessionPromptQueueSequenceTable.seq })
+        .from(SessionPromptQueueSequenceTable)
+        .where(eq(SessionPromptQueueSequenceTable.session_id, chat.id))
+        .all()
+      expect(rows).toEqual([])
+      expect(sequences).toEqual([])
     }),
   15_000,
 )
