@@ -46,6 +46,7 @@ type HttpError = {
   type: "http-error"
   status: number
   body: unknown
+  wait?: PromiseLike<unknown>
 }
 
 export type Item = Sse | HttpError
@@ -480,33 +481,29 @@ export class Reply {
     return this
   }
 
+  finish(value: string) {
+    this.#finish = value
+    this.#hang = false
+    this.#error = undefined
+    this.#reset = false
+    return this
+  }
+
   wait(value: PromiseLike<unknown>) {
     this.#wait = value
     return this
   }
 
   stop() {
-    this.#finish = "stop"
-    this.#hang = false
-    this.#error = undefined
-    this.#reset = false
-    return this
+    return this.finish("stop")
   }
 
   contentFilter() {
-    this.#finish = "content_filter"
-    this.#hang = false
-    this.#error = undefined
-    this.#reset = false
-    return this
+    return this.finish("content_filter")
   }
 
   toolCalls() {
-    this.#finish = "tool_calls"
-    this.#hang = false
-    this.#error = undefined
-    this.#reset = false
-    return this
+    return this.finish("tool_calls")
   }
 
   tool(name: string, input: unknown) {
@@ -565,11 +562,12 @@ export function reply() {
   return new Reply()
 }
 
-export function httpError(status: number, body: unknown): Item {
+export function httpError(status: number, body: unknown, wait?: PromiseLike<unknown>): Item {
   return {
     type: "http-error",
     status,
     body,
+    wait,
   }
 }
 
@@ -621,7 +619,7 @@ namespace TestLLMServer {
     readonly toolHang: (name: string, input: unknown) => Effect.Effect<void>
     readonly reason: (value: string, opts?: { text?: string; usage?: Usage }) => Effect.Effect<void>
     readonly fail: (message?: unknown) => Effect.Effect<void>
-    readonly error: (status: number, body: unknown) => Effect.Effect<void>
+    readonly error: (status: number, body: unknown, wait?: PromiseLike<unknown>) => Effect.Effect<void>
     readonly hang: Effect.Effect<void>
     readonly hold: (value: string, wait: PromiseLike<unknown>) => Effect.Effect<void>
     readonly reset: Effect.Effect<void>
@@ -690,7 +688,11 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         }
         hits = [...hits, current]
         yield* notify()
-        if (next.type !== "sse") return fail(next)
+        if (next.type !== "sse") {
+          const wait = next.wait
+          if (wait) yield* Effect.promise(() => wait)
+          return fail(next)
+        }
         if (mode === "responses") return send(responses(next, modelFrom(body)))
         if (next.reset) {
           yield* reset(next)
@@ -747,8 +749,8 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         fail: Effect.fn("TestLLMServer.fail")(function* (message: unknown = "boom") {
           queue(reply().streamError(message).item())
         }),
-        error: Effect.fn("TestLLMServer.error")(function* (status: number, body: unknown) {
-          queue(httpError(status, body))
+        error: Effect.fn("TestLLMServer.error")(function* (status: number, body: unknown, wait?: PromiseLike<unknown>) {
+          queue(httpError(status, body, wait))
         }),
         hang: Effect.gen(function* () {
           queue(reply().hang().item())

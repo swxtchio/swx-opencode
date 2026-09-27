@@ -1656,6 +1656,15 @@ export type ServerConfig = {
   cors?: Array<string>
 }
 
+export type MachineMessageMarker =
+  | {
+      type: "prefix"
+      value: string
+    }
+  | {
+      type: "fleet-heartbeat"
+    }
+
 export type PermissionActionConfig = "ask" | "allow" | "deny"
 
 export type PermissionObjectConfig = {
@@ -1902,6 +1911,13 @@ export type Config = {
       variant?: string
       subtask?: boolean
     }
+  }
+  /**
+   * Delivery rules for machine-generated session messages.
+   */
+  machine_message_markers?: {
+    hold?: Array<MachineMessageMarker>
+    critical?: Array<MachineMessageMarker>
   }
   skills?: {
     paths?: Array<string>

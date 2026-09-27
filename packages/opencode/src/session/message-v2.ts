@@ -583,22 +583,41 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
 // ([compaction-user, summary, ...retained tail..., continue-user]), so array
 // position is not chronological. IDs are only a deterministic tie-breaker
 // because imported messages do not necessarily have monotonic IDs.
-export function latest(msgs: WithParts[], options?: { excludedUserIDs?: ReadonlySet<MessageID> }) {
+export function latest(
+  msgs: WithParts[],
+  options?: {
+    completedUserIDs?: ReadonlySet<MessageID>
+    userOrder?: (messageID: MessageID) => number | undefined
+  },
+) {
   let user: User | undefined
   let assistant: Assistant | undefined
   let finished: Assistant | undefined
   for (const msg of msgs) {
     const info = msg.info
-    if (info.role === "user" && !options?.excludedUserIDs?.has(info.id) && isAfter(info, user)) user = info
+    if (info.role === "user" && !options?.completedUserIDs?.has(info.id) && isAfterUser(info, user, options?.userOrder))
+      user = info
     if (info.role === "assistant" && isAfter(info, assistant)) assistant = info
     if (info.role === "assistant" && info.finish && isAfter(info, finished)) finished = info
   }
-  const tasks = msgs.flatMap((m) =>
-    finished && !isAfter(m.info, finished)
-      ? []
-      : m.parts.filter((p): p is CompactionPart | SubtaskPart => p.type === "compaction" || p.type === "subtask"),
-  )
+  const tasks = msgs.flatMap((msg) => {
+    const parentID = msg.info.role === "user" ? msg.info.id : msg.info.parentID
+    if (options?.completedUserIDs?.has(parentID) || (finished && !isAfter(msg.info, finished))) return []
+    return msg.parts.filter(
+      (part): part is CompactionPart | SubtaskPart => part.type === "compaction" || part.type === "subtask",
+    )
+  })
   return { user, assistant, finished, tasks }
+}
+
+function isAfterUser(info: User, other?: User, order?: (messageID: MessageID) => number | undefined) {
+  if (!other) return true
+  const currentOrder = order?.(info.id)
+  const previousOrder = order?.(other.id)
+  if (currentOrder !== undefined && previousOrder !== undefined) return currentOrder > previousOrder
+  if (currentOrder !== undefined) return true
+  if (previousOrder !== undefined) return false
+  return isAfter(info, other)
 }
 
 function isAfter(info: Info, other?: Info) {
