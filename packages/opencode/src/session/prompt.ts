@@ -1477,10 +1477,15 @@ const layer = Layer.effect(
       yield* withdrawn
       const result = yield* state.ensureRunning(sessionID, lastAssistant(sessionID), runLoop(sessionID))
       // Work admitted after the joined run's last history read would otherwise
-      // wait for another prompt. This caller's own prompt is drained before it
-      // returns; anyone else's is woken in the background.
-      if (yield* queue.awaitingDrain(sessionID)) {
-        if (own && (yield* queue.unread(sessionID, own))) return yield* drain(sessionID, own)
+      // wait for another prompt. This caller stays with the drains until one has
+      // read its own prompt and finished; anyone else's is woken in the background.
+      const waiting = yield* queue.awaitingDrain(sessionID)
+      if (own) {
+        const unread = waiting && (yield* queue.unread(sessionID, own))
+        if (unread || Exit.isFailure(yield* state.assertNotBusy(sessionID).pipe(Effect.exit)))
+          return yield* drain(sessionID, own)
+      }
+      if (waiting) {
         yield* drain(sessionID).pipe(
           Effect.catchCause((cause) =>
             Effect.logError("queue drain failed", { "session.id": sessionID, cause }).pipe(
