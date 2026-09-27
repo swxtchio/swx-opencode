@@ -2297,7 +2297,7 @@ it.instance(
   15_000,
 )
 
-it.instance(
+gated.instance(
   "a prompt admitted while a stopping turn is still in flight is not parked by that stop",
   () =>
     Effect.gen(function* () {
@@ -2308,16 +2308,21 @@ it.instance(
       const gate = yield* Deferred.make<void>()
       yield* llm.push(reply().wait(deferredAsPromise(gate)).contentFilter())
       yield* llm.text("after the stop")
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (gates.nextEnsureRunning = undefined)))
 
       const task = yield* prompt
         .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("start the task") })
         .pipe(Effect.forkChild)
       yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
-      // Admitted after the stopping turn's last history read: its stop never saw it.
+      // Admitted after the stopping turn's last history read, it joins that turn's
+      // run before the stop lands: the stop never saw it.
+      const joined = { reached: yield* Deferred.make<void>(), startedRun: false }
+      gates.nextEnsureRunning = joined
       const late = yield* prompt
         .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("admitted before the stop landed") })
         .pipe(Effect.forkChild)
-      yield* admitted(chat.id, "admitted before the stop landed")
+      yield* awaitWithTimeout(Deferred.await(joined.reached), "late prompt never reached the running turn")
+      expect(joined.startedRun).toBe(false)
       yield* Deferred.succeed(gate, void 0)
 
       const [, answer] = yield* finish(task, late)
@@ -2353,6 +2358,86 @@ gated.instance(
       expect(mentions(inputs[1], "steer during the continue")).toBe(false)
       expect(mentions(inputs[2], "Continue if you have next steps")).toBe(true)
       expect(lastUser(inputs[2])).toEqual({ role: "user", content: "steer during the continue" })
+    }),
+  15_000,
+)
+
+it.instance(
+  "two steers promoted into one run each get that run's reply, never their own message",
+  () =>
+    Effect.gen(function* () {
+      const { llm, chat, task, send, release } = yield* startHeld()
+      yield* llm.text("steered reply")
+
+      const first = yield* send("first steer")
+      yield* admitted(chat.id, "first steer")
+      const second = yield* send("second steer")
+      yield* admitted(chat.id, "second steer")
+      yield* release
+      const [, older, newer] = yield* finish(task, first, second)
+
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(2)
+      expect(mentions(inputs[1], "first steer")).toBe(true)
+      expect(lastUser(inputs[1])).toEqual({ role: "user", content: "second steer" })
+      for (const answer of [older, newer]) {
+        expect(answer?.info.role).toBe("assistant")
+        expect(answer?.parts.some((part) => part.type === "text" && part.text === "steered reply")).toBe(true)
+      }
+    }),
+  15_000,
+)
+
+it.instance(
+  "a withdraw that beats a new session's first queued prompt ends its caller with WithdrawnError",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const gate = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      heldResource.gate = gate
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (heldResource.gate = undefined)))
+
+      const first = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          delivery: "queue",
+          parts: [...said("first and withdrawn"), resourcePart(HELD_RESOURCE)],
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(gate.entered), "first prompt was never prepared")
+      const [item] = yield* queue.list(chat.id)
+      expect(Option.isSome(yield* queue.withdraw(chat.id, item!.id))).toBe(true)
+      yield* Deferred.succeed(gate.release, undefined)
+
+      const exit = yield* awaitWithTimeout(Fiber.await(first), "withdrawn first prompt never returned")
+      expect(Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined).toBeInstanceOf(SessionQueue.WithdrawnError)
+      expect(yield* sessions.messages({ sessionID: chat.id })).toEqual([])
+      expect(yield* llm.calls).toBe(0)
+    }),
+  15_000,
+)
+
+it.instance(
+  "an interrupted caller leaves no reply tracked for its prompt",
+  () =>
+    Effect.gen(function* () {
+      const { llm, queue, chat, task, send, release } = yield* startHeld()
+      yield* llm.text("delivered anyway")
+      const abandoned = yield* send("queued then abandoned", { delivery: "queue" })
+      const [item] = yield* queued(chat.id, 1)
+      yield* Fiber.interrupt(abandoned)
+
+      yield* release
+      yield* finish(task)
+      // The run still delivers the prompt; only its caller is gone.
+      expect(lastUser((yield* llm.inputs)[1])).toEqual({ role: "user", content: "queued then abandoned" })
+      expect(yield* queue.delivered(item!.id)).toBeUndefined()
     }),
   15_000,
 )

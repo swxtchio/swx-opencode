@@ -1320,6 +1320,75 @@ describe("session HttpApi", () => {
   )
 
   it.live(
+    "a sync prompt or command whose queued prompt is withdrawn answers 409 PromptWithdrawn",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue withdrawn caller" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const model = { providerID: "test", modelID: "test-model" }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+
+        yield* post(SessionPaths.promptAsync, { agent: "build", model, parts: [{ type: "text", text: "start" }] })
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        const prompt = yield* post(SessionPaths.prompt, {
+          agent: "build",
+          model,
+          delivery: "queue",
+          parts: [{ type: "text", text: "withdrawn while waiting" }],
+        }).pipe(Effect.forkChild)
+        const command = yield* post(SessionPaths.command, {
+          command: "init",
+          arguments: "",
+          model: "test/test-model",
+          delivery: "queue",
+        }).pipe(Effect.forkChild)
+        const items = yield* pollWithTimeout(
+          requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }).pipe(
+            Effect.map((items) => (items.length === 2 ? items : undefined)),
+          ),
+          "prompt and command never queued",
+        )
+        for (const item of items)
+          expect(
+            (yield* request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID: item.id }), {
+              method: "DELETE",
+              headers,
+            })).status,
+          ).toBe(200)
+        yield* Deferred.succeed(gate, void 0)
+
+        const promptItem = items.find((item) =>
+          item.input.parts.some((part) => part.type === "text" && part.text === "withdrawn while waiting"),
+        )!
+        const commandItem = items.find((item) => item.id !== promptItem.id)!
+        for (const [caller, item] of [
+          [prompt, promptItem],
+          [command, commandItem],
+        ] as const) {
+          const response = yield* awaitWithTimeout(Fiber.join(caller), "withdrawn caller never answered", "10 seconds")
+          expect(response.status).toBe(409)
+          expect(yield* responseJson(response)).toMatchObject({
+            _tag: "PromptWithdrawn",
+            sessionID: session.id,
+            itemID: item.id,
+          })
+        }
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, void 0)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
     "restore and send now wake an idle session whose prompts an abort parked",
     () =>
       Effect.gen(function* () {
