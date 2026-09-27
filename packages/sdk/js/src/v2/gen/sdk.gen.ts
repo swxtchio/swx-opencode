@@ -3482,7 +3482,7 @@ export class Queue extends HeyApiClient {
   /**
    * Restore withdrawn prompt
    *
-   * Return a withdrawn prompt to the queue with its original id and position, and wake the session so it is delivered.
+   * Return a withdrawn prompt to the queue with its original id and position, and wake the session so it is delivered. Fails with QueueItemNotWithdrawn when the item is not withdrawn: still pending, already delivered or never existed.
    */
   public restore<ThrowOnError extends boolean = false>(
     parameters: {

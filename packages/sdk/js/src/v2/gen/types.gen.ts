@@ -2652,6 +2652,13 @@ export type QueueItemNotPending = {
   message: string
 }
 
+export type QueueItemNotWithdrawn = {
+  _tag: "QueueItemNotWithdrawn"
+  sessionID: string
+  itemID: string
+  message: string
+}
+
 export type EventTuiPromptAppend = {
   type: "tui.prompt.append"
   properties: {
@@ -10684,9 +10691,9 @@ export type SessionQueueRestoreErrors = {
    */
   400: EffectHttpApiErrorBadRequest | InvalidRequestError
   /**
-   * NotFoundError
+   * NotFoundError | QueueItemNotWithdrawn
    */
-  404: NotFoundError
+  404: NotFoundError | QueueItemNotWithdrawn
 }
 
 export type SessionQueueRestoreError = SessionQueueRestoreErrors[keyof SessionQueueRestoreErrors]
