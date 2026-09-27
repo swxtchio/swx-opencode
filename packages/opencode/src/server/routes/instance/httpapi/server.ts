@@ -35,6 +35,7 @@ import { SessionProcessor } from "@/session/processor"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
+import { SessionQueue } from "@/session/queue"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
@@ -239,6 +240,7 @@ const app = LayerNode.group([
   RuntimeFlags.node,
   EventV2Bridge.node,
   SessionRunState.node,
+  SessionQueue.node,
   SessionProcessor.node,
   SessionCompaction.node,
   SessionRevert.node,

@@ -24,6 +24,7 @@ import { Todo } from "@/session/todo"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { SessionRunState } from "@/session/run-state"
+import { SessionQueue } from "@/session/queue"
 import { SessionProcessor } from "@/session/processor"
 import { SessionCompaction } from "@/session/compaction"
 import { SessionRevert } from "@/session/revert"
@@ -83,6 +84,7 @@ export const AppLayer = AppNodeBuilderV1.build(
     RuntimeFlags.node,
     EventV2Bridge.node,
     SessionRunState.node,
+    SessionQueue.node,
     SessionProcessor.node,
     SessionCompaction.node,
     SessionRevert.node,

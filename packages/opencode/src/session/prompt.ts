@@ -46,6 +46,8 @@ import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Type
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
+import { SessionQueue } from "./queue"
+import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
@@ -133,6 +135,7 @@ const layer = Layer.effect(
     const scope = yield* Scope.Scope
     const instruction = yield* Instruction.Service
     const state = yield* SessionRunState.Service
+    const queue = yield* SessionQueue.Service
     const revert = yield* SessionRevert.Service
     const summary = yield* SessionSummary.Service
     const sys = yield* SystemPrompt.Service
@@ -151,6 +154,8 @@ const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
+      // Parked before the interrupt, so no joiner of the cancelled run restarts it.
+      yield* queue.park(sessionID)
       yield* state.cancel(sessionID)
     })
 
@@ -1070,7 +1075,14 @@ const layer = Layer.effect(
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
-      const message = yield* createUserMessage(input)
+      // noReply writes its message directly and never drains. Every other prompt
+      // is admitted to the durable queue first, and a steer becomes a message at
+      // once unless a pending compaction must run before it.
+      const message = input.noReply === true ? yield* createUserMessage(input) : undefined
+      if (!message) {
+        yield* queue.admit(input)
+        yield* promote(input.sessionID, "steer")
+      }
       yield* sessions.touch(input.sessionID)
 
       const permissions: PermissionV1.Rule[] = []
@@ -1082,9 +1094,29 @@ const layer = Layer.effect(
         yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
       }
 
-      if (input.noReply === true) return message
+      if (message) return message
       return yield* loop({ sessionID: input.sessionID })
     })
+
+    const promote = (sessionID: SessionID, delivery: SessionQueue.Delivery) =>
+      queue.promote({ sessionID, delivery, create: createUserMessage })
+
+    // Inside a drain a pending item that cannot become a message is dropped by
+    // the queue; report it the way prompt_async reports a failed prompt and
+    // reevaluate, since the queue changed.
+    const promoteInLoop = (sessionID: SessionID, delivery: SessionQueue.Delivery) =>
+      promote(sessionID, delivery).pipe(
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.interrupt
+            : events
+                .publish(Session.Event.Error, {
+                  sessionID,
+                  error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
+                })
+                .pipe(Effect.as(true)),
+        ),
+      )
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1099,18 +1131,24 @@ const layer = Layer.effect(
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
+        let settled = false
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
+          yield* queue.consume(sessionID)
           let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
             Effect.provideService(Database.Service, database),
           )
 
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
+          // Steers parked by an abort or held behind a compaction reach the next step.
+          if (yield* promoteInLoop(sessionID, "steer")) continue
+          // A new session whose first prompt was queued runs it now.
+          if (!lastUser && (yield* promoteInLoop(sessionID, "queue"))) continue
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
           const lastAssistantMsg = msgs.findLast(
@@ -1141,7 +1179,12 @@ const layer = Layer.effect(
                 callID: orphan.callID,
               })
             }
+            // The session would go idle: a pending steer goes next, otherwise one
+            // queued item runs as its own turn before the loop reevaluates.
+            if (yield* promoteInLoop(sessionID, "steer")) continue
+            if (yield* promoteInLoop(sessionID, "queue")) continue
             yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
+            settled = true
             break
           }
 
@@ -1351,6 +1394,8 @@ const layer = Layer.effect(
           continue
         }
 
+        // A stop, error or structured result parks pending work until the next wake.
+        if (!settled) yield* queue.park(sessionID)
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
       },
@@ -1359,7 +1404,15 @@ const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      const result = yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        runLoop(input.sessionID),
+      )
+      // Work admitted after the joined run's last history read would otherwise
+      // wait for another prompt; drain again while it is pending and not parked.
+      if (yield* queue.awaitingDrain(input.sessionID)) return yield* loop(input)
+      return result
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
@@ -1486,6 +1539,7 @@ const layer = Layer.effect(
         agent: userAgent,
         parts,
         variant: input.variant,
+        delivery: input.delivery,
       })
       yield* events.publish(Command.Event.Executed, {
         name: input.command,
@@ -1512,27 +1566,10 @@ const ModelRef = Schema.Struct({
   modelID: ModelV2.ID,
 })
 
+// The payload fields live with the queue schema, which stores and lists them.
 export const PromptInput = Schema.Struct({
   sessionID: SessionID,
-  messageID: Schema.optional(MessageID),
-  model: Schema.optional(ModelRef),
-  agent: Schema.optional(Schema.String),
-  noReply: Schema.optional(Schema.Boolean),
-  tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)).annotate({
-    description:
-      "@deprecated tools and permissions have been merged, you can set permissions on the session itself now",
-  }),
-  format: Schema.optional(SessionV1.Format),
-  system: Schema.optional(Schema.String),
-  variant: Schema.optional(Schema.String),
-  parts: Schema.Array(
-    Schema.Union([
-      SessionV1.TextPartInput,
-      SessionV1.FilePartInput,
-      SessionV1.AgentPartInput,
-      SessionV1.SubtaskPartInput,
-    ]).annotate({ discriminator: "type" }),
-  ),
+  ...SessionPromptQueue.Input.fields,
 })
 export type PromptInput = Schema.Schema.Type<typeof PromptInput>
 
@@ -1557,6 +1594,7 @@ export const CommandInput = Schema.Struct({
   arguments: Schema.String,
   command: Schema.String,
   variant: Schema.optional(Schema.String),
+  delivery: Schema.optional(SessionPromptQueue.Delivery),
   // Inlined (no identifier annotation) to keep the original SDK output — the
   // PromptInput call site below references FilePartInput by ref via the
   // Schema export in message-v2.ts.
@@ -1634,6 +1672,7 @@ export const node = LayerNode.make({
     CrossSpawnSpawner.node,
     Instruction.node,
     SessionRunState.node,
+    SessionQueue.node,
     SessionRevert.node,
     SessionSummary.node,
     SystemPrompt.node,
