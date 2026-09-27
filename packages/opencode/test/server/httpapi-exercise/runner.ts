@@ -176,6 +176,23 @@ function withContext<A, E>(
             }),
           messages: (sessionID) =>
             run(modules.Session.Service.use((svc) => svc.messages({ sessionID }).pipe(Effect.orDie))),
+          queued: (sessionID, input) =>
+            run(
+              modules.SessionQueue.Service.use((svc) =>
+                Effect.gen(function* () {
+                  const item = yield* svc.admit({
+                    sessionID,
+                    agent: "build",
+                    model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+                    delivery: "queue",
+                    parts: [{ type: "text", text: input.text }],
+                  })
+                  if (input.withdrawn) yield* svc.withdraw(sessionID, item.id)
+                  return item
+                }),
+              ),
+            ),
+          queue: (sessionID) => run(modules.SessionQueue.Service.use((svc) => svc.list(sessionID))),
           todos: (sessionID, todos) => run(modules.Todo.Service.use((svc) => svc.update({ sessionID, todos }))),
           worktree: (input) => run(modules.Worktree.Service.use((svc) => svc.create(input).pipe(Effect.orDie))),
           worktreeRemove: (directory) =>
