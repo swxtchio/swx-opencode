@@ -3,10 +3,17 @@ import { $ } from "bun"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Global } from "@opencode-ai/core/global"
+import { Hash } from "@opencode-ai/core/util/hash"
+import { randomUUID } from "crypto"
 import fs from "fs/promises"
+import os from "os"
 import path from "path"
-import { Effect, Fiber, Layer } from "effect"
+import { Duration, Effect, Fiber, Layer, Semaphore } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import { Snapshot } from "../../src/snapshot"
+import { MaintenanceService, maintenanceNode } from "../../src/snapshot/maintenance"
+import type { RunInput } from "../../src/snapshot/maintenance"
 import {
   disposeAllInstances,
   provideInstance,
@@ -14,13 +21,115 @@ import {
   TestInstance,
   tmpdirScoped,
 } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
 
 const it = testEffect(
   Layer.mergeAll(LayerNode.compile(LayerNode.group([Snapshot.node, FSUtil.node])), testInstanceStoreLayer),
 )
+const maintenanceLockIt = testEffect(
+  Layer.mergeAll(LayerNode.compile(maintenanceNode), LayerNode.compile(CrossSpawnSpawner.node)),
+)
 // Windows forbids both * and : in directory names.
 const nonWindowsIt = process.platform === "win32" ? it.live.skip : it.live
+const nonWindowsMaintenanceLockIt = process.platform === "win32" ? maintenanceLockIt.live.skip : maintenanceLockIt.live
+
+const makeMaintenanceHarness = (input?: {
+  readonly run?: (command: RunInput) => Effect.Effect<{ exitCode: number; stderr: string }>
+  readonly onLock?: (file: string) => void
+  readonly beforeLock?: (file: string) => Effect.Effect<void>
+}) => {
+  const data = path.join(os.tmpdir(), `opencode-snapshot-maintenance-${randomUUID()}`)
+  const calls: RunInput[] = []
+  const locks = new Map<string, Semaphore.Semaphore>()
+  const lockCalls: string[] = []
+  const lockReleases: string[] = []
+  const clock = { now: 10_000_000 }
+  const runAdvance = { millis: 0 }
+  const randomValues: number[] = []
+  const outcome = { exitCode: 0, stderr: "" }
+  const service = MaintenanceService.of({
+    withLock: (file, self) => {
+      lockCalls.push(file)
+      input?.onLock?.(file)
+      if (!locks.has(file)) locks.set(file, Semaphore.makeUnsafe(1))
+      return locks
+        .get(file)!
+        .withPermits(1)(
+          Effect.gen(function* () {
+            if (input?.beforeLock) yield* input.beforeLock(file)
+            return yield* self
+          }),
+        )
+        .pipe(Effect.ensuring(Effect.sync(() => lockReleases.push(file))))
+    },
+    run: (command) => {
+      calls.push(command)
+      return (
+        input?.run?.(command) ??
+        Effect.sync(() => {
+          clock.now += runAdvance.millis
+          return outcome
+        })
+      )
+    },
+    now: Effect.sync(() => clock.now),
+    random: Effect.sync(() => randomValues.shift() ?? 0.5),
+  })
+  const layer = Layer.mergeAll(
+    LayerNode.compile(LayerNode.group([Snapshot.node, FSUtil.node]), [
+      [maintenanceNode, Layer.succeed(MaintenanceService, service)],
+      [Global.node, Layer.succeed(Global.Service, Global.Service.of(Global.make({ data })))],
+    ]),
+    LayerNode.compile(CrossSpawnSpawner.node),
+    testInstanceStoreLayer,
+  )
+  return { data, calls, lockCalls, lockReleases, clock, randomValues, runAdvance, outcome, it: testEffect(layer) }
+}
+
+const gcHarness = makeMaintenanceHarness()
+const scheduleHarness = makeMaintenanceHarness()
+const reapHarness = makeMaintenanceHarness()
+const lockOrder = { entered: () => {}, release: () => {} }
+const cleanupLockEntered = new Promise<void>((resolve) => (lockOrder.entered = resolve))
+const cleanupLockGate = new Promise<void>((resolve) => (lockOrder.release = resolve))
+const lockOrderHarness = makeMaintenanceHarness({
+  beforeLock: (file) => {
+    if (path.basename(file) !== "gc.lock") return Effect.void
+    lockOrder.entered()
+    return Effect.promise(() => cleanupLockGate)
+  },
+})
+const cleanupRace = { lockAttempts: 0, processCalls: 0, started: () => {}, contenderReady: () => {}, release: () => {} }
+const gcStarted = new Promise<void>((resolve) => (cleanupRace.started = resolve))
+const contenderReady = new Promise<void>((resolve) => (cleanupRace.contenderReady = resolve))
+const gcGate = new Promise<void>((resolve) => (cleanupRace.release = resolve))
+const concurrencyHarness = makeMaintenanceHarness({
+  onLock: (file) => {
+    if (path.basename(file) !== "gc.lock") return
+    cleanupRace.lockAttempts++
+    if (cleanupRace.lockAttempts === 2) cleanupRace.contenderReady()
+  },
+  run: () =>
+    Effect.promise(async () => {
+      cleanupRace.processCalls++
+      if (cleanupRace.processCalls === 2) cleanupRace.contenderReady()
+      cleanupRace.started()
+      await gcGate
+      return { exitCode: 0, stderr: "" }
+    }),
+})
+const fixtureRoots = [
+  gcHarness.data,
+  scheduleHarness.data,
+  reapHarness.data,
+  lockOrderHarness.data,
+  concurrencyHarness.data,
+]
+const gcIt = gcHarness.it
+const scheduleIt = scheduleHarness.it
+const reapIt = reapHarness.it
+const lockOrderIt = lockOrderHarness.it
+const concurrencyIt = concurrencyHarness.it
 
 // Git always outputs /-separated paths internally. Snapshot.patch() joins them
 // with path.join (which produces \ on Windows) then normalizes back to /.
@@ -32,7 +141,312 @@ const MIXED_BATCH_GROUP_COUNT = Math.ceil(OVER_BATCH_COUNT / 4)
 
 afterEach(async () => {
   await disposeAllInstances()
+  cleanupRace.release()
+  lockOrder.release()
+  await Promise.all(fixtureRoots.map((dir) => fs.rm(dir, { recursive: true, force: true })))
+  for (const harness of [gcHarness, scheduleHarness, reapHarness, lockOrderHarness, concurrencyHarness]) {
+    harness.calls.length = 0
+    harness.lockCalls.length = 0
+    harness.lockReleases.length = 0
+    harness.randomValues.length = 0
+    harness.clock.now = 10_000_000
+    harness.runAdvance.millis = 0
+    harness.outcome.exitCode = 0
+    harness.outcome.stderr = ""
+  }
 })
+
+const snapshotGitdir = async (data: string, worktree: string) => {
+  for (const project of await fs.readdir(path.join(data, "snapshot"), { withFileTypes: true })) {
+    if (!project.isDirectory()) continue
+    for (const repo of await fs.readdir(path.join(data, "snapshot", project.name), { withFileTypes: true })) {
+      if (!repo.isDirectory()) continue
+      const gitdir = path.join(data, "snapshot", project.name, repo.name)
+      const record = await fs
+        .readFile(path.join(gitdir, "info", "opencode-worktree.json"), "utf8")
+        .then((text) => JSON.parse(text) as { worktree?: string })
+        .catch(() => undefined)
+      if (record?.worktree === worktree) return gitdir
+    }
+  }
+  throw new Error(`missing snapshot evidence for ${worktree}`)
+}
+
+const existsPath = (file: string) =>
+  fs
+    .stat(file)
+    .then(() => true)
+    .catch(() => false)
+const waitFor = (message: string, condition: () => boolean) =>
+  Effect.promise(async () => {
+    for (let attempt = 0; attempt < 3000; attempt++) {
+      if (condition()) return
+      await new Promise<void>((resolve) => setTimeout(resolve, 1))
+    }
+    throw new Error(`snapshot maintenance did not reach ${message}`)
+  })
+
+nonWindowsMaintenanceLockIt(
+  "holds the advisory file lock until its maintenance body exits",
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped()
+    const maintenance = yield* MaintenanceService
+    const gate = { ready: () => {}, release: () => {} }
+    const started = new Promise<void>((resolve) => (gate.ready = resolve))
+    const released = new Promise<void>((resolve) => (gate.release = resolve))
+    const completion = { secondRuns: 0 }
+
+    yield* Effect.gen(function* () {
+      const first = yield* Effect.forkScoped(
+        maintenance.withLock(
+          path.join(dir, "snapshot.lock"),
+          Effect.promise(async () => {
+            gate.ready()
+            await released
+          }),
+        ),
+      )
+      yield* awaitWithTimeout(
+        Effect.promise(() => started),
+        "first advisory lock was not acquired",
+        "2 seconds",
+      )
+      const second = yield* Effect.forkScoped(
+        maintenance.withLock(
+          path.join(dir, "snapshot.lock"),
+          Effect.sync(() => completion.secondRuns++),
+        ),
+      )
+      yield* Effect.sleep(Duration.millis(50))
+      expect(completion.secondRuns).toBe(0)
+      gate.release()
+      yield* Fiber.join(first)
+      yield* Fiber.join(second)
+      expect(completion.secondRuns).toBe(1)
+    }).pipe(Effect.ensuring(Effect.sync(() => gate.release())))
+  }),
+)
+
+gcIt.effect(
+  "skips gc after a recent successful maintenance pass",
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped({ git: true })
+    const snapshot = yield* Snapshot.Service
+    yield* snapshot.track().pipe(provideInstance(dir))
+    yield* Effect.promise(() =>
+      fs.writeFile(path.join(gcHarness.data, "snapshot", "gc-completed"), String(gcHarness.clock.now - 30_000)),
+    )
+
+    yield* snapshot.cleanup().pipe(provideInstance(dir))
+
+    expect(gcHarness.calls).toEqual([])
+  }),
+)
+
+gcIt.effect(
+  "runs auto gc with reduced process priority and records only successful completion",
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped({ git: true })
+    const snapshot = yield* Snapshot.Service
+    yield* snapshot.track().pipe(provideInstance(dir))
+    gcHarness.clock.now += Duration.toMillis(Duration.hours(2))
+    gcHarness.outcome.exitCode = 1
+    gcHarness.outcome.stderr = "simulated failure"
+
+    yield* snapshot.cleanup().pipe(provideInstance(dir))
+
+    const completion = path.join(gcHarness.data, "snapshot", "gc-completed")
+    expect(yield* Effect.promise(() => existsPath(completion))).toBe(false)
+    expect(gcHarness.calls).toHaveLength(1)
+    gcHarness.outcome.exitCode = 0
+    gcHarness.runAdvance.millis = 400
+    yield* snapshot.cleanup().pipe(provideInstance(dir))
+
+    expect(gcHarness.calls).toHaveLength(2)
+    expect(yield* Effect.promise(() => fs.readFile(completion, "utf8"))).toBe(String(gcHarness.clock.now))
+    const invocation = gcHarness.calls[1]!
+    const args = [invocation.command, ...invocation.args]
+    const gitIndex = args.indexOf("git")
+    expect(gitIndex).toBeGreaterThanOrEqual(0)
+    expect(args.slice(gitIndex)).toContain("gc")
+    expect(args.slice(gitIndex)).toContain("--auto")
+    expect(args.slice(gitIndex)).toContain("--prune=7.days")
+    if (process.platform !== "win32" && Bun.which("nice")) {
+      expect(args.slice(0, gitIndex)).toEqual(expect.arrayContaining(["-n", "10"]))
+    }
+    if (process.platform === "linux" && Bun.which("ionice")) {
+      expect(args.slice(0, gitIndex)).toEqual(expect.arrayContaining(["-c", "2", "-n", "7"]))
+    }
+  }),
+)
+
+concurrencyIt.live(
+  "serializes independent snapshot instances and rechecks the shared completion record",
+  Effect.gen(function* () {
+    const first = yield* tmpdirScoped({ git: true })
+    const second = yield* tmpdirScoped({ git: true })
+    const snapshot = yield* Snapshot.Service
+    yield* snapshot.track().pipe(provideInstance(first))
+    yield* snapshot.track().pipe(provideInstance(second))
+    concurrencyHarness.clock.now += Duration.toMillis(Duration.hours(2))
+
+    const one = yield* Effect.forkScoped(snapshot.cleanup().pipe(provideInstance(first)))
+    const two = yield* Effect.forkScoped(snapshot.cleanup().pipe(provideInstance(second)))
+    yield* awaitWithTimeout(
+      Effect.promise(() => gcStarted),
+      "first snapshot gc did not start",
+      "2 seconds",
+    )
+    yield* awaitWithTimeout(
+      Effect.promise(() => contenderReady),
+      "competing cleanup did not contend",
+      "2 seconds",
+    )
+    expect(concurrencyHarness.calls).toHaveLength(1)
+    cleanupRace.release()
+    yield* Fiber.join(one)
+    yield* Fiber.join(two)
+
+    expect(concurrencyHarness.calls).toHaveLength(1)
+    expect(concurrencyHarness.lockCalls.filter((file) => path.basename(file) === "gc.lock")).toHaveLength(2)
+  }),
+)
+
+lockOrderIt.live(
+  "lets snapshot tracking finish when cleanup is waiting on the box lock",
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped({ git: true })
+    const snapshot = yield* Snapshot.Service
+    yield* snapshot.track().pipe(provideInstance(dir))
+
+    const cleanup = yield* Effect.forkScoped(snapshot.cleanup().pipe(provideInstance(dir)))
+    yield* awaitWithTimeout(
+      Effect.promise(() => cleanupLockEntered),
+      "cleanup did not enter the box lock",
+      "2 seconds",
+    )
+    const tracking = yield* Effect.forkScoped(snapshot.track().pipe(provideInstance(dir)))
+    const hash = yield* awaitWithTimeout(
+      Fiber.join(tracking),
+      "tracking waited behind cleanup while holding the repo lock",
+      "2 seconds",
+    )
+    expect(hash).toBeTruthy()
+    lockOrder.release()
+    yield* Fiber.join(cleanup)
+    expect(lockOrderHarness.calls).toHaveLength(1)
+  }).pipe(Effect.ensuring(Effect.sync(() => lockOrder.release()))),
+)
+
+scheduleIt.effect(
+  "jitters each scoped loop start and keeps the hourly repeat cadence",
+  Effect.gen(function* () {
+    const first = yield* tmpdirScoped({ git: true })
+    const second = yield* tmpdirScoped({ git: true })
+    const snapshot = yield* Snapshot.Service
+    scheduleHarness.randomValues.push(0, 0.99)
+    yield* provideInstance(first)(
+      Effect.gen(function* () {
+        yield* snapshot.track()
+        yield* provideInstance(second)(
+          Effect.gen(function* () {
+            yield* snapshot.track()
+            const attempts = () => scheduleHarness.lockCalls.filter((file) => path.basename(file) === "gc.lock").length
+            const completed = () =>
+              scheduleHarness.lockReleases.filter((file) => path.basename(file) === "gc.lock").length
+            const beforeFirst = completed()
+            yield* TestClock.adjust(Duration.minutes(1))
+            yield* waitFor("the first cleanup", () => completed() === beforeFirst + 1)
+            expect(attempts()).toBe(1)
+            const beforeSecond = completed()
+            yield* TestClock.adjust(Duration.minutes(58))
+            expect(attempts()).toBe(1)
+            yield* TestClock.adjust(Duration.minutes(1))
+            yield* waitFor("the second cleanup", () => completed() === beforeSecond + 1)
+            expect(attempts()).toBe(2)
+            const beforeRepeat = completed()
+            yield* TestClock.adjust(Duration.minutes(1))
+            yield* waitFor("the hourly repeat", () => completed() === beforeRepeat + 1)
+            expect(attempts()).toBe(3)
+          }),
+        )
+      }),
+    )
+  }),
+)
+
+reapIt.effect(
+  "reaps a tracked shadow repo only after its absent worktree outlasts the grace",
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped({ git: true })
+    const snapshot = yield* Snapshot.Service
+    yield* snapshot.track().pipe(provideInstance(dir))
+    const gitdir = yield* Effect.promise(() => snapshotGitdir(reapHarness.data, dir))
+    expect(path.basename(gitdir)).toBe(Hash.fast(dir))
+    yield* Effect.promise(() => fs.rm(dir, { recursive: true, force: true }))
+    reapHarness.clock.now += Duration.toMillis(Duration.hours(2))
+
+    yield* snapshot.cleanup().pipe(provideInstance(dir))
+    const evidencePath = path.join(gitdir, "info", "opencode-worktree.json")
+    const evidence = JSON.parse(yield* Effect.promise(() => fs.readFile(evidencePath, "utf8"))) as {
+      missingSince?: number
+    }
+    expect(evidence.missingSince).toBe(reapHarness.clock.now)
+
+    reapHarness.clock.now += Duration.toMillis(Duration.days(7)) - 1
+    yield* snapshot.cleanup().pipe(provideInstance(dir))
+    expect(yield* Effect.promise(() => existsPath(gitdir))).toBe(true)
+
+    reapHarness.clock.now += 1
+    yield* snapshot.cleanup().pipe(provideInstance(dir))
+    expect(yield* Effect.promise(() => existsPath(gitdir))).toBe(false)
+  }),
+)
+
+reapIt.effect(
+  "retains present worktrees and shadow repos without trustworthy path evidence",
+  Effect.gen(function* () {
+    const present = yield* tmpdirScoped({ git: true })
+    const unknown = yield* tmpdirScoped({ git: true })
+    const forged = yield* tmpdirScoped({ git: true })
+    const snapshot = yield* Snapshot.Service
+    yield* snapshot.track().pipe(provideInstance(present))
+    yield* snapshot.track().pipe(provideInstance(unknown))
+    yield* snapshot.track().pipe(provideInstance(forged))
+    const presentGitdir = yield* Effect.promise(() => snapshotGitdir(reapHarness.data, present))
+    const unknownGitdir = yield* Effect.promise(() => snapshotGitdir(reapHarness.data, unknown))
+    const forgedGitdir = yield* Effect.promise(() => snapshotGitdir(reapHarness.data, forged))
+    const movedPresent = `${present}.moved`
+    const forgedEvidencePath = path.join(forgedGitdir, "info", "opencode-worktree.json")
+    const forgedEvidence = JSON.parse(yield* Effect.promise(() => fs.readFile(forgedEvidencePath, "utf8"))) as Record<
+      string,
+      unknown
+    >
+    yield* Effect.promise(() =>
+      Promise.all([
+        fs.rename(present, movedPresent),
+        fs.rm(unknown, { recursive: true, force: true }),
+        fs.rm(forged, { recursive: true, force: true }),
+        fs.rm(path.join(unknownGitdir, "info", "opencode-worktree.json"), { force: true }),
+        fs.writeFile(forgedEvidencePath, JSON.stringify({ ...forgedEvidence, project: "untrusted" })),
+      ]),
+    )
+    reapHarness.clock.now += Duration.toMillis(Duration.hours(2))
+    yield* snapshot.cleanup().pipe(provideInstance(present))
+    yield* Effect.promise(() => fs.rename(movedPresent, present))
+    reapHarness.clock.now += Duration.toMillis(Duration.days(8))
+
+    yield* snapshot.cleanup().pipe(provideInstance(present))
+
+    const presentEvidence = JSON.parse(
+      yield* Effect.promise(() => fs.readFile(path.join(presentGitdir, "info", "opencode-worktree.json"), "utf8")),
+    ) as { missingSince?: number }
+    expect(yield* Effect.promise(() => existsPath(presentGitdir))).toBe(true)
+    expect(presentEvidence.missingSince).toBeUndefined()
+    expect(yield* Effect.promise(() => existsPath(unknownGitdir))).toBe(true)
+    expect(yield* Effect.promise(() => existsPath(forgedGitdir))).toBe(true)
+  }),
+)
 
 const exec = (cwd: string, command: string[]) =>
   Effect.promise(async () => {
