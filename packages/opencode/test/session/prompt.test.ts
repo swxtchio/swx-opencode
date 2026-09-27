@@ -239,7 +239,97 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
   return makePrompt(input)
 }
 
+// Production-boundary gates for the V1 lost-wakeup regression. `finishingRead`
+// holds the next Session.findMessage call, which is the finishing run's
+// lastAssistant read; `nextEnsureRunning` resolves once the next caller of
+// SessionRunState.ensureRunning has joined or started a run, and records which.
+const gates = {
+  finishingRead: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  nextEnsureRunning: undefined as undefined | { reached: Deferred.Deferred<void>; startedRun: boolean },
+}
+
+const gatedSession = LayerNode.make({
+  service: Session.Service,
+  layer: Layer.effect(
+    Session.Service,
+    Effect.gen(function* () {
+      const real = yield* Session.Service
+      return Session.Service.of({
+        ...real,
+        findMessage: (sessionID, predicate) =>
+          Effect.gen(function* () {
+            const gate = gates.finishingRead
+            gates.finishingRead = undefined
+            if (gate) {
+              yield* Deferred.succeed(gate.entered, undefined)
+              yield* Deferred.await(gate.release)
+            }
+            return yield* real.findMessage(sessionID, predicate)
+          }),
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      Session.node.implementation as Layer.Layer<
+        Session.Service,
+        never,
+        BackgroundJob.Service | RuntimeFlags.Service | Database.Service | EventV2Bridge.Service
+      >,
+    ),
+  ),
+  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
+})
+
+const gatedRunState = LayerNode.make({
+  service: SessionRunState.Service,
+  layer: Layer.effect(
+    SessionRunState.Service,
+    Effect.gen(function* () {
+      const real = yield* SessionRunState.Service
+      return SessionRunState.Service.of({
+        ...real,
+        ensureRunning: (sessionID, onInterrupt, work) =>
+          Effect.gen(function* () {
+            const marked = gates.nextEnsureRunning
+            gates.nextEnsureRunning = undefined
+            if (!marked) return yield* real.ensureRunning(sessionID, onInterrupt, work)
+            // Deferred resumption evaluates the waiting fiber synchronously, so
+            // join (or start) the run first and only then tell the test.
+            const call = yield* real
+              .ensureRunning(
+                sessionID,
+                onInterrupt,
+                Effect.sync(() => void (marked.startedRun = true)).pipe(Effect.andThen(work)),
+              )
+              .pipe(Effect.forkChild({ startImmediately: true }))
+            yield* Deferred.succeed(marked.reached, undefined)
+            return yield* Fiber.join(call)
+          }),
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      SessionRunState.node.implementation as Layer.Layer<
+        SessionRunState.Service,
+        never,
+        BackgroundJob.Service | SessionStatus.Service
+      >,
+    ),
+  ),
+  deps: [BackgroundJob.node, SessionStatus.node],
+})
+
 const it = testEffect(makeHttp())
+const gated = testEffect(
+  LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, runtimeFlags],
+    [Session.node, gatedSession],
+    [SessionRunState.node, gatedRunState],
+  ]),
+)
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const withMcpInstructions = testEffect(
@@ -1494,6 +1584,59 @@ it.instance("prompt submitted during an active run is included in the next LLM i
     if (!Array.isArray(messages)) throw new Error("expected LLM messages")
     expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
   }),
+)
+
+gated.instance(
+  "prompt admitted after the finishing run's last history read is still answered",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const gate = yield* Deferred.make<void>()
+      const finishingRead = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      const joined = { reached: yield* Deferred.make<void>(), startedRun: false }
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          gates.finishingRead = undefined
+          gates.nextEnsureRunning = undefined
+        }),
+      )
+
+      yield* llm.hold("first", deferredAsPromise(gate))
+      yield* llm.text("second")
+
+      const a = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: [{ type: "text", text: "first" }] })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+
+      // The first run's last history read happens after this release; its
+      // following lastAssistant read is held open by the gated Session layer.
+      gates.finishingRead = finishingRead
+      yield* Deferred.succeed(gate, void 0)
+      yield* awaitWithTimeout(Deferred.await(finishingRead.entered), "finishing lastAssistant read never started")
+
+      gates.nextEnsureRunning = joined
+      const b = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: [{ type: "text", text: "second" }] })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(joined.reached), "second prompt never reached ensureRunning")
+      yield* Deferred.succeed(finishingRead.release, void 0)
+
+      const [ea, eb] = yield* Effect.all([Fiber.await(a), Fiber.await(b)])
+      expect(Exit.isSuccess(ea)).toBe(true)
+      expect(Exit.isSuccess(eb)).toBe(true)
+      // The second prompt must have joined the finishing run; a run of its own
+      // would mean this setup never exercised the finishing window.
+      expect(joined.startedRun).toBe(false)
+      yield* awaitWithTimeout(llm.wait(2), "second prompt was never answered")
+      const messages = (yield* llm.inputs).at(1)?.messages
+      if (!Array.isArray(messages)) throw new Error("expected LLM messages")
+      expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
+    }),
+  10_000,
 )
 
 it.instance("assertNotBusy fails with BusyError when loop running", () =>
