@@ -143,6 +143,7 @@ export type TuiInput = {
   url: string
   args: Args
   config: TuiConfig.Resolved
+  createRenderer?: typeof createCliRenderer
   onSnapshot?: () => Promise<string[]>
   directory?: string
   fetch?: typeof fetch
@@ -191,7 +192,7 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
       const renderer = yield* Effect.acquireRelease(
         Effect.tryPromise({
           try: () =>
-            createCliRenderer({
+            (input.createRenderer ?? createCliRenderer)({
               externalOutputMode: "passthrough",
               targetFps: 60,
               gatherStats: false,

@@ -6,6 +6,7 @@ import type { FooterPatch, LocalReplayRow, RunProvider, StreamCommit } from "./t
 
 type ReplayInput = {
   messages: SessionMessages
+  summaryMessages?: SessionMessages | null
   permissions: PermissionRequest[]
   questions: QuestionRequest[]
   thinking: boolean
@@ -17,9 +18,8 @@ type ReplayConfig = {
   limits: Record<string, number>
   providers?: RunProvider[]
   summaries: ReadonlySet<string>
-  // The whole transcript, so a turn summary can gather the models that served
-  // EVERY step of its turn rather than only the message it renders on.
-  messages: SessionMessages
+  // The full session transcript lets labels count earlier requests outside a limited replay window.
+  messages: SessionMessages | undefined
 }
 
 export type SessionReplay = {
@@ -238,6 +238,7 @@ export function replaySession(input: ReplayInput): SessionReplay {
   const commits: StreamCommit[] = []
   let patch: FooterPatch | undefined
   const summaries = summaryMessageIDs(input.messages)
+  const summaryMessages = input.summaryMessages === undefined ? input.messages : (input.summaryMessages ?? undefined)
 
   bootstrapSessionData({
     data,
@@ -251,7 +252,7 @@ export function replaySession(input: ReplayInput): SessionReplay {
       limits: input.limits,
       providers: input.providers,
       summaries,
-      messages: input.messages,
+      messages: summaryMessages,
     })
     commits.push(...next.commits)
     patch = mergePatch(patch, next.patch)

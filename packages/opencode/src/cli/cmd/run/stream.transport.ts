@@ -619,6 +619,12 @@ function createLayer(input: StreamInput) {
             }),
           ).pipe(Effect.flatMap((item) => (item.error ? Effect.fail(item.error) : Effect.succeed(item.data ?? []))))
 
+        const replaySummaryMessages = () =>
+          Effect.promise(() => input.sdk.session.messages({ sessionID: input.sessionID, limit: 0 })).pipe(
+            Effect.map((item) => (item.error ? null : (item.data ?? null))),
+            Effect.orElseSucceed(() => null),
+          )
+
         const replayRequests = () =>
           Effect.all(
             [
@@ -708,9 +714,11 @@ function createLayer(input: StreamInput) {
 
           const sessionPermissions = permissions.filter((item) => item.sessionID === input.sessionID)
           const sessionQuestions = questions.filter((item) => item.sessionID === input.sessionID)
+          const summaryMessages = input.replay && input.replayLimit !== undefined ? yield* replaySummaryMessages() : undefined
           const history = input.replay
             ? replaySession({
                 messages: messagesList,
+                summaryMessages,
                 permissions: sessionPermissions,
                 questions: sessionQuestions,
                 thinking: input.thinking,
@@ -722,6 +730,7 @@ function createLayer(input: StreamInput) {
             history && input.replayLimit !== undefined && messagesList.length > input.replayLimit
               ? replaySession({
                   messages: messagesList.slice(-input.replayLimit),
+                  summaryMessages,
                   permissions: sessionPermissions,
                   questions: sessionQuestions,
                   thinking: input.thinking,
@@ -1020,10 +1029,12 @@ function createLayer(input: StreamInput) {
           const [messagesList, [permissions, questions]] = source.value
           const sessionPermissions = permissions.filter((item) => item.sessionID === input.sessionID)
           const sessionQuestions = questions.filter((item) => item.sessionID === input.sessionID)
+          const summaryMessages = input.replay && input.replayLimit !== undefined ? yield* replaySummaryMessages() : undefined
           const snapshot = yield* Effect.try({
             try: () => {
               const history = replaySession({
                 messages: messagesList,
+                summaryMessages,
                 permissions: sessionPermissions,
                 questions: sessionQuestions,
                 thinking: input.thinking,
@@ -1042,6 +1053,7 @@ function createLayer(input: StreamInput) {
                   input.replayLimit !== undefined && messagesList.length > input.replayLimit
                     ? replaySession({
                         messages: messagesList.slice(-input.replayLimit),
+                        summaryMessages,
                         permissions: sessionPermissions,
                         questions: sessionQuestions,
                         thinking: input.thinking,

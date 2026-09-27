@@ -15,6 +15,7 @@ import { Global } from "@opencode-ai/core/global"
 import { openEditor } from "@opencode-ai/tui/editor"
 import { registerOpencodeKeymap } from "@opencode-ai/tui/keymap"
 import { Session as SessionApi } from "@/session/session"
+import type { SessionMessages } from "./session.shared"
 import * as Locale from "@/util/locale"
 import { resolveInteractiveStdin } from "./runtime.stdin"
 import { entrySplash, exitSplash, splashMeta } from "./splash"
@@ -51,6 +52,11 @@ type FooterLabels = {
   modelLabel: string
 }
 
+type RuntimeLifecycleDependencies = {
+  createRenderer?: typeof createCliRenderer
+  resolveStdin?: typeof resolveInteractiveStdin
+}
+
 export type LifecycleInput = {
   directory: string
   findFiles: (query: string) => Promise<string[]>
@@ -59,6 +65,7 @@ export type LifecycleInput = {
   sessionID: string
   sessionTitle?: string
   getSessionID?: () => string | undefined
+  getSessionMessages: (sessionID: string) => Promise<SessionMessages | undefined>
   first: boolean
   history: RunPrompt[]
   agent: string | undefined
@@ -173,12 +180,15 @@ function queueSplash(
 // The renderer starts in split-footer mode with captured stdout so that
 // scrollback commits and footer repaints happen in the same frame. After
 // the entry splash, RunFooter takes over the footer region.
-export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lifecycle> {
-  const source = resolveInteractiveStdin()
+export async function createRuntimeLifecycle(
+  input: LifecycleInput,
+  dependencies: RuntimeLifecycleDependencies = {},
+): Promise<Lifecycle> {
+  const source = (dependencies.resolveStdin ?? resolveInteractiveStdin)()
   let unregisterKeymap: (() => void) | undefined
 
   try {
-    const renderer = await createCliRenderer({
+    const renderer = await (dependencies.createRenderer ?? createCliRenderer)({
       stdin: source.stdin,
       targetFps: 30,
       maxFps: 60,
@@ -235,6 +245,7 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
       agents: input.agents,
       resources: input.resources,
       sessionID: input.getSessionID ?? (() => input.sessionID),
+      getSessionMessages: input.getSessionMessages,
       ...labels,
       model: input.model,
       variant: input.variant,

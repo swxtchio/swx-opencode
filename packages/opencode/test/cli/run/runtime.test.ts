@@ -81,6 +81,15 @@ function ok<T>(data: T) {
   })
 }
 
+function unavailable() {
+  return Promise.resolve({
+    data: undefined,
+    error: new Error("session history unavailable"),
+    request: new Request("https://opencode.test"),
+    response: new Response(null, { status: 500 }),
+  })
+}
+
 function footer(): FooterApi {
   let closed = false
   const closes = new Set<() => void>()
@@ -152,14 +161,14 @@ function effortProvider(): RunProvider {
 async function withEffort(
   variant: string,
   drive: (app: EffortApp) => Promise<void>,
-  opts: { model?: boolean; sessionVariant?: string } = {},
+  opts: { model?: boolean; sessionVariant?: string; sessionHistoryUnavailable?: boolean } = {},
 ) {
   const sdk = new OpencodeClient()
   const ready = defer<void>()
   // Closing before the eager transport exists makes the runtime fail as "runtime closed".
   const transported = defer<void>()
   spyOn(sdk.config, "providers").mockImplementation(() => ok({ providers: [effortProvider()], default: {} }))
-  spyOn(sdk.session, "messages").mockImplementation(() =>
+  const sessionMessages = spyOn(sdk.session, "messages").mockImplementation(() =>
     ok(
       opts.sessionVariant === undefined
         ? []
@@ -178,6 +187,11 @@ async function withEffort(
           ],
     ),
   )
+  if (opts.sessionHistoryUnavailable) {
+    sessionMessages.mockImplementation(
+      (() => unavailable()) as unknown as OpencodeClient["session"]["messages"],
+    )
+  }
   spyOn(sdk.session, "get").mockRejectedValue(new Error("not needed"))
   spyOn(sdk.app, "agents").mockImplementation(() => ok([]))
   spyOn(sdk.experimental.resource, "list").mockImplementation(() => ok({}))
@@ -254,6 +268,33 @@ type EffortApp = {
 }
 
 describe("run interactive runtime --effort", () => {
+  test("preserves a v2 session-history error as unavailable", async () => {
+    await withEffort(
+      "high",
+      async (app) => {
+        await expect(app.callbacks?.getSessionMessages("ses-1")).resolves.toBeUndefined()
+      },
+      { sessionHistoryUnavailable: true },
+    )
+  })
+
+  test("maps v2 session messages into the lifecycle history callback", async () => {
+    await withEffort(
+      "high",
+      async (app) => {
+        const getSessionMessages = app.callbacks?.getSessionMessages
+        if (!getSessionMessages) throw new Error("runtime lifecycle did not receive the session-history callback")
+        await expect(getSessionMessages("ses-1")).resolves.toMatchObject([
+          {
+            info: { id: "msg-user-1", sessionID: "ses-1", role: "user" },
+            parts: [expect.objectContaining({ id: "part-1", messageID: "msg-user-1", text: "hi" })],
+          },
+        ])
+      },
+      { sessionVariant: "high" },
+    )
+  })
+
   // GOAL: an unknown --effort is refused at launch with the choices listed, not shown as active
   // and left to fail on submit.
   test("refuses an unknown effort at launch", async () => {

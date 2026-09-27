@@ -854,6 +854,7 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
         providerID: info.providerID,
         modelID: info.modelID,
         served: [...(info.responseModelIDs ?? [])],
+        messageID: info.id,
       },
     }
 

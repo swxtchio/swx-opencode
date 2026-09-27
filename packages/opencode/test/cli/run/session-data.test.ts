@@ -604,12 +604,18 @@ describe("each assistant message reports its own model record", () => {
       providerID: "openai",
       modelID: "gpt-5",
       served: ["glm-5p3-flash", "glm-5p3"],
+      messageID: "msg-1",
     })
   })
 
   test("reports an empty served list when the provider recorded nothing", () => {
     const out = reduce(createSessionData(), assistant("msg-1", { parentID: "user-1" }))
-    expect(out.footer?.patch?.turnModel).toEqual({ providerID: "openai", modelID: "gpt-5", served: [] })
+    expect(out.footer?.patch?.turnModel).toEqual({
+      providerID: "openai",
+      modelID: "gpt-5",
+      served: [],
+      messageID: "msg-1",
+    })
   })
 
   test("reports the model the turn was dispatched to", () => {
