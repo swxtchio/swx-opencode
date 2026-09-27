@@ -1167,11 +1167,14 @@ const layer = Layer.effect(
               (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
             ) ?? false
 
-          // A turn that stopped on an abort or error stays settled, so waking the
-          // session delivers its parked prompts instead of retrying that turn.
-          const stopped = lastAssistant?.error !== undefined && lastAssistant.parentID === lastUser.id
+          // A turn that stopped on an abort or error, or ended with its structured
+          // result, stays settled, so waking the session delivers its parked
+          // prompts instead of continuing that turn.
+          const ended =
+            lastAssistant?.parentID === lastUser.id &&
+            (lastAssistant.error !== undefined || lastAssistant.structured !== undefined)
           if (
-            stopped ||
+            ended ||
             (lastAssistant?.finish &&
               !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
               !hasToolCalls &&
