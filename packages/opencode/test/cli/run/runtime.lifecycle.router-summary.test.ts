@@ -1,4 +1,4 @@
-import { afterEach, expect, mock, test } from "bun:test"
+import { expect, test } from "bun:test"
 import { createTestRenderer, type TestRenderer } from "@opentui/core/testing"
 import type { SessionMessages } from "@/cli/cmd/run/session.shared"
 import type { RunProvider } from "@/cli/cmd/run/types"
@@ -56,8 +56,6 @@ function scrollbackText(renderer: TestRenderer) {
   }
 }
 
-afterEach(() => mock.restore())
-
 test("runtime lifecycle forwards session history into the run footer summary", async () => {
   const setup = await createTestRenderer({
     width: 100,
@@ -66,18 +64,7 @@ test("runtime lifecycle forwards session history into the run footer summary", a
     externalOutputMode: "capture-stdout",
     consoleMode: "disabled",
   })
-  const core = await import("@opentui/core")
   let rendererCreated = false
-  await mock.module("@opentui/core", () => ({
-    ...core,
-    createCliRenderer: async () => {
-      rendererCreated = true
-      return setup.renderer
-    },
-  }))
-  await mock.module("@/cli/cmd/run/runtime.stdin", () => ({
-    resolveInteractiveStdin: () => ({ stdin: process.stdin }),
-  }))
 
   let lifecycle: Awaited<ReturnType<typeof import("@/cli/cmd/run/runtime.lifecycle").createRuntimeLifecycle>> | undefined
   try {
@@ -99,27 +86,36 @@ test("runtime lifecycle forwards session history into the run footer summary", a
         },
       },
     ] as unknown as RunProvider[]
-    lifecycle = await createRuntimeLifecycle({
-      directory: "/tmp",
-      findFiles: async () => [],
-      agents: [],
-      resources: [],
-      sessionID: "session-1",
-      getSessionMessages: async (sessionID) => {
-        readSessionIDs.push(sessionID)
-        return history
+    lifecycle = await createRuntimeLifecycle(
+      {
+        directory: "/tmp",
+        findFiles: async () => [],
+        agents: [],
+        resources: [],
+        sessionID: "session-1",
+        getSessionMessages: async (sessionID) => {
+          readSessionIDs.push(sessionID)
+          return history
+        },
+        first: false,
+        history: [],
+        agent: "build",
+        model: { providerID: "llmrouter", modelID: "auto" },
+        variant: undefined,
+        tuiConfig: createTuiResolvedConfig(),
+        backgroundSubagents: false,
+        onPermissionReply: () => {},
+        onQuestionReply: () => {},
+        onQuestionReject: () => {},
       },
-      first: false,
-      history: [],
-      agent: "build",
-      model: { providerID: "llmrouter", modelID: "auto" },
-      variant: undefined,
-      tuiConfig: createTuiResolvedConfig(),
-      backgroundSubagents: false,
-      onPermissionReply: () => {},
-      onQuestionReply: () => {},
-      onQuestionReject: () => {},
-    })
+      {
+        createRenderer: async () => {
+          rendererCreated = true
+          return setup.renderer
+        },
+        resolveStdin: () => ({ stdin: process.stdin }),
+      },
+    )
 
     lifecycle.footer.event({ type: "models", providers })
     lifecycle.footer.event({ type: "turn.send", queue: 0 })
@@ -147,6 +143,5 @@ test("runtime lifecycle forwards session history into the run footer summary", a
   } finally {
     if (lifecycle) await lifecycle.close({ showExit: false })
     else if (!setup.renderer.isDestroyed) setup.renderer.destroy()
-    mock.restore()
   }
 })

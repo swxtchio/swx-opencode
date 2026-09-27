@@ -52,6 +52,11 @@ type FooterLabels = {
   modelLabel: string
 }
 
+type RuntimeLifecycleDependencies = {
+  createRenderer?: typeof createCliRenderer
+  resolveStdin?: typeof resolveInteractiveStdin
+}
+
 export type LifecycleInput = {
   directory: string
   findFiles: (query: string) => Promise<string[]>
@@ -175,12 +180,15 @@ function queueSplash(
 // The renderer starts in split-footer mode with captured stdout so that
 // scrollback commits and footer repaints happen in the same frame. After
 // the entry splash, RunFooter takes over the footer region.
-export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lifecycle> {
-  const source = resolveInteractiveStdin()
+export async function createRuntimeLifecycle(
+  input: LifecycleInput,
+  dependencies: RuntimeLifecycleDependencies = {},
+): Promise<Lifecycle> {
+  const source = (dependencies.resolveStdin ?? resolveInteractiveStdin)()
   let unregisterKeymap: (() => void) | undefined
 
   try {
-    const renderer = await createCliRenderer({
+    const renderer = await (dependencies.createRenderer ?? createCliRenderer)({
       stdin: source.stdin,
       targetFps: 30,
       maxFps: 60,

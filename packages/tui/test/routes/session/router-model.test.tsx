@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-import { expect, mock, test } from "bun:test"
+import { expect, test } from "bun:test"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { createTestRenderer } from "@opentui/core/testing"
 import type { AssistantMessage, GlobalEvent, Part, Provider, Session, UserMessage } from "@opencode-ai/sdk/v2"
@@ -128,8 +128,6 @@ function event(payload: GlobalEvent["payload"]): GlobalEvent {
 
 async function startSession(input: { historyError?: boolean } = {}) {
   const setup = await createTestRenderer({ width: 160, height: 45, useThread: false })
-  const core = await import("@opentui/core")
-  await mock.module("@opentui/core", () => ({ ...core, createCliRenderer: async () => setup.renderer }))
   const events = createEventSource()
   const initial = initialMessages()
   const state = { messages: initial, historyReads: 0, omitLatestFromHistory: !input.historyError }
@@ -158,6 +156,7 @@ async function startSession(input: { historyError?: boolean } = {}) {
       .run({
         url: "http://test",
         directory,
+        createRenderer: async () => setup.renderer,
         config: createTuiResolvedConfig({ plugin_enabled: {} }),
         fetch: calls.fetch,
         events: events.source,
@@ -185,7 +184,6 @@ async function startSession(input: { historyError?: boolean } = {}) {
         await task
       } finally {
         if (!setup.renderer.isDestroyed) setup.renderer.destroy()
-        mock.restore()
       }
     },
   }

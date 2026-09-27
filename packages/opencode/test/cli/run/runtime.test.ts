@@ -278,6 +278,23 @@ describe("run interactive runtime --effort", () => {
     )
   })
 
+  test("maps v2 session messages into the lifecycle history callback", async () => {
+    await withEffort(
+      "high",
+      async (app) => {
+        const getSessionMessages = app.callbacks?.getSessionMessages
+        if (!getSessionMessages) throw new Error("runtime lifecycle did not receive the session-history callback")
+        await expect(getSessionMessages("ses-1")).resolves.toMatchObject([
+          {
+            info: { id: "msg-user-1", sessionID: "ses-1", role: "user" },
+            parts: [expect.objectContaining({ id: "part-1", messageID: "msg-user-1", text: "hi" })],
+          },
+        ])
+      },
+      { sessionVariant: "high" },
+    )
+  })
+
   // GOAL: an unknown --effort is refused at launch with the choices listed, not shown as active
   // and left to fail on submit.
   test("refuses an unknown effort at launch", async () => {
