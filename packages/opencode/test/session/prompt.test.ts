@@ -1923,6 +1923,33 @@ it.instance(
 )
 
 it.instance(
+  "a provider error parks pending prompts until the next admission",
+  () =>
+    Effect.gen(function* () {
+      const { llm, prompt, sessions, queue, chat, task, send, release } = yield* startHeld({ tool: true })
+      yield* llm.error(400, { error: { message: "rejected by the provider" } })
+
+      const held = yield* send("parked by the error", { delivery: "queue" })
+      yield* queued(chat.id, 1)
+      yield* release
+      yield* finish(task, held)
+      const stopped = (yield* sessions.messages({ sessionID: chat.id })).at(-1)?.info
+      expect(stopped?.role === "assistant" ? stopped.error?.name : undefined).toBe("APIError")
+      expect(yield* llm.calls).toBe(2)
+      expect((yield* queue.list(chat.id)).map((item) => item.input.parts)).toEqual([said("parked by the error")])
+
+      yield* llm.text("wake done")
+      yield* llm.text("parked done")
+      yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("wake up") })
+      expect((yield* llm.inputs).slice(2).map(lastUser)).toEqual([
+        { role: "user", content: "wake up" },
+        { role: "user", content: "parked by the error" },
+      ])
+    }),
+  15_000,
+)
+
+it.instance(
   "a run interrupted without a prompt cancel, as instance disposal does, also parks pending prompts",
   () =>
     Effect.gen(function* () {

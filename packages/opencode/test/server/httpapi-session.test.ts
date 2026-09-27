@@ -1402,8 +1402,24 @@ describe("session HttpApi", () => {
         expect(withdrawn.status).toBe(200)
         expect(yield* nextQueueUpdate).toEqual([])
 
-        yield* request(pathFor(SessionPaths.abort, params), { method: "POST", headers })
+        const held = listed[0]!
+        const restored = yield* request(pathFor(SessionQueuePaths.restore, params), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ id: held.id }),
+        })
+        expect(restored.status).toBe(200)
+        expect(yield* nextQueueUpdate).toEqual([held])
+        const steered = yield* request(pathFor(SessionQueuePaths.update, { ...params, itemID: held.id }), {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ delivery: "steer" }),
+        })
+        expect(steered.status).toBe(200)
+        expect(yield* nextQueueUpdate).toEqual([{ ...held, delivery: "steer" }])
+        // Promotion at the next step empties the list.
         yield* Deferred.succeed(gate, void 0)
+        expect(yield* nextQueueUpdate).toEqual([])
       }).pipe(
         Effect.ensuring(Deferred.succeed(gate, void 0)),
         Effect.provide(TestLLMServer.layer),
