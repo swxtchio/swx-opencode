@@ -583,13 +583,13 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
 // ([compaction-user, summary, ...retained tail..., continue-user]), so array
 // position is not chronological. IDs are only a deterministic tie-breaker
 // because imported messages do not necessarily have monotonic IDs.
-export function latest(msgs: WithParts[]) {
+export function latest(msgs: WithParts[], options?: { excludedUserIDs?: ReadonlySet<MessageID> }) {
   let user: User | undefined
   let assistant: Assistant | undefined
   let finished: Assistant | undefined
   for (const msg of msgs) {
     const info = msg.info
-    if (info.role === "user" && isAfter(info, user)) user = info
+    if (info.role === "user" && !options?.excludedUserIDs?.has(info.id) && isAfter(info, user)) user = info
     if (info.role === "assistant" && isAfter(info, assistant)) assistant = info
     if (info.role === "assistant" && info.finish && isAfter(info, finished)) finished = info
   }

@@ -5,7 +5,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { expect } from "bun:test"
+import { expect, test } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
@@ -35,6 +35,7 @@ import { SessionSummary } from "../../src/session/summary"
 import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
+import { MachineMessage } from "../../src/session/machine-message"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -336,6 +337,19 @@ const waitForBusy = (sessionID: SessionID, duration: Duration.Input = "2 seconds
     duration,
   )
 
+function lastUserContent(input: Record<string, unknown>) {
+  if (!Array.isArray(input.messages)) throw new Error("expected provider message array")
+  const message = input.messages.findLast(
+    (item) => typeof item === "object" && item !== null && "role" in item && item.role === "user",
+  )
+  return JSON.stringify(message)
+}
+
+function lastProviderMessage(input: Record<string, unknown>) {
+  if (!Array.isArray(input.messages)) throw new Error("expected provider message array")
+  return input.messages.at(-1)
+}
+
 const hasBash = Effect.sync(() => Bun.which("bash") !== null)
 
 const deferredAsPromise = <A>(deferred: Deferred.Deferred<A>): PromiseLike<A> => ({
@@ -441,6 +455,387 @@ const boot = Effect.fn("test.boot")(function* (input?: { title?: string }) {
   const chat = yield* sessions.create(input ?? { title: "Pinned" })
   return { prompt, run, sessions, chat }
 })
+
+test("classifies configured machine markers from their producer framing", async () => {
+  const heartbeat = await Bun.file(path.join(import.meta.dir, "fixtures", "fleet-heartbeat.txt")).text()
+  const heartbeatSummary = await Bun.file(
+    path.join(import.meta.dir, "fixtures", "fleet-heartbeat-summary.txt"),
+  ).text()
+  const summaryBoundary = heartbeatSummary.indexOf("… Full message:")
+  const oversizedSummary =
+    heartbeatSummary.slice(0, summaryBoundary) + "x".repeat(241) + heartbeatSummary.slice(summaryBoundary)
+  const marked = [
+    "[fm-from-peer]\x1f peer-name\x1f /peer/home\x1f p1-2-abcd\x1f peer request",
+    "[fm-from-firstmate]\x1f request from firstmate",
+    "\x1f daemon request",
+    "WATCHER FIRED [turn-ended]",
+    "OBSERVER: follow this direction",
+    heartbeat,
+    heartbeatSummary,
+  ]
+  for (const message of marked) expect(MachineMessage.classify(message)).toBe("hold")
+
+  const nearMisses = [
+    "[fm-from-peer] peer request",
+    "[fm-from-firstmate] request from firstmate",
+    "human text [fm-from-peer]\x1f peer request",
+    "human text WATCHER FIRED [turn-ended]",
+    "observer: lower-case label",
+    " \x1f daemon request",
+    heartbeat.replace(/ \[fm-heartbeat-receipt:[a-zA-Z0-9._-]+\]$/, ""),
+    heartbeat + " trailing text",
+    "human note " + heartbeat,
+    heartbeatSummary.replace(/ \[fm-heartbeat-receipt:[a-zA-Z0-9._-]+\]$/, ""),
+    oversizedSummary,
+  ]
+  for (const message of nearMisses) expect(MachineMessage.classify(message)).toBeUndefined()
+
+  const custom = { type: "prefix", value: "CUSTOM:" } as const
+  expect(MachineMessage.classify("CUSTOM: deployment message", { hold: [custom] })).toBe("hold")
+  expect(MachineMessage.classify(marked[0], { hold: [custom] })).toBeUndefined()
+  expect(
+    MachineMessage.classify(marked[0], {
+      critical: [{ type: "prefix", value: "[fm-from-peer]\x1f" }],
+    }),
+  ).toBe("critical")
+  expect(
+    MachineMessage.classify(heartbeat, {
+      critical: [{ type: "fleet-heartbeat" }],
+    }),
+  ).toBe("critical")
+  expect(
+    MachineMessage.classify(heartbeatSummary, {
+      critical: [{ type: "fleet-heartbeat" }],
+    }),
+  ).toBe("critical")
+})
+
+it.instance("holds marked inputs through tool continuation and delivers each in admission order", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const toolGate = yield* Deferred.make<void>()
+    const stopGate = yield* Deferred.make<void>()
+    const firstHeldGate = yield* Deferred.make<void>()
+    const secondHeldGate = yield* Deferred.make<void>()
+    const gates = [toolGate, stopGate, firstHeldGate, secondHeldGate]
+
+    yield* Effect.gen(function* () {
+      yield* llm.push(
+        reply().wait(deferredAsPromise(toolGate)).tool("first", { value: "continue" }).item(),
+        reply().wait(deferredAsPromise(stopGate)).text("task finished").stop().item(),
+        reply().wait(deferredAsPromise(firstHeldGate)).text("first message handled").stop().item(),
+        reply().wait(deferredAsPromise(secondHeldGate)).text("second message handled").stop().item(),
+      )
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "original task" }],
+      })
+      const run = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "provider did not receive the original task", "10 seconds")
+      yield* waitForBusy(session.id)
+
+      const firstID = MessageID.ascending()
+      const first = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          messageID: firstID,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "[fm-from-firstmate]\x1f first-mail" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: session.id })
+          .pipe(
+            Effect.map((messages) =>
+              messages.some((message) => message.info.role === "user" && message.info.id === firstID)
+                ? true
+                : undefined,
+            ),
+          ),
+        "first marked message was not admitted",
+        "10 seconds",
+      )
+
+      const secondID = MessageID.ascending()
+      const second = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          messageID: secondID,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "[fm-from-peer]\x1f second-mail" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: session.id })
+          .pipe(
+            Effect.map((messages) =>
+              messages.some((message) => message.info.role === "user" && message.info.id === secondID)
+                ? true
+                : undefined,
+            ),
+          ),
+        "second marked message was not admitted",
+        "10 seconds",
+      )
+
+      const initial = yield* llm.inputs
+      expect(initial).toHaveLength(1)
+      expect(JSON.stringify(initial[0]?.messages)).not.toContain("first-mail")
+      expect(JSON.stringify(initial[0]?.messages)).not.toContain("second-mail")
+
+      yield* Deferred.succeed(toolGate, void 0)
+      yield* awaitWithTimeout(llm.wait(2), "tool continuation provider step did not start", "10 seconds")
+      const continuation = yield* llm.inputs
+      expect(continuation).toHaveLength(2)
+      const beforeStop = JSON.stringify(continuation.map((input) => input.messages))
+      expect(beforeStop).not.toContain("first-mail")
+      expect(beforeStop).not.toContain("second-mail")
+
+      yield* Deferred.succeed(stopGate, void 0)
+      yield* awaitWithTimeout(llm.wait(3), "first held turn did not start after stop", "10 seconds")
+      const firstTurn = (yield* llm.inputs).at(2)
+      if (!firstTurn) throw new Error("expected the first held turn request")
+      expect(lastUserContent(firstTurn)).toContain("first-mail")
+      expect(lastProviderMessage(firstTurn)).toMatchObject({ role: "user" })
+      expect(JSON.stringify(lastProviderMessage(firstTurn))).toContain("first-mail")
+      expect(JSON.stringify(firstTurn.messages)).not.toContain("second-mail")
+
+      yield* Deferred.succeed(firstHeldGate, void 0)
+      yield* awaitWithTimeout(llm.wait(4), "second held turn did not start after the first", "10 seconds")
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(4)
+      const secondTurn = inputs[3]
+      if (!secondTurn) throw new Error("expected the second held turn request")
+      expect(lastUserContent(secondTurn)).toContain("second-mail")
+      expect(lastProviderMessage(secondTurn)).toMatchObject({ role: "user" })
+      expect(JSON.stringify(lastProviderMessage(secondTurn))).toContain("second-mail")
+
+      yield* Deferred.succeed(secondHeldGate, void 0)
+      const runExit = yield* awaitWithTimeout(Fiber.await(run), "session run did not finish", "10 seconds")
+      const firstExit = yield* awaitWithTimeout(Fiber.await(first), "first prompt caller did not finish", "10 seconds")
+      const secondExit = yield* awaitWithTimeout(Fiber.await(second), "second prompt caller did not finish", "10 seconds")
+      expect(Exit.isSuccess(runExit)).toBe(true)
+      expect(Exit.isSuccess(firstExit)).toBe(true)
+      expect(Exit.isSuccess(secondExit)).toBe(true)
+
+      const delivered = (yield* sessions.messages({ sessionID: session.id })).filter(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+          message.info.role === "assistant" && [firstID, secondID].includes(message.info.parentID),
+      )
+      expect(delivered.map((message) => message.info.parentID)).toEqual([firstID, secondID])
+      expect(yield* llm.calls).toBe(4)
+    }).pipe(
+      Effect.ensuring(
+        Effect.forEach(
+          gates,
+          (gate) => Deferred.succeed(gate, void 0).pipe(Effect.ignore),
+          { discard: true },
+        ),
+      ),
+    )
+  }),
+  60_000,
+)
+
+it.instance("keeps unmarked and configured critical prompts eligible during an active run", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      machine_message_markers: {
+        critical: [{ type: "prefix", value: "[fm-from-peer]\x1f" }],
+      },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const toolGate = yield* Deferred.make<void>()
+    const stopGate = yield* Deferred.make<void>()
+    const heldGate = yield* Deferred.make<void>()
+
+    yield* Effect.gen(function* () {
+      yield* llm.push(
+        reply().wait(deferredAsPromise(toolGate)).tool("first", { value: "continue" }).item(),
+        reply().wait(deferredAsPromise(stopGate)).text("captain intervention handled").stop().item(),
+        reply().wait(deferredAsPromise(heldGate)).text("held machine message handled").stop().item(),
+      )
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "original task" }],
+      })
+      const run = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "provider did not receive the original task", "10 seconds")
+      yield* waitForBusy(session.id)
+
+      const heldID = MessageID.ascending()
+      const held = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          messageID: heldID,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "[fm-from-firstmate]\x1f queued-mail" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: session.id })
+          .pipe(
+            Effect.map((messages) =>
+              messages.some((message) => message.info.role === "user" && message.info.id === heldID)
+                ? true
+                : undefined,
+            ),
+          ),
+        "marked message was not admitted",
+        "10 seconds",
+      )
+
+      const captainID = MessageID.ascending()
+      const captain = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          messageID: captainID,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "captain typed intervention" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: session.id })
+          .pipe(
+            Effect.map((messages) =>
+              messages.some((message) => message.info.role === "user" && message.info.id === captainID)
+                ? true
+                : undefined,
+            ),
+          ),
+        "unmarked captain prompt was not admitted",
+        "10 seconds",
+      )
+
+      const criticalID = MessageID.ascending()
+      const critical = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          messageID: criticalID,
+          agent: "build",
+          model: ref,
+          parts: [
+            {
+              type: "text",
+              text: "[fm-from-peer]\x1f peer-name\x1f /peer/home\x1f p1-2-abcd\x1f disk alert",
+            },
+          ],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: session.id })
+          .pipe(
+            Effect.map((messages) =>
+              messages.some((message) => message.info.role === "user" && message.info.id === criticalID)
+                ? true
+                : undefined,
+            ),
+          ),
+        "configured critical prompt was not admitted",
+        "10 seconds",
+      )
+
+      yield* Deferred.succeed(toolGate, void 0)
+      yield* awaitWithTimeout(llm.wait(2), "next provider step did not start", "10 seconds")
+      const next = (yield* llm.inputs).at(1)
+      if (!next) throw new Error("expected the next provider request")
+      expect(JSON.stringify(next.messages)).toContain("captain typed intervention")
+      expect(JSON.stringify(next.messages)).toContain("disk alert")
+      expect(JSON.stringify(next.messages)).not.toContain("queued-mail")
+
+      yield* Deferred.succeed(stopGate, void 0)
+      yield* awaitWithTimeout(llm.wait(3), "held prompt did not start after current turn stopped", "10 seconds")
+      const heldTurn = (yield* llm.inputs).at(2)
+      if (!heldTurn) throw new Error("expected the held provider request")
+      expect(lastProviderMessage(heldTurn)).toMatchObject({ role: "user" })
+      expect(JSON.stringify(lastProviderMessage(heldTurn))).toContain("queued-mail")
+
+      yield* Deferred.succeed(heldGate, void 0)
+      const runExit = yield* awaitWithTimeout(Fiber.await(run), "session run did not finish", "10 seconds")
+      const captainExit = yield* awaitWithTimeout(
+        Fiber.await(captain),
+        "captain prompt caller did not finish",
+        "10 seconds",
+      )
+      const criticalExit = yield* awaitWithTimeout(
+        Fiber.await(critical),
+        "critical prompt caller did not finish",
+        "10 seconds",
+      )
+      const heldExit = yield* awaitWithTimeout(Fiber.await(held), "held prompt caller did not finish", "10 seconds")
+      expect(Exit.isSuccess(runExit)).toBe(true)
+      expect(Exit.isSuccess(captainExit)).toBe(true)
+      expect(Exit.isSuccess(criticalExit)).toBe(true)
+      expect(Exit.isSuccess(heldExit)).toBe(true)
+
+      const response = (yield* sessions.messages({ sessionID: session.id })).findLast(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+          message.info.role === "assistant",
+      )
+      expect(response?.info.role === "assistant" ? response.info.parentID : undefined).toBe(heldID)
+      expect(yield* llm.calls).toBe(3)
+    }).pipe(
+      Effect.ensuring(
+        Effect.all(
+          [toolGate, stopGate, heldGate].map((gate) => Deferred.succeed(gate, void 0).pipe(Effect.ignore)),
+          { discard: true },
+        ),
+      ),
+    )
+  }),
+  60_000,
+)
+
+it.instance("starts a marked prompt normally when no run is active", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Pinned" })
+    yield* llm.text("idle machine message handled")
+
+    const run = yield* prompt
+      .prompt({
+        sessionID: session.id,
+        agent: "build",
+        parts: [{ type: "text", text: "[fm-from-firstmate]\x1f idle request" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "idle marked prompt did not start a provider turn", "5 seconds")
+    const request = (yield* llm.inputs).at(0)
+    if (!request) throw new Error("expected the idle provider request")
+    expect(lastUserContent(request)).toContain("idle request")
+
+    const exit = yield* awaitWithTimeout(Fiber.await(run), "idle marked prompt did not finish", "5 seconds")
+    expect(Exit.isSuccess(exit)).toBe(true)
+    expect(yield* llm.calls).toBe(1)
+  }),
+)
 
 // Loop semantics
 

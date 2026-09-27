@@ -56,6 +56,9 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { MachineMessage } from "./machine-message"
+
+type UserWithParts = Omit<SessionV1.WithParts, "info"> & { info: SessionV1.User }
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -1097,8 +1100,15 @@ const layer = Layer.effect(
     const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
+        const markerConfig = (yield* config.get()).machine_message_markers
         let structured: unknown
         let step = 0
+        let turnRoot: SessionV1.User | undefined
+        let held: UserWithParts[] = []
+        let promoted: UserWithParts | undefined
+        let titleStarted = false
+        const heldIDs = new Set<MessageID>()
+        const completedInputIDs = new Set<MessageID>()
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1109,7 +1119,37 @@ const layer = Layer.effect(
             Effect.provideService(Database.Service, database),
           )
 
-          const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
+          if (promoted) {
+            const nextTurn = promoted
+            msgs = [...msgs.filter((msg) => msg.info.id !== nextTurn.info.id), nextTurn]
+          }
+          if (!turnRoot) turnRoot = MessageV2.latest(msgs).user
+          if (!turnRoot) throw new Error("No user message found in stream. This should never happen.")
+          const root = turnRoot
+
+          if (step > 0) {
+            const incoming = msgs.filter((msg): msg is UserWithParts => {
+              if (msg.info.role !== "user" || heldIDs.has(msg.info.id)) return false
+              if (
+                msg.info.time.created < root.time.created ||
+                (msg.info.time.created === root.time.created && msg.info.id <= root.id)
+              )
+                return false
+              const text = msg.parts.find((part) => part.type === "text")?.text ?? ""
+              return MachineMessage.classify(text, markerConfig) === "hold"
+            })
+            incoming.forEach((msg) => heldIDs.add(msg.info.id))
+            held = [...held, ...incoming].sort(
+              (a, b) =>
+                a.info.time.created - b.info.time.created ||
+                (a.info.id === b.info.id ? 0 : a.info.id < b.info.id ? -1 : 1),
+            )
+          }
+
+          msgs = msgs.filter((msg) => !heldIDs.has(msg.info.id))
+          const selected = MessageV2.latest(msgs, { excludedUserIDs: completedInputIDs })
+          promoted = undefined
+          const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = selected
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
@@ -1130,6 +1170,9 @@ const layer = Layer.effect(
             !hasToolCalls &&
             lastAssistant.parentID === lastUser.id
           ) {
+            msgs.forEach((msg) => {
+              if (msg.info.role === "user") completedInputIDs.add(msg.info.id)
+            })
             const orphan = lastAssistantMsg?.parts.find(
               (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
             )
@@ -1141,18 +1184,30 @@ const layer = Layer.effect(
                 callID: orphan.callID,
               })
             }
+            if (lastAssistant.finish === "stop" && held.length > 0) {
+              const next = held.shift()
+              if (!next) throw new Error("Held session input disappeared from its admission queue")
+              heldIDs.delete(next.info.id)
+              turnRoot = next.info
+              promoted = next
+              structured = undefined
+              step = 0
+              continue
+            }
             yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
             break
           }
 
           step++
-          if (step === 1)
+          if (step === 1 && !titleStarted) {
+            titleStarted = true
             yield* title({
               session,
               modelID: lastUser.model.modelID,
               providerID: lastUser.model.providerID,
               history: msgs,
             }).pipe(Effect.ignore, Effect.forkIn(scope))
+          }
 
           const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
           const task = tasks.pop()
@@ -1347,7 +1402,10 @@ const layer = Layer.effect(
             Effect.ensuring(instruction.clear(handle.message.id)),
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
           )
-          if (outcome === "break") break
+          if (outcome === "break") {
+            if (handle.message.finish === "stop") continue
+            break
+          }
           continue
         }
 
