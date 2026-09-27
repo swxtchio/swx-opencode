@@ -1898,6 +1898,23 @@ it.instance(
 )
 
 it.instance(
+  "a run interrupted without a prompt cancel, as instance disposal does, also parks pending prompts",
+  () =>
+    Effect.gen(function* () {
+      const run = yield* SessionRunState.Service
+      const { llm, queue, chat, task, send } = yield* startHeld()
+      const held = yield* send("parked by the interrupt", { delivery: "queue" })
+      yield* queued(chat.id, 1)
+
+      yield* run.cancel(chat.id)
+      yield* finish(task, held)
+      expect(yield* llm.calls).toBe(1)
+      expect((yield* queue.list(chat.id)).map((item) => item.input.parts)).toEqual([said("parked by the interrupt")])
+    }),
+  15_000,
+)
+
+it.instance(
   "a steer sent while a compaction task is pending reaches the first call after it, not the compaction",
   () =>
     Effect.gen(function* () {

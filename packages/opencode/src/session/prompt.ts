@@ -1404,6 +1404,8 @@ const layer = Layer.effect(
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
       },
+      // So does an interrupt, such as instance disposal cancelling the run.
+      (effect, sessionID) => effect.pipe(Effect.onInterrupt(() => queue.park(sessionID))),
     )
 
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
