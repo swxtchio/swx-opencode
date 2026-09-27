@@ -1173,7 +1173,13 @@ describe("session HttpApi", () => {
         const restored = yield* post(SessionQueuePaths.restore, { id: held.id })
         expect(restored.status).toBe(200)
         expect(yield* json<SessionQueue.Item>(restored)).toEqual(held)
-        expect((yield* post(SessionQueuePaths.restore, { id: held.id })).status).toBe(404)
+        const restoredAgain = yield* post(SessionQueuePaths.restore, { id: held.id })
+        expect(restoredAgain.status).toBe(404)
+        expect(yield* responseJson(restoredAgain)).toMatchObject({
+          _tag: "QueueItemNotWithdrawn",
+          sessionID: session.id,
+          itemID: held.id,
+        })
 
         const steered = yield* item("PATCH", held.id, { delivery: "steer" })
         expect(steered.status).toBe(200)
@@ -1216,6 +1222,82 @@ describe("session HttpApi", () => {
             Effect.andThen(Deferred.succeed(gate, void 0)),
           ),
         ),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
+    "a prompt carrying an output format passes through the queue",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue format" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const model = { providerID: "test", modelID: "test-model" }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+        const schema = { type: "object", properties: { answer: { type: "string" } } }
+
+        expect(
+          (yield* post(SessionPaths.promptAsync, { agent: "build", model, parts: [{ type: "text", text: "start" }] }))
+            .status,
+        ).toBe(204)
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        expect(
+          (yield* post(SessionPaths.promptAsync, {
+            agent: "build",
+            model,
+            delivery: "queue",
+            format: { type: "json_schema", schema },
+            parts: [{ type: "text", text: "held with a format" }],
+          })).status,
+        ).toBe(204)
+        const [held] = yield* pollWithTimeout(
+          requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }).pipe(
+            Effect.map((items) => (items.length === 1 ? items : undefined)),
+          ),
+          "formatted prompt never queued",
+        )
+        // The listed input carries the format as the route decoded it, default included.
+        expect(held!.input.format).toEqual({ type: "json_schema", schema, retryCount: 2 })
+        yield* request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID: held!.id }), {
+          method: "DELETE",
+          headers,
+        })
+        yield* Deferred.succeed(gate, void 0)
+        yield* pollWithTimeout(
+          requestJson<Record<string, { type: string }>>(SessionPaths.status, { headers }).pipe(
+            Effect.map((status) => (status[session.id] === undefined ? true : undefined)),
+          ),
+          "session never went idle",
+        )
+
+        // On an idle session the steer becomes a message at once, through the stored row.
+        yield* llm.text("text done")
+        const reply = yield* post(SessionPaths.prompt, {
+          agent: "build",
+          model,
+          format: { type: "text" },
+          parts: [{ type: "text", text: "plain text please" }],
+        })
+        expect(reply.status).toBe(200)
+        expect(yield* responseJson(reply)).toMatchObject({ info: { role: "assistant" } })
+        const messages = yield* Session.use
+          .messages({ sessionID: session.id })
+          .pipe(provideInstanceEffect(directory), Effect.orDie)
+        const stored = messages.find((message) =>
+          message.parts.some((part) => part.type === "text" && part.text === "plain text please"),
+        )?.info
+        expect(stored?.role === "user" ? stored.format?.type : undefined).toBe("text")
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, void 0)),
         Effect.provide(TestLLMServer.layer),
         Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
       )
