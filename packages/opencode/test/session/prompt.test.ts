@@ -1627,7 +1627,11 @@ gated.instance(
       yield* awaitWithTimeout(Deferred.await(joined.reached), "second prompt never reached ensureRunning")
       yield* Deferred.succeed(finishingRead.release, void 0)
 
-      const [ea, eb] = yield* Effect.all([Fiber.await(a), Fiber.await(b)])
+      const [ea, eb] = yield* awaitWithTimeout(
+        Effect.all([Fiber.await(a), Fiber.await(b)]),
+        "prompts never finished",
+        "10 seconds",
+      )
       expect(Exit.isSuccess(ea)).toBe(true)
       expect(Exit.isSuccess(eb)).toBe(true)
       // The second prompt must have joined the finishing run; a run of its own
@@ -1667,6 +1671,29 @@ const queued = (sessionID: SessionID, count: number) =>
     `queue never held ${count} item(s)`,
   )
 
+// Waits until a prompt was admitted, whether it is still queued or already in
+// the message history, so a regression shows up in the model inputs instead.
+const admitted = (sessionID: SessionID, text: string) =>
+  pollWithTimeout(
+    Effect.gen(function* () {
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      if (
+        (yield* queue.list(sessionID)).some((item) =>
+          item.input.parts.some((part) => part.type === "text" && part.text === text),
+        )
+      )
+        return true
+      const msgs = yield* sessions.messages({ sessionID })
+      return msgs.some((msg) => msg.parts.some((part) => part.type === "text" && part.text === text)) ? true : undefined
+    }),
+    `prompt "${text}" was never admitted`,
+  )
+
+// Joins the prompts of one test, failing on its own if a drain never ends.
+const finish = <A, E>(...fibers: Fiber.Fiber<A, E>[]) =>
+  awaitWithTimeout(Effect.all(fibers.map((fiber) => Fiber.join(fiber))), "prompts never finished", "10 seconds")
+
 const startHeld = Effect.fn("test.startHeld")(function* (input?: { tool?: boolean }) {
   const { llm } = yield* useServerConfig(providerCfg)
   const prompt = yield* SessionPrompt.Service
@@ -1701,10 +1728,9 @@ it.instance(
       yield* llm.text("queued done")
 
       const held = yield* send("after the task", { delivery: "queue" })
-      yield* queued(chat.id, 1)
+      yield* admitted(chat.id, "after the task")
       yield* release
-      yield* Fiber.join(task)
-      yield* Fiber.join(held)
+      yield* finish(task, held)
 
       const inputs = yield* llm.inputs
       expect(inputs).toHaveLength(3)
@@ -1739,7 +1765,7 @@ it.instance(
       const third = yield* send("queued three", { delivery: "queue" })
       yield* queued(chat.id, 3)
       yield* release
-      yield* Effect.all([Fiber.join(task), Fiber.join(first), Fiber.join(second), Fiber.join(third)])
+      yield* finish(task, first, second, third)
 
       const inputs = yield* llm.inputs
       expect(inputs).toHaveLength(4)
@@ -1758,27 +1784,16 @@ it.instance(
   "a later steer reaches the next step before an earlier queued prompt",
   () =>
     Effect.gen(function* () {
-      const { llm, sessions, chat, task, send, release } = yield* startHeld()
+      const { llm, chat, task, send, release } = yield* startHeld()
       yield* llm.text("steer done")
       yield* llm.text("queued done")
 
       const held = yield* send("queued earlier", { delivery: "queue" })
-      yield* queued(chat.id, 1)
+      yield* admitted(chat.id, "queued earlier")
       const steer = yield* send("steer later")
-      yield* pollWithTimeout(
-        sessions
-          .messages({ sessionID: chat.id })
-          .pipe(
-            Effect.map((msgs) =>
-              msgs.some((msg) => msg.parts.some((part) => part.type === "text" && part.text === "steer later"))
-                ? true
-                : undefined,
-            ),
-          ),
-        "steer never reached the message history",
-      )
+      yield* admitted(chat.id, "steer later")
       yield* release
-      yield* Effect.all([Fiber.join(task), Fiber.join(held), Fiber.join(steer)])
+      yield* finish(task, held, steer)
 
       const inputs = yield* llm.inputs
       expect(inputs).toHaveLength(3)
@@ -1804,7 +1819,7 @@ it.instance(
       expect(Option.getOrUndefined(yield* queue.withdraw(chat.id, admitted!.id))).toEqual(admitted)
       expect(Option.isNone(yield* queue.withdraw(chat.id, admitted!.id))).toBe(true)
       yield* release
-      yield* Effect.all([Fiber.join(task), Fiber.join(withdrawn), Fiber.join(kept)])
+      yield* finish(task, withdrawn, kept)
 
       const inputs = yield* llm.inputs
       expect(inputs).toHaveLength(2)
@@ -1836,7 +1851,7 @@ it.instance(
         [expect.any(String), admitted!.seq + 1],
       ])
       yield* release
-      yield* Effect.all([Fiber.join(task), Fiber.join(first), Fiber.join(second)])
+      yield* finish(task, first, second)
 
       const inputs = yield* llm.inputs
       expect(inputs.slice(1).map(lastUser)).toEqual([
@@ -1858,7 +1873,7 @@ it.instance(
       yield* queued(chat.id, 2)
 
       yield* prompt.cancel(chat.id)
-      yield* Effect.all([Fiber.join(task), Fiber.join(first), Fiber.join(second)])
+      yield* finish(task, first, second)
       expect(yield* llm.calls).toBe(1)
       expect((yield* queue.list(chat.id)).map((item) => item.input.parts)).toEqual([
         said("parked one"),
@@ -1886,26 +1901,15 @@ it.instance(
   () =>
     Effect.gen(function* () {
       const compaction = yield* SessionCompaction.Service
-      const { llm, queue, sessions, chat, task, send, release } = yield* startHeld()
+      const { llm, chat, task, send, release } = yield* startHeld()
       yield* llm.text("summary of the task")
       yield* llm.text("steer done")
 
       yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
       const steer = yield* send("steer during compaction")
-      yield* pollWithTimeout(
-        Effect.gen(function* () {
-          if ((yield* queue.list(chat.id)).length > 0) return true
-          const msgs = yield* sessions.messages({ sessionID: chat.id })
-          return msgs.some((msg) =>
-            msg.parts.some((part) => part.type === "text" && part.text === "steer during compaction"),
-          )
-            ? true
-            : undefined
-        }),
-        "steer was never admitted",
-      )
+      yield* admitted(chat.id, "steer during compaction")
       yield* release
-      yield* Effect.all([Fiber.join(task), Fiber.join(steer)])
+      yield* finish(task, steer)
 
       const inputs = yield* llm.inputs
       expect(inputs).toHaveLength(3)
@@ -1922,9 +1926,9 @@ it.instance(
       const database = yield* Database.Service
       const { llm, prompt, chat, task, send } = yield* startHeld()
       const held = yield* send("survives the rebuild", { delivery: "queue" })
-      const [admitted] = yield* queued(chat.id, 1)
+      const [pending] = yield* queued(chat.id, 1)
       yield* prompt.cancel(chat.id)
-      yield* Effect.all([Fiber.join(task), Fiber.join(held)])
+      yield* finish(task, held)
 
       yield* llm.text("wake done")
       yield* llm.text("held done")
@@ -1938,7 +1942,7 @@ it.instance(
       yield* Effect.gen(function* () {
         const queue = yield* SessionQueue.Service
         const again = yield* SessionPrompt.Service
-        expect(yield* queue.list(chat.id)).toEqual([admitted])
+        expect(yield* queue.list(chat.id)).toEqual([pending])
         yield* again.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("wake up") })
         expect(yield* queue.list(chat.id)).toEqual([])
       }).pipe(Effect.provide(rebuilt))
@@ -2008,9 +2012,9 @@ it.instance(
       yield* llm.text("queued done")
 
       const held = yield* send("supplied an old id", { delivery: "queue", messageID: stale })
-      yield* queued(chat.id, 1)
+      yield* admitted(chat.id, "supplied an old id")
       yield* release
-      yield* Effect.all([Fiber.join(task), Fiber.join(held)])
+      yield* finish(task, held)
 
       const msgs = yield* sessions.messages({ sessionID: chat.id })
       const reply = msgs.find((msg) => msg.info.role === "assistant")
