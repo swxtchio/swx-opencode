@@ -37,7 +37,7 @@ import * as DateTime from "effect/DateTime"
 import { eq } from "drizzle-orm"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideInstanceEffect, TestInstance, tmpdirScoped } from "../fixture/fixture"
-import { TestLLMServer } from "../lib/llm-server"
+import { reply, TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 
@@ -1230,12 +1230,13 @@ describe("session HttpApi", () => {
   )
 
   it.live(
-    "a prompt carrying an output format passes through the queue",
+    "a queued json_schema prompt is listed and promoted from its stored row into a structured turn, and a text-format steer is promoted from its row",
     () => {
       const gate = Deferred.makeUnsafe<void>()
       return Effect.gen(function* () {
         const llm = yield* TestLLMServer
         yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        yield* llm.push(reply().tool("StructuredOutput", { answer: "42" }))
         const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
         const session = yield* createSession({ title: "queue format" }).pipe(provideInstanceEffect(directory))
         const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
@@ -1267,10 +1268,6 @@ describe("session HttpApi", () => {
         )
         // The listed input carries the format as the route decoded it, default included.
         expect(held!.input.format).toEqual({ type: "json_schema", schema, retryCount: 2 })
-        yield* request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID: held!.id }), {
-          method: "DELETE",
-          headers,
-        })
         yield* Deferred.succeed(gate, void 0)
         yield* pollWithTimeout(
           requestJson<Record<string, { type: string }>>(SessionPaths.status, { headers }).pipe(
@@ -1278,17 +1275,34 @@ describe("session HttpApi", () => {
           ),
           "session never went idle",
         )
+        // Promoted from its row at the would-idle point, it ran as a structured turn.
+        const afterHeld = yield* Session.use
+          .messages({ sessionID: session.id })
+          .pipe(provideInstanceEffect(directory), Effect.orDie)
+        const heldMessage = afterHeld.find((message) =>
+          message.parts.some((part) => part.type === "text" && part.text === "held with a format"),
+        )?.info
+        expect(heldMessage?.role === "user" ? heldMessage.format : undefined).toMatchObject({
+          type: "json_schema",
+          schema,
+          retryCount: 2,
+        })
+        const structured = afterHeld.find(
+          (message) => message.info.role === "assistant" && message.info.parentID === heldMessage?.id,
+        )?.info
+        expect(structured?.role === "assistant" ? structured.structured : undefined).toEqual({ answer: "42" })
+        expect(yield* llm.calls).toBe(2)
 
         // On an idle session the steer becomes a message at once, through the stored row.
         yield* llm.text("text done")
-        const reply = yield* post(SessionPaths.prompt, {
+        const textReply = yield* post(SessionPaths.prompt, {
           agent: "build",
           model,
           format: { type: "text" },
           parts: [{ type: "text", text: "plain text please" }],
         })
-        expect(reply.status).toBe(200)
-        expect(yield* responseJson(reply)).toMatchObject({ info: { role: "assistant" } })
+        expect(textReply.status).toBe(200)
+        expect(yield* responseJson(textReply)).toMatchObject({ info: { role: "assistant" } })
         const messages = yield* Session.use
           .messages({ sessionID: session.id })
           .pipe(provideInstanceEffect(directory), Effect.orDie)
