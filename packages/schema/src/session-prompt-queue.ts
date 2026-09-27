@@ -59,6 +59,8 @@ export const QueuedInput = Schema.Struct(Struct.omit(Input.fields, ["noReply", "
   identifier: "SessionPromptQueueInput",
 })
 export type QueuedInput = Schema.Schema.Type<typeof QueuedInput>
+// The stored form; `format` holds class instances only once decoded.
+export type QueuedInputEncoded = typeof QueuedInput.Encoded
 
 export const Item = Schema.Struct({
   id: ItemID,

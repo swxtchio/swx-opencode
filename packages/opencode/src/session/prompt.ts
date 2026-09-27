@@ -1081,8 +1081,16 @@ const layer = Layer.effect(
       // next step as it did before the queue.
       const message = input.noReply === true ? yield* createUserMessage(input) : undefined
       if (!message) {
-        yield* queue.admit(input)
-        yield* promote(input.sessionID, "steer")
+        const own = yield* queue.admit(input)
+        // Only this prompt's own failure is this caller's error; an older steer
+        // promoted alongside it is reported on its own.
+        yield* queue.promote({
+          sessionID: input.sessionID,
+          delivery: "steer",
+          create: createUserMessage,
+          rejected: rejected(input.sessionID),
+          own: own.id,
+        })
       }
       yield* sessions.touch(input.sessionID)
 
@@ -1099,25 +1107,21 @@ const layer = Layer.effect(
       return yield* loop({ sessionID: input.sessionID })
     })
 
-    const promote = (sessionID: SessionID, delivery: SessionQueue.Delivery) =>
-      queue.promote({ sessionID, delivery, create: createUserMessage })
+    // A queued prompt that cannot become a message is dropped by the queue;
+    // report it the way prompt_async reports a failed prompt.
+    const rejected = (sessionID: SessionID) => (cause: Cause.Cause<unknown>) =>
+      events
+        .publish(Session.Event.Error, {
+          sessionID,
+          error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
+        })
+        .pipe(Effect.asVoid)
 
-    // Inside a drain a pending item that cannot become a message is dropped by
-    // the queue; report it the way prompt_async reports a failed prompt and
-    // reevaluate, since the queue changed.
+    // Inside a drain no item is the caller's own, so only an interrupt can fail this.
     const promoteInLoop = (sessionID: SessionID, delivery: SessionQueue.Delivery) =>
-      promote(sessionID, delivery).pipe(
-        Effect.catchCause((cause) =>
-          Cause.hasInterruptsOnly(cause)
-            ? Effect.interrupt
-            : events
-                .publish(Session.Event.Error, {
-                  sessionID,
-                  error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
-                })
-                .pipe(Effect.as(true)),
-        ),
-      )
+      queue
+        .promote({ sessionID, delivery, create: createUserMessage, rejected: rejected(sessionID) })
+        .pipe(Effect.orDie)
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1144,7 +1148,7 @@ const layer = Layer.effect(
             Effect.provideService(Database.Service, database),
           )
 
-          const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
+          const { user: lastUser, assistant: lastAssistant, finished: lastFinished } = MessageV2.latest(msgs)
 
           // Steers parked by an abort or held behind a compaction reach the next step.
           if (yield* promoteInLoop(sessionID, "steer")) continue
@@ -1206,7 +1210,9 @@ const layer = Layer.effect(
             }).pipe(Effect.ignore, Effect.forkIn(scope))
 
           const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
-          const task = tasks.pop()
+          // A compaction whose summary turn stopped is over; retrying it would make
+          // the next prompt its parent.
+          const task = SessionQueue.openTasks(msgs).pop()
 
           if (task?.type === "subtask") {
             yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
@@ -1356,6 +1362,8 @@ const layer = Layer.effect(
               handle.message.structured = structured
               handle.message.finish = handle.message.finish ?? "stop"
               yield* sessions.updateMessage(handle.message)
+              // A structured result is a normal completion, not a stop.
+              settled = true
               return "break" as const
             }
 
@@ -1420,8 +1428,18 @@ const layer = Layer.effect(
         runLoop(input.sessionID),
       )
       // Work admitted after the joined run's last history read would otherwise
-      // wait for another prompt; drain again while it is pending and not parked.
-      if (yield* queue.awaitingDrain(input.sessionID)) return yield* loop(input)
+      // wait for another prompt; wake another drain while it is pending and not
+      // parked. It runs in the background so this caller keeps its own result,
+      // a structured one included.
+      if (yield* queue.awaitingDrain(input.sessionID))
+        yield* loop(input).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("queue drain failed", { "session.id": input.sessionID, cause }).pipe(
+              Effect.andThen(rejected(input.sessionID)(cause)),
+            ),
+          ),
+          Effect.forkIn(scope, { startImmediately: true }),
+        )
       return result
     })
 

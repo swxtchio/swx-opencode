@@ -2,9 +2,10 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionPromptQueueSequenceTable, SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
 import { MessageTable } from "@opencode-ai/core/session/sql"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm"
-import { Cause, Context, Effect, Exit, Layer, Option, Semaphore, Struct } from "effect"
+import { Cause, Context, Effect, Exit, Layer, Option, Schema, Semaphore, Struct } from "effect"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { MessageV2 } from "./message-v2"
 import { MessageID, SessionID } from "./schema"
@@ -44,21 +45,24 @@ export interface Interface {
     readonly delivery: Delivery
   }) => Effect.Effect<Option.Option<Item>>
   /**
-   * Turns pending items into V1 user messages through `create`. Steers wait
-   * while a compaction task is pending, so they never become that compaction's
-   * parent or input, and queued items go one per call so the loop reevaluates
-   * between their turns.
+   * Turns pending items into V1 user messages through `create`, and reports
+   * whether the queue changed. Steers wait while a compaction task is pending,
+   * so they never become that compaction's parent or input, and queued items go
+   * one per call so the loop reevaluates between their turns. An item that
+   * cannot become a message is dropped: the caller's `own` item fails the call,
+   * any other goes to `rejected`, so one prompt's failure never lands on another.
    */
   readonly promote: <E>(input: {
     readonly sessionID: SessionID
     readonly delivery: Delivery
     readonly create: (input: PromotedInput) => Effect.Effect<unknown, E>
+    readonly rejected: (cause: Cause.Cause<E>) => Effect.Effect<void>
+    readonly own?: ItemID
   }) => Effect.Effect<boolean, E>
   /**
    * Called by a drain before it reads history. A promoted row outlives its
    * promotion until then so that a joiner of a finishing run can see the prompt
-   * still needs a drain, and so that a promotion interrupted by a crash is
-   * delivered once rather than lost or repeated.
+   * still needs a drain.
    */
   readonly consume: (sessionID: SessionID) => Effect.Effect<void>
   /** A run that stopped on an abort or error must not restart until something wakes the session. */
@@ -114,7 +118,13 @@ const layer = Layer.effect(
       yield* events.publish(Event.Updated, { sessionID, items: yield* list(sessionID) })
     })
 
+    // Every mutation publishes its resulting list under the session's lock, so
+    // listeners see the lists in the order the mutations happened.
     const admit = Effect.fn("SessionQueue.admit")(function* (input: AdmitInput) {
+      return yield* exclusive(input.sessionID, admitLocked(input))
+    })
+
+    const admitLocked = Effect.fnUntraced(function* (input: AdmitInput) {
       const row = yield* db
         .transaction((tx) =>
           Effect.gen(function* () {
@@ -135,7 +145,7 @@ const layer = Layer.effect(
                 session_id: input.sessionID,
                 seq: allocated.seq,
                 delivery: input.delivery ?? "steer",
-                input: Struct.omit(input, ["sessionID", "noReply", "delivery"]),
+                input: encodeInput(Struct.omit(input, ["sessionID", "noReply", "delivery"])),
                 time_created: Date.now(),
               })
               .returning()
@@ -150,19 +160,28 @@ const layer = Layer.effect(
     })
 
     const withdraw = Effect.fn("SessionQueue.withdraw")(function* (sessionID: SessionID, itemID: ItemID) {
-      const row = yield* db
-        .update(SessionPromptQueueTable)
-        .set({ time_withdrawn: Date.now() })
-        .where(and(eq(SessionPromptQueueTable.id, itemID), pending(sessionID)))
-        .returning()
-        .get()
-        .pipe(Effect.orDie)
-      if (!row) return Option.none()
-      yield* publish(sessionID)
-      return Option.some(fromRow(row))
+      return yield* exclusive(
+        sessionID,
+        Effect.gen(function* () {
+          const row = yield* db
+            .update(SessionPromptQueueTable)
+            .set({ time_withdrawn: Date.now() })
+            .where(and(eq(SessionPromptQueueTable.id, itemID), pending(sessionID)))
+            .returning()
+            .get()
+            .pipe(Effect.orDie)
+          if (!row) return Option.none()
+          yield* publish(sessionID)
+          return Option.some(fromRow(row))
+        }),
+      )
     })
 
     const restore = Effect.fn("SessionQueue.restore")(function* (sessionID: SessionID, itemID: ItemID) {
+      return yield* exclusive(sessionID, restoreLocked(sessionID, itemID))
+    })
+
+    const restoreLocked = Effect.fnUntraced(function* (sessionID: SessionID, itemID: ItemID) {
       const row = yield* db
         .update(SessionPromptQueueTable)
         .set({ time_withdrawn: null })
@@ -187,6 +206,14 @@ const layer = Layer.effect(
       readonly itemID: ItemID
       readonly delivery: Delivery
     }) {
+      return yield* exclusive(input.sessionID, updateLocked(input))
+    })
+
+    const updateLocked = Effect.fnUntraced(function* (input: {
+      readonly sessionID: SessionID
+      readonly itemID: ItemID
+      readonly delivery: Delivery
+    }) {
       const row = yield* db
         .update(SessionPromptQueueTable)
         .set({ delivery: input.delivery })
@@ -203,7 +230,7 @@ const layer = Layer.effect(
     const compacting = (sessionID: SessionID) =>
       MessageV2.filterCompactedEffect(sessionID).pipe(
         Effect.provideService(Database.Service, database),
-        Effect.map((msgs) => MessageV2.latest(msgs).tasks.some((task) => task.type === "compaction")),
+        Effect.map((msgs) => openTasks(msgs).some((task) => task.type === "compaction")),
       )
 
     const oldest = (sessionID: SessionID, delivery: Delivery) =>
@@ -231,33 +258,72 @@ const layer = Layer.effect(
       return !newest || supplied > newest.id ? supplied : MessageID.ascending()
     })
 
+    const landed = (id: MessageID) =>
+      db
+        .select({ id: MessageTable.id })
+        .from(MessageTable)
+        .where(eq(MessageTable.id, id))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.map((row) => row !== undefined),
+        )
+
+    const markPromoted = (itemID: ItemID) =>
+      db
+        .update(SessionPromptQueueTable)
+        .set({ time_promoted: Date.now() })
+        .where(eq(SessionPromptQueueTable.id, itemID))
+        .run()
+        .pipe(Effect.orDie)
+
+    const drop = (itemID: ItemID) =>
+      db.delete(SessionPromptQueueTable).where(eq(SessionPromptQueueTable.id, itemID)).run().pipe(Effect.orDie)
+
+    // The item stays listed until its message exists: the message id is only
+    // reserved first, and the row is marked promoted once `create` has written it.
     const promoteOne = <E>(
       sessionID: SessionID,
       row: typeof SessionPromptQueueTable.$inferSelect,
       create: (input: PromotedInput) => Effect.Effect<unknown, E>,
     ) =>
       Effect.gen(function* () {
-        const id = yield* messageID(sessionID, row.input.messageID)
-        const claimed = yield* db
+        if (row.message_id && (yield* landed(row.message_id))) {
+          yield* markPromoted(row.id)
+          yield* publish(sessionID)
+          return true
+        }
+        const input = yield* Schema.decodeUnknownEffect(SessionPromptQueue.QueuedInput)(row.input).pipe(
+          Effect.tapError(() => drop(row.id).pipe(Effect.andThen(publish(sessionID)))),
+          Effect.orDie,
+        )
+        const id = yield* messageID(sessionID, input.messageID)
+        const reserved = yield* db
           .update(SessionPromptQueueTable)
-          .set({ time_promoted: Date.now(), message_id: id })
+          .set({ message_id: id })
           .where(and(eq(SessionPromptQueueTable.id, row.id), pending(sessionID)))
-          .returning()
+          .returning({ id: SessionPromptQueueTable.id })
           .get()
           .pipe(Effect.orDie)
-        // Withdrawn or promoted by someone else since it was read.
-        if (!claimed) return false
-        yield* create({ ...claimed.input, sessionID, messageID: id }).pipe(
-          // A prompt that cannot become a message is consumed, as a failed prompt was before the queue.
-          Effect.onExit((exit) =>
-            Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)
-              ? db
-                  .delete(SessionPromptQueueTable)
-                  .where(eq(SessionPromptQueueTable.id, row.id))
-                  .run()
-                  .pipe(Effect.orDie)
-              : Effect.void,
-          ),
+        if (!reserved) return false
+        yield* create({ ...input, sessionID, messageID: id }).pipe(
+          Effect.onExit((exit) => {
+            if (Exit.isSuccess(exit)) return markPromoted(row.id)
+            // A prompt that cannot become a message is consumed, as a failed prompt was before the queue.
+            if (!Cause.hasInterruptsOnly(exit.cause)) return drop(row.id)
+            return landed(id).pipe(
+              Effect.flatMap((exists) =>
+                exists
+                  ? markPromoted(row.id)
+                  : db
+                      .update(SessionPromptQueueTable)
+                      .set({ message_id: null })
+                      .where(eq(SessionPromptQueueTable.id, row.id))
+                      .run()
+                      .pipe(Effect.orDie),
+              ),
+            )
+          }),
           Effect.ensuring(publish(sessionID)),
         )
         return true
@@ -267,20 +333,26 @@ const layer = Layer.effect(
       readonly sessionID: SessionID
       readonly delivery: Delivery
       readonly create: (input: PromotedInput) => Effect.Effect<unknown, E>
+      readonly rejected: (cause: Cause.Cause<E>) => Effect.Effect<void>
+      readonly own?: ItemID
     }) =>
       exclusive(
         input.sessionID,
         Effect.gen(function* () {
           if (input.delivery === "steer" && !(yield* oldest(input.sessionID, "steer"))) return false
           if (input.delivery === "steer" && (yield* compacting(input.sessionID))) return false
-          let promoted = false
+          let changed = false
           while (true) {
             const row = yield* oldest(input.sessionID, input.delivery)
-            if (!row) return promoted
-            if (!(yield* promoteOne(input.sessionID, row, input.create))) continue
-            promoted = true
+            if (!row) return changed
+            const exit = yield* promoteOne(input.sessionID, row, input.create).pipe(Effect.exit)
+            if (Exit.isSuccess(exit) && !exit.value) continue
+            changed = true
             // Queued items run one per turn; the loop reevaluates before the next.
-            if (input.delivery === "queue") return true
+            if (Exit.isSuccess(exit) && input.delivery === "queue") return true
+            if (Exit.isSuccess(exit)) continue
+            if (Cause.hasInterruptsOnly(exit.cause) || row.id === input.own) return yield* Effect.failCause(exit.cause)
+            yield* input.rejected(exit.cause)
           }
         }),
       ).pipe(Effect.withSpan("SessionQueue.promote"))
@@ -288,46 +360,13 @@ const layer = Layer.effect(
     const consume = Effect.fn("SessionQueue.consume")(function* (sessionID: SessionID) {
       yield* exclusive(
         sessionID,
-        Effect.gen(function* () {
-          const rows = yield* db
-            .select()
-            .from(SessionPromptQueueTable)
-            .where(
-              and(eq(SessionPromptQueueTable.session_id, sessionID), isNotNull(SessionPromptQueueTable.time_promoted)),
-            )
-            .all()
-            .pipe(Effect.orDie)
-          if (rows.length === 0) return
-          const landed = new Set(
-            (yield* db
-              .select({ id: MessageTable.id })
-              .from(MessageTable)
-              .where(
-                inArray(
-                  MessageTable.id,
-                  rows.flatMap((row) => (row.message_id ? [row.message_id] : [])),
-                ),
-              )
-              .all()
-              .pipe(Effect.orDie)).map((row) => row.id),
+        db
+          .delete(SessionPromptQueueTable)
+          .where(
+            and(eq(SessionPromptQueueTable.session_id, sessionID), isNotNull(SessionPromptQueueTable.time_promoted)),
           )
-          const consumed = rows.filter((row) => row.message_id && landed.has(row.message_id)).map((row) => row.id)
-          const lost = rows.filter((row) => !row.message_id || !landed.has(row.message_id)).map((row) => row.id)
-          if (consumed.length > 0)
-            yield* db
-              .delete(SessionPromptQueueTable)
-              .where(inArray(SessionPromptQueueTable.id, consumed))
-              .run()
-              .pipe(Effect.orDie)
-          if (lost.length === 0) return
-          yield* db
-            .update(SessionPromptQueueTable)
-            .set({ time_promoted: null, message_id: null })
-            .where(inArray(SessionPromptQueueTable.id, lost))
-            .run()
-            .pipe(Effect.orDie)
-          yield* publish(sessionID)
-        }),
+          .run()
+          .pipe(Effect.orDie),
       )
     })
 
@@ -360,13 +399,30 @@ const layer = Layer.effect(
   }),
 )
 
+/**
+ * The compaction and subtask parts the loop still has to run. A compaction whose
+ * summary turn stopped on an abort or error is over, the way any stopped turn is,
+ * so neither a steer waits on it nor does the loop rerun it.
+ */
+export function openTasks(msgs: SessionV1.WithParts[]) {
+  const stopped = new Set(
+    msgs.flatMap((msg) => (msg.info.role === "assistant" && msg.info.error !== undefined ? [msg.info.parentID] : [])),
+  )
+  return MessageV2.latest(msgs).tasks.filter((task) => task.type !== "compaction" || !stopped.has(task.messageID))
+}
+
+// Rows hold the encoded input; `format`, for one, only becomes its class again
+// through the schema.
+const encodeInput = Schema.encodeSync(SessionPromptQueue.QueuedInput)
+const decodeInput = Schema.decodeUnknownSync(SessionPromptQueue.QueuedInput)
+
 function fromRow(row: typeof SessionPromptQueueTable.$inferSelect): Item {
   return {
     id: row.id,
     sessionID: row.session_id,
     seq: row.seq,
     delivery: row.delivery,
-    input: row.input,
+    input: decodeInput(row.input),
     time: { created: row.time_created },
   }
 }

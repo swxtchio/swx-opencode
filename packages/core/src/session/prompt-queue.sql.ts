@@ -5,9 +5,11 @@ import type { MessageID } from "../v1/session"
 import { SessionTable } from "./sql"
 
 // Fork-owned V1 prompt queue (swxtchio/swx-opencode#68). A row is pending until
-// it is promoted into a V1 user message (time_promoted, message_id) or withdrawn
-// for editing (time_withdrawn). A promoted row stays until the next drain's
-// history read has seen its message; a withdrawn row stays so it can be restored.
+// it is promoted into a V1 user message (time_promoted) or withdrawn for editing
+// (time_withdrawn). message_id is reserved before the message is written, so a
+// promotion a stopped process left half done is finished rather than repeated. A
+// promoted row stays until the next drain's history read has seen its message; a
+// withdrawn row stays so it can be restored.
 export const SessionPromptQueueTable = sqliteTable(
   "session_prompt_queue",
   {
@@ -18,7 +20,7 @@ export const SessionPromptQueueTable = sqliteTable(
       .references(() => SessionTable.id, { onDelete: "cascade" }),
     seq: integer().notNull(),
     delivery: text().$type<SessionPromptQueue.Delivery>().notNull(),
-    input: text({ mode: "json" }).notNull().$type<SessionPromptQueue.QueuedInput>(),
+    input: text({ mode: "json" }).notNull().$type<SessionPromptQueue.QueuedInputEncoded>(),
     message_id: text().$type<MessageID>(),
     time_created: integer().notNull(),
     time_promoted: integer(),
