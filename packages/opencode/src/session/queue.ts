@@ -331,9 +331,7 @@ const layer = Layer.effect(
       )
     })
 
-    const park = Effect.fn("SessionQueue.park")(function* (sessionID: SessionID) {
-      parked.add(sessionID)
-    })
+    const park = (sessionID: SessionID) => Effect.sync(() => void parked.add(sessionID))
 
     const awaitingDrain = Effect.fn("SessionQueue.awaitingDrain")(function* (sessionID: SessionID) {
       if (parked.has(sessionID)) return false
