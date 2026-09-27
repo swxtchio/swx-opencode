@@ -325,6 +325,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     }) {
       yield* requireSession(ctx.params.sessionID)
       yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
+        // A withdrawn prompt ended as its editor asked; it is not a session error.
+        Effect.catchTag("SessionQueueWithdrawnError", (error) =>
+          Effect.logInfo("prompt_async withdrawn before delivery", {
+            sessionID: ctx.params.sessionID,
+            itemID: error.itemID,
+          }),
+        ),
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
             yield* Effect.logError("prompt_async failed", { sessionID: ctx.params.sessionID, cause })
