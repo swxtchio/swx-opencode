@@ -637,7 +637,9 @@ const layer = Layer.effect(
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
-    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+    // Resolves a prompt into its user message without storing it, so a queue
+    // promotion can drop the result when a withdraw wins meanwhile.
+    const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (input: PromptInput) {
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
@@ -688,25 +690,6 @@ const layer = Layer.effect(
         },
         system: input.system,
         format: input.format,
-      }
-
-      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      if (
-        current.agent !== info.agent ||
-        current.model?.providerID !== info.model.providerID ||
-        current.model?.id !== info.model.modelID ||
-        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
-      ) {
-        yield* sessions.setAgentModel({
-          sessionID: input.sessionID,
-          agent: info.agent,
-          model: {
-            id: info.model.modelID,
-            providerID: info.model.providerID,
-            variant: info.model.variant ?? "default",
-          },
-          time: info.time.created,
-        })
       }
 
       yield* Effect.addFinalizer(() => instruction.clear(info.id))
@@ -1064,11 +1047,39 @@ const layer = Layer.effect(
         })
       }
 
-      yield* sessions.updateMessage(info)
-      for (const part of parts) yield* sessions.updatePart(part)
-
       return { info, parts }
     }, Effect.scoped)
+
+    // Stores a prepared user message; the session follows its agent and model.
+    const writeUserMessage = Effect.fnUntraced(function* (message: {
+      readonly info: SessionV1.User
+      readonly parts: ReadonlyArray<SessionV1.Part>
+    }) {
+      const info = message.info
+      const current = yield* sessions.get(info.sessionID).pipe(Effect.orDie)
+      if (
+        current.agent !== info.agent ||
+        current.model?.providerID !== info.model.providerID ||
+        current.model?.id !== info.model.modelID ||
+        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
+      ) {
+        yield* sessions.setAgentModel({
+          sessionID: info.sessionID,
+          agent: info.agent,
+          model: {
+            id: info.model.modelID,
+            providerID: info.model.providerID,
+            variant: info.model.variant ?? "default",
+          },
+          time: info.time.created,
+        })
+      }
+      yield* sessions.updateMessage(info)
+      for (const part of message.parts) yield* sessions.updatePart(part)
+      return { info, parts: [...message.parts] }
+    })
+
+    const createUserMessage = (input: PromptInput) => prepareUserMessage(input).pipe(Effect.flatMap(writeUserMessage))
 
     const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
       "SessionPrompt.prompt",
@@ -1079,19 +1090,21 @@ const layer = Layer.effect(
       // admitted to the durable queue first; a steer is promoted at once, unless a
       // pending compaction must run first, so it still reaches the running turn's
       // next step as it did before the queue.
-      const message = input.noReply === true ? yield* createUserMessage(input) : undefined
-      if (!message) {
-        const own = yield* queue.admit(input)
-        // Only this prompt's own failure is this caller's error; an older steer
-        // promoted alongside it is reported on its own.
+      const entry =
+        input.noReply === true
+          ? { kind: "direct" as const, message: yield* createUserMessage(input) }
+          : { kind: "queued" as const, own: yield* queue.admit(input) }
+      // Only this prompt's own failure is this caller's error; an older steer
+      // promoted alongside it is reported on its own.
+      if (entry.kind === "queued")
         yield* queue.promote({
           sessionID: input.sessionID,
           delivery: "steer",
-          create: createUserMessage,
+          prepare: prepareUserMessage,
+          write: writeUserMessage,
           rejected: rejected(input.sessionID),
-          own: own.id,
+          own: entry.own.id,
         })
-      }
       yield* sessions.touch(input.sessionID)
 
       const permissions: PermissionV1.Rule[] = []
@@ -1103,8 +1116,8 @@ const layer = Layer.effect(
         yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
       }
 
-      if (message) return message
-      return yield* loop({ sessionID: input.sessionID })
+      if (entry.kind === "direct") return entry.message
+      return yield* drain(input.sessionID, entry.own.id)
     })
 
     // A queued prompt that cannot become a message is dropped by the queue;
@@ -1120,7 +1133,13 @@ const layer = Layer.effect(
     // Inside a drain no item is the caller's own, so only an interrupt can fail this.
     const promoteInLoop = (sessionID: SessionID, delivery: SessionQueue.Delivery) =>
       queue
-        .promote({ sessionID, delivery, create: createUserMessage, rejected: rejected(sessionID) })
+        .promote({
+          sessionID,
+          delivery,
+          prepare: prepareUserMessage,
+          write: writeUserMessage,
+          rejected: rejected(sessionID),
+        })
         .pipe(Effect.orDie)
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -1137,13 +1156,14 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         let settled = false
+        let seen = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-          yield* queue.consume(sessionID)
+          seen = yield* queue.consume(sessionID)
           let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
             Effect.provideService(Database.Service, database),
           )
@@ -1223,13 +1243,18 @@ const layer = Layer.effect(
           }
 
           if (task?.type === "compaction") {
-            const result = yield* compaction.process({
-              messages: msgs,
-              parentID: lastUser.id,
+            // No steer is promoted until the summary and its replay or continue
+            // message are written, so none lands between them.
+            const result = yield* queue.whileCompacting(
               sessionID,
-              auto: task.auto,
-              overflow: task.overflow,
-            })
+              compaction.process({
+                messages: msgs,
+                parentID: lastUser.id,
+                sessionID,
+                auto: task.auto,
+                overflow: task.overflow,
+              }),
+            )
             if (result === "stop") break
             continue
           }
@@ -1365,9 +1390,10 @@ const layer = Layer.effect(
               handle.message.structured = structured
               handle.message.finish = handle.message.finish ?? "stop"
               yield* sessions.updateMessage(handle.message)
-              // A structured result is a normal completion, not a stop.
-              settled = true
-              return "break" as const
+              // The turn is over, but the run goes on to its would-idle point, so a
+              // queued prompt behind it runs in this drain.
+              structured = undefined
+              return "continue" as const
             }
 
             const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
@@ -1414,7 +1440,7 @@ const layer = Layer.effect(
         }
 
         // Any other exit stops the task; the joiner re-check must not restart it.
-        if (!settled) yield* queue.park(sessionID)
+        if (!settled) yield* queue.park(sessionID, seen)
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
       },
@@ -1422,28 +1448,37 @@ const layer = Layer.effect(
       (effect, sessionID) => effect.pipe(Effect.onInterrupt(() => queue.park(sessionID))),
     )
 
-    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
-      input: LoopInput,
-    ) {
-      const result = yield* state.ensureRunning(
-        input.sessionID,
-        lastAssistant(input.sessionID),
-        runLoop(input.sessionID),
-      )
+    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = (input) => drain(input.sessionID)
+
+    // Runs or joins the session's drain. With `own`, returns the reply to that
+    // prompt: the drain's final message may answer another caller's prompt.
+    const drain: (sessionID: SessionID, own?: SessionQueue.ItemID) => Effect.Effect<SessionV1.WithParts> = Effect.fn(
+      "SessionPrompt.loop",
+    )(function* (sessionID: SessionID, own?: SessionQueue.ItemID) {
+      const result = yield* state.ensureRunning(sessionID, lastAssistant(sessionID), runLoop(sessionID))
       // Work admitted after the joined run's last history read would otherwise
-      // wait for another prompt; wake another drain while it is pending and not
-      // parked. It runs in the background so this caller keeps its own result,
-      // a structured one included.
-      if (yield* queue.awaitingDrain(input.sessionID))
-        yield* loop(input).pipe(
+      // wait for another prompt. This caller's own prompt is drained before it
+      // returns; anyone else's is woken in the background.
+      if (yield* queue.awaitingDrain(sessionID)) {
+        if (own && (yield* queue.unread(sessionID, own))) return yield* drain(sessionID, own)
+        yield* drain(sessionID).pipe(
           Effect.catchCause((cause) =>
-            Effect.logError("queue drain failed", { "session.id": input.sessionID, cause }).pipe(
-              Effect.andThen(rejected(input.sessionID)(cause)),
+            Effect.logError("queue drain failed", { "session.id": sessionID, cause }).pipe(
+              Effect.andThen(rejected(sessionID)(cause)),
             ),
           ),
           Effect.forkIn(scope, { startImmediately: true }),
         )
-      return result
+      }
+      const message = own ? yield* queue.delivered(own) : undefined
+      if (!message) return result
+      const answer = yield* sessions
+        .findMessage(sessionID, (m) => m.info.role === "assistant" && m.info.parentID === message)
+        .pipe(Effect.orDie)
+      if (Option.isSome(answer)) return answer.value
+      // A run that stopped before replying still hands back the caller's own message.
+      const asked = yield* sessions.findMessage(sessionID, (m) => m.info.id === message).pipe(Effect.orDie)
+      return Option.getOrElse(asked, () => result)
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
