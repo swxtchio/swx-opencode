@@ -12,7 +12,7 @@ import path from "path"
 import { Duration, Effect, Fiber, Layer, Semaphore } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { Snapshot } from "../../src/snapshot"
-import { MaintenanceService, maintenanceNode } from "../../src/snapshot/maintenance"
+import { MaintenanceService, lockCommand, maintenanceNode } from "../../src/snapshot/maintenance"
 import type { RunInput } from "../../src/snapshot/maintenance"
 import {
   disposeAllInstances,
@@ -26,12 +26,21 @@ import { awaitWithTimeout, testEffect } from "../lib/effect"
 const it = testEffect(
   Layer.mergeAll(LayerNode.compile(LayerNode.group([Snapshot.node, FSUtil.node])), testInstanceStoreLayer),
 )
+const traversalData = path.join(os.tmpdir(), `opencode-snapshot-traversal-${randomUUID()}`)
+const traversalIt = testEffect(
+  Layer.mergeAll(
+    LayerNode.compile(LayerNode.group([Snapshot.node, FSUtil.node]), [
+      [Global.node, Layer.succeed(Global.Service, Global.Service.of(Global.make({ data: traversalData })))],
+    ]),
+    LayerNode.compile(CrossSpawnSpawner.node),
+    testInstanceStoreLayer,
+  ),
+)
 const maintenanceLockIt = testEffect(
   Layer.mergeAll(LayerNode.compile(maintenanceNode), LayerNode.compile(CrossSpawnSpawner.node)),
 )
 // Windows forbids both * and : in directory names.
 const nonWindowsIt = process.platform === "win32" ? it.live.skip : it.live
-const nonWindowsMaintenanceLockIt = process.platform === "win32" ? maintenanceLockIt.live.skip : maintenanceLockIt.live
 
 const makeMaintenanceHarness = (input?: {
   readonly run?: (command: RunInput) => Effect.Effect<{ exitCode: number; stderr: string }>
@@ -124,6 +133,7 @@ const fixtureRoots = [
   reapHarness.data,
   lockOrderHarness.data,
   concurrencyHarness.data,
+  traversalData,
 ]
 const gcIt = gcHarness.it
 const scheduleIt = scheduleHarness.it
@@ -186,7 +196,72 @@ const waitFor = (message: string, condition: () => boolean) =>
     throw new Error(`snapshot maintenance did not reach ${message}`)
   })
 
-nonWindowsMaintenanceLockIt(
+it.effect(
+  "selects installed advisory-lock mechanisms for supported platforms",
+  Effect.sync(() => {
+    const which = (command: string) => {
+      if (command === "flock") return "/usr/bin/flock"
+      if (command === "perl") return "/usr/bin/perl"
+      if (command === "powershell.exe") return "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+      return null
+    }
+    expect(lockCommand("linux", "/data/snapshot/gc.lock", which).slice(0, 2)).toEqual(["/usr/bin/flock", "--exclusive"])
+    expect(lockCommand("darwin", "/data/snapshot/gc.lock", which)).toEqual([
+      "/usr/bin/perl",
+      "-MFcntl=:flock",
+      "-e",
+      expect.stringContaining("flock($lock, LOCK_EX)"),
+      "/data/snapshot/gc.lock",
+    ])
+    expect(lockCommand("win32", "C:/data/snapshot/gc.lock", which).slice(0, 4)).toEqual([
+      "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+      "-NoProfile",
+      "-NonInteractive",
+      "-EncodedCommand",
+    ])
+  }),
+)
+
+it.live(
+  "loads the snapshot maintenance module as a direct entry point",
+  Effect.gen(function* () {
+    const child = Bun.spawn(
+      [process.execPath, "run", path.resolve(import.meta.dir, "../../src/snapshot/maintenance.ts")],
+      { cwd: process.cwd(), stdout: "ignore", stderr: "pipe" },
+    )
+    const stderr = new Response(child.stderr).text()
+    const exitCode = yield* Effect.acquireUseRelease(
+      Effect.succeed(child),
+      (proc) =>
+        awaitWithTimeout(
+          Effect.promise(() => proc.exited),
+          "maintenance import timed out",
+          "5 seconds",
+        ),
+      (proc) => Effect.sync(() => proc.kill()),
+    )
+
+    expect(exitCode).toBe(0)
+    expect(yield* Effect.promise(() => stderr)).toBe("")
+  }),
+)
+
+traversalIt.live(
+  "does not traverse advisory-lock directories as shadow repositories",
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped({ git: true })
+    const snapshot = yield* Snapshot.Service
+    yield* snapshot.track().pipe(provideInstance(dir))
+    const root = path.join(traversalData, "snapshot")
+    yield* Effect.promise(() => fs.writeFile(path.join(root, "gc-completed"), String(Date.now() + 60_000)))
+
+    yield* snapshot.cleanup().pipe(provideInstance(dir))
+
+    expect(yield* Effect.promise(() => existsPath(path.join(root, "locks", "locks")))).toBe(false)
+  }),
+)
+
+maintenanceLockIt.live(
   "holds the advisory file lock until its maintenance body exits",
   Effect.gen(function* () {
     const dir = yield* tmpdirScoped()
@@ -445,6 +520,37 @@ reapIt.effect(
     expect(presentEvidence.missingSince).toBeUndefined()
     expect(yield* Effect.promise(() => existsPath(unknownGitdir))).toBe(true)
     expect(yield* Effect.promise(() => existsPath(forgedGitdir))).toBe(true)
+  }),
+)
+
+reapIt.effect(
+  "bounds absent-repo lock work during one maintenance sweep",
+  Effect.gen(function* () {
+    const snapshot = yield* Snapshot.Service
+    const worktrees = yield* Effect.forEach(
+      Array.from({ length: 18 }),
+      () =>
+        Effect.gen(function* () {
+          const dir = yield* tmpdirScoped({ git: true })
+          yield* snapshot.track().pipe(provideInstance(dir))
+          return dir
+        }),
+      { concurrency: 1 },
+    )
+    const gitdirs = yield* Effect.promise(() =>
+      Promise.all(worktrees.map((dir) => snapshotGitdir(reapHarness.data, dir))),
+    )
+    yield* Effect.promise(() => Promise.all(worktrees.map((dir) => fs.rm(dir, { recursive: true, force: true }))))
+    reapHarness.clock.now += Duration.toMillis(Duration.hours(2))
+
+    yield* snapshot.cleanup().pipe(provideInstance(worktrees[0]!))
+
+    const records = yield* Effect.promise(() =>
+      Promise.all(gitdirs.map((gitdir) => fs.readFile(path.join(gitdir, "info", "opencode-worktree.json"), "utf8"))),
+    )
+    const started = records.filter((record) => JSON.parse(record).missingSince !== undefined).length
+    expect(started).toBeGreaterThan(0)
+    expect(started).toBeLessThan(worktrees.length)
   }),
 )
 

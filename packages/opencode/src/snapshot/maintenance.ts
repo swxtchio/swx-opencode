@@ -66,28 +66,51 @@ export const maintenanceNode = LayerNode.make({
   deps: [FSUtil.node, AppProcess.node],
 })
 
-async function acquire(file: string, signal: AbortSignal) {
-  const command =
-    process.platform === "linux"
-      ? ["flock", "--exclusive", file, "sh", "-c", 'printf "locked\\n"; exec cat']
-      : process.platform === "darwin"
-        ? ["lockf", "-k", file, "sh", "-c", 'printf "locked\\n"; exec cat']
-        : process.platform === "win32"
-          ? [
-              "powershell.exe",
-              "-NoProfile",
-              "-NonInteractive",
-              "-EncodedCommand",
-              Buffer.from(
-                `$ErrorActionPreference = 'Stop'\n$stream = [System.IO.File]::Open('${file.replaceAll("'", "''")}', [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)\nwhile ($true) { try { $stream.Lock(0, 1); break } catch [System.IO.IOException] { Start-Sleep -Milliseconds 25 } }\n[Console]::Out.WriteLine('locked')\n[Console]::Out.Flush()\n[Console]::In.ReadLine() | Out-Null\n$stream.Unlock(0, 1)\n$stream.Dispose()`,
-                "utf16le",
-              ).toString("base64"),
-            ]
-          : undefined
-  if (!command) throw new Error(`snapshot maintenance advisory locks are unavailable on ${process.platform}`)
+export function lockCommand(platform: NodeJS.Platform, file: string, which: (command: string) => string | null) {
+  // Linux uses util-linux flock, macOS uses system Perl's Fcntl lock, and Windows uses PowerShell's LockFileEx.
+  if (platform === "linux") {
+    const flock = which("flock")
+    if (!flock) throw new Error("snapshot advisory locks require the Linux flock utility")
+    return [flock, "--exclusive", file, "sh", "-c", 'printf "locked\\n"; exec cat']
+  }
 
-  // The holder process owns the OS lock so an exit releases it without lease recovery.
-  const child = Bun.spawn(command, { stdin: "pipe", stdout: "pipe", stderr: "pipe", signal })
+  if (platform === "darwin") {
+    const perl = which("perl")
+    if (!perl) throw new Error("snapshot advisory locks require the macOS Perl runtime")
+    return [
+      perl,
+      "-MFcntl=:flock",
+      "-e",
+      'use strict; open my $lock, ">>", $ARGV[0] or die $!; flock($lock, LOCK_EX) or die $!; $| = 1; print "locked\\n"; <STDIN>;',
+      file,
+    ]
+  }
+
+  if (platform === "win32") {
+    const powershell = which("powershell.exe")
+    if (!powershell) throw new Error("snapshot advisory locks require Windows PowerShell")
+    return [
+      powershell,
+      "-NoProfile",
+      "-NonInteractive",
+      "-EncodedCommand",
+      Buffer.from(
+        `$ErrorActionPreference = 'Stop'\n$stream = [System.IO.File]::Open('${file.replaceAll("'", "''")}', [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)\nwhile ($true) { try { $stream.Lock(0, 1); break } catch [System.IO.IOException] { Start-Sleep -Milliseconds 25 } }\n[Console]::Out.WriteLine('locked')\n[Console]::Out.Flush()\n[Console]::In.ReadLine() | Out-Null\n$stream.Unlock(0, 1)\n$stream.Dispose()`,
+        "utf16le",
+      ).toString("base64"),
+    ]
+  }
+
+  throw new Error(`snapshot advisory locks are unavailable on ${platform}`)
+}
+
+async function acquire(file: string, signal: AbortSignal) {
+  const child = Bun.spawn(lockCommand(process.platform, file, Bun.which), {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+    signal,
+  })
   const reader = child.stdout.getReader()
   let ready = ""
   try {
@@ -112,5 +135,3 @@ async function acquire(file: string, signal: AbortSignal) {
     throw error
   }
 }
-
-export * as SnapshotMaintenance from "."

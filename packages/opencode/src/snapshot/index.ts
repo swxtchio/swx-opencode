@@ -24,6 +24,7 @@ export type FileDiff = typeof FileDiff.Type
 const prune = "7.days"
 const gcInterval = Duration.toMillis(Duration.hours(1))
 const reapGrace = Duration.toMillis(Duration.days(7))
+const reapLockLimit = 16
 const limit = 2 * 1024 * 1024
 const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
 const cfg = ["-c", "core.autocrlf=false", ...core]
@@ -187,6 +188,23 @@ const layer: Layer.Layer<
         const evidence = (gitdir: string) => read(evidenceFile(gitdir)).pipe(Effect.map(decodeWorktreeEvidence))
         const saveEvidence = (gitdir: string, value: typeof WorktreeEvidence.Type) =>
           fs.writeFileString(evidenceFile(gitdir), JSON.stringify(value)).pipe(Effect.catch(() => Effect.void))
+        const inspect = Effect.fnUntraced(function* (gitdir: string, project: string, repo: string) {
+          const decoded = Option.getOrUndefined(yield* evidence(gitdir))
+          if (!decoded || !path.isAbsolute(decoded.worktree)) return
+          if (decoded.project !== project || Hash.fast(decoded.worktree) !== repo) return
+
+          const expected = path.join(path.dirname(path.dirname(gitdir)), decoded.project, Hash.fast(decoded.worktree))
+          if (path.resolve(expected) !== path.resolve(gitdir)) return
+
+          const presence = yield* fs.stat(decoded.worktree).pipe(
+            Effect.as("present" as const),
+            Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed("missing" as const)),
+            Effect.catch(() => Effect.succeed("unknown" as const)),
+          )
+          if (presence === "unknown") return
+
+          return { decoded, presence }
+        })
 
         const enabled = Effect.fnUntraced(function* () {
           if (state.vcs !== "git") return false
@@ -324,6 +342,7 @@ const layer: Layer.Layer<
         const reap = Effect.fnUntraced(function* (now: number) {
           const root = path.join(global.data, "snapshot")
           if (!(yield* exists(root))) return
+          const budget = { locks: 0 }
 
           const projects = yield* fs
             .readDirectoryEntries(root)
@@ -337,55 +356,63 @@ const layer: Layer.Layer<
                   .pipe(Effect.catch(() => Effect.succeed([] as FSUtil.DirEntry[])))
                 yield* Effect.forEach(
                   repos.filter((item) => item.type === "directory"),
-                  (repo) => {
-                    const gitdir = path.join(root, project.name, repo.name)
-                    const repoLock = path.join(root, "locks", project.name, `${repo.name}.lock`)
-                    return maintenance.withLock(
-                      repoLock,
-                      lock(gitdir).withPermits(1)(
-                        Effect.gen(function* () {
-                          const decoded = Option.getOrUndefined(yield* evidence(gitdir))
-                          if (!decoded || !path.isAbsolute(decoded.worktree)) return
-                          if (decoded.project !== project.name || Hash.fast(decoded.worktree) !== repo.name) return
+                  (repo) =>
+                    Effect.gen(function* () {
+                      const gitdir = path.join(root, project.name, repo.name)
+                      if (!(yield* fs.isFile(path.join(gitdir, "HEAD")))) return
+                      if (!(yield* fs.isDir(path.join(gitdir, "objects")))) return
+                      if (!(yield* fs.isFile(evidenceFile(gitdir)))) return
 
-                          const expected = path.join(root, decoded.project, Hash.fast(decoded.worktree))
-                          if (path.resolve(expected) !== path.resolve(gitdir)) return
+                      const initial = yield* inspect(gitdir, project.name, repo.name)
+                      if (!initial) return
+                      if (initial.presence === "present" && initial.decoded.missingSince === undefined) return
+                      if (
+                        initial.presence === "missing" &&
+                        initial.decoded.missingSince !== undefined &&
+                        now >= initial.decoded.missingSince &&
+                        now - initial.decoded.missingSince < reapGrace
+                      ) {
+                        return
+                      }
+                      if (budget.locks >= reapLockLimit) return
+                      budget.locks++
 
-                          const presence = yield* fs.stat(decoded.worktree).pipe(
-                            Effect.as("present" as const),
-                            Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed("missing" as const)),
-                            Effect.catch(() => Effect.succeed("unknown" as const)),
-                          )
-                          if (presence === "unknown") return
+                      const repoLock = path.join(root, "locks", project.name, `${repo.name}.lock`)
+                      yield* maintenance.withLock(
+                        repoLock,
+                        lock(gitdir).withPermits(1)(
+                          Effect.gen(function* () {
+                            const current = yield* inspect(gitdir, project.name, repo.name)
+                            if (!current) return
 
-                          if (presence === "present") {
-                            if (decoded.missingSince !== undefined) {
-                              yield* saveEvidence(gitdir, {
-                                version: 1,
-                                project: decoded.project,
-                                worktree: decoded.worktree,
-                              })
+                            if (current.presence === "present") {
+                              if (current.decoded.missingSince !== undefined) {
+                                yield* saveEvidence(gitdir, {
+                                  version: 1,
+                                  project: current.decoded.project,
+                                  worktree: current.decoded.worktree,
+                                })
+                              }
+                              return
                             }
-                            return
-                          }
 
-                          if (decoded.missingSince === undefined || now < decoded.missingSince) {
-                            yield* saveEvidence(gitdir, { ...decoded, missingSince: now })
-                            return
-                          }
-                          if (now - decoded.missingSince < reapGrace) return
+                            if (current.decoded.missingSince === undefined || now < current.decoded.missingSince) {
+                              yield* saveEvidence(gitdir, { ...current.decoded, missingSince: now })
+                              return
+                            }
+                            if (now - current.decoded.missingSince < reapGrace) return
 
-                          const stillMissing = yield* fs.stat(decoded.worktree).pipe(
-                            Effect.as(false),
-                            Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(true)),
-                            Effect.catch(() => Effect.succeed(false)),
-                          )
-                          if (stillMissing)
-                            yield* fs.remove(gitdir, { recursive: true }).pipe(Effect.catch(() => Effect.void))
-                        }),
-                      ),
-                    )
-                  },
+                            const stillMissing = yield* fs.stat(current.decoded.worktree).pipe(
+                              Effect.as(false),
+                              Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(true)),
+                              Effect.catch(() => Effect.succeed(false)),
+                            )
+                            if (stillMissing)
+                              yield* fs.remove(gitdir, { recursive: true }).pipe(Effect.catch(() => Effect.void))
+                          }),
+                        ),
+                      )
+                    }),
                   { concurrency: 1 },
                 )
               }),
