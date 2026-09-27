@@ -132,6 +132,16 @@ export class QueueItemNotPendingError extends Schema.TaggedErrorClass<QueueItemN
   { httpApiStatus: 404 },
 ) {}
 
+export class QueueItemNotWithdrawnError extends Schema.TaggedErrorClass<QueueItemNotWithdrawnError>()(
+  "QueueItemNotWithdrawn",
+  {
+    sessionID: Schema.String,
+    itemID: Schema.String,
+    message: Schema.String,
+  },
+  { httpApiStatus: 404 },
+) {}
+
 export class QuestionNotFoundError extends Schema.TaggedErrorClass<QuestionNotFoundError>()(
   "QuestionNotFoundError",
   {

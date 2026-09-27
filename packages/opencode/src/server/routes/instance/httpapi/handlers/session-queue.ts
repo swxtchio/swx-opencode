@@ -7,7 +7,7 @@ import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Effect, Option, Scope } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { notFound, QueueItemNotPendingError } from "../errors"
+import { QueueItemNotPendingError, QueueItemNotWithdrawnError } from "../errors"
 import { RestorePayload, UpdatePayload } from "../groups/session-queue"
 import * as SessionError from "./session-errors"
 
@@ -60,7 +60,12 @@ export const sessionQueueHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
     }) {
       yield* requireSession(ctx.params.sessionID)
       const item = yield* queue.restore(ctx.params.sessionID, ctx.payload.id)
-      if (Option.isNone(item)) return yield* notFound(`Withdrawn queue item not found: ${ctx.payload.id}`)
+      if (Option.isNone(item))
+        return yield* new QueueItemNotWithdrawnError({
+          sessionID: ctx.params.sessionID,
+          itemID: ctx.payload.id,
+          message: `Queue item is not withdrawn: ${ctx.payload.id}`,
+        })
       yield* wake(ctx.params.sessionID)
       return item.value
     })

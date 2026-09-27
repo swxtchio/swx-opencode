@@ -5,7 +5,7 @@ import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "e
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
 import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
-import { ApiNotFoundError, QueueItemNotPendingError } from "../errors"
+import { ApiNotFoundError, QueueItemNotPendingError, QueueItemNotWithdrawnError } from "../errors"
 import { described } from "./metadata"
 
 // Fork-owned V1 prompt queue routes (swxtchio/swx-opencode#68). Deliberately
@@ -55,13 +55,13 @@ export const SessionQueueApi = HttpApi.make("sessionQueue").add(
         query: WorkspaceRoutingQuery,
         payload: RestorePayload,
         success: described(SessionQueue.Item, "Restored queue item"),
-        error: [HttpApiError.BadRequest, ApiNotFoundError],
+        error: [HttpApiError.BadRequest, ApiNotFoundError, QueueItemNotWithdrawnError],
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "session.queue.restore",
           summary: "Restore withdrawn prompt",
           description:
-            "Return a withdrawn prompt to the queue with its original id and position, and wake the session so it is delivered.",
+            "Return a withdrawn prompt to the queue with its original id and position, and wake the session so it is delivered. Fails with QueueItemNotWithdrawn when the item is not withdrawn: still pending, already delivered or never existed.",
         }),
       ),
       HttpApiEndpoint.patch("update", SessionQueuePaths.update, {
