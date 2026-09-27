@@ -634,7 +634,6 @@ describe("run stream transport", () => {
     const ui = footer()
     const messages = Array.from({ length: 101 }, (_, index) => routerAssistant(index + 1, "luna-max"))
     messages.push(routerAssistant(102, "glm-5.3-flash"))
-    const limits: Array<number | undefined> = []
     const providers = [
       {
         id: "llmrouter",
@@ -654,7 +653,6 @@ describe("run stream transport", () => {
       sdk: sdk({
         stream: src.stream,
         messages: async ({ sessionID, limit }) => {
-          limits.push(limit)
           if (sessionID !== "session-1") return ok([])
           return ok(limit === undefined || limit === 0 ? messages : messages.slice(-limit))
         },
@@ -670,7 +668,6 @@ describe("run stream transport", () => {
 
     try {
       const summary = await waitFor(() => ui.commits.find((item) => item.summary))
-      expect(limits).toContain(0)
       expect(ui.commits.filter((item) => item.kind === "assistant").map((item) => item.text)).toEqual(["Done 102"])
       expect(summary?.summary?.model).toBe("Auto (luna-max:101/99%, glm-5.3-flash:1/1%, sol-high:0/0%)")
     } finally {

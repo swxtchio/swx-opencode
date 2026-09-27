@@ -96,6 +96,25 @@ function assistantMessage(index: number, responseModelID: string): SessionMessag
   }
 }
 
+function directAssistantMessage(index: number): AssistantMessage {
+  return {
+    id: `assistant-${String(index).padStart(3, "0")}`,
+    sessionID,
+    role: "assistant",
+    time: { created: index * 2 + 1, completed: index * 2 + 2 },
+    parentID: `user-${String(index).padStart(3, "0")}`,
+    providerID: "openai",
+    modelID: "gpt-5",
+    responseModelIDs: ["gpt-5"],
+    mode: "build",
+    agent: "build",
+    path: { cwd: directory, root: directory },
+    cost: 0,
+    tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+    finish: "stop",
+  }
+}
+
 function initialMessages(): SessionMessageWithParts[] {
   return Array.from({ length: 100 }, (_, index) => index + 1).flatMap((index) => [
     userMessage(index),
@@ -159,6 +178,7 @@ async function startSession(input: { historyError?: boolean } = {}) {
     renderer: setup,
     state,
     emit: events.emit,
+    sessionMessages: () => api?.state.session.messages(sessionID) ?? [],
     async stop() {
       try {
         api?.keymap.dispatchCommand("app.exit")
@@ -189,6 +209,20 @@ async function waitForHistoryReads(state: { historyReads: number }, previous: nu
     await Bun.sleep(10)
   }
   throw new Error("router session history was not refreshed")
+}
+
+async function waitForSessionMessageAbsence(
+  renderer: Awaited<ReturnType<typeof createTestRenderer>>,
+  messages: () => readonly { id: string }[],
+  id: string,
+) {
+  const until = Date.now() + 5000
+  while (Date.now() < until) {
+    await renderer.renderOnce()
+    if (!messages().some((message) => message.id === id)) return
+    await Bun.sleep(10)
+  }
+  throw new Error(`session Sync window still contained ${id}`)
 }
 
 test("Session footer loads all turns and refreshes after message removal and later steps", async () => {
@@ -230,6 +264,28 @@ test("Session footer loads all turns and refreshes after message removal and lat
     )
     await waitForHistoryReads(app.state, beforeNewStep)
     await waitForFrame(app.renderer, "Auto (luna-max:100/99%, glm-5.3-flash:1/1%, sol-high:0/0%)")
+
+    const laterDirectMessages = Array.from({ length: 101 }, (_, index) => directAssistantMessage(index + 103))
+    app.state.messages.push(...laterDirectMessages.map((info) => ({ info, parts: [] })))
+    for (const info of laterDirectMessages) {
+      app.emit(event({ id: `evt_${info.id}`, type: "message.updated", properties: { sessionID, info } }))
+    }
+    await waitForSessionMessageAbsence(app.renderer, app.sessionMessages, "assistant-102")
+
+    const beforeEvictedStep = app.state.historyReads
+    const finalUser = userMessage(204)
+    const finalAssistant = assistantMessage(204, "glm-5.3-flash")
+    app.state.messages.push(finalUser, finalAssistant)
+    app.emit(event({ id: "evt_user_204", type: "message.updated", properties: { sessionID, info: finalUser.info } }))
+    app.emit(
+      event({
+        id: "evt_assistant_204",
+        type: "message.updated",
+        properties: { sessionID, info: finalAssistant.info },
+      }),
+    )
+    await waitForHistoryReads(app.state, beforeEvictedStep)
+    await waitForFrame(app.renderer, "Auto (luna-max:100/98%, glm-5.3-flash:2/2%, sol-high:0/0%)")
   } finally {
     await app.stop()
   }
