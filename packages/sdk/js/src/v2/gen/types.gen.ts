@@ -2639,6 +2639,13 @@ export type NotFoundError = {
   }
 }
 
+export type PromptWithdrawn = {
+  _tag: "PromptWithdrawn"
+  sessionID: string
+  itemID: string
+  message: string
+}
+
 export type SessionBusyError = {
   _tag: "SessionBusyError"
   sessionID: string
@@ -9914,6 +9921,10 @@ export type SessionPromptErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * PromptWithdrawn
+   */
+  409: PromptWithdrawn
 }
 
 export type SessionPromptError = SessionPromptErrors[keyof SessionPromptErrors]
@@ -10312,6 +10323,10 @@ export type SessionCommandErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * PromptWithdrawn
+   */
+  409: PromptWithdrawn
 }
 
 export type SessionCommandError = SessionCommandErrors[keyof SessionCommandErrors]
