@@ -1098,6 +1098,7 @@ const layer = Layer.effect(
         input.noReply === true
           ? { kind: "direct" as const, message: yield* createUserMessage(input) }
           : { kind: "queued" as const, own: yield* queue.admit(input) }
+      if (entry.kind === "queued") yield* Effect.addFinalizer(() => queue.forget(entry.own.id))
       // Only this prompt's own failure is this caller's error; an older steer
       // promoted alongside it is reported on its own.
       if (entry.kind === "queued")
@@ -1122,7 +1123,7 @@ const layer = Layer.effect(
 
       if (entry.kind === "direct") return entry.message
       return yield* drain(input.sessionID, entry.own.id)
-    })
+    }, Effect.scoped)
 
     // A queued prompt that cannot become a message is dropped by the queue;
     // report it the way prompt_async reports a failed prompt.
@@ -1176,8 +1177,6 @@ const layer = Layer.effect(
 
           // Steers parked by an abort or held behind a compaction reach the next step.
           if (yield* promoteInLoop(sessionID, "steer")) continue
-          // A new session whose first prompt was queued runs it now.
-          if (!lastUser && (yield* promoteInLoop(sessionID, "queue"))) continue
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
           const lastAssistantMsg = msgs.findLast(
@@ -1461,10 +1460,9 @@ const layer = Layer.effect(
     const drain: (
       sessionID: SessionID,
       own?: SessionQueue.ItemID,
-    ) => Effect.Effect<SessionV1.WithParts, SessionQueue.WithdrawnError> = Effect.fn("SessionPrompt.loop")(function* (
-      sessionID: SessionID,
-      own?: SessionQueue.ItemID,
-    ) {
+    ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError> = Effect.fn(
+      "SessionPrompt.loop",
+    )(function* (sessionID: SessionID, own?: SessionQueue.ItemID) {
       const withdrawn = own
         ? queue
             .withdrawn(sessionID, own)
@@ -1475,6 +1473,25 @@ const layer = Layer.effect(
             )
         : Effect.void
       yield* withdrawn
+      // A run needs a user message to answer. On an idle new session the first
+      // prompt becomes one here, before any run, so a withdraw that wins leaves
+      // nothing running. A busy one (a shell, say) is joined as before.
+      const idle = Exit.isSuccess(yield* state.assertNotBusy(sessionID).pipe(Effect.exit))
+      if (idle && (yield* queue.empty(sessionID))) {
+        const first = (delivery: SessionQueue.Delivery) =>
+          queue.promote({
+            sessionID,
+            delivery,
+            prepare: prepareUserMessage,
+            write: writeUserMessage,
+            rejected: rejected(sessionID),
+            own,
+            untilStarted: true,
+          })
+        yield* first("steer")
+        yield* first("queue")
+        if (yield* queue.empty(sessionID)) return yield* withdrawn.pipe(Effect.andThen(lastAssistant(sessionID)))
+      }
       const result = yield* state.ensureRunning(sessionID, lastAssistant(sessionID), runLoop(sessionID))
       // Work admitted after the joined run's last history read would otherwise
       // wait for another prompt. This caller stays with the drains until one has
@@ -1497,13 +1514,27 @@ const layer = Layer.effect(
       }
       const message = own ? yield* queue.delivered(own) : undefined
       if (!message) return yield* withdrawn.pipe(Effect.as(result))
-      const answer = yield* sessions
-        .findMessage(sessionID, (m) => m.info.role === "assistant" && m.info.parentID === message)
+      // When the run stopped before this prompt's turn, the caller gets the run's
+      // final message, as every caller did before the queue.
+      return (yield* replyTo(sessionID, message)) ?? result
+    })
+
+    // The reply to a prompt is the last message of the first turn after it that
+    // answers it or a later prompt: steers promoted together share one turn,
+    // which replies to the newest of them. A compaction summary is not a reply.
+    const replyTo = Effect.fnUntraced(function* (sessionID: SessionID, message: MessageID) {
+      const replies: SessionV1.WithParts[] = []
+      // Scans newest first and stops at the prompt, collecting the replies after it.
+      yield* sessions
+        .findMessage(sessionID, (m) => {
+          if (m.info.id <= message) return true
+          if (m.info.role === "assistant" && !m.info.summary && m.info.parentID >= message) replies.push(m)
+          return false
+        })
         .pipe(Effect.orDie)
-      if (Option.isSome(answer)) return answer.value
-      // A run that stopped before replying still hands back the caller's own message.
-      const asked = yield* sessions.findMessage(sessionID, (m) => m.info.id === message).pipe(Effect.orDie)
-      return Option.getOrElse(asked, () => result)
+      const first = replies.at(-1)?.info
+      if (first?.role !== "assistant") return undefined
+      return replies.find((m) => m.info.role === "assistant" && m.info.parentID === first.parentID)
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(

@@ -68,6 +68,8 @@ export interface Interface {
     readonly write: (prepared: P) => Effect.Effect<unknown>
     readonly rejected: (cause: Cause.Cause<E>) => Effect.Effect<void>
     readonly own?: ItemID
+    /** Stops once the session has any message, for a new session's first promotion. */
+    readonly untilStarted?: boolean
   }) => Effect.Effect<boolean, E>
   /**
    * Called by a drain before it reads history; returns the wake count that read
@@ -87,8 +89,15 @@ export interface Interface {
   readonly withdrawn: (sessionID: SessionID, itemID: ItemID) => Effect.Effect<boolean>
   /** Whether no drain has read this item yet (withdrawn items excluded). */
   readonly unread: (sessionID: SessionID, itemID: ItemID) => Effect.Effect<boolean>
-  /** The message an item became, once; lets its prompt find its own reply. */
+  /**
+   * The message an item became, once; lets its prompt find its own reply. Only
+   * items still admitted by a waiting caller are tracked: the caller `forget`s
+   * its item however it returns, so an interrupted one leaves nothing behind.
+   */
   readonly delivered: (itemID: ItemID) => Effect.Effect<MessageID | undefined>
+  readonly forget: (itemID: ItemID) => Effect.Effect<void>
+  /** Whether the session has no message at all yet. */
+  readonly empty: (sessionID: SessionID) => Effect.Effect<boolean>
   /** For writers of user messages, such as compaction, that a promotion must not interleave with. */
   readonly exclusive: <A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
   /** Runs a compaction; no steer is promoted until it and its follow-up messages are written. */
@@ -111,7 +120,7 @@ const layer = Layer.effect(
     const parked = new Set<SessionID>()
     const wakes = new Map<SessionID, number>()
     const running = new Set<SessionID>()
-    const messages = new Map<ItemID, MessageID>()
+    const messages = new Map<ItemID, MessageID | undefined>()
 
     const semaphore = (map: Map<SessionID, Semaphore.Semaphore>, sessionID: SessionID) => {
       const hit = map.get(sessionID)
@@ -189,6 +198,7 @@ const layer = Layer.effect(
         )
         .pipe(Effect.orDie)
       if (!row) return yield* Effect.die(new Error(`Queue admission for ${input.sessionID} stored nothing`))
+      messages.set(row.id, undefined)
       wake(input.sessionID)
       yield* publish(input.sessionID)
       return fromRow(row)
@@ -328,7 +338,7 @@ const layer = Layer.effect(
         .run()
         .pipe(
           Effect.orDie,
-          Effect.tap(() => Effect.sync(() => void messages.set(itemID, id))),
+          Effect.tap(() => Effect.sync(() => void (messages.has(itemID) && messages.set(itemID, id)))),
         )
 
     const drop = (itemID: ItemID) =>
@@ -424,12 +434,14 @@ const layer = Layer.effect(
       readonly write: (prepared: P) => Effect.Effect<unknown>
       readonly rejected: (cause: Cause.Cause<E>) => Effect.Effect<void>
       readonly own?: ItemID
+      readonly untilStarted?: boolean
     }) =>
       semaphore(order, input.sessionID)
         .withPermit(
           Effect.gen(function* () {
             let changed = false
             while (true) {
+              if (input.untilStarted && !(yield* empty(input.sessionID))) return changed
               const next = yield* reserve(input.sessionID, input.delivery)
               if (!next) return changed
               changed = true
@@ -542,6 +554,19 @@ const layer = Layer.effect(
       return row !== undefined
     })
 
+    const empty = Effect.fn("SessionQueue.empty")(function* (sessionID: SessionID) {
+      const row = yield* db
+        .select({ id: MessageTable.id })
+        .from(MessageTable)
+        .where(eq(MessageTable.session_id, sessionID))
+        .limit(1)
+        .get()
+        .pipe(Effect.orDie)
+      return row === undefined
+    })
+
+    const forget = (itemID: ItemID) => Effect.sync(() => void messages.delete(itemID))
+
     const delivered = (itemID: ItemID) =>
       Effect.sync(() => {
         const id = messages.get(itemID)
@@ -562,6 +587,8 @@ const layer = Layer.effect(
       withdrawn,
       unread,
       delivered,
+      forget,
+      empty,
       exclusive,
       whileCompacting,
     })
