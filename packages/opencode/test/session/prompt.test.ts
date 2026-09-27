@@ -268,6 +268,8 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 const gates = {
   finishingRead: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   nextEnsureRunning: undefined as undefined | { reached: Deferred.Deferred<void>; startedRun: boolean },
+  // Holds a compaction between its summary and its continue message.
+  compactionContinue: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
 }
 
 const gatedSession = LayerNode.make({
@@ -341,6 +343,36 @@ const gatedRunState = LayerNode.make({
   deps: [BackgroundJob.node, SessionStatus.node],
 })
 
+const gatedPlugin = LayerNode.make({
+  service: Plugin.Service,
+  layer: Layer.effect(
+    Plugin.Service,
+    Effect.gen(function* () {
+      const real = yield* Plugin.Service
+      const trigger = ((name, input, output) =>
+        Effect.gen(function* () {
+          const gate = name === "experimental.compaction.autocontinue" ? gates.compactionContinue : undefined
+          if (gate) {
+            gates.compactionContinue = undefined
+            yield* Deferred.succeed(gate.entered, undefined)
+            yield* Deferred.await(gate.release)
+          }
+          return yield* real.trigger(name, input, output)
+        })) as typeof real.trigger
+      return Plugin.Service.of({ ...real, trigger })
+    }),
+  ).pipe(
+    Layer.provide(
+      Plugin.node.implementation as Layer.Layer<
+        Plugin.Service,
+        never,
+        EventV2Bridge.Service | Config.Service | RuntimeFlags.Service
+      >,
+    ),
+  ),
+  deps: [EventV2Bridge.node, Config.node, RuntimeFlags.node],
+})
+
 const it = testEffect(makeHttp())
 const gated = testEffect(
   LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
@@ -350,6 +382,7 @@ const gated = testEffect(
     [RuntimeFlags.node, runtimeFlags],
     [Session.node, gatedSession],
     [SessionRunState.node, gatedRunState],
+    [Plugin.node, gatedPlugin],
   ]),
 )
 const noLLMServer = testEffect(makeHttpNoLLMServer())
@@ -1661,6 +1694,13 @@ gated.instance(
       const messages = (yield* llm.inputs).at(1)?.messages
       if (!Array.isArray(messages)) throw new Error("expected LLM messages")
       expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
+      // A synchronous caller gets the reply to its own prompt, not the run it joined.
+      const asked = (yield* sessions.messages({ sessionID: chat.id })).find((msg) =>
+        msg.parts.some((part) => part.type === "text" && part.text === "second"),
+      )
+      const answer = Exit.isSuccess(eb) ? eb.value : undefined
+      expect(answer?.info.role === "assistant" ? answer.info.parentID : undefined).toBe(asked?.info.id)
+      expect(answer?.parts.some((part) => part.type === "text" && part.text === "second")).toBe(true)
     }),
   10_000,
 )
@@ -1864,7 +1904,10 @@ it.instance(
       expect(Option.getOrUndefined(yield* queue.withdraw(chat.id, admitted!.id))).toEqual(admitted)
       expect(Option.isNone(yield* queue.withdraw(chat.id, admitted!.id))).toBe(true)
       yield* release
-      yield* finish(task, withdrawn, kept)
+      yield* finish(task, kept)
+      // Its own caller learns the prompt was withdrawn rather than getting someone else's reply.
+      const gone = yield* awaitWithTimeout(Fiber.await(withdrawn), "withdrawn prompt never returned")
+      expect(Exit.isFailure(gone) ? Cause.squash(gone.cause) : undefined).toBeInstanceOf(SessionQueue.WithdrawnError)
 
       const inputs = yield* llm.inputs
       expect(inputs).toHaveLength(2)
@@ -2049,6 +2092,14 @@ it.instance(
       const gate = yield* Deferred.make<void>()
       yield* llm.push(reply().wait(deferredAsPromise(gate)).tool("StructuredOutput", { answer: "42" }))
       yield* llm.text("queued done")
+      const events = yield* EventV2Bridge.Service
+      const idleAt: number[] = []
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === SessionStatus.Event.Idle.type && (event.data as { sessionID: string }).sessionID === chat.id
+          ? llm.calls.pipe(Effect.map((calls) => void idleAt.push(calls)))
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
       const format = Schema.decodeUnknownSync(SessionV1.Format)({
         type: "json_schema",
         schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
@@ -2068,6 +2119,8 @@ it.instance(
       expect(result?.info.role === "assistant" ? result.info.structured : undefined).toEqual({ answer: "42" })
       yield* awaitWithTimeout(llm.wait(2), "queued prompt never ran after the structured result", "10 seconds")
       expect(lastUser((yield* llm.inputs)[1])).toEqual({ role: "user", content: "queued after it" })
+      // One drain carries the queued turn: the session never goes idle between them.
+      expect(idleAt).toEqual([2])
     }),
   15_000,
 )
@@ -2198,6 +2251,108 @@ it.instance(
       expect(mentions(inputs[0], "older and broken")).toBe(false)
       expect(errors).toHaveLength(1)
       expect(yield* queue.list(chat.id)).toEqual([])
+    }),
+  15_000,
+)
+
+it.instance(
+  "a withdraw wins over a promotion still preparing the same prompt",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const gate = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      heldResource.gate = gate
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (heldResource.gate = undefined)))
+
+      const slow = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [...said("withdrawn while preparing"), resourcePart(HELD_RESOURCE)],
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(gate.entered), "promotion never read the resource")
+      const [item] = yield* queue.list(chat.id)
+      // The session lock is free while the message is prepared, so the withdraw lands now.
+      const withdrawn = yield* awaitWithTimeout(queue.withdraw(chat.id, item!.id), "withdraw waited for the promotion")
+      expect(Option.getOrUndefined(withdrawn)?.id).toBe(item!.id)
+      yield* Deferred.succeed(gate.release, undefined)
+
+      const exit = yield* awaitWithTimeout(Fiber.await(slow), "withdrawn prompt never returned")
+      expect(Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined).toBeInstanceOf(SessionQueue.WithdrawnError)
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(
+        messages.some((msg) =>
+          msg.parts.some((part) => part.type === "text" && part.text === "withdrawn while preparing"),
+        ),
+      ).toBe(false)
+      expect(yield* llm.calls).toBe(0)
+      expect(yield* queue.list(chat.id)).toEqual([])
+    }),
+  15_000,
+)
+
+it.instance(
+  "a prompt admitted while a stopping turn is still in flight is not parked by that stop",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const gate = yield* Deferred.make<void>()
+      yield* llm.push(reply().wait(deferredAsPromise(gate)).contentFilter())
+      yield* llm.text("after the stop")
+
+      const task = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("start the task") })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+      // Admitted after the stopping turn's last history read: its stop never saw it.
+      const late = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("admitted before the stop landed") })
+        .pipe(Effect.forkChild)
+      yield* admitted(chat.id, "admitted before the stop landed")
+      yield* Deferred.succeed(gate, void 0)
+
+      const [, answer] = yield* finish(task, late)
+      expect(yield* llm.calls).toBe(2)
+      expect(lastUser((yield* llm.inputs)[1])).toEqual({ role: "user", content: "admitted before the stop landed" })
+      expect(answer?.parts.some((part) => part.type === "text" && part.text === "after the stop")).toBe(true)
+    }),
+  15_000,
+)
+
+gated.instance(
+  "a steer admitted while a compaction writes its continue message lands after that message",
+  () =>
+    Effect.gen(function* () {
+      const compaction = yield* SessionCompaction.Service
+      const { llm, chat, task, send, release } = yield* startHeld()
+      yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: true })
+      yield* llm.text("summary of the task")
+      yield* llm.text("steer done")
+      const hook = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      gates.compactionContinue = hook
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (gates.compactionContinue = undefined)))
+
+      yield* release
+      yield* awaitWithTimeout(Deferred.await(hook.entered), "compaction never reached its continue message")
+      const steer = yield* send("steer during the continue")
+      yield* admitted(chat.id, "steer during the continue")
+      yield* Deferred.succeed(hook.release, undefined)
+      yield* finish(task, steer)
+
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(3)
+      expect(mentions(inputs[1], "steer during the continue")).toBe(false)
+      expect(mentions(inputs[2], "Continue if you have next steps")).toBe(true)
+      expect(lastUser(inputs[2])).toEqual({ role: "user", content: "steer during the continue" })
     }),
   15_000,
 )
