@@ -1186,8 +1186,11 @@ const layer = Layer.effect(
             }
             // Queued prompts wait for this point and run one turn each, so a steer
             // or another admission arriving meanwhile is weighed before the next.
-            if (yield* promoteInLoop(sessionID, "steer")) continue
-            if (yield* promoteInLoop(sessionID, "queue")) continue
+            // Each such turn is new user input and gets a fresh step allowance.
+            if ((yield* promoteInLoop(sessionID, "steer")) || (yield* promoteInLoop(sessionID, "queue"))) {
+              step = 0
+              continue
+            }
             yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
             settled = true
             break

@@ -1695,8 +1695,11 @@ const admitted = (sessionID: SessionID, text: string) =>
 const finish = <A, E>(...fibers: Fiber.Fiber<A, E>[]) =>
   awaitWithTimeout(Effect.all(fibers.map((fiber) => Fiber.join(fiber))), "prompts never finished", "10 seconds")
 
-const startHeld = Effect.fn("test.startHeld")(function* (input?: { tool?: boolean }) {
-  const { llm } = yield* useServerConfig(providerCfg)
+const startHeld = Effect.fn("test.startHeld")(function* (input?: {
+  tool?: boolean
+  config?: (url: string) => Partial<ConfigV1.Info>
+}) {
+  const { llm } = yield* useServerConfig(input?.config ?? providerCfg)
   const prompt = yield* SessionPrompt.Service
   const sessions = yield* Session.Service
   const queue = yield* SessionQueue.Service
@@ -1801,6 +1804,28 @@ it.instance(
       expect(lastUser(inputs[1])).toEqual({ role: "user", content: "steer later" })
       expect(mentions(inputs[1], "queued earlier")).toBe(false)
       expect(lastUser(inputs[2])).toEqual({ role: "user", content: "queued earlier" })
+    }),
+  15_000,
+)
+
+it.instance(
+  "a queued prompt's turn starts with a fresh step allowance",
+  () =>
+    Effect.gen(function* () {
+      const { llm, chat, task, send, release } = yield* startHeld({
+        config: (url) => ({ ...providerCfg(url), agent: { build: { steps: 2 } } }),
+      })
+      yield* llm.text("queued done")
+
+      const held = yield* send("queued after a step", { delivery: "queue" })
+      yield* admitted(chat.id, "queued after a step")
+      yield* release
+      yield* finish(task, held)
+
+      const inputs = yield* llm.inputs
+      expect(lastUser(inputs[1])).toEqual({ role: "user", content: "queued after a step" })
+      // The task used one of its two steps; the queued turn must not start on the last one.
+      expect(mentions(inputs[1], "MAXIMUM STEPS REACHED")).toBe(false)
     }),
   15_000,
 )
