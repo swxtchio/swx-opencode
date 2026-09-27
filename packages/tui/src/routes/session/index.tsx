@@ -3,6 +3,7 @@ import {
   createContext,
   createEffect,
   createMemo,
+  createResource,
   createSignal,
   For,
   Match,
@@ -67,6 +68,8 @@ import { PermissionPrompt } from "./permission"
 import { QuestionPrompt } from "./question"
 import { DialogExportOptions } from "../../ui/dialog-export-options"
 import * as Model from "../../util/model"
+import { AssistantModelLabel } from "./message-model"
+import type { SessionStepMessage } from "../../util/model"
 import { formatTranscript } from "../../util/transcript"
 import { sessionEpilogue } from "../../util/presentation"
 import { setPreLayoutSiblingMargin } from "../../util/layout"
@@ -282,6 +285,39 @@ export function Session() {
   const toast = useToast()
   const sdk = useSDK()
   const editor = useEditorContext()
+  const [modelHistory] = createResource(
+    () =>
+      messages().some(
+        (message) => message.role === "assistant" && message.providerID === "llmrouter" && message.modelID === "auto",
+      )
+        ? route.sessionID
+        : undefined,
+    async (sessionID) => {
+      const result = await sdk.client.session.messages({ sessionID, limit: 0 }).catch(() => undefined)
+      return (result?.data ?? []).flatMap((message) => {
+        if (message.info.role !== "assistant") return []
+        return [
+          {
+            info: message.info,
+            parts: message.parts.filter((part) => part.type === "step-finish" || part.type === "compaction"),
+          },
+        ]
+      })
+    },
+  )
+  const modelMessages = createMemo<SessionStepMessage[]>(() => {
+    const out = new Map<string, SessionStepMessage>((modelHistory() ?? []).map((message) => [message.info.id, message]))
+    for (const message of messages()) {
+      const previous = out.get(message.id)
+      out.set(message.id, {
+        info: message,
+        parts: sync.data.part[message.id] ?? previous?.parts ?? [],
+      })
+    }
+    return [...out.values()].toSorted(
+      (left, right) => left.info.time.created - right.info.time.created || left.info.id.localeCompare(right.info.id),
+    )
+  })
 
   createEffect(() => {
     const sessionID = route.sessionID
@@ -1287,6 +1323,7 @@ export function Session() {
                           last={lastAssistant()?.id === message.id}
                           message={message as AssistantMessage}
                           parts={sync.data.part[message.id] ?? []}
+                          modelMessages={modelMessages()}
                         />
                       </Match>
                     </Switch>
@@ -1466,20 +1503,17 @@ function UserMessage(props: {
   )
 }
 
-function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; last: boolean }) {
+function AssistantMessage(props: {
+  message: AssistantMessage
+  parts: Part[]
+  last: boolean
+  modelMessages: SessionStepMessage[]
+}) {
   const ctx = use()
   const local = useLocal()
   const { theme } = useTheme()
   const sync = useSync()
   const messages = createMemo(() => sync.data.message[props.message.sessionID] ?? [])
-  const model = createMemo(() =>
-    Model.servedName(
-      ctx.providers(),
-      props.message.providerID,
-      props.message.modelID,
-      Model.servedAcrossTurn(messages(), props.message),
-    ),
-  )
 
   const final = createMemo(() => {
     return props.message.finish && !["tool-calls", "unknown"].includes(props.message.finish)
@@ -1567,7 +1601,15 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
                 ▣{" "}
               </span>{" "}
               <span style={{ fg: theme.text }}>{Locale.titlecase(props.message.mode)}</span>
-              <span style={{ fg: theme.textMuted }}> · {model()}</span>
+              <span style={{ fg: theme.textMuted }}>
+                {" · "}
+                <AssistantModelLabel
+                  message={props.message}
+                  providers={ctx.providers()}
+                  messages={props.modelMessages}
+                  turnMessages={messages()}
+                />
+              </span>
               <Show when={duration()}>
                 <span style={{ fg: theme.textMuted }}> · {Locale.duration(duration())}</span>
               </Show>

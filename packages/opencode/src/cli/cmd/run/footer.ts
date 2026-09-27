@@ -37,6 +37,7 @@ import { RunFooterView } from "./footer.view"
 import { RunScrollbackStream } from "./scrollback.surface"
 import { RUN_THEME_FALLBACK, resolveRunTheme, type RunTheme } from "./theme"
 import { reduceTurnModel, turnSummaryModel } from "./variant.shared"
+import type { SessionMessages } from "./session.shared"
 import type {
   FooterApi,
   FooterEvent,
@@ -76,6 +77,7 @@ type RunFooterOptions = {
   commands?: RunCommand[]
   wrote?: boolean
   sessionID: () => string | undefined
+  getSessionMessages: (sessionID: string) => Promise<SessionMessages>
   agentLabel: string
   modelLabel: string
   model: RunInput["model"]
@@ -394,15 +396,20 @@ export class RunFooter implements FooterApi {
   public event(next: FooterEvent): void {
     if (next.type === "turn.duration") {
       const turnModel = this.state().turnModel
+      const sessionID = this.options.sessionID()
       this.flush()
       this.flushing = this.flushing
-        .then(() =>
-          this.scrollback.writeTurnSummary({
+        .then(async () => {
+          const messages =
+            turnModel?.providerID === "llmrouter" && turnModel.modelID === "auto" && sessionID
+              ? await this.options.getSessionMessages(sessionID)
+              : undefined
+          await this.scrollback.writeTurnSummary({
             agent: this.options.agentLabel,
-            model: turnSummaryModel({ turnModel, providers: this.providers() }),
+            model: turnSummaryModel({ turnModel, providers: this.providers(), messages }),
             duration: next.duration,
-          }),
-        )
+          })
+        })
         .catch((error) => {
           this.flushError = error
         })

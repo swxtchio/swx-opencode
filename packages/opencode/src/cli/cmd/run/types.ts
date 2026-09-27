@@ -87,6 +87,7 @@ export type TurnModel = {
   providerID: string
   modelID: string
   served: string[]
+  messageID?: string
 }
 
 export type FooterState = {

@@ -32,6 +32,9 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { LLMEvent, Usage } from "@opencode-ai/llm"
 import { aggregateSessionStats, displayStats } from "@/cli/cmd/stats"
 import { readExport } from "@/cli/cmd/db-export-usage"
+import { servedAcrossSession, servedModelLabel } from "@/cli/cmd/run/variant.shared"
+import type { SessionMessages } from "@/cli/cmd/run/session.shared"
+import type { RunProvider } from "@/cli/cmd/run/types"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -108,6 +111,25 @@ function routedConfig() {
           "free-model": { cost: { input: 0, output: 0 } },
         },
         options: { apiKey: "test-key", baseURL: "http://localhost:1/v1" },
+      },
+    },
+  }
+}
+
+function routerLabelConfig() {
+  const base = cfg.provider.test.models["test-model"]
+  return {
+    provider: {
+      llmrouter: {
+        ...cfg.provider.test,
+        id: "llmrouter",
+        name: "LLMRouter",
+        models: {
+          auto: { ...base, id: "auto", name: "Auto" },
+          "luna-max": { ...base, id: "luna-max", name: "luna-max" },
+          "glm-5.3-flash": { ...base, id: "glm-5.3-flash", name: "glm-5.3-flash" },
+          "sol-high": { ...base, id: "sol-high", name: "sol-high" },
+        },
       },
     },
   }
@@ -1212,6 +1234,98 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
         expect(seen.filter((type) => type.startsWith("session.next."))).toEqual([])
       }),
     { config: cfg },
+  ),
+)
+
+itRouted.live(
+  "feeds repeated provider step records into the router session label",
+  provideTmpdirInstance((dir) =>
+    Effect.gen(function* () {
+      const { processors, session, provider } = yield* boot()
+      const chat = yield* session.create({})
+      const parent = yield* user(chat.id, "router label steps")
+      const requestModelRef = { providerID: ProviderV2.ID.make("llmrouter"), modelID: ModelV2.ID.make("auto") }
+      parent.model = requestModelRef
+      yield* session.updateMessage(parent)
+
+      const requestModel = yield* provider.getModel(requestModelRef.providerID, requestModelRef.modelID)
+      const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+      msg.providerID = requestModelRef.providerID
+      msg.modelID = requestModelRef.modelID
+      yield* session.updateMessage(msg)
+
+      routedEvents.splice(
+        0,
+        routedEvents.length,
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.stepFinish({
+          index: 0,
+          reason: "stop",
+          usage: new Usage({ inputTokens: 10, outputTokens: 2 }),
+          responseModelID: "luna-max",
+        }),
+        LLMEvent.stepStart({ index: 1 }),
+        LLMEvent.stepFinish({
+          index: 1,
+          reason: "stop",
+          usage: new Usage({ inputTokens: 10, outputTokens: 2 }),
+          responseModelID: "luna-max",
+        }),
+        LLMEvent.stepStart({ index: 2 }),
+        LLMEvent.stepFinish({
+          index: 2,
+          reason: "stop",
+          usage: new Usage({ inputTokens: 10, outputTokens: 2 }),
+          responseModelID: "glm-5.3-flash",
+        }),
+        LLMEvent.finish({ reason: "stop" }),
+      )
+
+      const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: requestModel })
+      yield* handle.process({
+        user: parent,
+        sessionID: chat.id,
+        model: requestModel,
+        agent: agent(),
+        system: [],
+        messages: [{ role: "user", content: "router label steps" }],
+        tools: {},
+      })
+
+      const messages = (yield* session.messages({ sessionID: chat.id })) as unknown as SessionMessages
+      const processed = messages.find((item) => item.info.id === msg.id)
+      if (!processed || processed.info.role !== "assistant") throw new Error("processor did not persist assistant message")
+      const stepModelIDs = processed.parts.flatMap((part) =>
+        part.type === "step-finish" && part.responseModelID !== undefined ? [part.responseModelID] : [],
+      )
+      expect(stepModelIDs).toEqual(["luna-max", "luna-max", "glm-5.3-flash"])
+
+      const providers = [
+        {
+          id: "llmrouter",
+          name: "LLMRouter",
+          source: "api",
+          env: [],
+          options: {},
+          models: {
+            auto: { name: "Auto" },
+            "luna-max": { name: "luna-max" },
+            "glm-5.3-flash": { name: "glm-5.3-flash" },
+            "sol-high": { name: "sol-high" },
+          },
+        },
+      ] as unknown as RunProvider[]
+      expect(
+        servedModelLabel(
+          providers,
+          "llmrouter",
+          "auto",
+          processed.info.responseModelIDs,
+          servedAcrossSession(messages, processed),
+        ),
+      ).toBe("Auto (luna-max:2/67%, glm-5.3-flash:1/33%, sol-high:0/0%)")
+    }),
+    { config: routerLabelConfig() },
   ),
 )
 

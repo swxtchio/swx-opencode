@@ -15,6 +15,7 @@ import { Global } from "@opencode-ai/core/global"
 import { openEditor } from "@opencode-ai/tui/editor"
 import { registerOpencodeKeymap } from "@opencode-ai/tui/keymap"
 import { Session as SessionApi } from "@/session/session"
+import type { SessionMessages } from "./session.shared"
 import * as Locale from "@/util/locale"
 import { resolveInteractiveStdin } from "./runtime.stdin"
 import { entrySplash, exitSplash, splashMeta } from "./splash"
@@ -59,6 +60,7 @@ export type LifecycleInput = {
   sessionID: string
   sessionTitle?: string
   getSessionID?: () => string | undefined
+  getSessionMessages: (sessionID: string) => Promise<SessionMessages>
   first: boolean
   history: RunPrompt[]
   agent: string | undefined
@@ -235,6 +237,7 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
       agents: input.agents,
       resources: input.resources,
       sessionID: input.getSessionID ?? (() => input.sessionID),
+      getSessionMessages: input.getSessionMessages,
       ...labels,
       model: input.model,
       variant: input.variant,

@@ -215,31 +215,20 @@ export function saveVariant(model: RunInput["model"], variant: string | undefine
   void runtime.saveVariant(model, variant)
 }
 
-// The configured model label, decorated with the model(s) that actually served
-// the turn whenever those differ. See the sibling helper in
-// packages/tui/src/util/model.ts (servedName) - the two render the same string
-// for the two different provider shapes each package already has, and any
-// change to the format belongs in both.
-//
-// A router provider (Fireworks FireRouter, Azure model-router) is sent a route
-// slug and answers with whichever member model it picked, so the configured
-// name on its own hides both what actually ran and what actually got billed.
-// Served ids are joined in the order they first appeared, so a multi-step turn
-// that switched models reads as the sequence it actually was.
-//
-// Suppression compares raw IDS, never resolved display names: a direct provider
-// echoes its own id back, which is the redundancy worth hiding, whereas two
-// DIFFERENT ids that happen to share a friendly name are different models,
-// versions or prices and hiding one behind the other would misreport the turn.
+// The configured model label, decorated with what served the request. The llmrouter/auto identity gets session request counts; every other identity keeps the turn label's existing raw-ID suppression and display-name rules.
 export function servedModelLabel(
   providers: RunProvider[] | undefined,
   providerID: string,
   modelID: string,
   responseModelIDs: readonly string[] | undefined,
+  sessionResponseModelIDs?: readonly string[],
 ): string {
   const provider = providers?.find((item) => item.id === providerID)
   const resolve = (id: string) => provider?.models[id]?.name ?? id
   const base = resolve(modelID)
+  if (providerID === "llmrouter" && modelID === "auto") {
+    return routerUsageLabel(provider, base, sessionResponseModelIDs ?? [])
+  }
   const served = responseModelIDs ?? []
   if (served.length === 0) return base
   if (served.length === 1 && served[0] === modelID) return base
@@ -252,6 +241,35 @@ export function servedModelLabel(
     return collides ? `${label} [${id}]` : label
   })
   return `${base} (${labels.join(" → ")})`
+}
+
+function routerUsageLabel(provider: RunProvider | undefined, base: string, responseModelIDs: readonly string[]) {
+  const configured = Object.entries(provider?.models ?? {}).filter(([id]) => id !== "auto")
+  const configuredIDs = new Set(configured.map(([id]) => id))
+  const unknown = [...new Set(responseModelIDs.filter((id) => !configuredIDs.has(id)))]
+  const ids = [...configured.map(([id]) => id), ...unknown]
+  if (ids.length === 0) return base
+
+  const counts = responseModelIDs.reduce((out, id) => out.set(id, (out.get(id) ?? 0) + 1), new Map<string, number>())
+  const total = responseModelIDs.length
+  const shares = ids.map((id, index) => {
+    const exact = total === 0 ? 0 : ((counts.get(id) ?? 0) * 100) / total
+    return { id, count: counts.get(id) ?? 0, share: Math.floor(exact), fraction: exact - Math.floor(exact), index }
+  })
+  const remaining = total === 0 ? 0 : 100 - shares.reduce((sum, item) => sum + item.share, 0)
+  const bonus = new Set(
+    shares
+      .toSorted((a, b) => b.fraction - a.fraction || a.index - b.index)
+      .slice(0, remaining)
+      .map((item) => item.index),
+  )
+
+  return `${base} (${shares
+    .map(
+      (item) =>
+        `${provider?.models[item.id]?.name ?? item.id}:${item.count}/${item.share + (bonus.has(item.index) ? 1 : 0)}%`,
+    )
+    .join(", ")})`
 }
 
 // Fold one assistant message's model record into the turn's running record.
@@ -291,9 +309,26 @@ function accumulateTurnModel(prev: TurnModel | undefined, next: TurnModel | unde
 export function turnSummaryModel(input: {
   turnModel: TurnModel | undefined
   providers: RunProvider[] | undefined
+  messages?: SessionMessages
 }): string {
   if (!input.turnModel) return "unknown model"
-  return servedModelLabel(input.providers, input.turnModel.providerID, input.turnModel.modelID, input.turnModel.served)
+  const message =
+    input.messages?.find((item) => item.info.id === input.turnModel?.messageID) ??
+    input.messages?.findLast(
+      (item) =>
+        item.info.role === "assistant" &&
+        item.info.providerID === input.turnModel?.providerID &&
+        item.info.modelID === input.turnModel?.modelID,
+    )
+  return servedModelLabel(
+    input.providers,
+    input.turnModel.providerID,
+    input.turnModel.modelID,
+    input.turnModel.served,
+    input.turnModel.providerID === "llmrouter" && input.turnModel.modelID === "auto" && message
+      ? servedAcrossSession(input.messages, message)
+      : undefined,
+  )
 }
 
 // Every model that served one TURN, in first-seen order. Sibling of
@@ -312,6 +347,28 @@ export function servedAcrossTurn(all: { info: TurnMessage }[] | undefined, info:
     }
   }
   return out
+}
+
+// Count per-request step records from this session up through the message being labeled. The info-level responseModelIDs array intentionally deduplicates members, so request frequency comes from each step-finish part.
+export function servedAcrossSession(
+  all: SessionMessages | undefined,
+  message: SessionMessages[number],
+): string[] {
+  const transcript = all ?? [message]
+  const index = transcript.findIndex((item) => item.info.id === message.info.id)
+  const through = index === -1 ? [message] : transcript.slice(0, index + 1)
+  const target = message.info
+  if (target.role !== "assistant") return []
+  return through.flatMap((item) => {
+    const info = item.info
+    if (info.role !== "assistant") return []
+    if (info.sessionID !== target.sessionID) return []
+    if (info.providerID !== target.providerID || info.modelID !== target.modelID) return []
+    if (info.summary === true || item.parts.some((part) => part.type === "compaction")) return []
+    return item.parts.flatMap((part) =>
+      part.type === "step-finish" && part.responseModelID !== undefined ? [part.responseModelID] : [],
+    )
+  })
 }
 
 type TurnMessage = {
