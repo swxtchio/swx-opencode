@@ -14,14 +14,16 @@ export function index(list: Provider[] | undefined) {
   return new Map((list ?? []).map((item) => [item.id, item] as const))
 }
 
+function getProvider(list: Provider[] | ReadonlyMap<string, Provider> | undefined, providerID: string) {
+  return list instanceof Map
+    ? list.get(providerID)
+    : Array.isArray(list)
+      ? list.find((item) => item.id === providerID)
+      : undefined
+}
+
 export function get(list: Provider[] | ReadonlyMap<string, Provider> | undefined, providerID: string, modelID: string) {
-  const provider =
-    list instanceof Map
-      ? list.get(providerID)
-      : Array.isArray(list)
-        ? list.find((item) => item.id === providerID)
-        : undefined
-  return provider?.models[modelID]
+  return getProvider(list, providerID)?.models[modelID]
 }
 
 export function name(
@@ -46,13 +48,7 @@ export function servedName(
 ) {
   const base = name(list, providerID, modelID)
   if (providerID === "llmrouter" && modelID === "auto" && sessionResponseModelIDs !== undefined) {
-    const provider =
-      list instanceof Map
-        ? list.get(providerID)
-        : Array.isArray(list)
-          ? list.find((item) => item.id === providerID)
-          : undefined
-    return routerUsageLabel(provider, base, sessionResponseModelIDs)
+    return routerUsageLabel(getProvider(list, providerID), base, sessionResponseModelIDs)
   }
   const served = responseModelIDs ?? []
   if (served.length === 0) return base

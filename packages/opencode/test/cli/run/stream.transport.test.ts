@@ -676,6 +676,52 @@ describe("run stream transport", () => {
     }
   })
 
+  test("resize replay keeps full-session counts in its visible summary", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const messages = [routerAssistant(1, "luna-max"), routerAssistant(2, "glm-5.3-flash")]
+    const providers = [
+      {
+        id: "llmrouter",
+        name: "LLMRouter",
+        source: "api",
+        env: [],
+        options: {},
+        models: {
+          auto: { name: "Auto" },
+          "luna-max": { name: "luna-max" },
+          "glm-5.3-flash": { name: "glm-5.3-flash" },
+          "sol-high": { name: "sol-high" },
+        },
+      },
+    ] as unknown as RunProvider[]
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        messages: async ({ sessionID }) => ok(sessionID === "session-1" ? messages : []),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      replay: true,
+      replayLimit: 1,
+      limits: () => ({}),
+      providers: () => providers,
+      footer: ui.api,
+    })
+
+    try {
+      await waitFor(() => ui.commits.find((item) => item.summary))
+      ui.commits.length = 0
+      expect(await transport.replayOnResize({ localRows: () => [], reset: () => Promise.resolve() })).toBe(true)
+      const summary = await waitFor(() => ui.commits.find((item) => item.summary))
+      expect(ui.commits.filter((item) => item.kind === "assistant").map((item) => item.text)).toEqual(["Done 2"])
+      expect(summary?.summary?.model).toBe("Auto (luna-max:1/50%, glm-5.3-flash:1/50%, sol-high:0/0%)")
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
   test("skips buffered pre-bootstrap deltas already covered by replay history", async () => {
     const src = eventFeed()
     const ui = footer()

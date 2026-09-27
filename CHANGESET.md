@@ -77,6 +77,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Features
 
+- **#<PR>** Show each configured router member's request count and share so far in `llmrouter/auto` labels in the TUI and run CLI. (swxtchio/swx-opencode#60). _Fork-only._
 - **#58** Price each routed step at its configured serving model and show per-model cost shares in `opencode stats`; `db export-usage` exposes per-served-model token/cost splits and derives record-level tokens, costs and summary `reportedCostTotal` from step-finish parts when present, falling back to message totals under the requested model for legacy rows. (swxtchio/swx-opencode#54). _Fork-only._
 - **#34** Export per-session usage as JSONL, verified against the live database. _Fork-only._
 - **#29** `--effort` flag, which rejects an unknown value instead of ignoring it. _Upstreamable._
