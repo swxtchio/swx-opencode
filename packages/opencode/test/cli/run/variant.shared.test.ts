@@ -347,6 +347,12 @@ describe("servedModelLabel", () => {
     )
   })
 
+  test("uses the existing served-ID label when session history is unavailable", () => {
+    expect(servedModelLabel(routerPool, "llmrouter", "auto", ["luna-max", "glm-5.3-flash"], undefined)).toBe(
+      "Auto (luna-max → glm-5.3-flash)",
+    )
+  })
+
   test("includes unknown served ids in configured order and in the share denominator", () => {
     expect(
       servedModelLabel(routerPool, "llmrouter", "auto", undefined, ["unknown-member", "luna-max", "unknown-member", "glm-5.3-flash"]),
@@ -356,6 +362,12 @@ describe("servedModelLabel", () => {
   test("rounds positive shares to 100 percent with configured-order ties", () => {
     expect(servedModelLabel(routerPool, "llmrouter", "auto", undefined, ["luna-max", "glm-5.3-flash", "sol-high"])).toBe(
       "Auto (luna-max:1/34%, glm-5.3-flash:1/33%, sol-high:1/33%)",
+    )
+  })
+
+  test("keeps an auto response id raw because auto is not a router member", () => {
+    expect(servedModelLabel(routerPool, "llmrouter", "auto", undefined, ["auto"])).toBe(
+      "Auto (luna-max:0/0%, glm-5.3-flash:0/0%, sol-high:0/0%, auto:1/100%)",
     )
   })
 
@@ -386,6 +398,16 @@ describe("turnSummaryModel", () => {
   // reproduce the misattribution this change exists to remove.
   test("says the model is unknown rather than borrowing the current selection", () => {
     expect(turnSummaryModel({ turnModel: undefined, providers })).toBe("unknown model")
+  })
+
+  test("uses the served-ID label when the current assistant is absent from the transcript", () => {
+    expect(
+      turnSummaryModel({
+        turnModel: { providerID: "llmrouter", modelID: "auto", served: ["luna-max", "glm-5.3-flash"], messageID: "missing" },
+        providers: routerPool,
+        messages: [servedStep("other", "session-1", "user-1", ["luna-max"])],
+      }),
+    ).toBe("Auto (luna-max → glm-5.3-flash)")
   })
 })
 

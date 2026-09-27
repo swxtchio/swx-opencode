@@ -25,6 +25,7 @@ function message(id: string, parentID: string, responseModelIDs: string[]): Sess
       parentID,
       providerID: "llmrouter",
       modelID: "auto",
+      responseModelIDs: [...new Set(responseModelIDs)],
       mode: "chat",
       agent: "build",
       path: { cwd: "/tmp", root: "/tmp" },
@@ -54,7 +55,11 @@ function output(renderer: TestRenderer) {
   return commits as Array<{ snapshot: OutputSnapshot }>
 }
 
-test("live run footer summary renders lifetime router usage through scrollback", async () => {
+async function renderSummary(input: {
+  sessionID?: string
+  messages?: SessionMessages
+  failHistory?: boolean
+}) {
   const renderer = await createTestRenderer({
     width: 100,
     screenMode: "split-footer",
@@ -65,7 +70,6 @@ test("live run footer summary renders lifetime router usage through scrollback",
   const treeSitterClient = new MockTreeSitterClient({ autoResolveTimeout: 0 })
   treeSitterClient.setMockResult({ highlights: [] })
   const current = message("m2", "user-2", ["glm-5.3-flash"])
-  const messages = [message("m1", "user-1", ["luna-max", "luna-max"]), current, message("m3", "user-3", ["sol-high"])]
   let reads = 0
   const providers = [
     {
@@ -90,10 +94,12 @@ test("live run footer summary renders lifetime router usage through scrollback",
     findFiles: async () => [],
     agents: [],
     resources: [],
-    sessionID: () => "session-1",
+    sessionID: () => input.sessionID,
     getSessionMessages: async (sessionID) => {
       reads++
-      return sessionID === "session-1" ? messages : []
+      if (input.failHistory) throw new Error("history unavailable")
+      if (sessionID !== "session-1") return undefined
+      return input.messages
     },
     agentLabel: "Build",
     modelLabel: "Auto",
@@ -134,16 +140,17 @@ test("live run footer summary renders lifetime router usage through scrollback",
     const flushing = Reflect.get(footer, "flushing")
     if (!(flushing instanceof Promise)) throw new Error("footer is missing its pending output chain")
     await flushing
-    expect(reads).toBe(1)
     const flushError = Reflect.get(footer, "flushError")
     if (flushError) throw flushError
 
     const commits = output(renderer.renderer)
     try {
-      const text = commits
+      return {
+        reads,
+        text: commits
         .map((commit) => new TextDecoder().decode(commit.snapshot.getRealCharBytes(true)))
-        .join("")
-      expect(text).toContain("▣ Build · Auto (luna-max:2/67%, glm-5.3-flash:1/33%, sol-high:0/0%) · 1s")
+          .join(""),
+      }
     } finally {
       for (const commit of commits) commit.snapshot.destroy()
     }
@@ -151,5 +158,28 @@ test("live run footer summary renders lifetime router usage through scrollback",
     footer.destroy()
     unregister()
     renderer.renderer.destroy()
+  }
+}
+
+test("live run footer summary renders lifetime router usage through scrollback", async () => {
+  const result = await renderSummary({
+    sessionID: "session-1",
+    messages: [message("m1", "user-1", ["luna-max", "luna-max"]), message("m2", "user-2", ["glm-5.3-flash"]), message("m3", "user-3", ["sol-high"])],
+  })
+  expect(result.reads).toBe(1)
+  expect(result.text).toContain("▣ Build · Auto (luna-max:2/67%, glm-5.3-flash:1/33%, sol-high:0/0%) · 1s")
+})
+
+test("live footer keeps its served-ID summary when session history is unavailable", async () => {
+  const unavailable = "▣ Build · Auto (glm-5.3-flash) · 1s"
+  const cases = [
+    { sessionID: undefined, messages: undefined, reads: 0 },
+    { sessionID: "session-1", messages: [message("other-message", "user-1", ["luna-max"])], reads: 1 },
+    { sessionID: "session-1", messages: undefined, failHistory: true, reads: 1 },
+  ]
+  for (const input of cases) {
+    const result = await renderSummary(input)
+    expect(result.reads).toBe(input.reads)
+    expect(result.text).toContain(unavailable)
   }
 })

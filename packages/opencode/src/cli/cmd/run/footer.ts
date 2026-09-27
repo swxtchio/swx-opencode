@@ -77,7 +77,7 @@ type RunFooterOptions = {
   commands?: RunCommand[]
   wrote?: boolean
   sessionID: () => string | undefined
-  getSessionMessages: (sessionID: string) => Promise<SessionMessages>
+  getSessionMessages: (sessionID: string) => Promise<SessionMessages | undefined>
   agentLabel: string
   modelLabel: string
   model: RunInput["model"]
@@ -402,7 +402,7 @@ export class RunFooter implements FooterApi {
         .then(async () => {
           const messages =
             turnModel?.providerID === "llmrouter" && turnModel.modelID === "auto" && sessionID
-              ? await this.options.getSessionMessages(sessionID)
+              ? await this.options.getSessionMessages(sessionID).catch(() => undefined)
               : undefined
           await this.scrollback.writeTurnSummary({
             agent: this.options.agentLabel,

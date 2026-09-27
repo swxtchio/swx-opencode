@@ -88,6 +88,32 @@ describe("transcript", () => {
       expect(result).toBe("## Assistant (Build · Claude Sonnet 4 · 5.4s)\n\n")
     })
 
+    test("keeps the served-ID label when a router session transcript is unavailable", () => {
+      const msg = {
+        ...baseMsg,
+        providerID: "llmrouter",
+        modelID: "auto",
+        responseModelIDs: ["luna-max", "glm-5.3-flash"],
+      }
+      const router = [
+        {
+          id: "llmrouter",
+          name: "LLMRouter",
+          source: "api",
+          env: [],
+          options: {},
+          models: {
+            auto: { name: "Auto" },
+            "luna-max": { name: "luna-max" },
+            "glm-5.3-flash": { name: "glm-5.3-flash" },
+          },
+        },
+      ] as unknown as Provider[]
+      expect(formatAssistantHeader(msg, true, router)).toBe(
+        "## Assistant (Build · Auto (luna-max → glm-5.3-flash) · 5.4s)\n\n",
+      )
+    })
+
     test("excludes metadata when disabled", () => {
       const result = formatAssistantHeader(baseMsg, false)
       expect(result).toBe("## Assistant\n\n")

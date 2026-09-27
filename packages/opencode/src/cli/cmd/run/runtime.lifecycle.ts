@@ -60,7 +60,7 @@ export type LifecycleInput = {
   sessionID: string
   sessionTitle?: string
   getSessionID?: () => string | undefined
-  getSessionMessages: (sessionID: string) => Promise<SessionMessages>
+  getSessionMessages: (sessionID: string) => Promise<SessionMessages | undefined>
   first: boolean
   history: RunPrompt[]
   agent: string | undefined

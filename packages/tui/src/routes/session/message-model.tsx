@@ -5,7 +5,7 @@ import { servedAcrossSession, servedAcrossTurn, servedName, type SessionStepMess
 export function AssistantModelLabel(props: {
   message: AssistantMessage
   providers: Provider[] | ReadonlyMap<string, Provider>
-  messages: readonly SessionStepMessage[]
+  messages: readonly SessionStepMessage[] | undefined
   turnMessages: readonly Message[]
 }) {
   const model = createMemo(() =>

@@ -238,18 +238,32 @@ const it = testEffect(env)
 const routedEvents: LLMEvent[] = []
 const routedLLM = Layer.succeed(LLM.Service, LLM.Service.of({ stream: () => Stream.fromIterable(routedEvents) }))
 const routedExportDbPath = path.join(import.meta.dir, `.opencode-served-cost-${crypto.randomUUID()}.db`)
+const routerLabelEvents: LLMEvent[] = []
+const routerLabelLLM = Layer.succeed(LLM.Service, LLM.Service.of({ stream: () => Stream.fromIterable(routerLabelEvents) }))
+const routerLabelDbPath = path.join(import.meta.dir, `.opencode-router-label-${crypto.randomUUID()}.db`)
 const routedEnv = LayerNode.compile(root, [
   ...replacements,
   [LLM.node, routedLLM],
   [Database.node, Database.layerFromPath(routedExportDbPath)],
 ])
 const itRouted = testEffect(routedEnv)
+const routerLabelEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, routerLabelLLM],
+  [Database.node, Database.layerFromPath(routerLabelDbPath)],
+])
+const itRouterLabel = testEffect(routerLabelEnv)
 
 afterAll(async () => {
   await Promise.all(
-    [routedExportDbPath, `${routedExportDbPath}-wal`, `${routedExportDbPath}-shm`].map((file) =>
-      rm(file, { force: true }),
-    ),
+    [
+      routedExportDbPath,
+      `${routedExportDbPath}-wal`,
+      `${routedExportDbPath}-shm`,
+      routerLabelDbPath,
+      `${routerLabelDbPath}-wal`,
+      `${routerLabelDbPath}-shm`,
+    ].map((file) => rm(file, { force: true })),
   )
 })
 
@@ -1237,7 +1251,7 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
   ),
 )
 
-itRouted.live(
+itRouterLabel.live(
   "feeds repeated provider step records into the router session label",
   provideTmpdirInstance((dir) =>
     Effect.gen(function* () {
@@ -1254,9 +1268,9 @@ itRouted.live(
       msg.modelID = requestModelRef.modelID
       yield* session.updateMessage(msg)
 
-      routedEvents.splice(
+      routerLabelEvents.splice(
         0,
-        routedEvents.length,
+        routerLabelEvents.length,
         LLMEvent.stepStart({ index: 0 }),
         LLMEvent.stepFinish({
           index: 0,

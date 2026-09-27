@@ -33,6 +33,7 @@ function message(
       parentID,
       providerID: "llmrouter",
       modelID: "auto",
+      responseModelIDs: [...new Set(responseModelIDs)],
       mode: "chat",
       agent: "build",
       path: { cwd: "/tmp", root: "/tmp" },
@@ -113,5 +114,40 @@ test("replay summary counts prior steps through each assistant message only", ()
     "Auto (luna-max:2/100%, glm-5.3-flash:0/0%, sol-high:0/0%)",
     "Auto (luna-max:2/67%, glm-5.3-flash:1/33%, sol-high:0/0%)",
     "Auto (luna-max:2/50%, glm-5.3-flash:1/25%, sol-high:1/25%)",
+  ])
+})
+
+test("limited replay keeps its window and uses full-session summary counts", () => {
+  const previous = message("m1", "session-1", "user-1", ["luna-max"])
+  const current = message("m2", "session-1", "user-2", ["glm-5.3-flash"])
+  const replay = replaySession({
+    messages: [user("user-2"), current],
+    summaryMessages: [user("user-1"), previous, user("user-2"), current],
+    permissions: [],
+    questions: [],
+    thinking: true,
+    limits: {},
+    providers,
+  })
+
+  expect(replay.commits.filter((commit) => commit.summary).map((commit) => commit.summary?.model)).toEqual([
+    "Auto (luna-max:1/50%, glm-5.3-flash:1/50%, sol-high:0/0%)",
+  ])
+})
+
+test("limited replay uses served IDs when the full transcript is unavailable", () => {
+  const current = message("m2", "session-1", "user-2", ["glm-5.3-flash"])
+  const replay = replaySession({
+    messages: [user("user-2"), current],
+    summaryMessages: null,
+    permissions: [],
+    questions: [],
+    thinking: true,
+    limits: {},
+    providers,
+  })
+
+  expect(replay.commits.filter((commit) => commit.summary).map((commit) => commit.summary?.model)).toEqual([
+    "Auto (glm-5.3-flash)",
   ])
 })

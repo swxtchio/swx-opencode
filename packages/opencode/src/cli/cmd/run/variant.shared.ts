@@ -226,8 +226,8 @@ export function servedModelLabel(
   const provider = providers?.find((item) => item.id === providerID)
   const resolve = (id: string) => provider?.models[id]?.name ?? id
   const base = resolve(modelID)
-  if (providerID === "llmrouter" && modelID === "auto") {
-    return routerUsageLabel(provider, base, sessionResponseModelIDs ?? [])
+  if (providerID === "llmrouter" && modelID === "auto" && sessionResponseModelIDs !== undefined) {
+    return routerUsageLabel(provider, base, sessionResponseModelIDs)
   }
   const served = responseModelIDs ?? []
   if (served.length === 0) return base
@@ -243,6 +243,7 @@ export function servedModelLabel(
   return `${base} (${labels.join(" → ")})`
 }
 
+// Keep this formatter aligned with packages/tui/src/util/model.ts routerUsageLabel.
 function routerUsageLabel(provider: RunProvider | undefined, base: string, responseModelIDs: readonly string[]) {
   const configured = Object.entries(provider?.models ?? {}).filter(([id]) => id !== "auto")
   const configuredIDs = new Set(configured.map(([id]) => id))
@@ -267,7 +268,7 @@ function routerUsageLabel(provider: RunProvider | undefined, base: string, respo
   return `${base} (${shares
     .map(
       (item) =>
-        `${provider?.models[item.id]?.name ?? item.id}:${item.count}/${item.share + (bonus.has(item.index) ? 1 : 0)}%`,
+        `${configuredIDs.has(item.id) ? provider?.models[item.id]?.name ?? item.id : item.id}:${item.count}/${item.share + (bonus.has(item.index) ? 1 : 0)}%`,
     )
     .join(", ")})`
 }
@@ -312,14 +313,9 @@ export function turnSummaryModel(input: {
   messages?: SessionMessages
 }): string {
   if (!input.turnModel) return "unknown model"
-  const message =
-    input.messages?.find((item) => item.info.id === input.turnModel?.messageID) ??
-    input.messages?.findLast(
-      (item) =>
-        item.info.role === "assistant" &&
-        item.info.providerID === input.turnModel?.providerID &&
-        item.info.modelID === input.turnModel?.modelID,
-    )
+  const message = input.turnModel.messageID
+    ? input.messages?.find((item) => item.info.id === input.turnModel?.messageID)
+    : undefined
   return servedModelLabel(
     input.providers,
     input.turnModel.providerID,
@@ -350,16 +346,17 @@ export function servedAcrossTurn(all: { info: TurnMessage }[] | undefined, info:
 }
 
 // Count per-request step records from this session up through the message being labeled. The info-level responseModelIDs array intentionally deduplicates members, so request frequency comes from each step-finish part.
+// Keep the count source and cut-off aligned with packages/tui/src/util/model.ts servedAcrossSession.
 export function servedAcrossSession(
   all: SessionMessages | undefined,
   message: SessionMessages[number],
-): string[] {
-  const transcript = all ?? [message]
-  const index = transcript.findIndex((item) => item.info.id === message.info.id)
-  const through = index === -1 ? [message] : transcript.slice(0, index + 1)
-  const target = message.info
+): string[] | undefined {
+  if (!all) return undefined
+  const index = all.findIndex((item) => item.info.id === message.info.id)
+  if (index === -1) return undefined
+  const target = all[index]!.info
   if (target.role !== "assistant") return []
-  return through.flatMap((item) => {
+  return all.slice(0, index + 1).flatMap((item) => {
     const info = item.info
     if (info.role !== "assistant") return []
     if (info.sessionID !== target.sessionID) return []

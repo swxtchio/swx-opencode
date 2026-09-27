@@ -32,7 +32,7 @@ export function name(
   return get(list, providerID, modelID)?.name ?? modelID
 }
 
-// The configured model name stays the base label. llmrouter/auto adds a session request breakdown; every other model keeps the existing turn suffix.
+// The configured model name stays the base label. llmrouter/auto adds a session request breakdown when history is available; otherwise the existing turn suffix remains.
 //
 // Direct-provider suppression compares raw IDs, never resolved display names: a provider echoing its requested ID is redundant, while distinct IDs sharing a friendly name still need disambiguation.
 //
@@ -45,14 +45,14 @@ export function servedName(
   sessionResponseModelIDs?: readonly string[],
 ) {
   const base = name(list, providerID, modelID)
-  if (providerID === "llmrouter" && modelID === "auto") {
+  if (providerID === "llmrouter" && modelID === "auto" && sessionResponseModelIDs !== undefined) {
     const provider =
       list instanceof Map
         ? list.get(providerID)
         : Array.isArray(list)
           ? list.find((item) => item.id === providerID)
           : undefined
-    return routerUsageLabel(provider, base, sessionResponseModelIDs ?? [])
+    return routerUsageLabel(provider, base, sessionResponseModelIDs)
   }
   const served = responseModelIDs ?? []
   if (served.length === 0) return base
@@ -69,6 +69,7 @@ export function servedName(
   return `${base} (${labels.join(" → ")})`
 }
 
+// Keep this formatter aligned with packages/opencode/src/cli/cmd/run/variant.shared.ts routerUsageLabel.
 function routerUsageLabel(provider: Provider | undefined, base: string, responseModelIDs: readonly string[]) {
   const configured = Object.entries(provider?.models ?? {}).filter(([id]) => id !== "auto")
   const configuredIDs = new Set(configured.map(([id]) => id))
@@ -93,7 +94,7 @@ function routerUsageLabel(provider: Provider | undefined, base: string, response
   return `${base} (${shares
     .map(
       (item) =>
-        `${provider?.models[item.id]?.name ?? item.id}:${item.count}/${item.share + (bonus.has(item.index) ? 1 : 0)}%`,
+        `${configuredIDs.has(item.id) ? provider?.models[item.id]?.name ?? item.id : item.id}:${item.count}/${item.share + (bonus.has(item.index) ? 1 : 0)}%`,
     )
     .join(", ")})`
 }
@@ -123,9 +124,14 @@ export function servedAcrossTurn(
   return out
 }
 
-export function servedAcrossSession(messages: readonly SessionStepMessage[], messageID: string): string[] {
+// Keep the count source and cut-off aligned with packages/opencode/src/cli/cmd/run/variant.shared.ts servedAcrossSession.
+export function servedAcrossSession(
+  messages: readonly SessionStepMessage[] | undefined,
+  messageID: string,
+): string[] | undefined {
+  if (!messages) return undefined
   const index = messages.findIndex((item) => item.info.id === messageID)
-  if (index === -1) return []
+  if (index === -1) return undefined
   const message = messages[index]!
   const target = message.info
   if (target.role !== "assistant") return []

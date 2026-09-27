@@ -137,6 +137,12 @@ describe("util.model", () => {
     )
   })
 
+  test("uses the existing served-ID label when session history is unavailable", () => {
+    expect(servedName(providers, "llmrouter", "auto", ["luna-max", "glm-5.3-flash"], undefined)).toBe(
+      "Auto (luna-max → glm-5.3-flash)",
+    )
+  })
+
   test("keeps an unknown served id visible and in the request total", () => {
     expect(
       servedName(providers, "llmrouter", "auto", undefined, ["outside-pool", "luna-max", "outside-pool", "glm-5.3-flash"]),
@@ -146,6 +152,12 @@ describe("util.model", () => {
   test("rounds member shares to a total of 100 percent", () => {
     expect(servedName(providers, "llmrouter", "auto", undefined, ["luna-max", "glm-5.3-flash", "sol-high"])).toBe(
       "Auto (luna-max:1/34%, glm-5.3-flash:1/33%, sol-high:1/33%)",
+    )
+  })
+
+  test("keeps an auto response id raw because auto is not a router member", () => {
+    expect(servedName(providers, "llmrouter", "auto", undefined, ["auto"])).toBe(
+      "Auto (luna-max:0/0%, glm-5.3-flash:0/0%, sol-high:0/0%, auto:1/100%)",
     )
   })
 

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test"
 import { OpencodeClient, type GlobalEvent } from "@opencode-ai/sdk/v2"
 import { createSessionTransport } from "@/cli/cmd/run/stream.transport"
-import type { FooterApi, FooterEvent, LocalReplayRow, RunFilePart, StreamCommit } from "@/cli/cmd/run/types"
+import type { FooterApi, FooterEvent, LocalReplayRow, RunFilePart, RunProvider, StreamCommit } from "@/cli/cmd/run/types"
 
 type EventStream = Awaited<ReturnType<OpencodeClient["event"]["subscribe"]>>["stream"]
 type GlobalEventStream = Awaited<ReturnType<OpencodeClient["global"]["event"]>>["stream"]
@@ -284,6 +284,41 @@ function textPart(id: string, messageID: string, text: string, sessionID = "sess
     messageID,
     type: "text",
     text,
+  }
+}
+
+function routerAssistant(index: number, responseModelID: string): SessionMessage {
+  const id = `router-${String(index).padStart(3, "0")}`
+  const tokens = { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }
+  return {
+    info: {
+      id,
+      sessionID: "session-1",
+      role: "assistant",
+      time: { created: index * 2, completed: index * 2 + 1 },
+      parentID: `user-${index}`,
+      providerID: "llmrouter",
+      modelID: "auto",
+      responseModelIDs: [responseModelID],
+      mode: "chat",
+      agent: "build",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens,
+    } as SessionMessage["info"],
+    parts: [
+      {
+        id: `${id}-step`,
+        sessionID: "session-1",
+        messageID: id,
+        type: "step-finish",
+        reason: "stop",
+        responseModelID,
+        cost: 0,
+        tokens,
+      },
+      textPart(`${id}-text`, id, `Done ${index}`),
+    ],
   }
 }
 
@@ -588,6 +623,56 @@ describe("run stream transport", () => {
           text: "World.",
         }),
       ])
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("limited replay keeps its visible window and counts the full session in its summary", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const messages = Array.from({ length: 101 }, (_, index) => routerAssistant(index + 1, "luna-max"))
+    messages.push(routerAssistant(102, "glm-5.3-flash"))
+    const limits: Array<number | undefined> = []
+    const providers = [
+      {
+        id: "llmrouter",
+        name: "LLMRouter",
+        source: "api",
+        env: [],
+        options: {},
+        models: {
+          auto: { name: "Auto" },
+          "luna-max": { name: "luna-max" },
+          "glm-5.3-flash": { name: "glm-5.3-flash" },
+          "sol-high": { name: "sol-high" },
+        },
+      },
+    ] as unknown as RunProvider[]
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        messages: async ({ sessionID, limit }) => {
+          limits.push(limit)
+          if (sessionID !== "session-1") return ok([])
+          return ok(limit === undefined || limit === 0 ? messages : messages.slice(-limit))
+        },
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      replay: true,
+      replayLimit: 1,
+      limits: () => ({}),
+      providers: () => providers,
+      footer: ui.api,
+    })
+
+    try {
+      const summary = await waitFor(() => ui.commits.find((item) => item.summary))
+      expect(limits).toContain(0)
+      expect(ui.commits.filter((item) => item.kind === "assistant").map((item) => item.text)).toEqual(["Done 102"])
+      expect(summary?.summary?.model).toBe("Auto (luna-max:101/99%, glm-5.3-flash:1/1%, sol-high:0/0%)")
     } finally {
       src.close()
       await transport.close()

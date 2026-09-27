@@ -257,7 +257,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
     sessionID: state.sessionID,
     sessionTitle: state.sessionTitle,
     getSessionID: () => state.sessionID,
-    getSessionMessages: async (sessionID) => (await ctx.sdk.session.messages({ sessionID, limit: 0 })).data ?? [],
+    getSessionMessages: async (sessionID) => (await ctx.sdk.session.messages({ sessionID, limit: 0 })).data,
     first: session.first,
     history: session.history,
     agent: state.agent,
