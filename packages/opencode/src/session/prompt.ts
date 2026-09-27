@@ -101,6 +101,23 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
+// Whether an assistant message ends its turn; a tool-call step does not. The
+// loop exits on one, and a sync prompt's reply is one.
+function concludes(msg: SessionV1.WithParts) {
+  if (msg.info.role !== "assistant") return false
+  // A turn that stopped on an abort or error, or ended with its structured
+  // result, stays settled, so waking the session delivers its parked prompts
+  // instead of continuing that turn.
+  if (msg.info.error !== undefined || msg.info.structured !== undefined) return true
+  // Some providers return "stop" even when the assistant message contains
+  // tool calls. Keep the loop running so tool results can be sent back to
+  // the model, but ignore cleanup-marked interrupted orphans.
+  const hasToolCalls = msg.parts.some(
+    (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
+  )
+  return !!msg.info.finish && !["tool-calls", "unknown"].includes(msg.info.finish) && !hasToolCalls
+}
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError>
@@ -1182,27 +1199,7 @@ const layer = Layer.effect(
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
           )
-          // Some providers return "stop" even when the assistant message contains
-          // tool calls. Keep the loop running so tool results can be sent back to
-          // the model, but ignore cleanup-marked interrupted orphans.
-          const hasToolCalls =
-            lastAssistantMsg?.parts.some(
-              (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
-            ) ?? false
-
-          // A turn that stopped on an abort or error, or ended with its structured
-          // result, stays settled, so waking the session delivers its parked
-          // prompts instead of continuing that turn.
-          const ended =
-            lastAssistant?.parentID === lastUser.id &&
-            (lastAssistant.error !== undefined || lastAssistant.structured !== undefined)
-          if (
-            ended ||
-            (lastAssistant?.finish &&
-              !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
-              !hasToolCalls &&
-              lastAssistant.parentID === lastUser.id)
-          ) {
+          if (lastAssistantMsg && lastAssistant?.parentID === lastUser.id && concludes(lastAssistantMsg)) {
             const orphan = lastAssistantMsg?.parts.find(
               (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
             )
@@ -1514,27 +1511,28 @@ const layer = Layer.effect(
       }
       const message = own ? yield* queue.delivered(own) : undefined
       if (!message) return yield* withdrawn.pipe(Effect.as(result))
-      // When the run stopped before this prompt's turn, the caller gets the run's
-      // final message, as every caller did before the queue.
+      // When the run stopped before this prompt's turn ended (or began), the caller
+      // gets the run's final message, as every caller did before the queue.
       return (yield* replyTo(sessionID, message)) ?? result
     })
 
-    // The reply to a prompt is the last message of the first turn after it that
-    // answers it or a later prompt: steers promoted together share one turn,
-    // which replies to the newest of them. A compaction summary is not a reply.
+    // The reply to a prompt is the first assistant message after it that ends a
+    // turn answering it or a later prompt. Tool-call steps do not end a turn, and
+    // a turn steered by later prompts ends with its own final reply, which every
+    // prompt in it shares; a queued prompt's turn comes after. A compaction
+    // summary is not a reply.
     const replyTo = Effect.fnUntraced(function* (sessionID: SessionID, message: MessageID) {
       const replies: SessionV1.WithParts[] = []
       // Scans newest first and stops at the prompt, collecting the replies after it.
       yield* sessions
         .findMessage(sessionID, (m) => {
           if (m.info.id <= message) return true
-          if (m.info.role === "assistant" && !m.info.summary && m.info.parentID >= message) replies.push(m)
+          if (m.info.role === "assistant" && !m.info.summary && m.info.parentID >= message && concludes(m))
+            replies.push(m)
           return false
         })
         .pipe(Effect.orDie)
-      const first = replies.at(-1)?.info
-      if (first?.role !== "assistant") return undefined
-      return replies.find((m) => m.info.role === "assistant" && m.info.parentID === first.parentID)
+      return replies.at(-1)
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
