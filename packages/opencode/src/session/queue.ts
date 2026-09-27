@@ -30,11 +30,13 @@ export type PromotedInput = SessionPromptQueue.QueuedInput & {
 
 export interface Interface {
   readonly admit: (input: AdmitInput) => Effect.Effect<Item>
-  /** Pending items in delivery order: steers, then queued items, each by admission. */
   readonly list: (sessionID: SessionID) => Effect.Effect<Item[]>
-  /** Takes a pending item out of the queue for editing; none once it was promoted or already withdrawn. */
+  /**
+   * Withdraws an item for editing so it cannot be delivered mid-edit. None
+   * tells the editor that delivery won the race.
+   */
   readonly withdraw: (sessionID: SessionID, itemID: ItemID) => Effect.Effect<Option.Option<Item>>
-  /** Returns a withdrawn item to the queue with its original id and seq. */
+  /** Cancels an edit: the item regains its place, since its seq is kept. */
   readonly restore: (sessionID: SessionID, itemID: ItemID) => Effect.Effect<Option.Option<Item>>
   readonly update: (input: {
     readonly sessionID: SessionID
@@ -42,9 +44,10 @@ export interface Interface {
     readonly delivery: Delivery
   }) => Effect.Effect<Option.Option<Item>>
   /**
-   * Promotes pending items into V1 user messages through `create`: every pending
-   * steer in seq order, or the single oldest queued item. Steers wait while a
-   * compaction task is pending so that compaction runs first.
+   * Turns pending items into V1 user messages through `create`. Steers wait
+   * while a compaction task is pending, so they never become that compaction's
+   * parent or input, and queued items go one per call so the loop reevaluates
+   * between their turns.
    */
   readonly promote: <E>(input: {
     readonly sessionID: SessionID
@@ -52,16 +55,17 @@ export interface Interface {
     readonly create: (input: PromotedInput) => Effect.Effect<unknown, E>
   }) => Effect.Effect<boolean, E>
   /**
-   * Called by a drain before it reads history: forgets promotions whose message
-   * that read will see, and returns to pending any promotion whose message never
-   * landed (a process stopped mid-promotion).
+   * Called by a drain before it reads history. A promoted row outlives its
+   * promotion until then so that a joiner of a finishing run can see the prompt
+   * still needs a drain, and so that a promotion interrupted by a crash is
+   * delivered once rather than lost or repeated.
    */
   readonly consume: (sessionID: SessionID) => Effect.Effect<void>
-  /** Marks a run that ended without going idle normally; nothing restarts until the next wake. */
+  /** A run that stopped on an abort or error must not restart until something wakes the session. */
   readonly park: (sessionID: SessionID) => Effect.Effect<void>
-  /** Whether admitted work is still waiting for a drain and the session is not parked. */
+  /** The joiner re-check's signal: admitted work no drain has read yet, on a session that is not parked. */
   readonly awaitingDrain: (sessionID: SessionID) => Effect.Effect<boolean>
-  /** Runs `effect` so that no promotion for the session interleaves with it. */
+  /** For writers of user messages, such as compaction, that a promotion must not interleave with. */
   readonly exclusive: <A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
 }
 

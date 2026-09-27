@@ -1075,9 +1075,10 @@ const layer = Layer.effect(
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
-      // noReply writes its message directly and never drains. Every other prompt
-      // is admitted to the durable queue first, and a steer becomes a message at
-      // once unless a pending compaction must run before it.
+      // noReply keeps its direct write and never drains. Every other prompt is
+      // admitted to the durable queue first; a steer is promoted at once, unless a
+      // pending compaction must run first, so it still reaches the running turn's
+      // next step as it did before the queue.
       const message = input.noReply === true ? yield* createUserMessage(input) : undefined
       if (!message) {
         yield* queue.admit(input)
@@ -1183,8 +1184,8 @@ const layer = Layer.effect(
                 callID: orphan.callID,
               })
             }
-            // The session would go idle: a pending steer goes next, otherwise one
-            // queued item runs as its own turn before the loop reevaluates.
+            // Queued prompts wait for this point and run one turn each, so a steer
+            // or another admission arriving meanwhile is weighed before the next.
             if (yield* promoteInLoop(sessionID, "steer")) continue
             if (yield* promoteInLoop(sessionID, "queue")) continue
             yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
@@ -1398,7 +1399,7 @@ const layer = Layer.effect(
           continue
         }
 
-        // A stop, error or structured result parks pending work until the next wake.
+        // Any other exit stops the task; the joiner re-check must not restart it.
         if (!settled) yield* queue.park(sessionID)
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
