@@ -306,14 +306,14 @@ export function Session() {
     },
   )
   const modelMessages = createMemo<SessionStepMessage[]>(() => {
-    const out = new Map<string, SessionStepMessage>((modelHistory() ?? []).map((message) => [message.info.id, message]))
-    for (const message of messages()) {
-      const previous = out.get(message.id)
-      out.set(message.id, {
-        info: message,
-        parts: sync.data.part[message.id] ?? previous?.parts ?? [],
-      })
-    }
+    const out = messages().reduce(
+      (map, message) =>
+        map.set(message.id, {
+          info: message,
+          parts: sync.data.part[message.id] ?? map.get(message.id)?.parts ?? [],
+        }),
+      new Map<string, SessionStepMessage>((modelHistory() ?? []).map((message) => [message.info.id, message])),
+    )
     return [...out.values()].toSorted(
       (left, right) => left.info.time.created - right.info.time.created || left.info.id.localeCompare(right.info.id),
     )
