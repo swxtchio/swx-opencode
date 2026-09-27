@@ -132,6 +132,17 @@ export class QueueItemNotPendingError extends Schema.TaggedErrorClass<QueueItemN
   { httpApiStatus: 404 },
 ) {}
 
+// A prompt's own item was withdrawn from the queue before it was delivered.
+export class PromptWithdrawnError extends Schema.TaggedErrorClass<PromptWithdrawnError>()(
+  "PromptWithdrawn",
+  {
+    sessionID: Schema.String,
+    itemID: Schema.String,
+    message: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {}
+
 export class QueueItemNotWithdrawnError extends Schema.TaggedErrorClass<QueueItemNotWithdrawnError>()(
   "QueueItemNotWithdrawn",
   {
