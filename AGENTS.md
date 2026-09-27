@@ -169,3 +169,16 @@ const table = sqliteTable("session", {
 - Keep delivery vocabulary explicit. Prompts steer by default and promote at the next safe provider-turn boundary while the current drain requires continuation. An explicit `queue` input remains pending until the Session would otherwise become idle; promote one queued input at that boundary, then reevaluate continuation before promoting another. Promoting any new user input resets the selected agent's provider-turn allowance; a batch of steers resets it once.
 - Keep EventV2 replay owner claims separate from clustered Session execution ownership.
 - Keep the System Context algebra, registry, and built-ins in `src/system-context`; keep Context Source producers with their observed domains, and keep Session History selection plus Context Epoch persistence Session-owned.
+
+## V1 Prompt Queue (fork)
+
+- Every V1 prompt except `noReply` is admitted to the fork-owned durable queue in `packages/opencode/src/session/queue.ts` before it becomes a user message; `prompt.ts` only hooks into it. Put new queue behaviour in that module, since `prompt.ts` churns upstream and small hooks re-apply cleanly on a sync.
+- A `steer` (the default) is promoted at admission so it still reaches the running turn's next step; only an explicit `queue` waits for the would-idle boundary. Holding every steer until the loop top would break senders that expect their message in history mid-run.
+- Never name a fork table, route or event after upstream v2's `session_input`, `session_pending` or `session_inbox`; a sync bringing v2 in would collide with it.
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project.
+Do not repeat what the codebase already shows; point to the authoritative file or command instead.
+Prefer rewriting or pruning existing entries over appending new ones.
+When updating this file, preserve this bar for all agents and keep entries concise.
