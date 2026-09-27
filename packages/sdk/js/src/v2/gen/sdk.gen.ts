@@ -205,6 +205,14 @@ import type {
   SessionPromptAsyncResponses,
   SessionPromptErrors,
   SessionPromptResponses,
+  SessionQueueListErrors,
+  SessionQueueListResponses,
+  SessionQueueRestoreErrors,
+  SessionQueueRestoreResponses,
+  SessionQueueUpdateErrors,
+  SessionQueueUpdateResponses,
+  SessionQueueWithdrawErrors,
+  SessionQueueWithdrawResponses,
   SessionRevertErrors,
   SessionRevertResponses,
   SessionShareErrors,
@@ -3359,6 +3367,160 @@ export class Provider extends HeyApiClient {
   }
 }
 
+export class Queue extends HeyApiClient {
+  /**
+   * List queued prompts
+   *
+   * List the prompts admitted to a session that have not reached the model yet: pending steers first, then queued prompts, each in admission order.
+   */
+  public list<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SessionQueueListResponses, SessionQueueListErrors, ThrowOnError>({
+      url: "/session/{sessionID}/queue",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Withdraw queued prompt
+   *
+   * Take a pending prompt out of the queue, for example to edit it. Fails with QueueItemNotPending when it was already delivered, withdrawn or never existed. A withdrawn prompt can be restored.
+   */
+  public withdraw<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      itemID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "itemID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).delete<
+      SessionQueueWithdrawResponses,
+      SessionQueueWithdrawErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/queue/{itemID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Change queued prompt delivery
+   *
+   * Change how a pending prompt is delivered and wake the session. Setting steer sends a queued prompt at the next step.
+   */
+  public update<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      itemID: string
+      directory?: string
+      workspace?: string
+      delivery?: "steer" | "queue"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "itemID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "delivery" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<SessionQueueUpdateResponses, SessionQueueUpdateErrors, ThrowOnError>({
+      url: "/session/{sessionID}/queue/{itemID}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Restore withdrawn prompt
+   *
+   * Return a withdrawn prompt to the queue with its original id and position, and wake the session so it is delivered.
+   */
+  public restore<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      id?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "id" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionQueueRestoreResponses, SessionQueueRestoreErrors, ThrowOnError>(
+      {
+        url: "/session/{sessionID}/queue/restore",
+        ...options,
+        ...params,
+        headers: {
+          "Content-Type": "application/json",
+          ...options?.headers,
+          ...params.headers,
+        },
+      },
+    )
+  }
+}
+
 export class Session2 extends HeyApiClient {
   /**
    * List sessions
@@ -3757,6 +3919,7 @@ export class Session2 extends HeyApiClient {
       format?: OutputFormat
       system?: string
       variant?: string
+      delivery?: "steer" | "queue"
       parts?: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
     },
     options?: Options<never, ThrowOnError>,
@@ -3777,6 +3940,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "format" },
             { in: "body", key: "system" },
             { in: "body", key: "variant" },
+            { in: "body", key: "delivery" },
             { in: "body", key: "parts" },
           ],
         },
@@ -4110,6 +4274,7 @@ export class Session2 extends HeyApiClient {
       format?: OutputFormat
       system?: string
       variant?: string
+      delivery?: "steer" | "queue"
       parts?: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
     },
     options?: Options<never, ThrowOnError>,
@@ -4130,6 +4295,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "format" },
             { in: "body", key: "system" },
             { in: "body", key: "variant" },
+            { in: "body", key: "delivery" },
             { in: "body", key: "parts" },
           ],
         },
@@ -4163,6 +4329,7 @@ export class Session2 extends HeyApiClient {
       arguments?: string
       command?: string
       variant?: string
+      delivery?: "steer" | "queue"
       parts?: Array<{
         id?: string
         type: "file"
@@ -4188,6 +4355,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "arguments" },
             { in: "body", key: "command" },
             { in: "body", key: "variant" },
+            { in: "body", key: "delivery" },
             { in: "body", key: "parts" },
           ],
         },
@@ -4324,6 +4492,11 @@ export class Session2 extends HeyApiClient {
       ...options,
       ...params,
     })
+  }
+
+  private _queue?: Queue
+  get queue(): Queue {
+    return (this._queue ??= new Queue({ client: this.client }))
   }
 }
 

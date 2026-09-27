@@ -81,6 +81,7 @@ export type Event =
   | EventProjectUpdated
   | EventSessionStatus
   | EventSessionIdle
+  | EventSessionQueueUpdated
   | EventQuestionAsked
   | EventQuestionReplied
   | EventQuestionRejected
@@ -693,6 +694,84 @@ export type SessionStatus =
   | {
       type: "busy"
     }
+
+export type TextPartInput = {
+  id?: string
+  type: "text"
+  text: string
+  synthetic?: boolean
+  ignored?: boolean
+  time?: {
+    start: number
+    end?: number
+  }
+  metadata?: {
+    [key: string]: unknown
+  }
+}
+
+export type FilePartInput = {
+  id?: string
+  type: "file"
+  mime: string
+  filename?: string
+  url: string
+  source?: FilePartSource
+}
+
+export type AgentPartInput = {
+  id?: string
+  type: "agent"
+  name: string
+  source?: {
+    value: string
+    start: number
+    end: number
+  }
+}
+
+export type SubtaskPartInput = {
+  id?: string
+  type: "subtask"
+  prompt: string
+  description: string
+  agent: string
+  model?: {
+    providerID: string
+    modelID: string
+  }
+  command?: string
+}
+
+export type SessionPromptQueueInput = {
+  messageID?: string
+  model?: {
+    providerID: string
+    modelID: string
+  }
+  agent?: string
+  tools?: {
+    [key: string]: boolean
+  }
+  format?: OutputFormat
+  system?: string
+  variant?: string
+  parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
+}
+
+export type SessionPromptQueueItem = {
+  id: string
+  sessionID: string
+  /**
+   * Admission order within the session; never reused
+   */
+  seq: number
+  delivery: "steer" | "queue"
+  input: SessionPromptQueueInput
+  time: {
+    created: number
+  }
+}
 
 export type QuestionOption = {
   /**
@@ -1505,6 +1584,14 @@ export type GlobalEvent = {
         type: "session.idle"
         properties: {
           sessionID: string
+        }
+      }
+    | {
+        id: string
+        type: "session.queue.updated"
+        properties: {
+          sessionID: string
+          items: Array<SessionPromptQueueItem>
         }
       }
     | {
@@ -2552,57 +2639,16 @@ export type NotFoundError = {
   }
 }
 
-export type TextPartInput = {
-  id?: string
-  type: "text"
-  text: string
-  synthetic?: boolean
-  ignored?: boolean
-  time?: {
-    start: number
-    end?: number
-  }
-  metadata?: {
-    [key: string]: unknown
-  }
-}
-
-export type FilePartInput = {
-  id?: string
-  type: "file"
-  mime: string
-  filename?: string
-  url: string
-  source?: FilePartSource
-}
-
-export type AgentPartInput = {
-  id?: string
-  type: "agent"
-  name: string
-  source?: {
-    value: string
-    start: number
-    end: number
-  }
-}
-
-export type SubtaskPartInput = {
-  id?: string
-  type: "subtask"
-  prompt: string
-  description: string
-  agent: string
-  model?: {
-    providerID: string
-    modelID: string
-  }
-  command?: string
-}
-
 export type SessionBusyError = {
   _tag: "SessionBusyError"
   sessionID: string
+  message: string
+}
+
+export type QueueItemNotPending = {
+  _tag: "QueueItemNotPending"
+  sessionID: string
+  itemID: string
   message: string
 }
 
@@ -2934,6 +2980,7 @@ export type V2Event =
   | ProjectUpdated
   | SessionStatus2
   | SessionIdle
+  | SessionQueueUpdated
   | QuestionAsked
   | QuestionReplied2
   | QuestionRejected2
@@ -5932,6 +5979,24 @@ export type SessionIdle = {
   }
 }
 
+export type SessionQueueUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.queue.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    items: Array<SessionPromptQueueItem>
+  }
+}
+
 export type QuestionAsked = {
   id: string
   metadata?: {
@@ -6947,6 +7012,15 @@ export type EventSessionIdle = {
   type: "session.idle"
   properties: {
     sessionID: string
+  }
+}
+
+export type EventSessionQueueUpdated = {
+  id: string
+  type: "session.queue.updated"
+  properties: {
+    sessionID: string
+    items: Array<SessionPromptQueueItem>
   }
 }
 
@@ -9811,6 +9885,7 @@ export type SessionPromptData = {
     format?: OutputFormat
     system?: string
     variant?: string
+    delivery?: "steer" | "queue"
     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
   }
   path: {
@@ -10158,6 +10233,7 @@ export type SessionPromptAsyncData = {
     format?: OutputFormat
     system?: string
     variant?: string
+    delivery?: "steer" | "queue"
     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
   }
   path: {
@@ -10200,6 +10276,7 @@ export type SessionCommandData = {
     arguments: string
     command: string
     variant?: string
+    delivery?: "steer" | "queue"
     parts?: Array<{
       id?: string
       type: "file"
@@ -10480,6 +10557,148 @@ export type PartUpdateResponses = {
 }
 
 export type PartUpdateResponse = PartUpdateResponses[keyof PartUpdateResponses]
+
+export type SessionQueueListData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue"
+}
+
+export type SessionQueueListErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionQueueListError = SessionQueueListErrors[keyof SessionQueueListErrors]
+
+export type SessionQueueListResponses = {
+  /**
+   * Pending queue items in delivery order
+   */
+  200: Array<SessionPromptQueueItem>
+}
+
+export type SessionQueueListResponse = SessionQueueListResponses[keyof SessionQueueListResponses]
+
+export type SessionQueueWithdrawData = {
+  body?: never
+  path: {
+    sessionID: string
+    itemID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/{itemID}"
+}
+
+export type SessionQueueWithdrawErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError | QueueItemNotPending
+   */
+  404: NotFoundError | QueueItemNotPending
+}
+
+export type SessionQueueWithdrawError = SessionQueueWithdrawErrors[keyof SessionQueueWithdrawErrors]
+
+export type SessionQueueWithdrawResponses = {
+  /**
+   * Withdrawn queue item
+   */
+  200: SessionPromptQueueItem
+}
+
+export type SessionQueueWithdrawResponse = SessionQueueWithdrawResponses[keyof SessionQueueWithdrawResponses]
+
+export type SessionQueueUpdateData = {
+  body?: {
+    delivery: "steer" | "queue"
+  }
+  path: {
+    sessionID: string
+    itemID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/{itemID}"
+}
+
+export type SessionQueueUpdateErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError | QueueItemNotPending
+   */
+  404: NotFoundError | QueueItemNotPending
+}
+
+export type SessionQueueUpdateError = SessionQueueUpdateErrors[keyof SessionQueueUpdateErrors]
+
+export type SessionQueueUpdateResponses = {
+  /**
+   * Updated queue item
+   */
+  200: SessionPromptQueueItem
+}
+
+export type SessionQueueUpdateResponse = SessionQueueUpdateResponses[keyof SessionQueueUpdateResponses]
+
+export type SessionQueueRestoreData = {
+  body?: {
+    id: string
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/restore"
+}
+
+export type SessionQueueRestoreErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionQueueRestoreError = SessionQueueRestoreErrors[keyof SessionQueueRestoreErrors]
+
+export type SessionQueueRestoreResponses = {
+  /**
+   * Restored queue item
+   */
+  200: SessionPromptQueueItem
+}
+
+export type SessionQueueRestoreResponse = SessionQueueRestoreResponses[keyof SessionQueueRestoreResponses]
 
 export type SyncStartData = {
   body?: never
