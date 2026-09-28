@@ -3,7 +3,7 @@
  *
  * | Path | Locks in order | Wait | Contention | Infrastructure failure | Work failure |
  * | --- | --- | --- | --- | --- | --- |
- * | `Snapshot.track` (user-facing) | per-repo and local | wait; never skip | wait, then track | loud log and surface lock failures | surface to caller |
+ * | `Snapshot.track` (user-facing) | per-repo and local | bounded wait windows; never skip | retry until tracked | loud log and skip | surface work failures |
  * | `Snapshot.cleanup` admission | `gc.lock` | long wait | wait, then recheck; expiry warns and skips | loud log and abort the pass | surface per repo |
  * | cleanup per-repo gc section | `gc.lock` → per-repo | short | skip this repo this pass | loud log and skip repo | log and continue other repos |
  * | reap | `gc.lock` → per-repo | short | skip | loud log and skip | log and continue other repos |
