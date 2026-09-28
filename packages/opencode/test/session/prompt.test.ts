@@ -567,12 +567,14 @@ test("classifies configured machine markers from their producer framing", async 
 })
 
 stepZeroPrompt.instance(
-  "holds marked inputs through tool continuation, reversed metadata, and the promoted step-zero reload",
+  "keeps released held inputs ordered through tool continuation and the promoted step-zero reload",
   () =>
     Effect.gen(function* () {
-      const { llm } = yield* useServerConfig(providerCfg)
+      const { dir, llm } = yield* useServerConfig(providerCfg)
       const prompt = yield* SessionPrompt.Service
       const sessions = yield* Session.Service
+      const toolFile = path.join(dir, "held-step.txt")
+      yield* writeText(toolFile, "held tool step")
       const session = yield* sessions.create({
         title: "Pinned",
         permission: [{ permission: "*", pattern: "*", action: "allow" }],
@@ -582,15 +584,18 @@ stepZeroPrompt.instance(
       const firstHeldGate = yield* Deferred.make<void>()
       const secondHeldGate = yield* Deferred.make<void>()
       const thirdHeldGate = yield* Deferred.make<void>()
-      const gates = [toolGate, stopGate, firstHeldGate, secondHeldGate, thirdHeldGate]
+      const captainGate = yield* Deferred.make<void>()
+      const gates = [toolGate, stopGate, firstHeldGate, secondHeldGate, thirdHeldGate, captainGate]
 
       yield* Effect.gen(function* () {
         yield* llm.push(
-          reply().wait(deferredAsPromise(toolGate)).tool("first", { value: "continue" }).item(),
+          reply().wait(deferredAsPromise(toolGate)).tool("glob", { pattern: "held-step.txt" }).item(),
           reply().wait(deferredAsPromise(stopGate)).text("task finished").stop().item(),
+          reply().tool("glob", { pattern: "held-step.txt" }).item(),
           reply().wait(deferredAsPromise(firstHeldGate)).text("first message handled").stop().item(),
           reply().wait(deferredAsPromise(secondHeldGate)).text("second message handled").stop().item(),
           reply().wait(deferredAsPromise(thirdHeldGate)).text("step-zero message handled").stop().item(),
+          reply().wait(deferredAsPromise(captainGate)).text("captain message handled").stop().item(),
         )
         const root = yield* prompt.prompt({
           sessionID: session.id,
@@ -649,7 +654,7 @@ stepZeroPrompt.instance(
           (message) => message.info.id === firstID,
         )
         if (!firstSaved || firstSaved.info.role !== "user") throw new Error("expected persisted first held input")
-        yield* sessions.updateMessage({ ...firstSaved.info, time: { created: 300 } })
+        yield* sessions.updateMessage({ ...firstSaved.info, time: { created: 100 } })
         yield* pollWithTimeout(
           sessions
             .messages({ sessionID: session.id })
@@ -657,7 +662,7 @@ stepZeroPrompt.instance(
               Effect.map((messages) =>
                 messages.some(
                   (message) =>
-                    message.info.role === "user" && message.info.id === firstID && message.info.time.created === 300,
+                    message.info.role === "user" && message.info.id === firstID && message.info.time.created === 100,
                 )
                   ? true
                   : undefined,
@@ -695,7 +700,7 @@ stepZeroPrompt.instance(
           (message) => message.info.id === secondID,
         )
         if (!secondSaved || secondSaved.info.role !== "user") throw new Error("expected persisted second held input")
-        yield* sessions.updateMessage({ ...secondSaved.info, time: { created: 200 } })
+        yield* sessions.updateMessage({ ...secondSaved.info, time: { created: 300 } })
         yield* pollWithTimeout(
           sessions
             .messages({ sessionID: session.id })
@@ -703,7 +708,7 @@ stepZeroPrompt.instance(
               Effect.map((messages) =>
                 messages.some(
                   (message) =>
-                    message.info.role === "user" && message.info.id === secondID && message.info.time.created === 200,
+                    message.info.role === "user" && message.info.id === secondID && message.info.time.created === 300,
                 )
                   ? true
                   : undefined,
@@ -760,7 +765,7 @@ stepZeroPrompt.instance(
           (message) => message.info.id === thirdID,
         )
         if (!thirdSaved || thirdSaved.info.role !== "user") throw new Error("expected persisted step-zero input")
-        yield* sessions.updateMessage({ ...thirdSaved.info, time: { created: 100 } })
+        yield* sessions.updateMessage({ ...thirdSaved.info, time: { created: 200 } })
         yield* pollWithTimeout(
           sessions
             .messages({ sessionID: session.id })
@@ -768,7 +773,7 @@ stepZeroPrompt.instance(
               Effect.map((messages) =>
                 messages.some(
                   (message) =>
-                    message.info.role === "user" && message.info.id === thirdID && message.info.time.created === 100,
+                    message.info.role === "user" && message.info.id === thirdID && message.info.time.created === 200,
                 )
                   ? true
                   : undefined,
@@ -778,33 +783,116 @@ stepZeroPrompt.instance(
           "10 seconds",
         )
 
+        const captainID = MessageID.make("msg_b_captain")
+        yield* prompt.prompt({
+          sessionID: session.id,
+          messageID: captainID,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: [{ type: "text", text: "captain typed intervention" }],
+        })
+        yield* pollWithTimeout(
+          sessions
+            .messages({ sessionID: session.id })
+            .pipe(
+              Effect.map((messages) =>
+                messages.some((message) => message.info.role === "user" && message.info.id === captainID)
+                  ? true
+                  : undefined,
+              ),
+            ),
+          "captain message was not admitted during the drain",
+          "10 seconds",
+        )
+
         yield* Effect.sync(() => stepZeroRelease.resolve())
         yield* awaitWithTimeout(llm.wait(3), "first held turn did not start after stop", "10 seconds")
         const firstTurn = (yield* llm.inputs).at(2)
         if (!firstTurn) throw new Error("expected the first held turn request")
-        expect(lastProviderMessage(firstTurn)).toMatchObject({ role: "user" })
-        expect(JSON.stringify(lastProviderMessage(firstTurn))).toContain("first-mail")
+        expect(JSON.stringify(firstTurn.messages)).toContain("first-mail")
+        expect(JSON.stringify(firstTurn.messages)).toContain("captain typed intervention")
         expect(JSON.stringify(firstTurn.messages)).not.toContain("second-mail")
         expect(JSON.stringify(firstTurn.messages)).not.toContain("third-mail")
 
+        const persisted = yield* MessageV2.filterCompactedEffect(session.id)
+        const persistedFirst = persisted.find((message) => message.info.id === firstID)
+        const persistedSecond = persisted.find((message) => message.info.id === secondID)
+        const persistedThird = persisted.find((message) => message.info.id === thirdID)
+        const persistedCaptain = persisted.find((message) => message.info.id === captainID)
+        if (
+          !persistedFirst ||
+          persistedFirst.info.role !== "user" ||
+          !persistedSecond ||
+          persistedSecond.info.role !== "user" ||
+          !persistedThird ||
+          persistedThird.info.role !== "user" ||
+          !persistedCaptain ||
+          persistedCaptain.info.role !== "user"
+        )
+          throw new Error("expected all released and intervening user inputs")
+        expect(persistedFirst.info.time.created).toBeGreaterThan(persistedSecond.info.time.created)
+        expect(persistedFirst.info.time.created).toBeGreaterThan(persistedThird.info.time.created)
+        expect(persistedFirst.info.time.created).toBeGreaterThan(persistedCaptain.info.time.created)
+        expect(MessageV2.latest(persisted).user?.id).toBe(firstID)
+
+        yield* awaitWithTimeout(llm.wait(4), "held tool continuation provider step did not start", "10 seconds")
+        const firstContinuation = (yield* llm.inputs).at(3)
+        if (!firstContinuation) throw new Error("expected the held tool continuation request")
+        expect(JSON.stringify(firstContinuation.messages)).toContain("first-mail")
+        expect(JSON.stringify(firstContinuation.messages)).toContain(toolFile)
+        expect(JSON.stringify(firstContinuation.messages)).not.toContain("second-mail")
+        expect(JSON.stringify(firstContinuation.messages)).not.toContain("third-mail")
+        const firstToolStep = (yield* sessions.messages({ sessionID: session.id })).find(
+          (message) =>
+            message.info.role === "assistant" &&
+            message.info.parentID === firstID &&
+            message.parts.some((part) => part.type === "tool"),
+        )
+        expect(firstToolStep?.info.role).toBe("assistant")
+        if (firstToolStep?.info.role === "assistant") {
+          const tool = completedTool(firstToolStep.parts)
+          expect(tool?.tool).toBe("glob")
+          expect(tool?.state.output).toContain(toolFile)
+        }
+
         yield* Deferred.succeed(firstHeldGate, void 0)
-        yield* awaitWithTimeout(llm.wait(4), "second held turn did not start after the first", "10 seconds")
+        yield* awaitWithTimeout(llm.wait(5), "second held turn did not start after the first", "10 seconds")
         const inputs = yield* llm.inputs
-        expect(inputs).toHaveLength(4)
-        const secondTurn = inputs[3]
+        expect(inputs).toHaveLength(5)
+        const secondTurn = inputs[4]
         if (!secondTurn) throw new Error("expected the second held turn request")
-        expect(lastProviderMessage(secondTurn)).toMatchObject({ role: "user" })
-        expect(JSON.stringify(lastProviderMessage(secondTurn))).toContain("second-mail")
+        expect(JSON.stringify(secondTurn.messages)).toContain("second-mail")
         expect(JSON.stringify(secondTurn.messages)).not.toContain("third-mail")
+        expect(
+          (yield* sessions.messages({ sessionID: session.id })).some(
+            (message) => message.info.role === "assistant" && message.info.parentID === secondID,
+          ),
+        ).toBe(true)
 
         yield* Deferred.succeed(secondHeldGate, void 0)
-        yield* awaitWithTimeout(llm.wait(5), "step-zero held turn did not follow admitted inputs", "10 seconds")
-        const thirdTurn = (yield* llm.inputs).at(4)
+        yield* awaitWithTimeout(llm.wait(6), "step-zero held turn did not follow admitted inputs", "10 seconds")
+        const thirdTurn = (yield* llm.inputs).at(5)
         if (!thirdTurn) throw new Error("expected the step-zero held turn request")
-        expect(lastProviderMessage(thirdTurn)).toMatchObject({ role: "user" })
-        expect(JSON.stringify(lastProviderMessage(thirdTurn))).toContain("third-mail")
+        expect(JSON.stringify(thirdTurn.messages)).toContain("third-mail")
+        expect(
+          (yield* sessions.messages({ sessionID: session.id })).some(
+            (message) => message.info.role === "assistant" && message.info.parentID === thirdID,
+          ),
+        ).toBe(true)
 
         yield* Deferred.succeed(thirdHeldGate, void 0)
+        yield* awaitWithTimeout(
+          llm.wait(7),
+          "captain message admitted during the drain did not get a turn",
+          "10 seconds",
+        )
+        const captainTurn = (yield* llm.inputs).at(6)
+        if (!captainTurn) throw new Error("expected the captain's provider request")
+        expect(lastProviderMessage(captainTurn)).toMatchObject({ role: "user" })
+        expect(JSON.stringify(lastProviderMessage(captainTurn))).toContain("captain typed intervention")
+
+        yield* Deferred.succeed(captainGate, void 0)
         const runExit = yield* awaitWithTimeout(Fiber.await(run), "session run did not finish", "10 seconds")
         const firstExit = yield* awaitWithTimeout(
           Fiber.await(first),
@@ -822,10 +910,17 @@ stepZeroPrompt.instance(
 
         const delivered = (yield* sessions.messages({ sessionID: session.id })).filter(
           (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
-            message.info.role === "assistant" && [firstID, secondID, thirdID].includes(message.info.parentID),
+            message.info.role === "assistant" &&
+            [firstID, secondID, thirdID, captainID].includes(message.info.parentID),
         )
-        expect(delivered.map((message) => message.info.parentID)).toEqual([firstID, secondID, thirdID])
-        expect(yield* llm.calls).toBe(5)
+        expect(delivered.map((message) => message.info.parentID)).toEqual([
+          firstID,
+          firstID,
+          secondID,
+          thirdID,
+          captainID,
+        ])
+        expect(yield* llm.calls).toBe(7)
       }).pipe(
         Effect.ensuring(
           Effect.all(
@@ -860,12 +955,14 @@ it.instance(
       const toolGate = yield* Deferred.make<void>()
       const stopGate = yield* Deferred.make<void>()
       const heldGate = yield* Deferred.make<void>()
+      const captainGate = yield* Deferred.make<void>()
 
       yield* Effect.gen(function* () {
         yield* llm.push(
           reply().wait(deferredAsPromise(toolGate)).tool("first", { value: "continue" }).item(),
           reply().wait(deferredAsPromise(stopGate)).text("captain intervention handled").stop().item(),
           reply().wait(deferredAsPromise(heldGate)).text("held machine message handled").stop().item(),
+          reply().wait(deferredAsPromise(captainGate)).text("captain message handled").stop().item(),
         )
         yield* prompt.prompt({
           sessionID: session.id,
@@ -970,10 +1067,21 @@ it.instance(
         yield* awaitWithTimeout(llm.wait(3), "held prompt did not start after current turn stopped", "10 seconds")
         const heldTurn = (yield* llm.inputs).at(2)
         if (!heldTurn) throw new Error("expected the held provider request")
-        expect(lastProviderMessage(heldTurn)).toMatchObject({ role: "user" })
-        expect(JSON.stringify(lastProviderMessage(heldTurn))).toContain("queued-mail")
+        expect(JSON.stringify(heldTurn.messages)).toContain("queued-mail")
+        expect(
+          (yield* sessions.messages({ sessionID: session.id })).some(
+            (message) => message.info.role === "assistant" && message.info.parentID === heldID,
+          ),
+        ).toBe(true)
 
         yield* Deferred.succeed(heldGate, void 0)
+        yield* awaitWithTimeout(llm.wait(4), "unmarked captain message was not answered during the drain", "10 seconds")
+        const captainTurn = (yield* llm.inputs).at(3)
+        if (!captainTurn) throw new Error("expected the captain's provider request")
+        expect(lastProviderMessage(captainTurn)).toMatchObject({ role: "user" })
+        expect(JSON.stringify(lastProviderMessage(captainTurn))).toContain("captain typed intervention")
+
+        yield* Deferred.succeed(captainGate, void 0)
         const runExit = yield* awaitWithTimeout(Fiber.await(run), "session run did not finish", "10 seconds")
         const captainExit = yield* awaitWithTimeout(
           Fiber.await(captain),
@@ -995,12 +1103,14 @@ it.instance(
           (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
             message.info.role === "assistant",
         )
-        expect(response?.info.role === "assistant" ? response.info.parentID : undefined).toBe(heldID)
-        expect(yield* llm.calls).toBe(3)
+        expect(response?.info.role === "assistant" ? response.info.parentID : undefined).toBe(captainID)
+        expect(yield* llm.calls).toBe(4)
       }).pipe(
         Effect.ensuring(
           Effect.all(
-            [toolGate, stopGate, heldGate].map((gate) => Deferred.succeed(gate, void 0).pipe(Effect.ignore)),
+            [toolGate, stopGate, heldGate, captainGate].map((gate) =>
+              Deferred.succeed(gate, void 0).pipe(Effect.ignore),
+            ),
             { discard: true },
           ),
         ),
@@ -2095,6 +2205,54 @@ it.instance(
       const exit = yield* awaitWithTimeout(Fiber.await(run), "interrupted session run did not finish", "10 seconds")
       expect(Exit.isSuccess(exit)).toBe(true)
       expect(yield* llm.calls).toBe(2)
+    }),
+  60_000,
+)
+
+it.instance(
+  "cancels a held provider request while the drain is active",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const heldResponse = yield* Deferred.make<void>()
+
+      yield* Effect.gen(function* () {
+        yield* llm.push(
+          reply().text("task finished").stop().item(),
+          reply().wait(deferredAsPromise(heldResponse)).text("held response").stop().item(),
+        )
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: [{ type: "text", text: "original task" }],
+        })
+        const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+        yield* awaitWithTimeout(llm.wait(1), "provider did not receive the original task", "10 seconds")
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: [{ type: "text", text: "[fm-from-firstmate]\x1f held while draining" }],
+        })
+        yield* awaitWithTimeout(llm.wait(2), "held provider request did not start", "10 seconds")
+
+        const cancellation = yield* prompt.cancel(chat.id).pipe(Effect.forkChild)
+        const cancelExit = yield* awaitWithTimeout(
+          Fiber.await(cancellation),
+          "cancel stayed blocked on the held provider request",
+          "2 seconds",
+        )
+        expect(Exit.isSuccess(cancelExit)).toBe(true)
+        const runExit = yield* awaitWithTimeout(Fiber.await(run), "cancelled drain did not finish", "2 seconds")
+        expect(Exit.isSuccess(runExit)).toBe(true)
+        expect(yield* llm.calls).toBe(2)
+      }).pipe(Effect.ensuring(Deferred.succeed(heldResponse, void 0).pipe(Effect.ignore)))
     }),
   60_000,
 )

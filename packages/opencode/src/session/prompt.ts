@@ -127,10 +127,12 @@ const layer = Layer.effect(
     const config = yield* Config.Service
     let admissionSequence = 0
     const messageAdmissionOrder = new Map<MessageID, number>()
+    const promptedInputIDs = new Set<MessageID>()
     const pendingAdmissions = new Map<
       MessageID,
       { sessionID: SessionID; order: number; ready: Deferred.Deferred<void> }
     >()
+    const heldDrains = new Map<SessionID, { cancel: Deferred.Deferred<void>; draining: boolean }>()
     const permission = yield* Permission.Service
     const fsys = yield* FSUtil.Service
     const mcp = yield* MCP.Service
@@ -160,6 +162,9 @@ const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
+      const drain = heldDrains.get(sessionID)
+      // A cancel that ends the original task must not cancel the held turns scheduled afterward.
+      if (drain?.draining) yield* Deferred.succeed(drain.cancel, void 0).pipe(Effect.ignore)
       yield* state.cancel(sessionID)
     })
 
@@ -1091,6 +1096,8 @@ const layer = Layer.effect(
       "SessionPrompt.prompt",
     )(function* (input: PromptInput) {
       const messageID = input.messageID ?? MessageID.ascending()
+      const previouslyPrompted = promptedInputIDs.has(messageID)
+      promptedInputIDs.add(messageID)
       const existingOrder = messageAdmissionOrder.get(messageID)
       const order = existingOrder ?? ++admissionSequence
       if (existingOrder === undefined) messageAdmissionOrder.set(messageID, order)
@@ -1120,7 +1127,10 @@ const layer = Layer.effect(
         Effect.onExit((exit) =>
           Effect.gen(function* () {
             if (!ready || !pendingAdmissions.has(messageID)) return
-            if (Exit.isFailure(exit)) messageAdmissionOrder.delete(messageID)
+            if (Exit.isFailure(exit)) {
+              messageAdmissionOrder.delete(messageID)
+              if (!previouslyPrompted) promptedInputIDs.delete(messageID)
+            }
             yield* releaseAdmission(messageID, ready)
           }),
         ),
@@ -1142,12 +1152,16 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         let turnRoot: SessionV1.User | undefined
+        let initialTurnRootID: MessageID | undefined
         let held: UserWithParts[] = []
         let activeHeldTurn: UserWithParts | undefined
         let titleStarted = false
         const heldIDs = new Set<MessageID>()
+        const heldReleasePending = new Set<MessageID>()
         const completedInputIDs = new Set<MessageID>()
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+        const drainControl = { cancel: yield* Deferred.make<void>(), draining: false }
+        heldDrains.set(sessionID, drainControl)
 
         const loadMessages = () =>
           MessageV2.filterCompactedEffect(sessionID).pipe(Effect.provideService(Database.Service, database))
@@ -1156,8 +1170,10 @@ const layer = Layer.effect(
           if (turnRoot) return
           turnRoot = MessageV2.latest(msgs, { userOrder: (id) => messageAdmissionOrder.get(id) }).user
           if (!turnRoot) return
+          initialTurnRootID = turnRoot.id
           msgs.forEach((msg) => {
-            if (msg.info.role === "user" && msg.info.id !== turnRoot?.id) completedInputIDs.add(msg.info.id)
+            if (msg.info.role === "user" && msg.info.id !== turnRoot?.id && !promptedInputIDs.has(msg.info.id))
+              completedInputIDs.add(msg.info.id)
           })
         }
 
@@ -1193,11 +1209,20 @@ const layer = Layer.effect(
           return [...history, root, ...current.filter((msg) => msg.info.id !== root.info.id)]
         }
 
-        const completeTurn = (msgs: SessionV1.WithParts[]) => {
+        const markAnsweredInputs = (msgs: SessionV1.WithParts[]) => {
           msgs.forEach((msg) => {
-            if (msg.info.role === "user" && !heldIDs.has(msg.info.id)) completedInputIDs.add(msg.info.id)
+            if (
+              msg.info.role !== "assistant" ||
+              !msg.info.finish ||
+              ["tool-calls", "unknown"].includes(msg.info.finish)
+            )
+              return
+            const hasToolCalls = msg.parts.some(
+              (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
+            )
+            if (!hasToolCalls) completedInputIDs.add(msg.info.parentID)
           })
-          activeHeldTurn = undefined
+          if (activeHeldTurn && completedInputIDs.has(activeHeldTurn.info.id)) activeHeldTurn = undefined
         }
 
         const waitForEarlierAdmissions = Effect.fnUntraced(function* () {
@@ -1212,6 +1237,37 @@ const layer = Layer.effect(
           )
         })
 
+        const releaseHeldInput = Effect.fnUntraced(function* (message: UserWithParts) {
+          while (true) {
+            const pending = Array.from(pendingAdmissions.values()).filter(
+              (admission) => admission.sessionID === sessionID,
+            )
+            if (pending.length > 0) {
+              yield* Effect.forEach(pending, (admission) => Deferred.await(admission.ready), {
+                concurrency: "unbounded",
+                discard: true,
+              })
+              continue
+            }
+
+            const msgs = yield* loadMessages()
+            if (Array.from(pendingAdmissions.values()).some((admission) => admission.sessionID === sessionID)) continue
+            collectHeld(msgs)
+
+            // Persist release order for later history reloads without this process's admission sequence.
+            const info = {
+              ...message.info,
+              time: {
+                ...message.info.time,
+                created: Math.max(Date.now(), ...msgs.map((msg) => msg.info.time.created)) + 1,
+              },
+            }
+            messageAdmissionOrder.set(info.id, ++admissionSequence)
+            yield* sessions.updateMessage(info).pipe(Effect.orDie)
+            return { ...message, info }
+          }
+        })
+
         const runSteps = Effect.gen(function* () {
           while (true) {
             yield* status.set(sessionID, { type: "busy" })
@@ -1222,6 +1278,13 @@ const layer = Layer.effect(
             initializeTurn(msgs)
             if (!turnRoot) throw new Error("No user message found in stream. This should never happen.")
             collectHeld(msgs)
+            if (activeHeldTurn && heldReleasePending.has(activeHeldTurn.info.id)) {
+              activeHeldTurn = yield* releaseHeldInput(activeHeldTurn)
+              heldReleasePending.delete(activeHeldTurn.info.id)
+              turnRoot = activeHeldTurn.info
+              msgs = yield* loadMessages()
+              collectHeld(msgs)
+            }
 
             msgs = msgs.filter((msg) => !heldIDs.has(msg.info.id))
             msgs = projectTurn(msgs)
@@ -1487,34 +1550,71 @@ const layer = Layer.effect(
               initializeTurn(msgs)
               if (!turnRoot) break
             }
+            if (initialTurnRootID) completedInputIDs.add(initialTurnRootID)
+            markAnsweredInputs(msgs)
             collectHeld(msgs)
-            completeTurn(msgs)
-            if (held.length === 0) break
+            if (activeHeldTurn) {
+              const answeredBefore = completedInputIDs.size
+              const exit = yield* Effect.exit(runSteps)
+              if (Exit.isFailure(exit)) failure ??= exit.cause
+              markAnsweredInputs(yield* loadMessages())
+              if (activeHeldTurn && completedInputIDs.size === answeredBefore) break
+              if (activeHeldTurn) {
+                step = 0
+                structured = undefined
+              }
+              continue
+            }
 
-            yield* waitForEarlierAdmissions()
-            const nextMessages = yield* loadMessages()
-            collectHeld(nextMessages)
-            completeTurn(nextMessages)
-            if (held.length === 0) continue
+            if (held.length > 0) {
+              yield* waitForEarlierAdmissions()
+              const nextMessages = yield* loadMessages()
+              markAnsweredInputs(nextMessages)
+              collectHeld(nextMessages)
+              if (held.length === 0) continue
 
-            const next = held.shift()
-            if (!next) continue
-            heldIDs.delete(next.info.id)
-            completedInputIDs.delete(next.info.id)
-            turnRoot = next.info
-            activeHeldTurn = next
+              const next = held.shift()
+              if (!next) continue
+              heldIDs.delete(next.info.id)
+              completedInputIDs.delete(next.info.id)
+              turnRoot = next.info
+              activeHeldTurn = next
+              heldReleasePending.add(next.info.id)
+              step = 0
+              structured = undefined
+              continue
+            }
+
+            const direct = msgs
+              .filter(
+                (msg): msg is UserWithParts =>
+                  msg.info.role === "user" &&
+                  !heldIDs.has(msg.info.id) &&
+                  !completedInputIDs.has(msg.info.id) &&
+                  msg.info.id !== turnRoot?.id &&
+                  promptedInputIDs.has(msg.info.id),
+              )
+              .sort((a, b) => admissionOrderOf(b.info.id) - admissionOrderOf(a.info.id))[0]
+            if (!direct) break
+            turnRoot = direct.info
+            activeHeldTurn = direct
             step = 0
             structured = undefined
-
-            const exit = yield* Effect.exit(runSteps)
-            if (Exit.isFailure(exit)) failure ??= exit.cause
           }
 
-          for (const messageID of completedInputIDs) messageAdmissionOrder.delete(messageID)
+          for (const messageID of completedInputIDs) {
+            messageAdmissionOrder.delete(messageID)
+            promptedInputIDs.delete(messageID)
+          }
           if (failure) return yield* Effect.failCause(failure)
         })
 
-        return yield* runSteps.pipe(Effect.ensuring(drainHeld))
+        const superviseDrain = Effect.gen(function* () {
+          drainControl.draining = true
+          return yield* Effect.raceFirst(drainHeld.pipe(Effect.interruptible), Deferred.await(drainControl.cancel))
+        }).pipe(Effect.ensuring(Effect.sync(() => heldDrains.delete(sessionID))))
+
+        return yield* runSteps.pipe(Effect.ensuring(superviseDrain))
       },
     )
 
