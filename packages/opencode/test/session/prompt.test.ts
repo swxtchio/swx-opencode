@@ -450,6 +450,27 @@ function blockingChatMessagePlugin() {
 const admissionPlugin = blockingChatMessagePlugin()
 const admissionPrompt = testEffect(makeHttp({ plugin: admissionPlugin.layer }))
 
+function failingChatTransformPlugin() {
+  let failNext = false
+  const layer = Layer.succeed(
+    Plugin.Service,
+    Plugin.Service.of({
+      init: () => Effect.void,
+      list: () => Effect.succeed([]),
+      trigger: (name, _input, output) =>
+        Effect.gen(function* () {
+          if (name !== "experimental.chat.messages.transform" || !failNext) return output
+          failNext = false
+          return yield* Effect.die(new Error("prompt preparation failed before provider start"))
+        }),
+    } satisfies Plugin.Interface),
+  )
+  return { layer, fail: () => (failNext = true) }
+}
+
+const preProviderFailurePlugin = failingChatTransformPlugin()
+const preProviderFailurePrompt = testEffect(makeHttp({ plugin: preProviderFailurePlugin.layer }))
+
 function busyStatusGate() {
   const entered = defer<void>()
   const release = defer<void>()
@@ -949,6 +970,47 @@ it.instance("persists prompt claims while the provider request is in flight", ()
       yield* awaitWithTimeout(Fiber.await(run), "provider request did not finish", "10 seconds")
       expect(yield* llm.calls).toBe(1)
     }).pipe(Effect.ensuring(Deferred.succeed(response, void 0).pipe(Effect.ignore)))
+  }),
+)
+
+preProviderFailurePrompt.instance("keeps admitted input unclaimed after preparation fails before provider start", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Retry before provider start" })
+    const messageID = MessageID.make("msg_retry_before_provider_start")
+
+    preProviderFailurePlugin.fail()
+    const failed = yield* prompt
+      .prompt({
+        sessionID: session.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "retry this admitted input" }],
+      })
+      .pipe(Effect.forkChild)
+    const failedExit = yield* awaitWithTimeout(
+      Fiber.await(failed),
+      "pre-provider prompt failure did not finish",
+      "10 seconds",
+    )
+    expect(Exit.isFailure(failedExit)).toBe(true)
+    expect((yield* MessageV2.admission(session.id)).claimed.has(messageID)).toBe(false)
+    expect(yield* llm.calls).toBe(0)
+
+    yield* llm.text("retried input handled")
+    const retry = yield* prompt.loop({ sessionID: session.id, messageID }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "unclaimed input did not reach its provider retry", "10 seconds")
+    const request = (yield* llm.inputs)[0]
+    if (!request) throw new Error("expected the retry provider request")
+    expect(lastUserContent(request)).toContain("retry this admitted input")
+    expect((yield* MessageV2.admission(session.id)).claimed.has(messageID)).toBe(true)
+    expect(
+      Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(retry), "provider retry did not finish", "10 seconds")),
+    ).toBe(true)
+    expect(yield* llm.calls).toBe(1)
   }),
 )
 
@@ -4087,6 +4149,67 @@ unixNoLLMServer(
     }),
   { git: true, config: cfg },
   30_000,
+)
+
+unix(
+  "rootless loop queued behind shell selects the latest persisted input",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        const { directory: dir } = yield* TestInstance
+        const { llm } = yield* useServerConfig(providerCfg)
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const session = yield* sessions.create({ title: "Rootless loop behind shell" })
+        const releaseFile = path.join(dir, ".rootless-shell-release")
+        yield* Effect.addFinalizer(() => writeText(releaseFile, "release").pipe(Effect.ignore))
+        const root = yield* seedUser({
+          sessionID: session.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "older rootless input" }],
+        })
+        if (root.info.role !== "user") throw new Error("expected the older user message")
+
+        const shell = yield* prompt
+          .shell({
+            sessionID: session.id,
+            agent: "build",
+            command: `while [ ! -f "${releaseFile}" ]; do sleep 0.01; done`,
+          })
+          .pipe(Effect.forkChild)
+        yield* waitForBusy(session.id)
+        const loop = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+        yield* Effect.yieldNow
+        const latest = yield* seedUser({
+          sessionID: session.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "latest persisted rootless input" }],
+        })
+        if (latest.info.role !== "user") throw new Error("expected the latest user message")
+        yield* llm.text("latest rootless input handled")
+        yield* writeText(releaseFile, "release")
+
+        yield* awaitWithTimeout(llm.wait(1), "queued rootless loop did not reach the provider", "10 seconds")
+        const request = (yield* llm.inputs)[0]
+        if (!request) throw new Error("expected the queued rootless provider request")
+        expect(lastUserContent(request)).toContain("latest persisted rootless input")
+
+        const loopExit = yield* awaitWithTimeout(Fiber.await(loop), "queued rootless loop did not finish", "10 seconds")
+        expect(Exit.isSuccess(loopExit)).toBe(true)
+        const shellExit = yield* awaitWithTimeout(Fiber.await(shell), "shell did not finish", "10 seconds")
+        expect(Exit.isSuccess(shellExit)).toBe(true)
+        expect(
+          (yield* sessions.messages({ sessionID: session.id })).some(
+            (message) => message.info.role === "assistant" && message.info.parentID === latest.info.id,
+          ),
+        ).toBe(true)
+        expect(yield* llm.calls).toBe(1)
+      })
+    ),
+  { git: true, config: cfg },
+  60_000,
 )
 
 unix(

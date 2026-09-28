@@ -46,6 +46,7 @@ import { Cause, Deferred, Effect, Exit, Latch, Layer, Option, Scope, Context, Sc
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
+import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
@@ -129,6 +130,7 @@ const layer = Layer.effect(
     const pendingAdmissions = new Map<MessageID, { sessionID: SessionID; ready: Deferred.Deferred<void> }>()
     const pendingNoReplyInputIDs = new Map<SessionID, Set<MessageID>>()
     const runControls = new Map<SessionID, { cancel: Deferred.Deferred<void>; claimed: Set<MessageID> }>()
+    const admissionLock = KeyedMutex.makeUnsafe<SessionID>()
     const permission = yield* Permission.Service
     const fsys = yield* FSUtil.Service
     const mcp = yield* MCP.Service
@@ -1070,8 +1072,12 @@ const layer = Layer.effect(
         })
       }
 
-      yield* sessions.updateMessage(info)
-      for (const part of parts) yield* sessions.updatePart(part)
+      yield* admissionLock.withLock(input.sessionID)(
+        Effect.gen(function* () {
+          yield* sessions.updateMessage(info)
+          for (const part of parts) yield* sessions.updatePart(part)
+        }),
+      )
 
       return { info, parts }
     }, Effect.scoped)
@@ -1149,18 +1155,23 @@ const layer = Layer.effect(
       runControl: { cancel: Deferred.Deferred<void>; claimed: Set<MessageID> },
     ) {
       return yield* Effect.gen(function* () {
-        yield* Effect.sync(() => runControls.set(sessionID, runControl))
-        const runRootMessageID =
-          rootMessageID ??
-          (yield* Effect.gen(function* () {
-            const messages = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-              Effect.provideService(Database.Service, database),
-            )
-            const admitted = yield* MessageV2.admission(sessionID).pipe(
-              Effect.provideService(Database.Service, database),
-            )
-            return MessageV2.latest(messages, { userOrder: (id) => admitted.order.get(id) }).user?.id
-          }))
+        const runRootMessageID = yield* admissionLock.withLock(sessionID)(
+          Effect.gen(function* () {
+            const root =
+              rootMessageID ??
+              (yield* Effect.gen(function* () {
+                const messages = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+                  Effect.provideService(Database.Service, database),
+                )
+                const admitted = yield* MessageV2.admission(sessionID).pipe(
+                  Effect.provideService(Database.Service, database),
+                )
+                return MessageV2.latest(messages, { userOrder: (id) => admitted.order.get(id) }).user?.id
+              }))
+            yield* Effect.sync(() => runControls.set(sessionID, runControl))
+            return root
+          }),
+        )
         const ctx = yield* InstanceState.context
         const markerConfig = (yield* config.get()).machine_message_markers
         let structured: unknown
@@ -1472,9 +1483,11 @@ const layer = Layer.effect(
             sessionID,
           }
           const claims = msgs.flatMap((item) =>
-            item.info.role === "user" && promptedInputIDs.has(item.info.id) ? [item.info.id] : [],
+            item.info.role === "user" && item.info.noReply !== true && !claimedInputIDs.has(item.info.id)
+              ? [item.info.id]
+              : [],
           )
-          yield* sessions.updateMessage(msg, { claims })
+          yield* sessions.updateMessage(msg)
 
           const finalizeInterruptedAssistant = Effect.gen(function* () {
             if (msg.time.completed) return
@@ -1491,6 +1504,7 @@ const layer = Layer.effect(
               assistantMessage: msg,
               sessionID,
               model,
+              onProviderStart: claims.length > 0 ? sessions.updateMessage(msg, { claims }) : Effect.void,
             })
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
