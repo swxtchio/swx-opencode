@@ -2115,8 +2115,10 @@ it.instance(
       yield* queued(chat.id, 1)
       yield* Deferred.succeed(gate, void 0)
 
-      const [result] = yield* finish(structured, held)
+      const [result, queuedReply] = yield* finish(structured, held)
       expect(result?.info.role === "assistant" ? result.info.structured : undefined).toEqual({ answer: "42" })
+      expect(queuedReply?.info.role).toBe("assistant")
+      expect(queuedReply?.parts.some((part) => part.type === "text" && part.text === "queued done")).toBe(true)
       yield* awaitWithTimeout(llm.wait(2), "queued prompt never ran after the structured result", "10 seconds")
       expect(lastUser((yield* llm.inputs)[1])).toEqual({ role: "user", content: "queued after it" })
       // One drain carries the queued turn: the session never goes idle between them.
@@ -2363,7 +2365,57 @@ gated.instance(
 )
 
 it.instance(
-  "two steers promoted into one run each get that run's reply, never their own message",
+  "a tool-step turn steered by later prompts: its caller and the steers share the turn's final reply, and each queued caller gets its own turn's",
+  () =>
+    Effect.gen(function* () {
+      const { llm, sessions, chat, task, send, release } = yield* startHeld({ tool: true })
+      yield* llm.text("steer answer")
+      yield* llm.text("queued answer")
+      yield* llm.text("last answer")
+
+      const held = yield* send("queued behind the turn", { delivery: "queue" })
+      yield* admitted(chat.id, "queued behind the turn")
+      const last = yield* send("queued last", { delivery: "queue" })
+      yield* admitted(chat.id, "queued last")
+      const first = yield* send("first steer")
+      yield* admitted(chat.id, "first steer")
+      const second = yield* send("second steer")
+      yield* admitted(chat.id, "second steer")
+      yield* release
+      const [original, firstReply, secondReply, queuedReply, lastReply] = yield* finish(task, first, second, held, last)
+
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(4)
+      expect(lastUser(inputs[1])).toEqual({ role: "user", content: "second steer" })
+      expect(lastUser(inputs[2])).toEqual({ role: "user", content: "queued behind the turn" })
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const asked = (text: string) =>
+        messages.find(
+          (msg) => msg.info.role === "user" && msg.parts.some((part) => part.type === "text" && part.text === text),
+        )?.info.id
+      const texts = (reply: SessionV1.WithParts | undefined) =>
+        reply?.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))
+      // The task's caller does not stop at its tool-call step: the turn it began
+      // ends with the reply to the steers, which it shares with them.
+      for (const reply of [original, firstReply, secondReply]) {
+        expect(reply?.info.role === "assistant" ? [reply.info.finish, reply.info.parentID] : undefined).toEqual([
+          "stop",
+          asked("second steer"),
+        ])
+        expect(texts(reply)).toEqual(["steer answer"])
+      }
+      expect(queuedReply?.info.role === "assistant" ? queuedReply.info.parentID : undefined).toBe(
+        asked("queued behind the turn"),
+      )
+      // The drain's final message answers the last queued caller, not this one.
+      expect(texts(queuedReply)).toEqual(["queued answer"])
+      expect(texts(lastReply)).toEqual(["last answer"])
+    }),
+  15_000,
+)
+
+it.instance(
+  "two steers promoted into one run get an assistant reply, never their own user message",
   () =>
     Effect.gen(function* () {
       const { llm, chat, task, send, release } = yield* startHeld()
@@ -2547,51 +2599,57 @@ it.instance(
   15_000,
 )
 
-it.instance("a queued first prompt on a new idle session runs in the first provider call", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
-    yield* llm.text("ran at once")
+it.instance(
+  "a queued first prompt on a new idle session runs in the first provider call",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.text("ran at once")
 
-    const result = yield* prompt.prompt({
-      sessionID: chat.id,
-      agent: "build",
-      model: ref,
-      delivery: "queue",
-      parts: said("queued on an idle session"),
-    })
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        delivery: "queue",
+        parts: said("queued on an idle session"),
+      })
 
-    expect(result.info.role).toBe("assistant")
-    expect(yield* llm.calls).toBe(1)
-    expect(lastUser((yield* llm.inputs)[0])).toEqual({ role: "user", content: "queued on an idle session" })
-  }),
+      expect(result.info.role).toBe("assistant")
+      expect(yield* llm.calls).toBe(1)
+      expect(lastUser((yield* llm.inputs)[0])).toEqual({ role: "user", content: "queued on an idle session" })
+    }),
+  15_000,
 )
 
-it.instance("noReply writes its message directly and starts no drain", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const queue = yield* SessionQueue.Service
-    const run = yield* SessionRunState.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
+it.instance(
+  "noReply writes its message directly and starts no drain",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const run = yield* SessionRunState.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
 
-    const message = yield* prompt.prompt({
-      sessionID: chat.id,
-      agent: "build",
-      model: ref,
-      noReply: true,
-      parts: said("context only"),
-    })
+      const message = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: said("context only"),
+      })
 
-    expect(message.info.role).toBe("user")
-    expect((yield* sessions.messages({ sessionID: chat.id })).map((msg) => msg.info.id)).toEqual([message.info.id])
-    expect(yield* queue.list(chat.id)).toEqual([])
-    yield* run.assertNotBusy(chat.id)
-    expect(yield* llm.calls).toBe(0)
-  }),
+      expect(message.info.role).toBe("user")
+      expect((yield* sessions.messages({ sessionID: chat.id })).map((msg) => msg.info.id)).toEqual([message.info.id])
+      expect(yield* queue.list(chat.id)).toEqual([])
+      yield* run.assertNotBusy(chat.id)
+      expect(yield* llm.calls).toBe(0)
+    }),
+  15_000,
 )
 
 it.instance(

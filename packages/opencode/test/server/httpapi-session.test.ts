@@ -1389,6 +1389,91 @@ describe("session HttpApi", () => {
   )
 
   it.live(
+    "a withdrawn prompt_async prompt ends without a session error",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        yield* llm.text("marker done")
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue async withdraw" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const model = { providerID: "test", modelID: "test-model" }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+
+        const events = yield* request(`${EventPaths.event}?directory=${encodeURIComponent(directory)}`)
+        const seen: { type: string; sessionID?: string }[] = []
+        const idles = yield* Queue.unbounded<void>()
+        let buffered = ""
+        yield* events.stream.pipe(
+          Stream.decodeText,
+          Stream.runForEach((chunk) =>
+            Effect.gen(function* () {
+              buffered += chunk
+              while (buffered.includes("\n\n")) {
+                const end = buffered.indexOf("\n\n")
+                const data = buffered
+                  .slice(0, end)
+                  .split("\n")
+                  .filter((line) => line.startsWith("data: "))
+                  .map((line) => line.slice("data: ".length))
+                  .join("\n")
+                buffered = buffered.slice(end + 2)
+                if (!data) continue
+                const event = JSON.parse(data) as { type: string; properties?: { sessionID?: string } }
+                if (event.properties?.sessionID !== session.id) continue
+                seen.push({ type: event.type, sessionID: event.properties.sessionID })
+                if (event.type === "session.idle") yield* Queue.offer(idles, undefined)
+              }
+            }),
+          ),
+          Effect.forkScoped,
+        )
+        const idle = awaitWithTimeout(Queue.take(idles), "session never went idle", "10 seconds")
+
+        yield* post(SessionPaths.promptAsync, { agent: "build", model, parts: [{ type: "text", text: "start" }] })
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        expect(
+          (yield* post(SessionPaths.promptAsync, {
+            agent: "build",
+            model,
+            delivery: "queue",
+            parts: [{ type: "text", text: "withdrawn async" }],
+          })).status,
+        ).toBe(204)
+        const [held] = yield* pollWithTimeout(
+          requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }).pipe(
+            Effect.map((items) => (items.length === 1 ? items : undefined)),
+          ),
+          "prompt never queued",
+        )
+        expect(
+          (yield* request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID: held!.id }), {
+            method: "DELETE",
+            headers,
+          })).status,
+        ).toBe(200)
+        yield* Deferred.succeed(gate, void 0)
+        yield* idle
+        // A later run on the session bounds the window in which the withdrawn
+        // prompt's caller could still report an error.
+        yield* post(SessionPaths.promptAsync, { agent: "build", model, parts: [{ type: "text", text: "marker" }] })
+        yield* idle
+        expect(yield* llm.calls).toBe(2)
+        expect(seen.filter((event) => event.type === "session.error")).toEqual([])
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, void 0)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
     "restore and send now wake an idle session whose prompts an abort parked",
     () =>
       Effect.gen(function* () {
