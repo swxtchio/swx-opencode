@@ -1,3 +1,13 @@
+/**
+ * Snapshot maintenance separates box admission from user tracking so a queued cleanup does not hold a repo lock.
+ *
+ * | Path | Locks in order | Wait | Contention | Infrastructure failure | Work failure |
+ * | --- | --- | --- | --- | --- | --- |
+ * | `Snapshot.track` (user-facing) | per-repo only; never `gc.lock` | bounded | quiet skip with an in-memory counter; caller succeeds | loud log and skip | surface to caller |
+ * | `Snapshot.cleanup` admission | `gc.lock` | blocking | wait, then recheck eligibility | loud log and abort the pass | surface per repo |
+ * | cleanup per-repo gc section | `gc.lock` → per-repo | short | skip this repo this pass | loud log and skip repo | log and continue other repos |
+ * | reap | `gc.lock` → per-repo | short | skip | loud log and skip | log and continue other repos |
+ */
 import { AppProcess } from "@opencode-ai/core/process"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -14,7 +24,12 @@ export interface RunInput {
 export type LockRole = "box" | "repo" | "local"
 
 export type LockRequest =
-  | { readonly role: "box" | "repo"; readonly file: string; readonly waitMillis?: number }
+  | {
+      readonly role: "box" | "repo"
+      readonly file: string
+      readonly waitMillis?: number
+      readonly blocking?: boolean
+    }
   | { readonly role: "local"; readonly semaphore: Semaphore.Semaphore }
 
 export type LockAttempt<A> =
@@ -54,7 +69,7 @@ const layer: Layer.Layer<MaintenanceService, never, FSUtil.Service | AppProcess.
         Effect.mapError((cause) => (cause instanceof Error ? cause : new Error(String(cause)))),
         Effect.andThen(
           Effect.tryPromise({
-            try: (signal) => acquire(request.file, signal, true),
+            try: (signal) => acquire(request.file, signal, !request.blocking),
             catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
           }).pipe(
             Effect.map((attempt) =>
@@ -64,8 +79,7 @@ const layer: Layer.Layer<MaintenanceService, never, FSUtil.Service | AppProcess.
         ),
       )
 
-    const withLocks: MaintenanceInterface["withLocks"] = (locks, self) =>
-      withSnapshotLocks(locks, self, acquireFile)
+    const withLocks: MaintenanceInterface["withLocks"] = (locks, self) => withSnapshotLocks(locks, self, acquireFile)
 
     const run: MaintenanceInterface["run"] = (input) =>
       appProcess.run(ChildProcess.make(input.command, input.args, { cwd: input.cwd })).pipe(
@@ -96,9 +110,12 @@ export function assertLockOrder(locks: readonly LockRequest[]) {
   const order: readonly LockRole[] = ["box", "repo", "local"]
   let previous = -1
   let hasRepo = false
-  for (const request of locks) {
+  for (const [index, request] of locks.entries()) {
     const current = order.indexOf(request.role)
     if (current < previous) throw new Error("snapshot locks must be acquired in box, repo, local order")
+    const blocking = "blocking" in request && request.blocking
+    if (request.role !== "box" && blocking) throw new Error("only gc admission may wait on a file lock")
+    if (blocking && index !== 0) throw new Error("blocking gc admission must be acquired first")
     if (request.role === "repo") hasRepo = true
     if (request.role === "local" && !hasRepo) throw new Error("snapshot local locks require a repo lock first")
     previous = current
@@ -110,55 +127,72 @@ export function withSnapshotLocks<A, E, R>(
   self: Effect.Effect<A, E, R>,
   acquireFile: (request: Extract<LockRequest, { role: "box" | "repo" }>) => Effect.Effect<FileLockAttempt, Error>,
 ): Effect.Effect<LockAttempt<A>, E, R> {
-  const files = locks.filter((request): request is Extract<LockRequest, { role: "box" | "repo" }> => request.role !== "local")
+  const files = locks.filter(
+    (request): request is Extract<LockRequest, { role: "box" | "repo" }> => request.role !== "local",
+  )
   const locals = locks.filter((request): request is Extract<LockRequest, { role: "local" }> => request.role === "local")
-  const acquireAll = Effect.gen(function* () {
-    const handles: { readonly request: Extract<LockRequest, { role: "box" | "repo" }>; readonly lease: LockLease }[] = []
-    for (const request of files) {
-      const startedAt = request.waitMillis === undefined ? undefined : yield* Clock.currentTimeNanos
-      while (true) {
-        const attempt = yield* acquireFile(request).pipe(
-          Effect.map((value) => ({ status: "result" as const, value })),
-          Effect.catch((cause) => Effect.succeed({ status: "failure" as const, cause })),
-        )
-        if (attempt.status === "failure") {
-          return { status: "unavailable" as const, handles, request, cause: attempt.cause }
-        }
-        if (attempt.value.status === "acquired") {
-          handles.push({ request, lease: attempt.value.lease })
-          break
-        }
-        if (startedAt === undefined) return { status: "contended" as const, handles }
-        const remaining = BigInt(request.waitMillis!) * 1_000_000n - ((yield* Clock.currentTimeNanos) - startedAt)
-        if (remaining <= 0n) return { status: "contended" as const, handles }
-        yield* Effect.sleep(Duration.nanos(remaining < 10_000_000n ? remaining : 10_000_000n))
-      }
-    }
-    return { status: "acquired" as const, handles }
-  })
-  const releaseAll = (resource: Effect.Success<typeof acquireAll>) =>
-    Effect.forEach(
-      resource.handles.slice().reverse(),
-      (item) =>
-        Effect.promise(item.lease.release).pipe(
-          Effect.catchCause((cause) => Effect.succeed({ exitCode: 1, stderr: Cause.pretty(cause) })),
-          Effect.flatMap((result) =>
-            result.exitCode === 0
-              ? Effect.void
-              : Effect.logError("snapshot advisory lock release failed", {
-                  role: item.request.role,
-                  file: item.request.file,
-                  exitCode: result.exitCode,
-                  stderr: result.stderr,
-                }),
-          ),
-        ),
-      { concurrency: 1 },
-    ).pipe(Effect.asVoid)
 
   return Effect.uninterruptibleMask((restore) =>
     Effect.gen(function* () {
       yield* Effect.sync(() => assertLockOrder(locks))
+      const acquireAll = Effect.gen(function* () {
+        const handles: {
+          readonly request: Extract<LockRequest, { role: "box" | "repo" }>
+          readonly lease: LockLease
+        }[] = []
+        for (const request of files) {
+          const startedAt = request.waitMillis === undefined ? undefined : yield* Clock.currentTimeNanos
+          while (true) {
+            const acquire =
+              request.blocking || request.waitMillis !== undefined
+                ? restore(acquireFile(request))
+                : acquireFile(request)
+            const attempt = yield* acquire.pipe(
+              Effect.map((value) => ({ status: "result" as const, value })),
+              Effect.catch((cause) => Effect.succeed({ status: "failure" as const, cause })),
+            )
+            if (attempt.status === "failure") {
+              return { status: "unavailable" as const, handles, request, cause: attempt.cause }
+            }
+            if (attempt.value.status === "acquired") {
+              handles.push({ request, lease: attempt.value.lease })
+              break
+            }
+            if (request.blocking) {
+              return {
+                status: "unavailable" as const,
+                handles,
+                request,
+                cause: new Error("blocking gc admission reported lock contention"),
+              }
+            }
+            if (startedAt === undefined) return { status: "contended" as const, handles }
+            const remaining = BigInt(request.waitMillis!) * 1_000_000n - ((yield* Clock.currentTimeNanos) - startedAt)
+            if (remaining <= 0n) return { status: "contended" as const, handles }
+            yield* restore(Effect.sleep(Duration.nanos(remaining < 10_000_000n ? remaining : 10_000_000n)))
+          }
+        }
+        return { status: "acquired" as const, handles }
+      })
+      const releaseAll = (resource: Effect.Success<typeof acquireAll>) =>
+        Effect.forEach(
+          resource.handles.slice().reverse(),
+          (item) =>
+            Effect.promise(item.lease.release).pipe(
+              Effect.catchCause((cause) => Effect.succeed({ exitCode: 1, stderr: Cause.pretty(cause) })),
+              Effect.flatMap((result) =>
+                result.exitCode === 0
+                  ? Effect.void
+                  : Effect.logError("snapshot advisory lock release failed", {
+                      role: item.request.role,
+                      file: item.request.file,
+                      exitCode: result.exitCode,
+                      stderr: result.stderr,
+                    }),
+              ),
+            ),
+          { concurrency: 1 },
+        ).pipe(Effect.asVoid)
       return yield* Effect.acquireUseRelease(
         acquireAll,
         (resource) => {
@@ -197,15 +231,7 @@ export function lockCommand(
   if (platform === "linux") {
     const flock = which("flock")
     if (!flock) throw new Error("snapshot advisory locks require the Linux flock utility")
-    return [
-      flock,
-      "-x",
-      ...(tryOnly ? ["-n"] : []),
-      file,
-      "sh",
-      "-c",
-      'printf "locked\\n"; exec cat',
-    ]
+    return [flock, "-x", ...(tryOnly ? ["-n"] : []), file, "sh", "-c", 'printf "locked\\n"; exec cat']
   }
 
   if (platform === "darwin") {
@@ -214,13 +240,7 @@ export function lockCommand(
     const script = tryOnly
       ? 'use strict; use Errno qw(EWOULDBLOCK EAGAIN); open my $lock, ">>", $ARGV[0] or die $!; if (!flock($lock, LOCK_EX|LOCK_NB)) { exit 75 if $! == EWOULDBLOCK || $! == EAGAIN; die $!; } $| = 1; print "locked\\n"; <STDIN>;'
       : 'use strict; open my $lock, ">>", $ARGV[0] or die $!; flock($lock, LOCK_EX) or die $!; $| = 1; print "locked\\n"; <STDIN>;'
-    return [
-      perl,
-      "-MFcntl=:flock",
-      "-e",
-      script,
-      file,
-    ]
+    return [perl, "-MFcntl=:flock", "-e", script, file]
   }
 
   if (platform === "win32") {
