@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test"
-import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { APICallError, TypeValidationError } from "ai"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -10,6 +9,7 @@ import { SessionID, MessageID, PartID } from "../../src/session/schema"
 import { Question } from "../../src/question"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { openAICompatibleStreamError } from "../lib/openai-compatible-stream-error"
 
 const sessionID = SessionID.make("session")
 const providerID = ProviderV2.ID.make("test")
@@ -1365,67 +1365,30 @@ describe("session.message-v2.toModelMessage", () => {
 })
 
 describe("session.message-v2.fromError", () => {
-  test("serializes a top-level OpenAI-compatible stream error as ContextOverflowError", () => {
-    const input = {
+  test("serializes an SDK-parsed top-level OpenAI-compatible stream error as ContextOverflowError", async () => {
+    const error = await openAICompatibleStreamError({
       message: "Request failed",
       type: "invalid_request_error",
       code: "context_length_exceeded",
-    }
-    const result = MessageV2.fromError(input, { providerID })
+    })
+    const result = MessageV2.fromError(error, { providerID })
 
     expect(result).toStrictEqual({
       name: "ContextOverflowError",
       data: {
         message: "Input exceeds context window of this model",
-        responseBody: JSON.stringify(input),
+        responseBody: JSON.stringify(error),
       },
     })
   })
 
   test("serializes an AI SDK TypeValidationError from an unparseable overflow chunk", async () => {
-    const chunk = {
-      id: "chatcmpl-fixture",
-      object: "chat.completion.chunk",
-      created: 1790550000,
-      model: "mock",
-      choices: [{ index: 0, delta: { role: "assistant", content: "partial response" }, finish_reason: null }],
-    }
-    const server = Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      fetch: () =>
-        new Response(
-          `data: ${JSON.stringify(chunk)}\n\ndata: ${JSON.stringify({ error: "Your input exceeds the context window of this model" })}\n\n`,
-          { headers: { "content-type": "text/event-stream" } },
-        ),
-    })
-    try {
-      const model = createOpenAICompatible({
-        name: "test",
-        baseURL: `http://127.0.0.1:${server.port}/v1`,
-        apiKey: "test",
-      })("test-model")
-      const response = await model.doStream({
-        prompt: [{ role: "user", content: [{ type: "text", text: "trigger" }] }],
-      })
-      const reader = response.stream.getReader()
-      const errors: unknown[] = []
-      const partial: string[] = []
-      while (true) {
-        const item = await reader.read()
-        if (item.done) break
-        if (item.value.type === "text-delta") partial.push(item.value.delta)
-        if (item.value.type === "error") errors.push(item.value.error)
-      }
+    const error = await openAICompatibleStreamError("Your input exceeds the context window of this model")
 
-      expect(partial.join("")).toBe("partial response")
-      expect(TypeValidationError.isInstance(errors[0])).toBe(true)
-      const result = MessageV2.fromError(errors[0], { providerID })
+    expect(TypeValidationError.isInstance(error)).toBe(true)
+    const result = MessageV2.fromError(error, { providerID })
 
-      expect(SessionV1.ContextOverflowError.isInstance(result)).toBe(true)
-    } finally {
-      server.stop(true)
-    }
+    expect(SessionV1.ContextOverflowError.isInstance(result)).toBe(true)
   })
 
   test("serializes context_length_exceeded as ContextOverflowError", () => {
