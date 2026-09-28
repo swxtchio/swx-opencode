@@ -4024,6 +4024,73 @@ unixNoLLMServer(
   30_000,
 )
 
+unix(
+  "cancelling a queued loop leaves the next prompt runnable",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const session = yield* sessions.create({ title: "Queued loop cancellation" })
+        const root = yield* seedUser({
+          sessionID: session.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "queued task" }],
+        })
+        const shell = yield* prompt
+          .shell({ sessionID: session.id, agent: "build", command: "printf shell-ready; sleep 30" })
+          .pipe(Effect.forkChild)
+        yield* waitForBusy(session.id)
+        yield* pollWithTimeout(
+          sessions
+            .messages({ sessionID: session.id })
+            .pipe(
+              Effect.map((messages) =>
+                messages.some((message) =>
+                  message.parts.some((part) => part.type === "tool" && part.state.status === "running"),
+                )
+                  ? true
+                  : undefined,
+              ),
+            ),
+          "shell did not enter its running state",
+        )
+
+        const queued = yield* prompt.loop({ sessionID: session.id, messageID: root.info.id }).pipe(Effect.forkChild)
+        yield* Effect.yieldNow
+        yield* prompt.cancel(session.id)
+        const queuedExit = yield* awaitWithTimeout(Fiber.await(queued), "queued loop did not cancel", "10 seconds")
+        const shellExit = yield* awaitWithTimeout(Fiber.await(shell), "shell did not cancel", "10 seconds")
+        expect(Exit.isSuccess(queuedExit)).toBe(true)
+        expect(Exit.isSuccess(shellExit)).toBe(true)
+        expect(yield* llm.calls).toBe(0)
+
+        const messageID = MessageID.make("msg_after_queued_cancel")
+        yield* llm.text("fresh task finished")
+        const next = yield* prompt
+          .prompt({
+            sessionID: session.id,
+            messageID,
+            agent: "build",
+            model: ref,
+            parts: [{ type: "text", text: "fresh task after cancellation" }],
+          })
+          .pipe(Effect.forkChild)
+        yield* awaitWithTimeout(llm.wait(1), "the next prompt was poisoned by the cancelled queue", "10 seconds")
+        const request = (yield* llm.inputs)[0]
+        if (!request) throw new Error("expected the next provider request")
+        expect(JSON.stringify(request.messages)).toContain("fresh task after cancellation")
+        const nextExit = yield* awaitWithTimeout(Fiber.await(next), "the next prompt did not finish", "10 seconds")
+        expect(Exit.isSuccess(nextExit)).toBe(true)
+        expect(yield* llm.calls).toBe(1)
+      }),
+    ),
+  { git: true, config: cfg },
+  60_000,
+)
+
 unixNoLLMServer(
   "shell rejects when another shell is already running",
   () =>

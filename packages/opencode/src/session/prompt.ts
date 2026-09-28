@@ -161,6 +161,7 @@ const layer = Layer.effect(
       const run = runControls.get(sessionID)
       if (run) yield* Deferred.succeed(run.cancel, void 0).pipe(Effect.ignore)
       yield* state.cancel(sessionID)
+      if (run && runControls.get(sessionID) === run) runControls.delete(sessionID)
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -1148,6 +1149,18 @@ const layer = Layer.effect(
       runControl: { cancel: Deferred.Deferred<void>; claimed: Set<MessageID> },
     ) {
       return yield* Effect.gen(function* () {
+        yield* Effect.sync(() => runControls.set(sessionID, runControl))
+        const runRootMessageID =
+          rootMessageID ??
+          (yield* Effect.gen(function* () {
+            const messages = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+              Effect.provideService(Database.Service, database),
+            )
+            const admitted = yield* MessageV2.admission(sessionID).pipe(
+              Effect.provideService(Database.Service, database),
+            )
+            return MessageV2.latest(messages, { userOrder: (id) => admitted.order.get(id) }).user?.id
+          }))
         const ctx = yield* InstanceState.context
         const markerConfig = (yield* config.get()).machine_message_markers
         let structured: unknown
@@ -1185,13 +1198,13 @@ const layer = Layer.effect(
 
         const initializeTurn = (msgs: SessionV1.WithParts[]) => {
           if (turnRoot) return
-          const root = rootMessageID
+          const root = runRootMessageID
             ? msgs.find(
                 (msg): msg is UserWithParts =>
-                  msg.info.role === "user" && msg.info.id === rootMessageID && msg.info.noReply !== true,
+                  msg.info.role === "user" && msg.info.id === runRootMessageID && msg.info.noReply !== true,
               )?.info
             : MessageV2.latest(msgs, { userOrder: (id) => admissionOrder.get(id) }).user
-          if (rootMessageID && !root) throw new Error(`Run root message not found: ${rootMessageID}`)
+          if (runRootMessageID && !root) throw new Error(`Run root message not found: ${runRootMessageID}`)
           turnRoot = root
           if (!turnRoot) return
           initialTurnRootID = turnRoot.id
@@ -1714,26 +1727,14 @@ const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      const rootMessageID =
-        input.messageID ??
-        (yield* Effect.gen(function* () {
-          const messages = yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
-          const admitted = yield* MessageV2.admission(input.sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
-          return MessageV2.latest(messages, { userOrder: (id) => admitted.order.get(id) }).user?.id
-        }))
-      const runControl = runControls.get(input.sessionID) ?? {
+      const runControl = {
         cancel: yield* Deferred.make<void>(),
         claimed: new Set<MessageID>(),
       }
-      runControls.set(input.sessionID, runControl)
       return yield* state.ensureRunning(
         input.sessionID,
         lastAssistant(input.sessionID),
-        runLoop(input.sessionID, rootMessageID, runControl),
+        runLoop(input.sessionID, input.messageID, runControl),
         Deferred.succeed(runControl.cancel, void 0).pipe(Effect.asVoid),
       )
     })
