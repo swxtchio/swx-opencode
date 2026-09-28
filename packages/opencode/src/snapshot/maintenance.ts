@@ -1,10 +1,10 @@
 /**
- * Snapshot maintenance separates box admission from user tracking so a queued cleanup does not hold a repo lock.
+ * Snapshot maintenance keeps user tracking outside the box-wide gc cooldown so a skipped gc cannot drop snapshot writes.
  *
  * | Path | Locks in order | Wait | Contention | Infrastructure failure | Work failure |
  * | --- | --- | --- | --- | --- | --- |
- * | `Snapshot.track` (user-facing) | per-repo only; never `gc.lock` | bounded | quiet skip with an in-memory counter; caller succeeds | loud log and skip | surface to caller |
- * | `Snapshot.cleanup` admission | `gc.lock` | blocking | wait, then recheck eligibility | loud log and abort the pass | surface per repo |
+ * | `Snapshot.track` (user-facing) | per-repo and local | wait; never skip | wait, then track | loud log and surface lock failures | surface to caller |
+ * | `Snapshot.cleanup` admission | `gc.lock` | long wait | wait, then recheck; expiry warns and skips | loud log and abort the pass | surface per repo |
  * | cleanup per-repo gc section | `gc.lock` → per-repo | short | skip this repo this pass | loud log and skip repo | log and continue other repos |
  * | reap | `gc.lock` → per-repo | short | skip | loud log and skip | log and continue other repos |
  */
@@ -27,10 +27,10 @@ export type LockRequest =
   | {
       readonly role: "box" | "repo"
       readonly file: string
+      readonly wait?: boolean
       readonly waitMillis?: number
-      readonly blocking?: boolean
     }
-  | { readonly role: "local"; readonly semaphore: Semaphore.Semaphore }
+  | { readonly role: "local"; readonly semaphore: Semaphore.Semaphore; readonly wait?: boolean }
 
 export type LockAttempt<A> =
   | { readonly status: "acquired"; readonly value: A }
@@ -69,7 +69,7 @@ const layer: Layer.Layer<MaintenanceService, never, FSUtil.Service | AppProcess.
         Effect.mapError((cause) => (cause instanceof Error ? cause : new Error(String(cause)))),
         Effect.andThen(
           Effect.tryPromise({
-            try: (signal) => acquire(request.file, signal, !request.blocking),
+            try: (signal) => acquire(request.file, signal, !request.wait),
             catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
           }).pipe(
             Effect.map((attempt) =>
@@ -113,9 +113,10 @@ export function assertLockOrder(locks: readonly LockRequest[]) {
   for (const [index, request] of locks.entries()) {
     const current = order.indexOf(request.role)
     if (current < previous) throw new Error("snapshot locks must be acquired in box, repo, local order")
-    const blocking = "blocking" in request && request.blocking
-    if (request.role !== "box" && blocking) throw new Error("only gc admission may wait on a file lock")
-    if (blocking && index !== 0) throw new Error("blocking gc admission must be acquired first")
+    const waitsForFile = request.role !== "local" && (request.wait || request.waitMillis !== undefined)
+    if (waitsForFile && index !== 0) {
+      throw new Error("waiting snapshot file locks must be acquired first")
+    }
     if (request.role === "repo") hasRepo = true
     if (request.role === "local" && !hasRepo) throw new Error("snapshot local locks require a repo lock first")
     previous = current
@@ -143,33 +144,43 @@ export function withSnapshotLocks<A, E, R>(
         for (const request of files) {
           const startedAt = request.waitMillis === undefined ? undefined : yield* Clock.currentTimeNanos
           while (true) {
+            const remaining =
+              startedAt === undefined
+                ? undefined
+                : BigInt(request.waitMillis!) * 1_000_000n - ((yield* Clock.currentTimeNanos) - startedAt)
+            if (remaining !== undefined && remaining <= 0n) return { status: "contended" as const, handles }
             const acquire =
-              request.blocking || request.waitMillis !== undefined
-                ? restore(acquireFile(request))
-                : acquireFile(request)
-            const attempt = yield* acquire.pipe(
+              request.wait || startedAt !== undefined ? restore(acquireFile(request)) : acquireFile(request)
+            const acquisition =
+              request.wait && remaining !== undefined
+                ? Effect.raceFirst(
+                    acquire.pipe(Effect.map((value) => ({ tag: "lock" as const, value }))),
+                    restore(Effect.sleep(Duration.nanos(remaining)).pipe(Effect.as({ tag: "timeout" as const }))),
+                  )
+                : acquire.pipe(Effect.map((value) => ({ tag: "lock" as const, value })))
+            const attempt = yield* acquisition.pipe(
               Effect.map((value) => ({ status: "result" as const, value })),
               Effect.catch((cause) => Effect.succeed({ status: "failure" as const, cause })),
             )
             if (attempt.status === "failure") {
               return { status: "unavailable" as const, handles, request, cause: attempt.cause }
             }
-            if (attempt.value.status === "acquired") {
-              handles.push({ request, lease: attempt.value.lease })
+            if (attempt.value.tag === "timeout") return { status: "contended" as const, handles }
+            if (attempt.value.value.status === "acquired") {
+              handles.push({ request, lease: attempt.value.value.lease })
               break
             }
-            if (request.blocking) {
+            if (request.wait) {
               return {
                 status: "unavailable" as const,
                 handles,
                 request,
-                cause: new Error("blocking gc admission reported lock contention"),
+                cause: new Error("waiting snapshot lock reported contention"),
               }
             }
             if (startedAt === undefined) return { status: "contended" as const, handles }
-            const remaining = BigInt(request.waitMillis!) * 1_000_000n - ((yield* Clock.currentTimeNanos) - startedAt)
-            if (remaining <= 0n) return { status: "contended" as const, handles }
-            yield* restore(Effect.sleep(Duration.nanos(remaining < 10_000_000n ? remaining : 10_000_000n)))
+            const sleepMillis = remaining! < 10_000_000n ? remaining! : 10_000_000n
+            yield* restore(Effect.sleep(Duration.nanos(sleepMillis)))
           }
         }
         return { status: "acquired" as const, handles }
@@ -208,6 +219,9 @@ export function withSnapshotLocks<A, E, R>(
           const runWithLocals = (index: number): Effect.Effect<LockAttempt<A>, E, R> => {
             if (index >= locals.length) {
               return restore(self).pipe(Effect.map((value) => ({ status: "acquired" as const, value })))
+            }
+            if (locals[index]!.wait) {
+              return restore(locals[index]!.semaphore.withPermits(1)(runWithLocals(index + 1)))
             }
             return locals[index]!.semaphore.withPermitsIfAvailable(1)(runWithLocals(index + 1)).pipe(
               Effect.map(Option.getOrElse(() => ({ status: "contended" as const }))),

@@ -23,11 +23,11 @@ export type FileDiff = typeof FileDiff.Type
 
 const prune = "7.days"
 const gcInterval = Duration.toMillis(Duration.hours(1))
+const gcAdmissionWaitMillis = Duration.toMillis(Duration.minutes(5))
 const reapGrace = Duration.toMillis(Duration.days(7))
 const reapLockLimit = 16
 const reapFailureLimit = 3
 const reapRetryInterval = Duration.toMillis(Duration.days(1))
-const trackLockWaitMillis = Duration.toMillis(Duration.seconds(1))
 const limit = 2 * 1024 * 1024
 const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
 const cfg = ["-c", "core.autocrlf=false", ...core]
@@ -77,7 +77,6 @@ const layer: Layer.Layer<
     const global = yield* Global.Service
     const maintenance = yield* MaintenanceService
     const locks = new Map<string, Semaphore.Semaphore>()
-    let trackContentionCount = 0
 
     const lock = (key: string) => {
       const hit = locks.get(key)
@@ -481,11 +480,6 @@ const layer: Layer.Layer<
                             )
                             if (!removal.success) return true
 
-                            yield* fs
-                              .remove(path.join(root, `gc-completed-${project.name}-${repo.name}.timestamp`), {
-                                force: true,
-                              })
-                              .pipe(Effect.orDie)
                             return true
                           }),
                         )
@@ -511,14 +505,23 @@ const layer: Layer.Layer<
         const cleanup = Effect.fnUntraced(function* () {
           if (!(yield* enabled())) return
           const root = path.join(global.data, "snapshot")
+          const completion = path.join(root, "gc-completed.timestamp")
           const repo = Hash.fast(state.worktree)
           const repoLock = path.join(root, "locks", state.project, `${repo}.lock`)
-          const completion = path.join(root, `gc-completed-${state.project}-${repo}.timestamp`)
-          yield* maintenance.withLocks(
-            [{ role: "box", file: path.join(root, "gc.lock"), blocking: true }],
+          const admission = yield* maintenance.withLocks(
+            [{ role: "box", file: path.join(root, "gc.lock"), wait: true, waitMillis: gcAdmissionWaitMillis }],
             Effect.gen(function* () {
               const reapNow = yield* maintenance.now
               yield* reap(reapNow)
+
+              const now = yield* maintenance.now
+              const text = yield* fs.readFileString(completion).pipe(
+                Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed("")),
+                Effect.orDie,
+              )
+              const completionText = text.trim()
+              const completed = completionText ? Number(completionText) : Number.NaN
+              if (Number.isFinite(completed) && completed <= now && now - completed < gcInterval) return
 
               yield* maintenance
                 .withLocks(
@@ -528,15 +531,6 @@ const layer: Layer.Layer<
                   ],
                   Effect.gen(function* () {
                     if (!(yield* exists(state.gitdir))) return
-
-                    const now = yield* maintenance.now
-                    const text = yield* fs.readFileString(completion).pipe(
-                      Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed("")),
-                      Effect.orDie,
-                    )
-                    const completionText = text.trim()
-                    const completed = completionText ? Number(completionText) : Number.NaN
-                    if (Number.isFinite(completed) && completed <= now && now - completed < gcInterval) return
 
                     const git = ["git", ...args(["gc", "--auto", `--prune=${prune}`])]
                     const nice = process.platform === "win32" ? undefined : Bun.which("nice")
@@ -578,6 +572,9 @@ const layer: Layer.Layer<
                 )
             }),
           )
+          if (admission.status === "contended") {
+            yield* Effect.logWarning("snapshot cleanup skipped after waiting for gc admission")
+          }
           return
         })
 
@@ -588,9 +585,9 @@ const layer: Layer.Layer<
               {
                 role: "repo",
                 file: path.join(global.data, "snapshot", "locks", state.project, `${Hash.fast(state.worktree)}.lock`),
-                waitMillis: trackLockWaitMillis,
+                wait: true,
               },
-              { role: "local", semaphore: lock(state.gitdir) },
+              { role: "local", semaphore: lock(state.gitdir), wait: true },
             ],
             Effect.gen(function* () {
               const existed = yield* exists(state.gitdir)
@@ -624,12 +621,8 @@ const layer: Layer.Layer<
               return hash
             }),
           )
-          if (attempt.status === "contended") {
-            trackContentionCount++
-            yield* Effect.logDebug(`snapshot tracking skipped after per-repo lock contention (${trackContentionCount})`)
-            return
-          }
           if (attempt.status === "acquired") return attempt.value
+          return yield* Effect.die(new Error("snapshot tracking could not acquire its per-repo locks"))
         })
 
         const patch = Effect.fnUntraced(function* (hash: string) {
