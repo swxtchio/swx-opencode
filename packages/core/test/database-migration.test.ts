@@ -12,6 +12,7 @@ import workspaceNameMigration from "@opencode-ai/core/database/migration/2026041
 import sessionUsageMigration from "@opencode-ai/core/database/migration/20260510033149_session_usage"
 import normalizeStoragePathsMigration from "@opencode-ai/core/database/migration/20260601010001_normalize_storage_paths"
 import sessionMessageProjectionOrderMigration from "@opencode-ai/core/database/migration/20260603040000_session_message_projection_order"
+import sessionMessageAdmissionOrderMigration from "@opencode-ai/core/database/migration/20260928030300_session-message-admission-order"
 import eventSourcedSessionInputMigration from "@opencode-ai/core/database/migration/20260604172448_event_sourced_session_input"
 import contextEpochAgentMigration from "@opencode-ai/core/database/migration/20260605042240_add_context_epoch_agent"
 import simplifyIntegrationCredentialsMigration from "@opencode-ai/core/database/migration/20260611192811_lush_chimera"
@@ -433,6 +434,43 @@ describe("DatabaseMigration", () => {
           sql`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES ('fresh_projection', 'session', 'user', 7, 2, 2, '{}')`,
         )
         expect(yield* db.get(sql`SELECT id, seq FROM session_message`)).toEqual({ id: "fresh_projection", seq: 7 })
+      }),
+    )
+  })
+
+  test("backfills per-session message order before enforcing sequence uniqueness", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(
+          sql`CREATE TABLE message (
+            id text PRIMARY KEY,
+            session_id text NOT NULL,
+            time_created integer NOT NULL,
+            time_updated integer NOT NULL,
+            data text NOT NULL
+          )`,
+        )
+        yield* db.run(
+          sql`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES
+            ('msg_old', 'ses_a', 10, 10, '{}'),
+            ('msg_z', 'ses_a', 20, 20, '{}'),
+            ('msg_a', 'ses_a', 20, 20, '{}'),
+            ('msg_other', 'ses_b', 5, 5, '{}')`,
+        )
+
+        yield* DatabaseMigration.applyOnly(db, [sessionMessageAdmissionOrderMigration])
+
+        expect(
+          yield* db.all(
+            sql`SELECT id, session_id, admission_seq, claimed FROM message ORDER BY session_id, admission_seq`,
+          ),
+        ).toEqual([
+          { id: "msg_old", session_id: "ses_a", admission_seq: 1, claimed: 0 },
+          { id: "msg_a", session_id: "ses_a", admission_seq: 2, claimed: 0 },
+          { id: "msg_z", session_id: "ses_a", admission_seq: 3, claimed: 0 },
+          { id: "msg_other", session_id: "ses_b", admission_seq: 1, claimed: 0 },
+        ])
       }),
     )
   })

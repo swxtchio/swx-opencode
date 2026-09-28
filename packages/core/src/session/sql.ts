@@ -73,10 +73,15 @@ export const MessageTable = sqliteTable(
       .$type<SessionSchema.ID>()
       .notNull()
       .references(() => SessionTable.id, { onDelete: "cascade" }),
+    admission_seq: integer().notNull().default(0),
+    claimed: integer({ mode: "boolean" }).notNull().default(false),
     ...Timestamps,
     data: text({ mode: "json" }).notNull().$type<V1MessageData>(),
   },
-  (table) => [index("message_session_time_created_id_idx").on(table.session_id, table.time_created, table.id)],
+  (table) => [
+    uniqueIndex("message_session_admission_seq_idx").on(table.session_id, table.admission_seq),
+    index("message_session_time_created_id_idx").on(table.session_id, table.time_created, table.id),
+  ],
 )
 
 export const PartTable = sqliteTable(

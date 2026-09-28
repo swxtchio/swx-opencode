@@ -26,7 +26,6 @@ import { desc } from "drizzle-orm"
 import { eq } from "drizzle-orm"
 import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
-import { or } from "drizzle-orm"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
@@ -62,7 +61,8 @@ export const Event = {
 
 const Cursor = Schema.Struct({
   id: MessageID,
-  time: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
+  seq: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
+  time: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
 })
 type Cursor = typeof Cursor.Type
 
@@ -92,8 +92,7 @@ const part = (row: typeof PartTable.$inferSelect) =>
     messageID: row.message_id,
   }) as Part
 
-const older = (row: Cursor) =>
-  or(lt(MessageTable.time_created, row.time), and(eq(MessageTable.time_created, row.time), lt(MessageTable.id, row.id)))
+const older = (seq: number) => lt(MessageTable.admission_seq, seq)
 
 function hydrate(db: Database.Interface["db"], rows: (typeof MessageTable.$inferSelect)[]) {
   const ids = rows.map((row) => row.id)
@@ -433,14 +432,26 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
 }) {
   const { db } = yield* Database.Service
   const before = input.before ? cursor.decode(input.before) : undefined
-  const where = before
-    ? and(eq(MessageTable.session_id, input.sessionID), older(before))
-    : eq(MessageTable.session_id, input.sessionID)
+  const beforeSeq =
+    before?.seq !== undefined
+      ? before.seq
+      : before
+        ? (yield* db
+            .select({ seq: MessageTable.admission_seq })
+            .from(MessageTable)
+            .where(and(eq(MessageTable.session_id, input.sessionID), eq(MessageTable.id, before.id)))
+            .get()
+            .pipe(Effect.orDie))?.seq
+        : undefined
+  const where =
+    beforeSeq === undefined
+      ? eq(MessageTable.session_id, input.sessionID)
+      : and(eq(MessageTable.session_id, input.sessionID), older(beforeSeq))
   const rows = yield* db
     .select()
     .from(MessageTable)
     .where(where)
-    .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
+    .orderBy(desc(MessageTable.admission_seq))
     .limit(input.limit + 1)
     .all()
     .pipe(Effect.orDie)
@@ -466,7 +477,21 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
   return {
     items,
     more,
-    cursor: more && tail ? cursor.encode({ id: tail.id, time: tail.time_created }) : undefined,
+    cursor: more && tail ? cursor.encode({ id: tail.id, seq: tail.admission_seq }) : undefined,
+  }
+})
+
+export const admission = Effect.fn("MessageV2.admission")(function* (sessionID: SessionID) {
+  const { db } = yield* Database.Service
+  const rows = yield* db
+    .select({ id: MessageTable.id, seq: MessageTable.admission_seq, claimed: MessageTable.claimed })
+    .from(MessageTable)
+    .where(eq(MessageTable.session_id, sessionID))
+    .all()
+    .pipe(Effect.orDie)
+  return {
+    order: new Map(rows.map((row) => [row.id, row.seq])),
+    claimed: new Set(rows.flatMap((row) => (row.claimed ? [row.id] : []))),
   }
 })
 

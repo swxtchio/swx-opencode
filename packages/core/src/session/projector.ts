@@ -1,6 +1,6 @@
 export * as SessionProjector from "./projector"
 
-import { and, desc, eq, gt, or, sql } from "drizzle-orm"
+import { and, desc, eq, gt, inArray, or, sql } from "drizzle-orm"
 import { DateTime, Effect, Layer, Schema } from "effect"
 import { Database } from "../database/database"
 import { EventV2 } from "../event"
@@ -263,11 +263,30 @@ const layer = Layer.effectDiscard(
         const id = event.data.info.id
         const sessionID = event.data.info.sessionID
         const data = messageData(event.data.info)
+        const admission_seq = sql<number>`(SELECT COALESCE(MAX(${MessageTable.admission_seq}), 0) + 1 FROM ${MessageTable} WHERE ${MessageTable.session_id} = ${sessionID})`
         yield* db
-          .insert(MessageTable)
-          .values({ id, session_id: sessionID, time_created, data })
-          .onConflictDoUpdate({ target: MessageTable.id, set: { data } })
-          .run()
+          .transaction((tx) =>
+            Effect.gen(function* () {
+              yield* tx
+                .insert(MessageTable)
+                .values({ id, session_id: sessionID, admission_seq, time_created, data })
+                .onConflictDoUpdate({
+                  target: MessageTable.id,
+                  set: {
+                    data,
+                    ...(event.data.reAdmit ? { admission_seq } : {}),
+                  },
+                })
+                .run()
+              if (event.data.claims?.length) {
+                yield* tx
+                  .update(MessageTable)
+                  .set({ claimed: true })
+                  .where(and(eq(MessageTable.session_id, sessionID), inArray(MessageTable.id, event.data.claims)))
+                  .run()
+              }
+            }),
+          )
           .pipe(Effect.orDie)
       }),
     )

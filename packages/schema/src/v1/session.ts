@@ -620,6 +620,8 @@ const events = {
     schema: {
       sessionID: SessionID,
       info: Info,
+      reAdmit: optional(Schema.Boolean),
+      claims: optional(Schema.Array(MessageID)),
     },
   }),
   MessageRemoved: define({
