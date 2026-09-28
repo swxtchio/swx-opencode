@@ -11,7 +11,7 @@ import { readFileSync } from "fs"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
-import { Clock, Duration, Effect, Exit, Fiber, Layer, Logger, PlatformError, Semaphore } from "effect"
+import { Clock, Duration, Effect, Exit, Fiber, Layer, Logger, Option, PlatformError, Semaphore } from "effect"
 import { Config } from "../../src/config/config"
 import { Snapshot } from "../../src/snapshot"
 import {
@@ -105,7 +105,14 @@ const realLockMaintenanceNode = LayerNode.make({
           ),
         )
       }
-      const withLocks: MaintenanceInterface["withLocks"] = (locks, self) => withSnapshotLocks(locks, self, acquireFile)
+      const withLocks: MaintenanceInterface["withLocks"] = (locks, self) =>
+        withSnapshotLocks(
+          locks.map((request) =>
+            request.role === "repo" && request.waitMillis !== undefined ? { ...request, waitMillis: 25 } : request,
+          ),
+          self,
+          acquireFile,
+        )
       return MaintenanceService.of({
         withLocks,
         run: (input) =>
@@ -145,6 +152,7 @@ const makeMaintenanceHarness = (input?: {
   readonly onLocks?: (locks: readonly LockRequest[]) => void
   readonly onRelease?: (file: string) => void
   readonly beforeLock?: (file: string) => Effect.Effect<void>
+  readonly afterLocalContention?: () => Effect.Effect<void>
   readonly tryLock?: (file: string) => boolean
   readonly lockRuntime?: (request: Extract<LockRequest, { role: "box" | "repo" }>) => LockRuntime | undefined
   readonly lockError?: (request: Extract<LockRequest, { role: "box" | "repo" }>) => Error | undefined
@@ -215,14 +223,38 @@ const makeMaintenanceHarness = (input?: {
   const service = MaintenanceService.of({
     withLocks: (locks, self) => {
       input?.onLocks?.(locks)
-      const requests =
-        input?.waitMillisOverride === undefined
-          ? locks
-          : locks.map((request) =>
-              request.role !== "local" && request.waitMillis !== undefined
-                ? { ...request, waitMillis: input.waitMillisOverride }
-                : request,
-            )
+      const requests = locks.map((request) => {
+        if (request.role === "local" && input?.afterLocalContention) {
+          const semaphore = request.semaphore
+          const afterLocalContention = input.afterLocalContention
+          return {
+            ...request,
+            semaphore: {
+              resize: (permits: number) => semaphore.resize(permits),
+              take: (permits: number) => semaphore.take(permits),
+              release: (permits: number) => semaphore.release(permits),
+              releaseAll: semaphore.releaseAll,
+              withPermit: <A, E, R>(self: Effect.Effect<A, E, R>) => semaphore.withPermit(self),
+              withPermits:
+                (permits: number) =>
+                <A, E, R>(self: Effect.Effect<A, E, R>) =>
+                  Effect.gen(function* () {
+                    const available = yield* semaphore.withPermitsIfAvailable(permits)(Effect.succeed(true))
+                    if (Option.isNone(available)) yield* afterLocalContention()
+                    return yield* semaphore.withPermits(permits)(self)
+                  }),
+              withPermitsIfAvailable:
+                (permits: number) =>
+                <A, E, R>(self: Effect.Effect<A, E, R>) =>
+                  semaphore.withPermitsIfAvailable(permits)(self),
+            } satisfies Semaphore.Semaphore,
+          }
+        }
+        if (request.role !== "local" && request.waitMillis !== undefined && input?.waitMillisOverride !== undefined) {
+          return { ...request, waitMillis: input.waitMillisOverride }
+        }
+        return request
+      })
       return withSnapshotLocks(
         requests,
         input?.workFailure?.(locks) ? Effect.die(new Error("simulated maintenance work failure")) : self,
@@ -339,10 +371,13 @@ const makeManualClock = () => {
 }
 
 const gcHarness = makeMaintenanceHarness()
+const gcWorkFailureHarness = makeMaintenanceHarness({
+  run: () => Effect.die(new Error("simulated gc runner defect")),
+})
 const traversalHarness = makeMaintenanceHarness()
 const traversalIt = traversalHarness.it
 const localTrackGate = { enabled: false, started: deferred(), release: deferred() }
-const localTrackRepoWait = { file: "", entered: deferred() }
+const localTrackSemaphoreWait = { enabled: false, entered: deferred(), release: deferred() }
 const localTrackAppProcess = Layer.effect(
   AppProcess.Service,
   Effect.gen(function* () {
@@ -369,8 +404,11 @@ const localTrackAppProcess = Layer.effect(
 const localTrackHarness = makeMaintenanceHarness({
   appProcessLayer: localTrackAppProcess,
   waitMillisOverride: 25,
-  onLock: (file) => {
-    if (file === localTrackRepoWait.file) localTrackRepoWait.entered.resolve()
+  afterLocalContention: () => {
+    if (!localTrackSemaphoreWait.enabled) return Effect.void
+    return Effect.sync(() => localTrackSemaphoreWait.entered.resolve()).pipe(
+      Effect.andThen(Effect.promise(() => localTrackSemaphoreWait.release.promise)),
+    )
   },
 })
 const scheduleClock = makeManualClock()
@@ -587,6 +625,7 @@ const concurrencyHarness = makeMaintenanceHarness({
 })
 const fixtureRoots = [
   gcHarness.data,
+  gcWorkFailureHarness.data,
   scheduleHarness.data,
   reapHarness.data,
   unstatableReapHarness.data,
@@ -606,6 +645,7 @@ const fixtureRoots = [
   inLockGraceHarness.data,
 ]
 const gcIt = gcHarness.it
+const gcWorkFailureIt = gcWorkFailureHarness.it
 const scheduleIt = scheduleHarness.it
 const reapIt = reapHarness.it
 const localTrackIt = localTrackHarness.it
@@ -635,8 +675,8 @@ const MIXED_BATCH_GROUP_COUNT = Math.ceil(OVER_BATCH_COUNT / 4)
 afterEach(async () => {
   localTrackGate.enabled = false
   localTrackGate.release.resolve()
-  localTrackRepoWait.file = ""
-  localTrackRepoWait.entered = deferred()
+  localTrackSemaphoreWait.enabled = false
+  localTrackSemaphoreWait.release.resolve()
   busyTrack.busy = false
   busyTrack.repoFile = ""
   busyTrack.waitMillis = 0
@@ -671,6 +711,7 @@ afterEach(async () => {
   await Promise.all(fixtureRoots.map((dir) => fs.rm(dir, { recursive: true, force: true })))
   for (const harness of [
     gcHarness,
+    gcWorkFailureHarness,
     traversalHarness,
     scheduleHarness,
     reapHarness,
@@ -713,6 +754,8 @@ afterEach(async () => {
   realLockTrackWait.entered = deferred()
   localTrackGate.started = deferred()
   localTrackGate.release = deferred()
+  localTrackSemaphoreWait.entered = deferred()
+  localTrackSemaphoreWait.release = deferred()
   resetRealLockGc()
   cleanupRace.started = deferred()
   cleanupRace.contender = deferred()
@@ -1128,6 +1171,9 @@ localTrackIt.live(
     localTrackGate.started = deferred()
     localTrackGate.release = deferred()
     localTrackGate.enabled = true
+    localTrackSemaphoreWait.entered = deferred()
+    localTrackSemaphoreWait.release = deferred()
+    localTrackSemaphoreWait.enabled = true
     const patching = yield* Effect.forkScoped(snapshot.patch(initial).pipe(provideInstance(dir)))
     yield* awaitWithTimeout(
       Effect.promise(() => localTrackGate.started.promise),
@@ -1136,8 +1182,6 @@ localTrackIt.live(
     )
 
     const repoFile = repoLockFile(localTrackHarness.data, gitdir)
-    localTrackRepoWait.file = repoFile
-    localTrackRepoWait.entered = deferred()
     const beforeRelease = localTrackHarness.lockReleases.length
     const beforeLocks = localTrackHarness.lockCalls.length
     const finished = { value: false }
@@ -1148,14 +1192,19 @@ localTrackIt.live(
         .pipe(Effect.ensuring(Effect.sync(() => (finished.value = true)))),
     )
     yield* awaitWithTimeout(
-      Effect.promise(() => localTrackRepoWait.entered.promise),
-      "tracking did not reach the repo lock",
+      Effect.promise(() => localTrackSemaphoreWait.entered.promise),
+      "tracking did not encounter local lock contention",
       "2 seconds",
     )
-    yield* Effect.sleep(Duration.millis(50))
     expect(finished.value).toBe(false)
     expect(localTrackHarness.lockReleases.slice(beforeRelease)).toEqual([])
     expect(localTrackHarness.lockCalls.slice(beforeLocks)).toEqual([repoFile])
+
+    localTrackSemaphoreWait.enabled = false
+    localTrackSemaphoreWait.release.resolve()
+    yield* Effect.yieldNow
+    expect(finished.value).toBe(false)
+    expect(localTrackHarness.lockReleases.slice(beforeRelease)).toEqual([])
 
     localTrackGate.enabled = false
     localTrackGate.release.resolve()
@@ -1174,7 +1223,7 @@ localTrackIt.live(
 )
 
 lockFailureIt.live(
-  "logs and skips tracking when the advisory lock command is unavailable",
+  "logs and surfaces tracking failure when the advisory lock command is unavailable",
   Effect.gen(function* () {
     const dir = yield* tmpdirScoped({ git: true })
     const snapshot = yield* Snapshot.Service
@@ -1193,8 +1242,7 @@ lockFailureIt.live(
     const beforeRepoFailure = lockFailureHarness.lockCalls.length
     const repo = yield* Effect.exit(snapshot.cleanup().pipe(provideInstance(dir), Effect.provide(logger)))
 
-    expect(Exit.isSuccess(tracked)).toBe(true)
-    expect(Exit.isSuccess(tracked) ? tracked.value : "failed").toBeUndefined()
+    expect(Exit.isFailure(tracked)).toBe(true)
     expect(Exit.isSuccess(admission)).toBe(true)
     expect(Exit.isSuccess(repo)).toBe(true)
     expect(yield* Effect.promise(() => fs.readFile(evidenceFile, "utf8"))).toBe(before)
@@ -1329,7 +1377,7 @@ realLockIt.live(
 )
 
 realLockIt.live(
-  "waits for an independent repo-lock holder and completes the pending track",
+  "retries track lock windows against an independent repo holder and completes tracking",
   Effect.gen(function* () {
     const dir = yield* tmpdirScoped({ git: true })
     const snapshot = yield* Snapshot.Service
@@ -1363,8 +1411,9 @@ realLockIt.live(
             "tracking did not reach the independent repo lock",
             "2 seconds",
           )
-          yield* Effect.sleep(Duration.millis(1_200))
+          yield* Effect.sleep(Duration.millis(150))
           expect(finished.value).toBe(false)
+          expect(realLockLockCalls.filter((file) => file === repoFile).length).toBeGreaterThan(1)
           holder.stdin.end()
           yield* awaitWithTimeout(
             Effect.promise(() => holder.exited),
@@ -1689,6 +1738,29 @@ gcIt.live(
     if (process.platform === "linux" && Bun.which("ionice")) {
       expect(args.slice(0, gitIndex)).toEqual(expect.arrayContaining(["-c", "2", "-n", "7"]))
     }
+  }),
+)
+
+gcWorkFailureIt.live(
+  "catches an effect failure from per-repo gc while holding maintenance locks",
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped({ git: true })
+    const snapshot = yield* Snapshot.Service
+    yield* snapshot.track().pipe(provideInstance(dir))
+    const logged: string[] = []
+    const result = yield* Effect.exit(
+      snapshot
+        .cleanup()
+        .pipe(
+          provideInstance(dir),
+          Effect.provide(Logger.layer([Logger.make((item) => logged.push(String(item.message)))])),
+        ),
+    )
+
+    expect(Exit.isSuccess(result)).toBe(true)
+    expect(gcWorkFailureHarness.calls).toHaveLength(1)
+    expect(logged.some((message) => message.includes("snapshot per-repo cleanup failed"))).toBe(true)
+    expect(yield* Effect.promise(() => existsPath(gcCompletionFile(gcWorkFailureHarness.data)))).toBe(false)
   }),
 )
 

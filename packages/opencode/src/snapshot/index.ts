@@ -623,7 +623,9 @@ const layer: Layer.Layer<
               }),
             )
             if (attempt.status === "acquired") return attempt.value
-            if (attempt.status === "unavailable") return
+            if (attempt.status === "unavailable") {
+              return yield* Effect.die(new Error("snapshot tracking could not acquire its per-repo locks"))
+            }
             yield* Effect.sleep(Duration.millis(10))
           }
         })
