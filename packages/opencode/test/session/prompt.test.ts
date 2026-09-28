@@ -2577,7 +2577,11 @@ gated.instance(
         error: "MessageAbortedError",
       }
       expect([original, steered].map(answered)).toEqual([cancelled, cancelled])
-      expect(answered(woken)).toEqual({ parentID: yield* asked(chat.id, "wake up"), texts: ["wake reply"], error: undefined })
+      expect(answered(woken)).toEqual({
+        parentID: yield* asked(chat.id, "wake up"),
+        texts: ["wake reply"],
+        error: undefined,
+      })
     }),
   15_000,
 )

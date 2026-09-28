@@ -590,7 +590,10 @@ const layer = Layer.effect(
         [...channels.values()]
           .filter(
             (channel) =>
-              channel.sessionID === sessionID && !channel.reply && channel.message !== undefined && channel.message <= turn,
+              channel.sessionID === sessionID &&
+              !channel.reply &&
+              channel.message !== undefined &&
+              channel.message <= turn,
           )
           .forEach((channel) => {
             channel.reply = reply
