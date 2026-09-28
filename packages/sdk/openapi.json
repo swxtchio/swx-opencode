@@ -15980,6 +15980,9 @@
             "required": ["created"],
             "additionalProperties": false
           },
+          "noReply": {
+            "type": "boolean"
+          },
           "format": {
             "$ref": "#/components/schemas/OutputFormat"
           },
@@ -17612,6 +17615,16 @@
                       },
                       "info": {
                         "$ref": "#/components/schemas/Message"
+                      },
+                      "reAdmit": {
+                        "type": "boolean"
+                      },
+                      "claims": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "pattern": "^msg"
+                        }
                       }
                     },
                     "required": ["sessionID", "info"],
@@ -25163,6 +25176,16 @@
                   },
                   "info": {
                     "$ref": "#/components/schemas/Message"
+                  },
+                  "reAdmit": {
+                    "type": "boolean"
+                  },
+                  "claims": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^msg"
+                    }
                   }
                 },
                 "required": ["sessionID", "info"],
@@ -31128,6 +31151,16 @@
               },
               "info": {
                 "$ref": "#/components/schemas/Message"
+              },
+              "reAdmit": {
+                "type": "boolean"
+              },
+              "claims": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^msg"
+                }
               }
             },
             "required": ["sessionID", "info"],
@@ -34080,6 +34113,16 @@
               },
               "info": {
                 "$ref": "#/components/schemas/Message"
+              },
+              "reAdmit": {
+                "type": "boolean"
+              },
+              "claims": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^msg"
+                }
               }
             },
             "required": ["sessionID", "info"],
