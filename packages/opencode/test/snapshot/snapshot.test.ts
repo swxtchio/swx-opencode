@@ -403,7 +403,6 @@ const localTrackAppProcess = Layer.effect(
 ).pipe(Layer.provide(LayerNode.compile(AppProcess.node)))
 const localTrackHarness = makeMaintenanceHarness({
   appProcessLayer: localTrackAppProcess,
-  waitMillisOverride: 25,
   afterLocalContention: () => {
     if (!localTrackSemaphoreWait.enabled) return Effect.void
     return Effect.sync(() => localTrackSemaphoreWait.entered.resolve()).pipe(
