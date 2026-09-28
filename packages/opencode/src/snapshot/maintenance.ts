@@ -100,8 +100,8 @@ export function lockCommand(
     if (!flock) throw new Error("snapshot advisory locks require the Linux flock utility")
     return [
       flock,
-      "--exclusive",
-      ...(tryOnly ? ["--nonblock", "--conflict-exit-code", "75"] : []),
+      "-x",
+      ...(tryOnly ? ["-n"] : []),
       file,
       "sh",
       "-c",
@@ -145,13 +145,19 @@ export function lockCommand(
   throw new Error(`snapshot advisory locks are unavailable on ${platform}`)
 }
 
-async function acquire(file: string, signal: AbortSignal, tryOnly: boolean) {
-  const child = Bun.spawn(lockCommand(process.platform, file, Bun.which, tryOnly), {
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-    signal,
-  })
+export type LockRuntime = {
+  readonly platform?: NodeJS.Platform
+  readonly which?: (command: string) => string | null
+  readonly spawn?: (
+    command: string[],
+    options: { readonly stdin: "pipe"; readonly stdout: "pipe"; readonly stderr: "pipe"; readonly signal: AbortSignal },
+  ) => ReturnType<typeof Bun.spawn>
+}
+
+export async function acquire(file: string, signal: AbortSignal, tryOnly: boolean, runtime: LockRuntime = {}) {
+  const command = lockCommand(runtime.platform ?? process.platform, file, runtime.which ?? Bun.which, tryOnly)
+  const options = { stdin: "pipe", stdout: "pipe", stderr: "pipe", signal } as const
+  const child = runtime.spawn ? runtime.spawn(command, options) : Bun.spawn(command, options)
   const reader = child.stdout.getReader()
   let ready = ""
   try {
@@ -159,7 +165,7 @@ async function acquire(file: string, signal: AbortSignal, tryOnly: boolean) {
       const next = await reader.read()
       if (next.done) {
         const exitCode = await child.exited
-        if (tryOnly && exitCode === 75) return
+        if (tryOnly && exitCode !== 0) return
         const stderr = await new Response(child.stderr).text()
         throw new Error(`failed to acquire snapshot maintenance lock (exit ${exitCode}): ${stderr}`)
       }

@@ -12,8 +12,8 @@ import path from "path"
 import { Clock, Duration, Effect, Exit, Fiber, Layer, Semaphore } from "effect"
 import { Config } from "../../src/config/config"
 import { Snapshot } from "../../src/snapshot"
-import { MaintenanceService, lockCommand, maintenanceNode } from "../../src/snapshot/maintenance"
-import type { RunInput } from "../../src/snapshot/maintenance"
+import { MaintenanceService, acquire, lockCommand, maintenanceNode } from "../../src/snapshot/maintenance"
+import type { LockRuntime, MaintenanceInterface, RunInput } from "../../src/snapshot/maintenance"
 import {
   disposeAllInstances,
   provideInstance,
@@ -24,18 +24,14 @@ import {
 import { TestConfig } from "../fixture/config"
 import { awaitWithTimeout, testEffect } from "../lib/effect"
 
+const deferred = () => {
+  let resolve = () => {}
+  const promise = new Promise<void>((done) => (resolve = done))
+  return { promise, resolve }
+}
+
 const it = testEffect(
   Layer.mergeAll(LayerNode.compile(LayerNode.group([Snapshot.node, FSUtil.node])), testInstanceStoreLayer),
-)
-const traversalData = path.join(os.tmpdir(), `opencode-snapshot-traversal-${randomUUID()}`)
-const traversalIt = testEffect(
-  Layer.mergeAll(
-    LayerNode.compile(LayerNode.group([Snapshot.node, FSUtil.node]), [
-      [Global.node, Layer.succeed(Global.Service, Global.Service.of(Global.make({ data: traversalData })))],
-    ]),
-    LayerNode.compile(CrossSpawnSpawner.node),
-    testInstanceStoreLayer,
-  ),
 )
 const maintenanceLockIt = testEffect(
   Layer.mergeAll(LayerNode.compile(maintenanceNode), LayerNode.compile(CrossSpawnSpawner.node)),
@@ -43,16 +39,90 @@ const maintenanceLockIt = testEffect(
 const realLockData = path.join(os.tmpdir(), `opencode-snapshot-real-lock-${randomUUID()}`)
 const realLockSignal = { armed: false, entered: () => {} }
 const realLockStarted = new Promise<void>((resolve) => (realLockSignal.entered = resolve))
+const realLockGc = {
+  attempts: 0,
+  active: 0,
+  maxActive: 0,
+  contender: deferred(),
+  started: deferred(),
+  gate: deferred(),
+}
 const realLockConfig = TestConfig.layer({
   get: () =>
     Effect.sync(() => {
       if (realLockSignal.armed) realLockSignal.entered()
       return {}
+  }),
+})
+const realLockCalls: RunInput[] = []
+const realLockMaintenanceNode = LayerNode.make({
+  service: MaintenanceService,
+  layer: Layer.effect(
+    MaintenanceService,
+    Effect.gen(function* () {
+      const fs = yield* FSUtil.Service
+      const acquireLock = (file: string, tryOnly: boolean) =>
+        fs.ensureDir(path.dirname(file)).pipe(
+          Effect.orDie,
+          Effect.andThen(
+            Effect.tryPromise({
+              try: (signal) => acquire(file, signal, tryOnly),
+              catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+            }),
+          ),
+        )
+      const withLock: MaintenanceInterface["withLock"] = (file, self) =>
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            if (path.basename(file) === "gc.lock") {
+              realLockGc.attempts++
+              if (realLockGc.attempts === 2) realLockGc.contender.resolve()
+            }
+            const handle = yield* restore(acquireLock(file, false))
+            if (!handle) return yield* Effect.die(new Error("blocking test lock acquisition returned no handle"))
+            return yield* Effect.acquireUseRelease(
+              Effect.succeed(handle),
+              () => restore(self),
+              (lock) => Effect.promise(lock.release),
+            )
+          }),
+        )
+      const tryWithLock: MaintenanceInterface["tryWithLock"] = (file, self) =>
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const handle = yield* restore(acquireLock(file, true)).pipe(Effect.catch(() => Effect.succeed(undefined)))
+            if (!handle) return undefined
+            return yield* Effect.acquireUseRelease(
+              Effect.succeed(handle),
+              () => restore(self),
+              (lock) => Effect.promise(lock.release),
+            )
+          }),
+        )
+      return MaintenanceService.of({
+        withLock,
+        tryWithLock,
+        run: (input) =>
+          Effect.promise(async () => {
+            realLockCalls.push(input)
+            realLockGc.active++
+            realLockGc.maxActive = Math.max(realLockGc.maxActive, realLockGc.active)
+            realLockGc.started.resolve()
+            await realLockGc.gate.promise
+            realLockGc.active--
+            return { exitCode: 0, stderr: "" }
+          }),
+        now: Effect.sync(() => Date.now()),
+        random: Effect.sync(() => 0.5),
+      })
     }),
+  ),
+  deps: [FSUtil.node],
 })
 const realLockIt = testEffect(
   Layer.mergeAll(
     LayerNode.compile(LayerNode.group([Snapshot.node, FSUtil.node]), [
+      [maintenanceNode, realLockMaintenanceNode],
       [Global.node, Layer.succeed(Global.Service, Global.Service.of(Global.make({ data: realLockData })))],
       [Config.node, realLockConfig],
     ]),
@@ -110,16 +180,23 @@ const makeMaintenanceHarness = (input?: {
       input?.onLock?.(file)
       return Effect.succeed(undefined)
     },
-    run: (command) => {
-      calls.push(command)
-      return (
-        input?.run?.(command) ??
-        Effect.sync(() => {
+    run: (command) =>
+      Effect.suspend(() => {
+        calls.push(command)
+        if (input?.run) {
+          return input.run(command).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                clock.now += runAdvance.millis
+              }),
+            ),
+          )
+        }
+        return Effect.sync(() => {
           clock.now += runAdvance.millis
           return outcome
         })
-      )
-    },
+      }),
     now: Effect.sync(() => clock.now),
     random: Effect.sync(() => randomValues.shift() ?? 0.5),
   })
@@ -211,6 +288,8 @@ const makeManualClock = () => {
 }
 
 const gcHarness = makeMaintenanceHarness()
+const traversalHarness = makeMaintenanceHarness()
+const traversalIt = traversalHarness.it
 const scheduleClock = makeManualClock()
 const scheduleEvents = {
   count: 0,
@@ -278,14 +357,17 @@ const inLockGraceHarness = makeMaintenanceHarness({
     )
   },
 })
-const lockOrder = { entered: () => {}, release: () => {} }
-const cleanupLockEntered = new Promise<void>((resolve) => (lockOrder.entered = resolve))
-const cleanupLockGate = new Promise<void>((resolve) => (lockOrder.release = resolve))
+const lockOrder = { entered: deferred(), gate: deferred(), busy: false }
 const lockOrderHarness = makeMaintenanceHarness({
+  tryLock: (file) => !lockOrder.busy || path.basename(file) === "gc.lock",
   beforeLock: (file) => {
     if (path.basename(file) !== "gc.lock") return Effect.void
-    lockOrder.entered()
-    return Effect.promise(() => cleanupLockGate)
+    lockOrder.busy = true
+    lockOrder.entered.resolve()
+    return Effect.promise(() => lockOrder.gate.promise)
+  },
+  onRelease: (file) => {
+    if (path.basename(file) === "gc.lock") lockOrder.busy = false
   },
 })
 const cleanupRace = {
@@ -293,27 +375,49 @@ const cleanupRace = {
   processCalls: 0,
   active: 0,
   maxActive: 0,
-  started: () => {},
-  contenderReady: () => {},
-  release: () => {},
+  started: deferred(),
+  contender: deferred(),
+  gate: deferred(),
 }
-const gcStarted = new Promise<void>((resolve) => (cleanupRace.started = resolve))
-const contenderReady = new Promise<void>((resolve) => (cleanupRace.contenderReady = resolve))
-const gcGate = new Promise<void>((resolve) => (cleanupRace.release = resolve))
+const sameRepoRace = {
+  repoHash: "",
+  repoLockAttempts: 0,
+  active: 0,
+  maxActive: 0,
+  started: deferred(),
+  contender: deferred(),
+  gate: deferred(),
+}
+const sameRepoHarness = makeMaintenanceHarness({
+  onLock: (file) => {
+    if (!path.basename(file).includes(sameRepoRace.repoHash)) return
+    sameRepoRace.repoLockAttempts++
+    if (sameRepoRace.repoLockAttempts === 2) sameRepoRace.contender.resolve()
+  },
+  run: () =>
+    Effect.promise(async () => {
+      sameRepoRace.active++
+      sameRepoRace.maxActive = Math.max(sameRepoRace.maxActive, sameRepoRace.active)
+      sameRepoRace.started.resolve()
+      await sameRepoRace.gate.promise
+      sameRepoRace.active--
+      return { exitCode: 0, stderr: "" }
+    }),
+})
 const concurrencyHarness = makeMaintenanceHarness({
   onLock: (file) => {
     if (path.basename(file) !== "gc.lock") return
     cleanupRace.lockAttempts++
-    if (cleanupRace.lockAttempts === 2) cleanupRace.contenderReady()
+    if (cleanupRace.lockAttempts === 2) cleanupRace.contender.resolve()
   },
   run: () =>
     Effect.promise(async () => {
       cleanupRace.processCalls++
       cleanupRace.active++
       cleanupRace.maxActive = Math.max(cleanupRace.maxActive, cleanupRace.active)
-      if (cleanupRace.processCalls === 2) cleanupRace.contenderReady()
-      cleanupRace.started()
-      await gcGate
+      if (cleanupRace.processCalls === 2) cleanupRace.contender.resolve()
+      cleanupRace.started.resolve()
+      await cleanupRace.gate.promise
       cleanupRace.active--
       return { exitCode: 0, stderr: "" }
     }),
@@ -322,9 +426,10 @@ const fixtureRoots = [
   gcHarness.data,
   scheduleHarness.data,
   reapHarness.data,
+  sameRepoHarness.data,
   lockOrderHarness.data,
   concurrencyHarness.data,
-  traversalData,
+  traversalHarness.data,
   realLockData,
   busyTrackHarness.data,
   bodyFailureHarness.data,
@@ -335,6 +440,7 @@ const scheduleIt = scheduleHarness.it
 const reapIt = reapHarness.it
 const lockOrderIt = lockOrderHarness.it
 const concurrencyIt = concurrencyHarness.it
+const sameRepoIt = sameRepoHarness.it
 const busyTrackIt = busyTrackHarness.it
 const bodyFailureIt = bodyFailureHarness.it
 const inLockGraceIt = inLockGraceHarness.it
@@ -350,16 +456,23 @@ const MIXED_BATCH_GROUP_COUNT = Math.ceil(OVER_BATCH_COUNT / 4)
 afterEach(async () => {
   busyTrack.busy = false
   busyTrack.release()
+  cleanupRace.gate.resolve()
+  sameRepoRace.gate.resolve()
+  lockOrder.gate.resolve()
+  realLockGc.gate.resolve()
   await disposeAllInstances()
-  cleanupRace.release()
   cleanupRace.lockAttempts = 0
   cleanupRace.processCalls = 0
   cleanupRace.active = 0
   cleanupRace.maxActive = 0
-  lockOrder.release()
+  sameRepoRace.repoHash = ""
+  sameRepoRace.repoLockAttempts = 0
+  sameRepoRace.active = 0
+  sameRepoRace.maxActive = 0
   await Promise.all(fixtureRoots.map((dir) => fs.rm(dir, { recursive: true, force: true })))
   for (const harness of [
     gcHarness,
+    traversalHarness,
     scheduleHarness,
     reapHarness,
     busyTrackHarness,
@@ -367,6 +480,7 @@ afterEach(async () => {
     inLockGraceHarness,
     lockOrderHarness,
     concurrencyHarness,
+    sameRepoHarness,
   ]) {
     harness.calls.length = 0
     harness.lockCalls.length = 0
@@ -387,6 +501,22 @@ afterEach(async () => {
   inLockGraceRace.worktree = ""
   inLockGraceRace.since = 0
   realLockSignal.armed = false
+  realLockCalls.length = 0
+  realLockGc.attempts = 0
+  realLockGc.active = 0
+  realLockGc.maxActive = 0
+  cleanupRace.started = deferred()
+  cleanupRace.contender = deferred()
+  cleanupRace.gate = deferred()
+  sameRepoRace.started = deferred()
+  sameRepoRace.contender = deferred()
+  sameRepoRace.gate = deferred()
+  lockOrder.entered = deferred()
+  lockOrder.gate = deferred()
+  lockOrder.busy = false
+  realLockGc.contender = deferred()
+  realLockGc.started = deferred()
+  realLockGc.gate = deferred()
 })
 
 const snapshotGitdir = async (data: string, worktree: string) => {
@@ -411,6 +541,9 @@ const completionFile = (data: string, gitdir: string) =>
     "snapshot",
     `gc-completed-${path.basename(path.dirname(gitdir))}-${path.basename(gitdir)}.timestamp`,
   )
+
+const repoLockFile = (data: string, gitdir: string) =>
+  path.join(data, "snapshot", "locks", path.basename(path.dirname(gitdir)), `${path.basename(gitdir)}.lock`)
 
 const startAdvisoryLock = (file: string) =>
   Effect.promise(async () => {
@@ -453,7 +586,7 @@ it.effect(
     }
     expect(lockCommand("linux", "/data/snapshot/gc.lock", which)).toEqual([
       "/usr/bin/flock",
-      "--exclusive",
+      "-x",
       "/data/snapshot/gc.lock",
       "sh",
       "-c",
@@ -461,10 +594,8 @@ it.effect(
     ])
     expect(lockCommand("linux", "/data/snapshot/repo.lock", which, true)).toEqual([
       "/usr/bin/flock",
-      "--exclusive",
-      "--nonblock",
-      "--conflict-exit-code",
-      "75",
+      "-x",
+      "-n",
       "/data/snapshot/repo.lock",
       "sh",
       "-c",
@@ -489,6 +620,44 @@ it.effect(
     expect(
       Buffer.from(lockCommand("win32", "C:/data/snapshot/repo.lock", which, true)[4]!, "base64").toString("utf16le"),
     ).toContain("exit 75")
+  }),
+)
+
+maintenanceLockIt.live(
+  "maps BusyBox and GNU nonblocking flock conflicts to an unavailable lease",
+  Effect.gen(function* () {
+    const binaries = ["/stub/busybox/flock", "/stub/gnu/flock"]
+    const args: string[][] = []
+    const spawn: NonNullable<LockRuntime["spawn"]> = (command, options) => {
+      args.push(command)
+      const busybox = command[0] === binaries[0]
+      const exitCode = busybox ? 2 : 1
+      return Bun.spawn([process.execPath, "-e", "process.exit(" + exitCode + ")"], options)
+    }
+
+    for (const binary of binaries) {
+      const lease = yield* Effect.promise(() =>
+        acquire("/data/snapshot/repo.lock", new AbortController().signal, true, {
+          platform: "linux",
+          which: () => binary,
+          spawn,
+        }),
+      )
+      expect(lease).toBeUndefined()
+    }
+
+    expect(args).toEqual(
+      binaries.map((binary) => [
+        binary,
+        "-x",
+        "-n",
+        "/data/snapshot/repo.lock",
+        "sh",
+        "-c",
+        'printf "locked\\n"; exec cat',
+      ]),
+    )
+    expect(args.every((command) => !command.includes("--conflict-exit-code"))).toBe(true)
   }),
 )
 
@@ -522,9 +691,11 @@ traversalIt.live(
     const dir = yield* tmpdirScoped({ git: true })
     const snapshot = yield* Snapshot.Service
     yield* snapshot.track().pipe(provideInstance(dir))
-    const root = path.join(traversalData, "snapshot")
-    const gitdir = yield* Effect.promise(() => snapshotGitdir(traversalData, dir))
-    yield* Effect.promise(() => fs.writeFile(completionFile(traversalData, gitdir), String(Date.now() - 30_000)))
+    const root = path.join(traversalHarness.data, "snapshot")
+    const gitdir = yield* Effect.promise(() => snapshotGitdir(traversalHarness.data, dir))
+    yield* Effect.promise(() =>
+      fs.writeFile(completionFile(traversalHarness.data, gitdir), String(traversalHarness.clock.now - 30_000)),
+    )
 
     yield* snapshot.cleanup().pipe(provideInstance(dir))
 
@@ -533,7 +704,7 @@ traversalIt.live(
 )
 
 busyTrackIt.live(
-  "keeps tracking when the repo advisory lock is busy and skips its evidence update",
+  "skips all snapshot tree work when the repo advisory lock is busy",
   Effect.gen(function* () {
     const dir = yield* tmpdirScoped({ git: true })
     const snapshot = yield* Snapshot.Service
@@ -554,7 +725,7 @@ busyTrackIt.live(
     )
     const after = JSON.parse(yield* Effect.promise(() => fs.readFile(evidenceFile, "utf8"))) as { missingSince?: number }
 
-    expect(hash).toBeTruthy()
+    expect(hash).toBeUndefined()
     expect(after.missingSince).toBe(123)
   }),
   { timeout: 10_000 },
@@ -573,12 +744,15 @@ bodyFailureIt.live(
 )
 
 realLockIt.live(
-  "snapshot cleanup waits for an independent process holding the box lock",
+  "snapshot cleanup waits boundedly for an independent process holding the repo lock",
   Effect.gen(function* () {
     const dir = yield* tmpdirScoped({ git: true })
     const snapshot = yield* Snapshot.Service
     const completed = { value: false }
-    const holder = yield* startAdvisoryLock(path.join(realLockData, "snapshot", "gc.lock"))
+    yield* snapshot.track().pipe(provideInstance(dir))
+    const gitdir = yield* Effect.promise(() => snapshotGitdir(realLockData, dir))
+    yield* Effect.promise(() => fs.writeFile(completionFile(realLockData, gitdir), String(Date.now() - 30_000)))
+    const holder = yield* startAdvisoryLock(repoLockFile(realLockData, gitdir))
     realLockSignal.armed = true
 
     yield* Effect.acquireUseRelease(
@@ -590,13 +764,72 @@ realLockIt.live(
               .cleanup()
               .pipe(provideInstance(dir), Effect.tap(() => Effect.sync(() => (completed.value = true)))),
           )
-          yield* awaitWithTimeout(Effect.promise(() => realLockStarted), "sweep did not reach maintenance admission", "2 seconds")
+          yield* awaitWithTimeout(Effect.promise(() => realLockStarted), "sweep did not reach the repo lease", "2 seconds")
           yield* Effect.sleep(Duration.millis(100))
           expect(completed.value).toBe(false)
           holder.stdin.end()
           yield* awaitWithTimeout(Effect.promise(() => holder.exited), "lock holder did not exit", "2 seconds")
           yield* awaitWithTimeout(Fiber.join(sweep), "snapshot sweep stayed behind the released lock", "2 seconds")
           expect(completed.value).toBe(true)
+          expect(realLockCalls).toEqual([])
+        }),
+      (child) =>
+        Effect.promise(async () => {
+          child.stdin.end()
+          await child.exited
+        }),
+    )
+  }),
+)
+
+realLockIt.live(
+  "serializes independent cleanup instances through the real box gc lock",
+  Effect.gen(function* () {
+    const first = yield* tmpdirScoped({ git: true })
+    const second = yield* tmpdirScoped({ git: true })
+    const snapshot = yield* Snapshot.Service
+    yield* snapshot.track().pipe(provideInstance(first))
+    yield* snapshot.track().pipe(provideInstance(second))
+    const firstGitdir = yield* Effect.promise(() => snapshotGitdir(realLockData, first))
+    const secondGitdir = yield* Effect.promise(() => snapshotGitdir(realLockData, second))
+    const stale = String(Date.now() - Duration.toMillis(Duration.hours(2)))
+    yield* Effect.promise(() =>
+      Promise.all([
+        fs.writeFile(completionFile(realLockData, firstGitdir), stale),
+        fs.writeFile(completionFile(realLockData, secondGitdir), stale),
+      ]),
+    )
+    const holder = yield* startAdvisoryLock(path.join(realLockData, "snapshot", "gc.lock"))
+    realLockSignal.armed = true
+
+    yield* Effect.acquireUseRelease(
+      Effect.succeed(holder),
+      () =>
+        Effect.gen(function* () {
+          const one = yield* Effect.forkScoped(snapshot.cleanup().pipe(provideInstance(first)))
+          const two = yield* Effect.forkScoped(snapshot.cleanup().pipe(provideInstance(second)))
+          yield* awaitWithTimeout(
+            Effect.promise(() => realLockGc.contender.promise),
+            "both cleanups did not contend for the shared gc lock",
+            "2 seconds",
+          )
+          yield* Effect.sleep(Duration.millis(100))
+          expect(realLockCalls).toEqual([])
+          holder.stdin.end()
+          yield* awaitWithTimeout(Effect.promise(() => holder.exited), "gc lock holder did not exit", "2 seconds")
+          yield* awaitWithTimeout(
+            Effect.promise(() => realLockGc.started.promise),
+            "first gc did not start",
+            "2 seconds",
+          )
+          yield* Effect.sleep(Duration.millis(100))
+          expect(realLockCalls).toHaveLength(1)
+          expect(realLockGc.maxActive).toBe(1)
+          realLockGc.gate.resolve()
+          yield* awaitWithTimeout(Fiber.join(one), "first cleanup stayed behind the gc lock", "2 seconds")
+          yield* awaitWithTimeout(Fiber.join(two), "second cleanup stayed behind the gc lock", "2 seconds")
+          expect(realLockCalls).toHaveLength(2)
+          expect(realLockGc.maxActive).toBe(1)
         }),
       (child) =>
         Effect.promise(async () => {
@@ -693,6 +926,8 @@ gcIt.live(
     yield* snapshot.cleanup().pipe(provideInstance(dir))
 
     expect(gcHarness.calls).toEqual([])
+    expect(gcHarness.lockCalls.filter((file) => path.basename(file) === "gc.lock")).toEqual([])
+    expect(gcHarness.lockCalls).toContain(repoLockFile(gcHarness.data, gitdir))
   }),
 )
 
@@ -775,18 +1010,18 @@ concurrencyIt.live(
     const one = yield* Effect.forkScoped(snapshot.cleanup().pipe(provideInstance(first)))
     const two = yield* Effect.forkScoped(snapshot.cleanup().pipe(provideInstance(second)))
     yield* awaitWithTimeout(
-      Effect.promise(() => gcStarted),
+      Effect.promise(() => cleanupRace.started.promise),
       "first snapshot gc did not start",
       "2 seconds",
     )
     yield* awaitWithTimeout(
-      Effect.promise(() => contenderReady),
+      Effect.promise(() => cleanupRace.contender.promise),
       "competing cleanup did not contend",
       "2 seconds",
     )
     expect(concurrencyHarness.calls).toHaveLength(1)
     expect(cleanupRace.maxActive).toBe(1)
-    cleanupRace.release()
+    cleanupRace.gate.resolve()
     yield* Fiber.join(one)
     yield* Fiber.join(two)
 
@@ -799,8 +1034,46 @@ concurrencyIt.live(
   }),
 )
 
+sameRepoIt.live(
+  "serializes same-repo cleanup and rechecks its completion timestamp",
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped({ git: true })
+    const snapshot = yield* Snapshot.Service
+    yield* snapshot.track().pipe(provideInstance(dir))
+    const gitdir = yield* Effect.promise(() => snapshotGitdir(sameRepoHarness.data, dir))
+    sameRepoRace.repoHash = path.basename(gitdir)
+    sameRepoHarness.clock.now += Duration.toMillis(Duration.hours(2))
+    sameRepoHarness.runAdvance.millis = 400
+
+    const one = yield* Effect.forkScoped(snapshot.cleanup().pipe(provideInstance(dir)))
+    const two = yield* Effect.forkScoped(snapshot.cleanup().pipe(provideInstance(dir)))
+    yield* awaitWithTimeout(
+      Effect.promise(() => sameRepoRace.started.promise),
+      "same-repo gc did not start",
+      "2 seconds",
+    )
+    yield* awaitWithTimeout(
+      Effect.promise(() => sameRepoRace.contender.promise),
+      "second cleanup did not contend for the repo lease",
+      "2 seconds",
+    )
+    yield* Effect.sleep(Duration.millis(50))
+    expect(sameRepoHarness.calls).toHaveLength(1)
+    expect(sameRepoRace.repoLockAttempts).toBeGreaterThanOrEqual(2)
+    expect(sameRepoRace.maxActive).toBe(1)
+    sameRepoRace.gate.resolve()
+    yield* Fiber.join(one)
+    yield* Fiber.join(two)
+
+    expect(sameRepoHarness.calls).toHaveLength(1)
+    expect(yield* Effect.promise(() => fs.readFile(completionFile(sameRepoHarness.data, gitdir), "utf8"))).toBe(
+      String(sameRepoHarness.clock.now),
+    )
+  }),
+)
+
 lockOrderIt.live(
-  "lets snapshot tracking finish when cleanup is waiting on the box lock",
+  "skips snapshot tracking while cleanup holds the repo lease waiting for box admission",
   Effect.gen(function* () {
     const dir = yield* tmpdirScoped({ git: true })
     const snapshot = yield* Snapshot.Service
@@ -808,21 +1081,21 @@ lockOrderIt.live(
 
     const cleanup = yield* Effect.forkScoped(snapshot.cleanup().pipe(provideInstance(dir)))
     yield* awaitWithTimeout(
-      Effect.promise(() => cleanupLockEntered),
-      "cleanup did not enter the box lock",
+      Effect.promise(() => lockOrder.entered.promise),
+      "cleanup did not enter box-wide gc admission",
       "2 seconds",
     )
     const tracking = yield* Effect.forkScoped(snapshot.track().pipe(provideInstance(dir)))
     const hash = yield* awaitWithTimeout(
       Fiber.join(tracking),
-      "tracking waited behind cleanup while holding the repo lock",
+      "tracking waited behind cleanup instead of skipping its busy repo lease",
       "2 seconds",
     )
-    expect(hash).toBeTruthy()
-    lockOrder.release()
+    expect(hash).toBeUndefined()
+    lockOrder.gate.resolve()
     yield* Fiber.join(cleanup)
     expect(lockOrderHarness.calls).toHaveLength(1)
-  }).pipe(Effect.ensuring(Effect.sync(() => lockOrder.release()))),
+  }).pipe(Effect.ensuring(Effect.sync(() => lockOrder.gate.resolve()))),
 )
 
 scheduleIt.live(
@@ -929,14 +1202,17 @@ reapIt.live(
     const beforeRecentCheck = reapHarness.lockCalls.length
     yield* snapshot.cleanup().pipe(provideInstance(dir))
     expect(yield* Effect.promise(() => existsPath(gitdir))).toBe(true)
-    expect(reapHarness.lockCalls.slice(beforeRecentCheck)).not.toContain(
-      path.join(reapHarness.data, "snapshot", "locks", path.basename(path.dirname(gitdir)), `${Hash.fast(dir)}.lock`),
-    )
+    expect(
+      reapHarness.lockCalls
+        .slice(beforeRecentCheck)
+        .filter((file) => file === repoLockFile(reapHarness.data, gitdir)),
+    ).toHaveLength(1)
 
     reapHarness.clock.now += 1
     yield* Effect.promise(() => fs.writeFile(completion, String(reapHarness.clock.now - 30_000)))
     yield* snapshot.cleanup().pipe(provideInstance(dir))
     expect(yield* Effect.promise(() => existsPath(gitdir))).toBe(false)
+    expect(yield* Effect.promise(() => existsPath(completion))).toBe(false)
   }),
 )
 
@@ -1020,9 +1296,11 @@ inLockGraceIt.live(
 )
 
 reapIt.live(
-  "advances past shadow repos that cannot be removed during a sweep",
+  "parks repeatedly failing reaps and lets later eligible repos advance",
   Effect.gen(function* () {
     const snapshot = yield* Snapshot.Service
+    const host = yield* tmpdirScoped({ git: true })
+    yield* snapshot.track().pipe(provideInstance(host))
     const worktrees = yield* Effect.forEach(
       Array.from({ length: 17 }),
       () =>
@@ -1039,11 +1317,13 @@ reapIt.live(
     yield* Effect.promise(() => Promise.all(worktrees.map((dir) => fs.rm(dir, { recursive: true, force: true }))))
     reapHarness.clock.now += Duration.toMillis(Duration.hours(2))
     const root = path.join(reapHarness.data, "snapshot")
-    const completion = completionFile(reapHarness.data, gitdirs[0]!)
-    yield* Effect.promise(() => fs.writeFile(completion, String(reapHarness.clock.now - 30_000)))
+    const hostGitdir = yield* Effect.promise(() => snapshotGitdir(reapHarness.data, host))
+    const completion = completionFile(reapHarness.data, hostGitdir)
+    const refreshCompletion = () => fs.writeFile(completion, String(reapHarness.clock.now - 30_000))
+    yield* Effect.promise(refreshCompletion)
     const beforeFirstSweep = reapHarness.lockCalls.length
 
-    yield* snapshot.cleanup().pipe(provideInstance(worktrees[0]!))
+    yield* snapshot.cleanup().pipe(provideInstance(host))
     const firstPage = Array.from(
       new Set(
         reapHarness.lockCalls
@@ -1053,8 +1333,8 @@ reapIt.live(
     ).slice(0, 16)
     expect(firstPage).toHaveLength(16)
 
-    yield* Effect.promise(() => fs.writeFile(completion, String(reapHarness.clock.now - 30_000)))
-    yield* snapshot.cleanup().pipe(provideInstance(worktrees[0]!))
+    yield* Effect.promise(refreshCompletion)
+    yield* snapshot.cleanup().pipe(provideInstance(host))
     const records = yield* Effect.promise(() =>
       Promise.all(gitdirs.map((gitdir) => fs.readFile(path.join(gitdir, "info", "opencode-worktree.json"), "utf8"))),
     )
@@ -1068,7 +1348,6 @@ reapIt.live(
     expect(blockedParents).toHaveLength(16)
     const laterGitdir = gitdirs.find((gitdir) => !firstPageGitdirs.includes(gitdir))!
     reapHarness.clock.now += Duration.toMillis(Duration.days(8))
-    yield* Effect.promise(() => fs.writeFile(completion, String(reapHarness.clock.now - 30_000)))
 
     yield* Effect.acquireUseRelease(
       Effect.promise(async () => {
@@ -1077,12 +1356,51 @@ reapIt.live(
       }),
       () =>
         Effect.gen(function* () {
-          yield* snapshot.cleanup().pipe(provideInstance(worktrees[0]!))
+          for (let attempt = 1; attempt <= 4; attempt++) {
+            yield* Effect.promise(refreshCompletion)
+            yield* snapshot.cleanup().pipe(provideInstance(host))
+            expect(yield* Effect.promise(() => existsPath(laterGitdir))).toBe(attempt < 4)
+          }
           const firstPageStillExists = yield* Effect.promise(() =>
             Promise.all(firstPageGitdirs.map((gitdir) => existsPath(gitdir))),
           )
           expect(firstPageStillExists.every(Boolean)).toBe(true)
-          expect(yield* Effect.promise(() => existsPath(laterGitdir))).toBe(false)
+          const parked = JSON.parse(
+            yield* Effect.promise(() =>
+              fs.readFile(path.join(firstPageGitdirs[0]!, "info", "opencode-worktree.json"), "utf8"),
+            ),
+          ) as { reapFailures?: number; worktree: string }
+          expect(parked.reapFailures).toBe(3)
+
+          const beforeParkedSweep = reapHarness.lockCalls.length
+          yield* Effect.promise(refreshCompletion)
+          yield* snapshot.cleanup().pipe(provideInstance(host))
+          expect(reapHarness.lockCalls.slice(beforeParkedSweep)).not.toContain(
+            repoLockFile(reapHarness.data, firstPageGitdirs[0]!),
+          )
+
+          const parkedWorktree = parked.worktree
+          yield* Effect.promise(() => fs.mkdir(parkedWorktree))
+          yield* Effect.promise(refreshCompletion)
+          yield* snapshot.cleanup().pipe(provideInstance(host))
+          const restored = JSON.parse(
+            yield* Effect.promise(() =>
+              fs.readFile(path.join(firstPageGitdirs[0]!, "info", "opencode-worktree.json"), "utf8"),
+            ),
+          ) as { missingSince?: number; reapFailures?: number }
+          expect(restored.missingSince).toBeUndefined()
+          expect(restored.reapFailures).toBeUndefined()
+
+          yield* Effect.promise(() => fs.rm(parkedWorktree, { recursive: true, force: true }))
+          yield* Effect.promise(refreshCompletion)
+          yield* snapshot.cleanup().pipe(provideInstance(host))
+          const absentAgain = JSON.parse(
+            yield* Effect.promise(() =>
+              fs.readFile(path.join(firstPageGitdirs[0]!, "info", "opencode-worktree.json"), "utf8"),
+            ),
+          ) as { missingSince?: number; reapFailures?: number }
+          expect(absentAgain.missingSince).toBe(reapHarness.clock.now)
+          expect(absentAgain.reapFailures).toBeUndefined()
         }),
       (dirs) => Effect.promise(() => Promise.all(dirs.map((dir) => fs.chmod(dir, 0o755))).then(() => undefined)),
     )
