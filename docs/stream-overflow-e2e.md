@@ -4,13 +4,14 @@ This is a dated run record for the recovery path, not a second behavior specific
 
 ## Reproduction
 
-Run these commands from the `swx-opencode` repository root. They use ports `18900` and `18901`, and require Bun, Python 3, `uv`, and a local checkout of `swx-llmrouter` containing the recorded commit.
+Run these commands from the `swx-opencode` repository root. They use ports `18900` and `18901`, and require Bun, Python 3, `uv`, and a local checkout of `swx-llmrouter` containing the recorded commit; set `SWX_LLMROUTER_CHECKOUT` to that checkout's root.
 
 ```sh
 repro_dir="$PWD/.cache/overflow-e2e-note"
+router_checkout="${SWX_LLMROUTER_CHECKOUT:?set SWX_LLMROUTER_CHECKOUT to a local swx-llmrouter checkout}"
 router_rev=cc4e5716f9f5d8afe6c5705f304212bebcd80afb
 mkdir -p "$repro_dir/router"
-git -C /home/byates/fm-llmrouter/projects/swx-llmrouter archive "$router_rev" openclaw_router | tar -x -C "$repro_dir/router"
+git -C "$router_checkout" archive "$router_rev" openclaw_router | tar -x -C "$repro_dir/router"
 ```
 
 Create the router config:

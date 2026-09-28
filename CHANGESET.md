@@ -59,6 +59,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#76** Classify mid-stream OpenAI-compatible context overflow errors as `ContextOverflowError` so automatic compaction can resume; cover SDK error shapes and session continuation. The unpatched-router reproduction is recorded in [docs/stream-overflow-e2e.md](docs/stream-overflow-e2e.md). (swxtchio/swx-opencode#66). _Fork-only._
 - **#49** `--effort` works on `opencode`, `--mini` and `attach` (one rule: it applies to whichever model declares
   it, until an in-app choice, and is never saved); an unknown CLI argument is now named after the help; and `run`
   prints the server's real validation error instead of a generic 500. _Fork-only; the unknown-argument message is
