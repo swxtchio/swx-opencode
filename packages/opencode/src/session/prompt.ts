@@ -1169,6 +1169,7 @@ const layer = Layer.effect(
         let initialTurnRootID: MessageID | undefined
         let held: UserWithParts[] = []
         let activeInputTurn: UserWithParts | undefined
+        let activeSteerInput: UserWithParts | undefined
         let titleStarted = false
         const heldIDs = new Set<MessageID>()
         const heldReleasePending = new Set<MessageID>()
@@ -1240,14 +1241,32 @@ const layer = Layer.effect(
           )
         }
 
-        const projectTurn = (msgs: SessionV1.WithParts[], turn = activeInputTurn) => {
-          if (!turn) return msgs
+        const pendingImmediateInputs = (msgs: SessionV1.WithParts[]) =>
+          msgs
+            .filter(
+              (msg): msg is UserWithParts =>
+                msg.info.role === "user" &&
+                msg.info.noReply !== true &&
+                msg.info.id !== turnRoot?.id &&
+                !heldIDs.has(msg.info.id) &&
+                !completedInputIDs.has(msg.info.id) &&
+                !claimedInputIDs.has(msg.info.id) &&
+                promptedInputIDs.has(msg.info.id),
+            )
+            .filter((msg) => {
+              const text = msg.parts.find(
+                (part): part is SessionV1.TextPart => part.type === "text" && !part.synthetic && !part.ignored,
+              )?.text
+              return MachineMessage.classify(text ?? "", markerConfig) !== "hold"
+            })
+            .sort(
+              (a, b) => (admissionOrder.get(a.info.id) ?? 0) - (admissionOrder.get(b.info.id) ?? 0),
+            )
+
+        const projectTurn = (msgs: SessionV1.WithParts[]) => {
           const completed = (msg: SessionV1.WithParts) =>
             completedInputIDs.has(msg.info.role === "user" ? msg.info.id : msg.info.parentID)
-          const history = msgs.filter(completed)
-          const current = msgs.filter((msg) => !completed(msg))
-          const root = current.find((msg) => msg.info.id === turn.info.id) ?? turn
-          return [...history, root, ...current.filter((msg) => msg.info.id !== root.info.id)]
+          return [...msgs.filter(completed), ...msgs.filter((msg) => !completed(msg))]
         }
 
         const markAnsweredInputs = (msgs: SessionV1.WithParts[], parentID?: MessageID) => {
@@ -1265,6 +1284,7 @@ const layer = Layer.effect(
             if (!hasToolCalls) completedInputIDs.add(msg.info.parentID)
           })
           if (activeInputTurn && completedInputIDs.has(activeInputTurn.info.id)) activeInputTurn = undefined
+          if (activeSteerInput && completedInputIDs.has(activeSteerInput.info.id)) activeSteerInput = undefined
         }
 
         const waitForEarlierAdmissions = Effect.fnUntraced(function* () {
@@ -1310,24 +1330,14 @@ const layer = Layer.effect(
             collectHeld(msgs)
           }
 
-          if (step > 0) {
-            msgs
-              .filter(
-                (msg): msg is UserWithParts =>
-                  msg.info.role === "user" &&
-                  msg.info.noReply !== true &&
-                  msg.info.id !== turnRoot?.id &&
-                  !heldIDs.has(msg.info.id) &&
-                  !completedInputIDs.has(msg.info.id),
-              )
-              .filter((msg) => {
-                const text = msg.parts.find(
-                  (part): part is SessionV1.TextPart => part.type === "text" && !part.synthetic && !part.ignored,
-                )?.text
-                return MachineMessage.classify(text ?? "", markerConfig) === undefined
-              })
-              .forEach((msg) => deferredInputIDs.add(msg.info.id))
-          }
+          const immediate = pendingImmediateInputs(msgs)
+          if (activeSteerInput && completedInputIDs.has(activeSteerInput.info.id)) activeSteerInput = undefined
+          activeSteerInput ??= immediate[0]
+          deferredInputIDs.clear()
+          immediate.forEach((msg) => {
+            if (msg.info.id !== activeSteerInput?.info.id) deferredInputIDs.add(msg.info.id)
+          })
+          if (activeSteerInput) turnRoot = activeSteerInput.info
 
           msgs = msgs.filter(
             (msg) => !heldIDs.has(msg.info.id) && !(msg.info.role === "user" && deferredInputIDs.has(msg.info.id)),
@@ -1337,18 +1347,23 @@ const layer = Layer.effect(
             userOrder: (id: MessageID) => admissionOrder.get(id),
           }
           let selected = MessageV2.latest(msgs, selection)
-          const previousTurnID = activeInputTurn?.info.id ?? turnRoot.id
+          if (activeSteerInput && msgs.some((msg) => msg.info.id === activeSteerInput?.info.id)) {
+            selected = { ...selected, user: activeSteerInput.info }
+          }
+          const previousTurnID = activeSteerInput?.info.id ?? activeInputTurn?.info.id ?? turnRoot.id
           if (selected.user && selected.user.id !== previousTurnID) {
             markAnsweredInputs(msgs, previousTurnID)
             selected = MessageV2.latest(msgs, selection)
+            if (activeSteerInput && msgs.some((msg) => msg.info.id === activeSteerInput?.info.id)) {
+              selected = { ...selected, user: activeSteerInput.info }
+            }
           }
           if (!selected.user) return "stop" as const
-          const selectedTurn = msgs.find(
-            (message): message is UserWithParts =>
-              message.info.role === "user" && message.info.id === selected.user?.id,
-          )
-          msgs = projectTurn(msgs, selectedTurn)
+          msgs = projectTurn(msgs)
           selected = MessageV2.latest(msgs, selection)
+          if (activeSteerInput && msgs.some((msg) => msg.info.id === activeSteerInput?.info.id)) {
+            selected = { ...selected, user: activeSteerInput.info }
+          }
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = selected
 
           if (!lastUser) return "stop" as const
@@ -1635,47 +1650,38 @@ const layer = Layer.effect(
               continue
             }
 
-            if (held.length > 0) {
-              const waited = yield* Effect.raceFirst(
-                waitForEarlierAdmissions().pipe(Effect.as("ready" as const)),
-                Deferred.await(runControl.cancel).pipe(Effect.as("cancel" as const)),
-              )
-              if (waited === "cancel") break
-              const nextMessages = yield* loadMessages()
-              markAnsweredInputs(nextMessages)
-              collectHeld(nextMessages)
-              if (held.length === 0) continue
-
-              const next = held.shift()
-              if (!next) continue
-              heldIDs.delete(next.info.id)
-              completedInputIDs.delete(next.info.id)
-              turnRoot = next.info
-              activeInputTurn = next
-              heldReleasePending.add(next.info.id)
+            const directInputs = pendingImmediateInputs(msgs)
+            const direct = directInputs[0]
+            const nextHeld = held[0]
+            const directOrder = direct ? (admissionOrder.get(direct.info.id) ?? 0) : undefined
+            const heldOrder = nextHeld ? (admissionOrder.get(nextHeld.info.id) ?? 0) : undefined
+            if (direct && (!nextHeld || (directOrder ?? 0) < (heldOrder ?? 0))) {
+              activeSteerInput = direct
+              turnRoot = direct.info
+              activeInputTurn = direct
               step = 0
               structured = undefined
               continue
             }
+            if (!nextHeld) break
 
-            const directInputs = msgs
-              .filter(
-                (msg): msg is UserWithParts =>
-                  msg.info.role === "user" &&
-                  msg.info.noReply !== true &&
-                  !heldIDs.has(msg.info.id) &&
-                  !completedInputIDs.has(msg.info.id) &&
-                  !claimedInputIDs.has(msg.info.id) &&
-                  msg.info.id !== turnRoot?.id &&
-                  promptedInputIDs.has(msg.info.id),
-              )
-              .sort((a, b) => (admissionOrder.get(a.info.id) ?? 0) - (admissionOrder.get(b.info.id) ?? 0))
-            const direct = directInputs[0]
-            if (!direct) break
-            directInputs.forEach((message) => deferredInputIDs.add(message.info.id))
-            deferredInputIDs.delete(direct.info.id)
-            turnRoot = direct.info
-            activeInputTurn = direct
+            const waited = yield* Effect.raceFirst(
+              waitForEarlierAdmissions().pipe(Effect.as("ready" as const)),
+              Deferred.await(runControl.cancel).pipe(Effect.as("cancel" as const)),
+            )
+            if (waited === "cancel") break
+            const nextMessages = yield* loadMessages()
+            markAnsweredInputs(nextMessages)
+            collectHeld(nextMessages)
+            if (held.length === 0) continue
+
+            const next = held.shift()
+            if (!next) continue
+            heldIDs.delete(next.info.id)
+            completedInputIDs.delete(next.info.id)
+            turnRoot = next.info
+            activeInputTurn = next
+            heldReleasePending.add(next.info.id)
             step = 0
             structured = undefined
           }
