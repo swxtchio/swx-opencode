@@ -101,23 +101,6 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
-// Whether an assistant message ends its turn; a tool-call step does not. The
-// loop exits on one, and a sync prompt's reply is one.
-function concludes(msg: SessionV1.WithParts) {
-  if (msg.info.role !== "assistant") return false
-  // A turn that stopped on an abort or error, or ended with its structured
-  // result, stays settled, so waking the session delivers its parked prompts
-  // instead of continuing that turn.
-  if (msg.info.error !== undefined || msg.info.structured !== undefined) return true
-  // Some providers return "stop" even when the assistant message contains
-  // tool calls. Keep the loop running so tool results can be sent back to
-  // the model, but ignore cleanup-marked interrupted orphans.
-  const hasToolCalls = msg.parts.some(
-    (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
-  )
-  return !!msg.info.finish && !["tool-calls", "unknown"].includes(msg.info.finish) && !hasToolCalls
-}
-
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError>
@@ -1199,7 +1182,27 @@ const layer = Layer.effect(
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
           )
-          if (lastAssistantMsg && lastAssistant?.parentID === lastUser.id && concludes(lastAssistantMsg)) {
+          // Some providers return "stop" even when the assistant message contains
+          // tool calls. Keep the loop running so tool results can be sent back to
+          // the model, but ignore cleanup-marked interrupted orphans.
+          const hasToolCalls =
+            lastAssistantMsg?.parts.some(
+              (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
+            ) ?? false
+
+          // A turn that stopped on an abort or error, or ended with its structured
+          // result, stays settled, so waking the session delivers its parked
+          // prompts instead of continuing that turn.
+          const ended =
+            lastAssistant?.parentID === lastUser.id &&
+            (lastAssistant.error !== undefined || lastAssistant.structured !== undefined)
+          if (
+            ended ||
+            (lastAssistant?.finish &&
+              !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
+              !hasToolCalls &&
+              lastAssistant.parentID === lastUser.id)
+          ) {
             const orphan = lastAssistantMsg?.parts.find(
               (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
             )
@@ -1211,6 +1214,9 @@ const layer = Layer.effect(
                 callID: orphan.callID,
               })
             }
+            // The turn is over. Its reply answers the prompt that began it and every
+            // steer that joined it, before the loop goes on to a turn of its own.
+            if (lastAssistantMsg) yield* queue.answer(sessionID, lastUser.id, lastAssistantMsg)
             // Queued prompts wait for this point and run one turn each, so a steer
             // or another admission arriving meanwhile is weighed before the next.
             // Each such turn is new user input and gets a fresh step allowance.
@@ -1442,18 +1448,29 @@ const layer = Layer.effect(
         // Any other exit stops the task; the joiner re-check must not restart it.
         if (!settled) yield* queue.park(sessionID, seen)
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
-        return yield* lastAssistant(sessionID)
+        return yield* endRun(sessionID)
       },
       // So does an interrupt, such as instance disposal cancelling the run.
-      (effect, sessionID) => effect.pipe(Effect.onInterrupt(() => queue.park(sessionID))),
+      (effect, sessionID) =>
+        effect.pipe(Effect.onInterrupt(() => queue.park(sessionID).pipe(Effect.andThen(endRun(sessionID))))),
     )
+
+    // A run's final message ends the turn it belongs to, so it answers that turn's
+    // prompts before any later run can. A turn the loop finished was answered as
+    // it ended; this answers one the run stopped on, by an error, abort or interrupt.
+    const endRun = Effect.fnUntraced(function* (sessionID: SessionID) {
+      const final = yield* lastAssistant(sessionID)
+      if (final.info.role === "assistant") yield* queue.answer(sessionID, final.info.parentID, final)
+      return final
+    })
 
     // Without an own item there is nothing that can be withdrawn from under it.
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = (input) =>
       drain(input.sessionID).pipe(Effect.orDie)
 
-    // Runs or joins the session's drain. With `own`, returns the reply to that
-    // prompt: the drain's final message may answer another caller's prompt.
+    // Runs or joins the session's drain. With `own`, returns the reply the turn
+    // that prompt joined recorded for it: the drain's final message may answer
+    // another caller's prompt.
     const drain: (
       sessionID: SessionID,
       own?: SessionQueue.ItemID,
@@ -1509,30 +1526,12 @@ const layer = Layer.effect(
           Effect.forkIn(scope, { startImmediately: true }),
         )
       }
-      const message = own ? yield* queue.delivered(own) : undefined
-      if (!message) return yield* withdrawn.pipe(Effect.as(result))
-      // When the run stopped before this prompt's turn ended (or began), the caller
-      // gets the run's final message, as every caller did before the queue.
-      return (yield* replyTo(sessionID, message)) ?? result
-    })
-
-    // The reply to a prompt is the first assistant message after it that ends a
-    // turn answering it or a later prompt. Tool-call steps do not end a turn, and
-    // a turn steered by later prompts ends with its own final reply, which every
-    // prompt in it shares; a queued prompt's turn comes after. A compaction
-    // summary is not a reply.
-    const replyTo = Effect.fnUntraced(function* (sessionID: SessionID, message: MessageID) {
-      const replies: SessionV1.WithParts[] = []
-      // Scans newest first and stops at the prompt, collecting the replies after it.
-      yield* sessions
-        .findMessage(sessionID, (m) => {
-          if (m.info.id <= message) return true
-          if (m.info.role === "assistant" && !m.info.summary && m.info.parentID >= message && concludes(m))
-            replies.push(m)
-          return false
-        })
-        .pipe(Effect.orDie)
-      return replies.at(-1)
+      const reply = own ? yield* queue.reply(own) : undefined
+      if (reply) return reply
+      // A prompt still pending when the run stopped, or delivered after its last
+      // history read, has no turn; its caller gets the run's final message, as
+      // every caller did before the queue.
+      return yield* withdrawn.pipe(Effect.as(result))
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(

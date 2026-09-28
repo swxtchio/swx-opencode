@@ -2489,7 +2489,7 @@ it.instance(
       yield* finish(task)
       // The run still delivers the prompt; only its caller is gone.
       expect(lastUser((yield* llm.inputs)[1])).toEqual({ role: "user", content: "queued then abandoned" })
-      expect(yield* queue.delivered(item!.id)).toBeUndefined()
+      expect(yield* queue.reply(item!.id)).toBeUndefined()
     }),
   15_000,
 )

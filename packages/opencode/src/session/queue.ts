@@ -90,11 +90,18 @@ export interface Interface {
   /** Whether no drain has read this item yet (withdrawn items excluded). */
   readonly unread: (sessionID: SessionID, itemID: ItemID) => Effect.Effect<boolean>
   /**
-   * The message an item became, once; lets its prompt find its own reply. Only
-   * items still admitted by a waiting caller are tracked: the caller `forget`s
-   * its item however it returns, so an interrupted one leaves nothing behind.
+   * Ends a turn: `reply`, the turn's final message, answers every waiting caller
+   * whose prompt became a message at or before `turn`, the user message the turn
+   * answered, and that no earlier turn answered. Those are the prompt that began
+   * the turn, the steers that joined it, and a queued prompt whose turn it was.
    */
-  readonly delivered: (itemID: ItemID) => Effect.Effect<MessageID | undefined>
+  readonly answer: (sessionID: SessionID, turn: MessageID, reply: SessionV1.WithParts) => Effect.Effect<void>
+  /**
+   * The answer to an item's prompt, once. Each caller's answer channel is opened
+   * at admission and closed when the caller `forget`s it, however it returns, so
+   * an interrupted one leaves nothing behind.
+   */
+  readonly reply: (itemID: ItemID) => Effect.Effect<SessionV1.WithParts | undefined>
   readonly forget: (itemID: ItemID) => Effect.Effect<void>
   /** Whether the session has no message at all yet. */
   readonly empty: (sessionID: SessionID) => Effect.Effect<boolean>
@@ -120,7 +127,12 @@ const layer = Layer.effect(
     const parked = new Set<SessionID>()
     const wakes = new Map<SessionID, number>()
     const running = new Set<SessionID>()
-    const messages = new Map<ItemID, MessageID | undefined>()
+    // Waiting callers' answer channels, by item: the message the item became,
+    // then the final reply of the turn that message joined.
+    const channels = new Map<
+      ItemID,
+      { readonly sessionID: SessionID; message?: MessageID; reply?: SessionV1.WithParts }
+    >()
 
     const semaphore = (map: Map<SessionID, Semaphore.Semaphore>, sessionID: SessionID) => {
       const hit = map.get(sessionID)
@@ -198,7 +210,7 @@ const layer = Layer.effect(
         )
         .pipe(Effect.orDie)
       if (!row) return yield* Effect.die(new Error(`Queue admission for ${input.sessionID} stored nothing`))
-      messages.set(row.id, undefined)
+      channels.set(row.id, { sessionID: input.sessionID })
       wake(input.sessionID)
       yield* publish(input.sessionID)
       return fromRow(row)
@@ -338,7 +350,12 @@ const layer = Layer.effect(
         .run()
         .pipe(
           Effect.orDie,
-          Effect.tap(() => Effect.sync(() => void (messages.has(itemID) && messages.set(itemID, id)))),
+          Effect.tap(() =>
+            Effect.sync(() => {
+              const channel = channels.get(itemID)
+              if (channel) channel.message = id
+            }),
+          ),
         )
 
     const drop = (itemID: ItemID) =>
@@ -565,13 +582,28 @@ const layer = Layer.effect(
       return row === undefined
     })
 
-    const forget = (itemID: ItemID) => Effect.sync(() => void messages.delete(itemID))
+    // Promotions run one at a time, and a promoted message's id sorts after every
+    // message written before its reservation (see `messageID`), so the prompts at
+    // or before a turn's user message are the ones its history held.
+    const answer: Interface["answer"] = (sessionID, turn, reply) =>
+      Effect.sync(() =>
+        [...channels.values()]
+          .filter(
+            (channel) =>
+              channel.sessionID === sessionID && !channel.reply && channel.message !== undefined && channel.message <= turn,
+          )
+          .forEach((channel) => {
+            channel.reply = reply
+          }),
+      )
 
-    const delivered = (itemID: ItemID) =>
+    const forget = (itemID: ItemID) => Effect.sync(() => void channels.delete(itemID))
+
+    const reply = (itemID: ItemID) =>
       Effect.sync(() => {
-        const id = messages.get(itemID)
-        messages.delete(itemID)
-        return id
+        const answered = channels.get(itemID)?.reply
+        channels.delete(itemID)
+        return answered
       })
 
     return Service.of({
@@ -586,7 +618,8 @@ const layer = Layer.effect(
       awaitingDrain,
       withdrawn,
       unread,
-      delivered,
+      answer,
+      reply,
       forget,
       empty,
       exclusive,
