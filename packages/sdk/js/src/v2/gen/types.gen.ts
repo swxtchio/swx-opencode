@@ -243,6 +243,7 @@ export type UserMessage = {
   time: {
     created: number
   }
+  noReply?: boolean
   format?: OutputFormat
   summary?: {
     title?: string
@@ -792,6 +793,8 @@ export type GlobalEvent = {
         properties: {
           sessionID: string
           info: Message
+          reAdmit?: boolean
+          claims?: Array<string>
         }
       }
     | {
@@ -3268,6 +3271,8 @@ export type SyncEventMessageUpdated = {
     data: {
       sessionID: string
       info: Message
+      reAdmit?: boolean
+      claims?: Array<string>
     }
   }
 }
@@ -5179,6 +5184,8 @@ export type MessageUpdated = {
   data: {
     sessionID: string
     info: Message
+    reAdmit?: boolean
+    claims?: Array<string>
   }
 }
 
@@ -6237,6 +6244,8 @@ export type EventMessageUpdated = {
   properties: {
     sessionID: string
     info: Message
+    reAdmit?: boolean
+    claims?: Array<string>
   }
 }
 
