@@ -1219,7 +1219,7 @@ const layer = Layer.effect(
           const root = runRootMessageID
             ? msgs.find(
                 (msg): msg is UserWithParts =>
-                  msg.info.role === "user" && msg.info.id === runRootMessageID && msg.info.noReply !== true,
+                  msg.info.role === "user" && msg.info.id === runRootMessageID,
               )?.info
             : MessageV2.latest(msgs, { admissionOrder }).user
           if (runRootMessageID && !root) throw new Error(`Run root message not found: ${runRootMessageID}`)
@@ -1364,25 +1364,25 @@ const layer = Layer.effect(
           const selection = {
             completedUserIDs: completedInputIDs,
             admissionOrder,
+            excludeNoReply: true,
           }
-          let selected = MessageV2.latest(msgs, selection)
-          if (activeSteerInput && msgs.some((msg) => msg.info.id === activeSteerInput?.info.id)) {
-            selected = { ...selected, user: activeSteerInput.info }
+          const root = turnRoot
+          const selectTurn = (messages: SessionV1.WithParts[]) => {
+            const latest = MessageV2.latest(messages, selection)
+            if (root.noReply === true && !completedInputIDs.has(root.id)) return { ...latest, user: root }
+            if (activeSteerInput && messages.some((msg) => msg.info.id === activeSteerInput?.info.id))
+              return { ...latest, user: activeSteerInput.info }
+            return latest
           }
+          let selected = selectTurn(msgs)
           const previousTurnID = activeSteerInput?.info.id ?? activeInputTurn?.info.id ?? turnRoot.id
           if (selected.user && selected.user.id !== previousTurnID) {
             markAnsweredInputs(msgs, previousTurnID)
-            selected = MessageV2.latest(msgs, selection)
-            if (activeSteerInput && msgs.some((msg) => msg.info.id === activeSteerInput?.info.id)) {
-              selected = { ...selected, user: activeSteerInput.info }
-            }
+            selected = selectTurn(msgs)
           }
           if (!selected.user) return "stop" as const
           msgs = projectTurn(msgs)
-          selected = MessageV2.latest(msgs, selection)
-          if (activeSteerInput && msgs.some((msg) => msg.info.id === activeSteerInput?.info.id)) {
-            selected = { ...selected, user: activeSteerInput.info }
-          }
+          selected = selectTurn(msgs)
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = selected
 
           if (!lastUser) return "stop" as const
@@ -1491,7 +1491,9 @@ const layer = Layer.effect(
             sessionID,
           }
           const claims = msgs.flatMap((item) =>
-            item.info.role === "user" && item.info.noReply !== true && !claimedInputIDs.has(item.info.id)
+            item.info.role === "user" &&
+            !claimedInputIDs.has(item.info.id) &&
+            (item.info.noReply !== true || item.info.id === turnRoot?.id)
               ? [item.info.id]
               : [],
           )

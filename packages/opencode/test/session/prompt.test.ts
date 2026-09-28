@@ -736,7 +736,7 @@ it.instance("imports successive message batches with one persisted session admis
   }),
 )
 
-it.instance("keeps noReply bookkeeping out of active and rootless provider turns", () =>
+it.instance("keeps admit-only input out of automatic turns and preserves explicit and real prompts", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
@@ -745,8 +745,7 @@ it.instance("keeps noReply bookkeeping out of active and rootless provider turns
     const response = yield* Deferred.make<void>()
     yield* llm.push(
       reply().wait(deferredAsPromise(response)).text("task finished").stop().item(),
-      reply().text("unexpected noReply turn").stop().item(),
-      reply().text("unexpected rootless noReply turn").stop().item(),
+      reply().text("rootless bookkeeping reminder handled").stop().item(),
     )
 
     const run = yield* prompt
@@ -772,18 +771,50 @@ it.instance("keeps noReply bookkeeping out of active and rootless provider turns
     yield* Deferred.succeed(response, void 0)
     yield* awaitWithTimeout(Fiber.await(run), "active task did not finish", "10 seconds")
     expect(yield* llm.calls).toBe(1)
+    expect((yield* MessageV2.admission(active.id)).claimed.has(reminder.info.id)).toBe(false)
 
     const rootless = yield* sessions.create({ title: "No reply rootless turn" })
-    yield* prompt.prompt({
+    const rootlessReminder = yield* prompt.prompt({
       sessionID: rootless.id,
       agent: "build",
       model: ref,
       noReply: true,
       parts: [{ type: "text", text: "rootless bookkeeping reminder" }],
     })
-    yield* prompt.loop({ sessionID: rootless.id })
+    if (rootlessReminder.info.role !== "user") throw new Error("expected an admit-only user message")
     expect(yield* llm.calls).toBe(1)
+    const loop = yield* prompt.loop({ sessionID: rootless.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(2), "explicit loop did not answer the admit-only input", "10 seconds")
+    const request = (yield* llm.inputs)[1]
+    if (!request) throw new Error("expected the explicit rootless provider request")
+    expect(lastUserContent(request)).toContain("rootless bookkeeping reminder")
+    expect((yield* MessageV2.admission(rootless.id)).claimed.has(rootlessReminder.info.id)).toBe(true)
+    expect(
+      Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(loop), "explicit rootless loop did not finish", "10 seconds")),
+    ).toBe(true)
+    expect(yield* llm.calls).toBe(2)
+
+    const realID = MessageID.make("msg_real_prompt_after_no_reply")
+    yield* llm.text("real prompt handled")
+    const real = yield* prompt
+      .prompt({
+        sessionID: rootless.id,
+        messageID: realID,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "real prompt after bookkeeping" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(3), "real prompt after bookkeeping did not reach the provider", "10 seconds")
+    const realRequest = (yield* llm.inputs)[2]
+    if (!realRequest) throw new Error("expected the real prompt provider request")
+    expect(lastUserContent(realRequest)).toContain("real prompt after bookkeeping")
+    expect(
+      Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(real), "real prompt did not finish", "10 seconds")),
+    ).toBe(true)
+    expect(yield* llm.calls).toBe(3)
   }),
+  60_000,
 )
 
 firstLoadPrompt.instance(

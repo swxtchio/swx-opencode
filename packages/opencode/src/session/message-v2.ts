@@ -609,6 +609,7 @@ export function latest(
   options: {
     completedUserIDs?: ReadonlySet<MessageID>
     admissionOrder: ReadonlyMap<MessageID, number>
+    excludeNoReply?: boolean
   },
 ) {
   let user: User | undefined
@@ -618,7 +619,7 @@ export function latest(
     const info = msg.info
     if (
       info.role === "user" &&
-      info.noReply !== true &&
+      (!options.excludeNoReply || info.noReply !== true) &&
       !options.completedUserIDs?.has(info.id) &&
       isLater(info, user, options.admissionOrder)
     )
