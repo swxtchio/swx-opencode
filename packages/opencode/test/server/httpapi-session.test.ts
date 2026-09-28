@@ -4,7 +4,7 @@ import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { Cause, Config, Effect, Exit, Layer } from "effect"
+import { Cause, Config, Effect, Exit, Fiber, Layer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -36,7 +36,7 @@ import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideInstanceEffect, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
-import { pollWithTimeout, testEffect } from "../lib/effect"
+import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 
 const originalWorkspaces = Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
 const noopBootstrapLayer = Layer.succeed(
@@ -425,6 +425,114 @@ describe("session HttpApi", () => {
         root: sessionDirectory,
       })
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  )
+
+  it.live(
+    "summarize runs its queued rootless loop from the latest persisted input",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({
+          git: true,
+          config: () => ({ ...testProviderConfig(llm.url), shell: "/bin/sh" }),
+        })
+        const session = yield* createSession({ title: "queued summarize root" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const admitNoReply = (text: string) =>
+          request(pathFor(SessionPaths.promptAsync, { sessionID: session.id }), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              noReply: true,
+              parts: [{ type: "text", text }],
+            }),
+          }).pipe(
+            Effect.flatMap((response) => {
+              expect(response.status).toBe(204)
+              return pollWithTimeout(
+                requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, { sessionID: session.id }), {
+                  headers,
+                }).pipe(
+                  Effect.map((messages) =>
+                    messages.find(
+                      (message) =>
+                        message.info.role === "user" &&
+                        message.parts.some((part) => part.type === "text" && part.text === text),
+                    ),
+                  ),
+                ),
+                `HTTP prompt_async did not persist ${text}`,
+                "10 seconds",
+              )
+            }),
+          )
+
+        const startedFile = path.join(directory, ".http-summarize-started")
+        const shell = yield* request(pathFor(SessionPaths.shell, { sessionID: session.id }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            command: `printf started > "${startedFile}"; sleep 15`,
+          }),
+        }).pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          Effect.promise(async () => (await Bun.file(startedFile).exists()) || undefined),
+          "HTTP shell did not start",
+          "10 seconds",
+        )
+
+        yield* llm.text("latest persisted input handled")
+        const summarize = yield* request(pathFor(SessionPaths.summarize, { sessionID: session.id }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ providerID: "test", modelID: "test-model", auto: false }),
+        }).pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, { sessionID: session.id }), {
+            headers,
+          }).pipe(
+            Effect.map((messages) =>
+              messages.find(
+                (message) => message.info.role === "user" && message.parts.some((part) => part.type === "compaction"),
+              ),
+            ),
+          ),
+          "HTTP summarize did not persist its compaction input",
+          "10 seconds",
+        )
+        yield* Effect.sleep("100 millis")
+        expect(summarize.pollUnsafe()).toBeUndefined()
+
+        const latest = yield* admitNoReply("latest persisted summarize root")
+        if (latest.info.role !== "user") throw new Error("expected the latest persisted user input")
+        expect(yield* llm.inputs).toHaveLength(0)
+
+        const summarizeResponse = yield* awaitWithTimeout(
+          Fiber.join(summarize),
+          "HTTP summarize did not finish after the shell released",
+          "30 seconds",
+        )
+        expect(summarizeResponse.status).toBe(200)
+        expect(yield* json<boolean>(summarizeResponse)).toBe(true)
+        const shellResponse = yield* awaitWithTimeout(Fiber.join(shell), "HTTP shell did not finish", "10 seconds")
+        expect(shellResponse.status).toBe(200)
+
+        const messages = yield* requestJson<SessionV1.WithParts[]>(
+          pathFor(SessionPaths.messages, { sessionID: session.id }),
+          { headers },
+        )
+        const assistant = messages.findLast(
+          (message) => message.info.role === "assistant" && message.info.parentID === latest.info.id,
+        )
+        expect(assistant?.info.role).toBe("assistant")
+        expect(assistant?.info.role === "assistant" ? assistant.info.summary : undefined).toBeUndefined()
+        expect(JSON.stringify(yield* llm.inputs)).toContain("latest persisted summarize root")
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    60_000,
   )
 
   it.instance(
