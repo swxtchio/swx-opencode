@@ -32,6 +32,7 @@ import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
 import { errorMessage } from "@/util/error"
 import { isMedia } from "@/util/media"
+import { isContextOverflow } from "@opencode-ai/llm"
 import type { SystemError } from "bun"
 import type { Provider } from "@/provider/provider"
 import { Effect, Schema } from "effect"
@@ -706,6 +707,8 @@ export function fromError(
         },
         { cause: e },
       ).toObject()
+    case e instanceof Error && isContextOverflow(e.message):
+      return new ContextOverflowError({ message: e.message }, { cause: e }).toObject()
     case e instanceof Error:
       return new NamedError.Unknown({ message: errorMessage(e) }, { cause: e }).toObject()
     default:
