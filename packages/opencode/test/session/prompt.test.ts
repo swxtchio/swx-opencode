@@ -265,9 +265,12 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 // holds the next Session.findMessage call, which is the finishing run's
 // lastAssistant read; `nextEnsureRunning` resolves once the next caller of
 // SessionRunState.ensureRunning has joined or started a run, and records which.
+// With `hold`, that caller also waits after its run ends, as a slow one would.
 const gates = {
   finishingRead: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
-  nextEnsureRunning: undefined as undefined | { reached: Deferred.Deferred<void>; startedRun: boolean },
+  nextEnsureRunning: undefined as
+    | undefined
+    | { reached: Deferred.Deferred<void>; startedRun: boolean; hold?: Deferred.Deferred<void> },
   // Holds a compaction between its summary and its continue message.
   compactionContinue: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
 }
@@ -327,7 +330,9 @@ const gatedRunState = LayerNode.make({
               )
               .pipe(Effect.forkChild({ startImmediately: true }))
             yield* Deferred.succeed(marked.reached, undefined)
-            return yield* Fiber.join(call)
+            const result = yield* Fiber.join(call)
+            if (marked.hold) yield* Deferred.await(marked.hold)
+            return result
           }),
       })
     }),
@@ -2364,78 +2369,215 @@ gated.instance(
   15_000,
 )
 
+// Reply routing: every caller shape, asserting the assistant each caller got
+// back. A turn's reply is its final message, which the prompt that began it and
+// every steer that joined it share; a queued prompt's turn is its own.
+
+// The user message a prompt became, once it has; a steer sent during a step is
+// then known to be part of that step's history.
+const asked = (sessionID: SessionID, text: string) =>
+  pollWithTimeout(
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      return (yield* sessions.messages({ sessionID })).find(
+        (msg) => msg.info.role === "user" && msg.parts.some((part) => part.type === "text" && part.text === text),
+      )?.info.id
+    }),
+    `prompt "${text}" never became a message`,
+  )
+
+const answered = (
+  reply: SessionV1.WithParts | undefined,
+): { parentID: string; texts: string[]; error?: string } | undefined =>
+  reply?.info.role === "assistant"
+    ? {
+        parentID: reply.info.parentID,
+        texts: reply.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])),
+        error: reply.info.error?.name,
+      }
+    : undefined
+
 it.instance(
-  "a tool-step turn steered by later prompts: its caller and the steers share the turn's final reply, and each queued caller gets its own turn's",
+  "a plain text turn steered mid-turn: its caller and both steers get the turn's final reply, not the step they overtook",
   () =>
     Effect.gen(function* () {
-      const { llm, sessions, chat, task, send, release } = yield* startHeld({ tool: true })
-      yield* llm.text("steer answer")
-      yield* llm.text("queued answer")
-      yield* llm.text("last answer")
+      const { llm, chat, task, send, release } = yield* startHeld()
+      yield* llm.text("steered reply")
+      yield* llm.text("queued reply")
 
       const held = yield* send("queued behind the turn", { delivery: "queue" })
-      yield* admitted(chat.id, "queued behind the turn")
-      const last = yield* send("queued last", { delivery: "queue" })
-      yield* admitted(chat.id, "queued last")
+      yield* queued(chat.id, 1)
       const first = yield* send("first steer")
-      yield* admitted(chat.id, "first steer")
+      yield* asked(chat.id, "first steer")
       const second = yield* send("second steer")
-      yield* admitted(chat.id, "second steer")
+      yield* asked(chat.id, "second steer")
       yield* release
-      const [original, firstReply, secondReply, queuedReply, lastReply] = yield* finish(task, first, second, held, last)
+      const [original, older, newer, queuedReply] = yield* finish(task, first, second, held)
 
-      const inputs = yield* llm.inputs
-      expect(inputs).toHaveLength(4)
-      expect(lastUser(inputs[1])).toEqual({ role: "user", content: "second steer" })
-      expect(lastUser(inputs[2])).toEqual({ role: "user", content: "queued behind the turn" })
-      const messages = yield* sessions.messages({ sessionID: chat.id })
-      const asked = (text: string) =>
-        messages.find(
-          (msg) => msg.info.role === "user" && msg.parts.some((part) => part.type === "text" && part.text === text),
-        )?.info.id
-      const texts = (reply: SessionV1.WithParts | undefined) =>
-        reply?.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))
-      // The task's caller does not stop at its tool-call step: the turn it began
-      // ends with the reply to the steers, which it shares with them.
-      for (const reply of [original, firstReply, secondReply]) {
-        expect(reply?.info.role === "assistant" ? [reply.info.finish, reply.info.parentID] : undefined).toEqual([
-          "stop",
-          asked("second steer"),
-        ])
-        expect(texts(reply)).toEqual(["steer answer"])
-      }
-      expect(queuedReply?.info.role === "assistant" ? queuedReply.info.parentID : undefined).toBe(
-        asked("queued behind the turn"),
-      )
-      // The drain's final message answers the last queued caller, not this one.
-      expect(texts(queuedReply)).toEqual(["queued answer"])
-      expect(texts(lastReply)).toEqual(["last answer"])
+      expect(yield* llm.calls).toBe(3)
+      const turn = { parentID: yield* asked(chat.id, "second steer"), texts: ["steered reply"], error: undefined }
+      expect([original, older, newer].map(answered)).toEqual([turn, turn, turn])
+      expect(answered(queuedReply)).toEqual({
+        parentID: yield* asked(chat.id, "queued behind the turn"),
+        texts: ["queued reply"],
+        error: undefined,
+      })
     }),
   15_000,
 )
 
 it.instance(
-  "two steers promoted into one run get an assistant reply, never their own user message",
+  "a plain text turn steered mid-turn whose continuation errors: every caller gets the errored reply",
   () =>
     Effect.gen(function* () {
       const { llm, chat, task, send, release } = yield* startHeld()
-      yield* llm.text("steered reply")
+      yield* llm.error(400, { error: { message: "rejected by the provider" } })
 
       const first = yield* send("first steer")
-      yield* admitted(chat.id, "first steer")
+      yield* asked(chat.id, "first steer")
       const second = yield* send("second steer")
-      yield* admitted(chat.id, "second steer")
+      yield* asked(chat.id, "second steer")
       yield* release
-      const [, older, newer] = yield* finish(task, first, second)
+      const replies = yield* finish(task, first, second)
 
-      const inputs = yield* llm.inputs
-      expect(inputs).toHaveLength(2)
-      expect(mentions(inputs[1], "first steer")).toBe(true)
-      expect(lastUser(inputs[1])).toEqual({ role: "user", content: "second steer" })
-      for (const answer of [older, newer]) {
-        expect(answer?.info.role).toBe("assistant")
-        expect(answer?.parts.some((part) => part.type === "text" && part.text === "steered reply")).toBe(true)
+      expect(yield* llm.calls).toBe(2)
+      const turn = { parentID: yield* asked(chat.id, "second steer"), texts: [], error: "APIError" }
+      expect(replies.map(answered)).toEqual([turn, turn, turn])
+    }),
+  15_000,
+)
+
+it.instance(
+  "a multi-step tool turn steered mid-turn: its caller and the steer get the turn's final reply",
+  () =>
+    Effect.gen(function* () {
+      const { llm, chat, task, send, release } = yield* startHeld({ tool: true })
+      const step = yield* Deferred.make<void>()
+      yield* llm.hold("task done", deferredAsPromise(step))
+      yield* llm.text("steered reply")
+      yield* llm.text("queued reply")
+
+      const held = yield* send("queued behind the turn", { delivery: "queue" })
+      yield* queued(chat.id, 1)
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "the tool turn never took its second step", "10 seconds")
+      const steer = yield* send("steer mid-turn")
+      yield* asked(chat.id, "steer mid-turn")
+      yield* Deferred.succeed(step, void 0)
+      const [original, steered, queuedReply] = yield* finish(task, steer, held)
+
+      expect(yield* llm.calls).toBe(4)
+      const turn = { parentID: yield* asked(chat.id, "steer mid-turn"), texts: ["steered reply"], error: undefined }
+      expect([original, steered].map(answered)).toEqual([turn, turn])
+      expect(answered(queuedReply)).toEqual({
+        parentID: yield* asked(chat.id, "queued behind the turn"),
+        texts: ["queued reply"],
+        error: undefined,
+      })
+    }),
+  15_000,
+)
+
+it.instance(
+  "a queued caller joining an active run gets its own turn's final reply, and the task's caller keeps its own",
+  () =>
+    Effect.gen(function* () {
+      const { llm, chat, task, send, release } = yield* startHeld()
+      const step = yield* Deferred.make<void>()
+      yield* llm.hold("queued step", deferredAsPromise(step))
+      yield* llm.text("steered reply")
+
+      const held = yield* send("queued behind the task", { delivery: "queue" })
+      yield* queued(chat.id, 1)
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "the queued turn never started", "10 seconds")
+      const steer = yield* send("steer into the queued turn")
+      yield* asked(chat.id, "steer into the queued turn")
+      yield* Deferred.succeed(step, void 0)
+      const [original, queuedReply, steered] = yield* finish(task, held, steer)
+
+      expect(yield* llm.calls).toBe(3)
+      expect(answered(original)).toEqual({
+        parentID: yield* asked(chat.id, "start the task"),
+        texts: ["task done"],
+        error: undefined,
+      })
+      const turn = {
+        parentID: yield* asked(chat.id, "steer into the queued turn"),
+        texts: ["steered reply"],
+        error: undefined,
       }
+      expect([queuedReply, steered].map(answered)).toEqual([turn, turn])
+    }),
+  15_000,
+)
+
+gated.instance(
+  "a turn that stops answers its callers then, so one slow to collect never gets a later turn's reply",
+  () =>
+    Effect.gen(function* () {
+      const { llm, chat, task, send, release } = yield* startHeld()
+      const stop = yield* Deferred.make<void>()
+      yield* llm.push(reply().wait(deferredAsPromise(stop)).contentFilter())
+      yield* llm.text("after the stop")
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (gates.nextEnsureRunning = undefined)))
+
+      // A steer the stopping turn carries; its caller is slow to collect once its run ends.
+      const slow = { reached: yield* Deferred.make<void>(), startedRun: false, hold: yield* Deferred.make<void>() }
+      gates.nextEnsureRunning = slow
+      const steer = yield* send("steer into the stop")
+      yield* awaitWithTimeout(Deferred.await(slow.reached), "the steer never joined the running turn")
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "the steered step never started", "10 seconds")
+      // Sent after the stopping step's history read, so it gets a turn of its own.
+      const late = yield* send("sent before the stop")
+      yield* asked(chat.id, "sent before the stop")
+      yield* Deferred.succeed(stop, void 0)
+      const [original, lateReply] = yield* finish(task, late)
+      yield* Deferred.succeed(slow.hold, void 0)
+      const [steered] = yield* finish(steer)
+
+      expect(yield* llm.calls).toBe(3)
+      const stopped = { parentID: yield* asked(chat.id, "steer into the stop"), texts: [], error: "ContentFilterError" }
+      expect([original, steered].map(answered)).toEqual([stopped, stopped])
+      expect(answered(lateReply)).toEqual({
+        parentID: yield* asked(chat.id, "sent before the stop"),
+        texts: ["after the stop"],
+        error: undefined,
+      })
+    }),
+  15_000,
+)
+
+gated.instance(
+  "a cancelled turn answers its callers as it stops, so one slow to collect never gets the next turn's reply",
+  () =>
+    Effect.gen(function* () {
+      const { llm, prompt, chat, task, send, release } = yield* startHeld()
+      yield* llm.hold("never finished", new Promise(() => {}))
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (gates.nextEnsureRunning = undefined)))
+
+      const slow = { reached: yield* Deferred.make<void>(), startedRun: false, hold: yield* Deferred.make<void>() }
+      gates.nextEnsureRunning = slow
+      const steer = yield* send("steer into the cancelled turn")
+      yield* awaitWithTimeout(Deferred.await(slow.reached), "the steer never joined the running turn")
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "the steered step never started", "10 seconds")
+      yield* prompt.cancel(chat.id)
+      const [original] = yield* finish(task)
+
+      yield* llm.text("wake reply")
+      const woken = yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("wake up") })
+      yield* Deferred.succeed(slow.hold, void 0)
+      const [steered] = yield* finish(steer)
+
+      const cancelled = {
+        parentID: yield* asked(chat.id, "steer into the cancelled turn"),
+        texts: [],
+        error: "MessageAbortedError",
+      }
+      expect([original, steered].map(answered)).toEqual([cancelled, cancelled])
+      expect(answered(woken)).toEqual({ parentID: yield* asked(chat.id, "wake up"), texts: ["wake reply"], error: undefined })
     }),
   15_000,
 )
