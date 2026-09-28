@@ -27,6 +27,8 @@ const reapGrace = Duration.toMillis(Duration.days(7))
 const reapLockLimit = 16
 const reapFailureLimit = 3
 const reapRetryInterval = Duration.toMillis(Duration.days(1))
+const trackLockWaitMillis = Duration.toMillis(Duration.millis(100))
+const gcLockWaitMillis = Duration.toMillis(Duration.seconds(2))
 const limit = 2 * 1024 * 1024
 const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
 const cfg = ["-c", "core.autocrlf=false", ...core]
@@ -187,15 +189,6 @@ const layer: Layer.Layer<
         const read = (file: string) => fs.readFileString(file).pipe(Effect.catch(() => Effect.succeed("")))
         const remove = (file: string) => fs.remove(file).pipe(Effect.catch(() => Effect.void))
         const locked = <A, E, R>(fx: Effect.Effect<A, E, R>) => lock(state.gitdir).withPermits(1)(fx)
-        const removeRepoLock = Effect.fnUntraced(function* (file: string) {
-          yield* fs.remove(file, { force: true }).pipe(Effect.orDie)
-          const directory = path.dirname(file)
-          const entries = yield* fs.readDirectoryEntries(directory).pipe(
-            Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed([] as FSUtil.DirEntry[])),
-            Effect.orDie,
-          )
-          if (!entries.length) yield* fs.remove(directory, { recursive: true, force: true }).pipe(Effect.orDie)
-        })
         const evidenceFile = (gitdir: string) => path.join(gitdir, "info", "opencode-worktree.json")
         const evidence = (gitdir: string) => read(evidenceFile(gitdir)).pipe(Effect.map(decodeWorktreeEvidence))
         const saveEvidence = (gitdir: string, value: typeof WorktreeEvidence.Type) =>
@@ -407,7 +400,6 @@ const layer: Layer.Layer<
                       const repoLock = path.join(root, "locks", project.name, `${repo.name}.lock`)
                       const attempt = yield* maintenance.withLocks(
                         [
-                          { role: "box", file: path.join(root, "gc.lock") },
                           { role: "repo", file: repoLock },
                           { role: "local", semaphore: lock(gitdir) },
                         ],
@@ -484,7 +476,6 @@ const layer: Layer.Layer<
                               force: true,
                             })
                             .pipe(Effect.orDie)
-                          yield* removeRepoLock(repoLock)
                           return true
                         }),
                       )
@@ -508,15 +499,12 @@ const layer: Layer.Layer<
           const completion = path.join(root, `gc-completed-${state.project}-${repo}.timestamp`)
           yield* maintenance.withLocks(
             [
-              { role: "box", file: path.join(root, "gc.lock") },
+              { role: "box", file: path.join(root, "gc.lock"), waitMillis: gcLockWaitMillis },
               { role: "repo", file: repoLock },
               { role: "local", semaphore: lock(state.gitdir) },
             ],
             Effect.gen(function* () {
-              if (!(yield* exists(state.gitdir))) {
-                yield* removeRepoLock(repoLock)
-                return
-              }
+              if (!(yield* exists(state.gitdir))) return
 
               const now = yield* maintenance.now
               const text = yield* fs.readFileString(completion).pipe(
@@ -561,44 +549,44 @@ const layer: Layer.Layer<
           if (!(yield* enabled())) return
           const attempt = yield* maintenance.withLocks(
             [
-              { role: "box", file: path.join(global.data, "snapshot", "gc.lock") },
               {
                 role: "repo",
                 file: path.join(global.data, "snapshot", "locks", state.project, `${Hash.fast(state.worktree)}.lock`),
+                waitMillis: trackLockWaitMillis,
               },
               { role: "local", semaphore: lock(state.gitdir) },
             ],
-              Effect.gen(function* () {
-                const existed = yield* exists(state.gitdir)
-                yield* fs.ensureDir(state.gitdir).pipe(Effect.orDie)
-                yield* fs.ensureDir(path.join(state.gitdir, "info")).pipe(Effect.orDie)
-                yield* saveEvidence(state.gitdir, {
-                  version: 1,
-                  project: state.project,
-                  worktree: state.worktree,
+            Effect.gen(function* () {
+              const existed = yield* exists(state.gitdir)
+              yield* fs.ensureDir(state.gitdir).pipe(Effect.orDie)
+              yield* fs.ensureDir(path.join(state.gitdir, "info")).pipe(Effect.orDie)
+              yield* saveEvidence(state.gitdir, {
+                version: 1,
+                project: state.project,
+                worktree: state.worktree,
+              })
+              if (!existed) {
+                yield* git(["init"], {
+                  env: { GIT_DIR: state.gitdir, GIT_WORK_TREE: state.worktree },
                 })
-                if (!existed) {
-                  yield* git(["init"], {
-                    env: { GIT_DIR: state.gitdir, GIT_WORK_TREE: state.worktree },
-                  })
-                  yield* git(["--git-dir", state.gitdir, "config", "core.autocrlf", "false"])
-                  yield* git(["--git-dir", state.gitdir, "config", "core.longpaths", "true"])
-                  yield* git(["--git-dir", state.gitdir, "config", "core.symlinks", "true"])
-                  yield* git(["--git-dir", state.gitdir, "config", "core.fsmonitor", "false"])
-                  // Tuning for very large worktrees so the first add stays bounded.
-                  yield* git(["--git-dir", state.gitdir, "config", "feature.manyFiles", "true"])
-                  yield* git(["--git-dir", state.gitdir, "config", "index.version", "4"])
-                  yield* git(["--git-dir", state.gitdir, "config", "index.threads", "true"])
-                  yield* git(["--git-dir", state.gitdir, "config", "core.untrackedCache", "true"])
-                  yield* seed()
-                  yield* Effect.logInfo("initialized")
-                }
-                yield* add()
-                const result = yield* git(args(["write-tree"]), { cwd: state.directory })
-                const hash = result.text.trim()
-                yield* Effect.logInfo("tracking", { hash, cwd: state.directory, git: state.gitdir })
-                return hash
-              }),
+                yield* git(["--git-dir", state.gitdir, "config", "core.autocrlf", "false"])
+                yield* git(["--git-dir", state.gitdir, "config", "core.longpaths", "true"])
+                yield* git(["--git-dir", state.gitdir, "config", "core.symlinks", "true"])
+                yield* git(["--git-dir", state.gitdir, "config", "core.fsmonitor", "false"])
+                // Tuning for very large worktrees so the first add stays bounded.
+                yield* git(["--git-dir", state.gitdir, "config", "feature.manyFiles", "true"])
+                yield* git(["--git-dir", state.gitdir, "config", "index.version", "4"])
+                yield* git(["--git-dir", state.gitdir, "config", "index.threads", "true"])
+                yield* git(["--git-dir", state.gitdir, "config", "core.untrackedCache", "true"])
+                yield* seed()
+                yield* Effect.logInfo("initialized")
+              }
+              yield* add()
+              const result = yield* git(args(["write-tree"]), { cwd: state.directory })
+              const hash = result.text.trim()
+              yield* Effect.logInfo("tracking", { hash, cwd: state.directory, git: state.gitdir })
+              return hash
+            }),
           )
           if (attempt.status === "acquired") return attempt.value
         })

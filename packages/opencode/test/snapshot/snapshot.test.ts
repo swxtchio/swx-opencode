@@ -327,6 +327,14 @@ const busyTrack = { busy: false, repoFile: "" }
 const busyTrackHarness = makeMaintenanceHarness({
   tryLock: (file) => !busyTrack.busy || file !== busyTrack.repoFile,
 })
+const boundedTrack = { repoFile: "", attempts: 0 }
+const boundedTrackHarness = makeMaintenanceHarness({
+  tryLock: (file) => {
+    if (file !== boundedTrack.repoFile) return true
+    boundedTrack.attempts++
+    return boundedTrack.attempts > 1
+  },
+})
 const bodyFailure = { reads: 0 }
 const bodyFailureHarness = makeMaintenanceHarness({
   config: TestConfig.layer({
@@ -336,7 +344,7 @@ const bodyFailureHarness = makeMaintenanceHarness({
 })
 const lockFailure = { fail: false }
 const lockFailureHarness = makeMaintenanceHarness({
-  lockError: (request) => lockFailure.fail && request.role === "box",
+  lockError: () => lockFailure.fail,
 })
 const inLockGraceRace = { gitdir: "", worktree: "", since: 0 }
 const inLockGraceHarness = makeMaintenanceHarness({
@@ -355,13 +363,14 @@ const inLockGraceHarness = makeMaintenanceHarness({
     )
   },
 })
-const lockOrder = { entered: deferred(), gate: deferred(), armed: false }
+const lockOrder = { started: deferred(), gate: deferred() }
 const lockOrderHarness = makeMaintenanceHarness({
-  beforeLock: (file) => {
-    if (!lockOrder.armed || path.basename(file) !== "gc.lock") return Effect.void
-    lockOrder.entered.resolve()
-    return Effect.promise(() => lockOrder.gate.promise)
-  },
+  run: () =>
+    Effect.promise(async () => {
+      lockOrder.started.resolve()
+      await lockOrder.gate.promise
+      return { exitCode: 0, stderr: "" }
+    }),
 })
 const cleanupRace = {
   lockAttempts: 0,
@@ -424,6 +433,7 @@ const fixtureRoots = [
   traversalHarness.data,
   realLockData,
   busyTrackHarness.data,
+  boundedTrackHarness.data,
   bodyFailureHarness.data,
   lockFailureHarness.data,
   inLockGraceHarness.data,
@@ -435,6 +445,7 @@ const lockOrderIt = lockOrderHarness.it
 const concurrencyIt = concurrencyHarness.it
 const sameRepoIt = sameRepoHarness.it
 const busyTrackIt = busyTrackHarness.it
+const boundedTrackIt = boundedTrackHarness.it
 const bodyFailureIt = bodyFailureHarness.it
 const lockFailureIt = lockFailureHarness.it
 const inLockGraceIt = inLockGraceHarness.it
@@ -450,6 +461,8 @@ const MIXED_BATCH_GROUP_COUNT = Math.ceil(OVER_BATCH_COUNT / 4)
 afterEach(async () => {
   busyTrack.busy = false
   busyTrack.repoFile = ""
+  boundedTrack.repoFile = ""
+  boundedTrack.attempts = 0
   cleanupRace.gate.resolve()
   sameRepoRace.gate.resolve()
   lockOrder.gate.resolve()
@@ -469,6 +482,7 @@ afterEach(async () => {
     scheduleHarness,
     reapHarness,
     busyTrackHarness,
+    boundedTrackHarness,
     bodyFailureHarness,
     lockFailureHarness,
     inLockGraceHarness,
@@ -505,9 +519,8 @@ afterEach(async () => {
   sameRepoRace.started = deferred()
   sameRepoRace.contender = deferred()
   sameRepoRace.gate = deferred()
-  lockOrder.entered = deferred()
+  lockOrder.started = deferred()
   lockOrder.gate = deferred()
-  lockOrder.armed = false
 })
 
 const snapshotGitdir = async (data: string, worktree: string) => {
@@ -680,6 +693,12 @@ maintenanceLockIt.live(
       [],
     ] satisfies LockRequest[][]
 
+    const repoOnly = yield* maintenance.withLocks(
+      [{ role: "repo", file: path.join(dir, "repo-only.lock") }],
+      Effect.succeed("repo-owned work"),
+    )
+    expect(repoOnly).toEqual({ status: "acquired", value: "repo-owned work" })
+
     for (const locks of invalid) {
       const result = yield* Effect.exit(maintenance.withLocks(locks, Effect.void))
       expect(Exit.isFailure(result)).toBe(true)
@@ -820,13 +839,34 @@ busyTrackIt.live(
 
     expect(hash).toBeUndefined()
     expect(after.missingSince).toBe(123)
-    expect(busyTrackHarness.lockCalls.slice(beforeTrack)).toEqual([
-      path.join(busyTrackHarness.data, "snapshot", "gc.lock"),
-      repoLockFile(busyTrackHarness.data, gitdir),
-    ])
+    const attempts = busyTrackHarness.lockCalls.slice(beforeTrack)
+    expect(attempts.length).toBeGreaterThan(1)
+    expect(attempts.every((file) => file === repoLockFile(busyTrackHarness.data, gitdir))).toBe(true)
     expect(logged).toEqual([])
   }),
   { timeout: 10_000 },
+)
+
+boundedTrackIt.live(
+  "retries a briefly contended repo lease within track's bound",
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped({ git: true })
+    const snapshot = yield* Snapshot.Service
+    yield* snapshot.track().pipe(provideInstance(dir))
+    const gitdir = yield* Effect.promise(() => snapshotGitdir(boundedTrackHarness.data, dir))
+    boundedTrack.repoFile = repoLockFile(boundedTrackHarness.data, gitdir)
+    boundedTrack.attempts = 0
+
+    const hash = yield* awaitWithTimeout(
+      snapshot.track().pipe(provideInstance(dir)),
+      "tracking did not finish after the repo lease became available",
+      "2 seconds",
+    )
+
+    expect(hash).toBeTruthy()
+    expect(boundedTrack.attempts).toBe(2)
+    expect(boundedTrackHarness.lockCalls.slice(-2)).toEqual([boundedTrack.repoFile, boundedTrack.repoFile])
+  }),
 )
 
 lockFailureIt.live(
@@ -939,21 +979,20 @@ realLockIt.live(
           )
           yield* Effect.sleep(Duration.millis(100))
           expect(realLockCalls).toEqual([])
-          yield* awaitWithTimeout(Fiber.join(one), "first cleanup waited on the contended box lock", "2 seconds")
-          yield* awaitWithTimeout(Fiber.join(two), "second cleanup waited on the contended box lock", "2 seconds")
           holder.stdin.end()
           yield* awaitWithTimeout(Effect.promise(() => holder.exited), "gc lock holder did not exit", "2 seconds")
-          const retry = yield* Effect.forkScoped(snapshot.cleanup().pipe(provideInstance(first)))
           yield* awaitWithTimeout(
             Effect.promise(() => realLockGc.started.promise),
-            "cleanup did not retry after the box lock holder exited",
+            "first cleanup did not start after the box lock holder exited",
             "2 seconds",
           )
+          yield* Effect.sleep(Duration.millis(100))
           expect(realLockCalls).toHaveLength(1)
           expect(realLockGc.maxActive).toBe(1)
           realLockGc.gate.resolve()
-          yield* awaitWithTimeout(Fiber.join(retry), "gc retry stayed behind the released lock", "2 seconds")
-          expect(realLockCalls).toHaveLength(1)
+          yield* awaitWithTimeout(Fiber.join(one), "first cleanup stayed behind box admission", "2 seconds")
+          yield* awaitWithTimeout(Fiber.join(two), "second cleanup stayed behind box admission", "2 seconds")
+          expect(realLockCalls).toHaveLength(2)
           expect(realLockGc.maxActive).toBe(1)
         }),
       (child) =>
@@ -1133,7 +1172,7 @@ gcIt.live(
 )
 
 concurrencyIt.live(
-  "one process admits one of two worktree contexts per box lock attempt",
+  "serializes gc across two worktree contexts sharing one maintenance service",
   Effect.gen(function* () {
     const first = yield* tmpdirScoped({ git: true })
     const second = yield* tmpdirScoped({ git: true })
@@ -1168,26 +1207,23 @@ concurrencyIt.live(
     yield* Fiber.join(one)
     yield* Fiber.join(two)
 
-    expect(concurrencyHarness.calls).toHaveLength(1)
+    expect(concurrencyHarness.calls).toHaveLength(2)
     expect(
       concurrencyHarness.lockCalls
         .slice(beforeConcurrentCleanup)
-        .filter((file) => path.basename(file) === "gc.lock"),
-    ).toHaveLength(2)
+        .filter((file) => path.basename(file) === "gc.lock").length,
+    ).toBeGreaterThanOrEqual(2)
     const firstGitdir = yield* Effect.promise(() => snapshotGitdir(concurrencyHarness.data, first))
     const secondGitdir = yield* Effect.promise(() => snapshotGitdir(concurrencyHarness.data, second))
     const firstCompleted = yield* Effect.promise(() => existsPath(completionFile(concurrencyHarness.data, firstGitdir)))
     const secondCompleted = yield* Effect.promise(() => existsPath(completionFile(concurrencyHarness.data, secondGitdir)))
-    expect(firstCompleted).not.toBe(secondCompleted)
-    yield* snapshot.cleanup().pipe(provideInstance(firstCompleted ? second : first))
-    expect(concurrencyHarness.calls).toHaveLength(2)
-    expect(yield* Effect.promise(() => existsPath(completionFile(concurrencyHarness.data, firstGitdir)))).toBe(true)
-    expect(yield* Effect.promise(() => existsPath(completionFile(concurrencyHarness.data, secondGitdir)))).toBe(true)
+    expect(firstCompleted).toBe(true)
+    expect(secondCompleted).toBe(true)
   }),
 )
 
 sameRepoIt.live(
-  "skips a competing same-repo cleanup and rechecks its completion timestamp on retry",
+  "serializes same-process same-repo cleanup and rechecks completion after box admission",
   Effect.gen(function* () {
     const dir = yield* tmpdirScoped({ git: true })
     const snapshot = yield* Snapshot.Service
@@ -1216,6 +1252,7 @@ sameRepoIt.live(
     )
     yield* Effect.sleep(Duration.millis(50))
     expect(sameRepoHarness.calls).toHaveLength(1)
+    expect(sameRepoRace.lockAttempts).toBeGreaterThan(2)
     expect(sameRepoRace.maxActive).toBe(1)
     sameRepoRace.gate.resolve()
     yield* Fiber.join(one)
@@ -1231,26 +1268,27 @@ sameRepoIt.live(
 )
 
 lockOrderIt.live(
-  "skips tracking while box admission is busy instead of blocking a user request",
+  "tracks a second repo while gc holds the box lock for another repo",
   Effect.gen(function* () {
     const dir = yield* tmpdirScoped({ git: true })
+    const other = yield* tmpdirScoped({ git: true })
     const snapshot = yield* Snapshot.Service
     yield* snapshot.track().pipe(provideInstance(dir))
-    lockOrder.armed = true
+    yield* snapshot.track().pipe(provideInstance(other))
+    lockOrder.started = deferred()
+    lockOrder.gate = deferred()
 
     const cleanup = yield* Effect.forkScoped(snapshot.cleanup().pipe(provideInstance(dir)))
     yield* awaitWithTimeout(
-      Effect.promise(() => lockOrder.entered.promise),
-      "cleanup did not enter box-wide gc admission",
+      Effect.promise(() => lockOrder.started.promise),
+      "cleanup did not enter gc while holding box and repo locks",
       "2 seconds",
     )
-    const tracking = yield* Effect.forkScoped(snapshot.track().pipe(provideInstance(dir)))
-    const hash = yield* awaitWithTimeout(
-      Fiber.join(tracking),
-      "tracking waited behind cleanup instead of skipping its busy repo lease",
-      "2 seconds",
-    )
-    expect(hash).toBeUndefined()
+    const beforeTrack = lockOrderHarness.lockCalls.length
+    const hash = yield* awaitWithTimeout(snapshot.track().pipe(provideInstance(other)), "tracking waited on gc", "2 seconds")
+    expect(hash).toBeTruthy()
+    const otherGitdir = yield* Effect.promise(() => snapshotGitdir(lockOrderHarness.data, other))
+    expect(lockOrderHarness.lockCalls.slice(beforeTrack)).toEqual([repoLockFile(lockOrderHarness.data, otherGitdir)])
     lockOrder.gate.resolve()
     yield* Fiber.join(cleanup)
     expect(lockOrderHarness.calls).toHaveLength(1)
@@ -1372,7 +1410,6 @@ reapIt.live(
     yield* snapshot.cleanup().pipe(provideInstance(dir))
     expect(yield* Effect.promise(() => existsPath(gitdir))).toBe(false)
     expect(yield* Effect.promise(() => existsPath(completion))).toBe(false)
-    expect(yield* Effect.promise(() => existsPath(path.dirname(repoLockFile(reapHarness.data, gitdir))))).toBe(false)
   }),
 )
 

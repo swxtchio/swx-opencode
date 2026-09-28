@@ -2,7 +2,7 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ChildProcess } from "effect/unstable/process"
-import { Cause, Clock, Context, Effect, Layer, Option, Semaphore } from "effect"
+import { Cause, Clock, Context, Duration, Effect, Layer, Option, Semaphore } from "effect"
 import path from "path"
 
 export interface RunInput {
@@ -14,7 +14,7 @@ export interface RunInput {
 export type LockRole = "box" | "repo" | "local"
 
 export type LockRequest =
-  | { readonly role: "box" | "repo"; readonly file: string }
+  | { readonly role: "box" | "repo"; readonly file: string; readonly waitMillis?: number }
   | { readonly role: "local"; readonly semaphore: Semaphore.Semaphore }
 
 export type LockAttempt<A> =
@@ -90,21 +90,16 @@ export const maintenanceNode = LayerNode.make({
   deps: [FSUtil.node, AppProcess.node],
 })
 
-// Keep maintenance admission ahead of repo and local ownership to prevent lock-order cycles.
+// When a path needs box admission, take it before repo and local locks; repo-only work stays independent.
 export function assertLockOrder(locks: readonly LockRequest[]) {
   if (!locks.length) throw new Error("snapshot work requires an acquisition lock")
   const order: readonly LockRole[] = ["box", "repo", "local"]
   let previous = -1
-  let hasBox = false
   let hasRepo = false
   for (const request of locks) {
     const current = order.indexOf(request.role)
     if (current < previous) throw new Error("snapshot locks must be acquired in box, repo, local order")
-    if (request.role === "box") hasBox = true
-    if (request.role === "repo") {
-      if (!hasBox) throw new Error("snapshot repo locks require box admission first")
-      hasRepo = true
-    }
+    if (request.role === "repo") hasRepo = true
     if (request.role === "local" && !hasRepo) throw new Error("snapshot local locks require a repo lock first")
     previous = current
   }
@@ -120,13 +115,24 @@ export function withSnapshotLocks<A, E, R>(
   const acquireAll = Effect.gen(function* () {
     const handles: { readonly request: Extract<LockRequest, { role: "box" | "repo" }>; readonly lease: LockLease }[] = []
     for (const request of files) {
-      const attempt = yield* acquireFile(request).pipe(
-        Effect.map((value) => ({ status: "result" as const, value })),
-        Effect.catch((cause) => Effect.succeed({ status: "failure" as const, cause })),
-      )
-      if (attempt.status === "failure") return { status: "unavailable" as const, handles, request, cause: attempt.cause }
-      if (attempt.value.status === "contended") return { status: "contended" as const, handles }
-      handles.push({ request, lease: attempt.value.lease })
+      const startedAt = request.waitMillis === undefined ? undefined : yield* Clock.currentTimeNanos
+      while (true) {
+        const attempt = yield* acquireFile(request).pipe(
+          Effect.map((value) => ({ status: "result" as const, value })),
+          Effect.catch((cause) => Effect.succeed({ status: "failure" as const, cause })),
+        )
+        if (attempt.status === "failure") {
+          return { status: "unavailable" as const, handles, request, cause: attempt.cause }
+        }
+        if (attempt.value.status === "acquired") {
+          handles.push({ request, lease: attempt.value.lease })
+          break
+        }
+        if (startedAt === undefined) return { status: "contended" as const, handles }
+        const remaining = BigInt(request.waitMillis!) * 1_000_000n - ((yield* Clock.currentTimeNanos) - startedAt)
+        if (remaining <= 0n) return { status: "contended" as const, handles }
+        yield* Effect.sleep(Duration.nanos(remaining < 10_000_000n ? remaining : 10_000_000n))
+      }
     }
     return { status: "acquired" as const, handles }
   })
