@@ -1695,6 +1695,17 @@ const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
+      const rootMessageID =
+        input.messageID ??
+        (yield* Effect.gen(function* () {
+          const messages = yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(
+            Effect.provideService(Database.Service, database),
+          )
+          const admitted = yield* MessageV2.admission(input.sessionID).pipe(
+            Effect.provideService(Database.Service, database),
+          )
+          return MessageV2.latest(messages, { userOrder: (id) => admitted.order.get(id) }).user?.id
+        }))
       const runControl = runControls.get(input.sessionID) ?? {
         cancel: yield* Deferred.make<void>(),
         claimed: new Set<MessageID>(),
@@ -1703,7 +1714,7 @@ const layer = Layer.effect(
       return yield* state.ensureRunning(
         input.sessionID,
         lastAssistant(input.sessionID),
-        runLoop(input.sessionID, input.messageID, runControl),
+        runLoop(input.sessionID, rootMessageID, runControl),
         Deferred.succeed(runControl.cancel, void 0).pipe(Effect.asVoid),
       )
     })

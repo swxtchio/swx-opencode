@@ -450,30 +450,37 @@ function blockingChatMessagePlugin() {
 const admissionPlugin = blockingChatMessagePlugin()
 const admissionPrompt = testEffect(makeHttp({ plugin: admissionPlugin.layer }))
 
-const firstLoadEntered = defer<void>()
-const firstLoadRelease = defer<void>()
-const firstLoadStatuses = new Map<SessionID, SessionStatus.Info>()
-let blockFirstLoad = true
-const firstLoadStatus = Layer.succeed(
-  SessionStatus.Service,
-  SessionStatus.Service.of({
-    get: (sessionID) => Effect.succeed(firstLoadStatuses.get(sessionID) ?? { type: "idle" as const }),
-    list: () => Effect.succeed(new Map(firstLoadStatuses)),
-    set: (sessionID, status) =>
-      Effect.gen(function* () {
-        if (status.type === "idle") {
-          firstLoadStatuses.delete(sessionID)
-          return
-        }
-        firstLoadStatuses.set(sessionID, status)
-        if (status.type !== "busy" || !blockFirstLoad) return
-        blockFirstLoad = false
-        firstLoadEntered.resolve()
-        yield* Effect.promise(() => firstLoadRelease.promise)
-      }),
-  }),
-)
-const firstLoadPrompt = testEffect(makeHttp({ status: firstLoadStatus }))
+function busyStatusGate() {
+  const entered = defer<void>()
+  const release = defer<void>()
+  const statuses = new Map<SessionID, SessionStatus.Info>()
+  let block = true
+  const status = Layer.succeed(
+    SessionStatus.Service,
+    SessionStatus.Service.of({
+      get: (sessionID) => Effect.succeed(statuses.get(sessionID) ?? { type: "idle" as const }),
+      list: () => Effect.succeed(new Map(statuses)),
+      set: (sessionID, value) =>
+        Effect.gen(function* () {
+          if (value.type === "idle") {
+            statuses.delete(sessionID)
+            return
+          }
+          statuses.set(sessionID, value)
+          if (value.type !== "busy" || !block) return
+          block = false
+          entered.resolve()
+          yield* Effect.promise(() => release.promise)
+        }),
+    }),
+  )
+  return { entered, release, status }
+}
+
+const firstLoad = busyStatusGate()
+const firstLoadPrompt = testEffect(makeHttp({ status: firstLoad.status }))
+const rootlessLoopGate = busyStatusGate()
+const rootlessLoopPrompt = testEffect(makeHttp({ status: rootlessLoopGate.status }))
 
 const compactionProcessEntered = defer<void>()
 const compactionProcessRelease = defer<void>()
@@ -781,7 +788,7 @@ firstLoadPrompt.instance(
           })
           .pipe(Effect.forkChild)
         yield* awaitWithTimeout(
-          Effect.promise(() => firstLoadEntered.promise),
+          Effect.promise(() => firstLoad.entered.promise),
           "first load did not gate",
           "10 seconds",
         )
@@ -809,7 +816,7 @@ firstLoadPrompt.instance(
           "10 seconds",
         )
 
-        yield* Effect.sync(() => firstLoadRelease.resolve())
+        yield* Effect.sync(() => firstLoad.release.resolve())
         yield* awaitWithTimeout(llm.wait(1), "original task did not reach the provider", "10 seconds")
         const taskRequest = (yield* llm.inputs)[0]
         if (!taskRequest) throw new Error("expected the original task request")
@@ -828,8 +835,90 @@ firstLoadPrompt.instance(
           Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(held), "held prompt did not finish", "10 seconds")),
         ).toBe(true)
         expect(yield* llm.calls).toBe(2)
-      }).pipe(Effect.ensuring(Effect.sync(() => firstLoadRelease.resolve())))
+      }).pipe(Effect.ensuring(Effect.sync(() => firstLoad.release.resolve())))
     }),
+  60_000,
+)
+
+rootlessLoopPrompt.instance(
+  "anchors rootless loop initialization with persisted admission order",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Rootless admission order" })
+      const earlier = yield* seedUser({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "earlier admitted task" }],
+      })
+      const root = yield* seedUser({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "latest admitted task" }],
+      })
+      yield* sessions.updateMessage({ ...earlier.info, time: { created: 300 } })
+      yield* sessions.updateMessage({ ...root.info, time: { created: 100 } })
+      const admission = yield* MessageV2.admission(session.id)
+      expect(admission.order.get(earlier.info.id)).toBeLessThan(admission.order.get(root.info.id) ?? Infinity)
+
+      const markedGate = yield* Deferred.make<void>()
+      yield* llm.push(
+        reply().text("rootless task finished").stop().item(),
+        reply().wait(deferredAsPromise(markedGate)).text("marked message handled").stop().item(),
+      )
+      const run = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(
+        Effect.promise(() => rootlessLoopGate.entered.promise),
+        "rootless loop did not reach its first load boundary",
+        "10 seconds",
+      )
+
+      const markedID = MessageID.make("msg_rootless_marked")
+      yield* seedUser({
+        sessionID: session.id,
+        messageID: markedID,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "[fm-from-firstmate]\x1f committed during rootless initialization" }],
+      })
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: session.id })
+          .pipe(
+            Effect.map((messages) =>
+              messages.some((message) => message.info.role === "user" && message.info.id === markedID)
+                ? true
+                : undefined,
+            ),
+          ),
+        "marked rootless input was not admitted",
+        "10 seconds",
+      )
+
+      yield* Effect.sync(() => rootlessLoopGate.release.resolve())
+      yield* awaitWithTimeout(llm.wait(1), "rootless loop did not reach the provider", "10 seconds")
+      const taskRequest = (yield* llm.inputs)[0]
+      if (!taskRequest) throw new Error("expected the rootless task request")
+      expect(JSON.stringify(taskRequest.messages)).toContain("latest admitted task")
+      expect(JSON.stringify(taskRequest.messages)).not.toContain("committed during rootless initialization")
+      expect(
+        (yield* sessions.messages({ sessionID: session.id })).some(
+          (message) => message.info.role === "assistant" && message.info.parentID === root.info.id,
+        ),
+      ).toBe(true)
+
+      yield* awaitWithTimeout(llm.wait(2), "marked message did not run after the rootless task", "10 seconds")
+      const markedRequest = (yield* llm.inputs)[1]
+      if (!markedRequest) throw new Error("expected the marked follow-up request")
+      expect(JSON.stringify(markedRequest.messages)).toContain("committed during rootless initialization")
+      yield* Deferred.succeed(markedGate, void 0)
+      yield* awaitWithTimeout(Fiber.await(run), "rootless loop did not finish", "10 seconds")
+      expect(yield* llm.calls).toBe(2)
+    }).pipe(Effect.ensuring(Effect.sync(() => rootlessLoopGate.release.resolve()))),
   60_000,
 )
 
