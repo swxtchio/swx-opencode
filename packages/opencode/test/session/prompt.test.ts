@@ -922,6 +922,36 @@ rootlessLoopPrompt.instance(
   60_000,
 )
 
+it.instance("persists prompt claims while the provider request is in flight", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Claim before provider" })
+    const response = yield* Deferred.make<void>()
+    const messageID = MessageID.make("msg_claim_before_provider")
+
+    yield* llm.push(reply().wait(deferredAsPromise(response)).text("task finished").stop().item())
+    const run = yield* prompt
+      .prompt({
+        sessionID: session.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "task that must be claimed" }],
+      })
+      .pipe(Effect.forkChild)
+
+    yield* Effect.gen(function* () {
+      yield* awaitWithTimeout(llm.wait(1), "provider request did not start", "10 seconds")
+      expect((yield* MessageV2.admission(session.id)).claimed.has(messageID)).toBe(true)
+      yield* Deferred.succeed(response, void 0)
+      yield* awaitWithTimeout(Fiber.await(run), "provider request did not finish", "10 seconds")
+      expect(yield* llm.calls).toBe(1)
+    }).pipe(Effect.ensuring(Deferred.succeed(response, void 0).pipe(Effect.ignore)))
+  }),
+)
+
 admissionPrompt.instance(
   "orders concurrent marked inputs by their persisted message-row admission",
   () =>
