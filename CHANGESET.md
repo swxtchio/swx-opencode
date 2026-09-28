@@ -59,6 +59,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#78** Coordinate snapshot maintenance with a box-wide hourly gc cooldown (issue #70 Fix-1) and serialized cleanups; `Snapshot.track()` waits through contention and never silently skips snapshot updates. _Fork-only._
 - **#49** `--effort` works on `opencode`, `--mini` and `attach` (one rule: it applies to whichever model declares
   it, until an in-app choice, and is never saved); an unknown CLI argument is now named after the help; and `run`
   prints the server's real validation error instead of a generic 500. _Fork-only; the unknown-argument message is
