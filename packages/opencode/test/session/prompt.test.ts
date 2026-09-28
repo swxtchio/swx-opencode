@@ -60,6 +60,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { runImport } from "../../src/cli/cmd/import"
+import { ShareNext } from "../../src/share/share-next"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -588,6 +589,16 @@ const boot = Effect.fn("test.boot")(function* (input?: { title?: string }) {
   return { prompt, run, sessions, chat }
 })
 
+const seedUser = Effect.fn("test.seedUser")(function* (input: Omit<SessionPrompt.PromptInput, "noReply">) {
+  const prompt = yield* SessionPrompt.Service
+  const sessions = yield* Session.Service
+  const message = yield* prompt.prompt({ ...input, noReply: true })
+  if (message.info.role !== "user") throw new Error("expected a user message")
+  const info = { ...message.info, noReply: false }
+  yield* sessions.updateMessage(info)
+  return { info, parts: message.parts }
+})
+
 test("classifies configured machine markers from their producer framing", async () => {
   const heartbeat = await Bun.file(path.join(import.meta.dir, "fixtures", "fleet-heartbeat.txt")).text()
   const heartbeatSummary = await Bun.file(path.join(import.meta.dir, "fixtures", "fleet-heartbeat-summary.txt")).text()
@@ -651,6 +662,7 @@ it.instance("imports successive message batches with one persisted session admis
     const sessions = yield* Session.Service
     const ctx = yield* InstanceRef
     if (!ctx) throw new Error("expected an instance context")
+    const localImportShare = Layer.mock(ShareNext.Service, { url: () => Effect.succeed("") })
 
     const session = yield* sessions.create({ title: "Imported admission order" })
     const firstID = MessageID.make("msg_import_first")
@@ -680,9 +692,9 @@ it.instance("imports successive message batches with one persisted session admis
     }
 
     yield* fs.writeJson(file, { info: session, messages: [first] })
-    yield* runImport(file, ctx)
+    yield* runImport(file, ctx).pipe(Effect.provide(localImportShare))
     yield* fs.writeJson(file, { info: session, messages: [second] })
-    yield* runImport(file, ctx)
+    yield* runImport(file, ctx).pipe(Effect.provide(localImportShare))
 
     const imported = yield* db
       .select({ id: MessageTable.id, admission_seq: MessageTable.admission_seq })
@@ -693,6 +705,56 @@ it.instance("imports successive message batches with one persisted session admis
       .pipe(Effect.orDie)
     expect(imported.map((message) => message.id)).toEqual([firstID, secondID])
     expect(imported[1]?.admission_seq).toBeGreaterThan(imported[0]?.admission_seq ?? 0)
+  }),
+)
+
+it.instance("keeps noReply bookkeeping out of active and rootless provider turns", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const active = yield* sessions.create({ title: "No reply during active turn" })
+    const response = yield* Deferred.make<void>()
+    yield* llm.push(
+      reply().wait(deferredAsPromise(response)).text("task finished").stop().item(),
+      reply().text("unexpected noReply turn").stop().item(),
+      reply().text("unexpected rootless noReply turn").stop().item(),
+    )
+
+    const run = yield* prompt
+      .prompt({
+        sessionID: active.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "active task" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "active task did not reach the provider", "10 seconds")
+
+    const reminder = yield* prompt.prompt({
+      sessionID: active.id,
+      agent: "build",
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "synthetic bookkeeping reminder" }],
+    })
+    expect(reminder.info.role).toBe("user")
+    if (reminder.info.role !== "user") throw new Error("expected the bookkeeping user message")
+
+    yield* Deferred.succeed(response, void 0)
+    yield* awaitWithTimeout(Fiber.await(run), "active task did not finish", "10 seconds")
+    expect(yield* llm.calls).toBe(1)
+
+    const rootless = yield* sessions.create({ title: "No reply rootless turn" })
+    yield* prompt.prompt({
+      sessionID: rootless.id,
+      agent: "build",
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "rootless bookkeeping reminder" }],
+    })
+    yield* prompt.loop({ sessionID: rootless.id })
+    expect(yield* llm.calls).toBe(1)
   }),
 )
 
@@ -790,11 +852,10 @@ admissionPrompt.instance(
           reply().text("second committed first").stop().item(),
           reply().text("first started earlier").stop().item(),
         )
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: session.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "original task" }],
         })
         const run = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
@@ -921,11 +982,10 @@ stepZeroPrompt.instance(
           reply().wait(deferredAsPromise(fourthHeldGate)).text("fourth message handled").stop().item(),
           reply().wait(deferredAsPromise(laterGate)).text("history replay handled").stop().item(),
         )
-        const root = yield* prompt.prompt({
+        const root = yield* seedUser({
           sessionID: session.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "original task" }],
         })
         if (root.info.role !== "user") throw new Error("expected the original user message")
@@ -1064,12 +1124,11 @@ stepZeroPrompt.instance(
         expect(yield* llm.calls).toBe(2)
 
         const thirdID = MessageID.make("msg_m_third")
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: session.id,
           messageID: thirdID,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "[fm-from-firstmate]\x1f third-mail" }],
         })
         yield* pollWithTimeout(
@@ -1108,12 +1167,11 @@ stepZeroPrompt.instance(
         )
 
         const captainID = MessageID.make("msg_b_captain")
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: session.id,
           messageID: captainID,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "captain typed intervention" }],
         })
         yield* pollWithTimeout(
@@ -1205,12 +1263,11 @@ stepZeroPrompt.instance(
         ).toBe(true)
 
         const fourthID = MessageID.make("msg_c_fourth")
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: session.id,
           messageID: fourthID,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "[fm-from-firstmate]\x1f fourth-mail" }],
         })
         const fourthAdmission = yield* MessageV2.admission(session.id)
@@ -1319,11 +1376,10 @@ it.instance(
           reply().wait(deferredAsPromise(stopGate)).text("captain intervention handled").stop().item(),
           reply().wait(deferredAsPromise(heldGate)).text("held machine message handled").stop().item(),
         )
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: session.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "original task" }],
         })
         const run = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
@@ -1492,11 +1548,10 @@ it.instance(
           reply().text("task finished").stop().item(),
           reply().text("unexpected direct replay").stop().item(),
         )
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: session.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "original task" }],
         })
         const run = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
@@ -1593,11 +1648,10 @@ it.instance(
           reply().wait(deferredAsPromise(firstGate)).text("captain one handled").stop().item(),
           reply().wait(deferredAsPromise(secondGate)).text("captain two handled").stop().item(),
         )
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: session.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "original task" }],
         })
         const run = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
@@ -1605,20 +1659,18 @@ it.instance(
 
         const firstID = MessageID.make("msg_direct_fifo_first")
         const secondID = MessageID.make("msg_direct_fifo_second")
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: session.id,
           messageID: firstID,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "captain one" }],
         })
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: session.id,
           messageID: secondID,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "captain two" }],
         })
         const order = (yield* MessageV2.admission(session.id)).order
@@ -1680,11 +1732,10 @@ directProjectionPrompt.instance(
           reply().tool("glob", { pattern: "direct-step.txt" }).item(),
           reply().wait(deferredAsPromise(directGate)).text("captain direct handled").stop().item(),
         )
-        const root = yield* prompt.prompt({
+        const root = yield* seedUser({
           sessionID: session.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "original task" }],
         })
         if (root.info.role !== "user") throw new Error("expected the original user message")
@@ -1696,12 +1747,11 @@ directProjectionPrompt.instance(
           "10 seconds",
         )
 
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: session.id,
           messageID: directID,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "captain direct arrived before task completion" }],
         })
         yield* Effect.sync(() => directProjectionRelease.resolve())
@@ -1787,11 +1837,10 @@ it.instance(
       const sessions = yield* Session.Service
       const chat = yield* sessions.create({ title: "Pinned" })
 
-      yield* prompt.prompt({
+      yield* seedUser({
         sessionID: chat.id,
         agent: "build",
         model: ref,
-        noReply: true,
         parts: [{ type: "text", text: "attempt a denied command" }],
       })
       yield* llm.push(
@@ -1910,10 +1959,9 @@ it.instance("loop calls LLM and returns assistant message", () =>
       title: "Pinned",
       permission: [{ permission: "*", pattern: "*", action: "allow" }],
     })
-    yield* prompt.prompt({
+    yield* seedUser({
       sessionID: chat.id,
       agent: "build",
-      noReply: true,
       parts: [{ type: "text", text: "hello" }],
     })
     yield* llm.text("world")
@@ -2027,21 +2075,19 @@ it.instance(
           reply().wait(deferredAsPromise(terminal)).text("partial response").contentFilter().item(),
           reply().text("held response").stop().item(),
         )
-        const root = yield* prompt.prompt({
+        const root = yield* seedUser({
           sessionID: chat.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "hello" }],
         })
         const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
         yield* awaitWithTimeout(llm.wait(1), "provider did not receive the original task", "10 seconds")
 
-        const held = yield* prompt.prompt({
+        const held = yield* seedUser({
           sessionID: chat.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "[fm-from-firstmate]\x1f queued after filter" }],
         })
         expect(held.info.role).toBe("user")
@@ -2094,20 +2140,18 @@ it.instance(
           reply().wait(deferredAsPromise(terminal)).text("partial response").finish("length").item(),
           reply().text("held response").stop().item(),
         )
-        const root = yield* prompt.prompt({
+        const root = yield* seedUser({
           sessionID: chat.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "task cut off by provider" }],
         })
         const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
         yield* awaitWithTimeout(llm.wait(1), "provider did not receive the original task", "10 seconds")
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: chat.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "[fm-from-firstmate]\x1f after length finish" }],
         })
         expect(JSON.stringify((yield* llm.inputs)[0]?.messages)).not.toContain("after length finish")
@@ -2147,11 +2191,10 @@ it.instance(
           reply().wait(deferredAsPromise(terminal)).text("not structured output").stop().item(),
           reply().text("held response").stop().item(),
         )
-        const root = yield* prompt.prompt({
+        const root = yield* seedUser({
           sessionID: chat.id,
           agent: "build",
           model: ref,
-          noReply: true,
           format: new SessionV1.OutputFormatJsonSchema({
             type: "json_schema",
             schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
@@ -2161,11 +2204,10 @@ it.instance(
         })
         const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
         yield* awaitWithTimeout(llm.wait(1), "provider did not receive the structured-output task", "10 seconds")
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: chat.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "[fm-from-peer]\x1f after structured-output break" }],
         })
         expect(JSON.stringify((yield* llm.inputs)[0]?.messages)).not.toContain("after structured-output break")
@@ -2203,20 +2245,18 @@ it.instance(
       yield* Effect.gen(function* () {
         yield* llm.error(413, { error: { message: "request entity too large" } }, deferredAsPromise(terminal))
         yield* llm.text("held response")
-        const root = yield* prompt.prompt({
+        const root = yield* seedUser({
           sessionID: chat.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "original task" }],
         })
         const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
         yield* awaitWithTimeout(llm.wait(1), "provider did not receive the original task", "10 seconds")
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: chat.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "[fm-from-peer]\x1f peer update" }],
         })
 
@@ -2252,11 +2292,10 @@ compactionStopPrompt.instance(
       const chat = yield* sessions.create({ title: "Pinned" })
 
       yield* Effect.gen(function* () {
-        const root = yield* prompt.prompt({
+        const root = yield* seedUser({
           sessionID: chat.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "task before compaction" }],
         })
         yield* sessions.updatePart({
@@ -2272,11 +2311,10 @@ compactionStopPrompt.instance(
           "compaction did not start",
           "10 seconds",
         )
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: chat.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "[fm-from-firstmate]\x1f after compaction" }],
         })
         yield* llm.text("held task complete")
@@ -2305,10 +2343,9 @@ it.instance("loop stops provider overflow instead of auto-compacting when disabl
     const chat = yield* sessions.create({ title: "Pinned" })
 
     yield* llm.error(413, { error: { message: "request entity too large" } })
-    yield* prompt.prompt({
+    yield* seedUser({
       sessionID: chat.id,
       agent: "build",
-      noReply: true,
       parts: [{ type: "text", text: "hello" }],
     })
 
@@ -2384,10 +2421,9 @@ it.instance("static loop returns assistant text through local provider", () =>
       permission: [{ permission: "*", pattern: "*", action: "allow" }],
     })
 
-    yield* prompt.prompt({
+    yield* seedUser({
       sessionID: session.id,
       agent: "build",
-      noReply: true,
       parts: [{ type: "text", text: "hello" }],
     })
 
@@ -2411,10 +2447,9 @@ it.instance("static loop consumes queued replies across turns", () =>
       permission: [{ permission: "*", pattern: "*", action: "allow" }],
     })
 
-    yield* prompt.prompt({
+    yield* seedUser({
       sessionID: session.id,
       agent: "build",
-      noReply: true,
       parts: [{ type: "text", text: "hello one" }],
     })
 
@@ -2424,10 +2459,9 @@ it.instance("static loop consumes queued replies across turns", () =>
     expect(first.info.role).toBe("assistant")
     expect(first.parts.some((part) => part.type === "text" && part.text === "world one")).toBe(true)
 
-    yield* prompt.prompt({
+    yield* seedUser({
       sessionID: session.id,
       agent: "build",
-      noReply: true,
       parts: [{ type: "text", text: "hello two" }],
     })
 
@@ -2451,10 +2485,9 @@ it.instance("loop continues when finish is tool-calls", () =>
       title: "Pinned",
       permission: [{ permission: "*", pattern: "*", action: "allow" }],
     })
-    yield* prompt.prompt({
+    yield* seedUser({
       sessionID: session.id,
       agent: "build",
-      noReply: true,
       parts: [{ type: "text", text: "hello" }],
     })
     yield* llm.tool("first", { value: "first" })
@@ -2479,10 +2512,9 @@ it.instance("loop continues when finish is unknown", () =>
       title: "Pinned",
       permission: [{ permission: "*", pattern: "*", action: "allow" }],
     })
-    yield* prompt.prompt({
+    yield* seedUser({
       sessionID: session.id,
       agent: "build",
-      noReply: true,
       parts: [{ type: "text", text: "hello" }],
     })
     yield* llm.push(reply())
@@ -2510,10 +2542,9 @@ it.instance("glob tool keeps instance context during prompt runs", () =>
     const file = path.join(dir, "probe.txt")
     yield* writeText(file, "probe")
 
-    yield* prompt.prompt({
+    yield* seedUser({
       sessionID: session.id,
       agent: "build",
-      noReply: true,
       parts: [{ type: "text", text: "find text files" }],
     })
     yield* llm.tool("glob", { pattern: "**/*.txt" })
@@ -2546,10 +2577,9 @@ it.instance("loop continues when finish is stop but assistant has tool parts", (
       title: "Pinned",
       permission: [{ permission: "*", pattern: "*", action: "allow" }],
     })
-    yield* prompt.prompt({
+    yield* seedUser({
       sessionID: session.id,
       agent: "build",
-      noReply: true,
       parts: [{ type: "text", text: "hello" }],
     })
     yield* llm.push(reply().tool("first", { value: "first" }).stop())
@@ -2806,21 +2836,19 @@ it.instance(
           reply().wait(deferredAsPromise(originalResponse)).text("task finished").stop().item(),
           reply().text("held task complete").stop().item(),
         )
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: chat.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "original task" }],
         })
 
         const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
         yield* awaitWithTimeout(llm.wait(1), "provider did not receive the original task", "10 seconds")
-        const heldMessage = yield* prompt.prompt({
+        const heldMessage = yield* seedUser({
           sessionID: chat.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "[fm-from-peer]\x1f peer alert" }],
         })
         if (heldMessage.info.role !== "user") throw new Error("expected the held user message")
@@ -2860,20 +2888,18 @@ it.instance(
           reply().text("task finished").stop().item(),
           reply().wait(deferredAsPromise(heldResponse)).text("held response").stop().item(),
         )
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: chat.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "original task" }],
         })
         const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
         yield* awaitWithTimeout(llm.wait(1), "provider did not receive the original task", "10 seconds")
-        yield* prompt.prompt({
+        yield* seedUser({
           sessionID: chat.id,
           agent: "build",
           model: ref,
-          noReply: true,
           parts: [{ type: "text", text: "[fm-from-firstmate]\x1f held while draining" }],
         })
         yield* awaitWithTimeout(llm.wait(2), "held provider request did not start", "10 seconds")
@@ -2959,11 +2985,10 @@ it.instance(
       })
       const taskGate = yield* Deferred.make<void>()
       yield* llm.push(reply().wait(deferredAsPromise(taskGate)).text("task finished").stop().item())
-      yield* prompt.prompt({
+      yield* seedUser({
         sessionID: session.id,
         agent: "build",
         model: ref,
-        noReply: true,
         parts: [{ type: "text", text: "original task" }],
       })
       const run = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
@@ -2978,12 +3003,11 @@ it.instance(
       yield* awaitWithTimeout(llm.wait(1), "provider did not receive the original task", "10 seconds")
 
       const heldID = MessageID.make("msg_held_subtask")
-      yield* prompt.prompt({
+      yield* seedUser({
         sessionID: session.id,
         messageID: heldID,
         agent: "build",
         model: ref,
-        noReply: true,
         parts: [{ type: "text", text: "[fm-from-peer]\x1f held task" }],
       })
       yield* addSubtask(session.id, heldID)
@@ -3045,10 +3069,9 @@ raceNoLLMServer.instance(
       const sessions = yield* Session.Service
       const chat = yield* sessions.create({ title: "Processor creation race" })
 
-      yield* prompt.prompt({
+      yield* seedUser({
         sessionID: chat.id,
         agent: "build",
-        noReply: true,
         parts: [{ type: "text", text: "first" }],
       })
 
@@ -3071,10 +3094,9 @@ raceNoLLMServer.instance(
         expect(firstInterrupted.info.error?.name).toBe("MessageAbortedError")
       }
 
-      yield* prompt.prompt({
+      yield* seedUser({
         sessionID: chat.id,
         agent: "build",
-        noReply: true,
         parts: [{ type: "text", text: "second" }],
       })
 
@@ -3774,10 +3796,9 @@ unix(
         permission: [{ permission: "*", pattern: "*", action: "allow" }],
       })
 
-      yield* prompt.prompt({
+      yield* seedUser({
         sessionID: chat.id,
         agent: "build",
-        noReply: true,
         parts: [{ type: "text", text: "run bash" }],
       })
 
@@ -4357,10 +4378,9 @@ it.instance("accepts the default sentinel without checking it", () =>
       title: "Default effort",
       permission: [{ permission: "*", pattern: "*", action: "allow" }],
     })
-    yield* prompt.prompt({
+    yield* seedUser({
       sessionID: chat.id,
       agent: "build",
-      noReply: true,
       variant: "default",
       parts: [{ type: "text", text: "hello" }],
     })

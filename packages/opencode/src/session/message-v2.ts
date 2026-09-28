@@ -620,7 +620,12 @@ export function latest(
   let finished: Assistant | undefined
   for (const msg of msgs) {
     const info = msg.info
-    if (info.role === "user" && !options?.completedUserIDs?.has(info.id) && isAfterUser(info, user, options?.userOrder))
+    if (
+      info.role === "user" &&
+      info.noReply !== true &&
+      !options?.completedUserIDs?.has(info.id) &&
+      isAfterUser(info, user, options?.userOrder)
+    )
       user = info
     if (info.role === "assistant" && isAfter(info, assistant)) assistant = info
     if (info.role === "assistant" && info.finish && isAfter(info, finished)) finished = info

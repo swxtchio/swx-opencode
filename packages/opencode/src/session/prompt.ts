@@ -127,6 +127,7 @@ const layer = Layer.effect(
     const config = yield* Config.Service
     const promptedInputIDs = new Set<MessageID>()
     const pendingAdmissions = new Map<MessageID, { sessionID: SessionID; ready: Deferred.Deferred<void> }>()
+    const pendingNoReplyInputIDs = new Map<SessionID, Set<MessageID>>()
     const runControls = new Map<SessionID, { cancel: Deferred.Deferred<void>; claimed: Set<MessageID> }>()
     const permission = yield* Permission.Service
     const fsys = yield* FSUtil.Service
@@ -691,6 +692,7 @@ const layer = Layer.effect(
         },
         system: input.system,
         format: input.format,
+        ...(input.noReply === true ? { noReply: true } : {}),
       }
 
       const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
@@ -1104,7 +1106,16 @@ const layer = Layer.effect(
           yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
         }
 
-        if (input.noReply === true) return message
+        if (input.noReply === true) {
+          if (!runControls.has(input.sessionID)) {
+            promptedInputIDs.delete(messageID)
+            return message
+          }
+          const ids = pendingNoReplyInputIDs.get(input.sessionID) ?? new Set<MessageID>()
+          ids.add(messageID)
+          pendingNoReplyInputIDs.set(input.sessionID, ids)
+          return message
+        }
         return yield* loop({ sessionID: input.sessionID, messageID })
       }).pipe(
         Effect.onExit((exit) =>
@@ -1175,7 +1186,10 @@ const layer = Layer.effect(
         const initializeTurn = (msgs: SessionV1.WithParts[]) => {
           if (turnRoot) return
           const root = rootMessageID
-            ? msgs.find((msg): msg is UserWithParts => msg.info.role === "user" && msg.info.id === rootMessageID)?.info
+            ? msgs.find(
+                (msg): msg is UserWithParts =>
+                  msg.info.role === "user" && msg.info.id === rootMessageID && msg.info.noReply !== true,
+              )?.info
             : MessageV2.latest(msgs, { userOrder: (id) => admissionOrder.get(id) }).user
           if (rootMessageID && !root) throw new Error(`Run root message not found: ${rootMessageID}`)
           turnRoot = root
@@ -1194,6 +1208,7 @@ const layer = Layer.effect(
           const incoming = msgs.filter((msg): msg is UserWithParts => {
             if (
               msg.info.role !== "user" ||
+              msg.info.noReply === true ||
               heldIDs.has(msg.info.id) ||
               completedInputIDs.has(msg.info.id) ||
               msg.info.id === root.id
@@ -1268,7 +1283,11 @@ const layer = Layer.effect(
           let msgs = yield* loadMessages()
 
           initializeTurn(msgs)
-          if (!turnRoot) throw new Error("No user message found in stream. This should never happen.")
+          if (!turnRoot) {
+            if (msgs.some((message) => message.info.role === "user" && message.info.noReply === true))
+              return "stop" as const
+            throw new Error("No user message found in stream. This should never happen.")
+          }
           collectHeld(msgs)
           if (activeInputTurn && heldReleasePending.has(activeInputTurn.info.id)) {
             activeInputTurn = yield* releaseHeldInput(activeInputTurn)
@@ -1611,6 +1630,7 @@ const layer = Layer.effect(
               .filter(
                 (msg): msg is UserWithParts =>
                   msg.info.role === "user" &&
+                  msg.info.noReply !== true &&
                   !heldIDs.has(msg.info.id) &&
                   !completedInputIDs.has(msg.info.id) &&
                   !claimedInputIDs.has(msg.info.id) &&
@@ -1661,6 +1681,8 @@ const layer = Layer.effect(
       }).pipe(
         Effect.ensuring(
           Effect.sync(() => {
+            for (const messageID of pendingNoReplyInputIDs.get(sessionID) ?? []) promptedInputIDs.delete(messageID)
+            pendingNoReplyInputIDs.delete(sessionID)
             for (const messageID of promptedInputIDs) {
               if (runControl.claimed.has(messageID)) promptedInputIDs.delete(messageID)
             }
