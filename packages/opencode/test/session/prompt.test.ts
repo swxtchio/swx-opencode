@@ -1470,7 +1470,7 @@ stepZeroPrompt.instance(
 )
 
 it.instance(
-  "keeps unmarked and configured critical prompts eligible during an active run",
+  "steers critical prompts during a continuation and queues unmarked prompts",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig((url) => ({
@@ -1488,12 +1488,14 @@ it.instance(
       const toolGate = yield* Deferred.make<void>()
       const stopGate = yield* Deferred.make<void>()
       const heldGate = yield* Deferred.make<void>()
+      const captainGate = yield* Deferred.make<void>()
 
       yield* Effect.gen(function* () {
         yield* llm.push(
           reply().wait(deferredAsPromise(toolGate)).tool("first", { value: "continue" }).item(),
-          reply().wait(deferredAsPromise(stopGate)).text("captain intervention handled").stop().item(),
+          reply().wait(deferredAsPromise(stopGate)).text("critical alert handled").stop().item(),
           reply().wait(deferredAsPromise(heldGate)).text("held machine message handled").stop().item(),
+          reply().wait(deferredAsPromise(captainGate)).text("captain intervention handled").stop().item(),
         )
         yield* seedUser({
           sessionID: session.id,
@@ -1589,15 +1591,16 @@ it.instance(
         yield* awaitWithTimeout(llm.wait(2), "next provider step did not start", "10 seconds")
         const next = (yield* llm.inputs).at(1)
         if (!next) throw new Error("expected the next provider request")
-        expect(JSON.stringify(next.messages)).toContain("captain typed intervention")
         expect(JSON.stringify(next.messages)).toContain("disk alert")
+        expect(JSON.stringify(next.messages)).not.toContain("captain typed intervention")
         expect(JSON.stringify(next.messages)).not.toContain("queued-mail")
 
         yield* Deferred.succeed(stopGate, void 0)
-        yield* awaitWithTimeout(llm.wait(3), "held prompt did not start after current turn stopped", "10 seconds")
+        yield* awaitWithTimeout(llm.wait(3), "held prompt did not start after the current turn stopped", "10 seconds")
         const heldTurn = (yield* llm.inputs).at(2)
         if (!heldTurn) throw new Error("expected the held provider request")
         expect(JSON.stringify(heldTurn.messages)).toContain("queued-mail")
+        expect(JSON.stringify(heldTurn.messages)).not.toContain("captain typed intervention")
         expect(
           (yield* sessions.messages({ sessionID: session.id })).some(
             (message) => message.info.role === "assistant" && message.info.parentID === heldID,
@@ -1605,6 +1608,11 @@ it.instance(
         ).toBe(true)
 
         yield* Deferred.succeed(heldGate, void 0)
+        yield* awaitWithTimeout(llm.wait(4), "unmarked captain prompt did not run after the held message", "10 seconds")
+        const captainTurn = (yield* llm.inputs).at(3)
+        if (!captainTurn) throw new Error("expected the deferred captain request")
+        expect(JSON.stringify(lastProviderMessage(captainTurn))).toContain("captain typed intervention")
+        yield* Deferred.succeed(captainGate, void 0)
         const runExit = yield* awaitWithTimeout(Fiber.await(run), "session run did not finish", "10 seconds")
         const captainExit = yield* awaitWithTimeout(
           Fiber.await(captain),
@@ -1628,12 +1636,14 @@ it.instance(
         ).toBe(true)
         expect(
           messages.some((message) => message.info.role === "assistant" && message.info.parentID === captainID),
-        ).toBe(false)
-        expect(yield* llm.calls).toBe(3)
+        ).toBe(true)
+        expect(yield* llm.calls).toBe(4)
       }).pipe(
         Effect.ensuring(
           Effect.all(
-            [toolGate, stopGate, heldGate].map((gate) => Deferred.succeed(gate, void 0).pipe(Effect.ignore)),
+            [toolGate, stopGate, heldGate, captainGate].map((gate) =>
+              Deferred.succeed(gate, void 0).pipe(Effect.ignore),
+            ),
             {
               discard: true,
             },
@@ -1645,7 +1655,7 @@ it.instance(
 )
 
 it.instance(
-  "does not replay unmarked steers already visible to a continuation step",
+  "queues unmarked steers after the interrupted task continuation",
   () =>
     Effect.gen(function* () {
       const { dir, llm } = yield* useServerConfig(providerCfg)
@@ -1658,6 +1668,8 @@ it.instance(
         permission: [{ permission: "*", pattern: "*", action: "allow" }],
       })
       const toolGate = yield* Deferred.make<void>()
+      const firstSteerGate = yield* Deferred.make<void>()
+      const secondSteerGate = yield* Deferred.make<void>()
       const firstID = MessageID.make("msg_steer_first")
       const secondID = MessageID.make("msg_steer_second")
 
@@ -1665,9 +1677,10 @@ it.instance(
         yield* llm.push(
           reply().wait(deferredAsPromise(toolGate)).tool("glob", { pattern: "steer-step.txt" }).item(),
           reply().text("task finished").stop().item(),
-          reply().text("unexpected direct replay").stop().item(),
+          reply().wait(deferredAsPromise(firstSteerGate)).text("captain one handled").stop().item(),
+          reply().wait(deferredAsPromise(secondSteerGate)).text("captain two handled").stop().item(),
         )
-        yield* seedUser({
+        const root = yield* seedUser({
           sessionID: session.id,
           agent: "build",
           model: ref,
@@ -1718,9 +1731,23 @@ it.instance(
         const continuation = (yield* llm.inputs)[1]
         if (!continuation) throw new Error("expected the direct steering continuation request")
         const continuationText = JSON.stringify(continuation.messages)
-        expect(continuationText).toContain("captain one")
-        expect(continuationText).toContain("captain two")
+        expect(continuationText).toContain("original task")
+        expect(continuationText).not.toContain("captain one")
+        expect(continuationText).not.toContain("captain two")
         expect(continuationText).toContain(toolFile)
+
+        yield* awaitWithTimeout(llm.wait(3), "oldest deferred steer did not run after task completion", "10 seconds")
+        const firstTurn = (yield* llm.inputs)[2]
+        if (!firstTurn) throw new Error("expected the first deferred steer request")
+        expect(JSON.stringify(lastProviderMessage(firstTurn))).toContain("captain one")
+        expect(JSON.stringify(lastProviderMessage(firstTurn))).not.toContain("captain two")
+
+        yield* Deferred.succeed(firstSteerGate, void 0)
+        yield* awaitWithTimeout(llm.wait(4), "second deferred steer did not follow the first", "10 seconds")
+        const secondTurn = (yield* llm.inputs)[3]
+        if (!secondTurn) throw new Error("expected the second deferred steer request")
+        expect(JSON.stringify(lastProviderMessage(secondTurn))).toContain("captain two")
+        yield* Deferred.succeed(secondSteerGate, void 0)
 
         expect(
           Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(run), "session run did not finish", "10 seconds")),
@@ -1736,15 +1763,27 @@ it.instance(
           ),
         ).toBe(true)
         const messages = yield* sessions.messages({ sessionID: session.id })
+        expect(
+          messages.some((message) => message.info.role === "assistant" && message.info.parentID === root.info.id),
+        ).toBe(true)
         expect(messages.some((message) => message.info.role === "assistant" && message.info.parentID === firstID)).toBe(
-          false,
+          true,
         )
         expect(
           messages.some((message) => message.info.role === "assistant" && message.info.parentID === secondID),
         ).toBe(true)
         expect((yield* MessageV2.admission(session.id)).claimed.has(firstID)).toBe(true)
-        expect(yield* llm.calls).toBe(2)
-      }).pipe(Effect.ensuring(Deferred.succeed(toolGate, void 0).pipe(Effect.ignore)))
+        expect(yield* llm.calls).toBe(4)
+      }).pipe(
+        Effect.ensuring(
+          Effect.all(
+            [toolGate, firstSteerGate, secondSteerGate].map((gate) =>
+              Deferred.succeed(gate, void 0).pipe(Effect.ignore),
+            ),
+            { discard: true },
+          ),
+        ),
+      )
     }),
   60_000,
 )

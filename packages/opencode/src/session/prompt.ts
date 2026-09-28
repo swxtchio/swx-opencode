@@ -1297,6 +1297,25 @@ const layer = Layer.effect(
             collectHeld(msgs)
           }
 
+          if (step > 0) {
+            msgs
+              .filter(
+                (msg): msg is UserWithParts =>
+                  msg.info.role === "user" &&
+                  msg.info.noReply !== true &&
+                  msg.info.id !== turnRoot?.id &&
+                  !heldIDs.has(msg.info.id) &&
+                  !completedInputIDs.has(msg.info.id),
+              )
+              .filter((msg) => {
+                const text = msg.parts.find(
+                  (part): part is SessionV1.TextPart => part.type === "text" && !part.synthetic && !part.ignored,
+                )?.text
+                return MachineMessage.classify(text ?? "", markerConfig) === undefined
+              })
+              .forEach((msg) => deferredInputIDs.add(msg.info.id))
+          }
+
           msgs = msgs.filter(
             (msg) => !heldIDs.has(msg.info.id) && !(msg.info.role === "user" && deferredInputIDs.has(msg.info.id)),
           )
