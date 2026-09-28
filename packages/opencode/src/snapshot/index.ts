@@ -182,12 +182,14 @@ const layer: Layer.Layer<
         const exists = (file: string) => fs.exists(file).pipe(Effect.orDie)
         const read = (file: string) => fs.readFileString(file).pipe(Effect.catch(() => Effect.succeed("")))
         const remove = (file: string) => fs.remove(file).pipe(Effect.catch(() => Effect.void))
-        // Maintenance paths take the repo lease before this gate so cleanup cannot deadlock a tracker.
         const locked = <A, E, R>(fx: Effect.Effect<A, E, R>) => lock(state.gitdir).withPermits(1)(fx)
         const evidenceFile = (gitdir: string) => path.join(gitdir, "info", "opencode-worktree.json")
         const evidence = (gitdir: string) => read(evidenceFile(gitdir)).pipe(Effect.map(decodeWorktreeEvidence))
         const saveEvidence = (gitdir: string, value: typeof WorktreeEvidence.Type) =>
-          fs.writeFileString(evidenceFile(gitdir), JSON.stringify(value)).pipe(Effect.catch(() => Effect.void))
+          fs.writeFileString(evidenceFile(gitdir), JSON.stringify(value)).pipe(
+            Effect.as(true),
+            Effect.catch(() => Effect.succeed(false)),
+          )
         const inspect = Effect.fnUntraced(function* (gitdir: string, project: string, repo: string) {
           const decoded = Option.getOrUndefined(yield* evidence(gitdir))
           if (!decoded || !path.isAbsolute(decoded.worktree)) return
@@ -375,43 +377,50 @@ const layer: Layer.Layer<
                         return
                       }
                       if (budget.locks >= reapLockLimit) return
-                      budget.locks++
 
                       const repoLock = path.join(root, "locks", project.name, `${repo.name}.lock`)
-                      yield* maintenance.withLock(
+                      const didWork = yield* maintenance.withLock(
                         repoLock,
                         lock(gitdir).withPermits(1)(
                           Effect.gen(function* () {
                             const current = yield* inspect(gitdir, project.name, repo.name)
-                            if (!current) return
+                            if (!current) return false
 
                             if (current.presence === "present") {
                               if (current.decoded.missingSince !== undefined) {
-                                yield* saveEvidence(gitdir, {
+                                return yield* saveEvidence(gitdir, {
                                   version: 1,
                                   project: current.decoded.project,
                                   worktree: current.decoded.worktree,
                                 })
                               }
-                              return
+                              return false
                             }
 
                             if (current.decoded.missingSince === undefined || now < current.decoded.missingSince) {
-                              yield* saveEvidence(gitdir, { ...current.decoded, missingSince: now })
-                              return
+                              return yield* saveEvidence(gitdir, { ...current.decoded, missingSince: now })
                             }
-                            if (now - current.decoded.missingSince < reapGrace) return
+                            if (now - current.decoded.missingSince < reapGrace) return false
 
                             const stillMissing = yield* fs.stat(current.decoded.worktree).pipe(
                               Effect.as(false),
                               Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(true)),
                               Effect.catch(() => Effect.succeed(false)),
                             )
-                            if (stillMissing)
-                              yield* fs.remove(gitdir, { recursive: true }).pipe(Effect.catch(() => Effect.void))
+                            if (!stillMissing) return false
+                            return yield* fs.remove(gitdir, { recursive: true, force: true }).pipe(
+                              Effect.as(true),
+                              Effect.catch((cause) =>
+                                Effect.logWarning("failed to reap snapshot shadow repo", {
+                                  gitdir,
+                                  cause: cause instanceof Error ? cause.message : String(cause),
+                                }).pipe(Effect.as(false)),
+                              ),
+                            )
                           }),
                         ),
                       )
+                      if (didWork) budget.locks++
                     }),
                   { concurrency: 1 },
                 )
@@ -430,9 +439,10 @@ const layer: Layer.Layer<
                 const now = yield* maintenance.now
                 yield* reap(now)
 
-                const completionText = (yield* read(path.join(root, "gc-completed"))).trim()
+                const completion = path.join(root, `gc-completed-${state.project}-${Hash.fast(state.worktree)}.timestamp`)
+                const completionText = (yield* read(completion)).trim()
                 const completed = completionText ? Number(completionText) : Number.NaN
-                if (Number.isFinite(completed) && (completed > now || now - completed < gcInterval)) return
+                if (Number.isFinite(completed) && completed <= now && now - completed < gcInterval) return
                 yield* maintenance.withLock(
                   path.join(root, "locks", state.project, `${Hash.fast(state.worktree)}.lock`),
                   locked(
@@ -461,8 +471,9 @@ const layer: Layer.Layer<
                       }
 
                       const completedAt = yield* maintenance.now
+                      yield* fs.ensureDir(path.dirname(completion)).pipe(Effect.orDie)
                       yield* fs
-                        .writeFileString(path.join(root, "gc-completed"), String(completedAt))
+                        .writeFileString(completion, String(completedAt))
                         .pipe(Effect.catch(() => Effect.void))
                       yield* Effect.logInfo("cleanup", { prune })
                     }),
@@ -478,17 +489,20 @@ const layer: Layer.Layer<
         })
 
         const track = Effect.fnUntraced(function* () {
-          const work = locked(
+          return yield* locked(
             Effect.gen(function* () {
               if (!(yield* enabled())) return
               const existed = yield* exists(state.gitdir)
               yield* fs.ensureDir(state.gitdir).pipe(Effect.orDie)
               yield* fs.ensureDir(path.join(state.gitdir, "info")).pipe(Effect.orDie)
-              yield* saveEvidence(state.gitdir, {
-                version: 1,
-                project: state.project,
-                worktree: state.worktree,
-              })
+              yield* maintenance.tryWithLock(
+                path.join(global.data, "snapshot", "locks", state.project, `${Hash.fast(state.worktree)}.lock`),
+                saveEvidence(state.gitdir, {
+                  version: 1,
+                  project: state.project,
+                  worktree: state.worktree,
+                }),
+              )
               if (!existed) {
                 yield* git(["init"], {
                   env: { GIT_DIR: state.gitdir, GIT_WORK_TREE: state.worktree },
@@ -512,19 +526,6 @@ const layer: Layer.Layer<
               return hash
             }),
           )
-          return yield* maintenance
-            .withLock(
-              path.join(global.data, "snapshot", "locks", state.project, `${Hash.fast(state.worktree)}.lock`),
-              work,
-            )
-            .pipe(
-              Effect.catchCause((cause) =>
-                Effect.gen(function* () {
-                  yield* Effect.logWarning("snapshot tracking lock unavailable", { cause: Cause.pretty(cause) })
-                  return yield* work
-                }),
-              ),
-            )
         })
 
         const patch = Effect.fnUntraced(function* (hash: string) {

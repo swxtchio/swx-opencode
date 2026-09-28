@@ -13,6 +13,7 @@ export interface RunInput {
 
 export interface MaintenanceInterface {
   readonly withLock: <A, E, R>(file: string, self: Effect.Effect<A, E, R>) => Effect.Effect<A, E | Error, R>
+  readonly tryWithLock: <A, E, R>(file: string, self: Effect.Effect<A, E, R>) => Effect.Effect<A | undefined, E, R>
   readonly run: (input: RunInput) => Effect.Effect<{ exitCode: number; stderr: string }>
   readonly now: Effect.Effect<number>
   readonly random: Effect.Effect<number>
@@ -27,20 +28,41 @@ const layer: Layer.Layer<MaintenanceService, never, FSUtil.Service | AppProcess.
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
     const appProcess = yield* AppProcess.Service
+    const acquireLock = (file: string, tryOnly: boolean) =>
+      fs.ensureDir(path.dirname(file)).pipe(
+        Effect.mapError((cause) => (cause instanceof Error ? cause : new Error(String(cause)))),
+        Effect.andThen(
+          Effect.tryPromise({
+            try: (signal) => acquire(file, signal, tryOnly),
+            catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+          }),
+        ),
+      )
 
     const withLock: MaintenanceInterface["withLock"] = (file, self) =>
-      Effect.acquireUseRelease(
-        fs.ensureDir(path.dirname(file)).pipe(
-          Effect.orDie,
-          Effect.andThen(
-            Effect.tryPromise({
-              try: (signal) => acquire(file, signal),
-              catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
-            }),
-          ),
-        ),
-        () => self,
-        (handle) => Effect.promise(handle.release),
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const handle = yield* restore(acquireLock(file, false))
+          if (!handle) return yield* Effect.die(new Error("blocking snapshot lock acquisition returned no handle"))
+          return yield* Effect.acquireUseRelease(
+            Effect.succeed(handle),
+            () => restore(self),
+            (lock) => Effect.promise(lock.release),
+          )
+        }),
+      )
+
+    const tryWithLock: MaintenanceInterface["tryWithLock"] = (file, self) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const handle = yield* restore(acquireLock(file, true)).pipe(Effect.catch(() => Effect.succeed(undefined)))
+          if (!handle) return undefined
+          return yield* Effect.acquireUseRelease(
+            Effect.succeed(handle),
+            () => restore(self),
+            (lock) => Effect.promise(lock.release),
+          )
+        }),
       )
 
     const run: MaintenanceInterface["run"] = (input) =>
@@ -53,6 +75,7 @@ const layer: Layer.Layer<MaintenanceService, never, FSUtil.Service | AppProcess.
 
     return MaintenanceService.of({
       withLock,
+      tryWithLock,
       run,
       now: Clock.currentTimeMillis,
       random: Effect.sync(() => Math.random()),
@@ -66,22 +89,37 @@ export const maintenanceNode = LayerNode.make({
   deps: [FSUtil.node, AppProcess.node],
 })
 
-export function lockCommand(platform: NodeJS.Platform, file: string, which: (command: string) => string | null) {
-  // Linux uses util-linux flock, macOS uses system Perl's Fcntl lock, and Windows uses PowerShell's LockFileEx.
+export function lockCommand(
+  platform: NodeJS.Platform,
+  file: string,
+  which: (command: string) => string | null,
+  tryOnly = false,
+) {
   if (platform === "linux") {
     const flock = which("flock")
     if (!flock) throw new Error("snapshot advisory locks require the Linux flock utility")
-    return [flock, "--exclusive", file, "sh", "-c", 'printf "locked\\n"; exec cat']
+    return [
+      flock,
+      "--exclusive",
+      ...(tryOnly ? ["--nonblock", "--conflict-exit-code", "75"] : []),
+      file,
+      "sh",
+      "-c",
+      'printf "locked\\n"; exec cat',
+    ]
   }
 
   if (platform === "darwin") {
     const perl = which("perl")
     if (!perl) throw new Error("snapshot advisory locks require the macOS Perl runtime")
+    const script = tryOnly
+      ? 'use strict; use Errno qw(EWOULDBLOCK EAGAIN); open my $lock, ">>", $ARGV[0] or die $!; if (!flock($lock, LOCK_EX|LOCK_NB)) { exit 75 if $! == EWOULDBLOCK || $! == EAGAIN; die $!; } $| = 1; print "locked\\n"; <STDIN>;'
+      : 'use strict; open my $lock, ">>", $ARGV[0] or die $!; flock($lock, LOCK_EX) or die $!; $| = 1; print "locked\\n"; <STDIN>;'
     return [
       perl,
       "-MFcntl=:flock",
       "-e",
-      'use strict; open my $lock, ">>", $ARGV[0] or die $!; flock($lock, LOCK_EX) or die $!; $| = 1; print "locked\\n"; <STDIN>;',
+      script,
       file,
     ]
   }
@@ -89,13 +127,16 @@ export function lockCommand(platform: NodeJS.Platform, file: string, which: (com
   if (platform === "win32") {
     const powershell = which("powershell.exe")
     if (!powershell) throw new Error("snapshot advisory locks require Windows PowerShell")
+    const lock = tryOnly
+      ? "try { $stream.Lock(0, 1) } catch [System.IO.IOException] { exit 75 }"
+      : "while ($true) { try { $stream.Lock(0, 1); break } catch [System.IO.IOException] { Start-Sleep -Milliseconds 25 } }"
     return [
       powershell,
       "-NoProfile",
       "-NonInteractive",
       "-EncodedCommand",
       Buffer.from(
-        `$ErrorActionPreference = 'Stop'\n$stream = [System.IO.File]::Open('${file.replaceAll("'", "''")}', [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)\nwhile ($true) { try { $stream.Lock(0, 1); break } catch [System.IO.IOException] { Start-Sleep -Milliseconds 25 } }\n[Console]::Out.WriteLine('locked')\n[Console]::Out.Flush()\n[Console]::In.ReadLine() | Out-Null\n$stream.Unlock(0, 1)\n$stream.Dispose()`,
+        `$ErrorActionPreference = 'Stop'\n$stream = [System.IO.File]::Open('${file.replaceAll("'", "''")}', [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)\n${lock}\n[Console]::Out.WriteLine('locked')\n[Console]::Out.Flush()\n[Console]::In.ReadLine() | Out-Null\n$stream.Unlock(0, 1)\n$stream.Dispose()`,
         "utf16le",
       ).toString("base64"),
     ]
@@ -104,8 +145,8 @@ export function lockCommand(platform: NodeJS.Platform, file: string, which: (com
   throw new Error(`snapshot advisory locks are unavailable on ${platform}`)
 }
 
-async function acquire(file: string, signal: AbortSignal) {
-  const child = Bun.spawn(lockCommand(process.platform, file, Bun.which), {
+async function acquire(file: string, signal: AbortSignal, tryOnly: boolean) {
+  const child = Bun.spawn(lockCommand(process.platform, file, Bun.which, tryOnly), {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -117,8 +158,10 @@ async function acquire(file: string, signal: AbortSignal) {
     while (!ready.includes("\n")) {
       const next = await reader.read()
       if (next.done) {
+        const exitCode = await child.exited
+        if (tryOnly && exitCode === 75) return
         const stderr = await new Response(child.stderr).text()
-        throw new Error(`failed to acquire snapshot maintenance lock (exit ${await child.exited}): ${stderr}`)
+        throw new Error(`failed to acquire snapshot maintenance lock (exit ${exitCode}): ${stderr}`)
       }
       ready += new TextDecoder().decode(next.value)
     }
