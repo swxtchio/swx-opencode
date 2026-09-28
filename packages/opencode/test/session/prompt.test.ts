@@ -817,6 +817,54 @@ it.instance("keeps admit-only input out of automatic turns and preserves explici
   60_000,
 )
 
+it.instance("completed prompt releases its run control before the next prompt", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Run control cleanup" })
+    const firstID = MessageID.make("msg_control_first")
+    const secondID = MessageID.make("msg_control_second")
+    yield* llm.push(
+      reply().text("first prompt handled").stop().item(),
+      reply().text("second prompt handled").stop().item(),
+    )
+
+    const first = yield* prompt
+      .prompt({
+        sessionID: session.id,
+        messageID: firstID,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "first prompt" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "first prompt did not reach the provider", "10 seconds")
+    expect(Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(first), "first prompt did not finish", "10 seconds"))).toBe(
+      true,
+    )
+
+    const second = yield* prompt
+      .prompt({
+        sessionID: session.id,
+        messageID: secondID,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "second prompt" }],
+      })
+      .pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(2), "second prompt did not reach the provider", "10 seconds")
+    const request = (yield* llm.inputs)[1]
+    if (!request) throw new Error("expected the second provider request")
+    expect(lastUserContent(request)).toContain("second prompt")
+    expect(
+      Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(second), "second prompt did not finish", "10 seconds")),
+    ).toBe(true)
+    expect(yield* llm.calls).toBe(2)
+  }),
+  60_000,
+)
+
 firstLoadPrompt.instance(
   "anchors the initiating prompt when marked input commits before the first history load",
   () =>

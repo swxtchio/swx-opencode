@@ -1168,6 +1168,7 @@ const layer = Layer.effect(
                 )
                 return MessageV2.latest(messages, { admissionOrder: admitted.order }).user?.id
               }))
+            if (runControls.has(sessionID)) throw new Error(`Active prompt run control already exists: ${sessionID}`)
             yield* Effect.sync(() => runControls.set(sessionID, runControl))
             return root
           }),
