@@ -604,15 +604,11 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
   return filterCompacted(yield* stream(sessionID))
 })
 
-// filterCompacted reorders messages for model consumption
-// ([compaction-user, summary, ...retained tail..., continue-user]), so array
-// position is not chronological. IDs are only a deterministic tie-breaker
-// because imported messages do not necessarily have monotonic IDs.
 export function latest(
   msgs: WithParts[],
-  options?: {
+  options: {
     completedUserIDs?: ReadonlySet<MessageID>
-    userOrder?: (messageID: MessageID) => number | undefined
+    admissionOrder: ReadonlyMap<MessageID, number>
   },
 ) {
   let user: User | undefined
@@ -623,16 +619,17 @@ export function latest(
     if (
       info.role === "user" &&
       info.noReply !== true &&
-      !options?.completedUserIDs?.has(info.id) &&
-      isAfterUser(info, user, options?.userOrder)
+      !options.completedUserIDs?.has(info.id) &&
+      isLater(info, user, options.admissionOrder)
     )
       user = info
-    if (info.role === "assistant" && isAfter(info, assistant)) assistant = info
-    if (info.role === "assistant" && info.finish && isAfter(info, finished)) finished = info
+    if (info.role === "assistant" && isLater(info, assistant, options.admissionOrder)) assistant = info
+    if (info.role === "assistant" && info.finish && isLater(info, finished, options.admissionOrder)) finished = info
   }
   const tasks = msgs.flatMap((msg) => {
     const parentID = msg.info.role === "user" ? msg.info.id : msg.info.parentID
-    if (options?.completedUserIDs?.has(parentID) || (finished && !isAfter(msg.info, finished))) return []
+    if (options.completedUserIDs?.has(parentID) || (finished && !isLater(msg.info, finished, options.admissionOrder)))
+      return []
     return msg.parts.filter(
       (part): part is CompactionPart | SubtaskPart => part.type === "compaction" || part.type === "subtask",
     )
@@ -640,20 +637,15 @@ export function latest(
   return { user, assistant, finished, tasks }
 }
 
-function isAfterUser(info: User, other?: User, order?: (messageID: MessageID) => number | undefined) {
+function isLater(info: Info, other: Info | undefined, order: ReadonlyMap<MessageID, number>) {
   if (!other) return true
-  const currentOrder = order?.(info.id)
-  const previousOrder = order?.(other.id)
-  if (currentOrder !== undefined && previousOrder !== undefined) return currentOrder > previousOrder
-  if (currentOrder !== undefined) return true
-  if (previousOrder !== undefined) return false
-  return isAfter(info, other)
+  return orderOf(info.id, order) > orderOf(other.id, order)
 }
 
-function isAfter(info: Info, other?: Info) {
-  if (!other) return true
-  if (info.time.created !== other.time.created) return info.time.created > other.time.created
-  return info.id > other.id
+function orderOf(messageID: MessageID, order: ReadonlyMap<MessageID, number>) {
+  const result = order.get(messageID)
+  if (result === undefined) throw new Error(`Missing persisted admission order for message: ${messageID}`)
+  return result
 }
 
 export function fromError(

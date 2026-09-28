@@ -701,7 +701,7 @@ it.instance("imports successive message batches with one persisted session admis
         id: firstID,
         sessionID: session.id,
         role: "user" as const,
-        time: { created: 1 },
+        time: { created: 200 },
         agent: "build",
         model: { providerID: ref.providerID, modelID: ref.modelID },
       },
@@ -712,7 +712,7 @@ it.instance("imports successive message batches with one persisted session admis
         id: secondID,
         sessionID: session.id,
         role: "user" as const,
-        time: { created: 2 },
+        time: { created: 100 },
         agent: "build",
         model: { providerID: ref.providerID, modelID: ref.modelID },
       },
@@ -1130,6 +1130,81 @@ admissionPrompt.instance(
   60_000,
 )
 
+it.instance("steers from persisted admission order without prompt-entry state", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Persisted direct steer order" })
+    const taskGate = yield* Deferred.make<void>()
+    const firstGate = yield* Deferred.make<void>()
+    const root = yield* seedUser({
+      sessionID: session.id,
+      agent: "build",
+      model: ref,
+      parts: [{ type: "text", text: "original task" }],
+    })
+    if (root.info.role !== "user") throw new Error("expected the original user message")
+    yield* sessions.updateMessage({ ...root.info, time: { created: 500 } })
+
+    yield* Effect.gen(function* () {
+      yield* llm.push(
+        reply().wait(deferredAsPromise(taskGate)).tool("first", { value: "continue" }).item(),
+        reply().wait(deferredAsPromise(firstGate)).text("first persisted input handled").stop().item(),
+        reply().text("second persisted input handled").stop().item(),
+      )
+      const run = yield* prompt.loop({ sessionID: session.id, messageID: root.info.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "original task provider request did not start", "10 seconds")
+
+      const firstID = MessageID.make("msg_z_persisted_first")
+      const secondID = MessageID.make("msg_a_persisted_second")
+      yield* sessions.updateMessage({ ...root.info, id: firstID, time: { created: 400 } })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: firstID,
+        sessionID: session.id,
+        type: "text",
+        text: "first persisted direct input",
+      })
+      yield* sessions.updateMessage({ ...root.info, id: secondID, time: { created: 100 } })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: secondID,
+        sessionID: session.id,
+        type: "text",
+        text: "second persisted direct input",
+      })
+      const order = (yield* MessageV2.admission(session.id)).order
+      expect(order.get(firstID)).toBeLessThan(order.get(secondID) ?? Infinity)
+
+      yield* Deferred.succeed(taskGate, void 0)
+      yield* awaitWithTimeout(llm.wait(2), "oldest persisted direct input missed the next provider boundary", "10 seconds")
+      const firstRequest = (yield* llm.inputs)[1]
+      if (!firstRequest) throw new Error("expected the first persisted direct request")
+      expect(JSON.stringify(firstRequest.messages)).toContain("first persisted direct input")
+      expect(JSON.stringify(firstRequest.messages)).not.toContain("second persisted direct input")
+
+      yield* Deferred.succeed(firstGate, void 0)
+      yield* awaitWithTimeout(llm.wait(3), "newer persisted direct input did not follow", "10 seconds")
+      const secondRequest = (yield* llm.inputs)[2]
+      if (!secondRequest) throw new Error("expected the second persisted direct request")
+      expect(JSON.stringify(secondRequest.messages)).toContain("second persisted direct input")
+      expect((yield* MessageV2.admission(session.id)).claimed.has(firstID)).toBe(true)
+      expect((yield* MessageV2.admission(session.id)).claimed.has(secondID)).toBe(true)
+      expect(Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(run), "persisted direct run did not finish", "10 seconds"))).toBe(
+        true,
+      )
+      expect(yield* llm.calls).toBe(3)
+    }).pipe(
+      Effect.ensuring(
+        Effect.all([taskGate, firstGate].map((gate) => Deferred.succeed(gate, void 0).pipe(Effect.ignore)), {
+          discard: true,
+        }),
+      ),
+    )
+  }),
+)
+
 stepZeroPrompt.instance(
   "keeps released held inputs ordered through tool continuation and the promoted step-zero reload",
   () =>
@@ -1371,7 +1446,7 @@ stepZeroPrompt.instance(
           throw new Error("expected all released held user inputs")
         expect(persistedAdmission.order.get(firstID)).toBeGreaterThan(persistedAdmission.order.get(secondID) ?? 0)
         expect(persistedAdmission.order.get(firstID)).toBeGreaterThan(persistedAdmission.order.get(thirdID) ?? 0)
-        expect(MessageV2.latest(persisted, { userOrder: (id) => persistedAdmission.order.get(id) }).user?.id).toBe(
+        expect(MessageV2.latest(persisted, { admissionOrder: persistedAdmission.order }).user?.id).toBe(
           firstID,
         )
 
@@ -1657,8 +1732,8 @@ it.instance(
       const toolGate = yield* Deferred.make<void>()
       const firstSteerGate = yield* Deferred.make<void>()
       const secondSteerGate = yield* Deferred.make<void>()
-      const firstID = MessageID.make("msg_steer_first")
-      const secondID = MessageID.make("msg_steer_second")
+      const firstID = MessageID.make("msg_z_steer_first")
+      const secondID = MessageID.make("msg_a_steer_second")
       const heldID = MessageID.make("msg_steer_held")
 
       yield* Effect.gen(function* () {
@@ -1719,6 +1794,16 @@ it.instance(
           "direct steering prompts were not admitted",
           "10 seconds",
         )
+        const firstSaved = (yield* sessions.messages({ sessionID: session.id })).find(
+          (message) => message.info.id === firstID,
+        )
+        const secondSaved = (yield* sessions.messages({ sessionID: session.id })).find(
+          (message) => message.info.id === secondID,
+        )
+        if (!firstSaved || firstSaved.info.role !== "user" || !secondSaved || secondSaved.info.role !== "user")
+          throw new Error("expected both direct messages to be persisted")
+        yield* sessions.updateMessage({ ...firstSaved.info, time: { created: 300 } })
+        yield* sessions.updateMessage({ ...secondSaved.info, time: { created: 100 } })
         const original = (yield* llm.inputs)[0]
         if (!original) throw new Error("expected the original provider request")
         expect(JSON.stringify(original.messages)).not.toContain("captain one")
@@ -4165,11 +4250,13 @@ unix(
         yield* Effect.addFinalizer(() => writeText(releaseFile, "release").pipe(Effect.ignore))
         const root = yield* seedUser({
           sessionID: session.id,
+          messageID: MessageID.make("msg_z_rootless_older"),
           agent: "build",
           model: ref,
           parts: [{ type: "text", text: "older rootless input" }],
         })
         if (root.info.role !== "user") throw new Error("expected the older user message")
+        yield* sessions.updateMessage({ ...root.info, time: { created: 300 } })
 
         const shell = yield* prompt
           .shell({
@@ -4183,11 +4270,15 @@ unix(
         yield* Effect.yieldNow
         const latest = yield* seedUser({
           sessionID: session.id,
+          messageID: MessageID.make("msg_a_rootless_newer"),
           agent: "build",
           model: ref,
           parts: [{ type: "text", text: "latest persisted rootless input" }],
         })
         if (latest.info.role !== "user") throw new Error("expected the latest user message")
+        yield* sessions.updateMessage({ ...latest.info, time: { created: 100 } })
+        const order = (yield* MessageV2.admission(session.id)).order
+        expect(order.get(root.info.id)).toBeLessThan(order.get(latest.info.id) ?? Infinity)
         yield* llm.text("latest rootless input handled")
         yield* writeText(releaseFile, "release")
 

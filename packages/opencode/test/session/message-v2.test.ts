@@ -1611,42 +1611,52 @@ describe("session.message-v2.latest", () => {
     ] as SessionV1.Part[],
   }
 
-  test("selects latest messages by creation time when IDs are nonmonotonic", () => {
-    const oldUser = { ...userInfo("msg_z_user"), time: { created: 100 } }
-    const newUser = { ...userInfo("msg_a_user"), time: { created: 200 } }
+  test("selects latest messages by admission order when IDs and timestamps disagree", () => {
+    const oldUser = { ...userInfo("msg_z_user"), time: { created: 400 } }
+    const newUser = { ...userInfo("msg_a_user"), time: { created: 100 } }
     const oldAssistant = {
       ...assistantInfo("msg_z_assistant", oldUser.id),
-      time: { created: 300 },
+      time: { created: 500 },
       finish: "stop",
     } as SessionV1.Assistant
     const newAssistant = {
       ...assistantInfo("msg_a_assistant", newUser.id),
-      time: { created: 400 },
+      time: { created: 200 },
       finish: "stop",
     } as SessionV1.Assistant
+    const admissionOrder = new Map<MessageID, number>([
+      [oldUser.id, 1],
+      [oldAssistant.id, 2],
+      [newUser.id, 3],
+      [newAssistant.id, 4],
+    ])
 
     const state = MessageV2.latest([
       { info: newAssistant, parts: [] },
       { info: oldUser, parts: [] },
       { info: oldAssistant, parts: [] },
       { info: newUser, parts: [] },
-    ])
+    ], { admissionOrder })
 
     expect(state.user?.id).toBe(newUser.id)
     expect(state.assistant?.id).toBe(newAssistant.id)
     expect(state.finished?.id).toBe(newAssistant.id)
   })
 
-  test("uses ID as a deterministic tie-breaker for equal creation times", () => {
+  test("uses admission order when IDs have equal timestamps", () => {
     const lower = { ...userInfo("msg_a_user"), time: { created: 100 } }
     const higher = { ...userInfo("msg_z_user"), time: { created: 100 } }
+    const admissionOrder = new Map<MessageID, number>([
+      [higher.id, 1],
+      [lower.id, 2],
+    ])
 
     const state = MessageV2.latest([
       { info: higher, parts: [] },
       { info: lower, parts: [] },
-    ])
+    ], { admissionOrder })
 
-    expect(state.user?.id).toBe(higher.id)
+    expect(state.user?.id).toBe(lower.id)
   })
 
   // Regression for double auto-compaction. The reorder in filterCompacted
@@ -1654,7 +1664,14 @@ describe("session.message-v2.latest", () => {
   // so picking lastFinished by array position landed on the pre-compaction
   // overflow assistant and bypassed the `summary !== true` overflow guard
   // in SessionPrompt.runLoop, firing a second compaction.create immediately.
-  test("finished is the chronologically-latest finished assistant, not the array-latest", () => {
+  test("finished follows admission order, not the model-history array order", () => {
+    const admissionOrder = new Map<MessageID, number>([
+      [TAIL_USER, 1],
+      [OVERFLOW_ASSISTANT, 2],
+      [COMPACTION_USER, 3],
+      [SUMMARY_ASSISTANT, 4],
+      [CONTINUE_USER, 5],
+    ])
     const filtered = MessageV2.filterCompacted([
       continueUser,
       summaryAssistant,
@@ -1663,7 +1680,7 @@ describe("session.message-v2.latest", () => {
       tailUser,
     ])
 
-    const state = MessageV2.latest(filtered)
+    const state = MessageV2.latest(filtered, { admissionOrder })
 
     expect(state.finished?.id).toBe(SUMMARY_ASSISTANT)
     expect(state.finished?.summary).toBe(true)
@@ -1683,14 +1700,19 @@ describe("session.message-v2.latest", () => {
       ] as SessionV1.Part[],
     }
 
-    const state = MessageV2.latest([
-      tailUser,
-      overflowAssistant,
-      compactionUser,
-      summaryAssistant,
-      continueUser,
-      newCompactionUser,
-    ])
+    const state = MessageV2.latest(
+      [tailUser, overflowAssistant, compactionUser, summaryAssistant, continueUser, newCompactionUser],
+      {
+        admissionOrder: new Map<MessageID, number>([
+          [TAIL_USER, 1],
+          [OVERFLOW_ASSISTANT, 2],
+          [COMPACTION_USER, 3],
+          [SUMMARY_ASSISTANT, 4],
+          [CONTINUE_USER, 5],
+          [NEW_COMPACTION_USER, 6],
+        ]),
+      },
+    )
 
     expect(state.finished?.id).toBe(SUMMARY_ASSISTANT)
     expect(state.user?.id).toBe(NEW_COMPACTION_USER)
@@ -1698,7 +1720,7 @@ describe("session.message-v2.latest", () => {
     expect(state.tasks[0]).toMatchObject({ type: "compaction", auto: true })
   })
 
-  test("selects compaction and subtask work after the finished boundary by creation time", () => {
+  test("selects compaction and subtask work after the finished boundary by admission order", () => {
     const finished = {
       ...assistantInfo("msg_z_finished", "msg_parent"),
       time: { created: 200 },
@@ -1721,7 +1743,13 @@ describe("session.message-v2.latest", () => {
       ] as SessionV1.Part[],
     }
 
-    const state = MessageV2.latest([newTask, { info: finished, parts: [] }, oldTask])
+    const state = MessageV2.latest([newTask, { info: finished, parts: [] }, oldTask], {
+      admissionOrder: new Map<MessageID, number>([
+        [oldTask.info.id, 1],
+        [finished.id, 2],
+        [newTask.info.id, 3],
+      ]),
+    })
 
     expect(state.tasks).toHaveLength(1)
     expect(state.tasks[0]).toMatchObject({ type: "subtask", prompt: "inspect" })

@@ -1166,7 +1166,7 @@ const layer = Layer.effect(
                 const admitted = yield* MessageV2.admission(sessionID).pipe(
                   Effect.provideService(Database.Service, database),
                 )
-                return MessageV2.latest(messages, { userOrder: (id) => admitted.order.get(id) }).user?.id
+                return MessageV2.latest(messages, { admissionOrder: admitted.order }).user?.id
               }))
             yield* Effect.sync(() => runControls.set(sessionID, runControl))
             return root
@@ -1208,6 +1208,12 @@ const layer = Layer.effect(
           return msgs
         })
 
+        const orderOf = (messageID: MessageID) => {
+          const order = admissionOrder.get(messageID)
+          if (order === undefined) throw new Error(`Missing persisted admission order for message: ${messageID}`)
+          return order
+        }
+
         const initializeTurn = (msgs: SessionV1.WithParts[]) => {
           if (turnRoot) return
           const root = runRootMessageID
@@ -1215,13 +1221,18 @@ const layer = Layer.effect(
                 (msg): msg is UserWithParts =>
                   msg.info.role === "user" && msg.info.id === runRootMessageID && msg.info.noReply !== true,
               )?.info
-            : MessageV2.latest(msgs, { userOrder: (id) => admissionOrder.get(id) }).user
+            : MessageV2.latest(msgs, { admissionOrder }).user
           if (runRootMessageID && !root) throw new Error(`Run root message not found: ${runRootMessageID}`)
           turnRoot = root
           if (!turnRoot) return
           initialTurnRootID = turnRoot.id
+          const rootOrder = orderOf(turnRoot.id)
           msgs.forEach((msg) => {
-            if (msg.info.role === "user" && msg.info.id !== turnRoot?.id && !promptedInputIDs.has(msg.info.id))
+            if (
+              msg.info.role === "user" &&
+              msg.info.id !== turnRoot?.id &&
+              (orderOf(msg.info.id) < rootOrder || claimedInputIDs.has(msg.info.id))
+            )
               completedInputIDs.add(msg.info.id)
           })
         }
@@ -1248,7 +1259,7 @@ const layer = Layer.effect(
           })
           incoming.forEach((msg) => heldIDs.add(msg.info.id))
           held = [...held, ...incoming].sort(
-            (a, b) => (admissionOrder.get(a.info.id) ?? 0) - (admissionOrder.get(b.info.id) ?? 0),
+            (a, b) => orderOf(a.info.id) - orderOf(b.info.id),
           )
         }
 
@@ -1261,8 +1272,7 @@ const layer = Layer.effect(
                 msg.info.id !== turnRoot?.id &&
                 !heldIDs.has(msg.info.id) &&
                 !completedInputIDs.has(msg.info.id) &&
-                !claimedInputIDs.has(msg.info.id) &&
-                promptedInputIDs.has(msg.info.id),
+                !claimedInputIDs.has(msg.info.id),
             )
             .filter((msg) => {
               const text = msg.parts.find(
@@ -1270,9 +1280,7 @@ const layer = Layer.effect(
               )?.text
               return MachineMessage.classify(text ?? "", markerConfig) !== "hold"
             })
-            .sort(
-              (a, b) => (admissionOrder.get(a.info.id) ?? 0) - (admissionOrder.get(b.info.id) ?? 0),
-            )
+            .sort((a, b) => orderOf(a.info.id) - orderOf(b.info.id))
 
         const projectTurn = (msgs: SessionV1.WithParts[]) => {
           const completed = (msg: SessionV1.WithParts) =>
@@ -1355,7 +1363,7 @@ const layer = Layer.effect(
           )
           const selection = {
             completedUserIDs: completedInputIDs,
-            userOrder: (id: MessageID) => admissionOrder.get(id),
+            admissionOrder,
           }
           let selected = MessageV2.latest(msgs, selection)
           if (activeSteerInput && msgs.some((msg) => msg.info.id === activeSteerInput?.info.id)) {
@@ -1667,9 +1675,7 @@ const layer = Layer.effect(
             const directInputs = pendingImmediateInputs(msgs)
             const direct = directInputs[0]
             const nextHeld = held[0]
-            const directOrder = direct ? (admissionOrder.get(direct.info.id) ?? 0) : undefined
-            const heldOrder = nextHeld ? (admissionOrder.get(nextHeld.info.id) ?? 0) : undefined
-            if (direct && (!nextHeld || (directOrder ?? 0) < (heldOrder ?? 0))) {
+            if (direct && (!nextHeld || orderOf(direct.info.id) < orderOf(nextHeld.info.id))) {
               activeSteerInput = direct
               turnRoot = direct.info
               activeInputTurn = direct
