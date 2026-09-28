@@ -26,7 +26,7 @@ import { Image } from "../../src/image/image"
 import { Question } from "../../src/question"
 import { Todo } from "../../src/session/todo"
 import { Session } from "@/session/session"
-import { SessionMessageTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, SessionMessageTable } from "@opencode-ai/core/session/sql"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -55,9 +55,11 @@ import { TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { InstanceRef } from "@/effect/instance-ref"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import { runImport } from "../../src/cli/cmd/import"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -641,6 +643,58 @@ test("classifies configured machine markers from their producer framing", async 
     }),
   ).toBe("critical")
 })
+
+it.instance("imports successive message batches with one persisted session admission order", () =>
+  Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const fs = yield* FSUtil.Service
+    const sessions = yield* Session.Service
+    const ctx = yield* InstanceRef
+    if (!ctx) throw new Error("expected an instance context")
+
+    const session = yield* sessions.create({ title: "Imported admission order" })
+    const firstID = MessageID.make("msg_import_first")
+    const secondID = MessageID.make("msg_import_second")
+    const file = path.join(ctx.directory, "session-import.json")
+    const first = {
+      info: {
+        id: firstID,
+        sessionID: session.id,
+        role: "user" as const,
+        time: { created: 1 },
+        agent: "build",
+        model: { providerID: ref.providerID, modelID: ref.modelID },
+      },
+      parts: [],
+    }
+    const second = {
+      info: {
+        id: secondID,
+        sessionID: session.id,
+        role: "user" as const,
+        time: { created: 2 },
+        agent: "build",
+        model: { providerID: ref.providerID, modelID: ref.modelID },
+      },
+      parts: [],
+    }
+
+    yield* fs.writeJson(file, { info: session, messages: [first] })
+    yield* runImport(file, ctx)
+    yield* fs.writeJson(file, { info: session, messages: [second] })
+    yield* runImport(file, ctx)
+
+    const imported = yield* db
+      .select({ id: MessageTable.id, admission_seq: MessageTable.admission_seq })
+      .from(MessageTable)
+      .where(eq(MessageTable.session_id, session.id))
+      .orderBy(MessageTable.admission_seq)
+      .all()
+      .pipe(Effect.orDie)
+    expect(imported.map((message) => message.id)).toEqual([firstID, secondID])
+    expect(imported[1]?.admission_seq).toBeGreaterThan(imported[0]?.admission_seq ?? 0)
+  }),
+)
 
 firstLoadPrompt.instance(
   "anchors the initiating prompt when marked input commits before the first history load",
