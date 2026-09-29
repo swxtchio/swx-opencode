@@ -605,23 +605,6 @@ const rootlessLoopPrompt = testEffect(makeHttp({ status: rootlessLoopGate.status
 const shellQueuedLoopGate = busyStatusGate(1)
 const shellQueuedLoopPrompt = testEffect(makeHttp({ status: shellQueuedLoopGate.status }))
 
-const compactionProcessEntered = defer<void>()
-const compactionProcessRelease = defer<void>()
-const stoppingCompaction = Layer.succeed(
-  SessionCompaction.Service,
-  SessionCompaction.Service.of({
-    isOverflow: () => Effect.succeed(false),
-    prune: () => Effect.void,
-    process: () =>
-      Effect.promise(() => {
-        compactionProcessEntered.resolve()
-        return compactionProcessRelease.promise.then(() => "stop" as const)
-      }),
-    create: () => Effect.succeed(MessageID.ascending()),
-  }),
-)
-const compactionStopPrompt = testEffect(makeHttp({ compaction: stoppingCompaction }))
-
 const directProjectionEntered = defer<void>()
 const directProjectionRelease = defer<void>()
 let gateDirectProjection = false
@@ -729,58 +712,77 @@ const seedUser = Effect.fn("test.seedUser")(function* (input: Omit<SessionPrompt
   return { info, parts: message.parts }
 })
 
-test("classifies configured machine markers from their producer framing", async () => {
-  const heartbeat = await Bun.file(path.join(import.meta.dir, "fixtures", "fleet-heartbeat.txt")).text()
-  const heartbeatSummary = await Bun.file(path.join(import.meta.dir, "fixtures", "fleet-heartbeat-summary.txt")).text()
-  const summaryBoundary = heartbeatSummary.indexOf("… Full message:")
-  const shortSummary = heartbeatSummary.slice(0, summaryBoundary - 1) + heartbeatSummary.slice(summaryBoundary)
-  const oversizedSummary =
-    heartbeatSummary.slice(0, summaryBoundary) + "x".repeat(241) + heartbeatSummary.slice(summaryBoundary)
-  const arbitrarySummary = "Heartbeat summary: ordinary user text" + heartbeatSummary.slice(summaryBoundary)
-  const marked = [
-    "[fm-from-peer]\x1f peer-name\x1f /peer/home\x1f p1-2-abcd\x1f peer request",
-    "[fm-from-firstmate]\x1f request from firstmate",
-    "\x1f daemon request",
-    "WATCHER FIRED [turn-ended]",
-    "OBSERVER: follow this direction",
+// Wire shapes mirror fm-marker-lib.sh, fm-heartbeat-timer.sh, fm-send.sh, and both primary OpenCode plugins.
+test("classifies current firstmate generator output", () => {
+  const levelToken = (level: string, key?: string) => `[fm-level:${level}${key ? `:${key}` : ""}]\x1f `
+  const receipt = (id: string) => ` [fm-heartbeat-receipt:${id}]`
+  const heartbeatPrompt =
+    "Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.md."
+  const anchor = " See docs/fleet-operating-process.md."
+  const promptWithoutAnchor = heartbeatPrompt.slice(0, -anchor.length)
+  const timestamp = "2026-09-29T12:30Z"
+  const ram = "System RAM: 53.2/86.1 GiB used (62%) · 33.0 GiB available"
+  const transcript = "Session transcript: unavailable (reason=no-primary-target)"
+  const context = `${timestamp} · ${ram} · ${transcript} · `
+  const heartbeat = `${levelToken("nudge", "heartbeat")}${context}${heartbeatPrompt}${receipt("hb-inline")}`
+  const watcherRequest = `${levelToken("request")}WATCHER FIRED [failure-1] - handle this retained watcher episode and continue normal supervision without running a foreground watcher or status loop.\n\nsignal: waiting: peer reply`
+  const watcherWake = `${levelToken("nudge", "watcher.wake")}WATCHER FIRED [wake-1] - drain queued wakes with bin/fm-wake-drain.sh, handle the reported wake, and continue normal supervision\n\nsignal: check: resume the peer review`
+  const turnendNudge = `${levelToken("nudge", "turnend.blind")}TURN WOULD END BLIND - supervision is off. Resume supervision according to the session-start operating block before ending the turn.\n\nwatcher: arm failed`
+  const peerEnvelope = "[fm-from-peer]\x1f peer-name\x1f /peer/home\x1f p1-2-abcd\x1f "
+  const peerRequest = `${peerEnvelope}${levelToken("request")}review the branch`
+  const peerInfo = `${peerEnvelope}${levelToken("info")}peer status`
+  const peerCritical = `${peerEnvelope}${levelToken("critical")}disk alert`
+  const secondmateRequest = `[fm-from-firstmate]\x1f${levelToken("request")}inspect the issue`
+  const secondmateCritical = `[fm-from-firstmate]\x1f${levelToken("critical")}disk alert`
+  const observerDirective = `OBSERVER: ${levelToken("directive")}look up the open issue before editing`
+  const summarySource = `${context}${promptWithoutAnchor} Periodic nudge: ${"Review recent open work from the live queue. ".repeat(8)}${anchor}`
+  const summaryPrefix = Array.from(summarySource).slice(0, 240).join("")
+  const heartbeatSummary =
+    `${levelToken("nudge", "heartbeat.duty.review")}` +
+    `Heartbeat summary: ${summaryPrefix}… Full message: /tmp/heartbeat-payload${receipt("hb-summary")}`
+  const boundaryReceipt = receipt("hb-boundary")
+  const boundaryNudgePrefix = `${context}${promptWithoutAnchor} Periodic nudge: `
+  const boundaryPadding = 700 - Array.from(`${boundaryNudgePrefix}${anchor}${boundaryReceipt}`).length
+  expect(boundaryPadding).toBeGreaterThan(0)
+  const boundaryBody = `${boundaryNudgePrefix}${"x".repeat(boundaryPadding)}${anchor}${boundaryReceipt}`
+  const boundaryHeartbeat = `${levelToken("nudge", "heartbeat.duty.boundary")}${boundaryBody}`
+  const malformedPeerCritical = `${"[fm-from-peer]\x1f peer-name\x1f /peer/home\x1f not-a-msgid\x1f "}${levelToken("critical")}disk alert`
+
+  expect(Array.from(boundaryBody)).toHaveLength(700)
+  expect(Array.from(boundaryHeartbeat).length).toBeGreaterThan(700)
+  for (const message of [
     heartbeat,
     heartbeatSummary,
-  ]
-  for (const message of marked) expect(MachineMessage.classify(message)).toBe("hold")
+    boundaryHeartbeat,
+    watcherRequest,
+    watcherWake,
+    turnendNudge,
+    peerRequest,
+    peerInfo,
+    secondmateRequest,
+    observerDirective,
+  ])
+    expect(MachineMessage.classify(message)).toBe("hold")
+  expect(MachineMessage.classify(peerCritical)).toBe("critical")
+  expect(MachineMessage.classify(secondmateCritical)).toBe("critical")
 
   const nearMisses = [
-    "[fm-from-peer] peer request",
-    "[fm-from-firstmate] request from firstmate",
-    "human text [fm-from-peer]\x1f peer request",
-    "human text WATCHER FIRED [turn-ended]",
-    "observer: lower-case label",
-    " \x1f daemon request",
+    "[fm-level:unknown]\x1f WATCHER FIRED [unknown]",
+    "[fm-level:nudge:BadKey]\x1f WATCHER FIRED [bad key]",
+    "[fm-level:request\x1f WATCHER FIRED [unterminated]",
+    "human note [fm-level:critical]\x1f disk alert",
     heartbeat.replace(/ \[fm-heartbeat-receipt:[a-zA-Z0-9._-]+\]$/, ""),
-    heartbeat + " trailing text",
-    "human note " + heartbeat,
-    heartbeatSummary.replace(/ \[fm-heartbeat-receipt:[a-zA-Z0-9._-]+\]$/, ""),
-    shortSummary,
-    arbitrarySummary,
-    oversizedSummary,
+    `${levelToken("nudge", "heartbeat")}${context}${promptWithoutAnchor} Periodic nudge: missing-anchor`,
   ]
   for (const message of nearMisses) expect(MachineMessage.classify(message)).toBeUndefined()
+  expect(MachineMessage.classify(malformedPeerCritical)).toBe("hold")
 
   const custom = { type: "prefix", value: "CUSTOM:" } as const
   expect(MachineMessage.classify("CUSTOM: deployment message", { hold: [custom] })).toBe("hold")
-  expect(MachineMessage.classify(marked[0], { hold: [custom] })).toBe("hold")
+  expect(MachineMessage.classify(`${peerEnvelope}ordinary peer mail`, { critical: [custom] })).toBe("hold")
   expect(
-    MachineMessage.classify(marked[0], {
+    MachineMessage.classify(`${peerEnvelope}ordinary peer mail`, {
       critical: [{ type: "prefix", value: "[fm-from-peer]\x1f" }],
-    }),
-  ).toBe("critical")
-  expect(
-    MachineMessage.classify(heartbeat, {
-      critical: [{ type: "fleet-heartbeat" }],
-    }),
-  ).toBe("critical")
-  expect(
-    MachineMessage.classify(heartbeatSummary, {
-      critical: [{ type: "fleet-heartbeat" }],
     }),
   ).toBe("critical")
 })
@@ -1157,7 +1159,7 @@ preProviderFailurePrompt.instance("allows retry after preparation fails before p
 )
 
 it.instance(
-  "orders multiple queued prompts by durable queue admission",
+  "orders marked watcher and turn-end prompts by durable queue admission",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
@@ -1167,8 +1169,10 @@ it.instance(
       const session = yield* sessions.create({ title: "Pinned" })
       const taskGate = yield* Deferred.make<void>()
       yield* Effect.addFinalizer(() => Deferred.succeed(taskGate, void 0).pipe(Effect.ignore))
-      const firstText = "first queued prompt"
-      const secondText = "second queued prompt"
+      const firstText =
+        "[fm-level:nudge:watcher.wake]\x1f WATCHER FIRED [wake-1] - drain queued wakes with bin/fm-wake-drain.sh, handle the reported wake, and continue normal supervision\n\nsignal: waiting: peer reply"
+      const secondText =
+        "[fm-level:nudge:turnend.blind]\x1f TURN WOULD END BLIND - supervision is off. Resume supervision according to the session-start operating block before ending the turn.\n\nwatcher: arm exited"
 
       yield* llm.push(
         reply().wait(deferredAsPromise(taskGate)).text("task finished").stop().item(),
@@ -1185,7 +1189,6 @@ it.instance(
           sessionID: session.id,
           agent: "build",
           model: ref,
-          delivery: "queue",
           parts: [{ type: "text", text: firstText }],
         })
         .pipe(Effect.forkChild)
@@ -1199,7 +1202,6 @@ it.instance(
           sessionID: session.id,
           agent: "build",
           model: ref,
-          delivery: "queue",
           parts: [{ type: "text", text: secondText }],
         })
         .pipe(Effect.forkChild)
@@ -1212,13 +1214,10 @@ it.instance(
         item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(" "),
       )
       expect(pending.map((item) => item.delivery)).toEqual(["queue", "queue"])
-      expect([...pendingTexts].sort()).toEqual([firstText, secondText].sort())
+      expect(pendingTexts).toEqual([firstText, secondText])
       const firstPending = pending[0]
       const secondPending = pending[1]
       if (!firstPending || !secondPending) throw new Error("expected both pending marked prompts")
-      const firstQueuedText = pendingTexts[0]
-      const secondQueuedText = pendingTexts[1]
-      if (!firstQueuedText || !secondQueuedText) throw new Error("expected both marked prompt texts")
       expect(firstPending.seq).toBeLessThan(secondPending.seq)
 
       const active = (yield* llm.inputs)[0]
@@ -1227,15 +1226,15 @@ it.instance(
       expect(JSON.stringify(active.messages)).not.toContain(secondText)
 
       yield* Deferred.succeed(taskGate, void 0)
-      yield* awaitWithTimeout(llm.wait(2), "first queued marked prompt was not promoted", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(2), "first marked prompt was not promoted", "10 seconds")
       const firstTurn = (yield* llm.inputs)[1]
       if (!firstTurn) throw new Error("expected the first queued provider request")
-      expect(lastUserContent(firstTurn)).toContain(firstQueuedText)
+      expect(lastUserContent(firstTurn)).toContain("WATCHER FIRED [wake-1]")
 
-      yield* awaitWithTimeout(llm.wait(3), "second queued marked prompt was not promoted", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(3), "second marked prompt was not promoted", "10 seconds")
       const secondTurn = (yield* llm.inputs)[2]
       if (!secondTurn) throw new Error("expected the second queued provider request")
-      expect(lastUserContent(secondTurn)).toContain(secondQueuedText)
+      expect(lastUserContent(secondTurn)).toContain("TURN WOULD END BLIND")
 
       expect(Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(task), "task did not finish", "10 seconds"))).toBe(true)
       expect(
@@ -1253,15 +1252,10 @@ it.instance(
 )
 
 it.instance(
-  "steers configured critical prompts during a continuation while holding ordinary machine mail",
+  "steers live critical-level prompts during a continuation while holding ordinary machine mail",
   () =>
     Effect.gen(function* () {
-      const { llm } = yield* useServerConfig((url) => ({
-        ...providerCfg(url),
-        machine_message_markers: {
-          critical: [{ type: "prefix", value: "[fm-from-peer]\x1f" }],
-        },
-      }))
+      const { llm } = yield* useServerConfig(providerCfg)
       const prompt = yield* SessionPrompt.Service
       const queue = yield* SessionQueue.Service
       const sessions = yield* Session.Service
@@ -1316,7 +1310,7 @@ it.instance(
             parts: [
               {
                 type: "text",
-                text: "[fm-from-peer]\x1f peer-name\x1f /peer/home\x1f p1-2-abcd\x1f disk alert",
+                text: "[fm-from-peer]\x1f peer-name\x1f /peer/home\x1f p1-2-abcd\x1f [fm-level:critical]\x1f disk alert",
               },
             ],
           })
@@ -1331,7 +1325,7 @@ it.instance(
                   : undefined,
               ),
             ),
-          "configured critical prompt was not admitted",
+          "live critical-level prompt was not admitted",
           "10 seconds",
         )
 
@@ -2039,7 +2033,7 @@ it.instance("legacy prompt emits message events without session.next events", ()
 )
 
 it.instance(
-  "parks queued machine mail after a content-filter terminal",
+  "delivers queued machine mail after a content-filter terminal",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
@@ -2200,17 +2194,21 @@ it.instance(
 )
 
 it.instance(
-  "reports structured-output errors when the response fails validation",
+  "delivers queued machine mail after a structured-output break",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
       const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
       const sessions = yield* Session.Service
       const chat = yield* sessions.create({ title: "Pinned" })
       const terminal = yield* Deferred.make<void>()
 
       yield* Effect.gen(function* () {
-        yield* llm.push(reply().wait(deferredAsPromise(terminal)).text("not structured output").stop().item())
+        yield* llm.push(
+          reply().wait(deferredAsPromise(terminal)).text("not structured output").stop().item(),
+          reply().text("held response").stop().item(),
+        )
         const root = yield* seedUser({
           sessionID: chat.id,
           agent: "build",
@@ -2224,80 +2222,147 @@ it.instance(
         })
         const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
         yield* awaitWithTimeout(llm.wait(1), "provider did not receive the structured-output task", "10 seconds")
-        yield* Deferred.succeed(terminal, void 0)
-        const exit = yield* awaitWithTimeout(Fiber.await(run), "session run did not finish", "10 seconds")
-        const messages = yield* sessions.messages({ sessionID: chat.id })
-        const failed = messages.find(
-          (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
-            message.info.role === "assistant" && message.info.parentID === root.info.id,
-        )
-        expect(Exit.isSuccess(exit)).toBe(true)
-        expect(failed?.info.role).toBe("assistant")
-        if (failed?.info.role === "assistant") expect(failed.info.error?.name).toBe("StructuredOutputError")
-        expect(yield* llm.calls).toBe(1)
-      }).pipe(Effect.ensuring(Deferred.succeed(terminal, void 0).pipe(Effect.ignore)))
-    }),
-  60_000,
-)
-
-compactionStopPrompt.instance(
-  "parks queued machine mail when compaction stops the current run",
-  () =>
-    Effect.gen(function* () {
-      const { llm } = yield* useServerConfig(providerCfg)
-      const prompt = yield* SessionPrompt.Service
-      const queue = yield* SessionQueue.Service
-      const sessions = yield* Session.Service
-      const chat = yield* sessions.create({ title: "Pinned" })
-
-      yield* Effect.gen(function* () {
-        const root = yield* seedUser({
-          sessionID: chat.id,
-          agent: "build",
-          model: ref,
-          parts: [{ type: "text", text: "task before compaction" }],
-        })
-        yield* sessions.updatePart({
-          id: PartID.ascending(),
-          messageID: root.info.id,
-          sessionID: chat.id,
-          type: "compaction",
-          auto: true,
-        })
-        const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-        yield* awaitWithTimeout(
-          Effect.promise(() => compactionProcessEntered.promise),
-          "compaction did not start",
-          "10 seconds",
-        )
         const heldID = MessageID.ascending()
+        const heldText = "[fm-from-peer]\x1f after structured-output break"
         const held = yield* prompt
           .prompt({
             sessionID: chat.id,
             messageID: heldID,
             agent: "build",
             model: ref,
-            parts: [{ type: "text", text: "[fm-from-firstmate]\x1f after compaction" }],
+            parts: [{ type: "text", text: heldText }],
           })
           .pipe(Effect.forkChild)
         const pending = yield* pollWithTimeout(
           queue.list(chat.id).pipe(Effect.map((items) => items.find((item) => item.input.messageID === heldID))),
-          "machine mail was not queued during compaction",
+          "machine mail was not queued before the structured-output break",
           "10 seconds",
         )
-        compactionProcessRelease.resolve()
+        expect(pending.delivery).toBe("queue")
 
+        yield* Deferred.succeed(terminal, void 0)
+        yield* awaitWithTimeout(
+          llm.wait(2),
+          "queued machine mail was not delivered after structured-output break",
+          "10 seconds",
+        )
+        const heldRequest = (yield* llm.inputs)[1]
+        if (!heldRequest) throw new Error("expected the queued machine request")
+        expect(lastUserContent(heldRequest)).toContain("after structured-output break")
         const exit = yield* awaitWithTimeout(Fiber.await(run), "session run did not finish", "10 seconds")
-        yield* awaitWithTimeout(Fiber.await(held), "queued machine mail did not return after compaction", "10 seconds")
+        const heldExit = yield* awaitWithTimeout(Fiber.await(held), "queued machine mail did not return", "10 seconds")
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        const failed = messages.find(
+          (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+            message.info.role === "assistant" && message.info.parentID === root.info.id,
+        )
         expect(Exit.isSuccess(exit)).toBe(true)
-        expect(yield* llm.calls).toBe(0)
-        expect(yield* queue.list(chat.id)).toEqual([pending])
-        expect(
-          (yield* sessions.messages({ sessionID: chat.id })).some((message) =>
-            message.parts.some((part) => part.type === "text" && part.text.includes("after compaction")),
-          ),
-        ).toBe(false)
-      }).pipe(Effect.ensuring(Effect.sync(() => compactionProcessRelease.resolve())))
+        expect(Exit.isSuccess(heldExit)).toBe(true)
+        expect(failed?.info.role).toBe("assistant")
+        if (failed?.info.role === "assistant") expect(failed.info.error?.name).toBe("StructuredOutputError")
+        expect(yield* queue.list(chat.id)).toEqual([])
+        expect(yield* llm.calls).toBe(2)
+      }).pipe(Effect.ensuring(Deferred.succeed(terminal, void 0).pipe(Effect.ignore)))
+    }),
+  60_000,
+)
+
+it.instance(
+  "delivers queued machine mail after a failed compaction summary",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const compaction = yield* SessionCompaction.Service
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      const toolFile = path.join(dir, "compaction-stop.txt")
+      yield* writeText(toolFile, "queue delivery after a failed summary")
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const toolGate = yield* Deferred.make<void>()
+      const compactionGate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() =>
+        Effect.all(
+          [toolGate, compactionGate].map((gate) => Deferred.succeed(gate, void 0).pipe(Effect.ignore)),
+          { discard: true },
+        ),
+      )
+
+      yield* seedUser({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "task before tool continuation" }],
+      })
+      yield* llm.push(reply().wait(deferredAsPromise(toolGate)).tool("glob", { pattern: "compaction-stop.txt" }).item())
+      yield* llm.error(400, { error: { message: "summary rejected" } }, deferredAsPromise(compactionGate))
+      yield* llm.text("held machine mail handled")
+
+      const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "task tool call did not reach the provider", "10 seconds")
+      const held = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: MessageID.ascending(),
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "[fm-from-firstmate]\x1f after compaction" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        queue.list(chat.id).pipe(Effect.map((items) => items.find((item) => item.delivery === "queue"))),
+        "machine mail was not queued during compaction",
+        "10 seconds",
+      )
+
+      const compactionID = yield* compaction.create({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        auto: true,
+      })
+
+      yield* Deferred.succeed(toolGate, void 0)
+      yield* awaitWithTimeout(llm.wait(2), "compaction summary did not reach the provider", "10 seconds")
+      yield* Deferred.succeed(compactionGate, void 0)
+      yield* awaitWithTimeout(
+        llm.wait(3),
+        "queued machine mail was not delivered after compaction stopped",
+        "10 seconds",
+      )
+      const heldRequest = (yield* llm.inputs)[2]
+      if (!heldRequest) throw new Error("expected the queued machine request")
+      expect(lastUserContent(heldRequest)).toContain("after compaction")
+
+      const runExit = yield* awaitWithTimeout(Fiber.await(run), "session run did not finish", "10 seconds")
+      const heldExit = yield* awaitWithTimeout(
+        Fiber.await(held),
+        "held prompt did not receive its own reply",
+        "10 seconds",
+      )
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const failedSummary = messages.find(
+        (message) => message.info.role === "assistant" && message.info.parentID === compactionID,
+      )
+      const heldUser = messages.find(
+        (message) =>
+          message.info.role === "user" &&
+          message.parts.some((part) => part.type === "text" && part.text.includes("after compaction")),
+      )
+      if (!Exit.isSuccess(heldExit) || !heldUser) throw new Error("expected the queued prompt's assistant reply")
+      expect(Exit.isSuccess(runExit)).toBe(true)
+      expect(failedSummary?.info.role).toBe("assistant")
+      if (failedSummary?.info.role === "assistant") expect(failedSummary.info.error).toBeDefined()
+      expect(heldExit.value.info.role).toBe("assistant")
+      if (heldExit.value.info.role === "assistant") expect(heldExit.value.info.parentID).toBe(heldUser.info.id)
+      expect(
+        heldExit.value.parts.some((part) => part.type === "text" && part.text === "held machine mail handled"),
+      ).toBe(true)
+      expect(yield* queue.list(chat.id)).toEqual([])
+      expect(yield* llm.calls).toBe(3)
     }),
   60_000,
 )
@@ -3779,22 +3844,22 @@ it.instance(
       const { llm, prompt, sessions, queue, chat, task, send, release } = yield* startHeld({ tool: true })
       yield* llm.error(400, { error: { message: "rejected by the provider" } })
 
-      const held = yield* send("parked by the error", { delivery: "queue" })
+      const parked = "[fm-from-peer]\x1f parked by the error"
+      const held = yield* send(parked)
       yield* queued(chat.id, 1)
       yield* release
       yield* finish(task, held)
       const stopped = (yield* sessions.messages({ sessionID: chat.id })).at(-1)?.info
       expect(stopped?.role === "assistant" ? stopped.error?.name : undefined).toBe("APIError")
       expect(yield* llm.calls).toBe(2)
-      expect((yield* queue.list(chat.id)).map((item) => item.input.parts)).toEqual([said("parked by the error")])
+      expect((yield* queue.list(chat.id)).map((item) => item.input.parts)).toEqual([said(parked)])
 
       yield* llm.text("wake done")
       yield* llm.text("parked done")
       yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("wake up") })
-      expect((yield* llm.inputs).slice(2).map(lastUser)).toEqual([
-        { role: "user", content: "wake up" },
-        { role: "user", content: "parked by the error" },
-      ])
+      const inputs = yield* llm.inputs
+      expect(lastUser(inputs[2])).toEqual({ role: "user", content: "wake up" })
+      expect(JSON.stringify(lastUser(inputs[3]))).toContain("parked by the error")
     }),
   15_000,
 )

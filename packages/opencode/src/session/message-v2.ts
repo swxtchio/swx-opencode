@@ -26,6 +26,7 @@ import { desc } from "drizzle-orm"
 import { eq } from "drizzle-orm"
 import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
+import { or } from "drizzle-orm"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
@@ -433,10 +434,11 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
 }) {
   const { db } = yield* Database.Service
   const before = input.before ? cursor.decode(input.before) : undefined
+  const legacyTime = before?.seq === undefined ? before?.time : undefined
   const beforeSeq =
     before?.seq !== undefined
       ? before.seq
-      : before
+      : before && legacyTime === undefined
         ? (yield* db
             .select({ seq: MessageTable.admission_seq })
             .from(MessageTable)
@@ -444,15 +446,30 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
             .get()
             .pipe(Effect.orDie))?.seq
         : undefined
+  if (before && beforeSeq === undefined && legacyTime === undefined)
+    throw new Error(`Message cursor anchor not found and has no legacy time: ${before.id}`)
+  const session = eq(MessageTable.session_id, input.sessionID)
   const where =
-    beforeSeq === undefined
-      ? eq(MessageTable.session_id, input.sessionID)
-      : and(eq(MessageTable.session_id, input.sessionID), older(beforeSeq))
+    beforeSeq !== undefined
+      ? and(session, older(beforeSeq))
+      : legacyTime !== undefined && before
+        ? and(
+            session,
+            or(
+              lt(MessageTable.time_created, legacyTime),
+              and(eq(MessageTable.time_created, legacyTime), lt(MessageTable.id, before.id)),
+            ),
+          )
+        : session
+  const order =
+    legacyTime === undefined
+      ? [desc(MessageTable.admission_seq)]
+      : [desc(MessageTable.time_created), desc(MessageTable.id)]
   const rows = yield* db
     .select()
     .from(MessageTable)
     .where(where)
-    .orderBy(desc(MessageTable.admission_seq))
+    .orderBy(...order)
     .limit(input.limit + 1)
     .all()
     .pipe(Effect.orDie)
@@ -478,7 +495,14 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
   return {
     items,
     more,
-    cursor: more && tail ? cursor.encode({ id: tail.id, seq: tail.admission_seq }) : undefined,
+    cursor:
+      more && tail
+        ? cursor.encode(
+            legacyTime === undefined
+              ? { id: tail.id, seq: tail.admission_seq }
+              : { id: tail.id, time: tail.time_created },
+          )
+        : undefined,
   }
 })
 
@@ -607,7 +631,6 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
 export function latest(
   msgs: WithParts[],
   options: {
-    completedUserIDs?: ReadonlySet<MessageID>
     admissionOrder: ReadonlyMap<MessageID, number>
     excludeNoReply?: boolean
   },
@@ -620,7 +643,6 @@ export function latest(
     if (
       info.role === "user" &&
       (!options.excludeNoReply || info.noReply !== true) &&
-      !options.completedUserIDs?.has(info.id) &&
       isLater(info, user, options.admissionOrder)
     )
       user = info
@@ -629,8 +651,7 @@ export function latest(
   }
   const tasks = msgs.flatMap((msg) => {
     const parentID = msg.info.role === "user" ? msg.info.id : msg.info.parentID
-    if (options.completedUserIDs?.has(parentID) || (finished && !isLater(msg.info, finished, options.admissionOrder)))
-      return []
+    if (finished && !isLater(msg.info, finished, options.admissionOrder)) return []
     return msg.parts.filter(
       (part): part is CompactionPart | SubtaskPart => part.type === "compaction" || part.type === "subtask",
     )

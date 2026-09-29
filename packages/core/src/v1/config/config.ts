@@ -31,10 +31,12 @@ export const MachineMessageMarker = Schema.Union([
 
 const MachineMessageMarkers = Schema.Struct({
   hold: Schema.optional(Schema.mutable(Schema.Array(MachineMessageMarker))).annotate({
-    description: "Markers held until the active prompt turn finishes. Prefix markers match at the start of the message.",
+    description:
+      "Markers held until the active prompt turn finishes. Prefix markers match at the start of the message.",
   }),
   critical: Schema.optional(Schema.mutable(Schema.Array(MachineMessageMarker))).annotate({
-    description: "Markers that let messages steer an active prompt immediately. No markers are critical by default.",
+    description:
+      "Markers that let messages steer an active prompt immediately. The generated [fm-level:critical] token is built in; configured markers add deployment-specific critical matches.",
   }),
 }).annotate({
   description: "Delivery rules for machine-generated session messages.",

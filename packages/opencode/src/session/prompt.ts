@@ -1294,8 +1294,7 @@ const layer = Layer.effect(
             }).pipe(Effect.ignore, Effect.forkIn(scope))
 
           const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
-          // A compaction whose summary turn stopped is over; retrying it would make
-          // the next prompt its parent.
+          // A stopped summary is terminal; re-read it so the terminal-turn path can release held mail.
           const task = SessionQueue.openTasks(msgs, selection).pop()
 
           if (task?.type === "subtask") {
@@ -1306,7 +1305,7 @@ const layer = Layer.effect(
           if (task?.type === "compaction") {
             // No steer is promoted until the summary and its replay or continue
             // message are written, so none lands between them.
-            const result = yield* queue.whileCompacting(
+            yield* queue.whileCompacting(
               sessionID,
               compaction.process({
                 messages: msgs,
@@ -1316,7 +1315,6 @@ const layer = Layer.effect(
                 overflow: task.overflow,
               }),
             )
-            if (result === "stop") break
             continue
           }
 

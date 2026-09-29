@@ -164,6 +164,34 @@ describe("MessageV2.page", () => {
     ),
   )
 
+  it.instance("keeps legacy time cursor bounds after deleting the anchor message", () =>
+    withSession(({ session, sessionID }) =>
+      Effect.gen(function* () {
+        const times = [10, 60, 20, 50, 30, 40, 70]
+        const ids = yield* fill(sessionID, times.length, (index: number) => times[index] ?? 0)
+        const anchor = ids[3]
+        const expectedMiddle = ids.slice(4, 6)
+        const expectedOldest = [ids[0], ids[2]]
+        if (!anchor || !expectedMiddle[0] || !expectedMiddle[1] || !expectedOldest[0] || !expectedOldest[1])
+          throw new Error("expected pagination fixture messages")
+        const legacyCursor = MessageV2.cursor.encode({ id: anchor, time: times[3] ?? 0 })
+
+        yield* session.removeMessage({ sessionID, messageID: anchor })
+
+        const middle = yield* MessageV2.page({ sessionID, limit: 2, before: legacyCursor })
+        expect(middle.items.map((item) => item.info.id)).toEqual(expectedMiddle)
+        expect(middle.more).toBe(true)
+        if (!middle.cursor) throw new Error("expected a cursor for the remaining legacy page")
+        expect(MessageV2.cursor.decode(middle.cursor)).toEqual({ id: expectedMiddle[0], time: times[4] })
+
+        const oldest = yield* MessageV2.page({ sessionID, limit: 2, before: middle.cursor })
+        expect(oldest.items.map((item) => item.info.id)).toEqual(expectedOldest)
+        expect(oldest.more).toBe(false)
+        expect(oldest.cursor).toBeUndefined()
+      }),
+    ),
+  )
+
   it.instance("returns items in chronological order within a page", () =>
     withSession(({ sessionID }) =>
       Effect.gen(function* () {

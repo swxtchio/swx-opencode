@@ -2,6 +2,13 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 
 type Marker = typeof ConfigV1.MachineMessageMarker.Type
 type MarkerConfig = NonNullable<ConfigV1.Info["machine_message_markers"]>
+type Level = "critical" | "request" | "info" | "directive" | "nudge"
+
+type LevelToken = {
+  level: Level
+  key?: string
+  body: string
+}
 
 const DEFAULT_HOLD_MARKERS: Marker[] = [
   { type: "prefix", value: `[fm-from-peer]\x1f` },
@@ -11,6 +18,12 @@ const DEFAULT_HOLD_MARKERS: Marker[] = [
   { type: "prefix", value: "OBSERVER: " },
   { type: "fleet-heartbeat" },
 ]
+const DEFAULT_CRITICAL_LEVELS = new Set<Level>(["critical"])
+const LEVEL_PREFIX = "[fm-level:"
+const UNIT_SEPARATOR = "\x1f"
+const PEER_PREFIX = `[fm-from-peer]${UNIT_SEPARATOR}`
+const FIRSTMATE_PREFIX = `[fm-from-firstmate]${UNIT_SEPARATOR}`
+const OBSERVER_PREFIX = "OBSERVER: "
 
 const HEARTBEAT_PROMPT =
   "Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.md."
@@ -66,7 +79,11 @@ type PrefixToken =
   | { readonly choices: readonly string[] }
 
 export function classify(input: string, config?: MarkerConfig) {
+  const token = parseLevelToken(input)
+  if (token && DEFAULT_CRITICAL_LEVELS.has(token.level)) return "critical" as const
   if (config?.critical?.some((marker) => matches(marker, input))) return "critical" as const
+  if (token && !isHeartbeatLevel(token)) return "hold" as const
+  if (token && isFleetHeartbeat(input)) return "hold" as const
   if ([...DEFAULT_HOLD_MARKERS, ...(config?.hold ?? [])].some((marker) => matches(marker, input)))
     return "hold" as const
 }
@@ -77,12 +94,85 @@ function matches(marker: Marker, input: string) {
 }
 
 function isFleetHeartbeat(input: string) {
-  if (input.includes("\n") || input.includes("\r")) return false
-  const envelope = input.match(/^(.*) \[fm-heartbeat-receipt:([a-zA-Z0-9._-]+)\]$/)
+  const token = parseLevelToken(input)
+  const payload = token?.body ?? input
+  if (payload.includes("\n") || payload.includes("\r")) return false
+  const envelope = payload.match(/^(.*) \[fm-heartbeat-receipt:([a-zA-Z0-9._-]+)\]$/)
   if (!envelope) return false
   const body = envelope[1]
-  if (characterCount(input) <= HEARTBEAT_INLINE_PAYLOAD_MAX_CHARS && isGeneratedPayload(body)) return true
+  if (characterCount(payload) <= HEARTBEAT_INLINE_PAYLOAD_MAX_CHARS && isGeneratedPayload(body)) return true
   return isGeneratedSummary(body)
+}
+
+function parseLevelToken(input: string): LevelToken | undefined {
+  const body = levelTokenBody(input)
+  if (!body?.startsWith(LEVEL_PREFIX)) return
+  const end = body.indexOf(`]${UNIT_SEPARATOR}`, LEVEL_PREFIX.length)
+  if (end === -1) return
+  const specification = body.slice(LEVEL_PREFIX.length, end)
+  const trailing = body.slice(end + 2)
+  const content = trailing.startsWith(" ") ? trailing.slice(1) : trailing
+  if (specification === "nudge") return { level: "nudge", body: content }
+  if (specification.startsWith("nudge:")) {
+    const key = specification.slice("nudge:".length)
+    if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(key)) return
+    return { level: "nudge", key, body: content }
+  }
+  if (["critical", "request", "info", "directive"].includes(specification))
+    return { level: specification as Level, body: content }
+}
+
+function levelTokenBody(input: string): string | undefined {
+  if (input.startsWith(PEER_PREFIX)) return peerEnvelopeBody(input)
+  if (input.startsWith(FIRSTMATE_PREFIX)) return input.slice(FIRSTMATE_PREFIX.length)
+  if (input.startsWith(OBSERVER_PREFIX)) return input.slice(OBSERVER_PREFIX.length)
+  if (input.startsWith(UNIT_SEPARATOR)) return input.slice(UNIT_SEPARATOR.length)
+  return input
+}
+
+function peerEnvelopeBody(input: string) {
+  let rest = input.slice(PEER_PREFIX.length)
+  let padded = false
+  if (rest.startsWith(" ")) {
+    padded = true
+    rest = rest.slice(1)
+  }
+  const field = (stripPadding: boolean) => {
+    const separator = rest.indexOf(UNIT_SEPARATOR)
+    if (separator === -1) return
+    const value = rest.slice(0, separator)
+    rest = rest.slice(separator + 1)
+    if (stripPadding && rest.startsWith(" ")) {
+      padded = true
+      rest = rest.slice(1)
+    }
+    return value
+  }
+  const name = field(true)
+  const home = field(true)
+  const messageID = field(false)
+  if (!name || !home || !messageID) return
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(name) || isPeerTaskLabel(name)) return
+  if (!home.startsWith("/") || home.includes("\n") || home.includes("\r")) return
+  if (!/^p[0-9]+-[0-9]+-[0-9a-f]{4}$/.test(messageID)) return
+  if (padded && rest.startsWith(" ")) rest = rest.slice(1)
+  return rest
+}
+
+function isPeerTaskLabel(name: string) {
+  if (name.startsWith("fm-") && name.length > 3) return true
+  const separator = name.indexOf("-fm-")
+  if (separator === -1) return false
+  const short = name.slice(0, separator)
+  const id = name.slice(separator + "-fm-".length)
+  return /^[a-z0-9]+$/.test(short) && short !== "fm" && id.length > 0
+}
+
+function isHeartbeatLevel(token: LevelToken) {
+  return (
+    token.level === "nudge" &&
+    (token.key === "heartbeat" || /^heartbeat\.duty\.[a-z0-9][a-z0-9-]*$/.test(token.key ?? ""))
+  )
 }
 
 function isGeneratedPayload(input: string) {
