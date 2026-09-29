@@ -60,6 +60,8 @@ import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
 import { MachineMessage } from "./machine-message"
 
+type UserWithParts = Omit<SessionV1.WithParts, "info"> & { info: SessionV1.User }
+
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
 
@@ -1104,7 +1106,10 @@ const layer = Layer.effect(
       // next step as it did before the queue.
       const entry =
         input.noReply === true
-          ? { kind: "direct" as const, message: yield* createUserMessage(input) }
+          ? {
+              kind: "direct" as const,
+              message: yield* queue.exclusive(input.sessionID, createUserMessage(input)),
+            }
           : {
               kind: "queued" as const,
               own: yield* queue.admit({ ...input, ...(delivery ? { delivery } : {}) }),
@@ -1166,13 +1171,15 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID) {
+    const runLoop: (sessionID: SessionID, rootMessageID?: MessageID) => Effect.Effect<SessionV1.WithParts> = Effect.fn(
+      "SessionPrompt.run",
+    )(function* (sessionID: SessionID, rootMessageID?: MessageID) {
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
         let settled = false
         let seen = 0
+        let initialRootSelected = false
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1186,13 +1193,45 @@ const layer = Layer.effect(
           const admission = yield* MessageV2.admission(sessionID).pipe(
             Effect.provideService(Database.Service, database),
           )
-          const selection = { admissionOrder: admission.order }
+          const selection = { admissionOrder: admission.order, excludeNoReply: true }
+          const root =
+            !initialRootSelected && rootMessageID
+              ? msgs.find(
+                  (message): message is UserWithParts =>
+                    message.info.role === "user" && message.info.id === rootMessageID,
+                )
+              : undefined
+          if (!initialRootSelected && rootMessageID && !root)
+            throw new Error(`Run root message not found: ${rootMessageID}`)
+          const rootOrder = rootMessageID ? admission.order.get(rootMessageID) : undefined
+          if (root && rootOrder === undefined)
+            throw new Error(`Missing persisted admission order for run root: ${rootMessageID}`)
+          if (root && rootOrder !== undefined) {
+            msgs = msgs.filter((message) => {
+              const order = admission.order.get(message.info.id)
+              return (
+                (order !== undefined && order <= rootOrder) ||
+                (message.info.role === "assistant" && message.info.parentID === root.info.id)
+              )
+            })
+          }
+          initialRootSelected = true
 
-          const { user: lastUser, assistant: lastAssistant, finished: lastFinished } = MessageV2.latest(msgs, selection)
+          const latest = MessageV2.latest(msgs, selection)
+          const lastUser = root?.info ?? latest.user
+          const lastAssistant = latest.assistant
+          const lastFinished = latest.finished
 
           // Steers parked by an abort or held behind a compaction reach the next step.
           if (yield* promoteInLoop(sessionID, "steer")) continue
-          if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+          if (!lastUser) {
+            if (yield* promoteInLoop(sessionID, "queue")) {
+              step = 0
+              continue
+            }
+            settled = true
+            break
+          }
 
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1320,6 +1359,9 @@ const layer = Layer.effect(
             time: { created: Date.now() },
             sessionID,
           }
+          const claims = msgs.flatMap((item) =>
+            item.info.role === "user" && !item.info.noReply && !admission.claimed.has(item.info.id) ? [item.info.id] : [],
+          )
           yield* sessions.updateMessage(msg)
 
           const finalizeInterruptedAssistant = Effect.gen(function* () {
@@ -1337,6 +1379,7 @@ const layer = Layer.effect(
               assistantMessage: msg,
               sessionID,
               model,
+              onProviderStart: claims.length > 0 ? sessions.updateMessage(msg, { claims }) : Effect.void,
             })
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
@@ -1480,8 +1523,25 @@ const layer = Layer.effect(
     })
 
     // Without an own item there is nothing that can be withdrawn from under it.
-    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = (input) =>
-      drain(input.sessionID).pipe(Effect.orDie)
+    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(
+      function* (input: LoopInput) {
+        const messageID =
+          input.messageID ??
+          (yield* queue.exclusive(
+            input.sessionID,
+            Effect.gen(function* () {
+              const msgs = yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(
+                Effect.provideService(Database.Service, database),
+              )
+              const admission = yield* MessageV2.admission(input.sessionID).pipe(
+                Effect.provideService(Database.Service, database),
+              )
+              return MessageV2.latest(msgs, { admissionOrder: admission.order, excludeNoReply: true }).user?.id
+            }),
+          ))
+        return yield* drain(input.sessionID, undefined, messageID).pipe(Effect.orDie)
+      },
+    )
 
     // Runs or joins the session's drain. With `own`, returns the reply the turn
     // that prompt joined recorded for it: the drain's final message may answer
@@ -1489,9 +1549,10 @@ const layer = Layer.effect(
     const drain: (
       sessionID: SessionID,
       own?: SessionQueue.ItemID,
+      rootMessageID?: MessageID,
     ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError> = Effect.fn(
       "SessionPrompt.loop",
-    )(function* (sessionID: SessionID, own?: SessionQueue.ItemID) {
+    )(function* (sessionID: SessionID, own?: SessionQueue.ItemID, rootMessageID?: MessageID) {
       const withdrawn = own
         ? queue
             .withdrawn(sessionID, own)
@@ -1521,7 +1582,11 @@ const layer = Layer.effect(
         yield* first("queue")
         if (yield* queue.empty(sessionID)) return yield* withdrawn.pipe(Effect.andThen(lastAssistant(sessionID)))
       }
-      const result = yield* state.ensureRunning(sessionID, lastAssistant(sessionID), runLoop(sessionID))
+      const result = yield* state.ensureRunning(
+        sessionID,
+        lastAssistant(sessionID),
+        runLoop(sessionID, rootMessageID),
+      )
       // Work admitted after the joined run's last history read would otherwise
       // wait for another prompt. This caller stays with the drains until one has
       // read its own prompt and finished; anyone else's is woken in the background.
@@ -1529,7 +1594,7 @@ const layer = Layer.effect(
       if (own) {
         const unread = waiting && (yield* queue.unread(sessionID, own))
         if (unread || Exit.isFailure(yield* state.assertNotBusy(sessionID).pipe(Effect.exit)))
-          return yield* drain(sessionID, own)
+          return yield* drain(sessionID, own, rootMessageID)
       }
       if (waiting) {
         yield* drain(sessionID).pipe(
@@ -1709,6 +1774,7 @@ export type PromptInput = Schema.Schema.Type<typeof PromptInput>
 
 export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput")({
   sessionID: SessionID,
+  messageID: Schema.optional(MessageID),
 }) {}
 
 export const ShellInput = Schema.Struct({

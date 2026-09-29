@@ -4,7 +4,7 @@ import { SessionPromptQueueSequenceTable, SessionPromptQueueTable } from "@openc
 import { MessageTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
-import { and, asc, desc, eq, isNotNull, isNull, sql } from "drizzle-orm"
+import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm"
 import { Cause, Context, Effect, Exit, Layer, Option, Schema, Semaphore, Struct } from "effect"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { MessageV2 } from "./message-v2"
@@ -294,7 +294,7 @@ const layer = Layer.effect(
             const admission = yield* MessageV2.admission(sessionID).pipe(
               Effect.provideService(Database.Service, database),
             )
-            return openTasks(msgs, { admissionOrder: admission.order }).some(
+            return openTasks(msgs, { admissionOrder: admission.order, excludeNoReply: true }).some(
               (task) => task.type === "compaction",
             )
           })
@@ -589,23 +589,33 @@ const layer = Layer.effect(
       return row === undefined
     })
 
-    // Promotions run one at a time, and a promoted message's id sorts after every
-    // message written before its reservation (see `messageID`), so the prompts at
-    // or before a turn's user message are the ones its history held.
+    // Admission order, not caller-supplied message IDs, defines which prompts a turn answered.
     const answer: Interface["answer"] = (sessionID, turn, reply) =>
-      Effect.sync(() =>
-        [...channels.values()]
-          .filter(
-            (channel) =>
-              channel.sessionID === sessionID &&
-              !channel.reply &&
-              channel.message !== undefined &&
-              channel.message <= turn,
-          )
-          .forEach((channel) => {
-            channel.reply = reply
-          }),
-      )
+      Effect.gen(function* () {
+        const target = yield* db
+          .select({ seq: MessageTable.admission_seq })
+          .from(MessageTable)
+          .where(and(eq(MessageTable.session_id, sessionID), eq(MessageTable.id, turn)))
+          .get()
+          .pipe(Effect.orDie)
+        if (!target) return
+        const pending = [...channels.entries()].filter(
+          ([, channel]) => channel.sessionID === sessionID && !channel.reply && channel.message !== undefined,
+        )
+        const messageIDs = pending.flatMap(([, channel]) => (channel.message ? [channel.message] : []))
+        if (messageIDs.length === 0) return
+        const rows = yield* db
+          .select({ id: MessageTable.id, seq: MessageTable.admission_seq })
+          .from(MessageTable)
+          .where(and(eq(MessageTable.session_id, sessionID), inArray(MessageTable.id, messageIDs)))
+          .all()
+          .pipe(Effect.orDie)
+        const order = new Map(rows.map((row) => [row.id, row.seq]))
+        pending.forEach(([, channel]) => {
+          const seq = channel.message ? order.get(channel.message) : undefined
+          if (seq !== undefined && seq <= target.seq) channel.reply = reply
+        })
+      })
 
     const forget = (itemID: ItemID) => Effect.sync(() => void channels.delete(itemID))
 

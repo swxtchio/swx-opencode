@@ -621,11 +621,12 @@ function failingChatTransformPlugin() {
 const preProviderFailurePlugin = failingChatTransformPlugin()
 const preProviderFailurePrompt = testEffect(makeHttp({ plugin: preProviderFailurePlugin.layer }))
 
-function busyStatusGate() {
+function busyStatusGate(skipBusy = 0) {
   const entered = defer<void>()
   const release = defer<void>()
   const statuses = new Map<SessionID, SessionStatus.Info>()
   let block = true
+  let remainingSkips = skipBusy
   const status = Layer.succeed(
     SessionStatus.Service,
     SessionStatus.Service.of({
@@ -639,6 +640,10 @@ function busyStatusGate() {
           }
           statuses.set(sessionID, value)
           if (value.type !== "busy" || !block) return
+          if (remainingSkips > 0) {
+            remainingSkips--
+            return
+          }
           block = false
           entered.resolve()
           yield* Effect.promise(() => release.promise)
@@ -652,6 +657,8 @@ const firstLoad = busyStatusGate()
 const firstLoadPrompt = testEffect(makeHttp({ status: firstLoad.status }))
 const rootlessLoopGate = busyStatusGate()
 const rootlessLoopPrompt = testEffect(makeHttp({ status: rootlessLoopGate.status }))
+const shellQueuedLoopGate = busyStatusGate(1)
+const shellQueuedLoopPrompt = testEffect(makeHttp({ status: shellQueuedLoopGate.status }))
 
 const compactionProcessEntered = defer<void>()
 const compactionProcessRelease = defer<void>()
@@ -665,7 +672,7 @@ const stoppingCompaction = Layer.succeed(
         compactionProcessEntered.resolve()
         return compactionProcessRelease.promise.then(() => "stop" as const)
       }),
-    create: () => Effect.void,
+    create: () => Effect.succeed(MessageID.ascending()),
   }),
 )
 const compactionStopPrompt = testEffect(makeHttp({ compaction: stoppingCompaction }))
@@ -684,7 +691,7 @@ const directProjectionCompaction = Layer.succeed(
     },
     prune: () => Effect.void,
     process: () => Effect.succeed("stop" as const),
-    create: () => Effect.void,
+    create: () => Effect.succeed(MessageID.ascending()),
   }),
 )
 const directProjectionPrompt = testEffect(makeHttp({ compaction: directProjectionCompaction }))
@@ -1016,11 +1023,12 @@ it.instance("completed prompt releases its run control before the next prompt", 
 )
 
 firstLoadPrompt.instance(
-  "anchors the initiating prompt when marked input commits before the first history load",
+  "keeps marked input out of the initiating prompt before the first history load",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
       const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
       const sessions = yield* Session.Service
       const session = yield* sessions.create({ title: "Pinned" })
       const taskID = MessageID.make("msg_first_load_task")
@@ -1052,19 +1060,12 @@ firstLoadPrompt.instance(
             parts: [{ type: "text", text: "[fm-from-peer]\x1f committed before the first load" }],
           })
           .pipe(Effect.forkChild)
-        yield* pollWithTimeout(
-          sessions
-            .messages({ sessionID: session.id })
-            .pipe(
-              Effect.map((messages) =>
-                messages.some((message) => message.info.role === "user" && message.info.id === heldID)
-                  ? true
-                  : undefined,
-              ),
-            ),
-          "marked first-load input was not committed",
+        const queued = yield* pollWithTimeout(
+          queue.list(session.id).pipe(Effect.map((items) => items.find((item) => item.input.messageID === heldID))),
+          "marked first-load input was not queued",
           "10 seconds",
         )
+        expect(queued.delivery).toBe("queue")
 
         yield* Effect.sync(() => firstLoad.release.resolve())
         yield* awaitWithTimeout(llm.wait(1), "original task did not reach the provider", "10 seconds")
@@ -1946,11 +1947,12 @@ it.instance(
 )
 
 it.instance(
-  "answers unmarked steers in admission order at the next continuation boundary before held mail",
+  "answers unmarked steers together in admission order before held mail",
   () =>
     Effect.gen(function* () {
       const { dir, llm } = yield* useServerConfig(providerCfg)
       const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
       const sessions = yield* Session.Service
       const toolFile = path.join(dir, "steer-step.txt")
       yield* writeText(toolFile, "steer continuation")
@@ -1960,7 +1962,6 @@ it.instance(
       })
       const toolGate = yield* Deferred.make<void>()
       const firstSteerGate = yield* Deferred.make<void>()
-      const secondSteerGate = yield* Deferred.make<void>()
       const firstID = MessageID.make("msg_z_steer_first")
       const secondID = MessageID.make("msg_a_steer_second")
       const heldID = MessageID.make("msg_steer_held")
@@ -1968,8 +1969,7 @@ it.instance(
       yield* Effect.gen(function* () {
         yield* llm.push(
           reply().wait(deferredAsPromise(toolGate)).tool("glob", { pattern: "steer-step.txt" }).item(),
-          reply().wait(deferredAsPromise(firstSteerGate)).text("captain one handled").stop().item(),
-          reply().wait(deferredAsPromise(secondSteerGate)).text("captain two handled").stop().item(),
+          reply().wait(deferredAsPromise(firstSteerGate)).text("captains handled together").stop().item(),
           reply().text("held message handled").stop().item(),
         )
         yield* seedUser({
@@ -2013,9 +2013,16 @@ it.instance(
             .messages({ sessionID: session.id })
             .pipe(
               Effect.map((messages) =>
-                messages.some((message) => message.info.role === "user" && message.info.id === firstID) &&
-                messages.some((message) => message.info.role === "user" && message.info.id === secondID) &&
-                messages.some((message) => message.info.role === "user" && message.info.id === heldID)
+                messages.some(
+                  (message) =>
+                    message.info.role === "user" &&
+                    message.parts.some((part) => part.type === "text" && part.text === "captain one"),
+                ) &&
+                messages.some(
+                  (message) =>
+                    message.info.role === "user" &&
+                    message.parts.some((part) => part.type === "text" && part.text === "captain two"),
+                )
                   ? true
                   : undefined,
               ),
@@ -2023,11 +2030,19 @@ it.instance(
           "direct steering prompts were not admitted",
           "10 seconds",
         )
+        const queuedHeld = yield* pollWithTimeout(
+          queue.list(session.id).pipe(Effect.map((items) => items.find((item) => item.input.messageID === heldID))),
+          "held machine mail was not kept in the queue",
+          "10 seconds",
+        )
+        expect(queuedHeld.delivery).toBe("queue")
         const firstSaved = (yield* sessions.messages({ sessionID: session.id })).find(
-          (message) => message.info.id === firstID,
+          (message) =>
+            message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === "captain one"),
         )
         const secondSaved = (yield* sessions.messages({ sessionID: session.id })).find(
-          (message) => message.info.id === secondID,
+          (message) =>
+            message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === "captain two"),
         )
         if (!firstSaved || firstSaved.info.role !== "user" || !secondSaved || secondSaved.info.role !== "user")
           throw new Error("expected both direct messages to be persisted")
@@ -2039,8 +2054,7 @@ it.instance(
         expect(JSON.stringify(original.messages)).not.toContain("captain two")
         expect(JSON.stringify(original.messages)).not.toContain("held mail")
         const order = (yield* MessageV2.admission(session.id)).order
-        expect(order.get(firstID)).toBeLessThan(order.get(secondID) ?? Infinity)
-        expect(order.get(secondID)).toBeLessThan(order.get(heldID) ?? Infinity)
+        expect(order.get(firstSaved.info.id)).toBeLessThan(order.get(secondSaved.info.id) ?? Infinity)
 
         yield* Deferred.succeed(toolGate, void 0)
         yield* awaitWithTimeout(llm.wait(2), "the first direct steer missed the next continuation boundary", "10 seconds")
@@ -2048,63 +2062,61 @@ it.instance(
         if (!continuation) throw new Error("expected the direct steering continuation request")
         const continuationText = JSON.stringify(continuation.messages)
         expect(continuationText).toContain("captain one")
+        expect(continuationText).toContain("captain two")
         expect(continuationText).toContain("original task")
         expect(continuationText.indexOf("original task")).toBeLessThan(continuationText.indexOf("captain one"))
+        expect(continuationText.indexOf("captain one")).toBeLessThan(continuationText.indexOf("captain two"))
         expect(continuationText.indexOf(toolFile)).toBeLessThan(continuationText.indexOf("captain one"))
-        expect(continuationText).not.toContain("captain two")
         expect(continuationText).not.toContain("held mail")
         expect(continuationText).toContain(toolFile)
 
         yield* Deferred.succeed(firstSteerGate, void 0)
-        yield* awaitWithTimeout(llm.wait(3), "the second direct steer did not follow the first", "10 seconds")
-        const firstTurn = (yield* llm.inputs)[2]
-        if (!firstTurn) throw new Error("expected the second direct steer request")
-        const secondTurnText = JSON.stringify(firstTurn.messages)
-        expect(secondTurnText).toContain("captain two")
-        expect(secondTurnText.indexOf("captain one handled")).toBeLessThan(secondTurnText.indexOf("captain two"))
-        expect(secondTurnText).not.toContain("held mail")
-
-        yield* Deferred.succeed(secondSteerGate, void 0)
-        yield* awaitWithTimeout(llm.wait(4), "held mail did not follow the direct steers", "10 seconds")
-        const heldTurn = (yield* llm.inputs)[3]
+        yield* awaitWithTimeout(llm.wait(3), "held mail did not follow the direct steers", "10 seconds")
+        const heldTurn = (yield* llm.inputs)[2]
         if (!heldTurn) throw new Error("expected the held mail request")
         const heldText = JSON.stringify(heldTurn.messages)
         expect(heldText).toContain("held mail")
-        expect(heldText.indexOf("captain two handled")).toBeLessThan(heldText.indexOf("held mail"))
+        expect(heldText.indexOf("captains handled together")).toBeLessThan(heldText.indexOf("held mail"))
 
         expect(
           Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(run), "session run did not finish", "10 seconds")),
         ).toBe(true)
-        expect(
-          Exit.isSuccess(
-            yield* awaitWithTimeout(Fiber.await(first), "first direct prompt did not finish", "10 seconds"),
-          ),
-        ).toBe(true)
-        expect(
-          Exit.isSuccess(
-            yield* awaitWithTimeout(Fiber.await(second), "second direct prompt did not finish", "10 seconds"),
-          ),
-        ).toBe(true)
+        const firstExit = yield* awaitWithTimeout(Fiber.await(first), "first direct prompt did not finish", "10 seconds")
+        const secondExit = yield* awaitWithTimeout(
+          Fiber.await(second),
+          "second direct prompt did not finish",
+          "10 seconds",
+        )
+        expect(Exit.isSuccess(firstExit)).toBe(true)
+        expect(Exit.isSuccess(secondExit)).toBe(true)
+        if (Exit.isSuccess(firstExit) && Exit.isSuccess(secondExit))
+          expect(firstExit.value.info.id).toBe(secondExit.value.info.id)
         expect(
           Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(held), "held prompt did not finish", "10 seconds")),
         ).toBe(true)
         const messages = yield* sessions.messages({ sessionID: session.id })
-        expect(messages.some((message) => message.info.role === "assistant" && message.info.parentID === firstID)).toBe(
-          true,
-        )
         expect(
-          messages.some((message) => message.info.role === "assistant" && message.info.parentID === secondID),
+          messages.some(
+            (message) => message.info.role === "assistant" && message.info.parentID === secondSaved.info.id,
+          ),
         ).toBe(true)
-        expect(messages.some((message) => message.info.role === "assistant" && message.info.parentID === heldID)).toBe(
-          true,
+        const promotedHeld = messages.findLast(
+          (message) =>
+            message.info.role === "user" &&
+            message.parts.some((part) => part.type === "text" && part.text === "[fm-from-firstmate]\x1f held mail"),
         )
-        expect((yield* MessageV2.admission(session.id)).claimed.has(firstID)).toBe(true)
-        expect((yield* MessageV2.admission(session.id)).claimed.has(secondID)).toBe(true)
-        expect(yield* llm.calls).toBe(4)
+        expect(promotedHeld?.info.role).toBe("user")
+        if (promotedHeld?.info.role !== "user") throw new Error("expected held mail to be promoted")
+        expect(
+          messages.some((message) => message.info.role === "assistant" && message.info.parentID === promotedHeld.info.id),
+        ).toBe(true)
+        expect((yield* MessageV2.admission(session.id)).claimed.has(firstSaved.info.id)).toBe(true)
+        expect((yield* MessageV2.admission(session.id)).claimed.has(secondSaved.info.id)).toBe(true)
+        expect(yield* llm.calls).toBe(3)
       }).pipe(
         Effect.ensuring(
           Effect.all(
-            [toolGate, firstSteerGate, secondSteerGate].map((gate) =>
+            [toolGate, firstSteerGate].map((gate) =>
               Deferred.succeed(gate, void 0).pipe(Effect.ignore),
             ),
             { discard: true },
@@ -3422,50 +3434,105 @@ it.instance("cancel interrupts loop and resolves with an assistant message", () 
 )
 
 it.instance(
-  "observes cancellation before the held drain starts",
+  "delivers queued machine mail in its own turn after an earlier run is cancelled",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
       const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
       const sessions = yield* Session.Service
       const chat = yield* sessions.create({ title: "Pinned" })
       const originalResponse = yield* Deferred.make<void>()
       yield* Effect.gen(function* () {
         yield* llm.push(
           reply().wait(deferredAsPromise(originalResponse)).text("task finished").stop().item(),
-          reply().text("held task complete").stop().item(),
+          reply().text("captain follow-up handled").stop().item(),
+          reply().text("machine mail handled").stop().item(),
         )
-        yield* seedUser({
-          sessionID: chat.id,
-          agent: "build",
-          model: ref,
-          parts: [{ type: "text", text: "original task" }],
-        })
-
-        const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+        const rootID = MessageID.make("msg_cancelled_run_root")
+        const run = yield* prompt
+          .prompt({
+            sessionID: chat.id,
+            messageID: rootID,
+            agent: "build",
+            model: ref,
+            parts: [{ type: "text", text: "original task" }],
+          })
+          .pipe(Effect.forkChild)
         yield* awaitWithTimeout(llm.wait(1), "provider did not receive the original task", "10 seconds")
-        const heldMessage = yield* seedUser({
-          sessionID: chat.id,
-          agent: "build",
-          model: ref,
-          parts: [{ type: "text", text: "[fm-from-peer]\x1f peer alert" }],
-        })
-        if (heldMessage.info.role !== "user") throw new Error("expected the held user message")
+        const machineID = MessageID.make("msg_cancelled_machine_mail")
+        const machineText = "[fm-from-peer]\x1f peer alert"
+        const machine = yield* prompt
+          .prompt({
+            sessionID: chat.id,
+            messageID: machineID,
+            agent: "build",
+            model: ref,
+            parts: [{ type: "text", text: machineText }],
+          })
+          .pipe(Effect.forkChild)
+        const queuedMachine = yield* pollWithTimeout(
+          queue
+            .list(chat.id)
+            .pipe(Effect.map((items) => items.find((item) => item.input.messageID === machineID))),
+          "machine mail was not kept in the queue",
+          "10 seconds",
+        )
+        expect(queuedMachine.delivery).toBe("queue")
+        expect(yield* llm.calls).toBe(1)
+
         const cancellation = yield* prompt.cancel(chat.id).pipe(Effect.forkChild)
         const cancelExit = yield* awaitWithTimeout(
           Fiber.await(cancellation),
-          "cancel before held-drain start did not finish",
+          "cancellation did not finish",
           "2 seconds",
         )
         expect(Exit.isSuccess(cancelExit)).toBe(true)
         const exit = yield* awaitWithTimeout(Fiber.await(run), "cancelled session run did not finish", "2 seconds")
         expect(Exit.isSuccess(exit)).toBe(true)
+        const machineExit = yield* awaitWithTimeout(
+          Fiber.await(machine),
+          "queued machine caller did not settle with the cancelled run",
+          "2 seconds",
+        )
+        expect(Exit.isSuccess(machineExit)).toBe(true)
         expect(yield* llm.calls).toBe(1)
+
+        expect((yield* queue.list(chat.id)).some((item) => item.id === queuedMachine.id)).toBe(true)
+        const followUpID = MessageID.make("msg_after_cancel_followup")
+        const followUp = yield* prompt
+          .prompt({
+            sessionID: chat.id,
+            messageID: followUpID,
+            agent: "build",
+            model: ref,
+            parts: [{ type: "text", text: "captain follow-up" }],
+          })
+          .pipe(Effect.forkChild)
+        yield* awaitWithTimeout(llm.wait(2), "the captain follow-up did not reach the provider", "10 seconds")
+        const followUpRequest = (yield* llm.inputs)[1]
+        if (!followUpRequest) throw new Error("expected the captain follow-up request")
+        expect(JSON.stringify(followUpRequest.messages)).toContain("captain follow-up")
+        expect(JSON.stringify(followUpRequest.messages)).not.toContain(machineText)
+
+        yield* awaitWithTimeout(llm.wait(3), "machine mail did not get its own turn", "10 seconds")
+        const machineRequest = (yield* llm.inputs)[2]
+        if (!machineRequest) throw new Error("expected the machine mail request")
+        expect(JSON.stringify(machineRequest.messages)).toContain("peer alert")
         expect(
-          (yield* sessions.messages({ sessionID: chat.id })).some(
-            (message) => message.info.role === "assistant" && message.info.parentID === heldMessage.info.id,
-          ),
-        ).toBe(false)
+          Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(followUp), "follow-up did not finish", "10 seconds")),
+        ).toBe(true)
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        const deliveredMachine = messages.findLast(
+          (message) =>
+            message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === machineText),
+        )
+        expect(deliveredMachine?.info.role).toBe("user")
+        if (deliveredMachine?.info.role !== "user") throw new Error("expected the machine message to be promoted")
+        expect(messages.some((message) => message.info.role === "assistant" && message.info.parentID === deliveredMachine.info.id)).toBe(
+          true,
+        )
+        expect(yield* llm.calls).toBe(3)
       }).pipe(Effect.ensuring(Deferred.succeed(originalResponse, void 0).pipe(Effect.ignore)))
     }),
   60_000,
@@ -5644,27 +5711,30 @@ unixNoLLMServer(
   30_000,
 )
 
-unix(
-  "rootless loop queued behind shell selects the latest persisted input",
+shellQueuedLoopPrompt.instance(
+  "shell-queued rootless compaction keeps its initiating root ahead of a later noReply input",
   () =>
     withSh(() =>
       Effect.gen(function* () {
         const { directory: dir } = yield* TestInstance
         const { llm } = yield* useServerConfig(providerCfg)
         const prompt = yield* SessionPrompt.Service
+        const compaction = yield* SessionCompaction.Service
         const sessions = yield* Session.Service
-        const session = yield* sessions.create({ title: "Rootless loop behind shell" })
+        const session = yield* sessions.create({ title: "Rootless compaction behind shell" })
         const releaseFile = path.join(dir, ".rootless-shell-release")
         yield* Effect.addFinalizer(() => writeText(releaseFile, "release").pipe(Effect.ignore))
-        const root = yield* seedUser({
+        yield* Effect.addFinalizer(() => Effect.sync(() => shellQueuedLoopGate.release.resolve()))
+
+        const history = yield* seedUser({
           sessionID: session.id,
-          messageID: MessageID.make("msg_z_rootless_older"),
+          messageID: MessageID.make("msg_z_rootless_history"),
           agent: "build",
           model: ref,
-          parts: [{ type: "text", text: "older rootless input" }],
+          parts: [{ type: "text", text: "rootless compaction history" }],
         })
-        if (root.info.role !== "user") throw new Error("expected the older user message")
-        yield* sessions.updateMessage({ ...root.info, time: { created: 300 } })
+        if (history.info.role !== "user") throw new Error("expected the history message")
+        yield* sessions.updateMessage({ ...history.info, time: { created: 300 } })
 
         const shell = yield* prompt
           .shell({
@@ -5674,38 +5744,60 @@ unix(
           })
           .pipe(Effect.forkChild)
         yield* waitForBusy(session.id)
-        const loop = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
-        yield* Effect.yieldNow
-        const latest = yield* seedUser({
+
+        const rootMessageID = yield* compaction.create({
           sessionID: session.id,
-          messageID: MessageID.make("msg_a_rootless_newer"),
           agent: "build",
           model: ref,
-          parts: [{ type: "text", text: "latest persisted rootless input" }],
+          auto: false,
         })
-        if (latest.info.role !== "user") throw new Error("expected the latest user message")
-        yield* sessions.updateMessage({ ...latest.info, time: { created: 100 } })
-        const order = (yield* MessageV2.admission(session.id)).order
-        expect(order.get(root.info.id)).toBeLessThan(order.get(latest.info.id) ?? Infinity)
-        yield* llm.text("latest rootless input handled")
+        const loop = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+        yield* llm.text("initiating compaction completed")
         yield* writeText(releaseFile, "release")
+        yield* awaitWithTimeout(
+          Effect.promise(() => shellQueuedLoopGate.entered.promise),
+          "shell-queued rootless loop did not reach its first provider boundary",
+          "10 seconds",
+        )
 
-        yield* awaitWithTimeout(llm.wait(1), "queued rootless loop did not reach the provider", "10 seconds")
+        const lateMessageID = MessageID.make("msg_a_rootless_late_no_reply")
+        const late = yield* prompt.prompt({
+          sessionID: session.id,
+          messageID: lateMessageID,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: [{ type: "text", text: "later noReply input" }],
+        })
+        if (late.info.role !== "user") throw new Error("expected the later user input")
+        expect(late.info.noReply).toBe(true)
+        yield* sessions.updateMessage({ ...late.info, time: { created: 100 } })
+        const order = (yield* MessageV2.admission(session.id)).order
+        expect(order.get(rootMessageID)).toBeLessThan(order.get(late.info.id) ?? Infinity)
+        expect(yield* llm.inputs).toHaveLength(0)
+
+        yield* Effect.sync(() => shellQueuedLoopGate.release.resolve())
+        yield* awaitWithTimeout(llm.wait(1), "queued compaction did not reach the provider", "10 seconds")
         const request = (yield* llm.inputs)[0]
-        if (!request) throw new Error("expected the queued rootless provider request")
-        expect(lastUserContent(request)).toContain("latest persisted rootless input")
+        if (!request) throw new Error("expected the queued compaction provider request")
+        expect(JSON.stringify(request.messages)).toContain("rootless compaction history")
+        expect(JSON.stringify(request.messages)).not.toContain("later noReply input")
 
-        const loopExit = yield* awaitWithTimeout(Fiber.await(loop), "queued rootless loop did not finish", "10 seconds")
+        const loopExit = yield* awaitWithTimeout(Fiber.await(loop), "queued compaction loop did not finish", "10 seconds")
         expect(Exit.isSuccess(loopExit)).toBe(true)
         const shellExit = yield* awaitWithTimeout(Fiber.await(shell), "shell did not finish", "10 seconds")
         expect(Exit.isSuccess(shellExit)).toBe(true)
+        const messages = yield* sessions.messages({ sessionID: session.id })
+        const summary = messages.findLast(
+          (message) => message.info.role === "assistant" && message.info.parentID === rootMessageID,
+        )
+        expect(summary?.info.role).toBe("assistant")
+        expect(summary?.info.role === "assistant" ? summary.info.summary : undefined).toBe(true)
         expect(
-          (yield* sessions.messages({ sessionID: session.id })).some(
-            (message) => message.info.role === "assistant" && message.info.parentID === latest.info.id,
-          ),
-        ).toBe(true)
+          messages.some((message) => message.info.role === "assistant" && message.info.parentID === late.info.id),
+        ).toBe(false)
         expect(yield* llm.calls).toBe(1)
-      })
+      }),
     ),
   { git: true, config: cfg },
   60_000,

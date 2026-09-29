@@ -431,7 +431,7 @@ describe("session HttpApi", () => {
   )
 
   it.live(
-    "summarize runs its queued rootless loop from the latest persisted input",
+    "summarize keeps its initiating compaction root when queued behind a shell",
     () =>
       Effect.gen(function* () {
         const llm = yield* TestLLMServer
@@ -494,7 +494,7 @@ describe("session HttpApi", () => {
           headers,
           body: JSON.stringify({ providerID: "test", modelID: "test-model", auto: false }),
         }).pipe(Effect.forkChild)
-        yield* pollWithTimeout(
+        const compactionRoot = yield* pollWithTimeout(
           requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, { sessionID: session.id }), {
             headers,
           }).pipe(
@@ -507,11 +507,12 @@ describe("session HttpApi", () => {
           "HTTP summarize did not persist its compaction input",
           "10 seconds",
         )
-        yield* Effect.sleep("100 millis")
+        if (compactionRoot.info.role !== "user") throw new Error("expected the initiating compaction message")
         expect(summarize.pollUnsafe()).toBeUndefined()
 
-        const latest = yield* admitNoReply("latest persisted summarize root")
-        if (latest.info.role !== "user") throw new Error("expected the latest persisted user input")
+        const later = yield* admitNoReply("later noReply summarize input")
+        if (later.info.role !== "user") throw new Error("expected the later user input")
+        expect(later.info.noReply).toBe(true)
         expect(yield* llm.inputs).toHaveLength(0)
 
         const summarizeResponse = yield* awaitWithTimeout(
@@ -528,12 +529,16 @@ describe("session HttpApi", () => {
           pathFor(SessionPaths.messages, { sessionID: session.id }),
           { headers },
         )
-        const assistant = messages.findLast(
-          (message) => message.info.role === "assistant" && message.info.parentID === latest.info.id,
+        const summary = messages.findLast(
+          (message) => message.info.role === "assistant" && message.info.parentID === compactionRoot.info.id,
         )
-        expect(assistant?.info.role).toBe("assistant")
-        expect(assistant?.info.role === "assistant" ? assistant.info.summary : undefined).toBeUndefined()
-        expect(JSON.stringify(yield* llm.inputs)).toContain("latest persisted summarize root")
+        expect(summary?.info.role).toBe("assistant")
+        expect(summary?.info.role === "assistant" ? summary.info.summary : undefined).toBe(true)
+        expect(
+          messages.some((message) => message.info.role === "assistant" && message.info.parentID === later.info.id),
+        ).toBe(false)
+        expect(JSON.stringify(yield* llm.inputs)).not.toContain("later noReply summarize input")
+        expect(yield* llm.calls).toBe(1)
       }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
     60_000,
   )
