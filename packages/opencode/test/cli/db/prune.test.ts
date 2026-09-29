@@ -2080,6 +2080,45 @@ test("online prune honors --database over OPENCODE_DB and never creates a missin
   expect(ownedCounts(environmentDefault.filename, defaultID)).toEqual(defaultBefore)
 })
 
+test("online prune apply tightens the explicitly selected --database target", async () => {
+  await using target = await producedStore([{}])
+  await using environmentDefault = await producedStore([{}])
+  const selected = produce(target, { create: {} })
+  const sessionID = selected.created[0]!.id
+  const cutoffAt = Date.now() - 5
+  const cutoff = new Date(cutoffAt).toISOString()
+  backdateSession(target.filename, sessionID, cutoffAt - 1_000)
+  await Promise.all([chmod(target.filename, 0o644), chmod(environmentDefault.filename, 0o644)])
+
+  const report = parseReport(
+    await runCLI(
+      target,
+      [
+        "--online",
+        "--database",
+        target.filename,
+        "--before",
+        cutoff,
+        "--session",
+        sessionID,
+        "--apply",
+        "--reserve-bytes",
+        "1",
+        "--usage-capture-status",
+        "confirmed",
+        "--usage-capture-session",
+        sessionID,
+      ],
+      "either",
+      { databaseDefault: environmentDefault.filename },
+    ),
+  )
+
+  expect(report.database).toBe(await realpath(target.filename))
+  expect((await stat(target.filename)).mode & 0o777).toBe(0o600)
+  expect((await stat(environmentDefault.filename)).mode & 0o777).toBe(0o644)
+}, 30_000)
+
 test("online inventory stays an inventory response when the selected database cannot be opened", async () => {
   await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
   const selected = produce(store, { create: { payloadBytes: 512 * 1024 } })
