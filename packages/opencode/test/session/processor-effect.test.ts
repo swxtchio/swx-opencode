@@ -22,6 +22,7 @@ import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionSummary } from "../../src/session/summary"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { provideTmpdirInstance, provideTmpdirServer } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { raw, reply, TestLLMServer } from "../lib/llm-server"
@@ -31,6 +32,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { LLMEvent, Usage } from "@opencode-ai/llm"
+import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
 import { aggregateSessionStats, displayStats } from "@/cli/cmd/stats"
 import { readExport } from "@/cli/cmd/db-export-usage"
 import { servedAcrossSession, servedModelLabel } from "@/cli/cmd/run/variant.shared"
@@ -344,6 +346,22 @@ const fragmentFailureLLM = Layer.succeed(
 )
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
+
+const sqliteLockError = new EffectDrizzleQueryError({
+  query: "INSERT INTO secret_table (value) VALUES (?)",
+  params: ["secret_parameter"],
+  cause: Cause.fail(
+    new SqlError({
+      reason: classifySqliteError(Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY_SNAPSHOT" }), {
+        message: "Failed to execute statement",
+        operation: "execute",
+      }),
+    }),
+  ),
+})
+const sqliteLockLLM = Layer.succeed(LLM.Service, LLM.Service.of({ stream: () => Stream.die(sqliteLockError) }))
+const sqliteLockEnv = LayerNode.compile(root, [...replacements, [LLM.node, sqliteLockLLM]])
+const itSqliteLock = testEffect(sqliteLockEnv)
 
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
@@ -1350,6 +1368,66 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
       }),
     { config: cfg },
   ),
+)
+
+itSqliteLock.live(
+  "session.processor persists and publishes safe SQLite lock diagnostics",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+          const events = yield* EventV2Bridge.Service
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "sqlite lock persistence")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const model = yield* provider.getModel(ref.providerID, ref.modelID)
+          const eventMessages: string[] = []
+          const off = yield* events.listen((event) => {
+            if (event.type !== Session.Event.Error.type) return Effect.void
+            const data = event.data as typeof Session.Event.Error.data.Type
+            if (data.sessionID !== chat.id || !data.error) return Effect.void
+            eventMessages.push(data.error.name === "UnknownError" ? data.error.data.message : data.error.name)
+            return Effect.void
+          })
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+          const result = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "sqlite lock persistence" }],
+            tools: {},
+          })
+          yield* off
+          const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+          const lockMessage = "Database is locked (SQLITE_BUSY)"
+
+          expect(result).toBe("stop")
+          expect(handle.message.error).toMatchObject({ name: "UnknownError", data: { message: lockMessage } })
+          expect(stored.info.role).toBe("assistant")
+          if (stored.info.role === "assistant") {
+            expect(stored.info.error).toMatchObject({ name: "UnknownError", data: { message: lockMessage } })
+          }
+          expect(eventMessages).toContain(lockMessage)
+          expect(JSON.stringify({ assistant: handle.message.error, stored, eventMessages })).not.toContain(
+            "secret_table",
+          )
+          expect(JSON.stringify({ assistant: handle.message.error, stored, eventMessages })).not.toContain(
+            "secret_parameter",
+          )
+        }),
+      { config: cfg },
+    ),
+  15_000,
 )
 
 itRouterLabel.live(

@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test"
 import { Database } from "@opencode-ai/core/database/database"
 import { NodeSqliteClient } from "@opencode-ai/effect-sqlite-node"
+import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option } from "effect"
 import { isSqlError } from "effect/unstable/sql/SqlError"
 import { SqlClient } from "effect/unstable/sql/SqlClient"
 import { layer } from "../src/database/sqlite.node"
+import { Sqlite } from "../src/database/sqlite"
 import path from "path"
 import { tmpdir } from "./fixture/tmpdir"
 
@@ -31,6 +33,20 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   yield* client.unsafe("COMMIT").raw
   console.log("released")
 })))
+`
+
+const bunHolderScript = `
+import { Database } from "bun:sqlite"
+
+const native = new Database(process.env.SQLITE_BUSY_DB!)
+native.run("PRAGMA journal_mode = WAL")
+native.run("BEGIN IMMEDIATE")
+native.run("INSERT INTO busy_retry_test (id, value) VALUES (100, 'holder')")
+console.log("ready")
+await new Promise((resolve) => process.stdin.once("data", resolve))
+native.run("COMMIT")
+console.log("released")
+native.close()
 `
 
 const nodeHolderScript = `
@@ -305,18 +321,50 @@ describe("SQLite busy timeout and statement retries", () => {
   for (const method of ["run", "values"] as const) {
     test(`exhausts retryable ${method} locks and preserves a nonretryable partial write cause`, async () => {
       await using tmp = await tmpdir()
+      const sqlite = await import("bun:sqlite")
+      const bun = await import("../src/database/sqlite.bun")
       const filename = path.join(tmp.path, "busy.sqlite")
       const exit = await Effect.runPromiseExit(
         Effect.scoped(
           Effect.gen(function* () {
-            const context = yield* Layer.build(Database.layerFromPath(filename))
-            const database = Context.get(context, Database.Service).db
+            const context = yield* Layer.build(bun.layer({ filename }))
+            const database = yield* EffectDrizzleSqlite.makeWithDefaults().pipe(Effect.provide(context))
             const client = database.$client
-            yield* client.unsafe(
+            yield* database.run(
               "CREATE TABLE busy_retry_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL CHECK (value <> 'bad'))",
-            ).raw
+            )
             yield* client.unsafe("PRAGMA busy_timeout = 0").raw
-            const holder = yield* Effect.promise(() => startLockHolder(filename))
+            const native = Context.get(context, Sqlite.Native) as InstanceType<typeof sqlite.Database>
+            const attempts = { lock: 0, partial: 0 }
+            const query = native.query.bind(native)
+            Object.defineProperty(native, "query", {
+              configurable: true,
+              value: (sql: string) => {
+                const statement = query(sql)
+                const counted =
+                  sql.includes("busy_retry_test") && sql.includes("'writer'")
+                    ? "lock"
+                    : sql.includes("busy_retry_test") && sql.includes("'good'")
+                      ? "partial"
+                      : undefined
+                if (!counted) return statement
+                if (method === "run") {
+                  const all = statement.native.all
+                  statement.native.all = (...params: Parameters<typeof all>) => {
+                    attempts[counted] += 1
+                    return all.apply(statement.native, params)
+                  }
+                } else {
+                  const values = statement.native.values
+                  statement.native.values = (...params: Parameters<typeof values>) => {
+                    attempts[counted] += 1
+                    return values.apply(statement.native, params)
+                  }
+                }
+                return statement
+              },
+            })
+            const holder = yield* Effect.promise(() => startLockHolder(filename, bunHolderScript))
 
             yield* Effect.gen(function* () {
               let failure: unknown
@@ -341,6 +389,7 @@ describe("SQLite busy timeout and statement retries", () => {
               }
               expect(failure).toBeInstanceOf(EffectDrizzleQueryError)
               if (!(failure instanceof EffectDrizzleQueryError)) return
+              expect(attempts.lock).toBe(5)
               expect(failure.query).toBe("Database is locked (SQLITE_BUSY)")
               expect(failure.params).toEqual([])
               expect(failure.message).toContain("Database is locked (SQLITE_BUSY)")
@@ -372,6 +421,7 @@ describe("SQLite busy timeout and statement retries", () => {
               expect(constraint.reason._tag).toBe("ConstraintError")
               expect(constraint.reason.isRetryable).toBe(false)
               expect(constraint.reason.cause).toMatchObject({ code: "SQLITE_CONSTRAINT_CHECK" })
+              expect(attempts.partial).toBe(1)
               expect(yield* database.values("SELECT id, value FROM busy_retry_test ORDER BY id")).toEqual([
                 [1, "good"],
                 [100, "holder"],
@@ -380,7 +430,7 @@ describe("SQLite busy timeout and statement retries", () => {
           }),
         ),
       )
-      expect(Exit.isSuccess(exit)).toBe(true)
+      if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
     }, 10_000)
   }
 
