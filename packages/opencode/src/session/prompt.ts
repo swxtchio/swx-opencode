@@ -1098,8 +1098,7 @@ const layer = Layer.effect(
         input.parts.find((part) => part.type === "text")?.text ?? "",
         (yield* config.get()).machine_message_markers,
       )
-      const delivery =
-        classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
+      const delivery = classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
       // noReply keeps its direct write and never drains. Every other prompt is
       // admitted to the durable queue first; a steer is promoted at once, unless a
       // pending compaction must run first, so it still reaches the running turn's
@@ -1171,9 +1170,11 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
+    // Root pins bind only when this caller starts the run; a joiner keeps the active run's root.
     const runLoop: (sessionID: SessionID, rootMessageID?: MessageID) => Effect.Effect<SessionV1.WithParts> = Effect.fn(
       "SessionPrompt.run",
-    )(function* (sessionID: SessionID, rootMessageID?: MessageID) {
+    )(
+      function* (sessionID: SessionID, rootMessageID?: MessageID) {
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
@@ -1359,9 +1360,6 @@ const layer = Layer.effect(
             time: { created: Date.now() },
             sessionID,
           }
-          const claims = msgs.flatMap((item) =>
-            item.info.role === "user" && !item.info.noReply && !admission.claimed.has(item.info.id) ? [item.info.id] : [],
-          )
           yield* sessions.updateMessage(msg)
 
           const finalizeInterruptedAssistant = Effect.gen(function* () {
@@ -1379,7 +1377,6 @@ const layer = Layer.effect(
               assistantMessage: msg,
               sessionID,
               model,
-              onProviderStart: claims.length > 0 ? sessions.updateMessage(msg, { claims }) : Effect.void,
             })
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
@@ -1523,25 +1520,25 @@ const layer = Layer.effect(
     })
 
     // Without an own item there is nothing that can be withdrawn from under it.
-    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(
-      function* (input: LoopInput) {
-        const messageID =
-          input.messageID ??
-          (yield* queue.exclusive(
-            input.sessionID,
-            Effect.gen(function* () {
-              const msgs = yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(
-                Effect.provideService(Database.Service, database),
-              )
-              const admission = yield* MessageV2.admission(input.sessionID).pipe(
-                Effect.provideService(Database.Service, database),
-              )
-              return MessageV2.latest(msgs, { admissionOrder: admission.order, excludeNoReply: true }).user?.id
-            }),
-          ))
-        return yield* drain(input.sessionID, undefined, messageID).pipe(Effect.orDie)
-      },
-    )
+    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
+      input: LoopInput,
+    ) {
+      const messageID =
+        input.messageID ??
+        (yield* queue.exclusive(
+          input.sessionID,
+          Effect.gen(function* () {
+            const msgs = yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(
+              Effect.provideService(Database.Service, database),
+            )
+            const admission = yield* MessageV2.admission(input.sessionID).pipe(
+              Effect.provideService(Database.Service, database),
+            )
+            return MessageV2.latest(msgs, { admissionOrder: admission.order, excludeNoReply: true }).user?.id
+          }),
+        ))
+      return yield* drain(input.sessionID, undefined, messageID).pipe(Effect.orDie)
+    })
 
     // Runs or joins the session's drain. With `own`, returns the reply the turn
     // that prompt joined recorded for it: the drain's final message may answer
@@ -1582,11 +1579,7 @@ const layer = Layer.effect(
         yield* first("queue")
         if (yield* queue.empty(sessionID)) return yield* withdrawn.pipe(Effect.andThen(lastAssistant(sessionID)))
       }
-      const result = yield* state.ensureRunning(
-        sessionID,
-        lastAssistant(sessionID),
-        runLoop(sessionID, rootMessageID),
-      )
+      const result = yield* state.ensureRunning(sessionID, lastAssistant(sessionID), runLoop(sessionID, rootMessageID))
       // Work admitted after the joined run's last history read would otherwise
       // wait for another prompt. This caller stays with the drains until one has
       // read its own prompt and finished; anyone else's is woken in the background.

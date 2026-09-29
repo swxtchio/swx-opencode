@@ -12,7 +12,7 @@ import workspaceNameMigration from "@opencode-ai/core/database/migration/2026041
 import sessionUsageMigration from "@opencode-ai/core/database/migration/20260510033149_session_usage"
 import normalizeStoragePathsMigration from "@opencode-ai/core/database/migration/20260601010001_normalize_storage_paths"
 import sessionMessageProjectionOrderMigration from "@opencode-ai/core/database/migration/20260603040000_session_message_projection_order"
-import sessionMessageAdmissionOrderMigration from "@opencode-ai/core/database/migration/20260928030300_session-message-admission-order"
+import sessionMessageAdmissionOrderMigration from "@opencode-ai/core/database/migration/20260929045002_session-message-admission-order"
 import eventSourcedSessionInputMigration from "@opencode-ai/core/database/migration/20260604172448_event_sourced_session_input"
 import contextEpochAgentMigration from "@opencode-ai/core/database/migration/20260605042240_add_context_epoch_agent"
 import simplifyIntegrationCredentialsMigration from "@opencode-ai/core/database/migration/20260611192811_lush_chimera"
@@ -462,14 +462,12 @@ describe("DatabaseMigration", () => {
         yield* DatabaseMigration.applyOnly(db, [sessionMessageAdmissionOrderMigration])
 
         expect(
-          yield* db.all(
-            sql`SELECT id, session_id, admission_seq, claimed FROM message ORDER BY session_id, admission_seq`,
-          ),
+          yield* db.all(sql`SELECT id, session_id, admission_seq FROM message ORDER BY session_id, admission_seq`),
         ).toEqual([
-          { id: "msg_old", session_id: "ses_a", admission_seq: 1, claimed: 0 },
-          { id: "msg_a", session_id: "ses_a", admission_seq: 2, claimed: 0 },
-          { id: "msg_z", session_id: "ses_a", admission_seq: 3, claimed: 0 },
-          { id: "msg_other", session_id: "ses_b", admission_seq: 1, claimed: 0 },
+          { id: "msg_old", session_id: "ses_a", admission_seq: 1 },
+          { id: "msg_a", session_id: "ses_a", admission_seq: 2 },
+          { id: "msg_z", session_id: "ses_a", admission_seq: 3 },
+          { id: "msg_other", session_id: "ses_b", admission_seq: 1 },
         ])
       }),
     )

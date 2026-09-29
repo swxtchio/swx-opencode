@@ -71,7 +71,6 @@ type Input = {
   assistantMessage: SessionV1.Assistant
   sessionID: SessionID
   model: Provider.Model
-  onProviderStart?: Effect.Effect<void>
 }
 
 export interface Interface {
@@ -702,7 +701,6 @@ const layer = Layer.effect(
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
             const stream = llm.stream(streamInput)
-            if (input.onProviderStart) yield* input.onProviderStart
 
             yield* stream.pipe(
               Stream.tap((event) => handleEvent(event)),

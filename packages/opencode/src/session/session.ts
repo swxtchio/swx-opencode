@@ -448,10 +448,7 @@ export interface Interface {
   readonly messages: (input: { sessionID: SessionID; limit?: number }) => Effect.Effect<SessionV1.WithParts[], NotFound>
   readonly children: (parentID: SessionID) => Effect.Effect<Info[]>
   readonly remove: (sessionID: SessionID) => Effect.Effect<void, NotFound>
-  readonly updateMessage: <T extends SessionV1.Info>(
-    msg: T,
-    options?: { reAdmit?: boolean; claims?: ReadonlyArray<SessionV1.MessageID> },
-  ) => Effect.Effect<T>
+  readonly updateMessage: <T extends SessionV1.Info>(msg: T) => Effect.Effect<T>
   readonly removeMessage: (input: { sessionID: SessionID; messageID: MessageID }) => Effect.Effect<MessageID>
   readonly removePart: (input: { sessionID: SessionID; messageID: MessageID; partID: PartID }) => Effect.Effect<PartID>
   readonly getPart: (input: {
@@ -629,16 +626,11 @@ const layer: Layer.Layer<
       }
     })
 
-    const updateMessage = <T extends SessionV1.Info>(
-      msg: T,
-      options?: { reAdmit?: boolean; claims?: ReadonlyArray<SessionV1.MessageID> },
-    ): Effect.Effect<T> =>
+    const updateMessage = <T extends SessionV1.Info>(msg: T): Effect.Effect<T> =>
       Effect.gen(function* () {
         yield* events.publish(SessionV1.Event.MessageUpdated, {
           sessionID: msg.sessionID,
           info: msg,
-          ...(options?.reAdmit ? { reAdmit: true } : {}),
-          ...(options?.claims?.length ? { claims: [...options.claims] } : {}),
         })
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))

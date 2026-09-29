@@ -485,14 +485,13 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
 export const admission = Effect.fn("MessageV2.admission")(function* (sessionID: SessionID) {
   const { db } = yield* Database.Service
   const rows = yield* db
-    .select({ id: MessageTable.id, seq: MessageTable.admission_seq, claimed: MessageTable.claimed })
+    .select({ id: MessageTable.id, seq: MessageTable.admission_seq })
     .from(MessageTable)
     .where(eq(MessageTable.session_id, sessionID))
     .all()
     .pipe(Effect.orDie)
   return {
     order: new Map(rows.map((row) => [row.id, row.seq])),
-    claimed: new Set(rows.flatMap((row) => (row.claimed ? [row.id] : []))),
   }
 })
 

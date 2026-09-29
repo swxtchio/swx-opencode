@@ -15,7 +15,6 @@ export interface Interface {
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
-    onCancel?: Effect.Effect<void>,
   ) => Effect.Effect<SessionV1.WithParts>
   readonly startShell: (
     sessionID: SessionID,
@@ -90,9 +89,8 @@ const layer = Layer.effect(
       sessionID: SessionID,
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
-      onCancel?: Effect.Effect<void>,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work, onCancel)
+      return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
     })
 
     const startShell = Effect.fn("SessionRunState.startShell")(function* (

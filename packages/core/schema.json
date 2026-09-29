@@ -1,9 +1,8 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "ab3d4b25-4ee9-41d2-884c-db88978a8554",
+  "id": "1b57e6eb-f423-4b30-a122-08148e532a83",
   "prevIds": [
-    "bfb0097b-dffa-47c4-ab88-05e4ec526ef3",
     "cd7fa1fc-32aa-4d19-bf5c-96318df972bb"
   ],
   "ddl": [
@@ -918,16 +917,6 @@
       "default": "0",
       "generated": null,
       "name": "admission_seq",
-      "entityType": "columns",
-      "table": "message"
-    },
-    {
-      "type": "integer",
-      "notNull": true,
-      "autoincrement": false,
-      "default": "false",
-      "generated": null,
-      "name": "claimed",
       "entityType": "columns",
       "table": "message"
     },

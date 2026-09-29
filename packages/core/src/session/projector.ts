@@ -1,6 +1,6 @@
 export * as SessionProjector from "./projector"
 
-import { and, desc, eq, gt, inArray, or, sql } from "drizzle-orm"
+import { and, desc, eq, gt, or, sql } from "drizzle-orm"
 import { DateTime, Effect, Layer, Schema } from "effect"
 import { Database } from "../database/database"
 import { EventV2 } from "../event"
@@ -272,19 +272,9 @@ const layer = Layer.effectDiscard(
                 .values({ id, session_id: sessionID, admission_seq, time_created, data })
                 .onConflictDoUpdate({
                   target: MessageTable.id,
-                  set: {
-                    data,
-                    ...(event.data.reAdmit ? { admission_seq } : {}),
-                  },
+                  set: { data },
                 })
                 .run()
-              if (event.data.claims?.length) {
-                yield* tx
-                  .update(MessageTable)
-                  .set({ claimed: true })
-                  .where(and(eq(MessageTable.session_id, sessionID), inArray(MessageTable.id, event.data.claims)))
-                  .run()
-              }
             }),
           )
           .pipe(Effect.orDie)

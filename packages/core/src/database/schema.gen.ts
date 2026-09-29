@@ -150,7 +150,6 @@ export default {
           \`id\` text PRIMARY KEY,
           \`session_id\` text NOT NULL,
           \`admission_seq\` integer DEFAULT 0 NOT NULL,
-          \`claimed\` integer DEFAULT false NOT NULL,
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL,
           \`data\` text NOT NULL,

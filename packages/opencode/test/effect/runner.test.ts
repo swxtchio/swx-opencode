@@ -432,38 +432,6 @@ describe("Runner", () => {
     }),
   )
 
-  it.live(
-    "cancel during shell_then_run notifies never-started queued work",
-    Effect.gen(function* () {
-      const s = yield* Scope.Scope
-      const runner = Runner.make<string>(s)
-      const shellGate = yield* Deferred.make<void>()
-      const queuedCancel = yield* Deferred.make<void>()
-      const starts = yield* Ref.make(0)
-
-      const shell = yield* runner.startShell(Deferred.await(shellGate).pipe(Effect.as("shell"))).pipe(Effect.forkChild)
-      yield* waitForState(runner, "Shell")
-      const queued = yield* runner
-        .ensureRunning(
-          Effect.gen(function* () {
-            yield* Ref.update(starts, (value) => value + 1)
-            return "queued"
-          }),
-          Deferred.succeed(queuedCancel, void 0).pipe(Effect.asVoid),
-        )
-        .pipe(Effect.forkChild)
-      yield* waitForState(runner, "ShellThenRun")
-
-      yield* runner.cancel
-
-      expect(yield* Deferred.isDone(queuedCancel)).toBe(true)
-      expect(yield* Ref.get(starts)).toBe(0)
-      expect(runner.state._tag).toBe("Idle")
-      expect(Exit.isFailure(yield* Fiber.await(queued))).toBe(true)
-      expect(Exit.isFailure(yield* Fiber.await(shell))).toBe(true)
-    }),
-  )
-
   // --- lifecycle callbacks ---
 
   it.live(

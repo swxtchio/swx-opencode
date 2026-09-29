@@ -74,7 +74,6 @@ export const MessageTable = sqliteTable(
       .notNull()
       .references(() => SessionTable.id, { onDelete: "cascade" }),
     admission_seq: integer().notNull().default(0),
-    claimed: integer({ mode: "boolean" }).notNull().default(false),
     ...Timestamps,
     data: text({ mode: "json" }).notNull().$type<V1MessageData>(),
   },
