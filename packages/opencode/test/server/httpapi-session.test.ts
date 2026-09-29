@@ -4,7 +4,7 @@ import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { Cause, Config, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer, Queue, Stream } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -23,6 +23,9 @@ import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import * as HttpSessionError from "../../src/server/routes/instance/httpapi/handlers/session-errors"
 import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/groups/experimental"
 import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
+import { SessionQueuePaths } from "../../src/server/routes/instance/httpapi/groups/session-queue"
+import { EventPaths } from "../../src/server/routes/instance/httpapi/groups/event"
+import type { SessionQueue } from "../../src/session/queue"
 import { Session } from "@/session/session"
 import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from "../../src/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
@@ -34,7 +37,7 @@ import * as DateTime from "effect/DateTime"
 import { eq } from "drizzle-orm"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideInstanceEffect, TestInstance, tmpdirScoped } from "../fixture/fixture"
-import { TestLLMServer } from "../lib/llm-server"
+import { reply, TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 
@@ -1194,5 +1197,593 @@ describe("session HttpApi", () => {
         })
       }),
     { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  // Prompt queue (swxtchio/swx-opencode#68).
+
+  it.live(
+    "serves the V1 prompt queue: list, withdraw, restore and send now",
+    () => {
+      // On every exit, before the fake LLM server shuts down, abort the session
+      // and release its held reply, so a failing assertion ends the drain and
+      // the queued command request instead of leaving them retrying.
+      const gate = Deferred.makeUnsafe<void>()
+      const stop: { abort?: Effect.Effect<unknown, unknown, HttpClient.HttpClient> } = {}
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        yield* llm.text("steered done")
+        yield* llm.text("command done")
+        yield* llm.text("idle done")
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue routes" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const model = { providerID: "test", modelID: "test-model" }
+        stop.abort = request(pathFor(SessionPaths.abort, params), { method: "POST", headers })
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+        const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+        const item = (method: string, itemID: string, body?: unknown) =>
+          request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID }), {
+            method,
+            headers,
+            body: body === undefined ? undefined : JSON.stringify(body),
+          })
+
+        expect(
+          (yield* post(SessionPaths.promptAsync, { agent: "build", model, parts: [{ type: "text", text: "start" }] }))
+            .status,
+        ).toBe(204)
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        expect(
+          (yield* post(SessionPaths.promptAsync, {
+            agent: "build",
+            model,
+            delivery: "queue",
+            parts: [{ type: "text", text: "held prompt" }],
+          })).status,
+        ).toBe(204)
+        yield* pollWithTimeout(
+          listed().pipe(Effect.map((items) => (items.length === 1 ? true : undefined))),
+          "held prompt never queued",
+        )
+        const command = yield* post(SessionPaths.command, {
+          command: "init",
+          arguments: "",
+          model: "test/test-model",
+          delivery: "queue",
+        }).pipe(Effect.forkChild)
+        const items = yield* pollWithTimeout(
+          listed().pipe(Effect.map((items) => (items.length === 2 ? items : undefined))),
+          "command never queued",
+        )
+        // Admission seqs follow the requests: start (1, already delivered), held (2), command (3).
+        expect(items.map((entry) => [entry.delivery, entry.seq, entry.sessionID])).toEqual([
+          ["queue", 2, session.id],
+          ["queue", 3, session.id],
+        ])
+        expect(items[0]!.input.parts).toEqual([{ type: "text", text: "held prompt" }])
+        const held = items[0]!
+
+        const withdrawn = yield* item("DELETE", held.id)
+        expect(withdrawn.status).toBe(200)
+        expect(yield* json<SessionQueue.Item>(withdrawn)).toEqual(held)
+        expect((yield* listed()).map((entry) => entry.id)).toEqual([items[1]!.id])
+        const again = yield* item("DELETE", held.id)
+        expect(again.status).toBe(404)
+        expect(yield* responseJson(again)).toMatchObject({
+          _tag: "QueueItemNotPending",
+          sessionID: session.id,
+          itemID: held.id,
+        })
+
+        const restored = yield* post(SessionQueuePaths.restore, { id: held.id })
+        expect(restored.status).toBe(200)
+        expect(yield* json<SessionQueue.Item>(restored)).toEqual(held)
+        const restoredAgain = yield* post(SessionQueuePaths.restore, { id: held.id })
+        expect(restoredAgain.status).toBe(404)
+        expect(yield* responseJson(restoredAgain)).toMatchObject({
+          _tag: "QueueItemNotWithdrawn",
+          sessionID: session.id,
+          itemID: held.id,
+        })
+
+        const steered = yield* item("PATCH", held.id, { delivery: "steer" })
+        expect(steered.status).toBe(200)
+        expect(yield* json<SessionQueue.Item>(steered)).toEqual({ ...held, delivery: "steer" })
+
+        yield* Deferred.succeed(gate, void 0)
+        const finished = yield* awaitWithTimeout(Fiber.join(command), "queued command never finished", "10 seconds")
+        expect(finished.status).toBe(200)
+        const inputs = yield* llm.inputs
+        expect(inputs).toHaveLength(3)
+        const lastUser = (input: Record<string, unknown> | undefined) =>
+          Array.isArray(input?.messages) ? input.messages.at(-1) : undefined
+        const userText = (input: Record<string, unknown> | undefined) =>
+          JSON.stringify(
+            Array.isArray(input?.messages) ? input.messages.filter((message) => message?.role === "user") : [],
+          )
+        // The init command's template, which the queued command turn delivers.
+        const initTemplate = "Create or update `AGENTS.md` for this repository."
+        // Sent now, the held prompt steers the next step, ahead of the queued command.
+        expect(lastUser(inputs[1])).toEqual({ role: "user", content: "held prompt" })
+        expect(userText(inputs[1])).not.toContain(initTemplate)
+        expect(JSON.stringify(lastUser(inputs[2]))).toContain(initTemplate)
+        expect(yield* listed()).toEqual([])
+        expect((yield* item("DELETE", held.id)).status).toBe(404)
+
+        // A queued prompt on an idle session runs at once through the sync route.
+        const idle = yield* post(SessionPaths.prompt, {
+          agent: "build",
+          model,
+          delivery: "queue",
+          parts: [{ type: "text", text: "queued while idle" }],
+        })
+        expect(idle.status).toBe(200)
+        expect(yield* responseJson(idle)).toMatchObject({ info: { role: "assistant" } })
+        expect(lastUser((yield* llm.inputs)[3])).toEqual({ role: "user", content: "queued while idle" })
+      }).pipe(
+        Effect.ensuring(
+          Effect.suspend(() => stop.abort ?? Effect.void).pipe(
+            Effect.ignore,
+            Effect.andThen(Deferred.succeed(gate, void 0)),
+          ),
+        ),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
+    "a queued json_schema prompt is listed and promoted from its stored row into a structured turn, and a text-format steer is promoted from its row",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        yield* llm.push(reply().tool("StructuredOutput", { answer: "42" }))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue format" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const model = { providerID: "test", modelID: "test-model" }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+        const schema = { type: "object", properties: { answer: { type: "string" } } }
+
+        expect(
+          (yield* post(SessionPaths.promptAsync, { agent: "build", model, parts: [{ type: "text", text: "start" }] }))
+            .status,
+        ).toBe(204)
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        expect(
+          (yield* post(SessionPaths.promptAsync, {
+            agent: "build",
+            model,
+            delivery: "queue",
+            format: { type: "json_schema", schema },
+            parts: [{ type: "text", text: "held with a format" }],
+          })).status,
+        ).toBe(204)
+        const [held] = yield* pollWithTimeout(
+          requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }).pipe(
+            Effect.map((items) => (items.length === 1 ? items : undefined)),
+          ),
+          "formatted prompt never queued",
+        )
+        // The listed input carries the format as the route decoded it, default included.
+        expect(held!.input.format).toEqual({ type: "json_schema", schema, retryCount: 2 })
+        yield* Deferred.succeed(gate, void 0)
+        yield* pollWithTimeout(
+          requestJson<Record<string, { type: string }>>(SessionPaths.status, { headers }).pipe(
+            Effect.map((status) => (status[session.id] === undefined ? true : undefined)),
+          ),
+          "session never went idle",
+        )
+        // Promoted from its row at the would-idle point, it ran as a structured turn.
+        const afterHeld = yield* Session.use
+          .messages({ sessionID: session.id })
+          .pipe(provideInstanceEffect(directory), Effect.orDie)
+        const heldMessage = afterHeld.find((message) =>
+          message.parts.some((part) => part.type === "text" && part.text === "held with a format"),
+        )?.info
+        expect(heldMessage?.role === "user" ? heldMessage.format : undefined).toMatchObject({
+          type: "json_schema",
+          schema,
+          retryCount: 2,
+        })
+        const structured = afterHeld.find(
+          (message) => message.info.role === "assistant" && message.info.parentID === heldMessage?.id,
+        )?.info
+        expect(structured?.role === "assistant" ? structured.structured : undefined).toEqual({ answer: "42" })
+        expect(yield* llm.calls).toBe(2)
+
+        // On an idle session the steer becomes a message at once, through the stored row.
+        yield* llm.text("text done")
+        const textReply = yield* post(SessionPaths.prompt, {
+          agent: "build",
+          model,
+          format: { type: "text" },
+          parts: [{ type: "text", text: "plain text please" }],
+        })
+        expect(textReply.status).toBe(200)
+        expect(yield* responseJson(textReply)).toMatchObject({ info: { role: "assistant" } })
+        const messages = yield* Session.use
+          .messages({ sessionID: session.id })
+          .pipe(provideInstanceEffect(directory), Effect.orDie)
+        const stored = messages.find((message) =>
+          message.parts.some((part) => part.type === "text" && part.text === "plain text please"),
+        )?.info
+        expect(stored?.role === "user" ? stored.format?.type : undefined).toBe("text")
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, void 0)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
+    "a sync prompt or command whose queued prompt is withdrawn answers 409 PromptWithdrawn",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue withdrawn caller" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const model = { providerID: "test", modelID: "test-model" }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+
+        yield* post(SessionPaths.promptAsync, { agent: "build", model, parts: [{ type: "text", text: "start" }] })
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        const prompt = yield* post(SessionPaths.prompt, {
+          agent: "build",
+          model,
+          delivery: "queue",
+          parts: [{ type: "text", text: "withdrawn while waiting" }],
+        }).pipe(Effect.forkChild)
+        const command = yield* post(SessionPaths.command, {
+          command: "init",
+          arguments: "",
+          model: "test/test-model",
+          delivery: "queue",
+        }).pipe(Effect.forkChild)
+        const items = yield* pollWithTimeout(
+          requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }).pipe(
+            Effect.map((items) => (items.length === 2 ? items : undefined)),
+          ),
+          "prompt and command never queued",
+        )
+        for (const item of items)
+          expect(
+            (yield* request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID: item.id }), {
+              method: "DELETE",
+              headers,
+            })).status,
+          ).toBe(200)
+        yield* Deferred.succeed(gate, void 0)
+
+        const promptItem = items.find((item) =>
+          item.input.parts.some((part) => part.type === "text" && part.text === "withdrawn while waiting"),
+        )!
+        const commandItem = items.find((item) => item.id !== promptItem.id)!
+        for (const [caller, item] of [
+          [prompt, promptItem],
+          [command, commandItem],
+        ] as const) {
+          const response = yield* awaitWithTimeout(Fiber.join(caller), "withdrawn caller never answered", "10 seconds")
+          expect(response.status).toBe(409)
+          expect(yield* responseJson(response)).toMatchObject({
+            _tag: "PromptWithdrawn",
+            sessionID: session.id,
+            itemID: item.id,
+          })
+        }
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, void 0)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
+    "a withdrawn prompt_async prompt ends without a session error",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        yield* llm.text("marker done")
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue async withdraw" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const model = { providerID: "test", modelID: "test-model" }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+
+        const events = yield* request(`${EventPaths.event}?directory=${encodeURIComponent(directory)}`)
+        const seen: { type: string; sessionID?: string }[] = []
+        const idles = yield* Queue.unbounded<void>()
+        let buffered = ""
+        yield* events.stream.pipe(
+          Stream.decodeText,
+          Stream.runForEach((chunk) =>
+            Effect.gen(function* () {
+              buffered += chunk
+              while (buffered.includes("\n\n")) {
+                const end = buffered.indexOf("\n\n")
+                const data = buffered
+                  .slice(0, end)
+                  .split("\n")
+                  .filter((line) => line.startsWith("data: "))
+                  .map((line) => line.slice("data: ".length))
+                  .join("\n")
+                buffered = buffered.slice(end + 2)
+                if (!data) continue
+                const event = JSON.parse(data) as { type: string; properties?: { sessionID?: string } }
+                if (event.properties?.sessionID !== session.id) continue
+                seen.push({ type: event.type, sessionID: event.properties.sessionID })
+                if (event.type === "session.idle") yield* Queue.offer(idles, undefined)
+              }
+            }),
+          ),
+          Effect.forkScoped,
+        )
+        const idle = awaitWithTimeout(Queue.take(idles), "session never went idle", "10 seconds")
+
+        yield* post(SessionPaths.promptAsync, { agent: "build", model, parts: [{ type: "text", text: "start" }] })
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        expect(
+          (yield* post(SessionPaths.promptAsync, {
+            agent: "build",
+            model,
+            delivery: "queue",
+            parts: [{ type: "text", text: "withdrawn async" }],
+          })).status,
+        ).toBe(204)
+        const [held] = yield* pollWithTimeout(
+          requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }).pipe(
+            Effect.map((items) => (items.length === 1 ? items : undefined)),
+          ),
+          "prompt never queued",
+        )
+        expect(
+          (yield* request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID: held!.id }), {
+            method: "DELETE",
+            headers,
+          })).status,
+        ).toBe(200)
+        yield* Deferred.succeed(gate, void 0)
+        yield* idle
+        // A later run on the session bounds the window in which the withdrawn
+        // prompt's caller could still report an error.
+        yield* post(SessionPaths.promptAsync, { agent: "build", model, parts: [{ type: "text", text: "marker" }] })
+        yield* idle
+        expect(yield* llm.calls).toBe(2)
+        expect(seen.filter((event) => event.type === "session.error")).toEqual([])
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, void 0)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
+    "restore and send now wake an idle session whose prompts an abort parked",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hang
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue wake" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const model = { providerID: "test", modelID: "test-model" }
+        const post = (path: string, body?: unknown) =>
+          request(pathFor(path, params), {
+            method: "POST",
+            headers,
+            body: body === undefined ? undefined : JSON.stringify(body),
+          })
+        const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+        const queued = (text: string) =>
+          post(SessionPaths.promptAsync, { agent: "build", model, delivery: "queue", parts: [{ type: "text", text }] })
+        const idle = () =>
+          pollWithTimeout(
+            requestJson<Record<string, { type: string }>>(SessionPaths.status, { headers }).pipe(
+              Effect.map((status) => (status[session.id] === undefined ? true : undefined)),
+            ),
+            "session never went idle",
+          )
+        const answered = (text: string) =>
+          pollWithTimeout(
+            llm.inputs.pipe(
+              Effect.map((inputs) =>
+                inputs.some((input) => {
+                  const messages = Array.isArray(input.messages) ? input.messages : []
+                  return JSON.stringify(messages.at(-1)) === JSON.stringify({ role: "user", content: text })
+                })
+                  ? true
+                  : undefined,
+              ),
+            ),
+            `"${text}" never reached the model`,
+            "10 seconds",
+          )
+
+        yield* post(SessionPaths.promptAsync, { agent: "build", model, parts: [{ type: "text", text: "start" }] })
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        yield* queued("restored after abort")
+        yield* queued("parked after abort")
+        const [restoredItem] = yield* pollWithTimeout(
+          listed().pipe(Effect.map((items) => (items.length === 2 ? items : undefined))),
+          "prompts never queued",
+        )
+        expect(
+          (yield* request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID: restoredItem!.id }), {
+            method: "DELETE",
+            headers,
+          })).status,
+        ).toBe(200)
+        yield* post(SessionPaths.abort)
+        yield* idle()
+        expect(yield* llm.calls).toBe(1)
+
+        yield* llm.text("restored done")
+        yield* llm.text("parked done")
+        expect((yield* post(SessionQueuePaths.restore, { id: restoredItem!.id })).status).toBe(200)
+        yield* answered("restored after abort")
+        yield* answered("parked after abort")
+        // The wake delivers the parked prompts in admission order and never retries the aborted turn.
+        const lastUsers = (yield* llm.inputs).map((input) =>
+          Array.isArray(input.messages) ? input.messages.at(-1) : undefined,
+        )
+        expect(lastUsers).toEqual([
+          { role: "user", content: "start" },
+          { role: "user", content: "restored after abort" },
+          { role: "user", content: "parked after abort" },
+        ])
+        yield* idle()
+        expect(yield* listed()).toEqual([])
+
+        yield* llm.hang
+        yield* post(SessionPaths.promptAsync, { agent: "build", model, parts: [{ type: "text", text: "again" }] })
+        yield* awaitWithTimeout(llm.wait(4), "fourth provider call never started", "10 seconds")
+        yield* queued("steered after abort")
+        const [parked] = yield* pollWithTimeout(
+          listed().pipe(Effect.map((items) => (items.length === 1 ? items : undefined))),
+          "prompt never queued",
+        )
+        yield* post(SessionPaths.abort)
+        yield* idle()
+        yield* llm.text("steered done")
+        const steered = yield* request(pathFor(SessionQueuePaths.update, { ...params, itemID: parked!.id }), {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ delivery: "steer" }),
+        })
+        expect(steered.status).toBe(200)
+        yield* answered("steered after abort")
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
+    "publishes session.queue.updated on the event stream with the full pending list",
+    () => {
+      // Released on every exit before the fake LLM server shuts down, so a
+      // failing assertion cannot hold its reply open.
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue events" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const model = { providerID: "test", modelID: "test-model" }
+
+        const events = yield* request(`${EventPaths.event}?directory=${encodeURIComponent(directory)}`)
+        const chunks = yield* Queue.unbounded<string>()
+        yield* events.stream.pipe(
+          Stream.decodeText,
+          Stream.runForEach((chunk) => Queue.offer(chunks, chunk)),
+          Effect.forkScoped,
+        )
+        let buffered = ""
+        const nextQueueUpdate = Effect.gen(function* () {
+          while (true) {
+            const end = buffered.indexOf("\n\n")
+            if (end === -1) {
+              buffered += yield* Queue.take(chunks)
+              continue
+            }
+            const frame = buffered.slice(0, end)
+            buffered = buffered.slice(end + 2)
+            const data = frame
+              .split("\n")
+              .filter((line) => line.startsWith("data: "))
+              .map((line) => line.slice("data: ".length))
+              .join("\n")
+            if (!data) continue
+            const event = JSON.parse(data) as {
+              type: string
+              properties: { sessionID?: string; items?: SessionQueue.Item[] }
+            }
+            if (event.type === "session.queue.updated" && event.properties.sessionID === session.id)
+              return event.properties.items
+          }
+        }).pipe(
+          Effect.timeoutOrElse({
+            duration: "5 seconds",
+            orElse: () => Effect.fail(new Error("no session.queue.updated event")),
+          }),
+        )
+
+        const start = yield* request(pathFor(SessionPaths.promptAsync, params), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ agent: "build", model, parts: [{ type: "text", text: "start" }] }),
+        })
+        expect(start.status).toBe(204)
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        // The start prompt's own admission and promotion publish first; skip to the held one.
+        yield* nextQueueUpdate
+        yield* nextQueueUpdate
+        yield* request(pathFor(SessionPaths.promptAsync, params), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ agent: "build", model, delivery: "queue", parts: [{ type: "text", text: "held" }] }),
+        })
+        const admittedList = yield* nextQueueUpdate
+        const listed = yield* requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+        expect(admittedList).toEqual(listed)
+        expect(listed.map((entry) => entry.input.parts)).toEqual([[{ type: "text", text: "held" }]])
+
+        const withdrawn = yield* request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID: listed[0]!.id }), {
+          method: "DELETE",
+          headers,
+        })
+        expect(withdrawn.status).toBe(200)
+        expect(yield* nextQueueUpdate).toEqual([])
+
+        const held = listed[0]!
+        const restored = yield* request(pathFor(SessionQueuePaths.restore, params), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ id: held.id }),
+        })
+        expect(restored.status).toBe(200)
+        expect(yield* nextQueueUpdate).toEqual([held])
+        const steered = yield* request(pathFor(SessionQueuePaths.update, { ...params, itemID: held.id }), {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ delivery: "steer" }),
+        })
+        expect(steered.status).toBe(200)
+        expect(yield* nextQueueUpdate).toEqual([{ ...held, delivery: "steer" }])
+        // Promotion at the next step empties the list.
+        yield* Deferred.succeed(gate, void 0)
+        expect(yield* nextQueueUpdate).toEqual([])
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, void 0)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
   )
 })

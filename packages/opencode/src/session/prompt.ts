@@ -42,11 +42,12 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Deferred, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
-import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
+import { SessionQueue } from "./queue"
+import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
@@ -58,8 +59,6 @@ import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
 import { MachineMessage } from "./machine-message"
-
-type UserWithParts = Omit<SessionV1.WithParts, "info"> & { info: SessionV1.User }
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -105,10 +104,12 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
-  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
-  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly command: (
+    input: CommandInput,
+  ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
 }
 
@@ -126,11 +127,6 @@ const layer = Layer.effect(
     const plugin = yield* Plugin.Service
     const commands = yield* Command.Service
     const config = yield* Config.Service
-    const promptedInputIDs = new Set<MessageID>()
-    const pendingAdmissions = new Map<MessageID, { sessionID: SessionID; ready: Deferred.Deferred<void> }>()
-    const pendingNoReplyInputIDs = new Map<SessionID, Set<MessageID>>()
-    const runControls = new Map<SessionID, { cancel: Deferred.Deferred<void>; claimed: Set<MessageID> }>()
-    const admissionLock = KeyedMutex.makeUnsafe<SessionID>()
     const permission = yield* Permission.Service
     const fsys = yield* FSUtil.Service
     const mcp = yield* MCP.Service
@@ -142,6 +138,7 @@ const layer = Layer.effect(
     const scope = yield* Scope.Scope
     const instruction = yield* Instruction.Service
     const state = yield* SessionRunState.Service
+    const queue = yield* SessionQueue.Service
     const revert = yield* SessionRevert.Service
     const summary = yield* SessionSummary.Service
     const sys = yield* SystemPrompt.Service
@@ -160,10 +157,9 @@ const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
-      const run = runControls.get(sessionID)
-      if (run) yield* Deferred.succeed(run.cancel, void 0).pipe(Effect.ignore)
+      // Parked before the interrupt, so no joiner of the cancelled run restarts it.
+      yield* queue.park(sessionID)
       yield* state.cancel(sessionID)
-      if (run && runControls.get(sessionID) === run) runControls.delete(sessionID)
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -644,7 +640,9 @@ const layer = Layer.effect(
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
-    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+    // Resolves a prompt into its user message without storing it, so a queue
+    // promotion can drop the result when a withdraw wins meanwhile.
+    const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (input: PromptInput) {
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
@@ -696,25 +694,6 @@ const layer = Layer.effect(
         system: input.system,
         format: input.format,
         ...(input.noReply === true ? { noReply: true } : {}),
-      }
-
-      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      if (
-        current.agent !== info.agent ||
-        current.model?.providerID !== info.model.providerID ||
-        current.model?.id !== info.model.modelID ||
-        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
-      ) {
-        yield* sessions.setAgentModel({
-          sessionID: input.sessionID,
-          agent: info.agent,
-          model: {
-            id: info.model.modelID,
-            providerID: info.model.providerID,
-            variant: info.model.variant ?? "default",
-          },
-          time: info.time.created,
-        })
       }
 
       yield* Effect.addFinalizer(() => instruction.clear(info.id))
@@ -1072,70 +1051,112 @@ const layer = Layer.effect(
         })
       }
 
-      yield* admissionLock.withLock(input.sessionID)(
-        Effect.gen(function* () {
-          yield* sessions.updateMessage(info)
-          for (const part of parts) yield* sessions.updatePart(part)
-        }),
-      )
-
       return { info, parts }
     }, Effect.scoped)
 
-    const releaseAdmission = Effect.fnUntraced(function* (messageID: MessageID, ready: Deferred.Deferred<void>) {
-      pendingAdmissions.delete(messageID)
-      yield* Deferred.succeed(ready, void 0).pipe(Effect.ignore)
+    // Stores a prepared user message; the session follows its agent and model.
+    const writeUserMessage = Effect.fnUntraced(function* (message: {
+      readonly info: SessionV1.User
+      readonly parts: ReadonlyArray<SessionV1.Part>
+    }) {
+      const info = message.info
+      const current = yield* sessions.get(info.sessionID).pipe(Effect.orDie)
+      if (
+        current.agent !== info.agent ||
+        current.model?.providerID !== info.model.providerID ||
+        current.model?.id !== info.model.modelID ||
+        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
+      ) {
+        yield* sessions.setAgentModel({
+          sessionID: info.sessionID,
+          agent: info.agent,
+          model: {
+            id: info.model.modelID,
+            providerID: info.model.providerID,
+            variant: info.model.variant ?? "default",
+          },
+          time: info.time.created,
+        })
+      }
+      yield* sessions.updateMessage(info)
+      for (const part of message.parts) yield* sessions.updatePart(part)
+      return { info, parts: [...message.parts] }
     })
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
+    const createUserMessage = (input: PromptInput) => prepareUserMessage(input).pipe(Effect.flatMap(writeUserMessage))
+
+    const prompt: (
+      input: PromptInput,
+    ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError> = Effect.fn(
       "SessionPrompt.prompt",
     )(function* (input: PromptInput) {
-      const messageID = input.messageID ?? MessageID.ascending()
-      const previouslyPrompted = promptedInputIDs.has(messageID)
-      promptedInputIDs.add(messageID)
-      const ready = previouslyPrompted ? undefined : yield* Deferred.make<void>()
-      if (ready) pendingAdmissions.set(messageID, { sessionID: input.sessionID, ready })
-
-      return yield* Effect.gen(function* () {
-        const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-        yield* revert.cleanup(session)
-        const message = yield* createUserMessage({ ...input, messageID }).pipe(
-          Effect.tap(() => (ready ? releaseAdmission(messageID, ready) : Effect.void)),
-        )
-        yield* sessions.touch(input.sessionID)
-
-        const permissions: PermissionV1.Rule[] = []
-        for (const [t, enabled] of Object.entries(input.tools ?? {})) {
-          permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
-        }
-        if (permissions.length > 0) {
-          session.permission = permissions
-          yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
-        }
-
-        if (input.noReply === true) {
-          if (!runControls.has(input.sessionID)) {
-            promptedInputIDs.delete(messageID)
-            return message
-          }
-          const ids = pendingNoReplyInputIDs.get(input.sessionID) ?? new Set<MessageID>()
-          ids.add(messageID)
-          pendingNoReplyInputIDs.set(input.sessionID, ids)
-          return message
-        }
-        return yield* loop({ sessionID: input.sessionID, messageID })
-      }).pipe(
-        Effect.onExit((exit) =>
-          Effect.gen(function* () {
-            if (!ready || !pendingAdmissions.has(messageID)) return
-            if (Exit.isFailure(exit)) {
-              if (!previouslyPrompted) promptedInputIDs.delete(messageID)
-            }
-            yield* releaseAdmission(messageID, ready)
-          }),
-        ),
+      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      yield* revert.cleanup(session)
+      const classification = MachineMessage.classify(
+        input.parts.find((part) => part.type === "text")?.text ?? "",
+        (yield* config.get()).machine_message_markers,
       )
-    })
+      const delivery =
+        classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
+      // noReply keeps its direct write and never drains. Every other prompt is
+      // admitted to the durable queue first; a steer is promoted at once, unless a
+      // pending compaction must run first, so it still reaches the running turn's
+      // next step as it did before the queue.
+      const entry =
+        input.noReply === true
+          ? { kind: "direct" as const, message: yield* createUserMessage(input) }
+          : {
+              kind: "queued" as const,
+              own: yield* queue.admit({ ...input, ...(delivery ? { delivery } : {}) }),
+            }
+      if (entry.kind === "queued") yield* Effect.addFinalizer(() => queue.forget(entry.own.id))
+      // Only this prompt's own failure is this caller's error; an older steer
+      // promoted alongside it is reported on its own.
+      if (entry.kind === "queued")
+        yield* queue.promote({
+          sessionID: input.sessionID,
+          delivery: "steer",
+          prepare: prepareUserMessage,
+          write: writeUserMessage,
+          rejected: rejected(input.sessionID),
+          own: entry.own.id,
+        })
+      yield* sessions.touch(input.sessionID)
+
+      const permissions: PermissionV1.Rule[] = []
+      for (const [t, enabled] of Object.entries(input.tools ?? {})) {
+        permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
+      }
+      if (permissions.length > 0) {
+        session.permission = permissions
+        yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
+      }
+
+      if (entry.kind === "direct") return entry.message
+      return yield* drain(input.sessionID, entry.own.id)
+    }, Effect.scoped)
+
+    // A queued prompt that cannot become a message is dropped by the queue;
+    // report it the way prompt_async reports a failed prompt.
+    const rejected = (sessionID: SessionID) => (cause: Cause.Cause<unknown>) =>
+      events
+        .publish(Session.Event.Error, {
+          sessionID,
+          error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
+        })
+        .pipe(Effect.asVoid)
+
+    // Inside a drain no item is the caller's own, so only an interrupt can fail this.
+    const promoteInLoop = (sessionID: SessionID, delivery: SessionQueue.Delivery) =>
+      queue
+        .promote({
+          sessionID,
+          delivery,
+          prepare: prepareUserMessage,
+          write: writeUserMessage,
+          rejected: rejected(sessionID),
+        })
+        .pipe(Effect.orDie)
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1145,248 +1166,33 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
-    const runLoop: (
-      sessionID: SessionID,
-      rootMessageID: MessageID | undefined,
-      runControl: { cancel: Deferred.Deferred<void>; claimed: Set<MessageID> },
-    ) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(function* (
-      sessionID: SessionID,
-      rootMessageID: MessageID | undefined,
-      runControl: { cancel: Deferred.Deferred<void>; claimed: Set<MessageID> },
-    ) {
-      return yield* Effect.gen(function* () {
-        const runRootMessageID = yield* admissionLock.withLock(sessionID)(
-          Effect.gen(function* () {
-            const root =
-              rootMessageID ??
-              (yield* Effect.gen(function* () {
-                const messages = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-                  Effect.provideService(Database.Service, database),
-                )
-                const admitted = yield* MessageV2.admission(sessionID).pipe(
-                  Effect.provideService(Database.Service, database),
-                )
-                return MessageV2.latest(messages, { admissionOrder: admitted.order }).user?.id
-              }))
-            if (runControls.has(sessionID)) throw new Error(`Active prompt run control already exists: ${sessionID}`)
-            yield* Effect.sync(() => runControls.set(sessionID, runControl))
-            return root
-          }),
-        )
+    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
+      function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
-        const markerConfig = (yield* config.get()).machine_message_markers
         let structured: unknown
         let step = 0
-        let turnRoot: SessionV1.User | undefined
-        let initialTurnRootID: MessageID | undefined
-        let held: UserWithParts[] = []
-        let activeInputTurn: UserWithParts | undefined
-        let activeSteerInput: UserWithParts | undefined
-        let titleStarted = false
-        const heldIDs = new Set<MessageID>()
-        const heldReleasePending = new Set<MessageID>()
-        const completedInputIDs = new Set<MessageID>()
-        const deferredInputIDs = new Set<MessageID>()
-        const admissionOrder = new Map<MessageID, number>()
-        const claimedInputIDs = runControl.claimed
+        let settled = false
+        let seen = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
-        const loadAdmission = Effect.fnUntraced(function* () {
-          const persisted = yield* MessageV2.admission(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
-          admissionOrder.clear()
-          for (const [id, order] of persisted.order) admissionOrder.set(id, order)
-          claimedInputIDs.clear()
-          for (const id of persisted.claimed) claimedInputIDs.add(id)
-        })
-
-        const loadMessages = Effect.fnUntraced(function* () {
-          const msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
-          yield* loadAdmission()
-          return msgs
-        })
-
-        const orderOf = (messageID: MessageID) => {
-          const order = admissionOrder.get(messageID)
-          if (order === undefined) throw new Error(`Missing persisted admission order for message: ${messageID}`)
-          return order
-        }
-
-        const initializeTurn = (msgs: SessionV1.WithParts[]) => {
-          if (turnRoot) return
-          const root = runRootMessageID
-            ? msgs.find(
-                (msg): msg is UserWithParts =>
-                  msg.info.role === "user" && msg.info.id === runRootMessageID,
-              )?.info
-            : MessageV2.latest(msgs, { admissionOrder }).user
-          if (runRootMessageID && !root) throw new Error(`Run root message not found: ${runRootMessageID}`)
-          turnRoot = root
-          if (!turnRoot) return
-          initialTurnRootID = turnRoot.id
-          const rootOrder = orderOf(turnRoot.id)
-          msgs.forEach((msg) => {
-            if (
-              msg.info.role === "user" &&
-              msg.info.id !== turnRoot?.id &&
-              (orderOf(msg.info.id) < rootOrder || claimedInputIDs.has(msg.info.id))
-            )
-              completedInputIDs.add(msg.info.id)
-          })
-        }
-
-        const collectHeld = (msgs: SessionV1.WithParts[]) => {
-          if (!turnRoot) return
-          const root = turnRoot
-          const rootOrder = admissionOrder.get(root.id)
-          const incoming = msgs.filter((msg): msg is UserWithParts => {
-            if (
-              msg.info.role !== "user" ||
-              msg.info.noReply === true ||
-              heldIDs.has(msg.info.id) ||
-              completedInputIDs.has(msg.info.id) ||
-              msg.info.id === root.id
-            )
-              return false
-            const order = admissionOrder.get(msg.info.id)
-            if (rootOrder === undefined || order === undefined || order <= rootOrder) return false
-            const text = msg.parts.find(
-              (part): part is SessionV1.TextPart => part.type === "text" && !part.synthetic && !part.ignored,
-            )?.text
-            return MachineMessage.classify(text ?? "", markerConfig) === "hold"
-          })
-          incoming.forEach((msg) => heldIDs.add(msg.info.id))
-          held = [...held, ...incoming].sort(
-            (a, b) => orderOf(a.info.id) - orderOf(b.info.id),
-          )
-        }
-
-        const pendingImmediateInputs = (msgs: SessionV1.WithParts[]) =>
-          msgs
-            .filter(
-              (msg): msg is UserWithParts =>
-                msg.info.role === "user" &&
-                msg.info.noReply !== true &&
-                msg.info.id !== turnRoot?.id &&
-                !heldIDs.has(msg.info.id) &&
-                !completedInputIDs.has(msg.info.id) &&
-                !claimedInputIDs.has(msg.info.id),
-            )
-            .filter((msg) => {
-              const text = msg.parts.find(
-                (part): part is SessionV1.TextPart => part.type === "text" && !part.synthetic && !part.ignored,
-              )?.text
-              return MachineMessage.classify(text ?? "", markerConfig) !== "hold"
-            })
-            .sort((a, b) => orderOf(a.info.id) - orderOf(b.info.id))
-
-        const projectTurn = (msgs: SessionV1.WithParts[]) => {
-          const completed = (msg: SessionV1.WithParts) =>
-            completedInputIDs.has(msg.info.role === "user" ? msg.info.id : msg.info.parentID)
-          return [...msgs.filter(completed), ...msgs.filter((msg) => !completed(msg))]
-        }
-
-        const markAnsweredInputs = (msgs: SessionV1.WithParts[], parentID?: MessageID) => {
-          msgs.forEach((msg) => {
-            if (
-              msg.info.role !== "assistant" ||
-              (parentID !== undefined && msg.info.parentID !== parentID) ||
-              !msg.info.finish ||
-              ["tool-calls", "unknown"].includes(msg.info.finish)
-            )
-              return
-            const hasToolCalls = msg.parts.some(
-              (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
-            )
-            if (!hasToolCalls) completedInputIDs.add(msg.info.parentID)
-          })
-          if (activeInputTurn && completedInputIDs.has(activeInputTurn.info.id)) activeInputTurn = undefined
-          if (activeSteerInput && completedInputIDs.has(activeSteerInput.info.id)) activeSteerInput = undefined
-        }
-
-        const waitForEarlierAdmissions = Effect.fnUntraced(function* () {
-          const first = held[0]
-          if (!first) return
-          const firstOrder = admissionOrder.get(first.info.id)
-          if (firstOrder === undefined) return
-          yield* Effect.forEach(
-            Array.from(pendingAdmissions.entries())
-              .filter(([messageID, admission]) => {
-                const order = admissionOrder.get(messageID)
-                return admission.sessionID === sessionID && order !== undefined && order < firstOrder
-              })
-              .map(([, admission]) => admission),
-            (admission) => Deferred.await(admission.ready),
-            { concurrency: "unbounded", discard: true },
-          )
-        })
-
-        const releaseHeldInput = Effect.fnUntraced(function* (message: UserWithParts) {
-          yield* sessions.updateMessage(message.info, { reAdmit: true }).pipe(Effect.orDie)
-          return message
-        })
-
-        const runStep = Effect.gen(function* () {
+        while (true) {
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-          let msgs = yield* loadMessages()
-
-          initializeTurn(msgs)
-          if (!turnRoot) {
-            if (msgs.some((message) => message.info.role === "user" && message.info.noReply === true))
-              return "stop" as const
-            throw new Error("No user message found in stream. This should never happen.")
-          }
-          collectHeld(msgs)
-          if (activeInputTurn && heldReleasePending.has(activeInputTurn.info.id)) {
-            activeInputTurn = yield* releaseHeldInput(activeInputTurn)
-            heldReleasePending.delete(activeInputTurn.info.id)
-            turnRoot = activeInputTurn.info
-            msgs = yield* loadMessages()
-            collectHeld(msgs)
-          }
-
-          const immediate = pendingImmediateInputs(msgs)
-          if (activeSteerInput && completedInputIDs.has(activeSteerInput.info.id)) activeSteerInput = undefined
-          activeSteerInput ??= immediate[0]
-          deferredInputIDs.clear()
-          immediate.forEach((msg) => {
-            if (msg.info.id !== activeSteerInput?.info.id) deferredInputIDs.add(msg.info.id)
-          })
-          if (activeSteerInput) turnRoot = activeSteerInput.info
-
-          msgs = msgs.filter(
-            (msg) => !heldIDs.has(msg.info.id) && !(msg.info.role === "user" && deferredInputIDs.has(msg.info.id)),
+          seen = yield* queue.consume(sessionID)
+          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+            Effect.provideService(Database.Service, database),
           )
-          const selection = {
-            completedUserIDs: completedInputIDs,
-            admissionOrder,
-            excludeNoReply: true,
-          }
-          const root = turnRoot
-          const selectTurn = (messages: SessionV1.WithParts[]) => {
-            const latest = MessageV2.latest(messages, selection)
-            if (root.noReply === true && !completedInputIDs.has(root.id)) return { ...latest, user: root }
-            if (activeSteerInput && messages.some((msg) => msg.info.id === activeSteerInput?.info.id))
-              return { ...latest, user: activeSteerInput.info }
-            return latest
-          }
-          let selected = selectTurn(msgs)
-          const previousTurnID = activeSteerInput?.info.id ?? activeInputTurn?.info.id ?? turnRoot.id
-          if (selected.user && selected.user.id !== previousTurnID) {
-            markAnsweredInputs(msgs, previousTurnID)
-            selected = selectTurn(msgs)
-          }
-          if (!selected.user) return "stop" as const
-          msgs = projectTurn(msgs)
-          selected = selectTurn(msgs)
-          const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = selected
+          const admission = yield* MessageV2.admission(sessionID).pipe(
+            Effect.provideService(Database.Service, database),
+          )
+          const selection = { admissionOrder: admission.order }
 
-          if (!lastUser) return "stop" as const
+          const { user: lastUser, assistant: lastAssistant, finished: lastFinished } = MessageV2.latest(msgs, selection)
+
+          // Steers parked by an abort or held behind a compaction reach the next step.
+          if (yield* promoteInLoop(sessionID, "steer")) continue
+          if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1399,11 +1205,18 @@ const layer = Layer.effect(
               (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
             ) ?? false
 
+          // A turn that stopped on an abort or error, or ended with its structured
+          // result, stays settled, so waking the session delivers its parked
+          // prompts instead of continuing that turn.
+          const ended =
+            lastAssistant?.parentID === lastUser.id &&
+            (lastAssistant.error !== undefined || lastAssistant.structured !== undefined)
           if (
-            lastAssistant?.finish &&
-            !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
-            !hasToolCalls &&
-            lastAssistant.parentID === lastUser.id
+            ended ||
+            (lastAssistant?.finish &&
+              !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
+              !hasToolCalls &&
+              lastAssistant.parentID === lastUser.id)
           ) {
             const orphan = lastAssistantMsg?.parts.find(
               (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
@@ -1416,39 +1229,55 @@ const layer = Layer.effect(
                 callID: orphan.callID,
               })
             }
+            // The turn is over. Its reply answers the prompt that began it and every
+            // steer that joined it, before the loop goes on to a turn of its own.
+            if (lastAssistantMsg) yield* queue.answer(sessionID, lastUser.id, lastAssistantMsg)
+            // Queued prompts wait for this point and run one turn each, so a steer
+            // or another admission arriving meanwhile is weighed before the next.
+            // Each such turn is new user input and gets a fresh step allowance.
+            if ((yield* promoteInLoop(sessionID, "steer")) || (yield* promoteInLoop(sessionID, "queue"))) {
+              step = 0
+              continue
+            }
             yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
-            return "stop" as const
+            settled = true
+            break
           }
 
           step++
-          if (step === 1 && !titleStarted) {
-            titleStarted = true
+          if (step === 1)
             yield* title({
               session,
               modelID: lastUser.model.modelID,
               providerID: lastUser.model.providerID,
               history: msgs,
             }).pipe(Effect.ignore, Effect.forkIn(scope))
-          }
 
           const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
-          const task = tasks.pop()
+          // A compaction whose summary turn stopped is over; retrying it would make
+          // the next prompt its parent.
+          const task = SessionQueue.openTasks(msgs, selection).pop()
 
           if (task?.type === "subtask") {
             yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
-            return "continue" as const
+            continue
           }
 
           if (task?.type === "compaction") {
-            const result = yield* compaction.process({
-              messages: msgs,
-              parentID: lastUser.id,
+            // No steer is promoted until the summary and its replay or continue
+            // message are written, so none lands between them.
+            const result = yield* queue.whileCompacting(
               sessionID,
-              auto: task.auto,
-              overflow: task.overflow,
-            })
-            if (result === "stop") return "stop" as const
-            return "continue" as const
+              compaction.process({
+                messages: msgs,
+                parentID: lastUser.id,
+                sessionID,
+                auto: task.auto,
+                overflow: task.overflow,
+              }),
+            )
+            if (result === "stop") break
+            continue
           }
 
           if (
@@ -1457,7 +1286,7 @@ const layer = Layer.effect(
             (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
           ) {
             yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
-            return "continue" as const
+            continue
           }
 
           const agent = yield* agents.get(lastUser.agent)
@@ -1491,13 +1320,6 @@ const layer = Layer.effect(
             time: { created: Date.now() },
             sessionID,
           }
-          const claims = msgs.flatMap((item) =>
-            item.info.role === "user" &&
-            !claimedInputIDs.has(item.info.id) &&
-            (item.info.noReply !== true || item.info.id === turnRoot?.id)
-              ? [item.info.id]
-              : [],
-          )
           yield* sessions.updateMessage(msg)
 
           const finalizeInterruptedAssistant = Effect.gen(function* () {
@@ -1515,7 +1337,6 @@ const layer = Layer.effect(
               assistantMessage: msg,
               sessionID,
               model,
-              onProviderStart: claims.length > 0 ? sessions.updateMessage(msg, { claims }) : Effect.void,
             })
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
@@ -1585,11 +1406,15 @@ const layer = Layer.effect(
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
             })
+
             if (structured !== undefined) {
               handle.message.structured = structured
               handle.message.finish = handle.message.finish ?? "stop"
               yield* sessions.updateMessage(handle.message)
-              return "break" as const
+              // The turn is over, but the run goes on to its would-idle point, so a
+              // queued prompt behind it runs in this drain.
+              structured = undefined
+              return "continue" as const
             }
 
             const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
@@ -1631,141 +1456,97 @@ const layer = Layer.effect(
             Effect.ensuring(instruction.clear(handle.message.id)),
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
           )
-          if (outcome === "break") return "stop" as const
-          return "continue" as const
-        })
+          if (outcome === "break") break
+          continue
+        }
 
-        const runSteps = Effect.gen(function* () {
-          while (true) {
-            if (yield* Deferred.isDone(runControl.cancel)) break
-            const result = yield* Effect.raceFirst(
-              runStep.pipe(Effect.map((outcome) => ({ type: "step" as const, outcome }))),
-              Deferred.await(runControl.cancel).pipe(Effect.as({ type: "cancel" as const })),
-            )
-            if (result.type === "cancel" || result.outcome === "stop") break
-          }
+        // Any other exit stops the task; the joiner re-check must not restart it.
+        if (!settled) yield* queue.park(sessionID, seen)
+        yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
+        return yield* endRun(sessionID)
+      },
+      // So does an interrupt, such as instance disposal cancelling the run.
+      (effect, sessionID) =>
+        effect.pipe(Effect.onInterrupt(() => queue.park(sessionID).pipe(Effect.andThen(endRun(sessionID))))),
+    )
 
-          yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
-          return yield* lastAssistant(sessionID)
-        })
-
-        const drainHeld = Effect.gen(function* () {
-          let failure: Cause.Cause<never> | undefined
-          while (true) {
-            if (yield* Deferred.isDone(runControl.cancel)) break
-            const msgs = yield* loadMessages()
-            if (!turnRoot) {
-              initializeTurn(msgs)
-              if (!turnRoot) break
-            }
-            if (initialTurnRootID) completedInputIDs.add(initialTurnRootID)
-            markAnsweredInputs(msgs)
-            collectHeld(msgs)
-            if (activeInputTurn) {
-              const answeredBefore = completedInputIDs.size
-              const exit = yield* Effect.exit(runSteps)
-              if (Exit.isFailure(exit)) failure ??= exit.cause
-              if (yield* Deferred.isDone(runControl.cancel)) break
-              markAnsweredInputs(yield* loadMessages())
-              if (activeInputTurn && completedInputIDs.size === answeredBefore) break
-              if (activeInputTurn) {
-                step = 0
-                structured = undefined
-              }
-              continue
-            }
-
-            const directInputs = pendingImmediateInputs(msgs)
-            const direct = directInputs[0]
-            const nextHeld = held[0]
-            if (direct && (!nextHeld || orderOf(direct.info.id) < orderOf(nextHeld.info.id))) {
-              activeSteerInput = direct
-              turnRoot = direct.info
-              activeInputTurn = direct
-              step = 0
-              structured = undefined
-              continue
-            }
-            if (!nextHeld) break
-
-            const waited = yield* Effect.raceFirst(
-              waitForEarlierAdmissions().pipe(Effect.as("ready" as const)),
-              Deferred.await(runControl.cancel).pipe(Effect.as("cancel" as const)),
-            )
-            if (waited === "cancel") break
-            const nextMessages = yield* loadMessages()
-            markAnsweredInputs(nextMessages)
-            collectHeld(nextMessages)
-            if (held.length === 0) continue
-
-            const next = held.shift()
-            if (!next) continue
-            heldIDs.delete(next.info.id)
-            completedInputIDs.delete(next.info.id)
-            turnRoot = next.info
-            activeInputTurn = next
-            heldReleasePending.add(next.info.id)
-            step = 0
-            structured = undefined
-          }
-
-          for (const messageID of completedInputIDs) {
-            promptedInputIDs.delete(messageID)
-          }
-          for (const messageID of promptedInputIDs) {
-            if (claimedInputIDs.has(messageID)) promptedInputIDs.delete(messageID)
-          }
-          if (failure) return yield* Effect.failCause(failure)
-        })
-
-        return yield* Effect.uninterruptibleMask((restore) =>
-          Effect.gen(function* () {
-            const initial = yield* Effect.exit(restore(runSteps))
-            if (yield* Deferred.isDone(runControl.cancel)) {
-              yield* loadAdmission()
-              return yield* lastAssistant(sessionID)
-            }
-
-            const drained = yield* Effect.exit(restore(drainHeld))
-            if (yield* Deferred.isDone(runControl.cancel)) {
-              yield* loadAdmission()
-              return yield* lastAssistant(sessionID)
-            }
-            if (Exit.isFailure(drained)) {
-              yield* loadAdmission()
-              return yield* Effect.failCause(drained.cause)
-            }
-            if (Exit.isFailure(initial)) return yield* Effect.failCause(initial.cause)
-            return yield* lastAssistant(sessionID)
-          }),
-        )
-      }).pipe(
-        Effect.ensuring(
-          Effect.sync(() => {
-            for (const messageID of pendingNoReplyInputIDs.get(sessionID) ?? []) promptedInputIDs.delete(messageID)
-            pendingNoReplyInputIDs.delete(sessionID)
-            for (const messageID of promptedInputIDs) {
-              if (runControl.claimed.has(messageID)) promptedInputIDs.delete(messageID)
-            }
-            if (runControls.get(sessionID) === runControl) runControls.delete(sessionID)
-          }),
-        ),
-      )
+    // A run's final message ends the turn it belongs to, so it answers that turn's
+    // prompts before any later run can. A turn the loop finished was answered as
+    // it ended; this answers one the run stopped on, by an error, abort or interrupt.
+    const endRun = Effect.fnUntraced(function* (sessionID: SessionID) {
+      const final = yield* lastAssistant(sessionID)
+      if (final.info.role === "assistant") yield* queue.answer(sessionID, final.info.parentID, final)
+      return final
     })
 
-    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
-      input: LoopInput,
-    ) {
-      const runControl = {
-        cancel: yield* Deferred.make<void>(),
-        claimed: new Set<MessageID>(),
+    // Without an own item there is nothing that can be withdrawn from under it.
+    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = (input) =>
+      drain(input.sessionID).pipe(Effect.orDie)
+
+    // Runs or joins the session's drain. With `own`, returns the reply the turn
+    // that prompt joined recorded for it: the drain's final message may answer
+    // another caller's prompt.
+    const drain: (
+      sessionID: SessionID,
+      own?: SessionQueue.ItemID,
+    ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError> = Effect.fn(
+      "SessionPrompt.loop",
+    )(function* (sessionID: SessionID, own?: SessionQueue.ItemID) {
+      const withdrawn = own
+        ? queue
+            .withdrawn(sessionID, own)
+            .pipe(
+              Effect.flatMap((gone) =>
+                gone ? Effect.fail(new SessionQueue.WithdrawnError({ sessionID, itemID: own })) : Effect.void,
+              ),
+            )
+        : Effect.void
+      yield* withdrawn
+      // A run needs a user message to answer. On an idle new session the first
+      // prompt becomes one here, before any run, so a withdraw that wins leaves
+      // nothing running. A busy one (a shell, say) is joined as before.
+      const idle = Exit.isSuccess(yield* state.assertNotBusy(sessionID).pipe(Effect.exit))
+      if (idle && (yield* queue.empty(sessionID))) {
+        const first = (delivery: SessionQueue.Delivery) =>
+          queue.promote({
+            sessionID,
+            delivery,
+            prepare: prepareUserMessage,
+            write: writeUserMessage,
+            rejected: rejected(sessionID),
+            own,
+            untilStarted: true,
+          })
+        yield* first("steer")
+        yield* first("queue")
+        if (yield* queue.empty(sessionID)) return yield* withdrawn.pipe(Effect.andThen(lastAssistant(sessionID)))
       }
-      return yield* state.ensureRunning(
-        input.sessionID,
-        lastAssistant(input.sessionID),
-        runLoop(input.sessionID, input.messageID, runControl),
-        Deferred.succeed(runControl.cancel, void 0).pipe(Effect.asVoid),
-      )
+      const result = yield* state.ensureRunning(sessionID, lastAssistant(sessionID), runLoop(sessionID))
+      // Work admitted after the joined run's last history read would otherwise
+      // wait for another prompt. This caller stays with the drains until one has
+      // read its own prompt and finished; anyone else's is woken in the background.
+      const waiting = yield* queue.awaitingDrain(sessionID)
+      if (own) {
+        const unread = waiting && (yield* queue.unread(sessionID, own))
+        if (unread || Exit.isFailure(yield* state.assertNotBusy(sessionID).pipe(Effect.exit)))
+          return yield* drain(sessionID, own)
+      }
+      if (waiting) {
+        yield* drain(sessionID).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("queue drain failed", { "session.id": sessionID, cause }).pipe(
+              Effect.andThen(rejected(sessionID)(cause)),
+            ),
+          ),
+          Effect.forkIn(scope, { startImmediately: true }),
+        )
+      }
+      const reply = own ? yield* queue.reply(own) : undefined
+      if (reply) return reply
+      // A prompt still pending when the run stopped, or delivered after its last
+      // history read, has no turn; its caller gets the run's final message, as
+      // every caller did before the queue.
+      return yield* withdrawn.pipe(Effect.as(result))
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
@@ -1892,6 +1673,7 @@ const layer = Layer.effect(
         agent: userAgent,
         parts,
         variant: input.variant,
+        delivery: input.delivery,
       })
       yield* events.publish(Command.Event.Executed, {
         name: input.command,
@@ -1918,33 +1700,15 @@ const ModelRef = Schema.Struct({
   modelID: ModelV2.ID,
 })
 
+// The payload fields live with the queue schema, which stores and lists them.
 export const PromptInput = Schema.Struct({
   sessionID: SessionID,
-  messageID: Schema.optional(MessageID),
-  model: Schema.optional(ModelRef),
-  agent: Schema.optional(Schema.String),
-  noReply: Schema.optional(Schema.Boolean),
-  tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)).annotate({
-    description:
-      "@deprecated tools and permissions have been merged, you can set permissions on the session itself now",
-  }),
-  format: Schema.optional(SessionV1.Format),
-  system: Schema.optional(Schema.String),
-  variant: Schema.optional(Schema.String),
-  parts: Schema.Array(
-    Schema.Union([
-      SessionV1.TextPartInput,
-      SessionV1.FilePartInput,
-      SessionV1.AgentPartInput,
-      SessionV1.SubtaskPartInput,
-    ]).annotate({ discriminator: "type" }),
-  ),
+  ...SessionPromptQueue.Input.fields,
 })
 export type PromptInput = Schema.Schema.Type<typeof PromptInput>
 
 export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput")({
   sessionID: SessionID,
-  messageID: Schema.optional(MessageID),
 }) {}
 
 export const ShellInput = Schema.Struct({
@@ -1964,6 +1728,7 @@ export const CommandInput = Schema.Struct({
   arguments: Schema.String,
   command: Schema.String,
   variant: Schema.optional(Schema.String),
+  delivery: Schema.optional(SessionPromptQueue.Delivery),
   // Inlined (no identifier annotation) to keep the original SDK output — the
   // PromptInput call site below references FilePartInput by ref via the
   // Schema export in message-v2.ts.
@@ -2041,6 +1806,7 @@ export const node = LayerNode.make({
     CrossSpawnSpawner.node,
     Instruction.node,
     SessionRunState.node,
+    SessionQueue.node,
     SessionRevert.node,
     SessionSummary.node,
     SystemPrompt.node,
