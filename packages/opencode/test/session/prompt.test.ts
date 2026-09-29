@@ -54,7 +54,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { reply, TestLLMServer } from "../lib/llm-server"
+import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -851,6 +851,59 @@ it.instance("loop stops provider overflow instead of auto-compacting when disabl
       expect(result.info.finish).toBe("error")
     }
     expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(false)
+  }),
+)
+
+it.instance("automatically compacts and continues after an unparseable mid-stream error chunk", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      compaction: { auto: true },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Continue after handling a mocked overflow." }],
+    })
+    yield* llm.push(
+      raw({
+        chunks: [
+          {
+            id: "chatcmpl-test",
+            object: "chat.completion.chunk",
+            created: 1790550000,
+            model: "test-model",
+            choices: [{ index: 0, delta: { role: "assistant", content: "partial response" }, finish_reason: null }],
+          },
+          { error: "Your input exceeds the context window of this model" },
+        ],
+      }),
+      reply().text("Compaction summary from the mock.").stop(),
+      reply().text("Continued after automatic compaction.").stop(),
+    )
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+
+    expect(yield* llm.hits).toHaveLength(3)
+    expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(true)
+    expect(
+      messages.some((message) =>
+        message.parts.some((part) => part.type === "text" && part.text === "partial response"),
+      ),
+    ).toBe(true)
+    expect(result.info.role).toBe("assistant")
+    expect(result.parts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "text", text: "Continued after automatic compaction." }),
+      ]),
+    )
+    if (result.info.role === "assistant") expect(result.info.error).toBeUndefined()
   }),
 )
 

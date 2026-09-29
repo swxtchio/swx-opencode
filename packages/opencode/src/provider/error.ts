@@ -105,6 +105,17 @@ export function parseStreamError(input: unknown): ParsedStreamError | undefined 
   if (!body) return
 
   const responseBody = JSON.stringify(body)
+  if (
+    body.code === "context_length_exceeded" ||
+    (typeof body.message === "string" && isContextOverflow(body.message))
+  ) {
+    return {
+      type: "context_overflow",
+      message: body.code === "context_length_exceeded" ? "Input exceeds context window of this model" : body.message,
+      responseBody,
+    }
+  }
+
   if (body.type !== "error") return
 
   switch (body?.error?.code) {

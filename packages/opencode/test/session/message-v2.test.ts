@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { APICallError } from "ai"
+import { APICallError, TypeValidationError } from "ai"
 import { MessageV2 } from "../../src/session/message-v2"
 import { ProviderTransform } from "@/provider/transform"
 import type { Provider } from "@/provider/provider"
@@ -9,6 +9,7 @@ import { SessionID, MessageID, PartID } from "../../src/session/schema"
 import { Question } from "../../src/question"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { openAICompatibleStreamError } from "../lib/openai-compatible-stream-error"
 
 const sessionID = SessionID.make("session")
 const providerID = ProviderV2.ID.make("test")
@@ -1364,6 +1365,32 @@ describe("session.message-v2.toModelMessage", () => {
 })
 
 describe("session.message-v2.fromError", () => {
+  test("serializes an SDK-parsed top-level OpenAI-compatible stream error as ContextOverflowError", async () => {
+    const error = await openAICompatibleStreamError({
+      message: "Request failed",
+      type: "invalid_request_error",
+      code: "context_length_exceeded",
+    })
+    const result = MessageV2.fromError(error, { providerID })
+
+    expect(result).toStrictEqual({
+      name: "ContextOverflowError",
+      data: {
+        message: "Input exceeds context window of this model",
+        responseBody: JSON.stringify(error),
+      },
+    })
+  })
+
+  test("serializes an AI SDK TypeValidationError from an unparseable overflow chunk", async () => {
+    const error = await openAICompatibleStreamError("Your input exceeds the context window of this model")
+
+    expect(TypeValidationError.isInstance(error)).toBe(true)
+    const result = MessageV2.fromError(error, { providerID })
+
+    expect(SessionV1.ContextOverflowError.isInstance(result)).toBe(true)
+  })
+
   test("serializes context_length_exceeded as ContextOverflowError", () => {
     const input = {
       type: "error",
