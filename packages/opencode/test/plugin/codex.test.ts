@@ -335,7 +335,7 @@ describe("plugin.codex", () => {
   })
 
   test.each([
-    ["gpt-6-astra", false],
+    ["gpt-6-astra", true],
     ["gpt-6", true],
     ["gpt-6.0-astra", false],
     ["gpt-7", true],
@@ -357,6 +357,11 @@ describe("plugin.codex", () => {
     ["gpt-6.1.2", false],
     ["gpt-6-extra", false],
     ["gpt-6-sol-extra", false],
+    ["gpt-06", false],
+    ["gpt-05.5", false],
+    ["gpt-5.05", false],
+    ["gpt-6.00", false],
+    ["gpt-5.06", false],
     ["gpt-5.6-sol", true],
     ["gpt-5.6-terra", true],
     ["gpt-5.6-luna", true],

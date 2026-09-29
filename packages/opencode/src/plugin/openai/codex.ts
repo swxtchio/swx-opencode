@@ -20,6 +20,7 @@ const ALLOWED_MODELS = new Set([
   "gpt-5.6-sol",
   "gpt-5.6-terra",
   "gpt-5.6-luna",
+  "gpt-6-astra",
   "gpt-6-sol",
   "gpt-6-luna",
 ])
@@ -307,8 +308,8 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
               if (ALLOWED_MODELS.has(model.api.id)) return true
               if (DISALLOWED_MODELS.has(model.api.id)) return false
               if (model.api.id === "gpt-5.6") return false
-              const match = model.api.id.match(/^gpt-(\d+)(?:\.(\d+))?$/)
-              if (!match || match[0] !== model.api.id) return false
+              const match = model.api.id.match(/^gpt-([1-9]\d*)(?:\.(0|[1-9]\d*))?$/)
+              if (!match) return false
               const major = Number(match[1])
               const minor = Number(match[2] ?? 0)
               return major > 5 || (major === 5 && minor > 4)
