@@ -1380,6 +1380,95 @@ const scenarios: Scenario[] = [
       }),
     ),
   http.protected
+    .get("/session/{sessionID}/queue", "session.queue.list")
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue list session" })
+        const item = yield* ctx.queued(session.id, { text: "listed" })
+        return { session, item }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue", { sessionID: ctx.state.session.id }),
+      headers: ctx.headers(),
+    }))
+    .json(200, (body, ctx) => {
+      array(body)
+      check(stable(body) === stable([ctx.state.item]), "queue should list the pending item")
+    }),
+  http.protected
+    .delete("/session/{sessionID}/queue/{itemID}", "session.queue.withdraw")
+    .mutating()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue withdraw session" })
+        const item = yield* ctx.queued(session.id, { text: "withdrawn" })
+        return { session, item }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/{itemID}", {
+        sessionID: ctx.state.session.id,
+        itemID: ctx.state.item.id,
+      }),
+      headers: ctx.headers(),
+    }))
+    .jsonEffect(200, (body, ctx) =>
+      Effect.gen(function* () {
+        check(stable(body) === stable(ctx.state.item), "withdraw should return the item")
+        check((yield* ctx.queue(ctx.state.session.id)).length === 0, "withdrawn item should leave the queue")
+      }),
+    ),
+  http.protected
+    .post("/session/{sessionID}/queue/restore", "session.queue.restore")
+    .preserveDatabase()
+    .withLlm()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue restore session" })
+        const item = yield* ctx.queued(session.id, { text: "restored", withdrawn: true })
+        yield* ctx.llmText("restored reply")
+        return { session, item }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/restore", { sessionID: ctx.state.session.id }),
+      headers: ctx.headers(),
+      body: { id: ctx.state.item.id },
+    }))
+    .jsonEffect(200, (body, ctx) =>
+      Effect.gen(function* () {
+        check(stable(body) === stable(ctx.state.item), "restore should return the item with its id and seq")
+        yield* ctx.llmWait(1)
+      }),
+    ),
+  http.protected
+    .patch("/session/{sessionID}/queue/{itemID}", "session.queue.update")
+    .preserveDatabase()
+    .withLlm()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue send-now session" })
+        const item = yield* ctx.queued(session.id, { text: "sent now" })
+        yield* ctx.llmText("sent now reply")
+        return { session, item }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/{itemID}", {
+        sessionID: ctx.state.session.id,
+        itemID: ctx.state.item.id,
+      }),
+      headers: ctx.headers(),
+      body: { delivery: "steer" },
+    }))
+    .jsonEffect(200, (body, ctx) =>
+      Effect.gen(function* () {
+        check(stable(body) === stable({ ...ctx.state.item, delivery: "steer" }), "update should return the item")
+        yield* ctx.llmWait(1)
+      }),
+    ),
+  http.protected
     .post("/session/{sessionID}/fork", "session.fork")
     .mutating()
     .seeded((ctx) => ctx.session({ title: "Fork source" }))

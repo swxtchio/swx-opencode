@@ -82,6 +82,10 @@ delete process.env["OPENCODE_ENABLE_EXPERIMENTAL_MODELS"]
 delete process.env["OTEL_EXPORTER_OTLP_ENDPOINT"]
 delete process.env["OTEL_EXPORTER_OTLP_HEADERS"]
 delete process.env["OTEL_RESOURCE_ATTRIBUTES"]
+// A config injected by the calling environment (an agent harness, for one)
+// would override the configs these tests write, such as the model they pin.
+delete process.env["OPENCODE_CONFIG"]
+delete process.env["OPENCODE_CONFIG_CONTENT"]
 
 // Use in-memory sqlite
 process.env["OPENCODE_DB"] = ":memory:"
