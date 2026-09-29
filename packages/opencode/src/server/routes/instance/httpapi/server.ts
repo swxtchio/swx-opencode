@@ -35,6 +35,7 @@ import { SessionProcessor } from "@/session/processor"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
+import { SessionQueue } from "@/session/queue"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
@@ -97,6 +98,7 @@ import { providerHandlers } from "./handlers/provider"
 import { ptyConnectHandlers, ptyHandlers } from "./handlers/pty"
 import { questionHandlers } from "./handlers/question"
 import { sessionHandlers } from "./handlers/session"
+import { sessionQueueHandlers } from "./handlers/session-queue"
 import { syncHandlers } from "./handlers/sync"
 import { tuiHandlers } from "./handlers/tui"
 import { handlers } from "@opencode-ai/server/handlers"
@@ -165,6 +167,7 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
     permissionHandlers,
     providerHandlers,
     sessionHandlers,
+    sessionQueueHandlers,
     syncHandlers,
     tuiHandlers,
     workspaceHandlers,
@@ -239,6 +242,7 @@ const app = LayerNode.group([
   RuntimeFlags.node,
   EventV2Bridge.node,
   SessionRunState.node,
+  SessionQueue.node,
   SessionProcessor.node,
   SessionCompaction.node,
   SessionRevert.node,

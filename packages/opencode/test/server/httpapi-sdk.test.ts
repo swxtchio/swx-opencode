@@ -771,6 +771,61 @@ describe("HttpApi SDK", () => {
     ),
   )
 
+  // Prompt queue (swxtchio/swx-opencode#68) through the regenerated V1 client.
+  serverPathParity("drives the prompt queue through the generated SDK", (serverPath) => {
+    const gate = Deferred.makeUnsafe<void>()
+    return withFakeLlm(serverPath, ({ sdk, llm }) =>
+      Effect.gen(function* () {
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        yield* llm.text("queued done")
+        const session = yield* capture(() => sdk.session.create({ title: "sdk queue" }))
+        const sessionID = String(record(session.data).id)
+        const model = { providerID: "test", modelID: "test-model" }
+        yield* expectStatus(
+          () => sdk.session.promptAsync({ sessionID, agent: "build", model, parts: [{ type: "text", text: "start" }] }),
+          204,
+        )
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        yield* expectStatus(
+          () =>
+            sdk.session.promptAsync({
+              sessionID,
+              agent: "build",
+              model,
+              delivery: "queue",
+              parts: [{ type: "text", text: "sdk queued" }],
+            }),
+          204,
+        )
+        const listed = yield* pollWithTimeout(
+          call(() => sdk.session.queue.list({ sessionID })).pipe(
+            Effect.map((result) => (result.data?.length === 1 ? result.data : undefined)),
+          ),
+          "prompt never queued",
+        )
+        const item = listed[0]!
+        expect(item).toMatchObject({ delivery: "queue", input: { parts: [{ type: "text", text: "sdk queued" }] } })
+
+        const withdrawn = yield* capture(() => sdk.session.queue.withdraw({ sessionID, itemID: item.id }))
+        expect(withdrawn).toMatchObject({ status: 200, data: item })
+        const again = yield* capture(() => sdk.session.queue.withdraw({ sessionID, itemID: item.id }))
+        expect(again).toMatchObject({ status: 404, error: { _tag: "QueueItemNotPending", itemID: item.id } })
+        expect(yield* capture(() => sdk.session.queue.restore({ sessionID, id: item.id }))).toMatchObject({
+          status: 200,
+          data: item,
+        })
+        expect(
+          yield* capture(() => sdk.session.queue.update({ sessionID, itemID: item.id, delivery: "steer" })),
+        ).toMatchObject({ status: 200, data: { ...item, delivery: "steer" } })
+
+        yield* Deferred.succeed(gate, void 0)
+        yield* awaitWithTimeout(llm.wait(2), "sent-now prompt never reached the model", "10 seconds")
+        const messages = (yield* llm.inputs)[1]?.messages
+        expect(Array.isArray(messages) ? messages.at(-1) : undefined).toEqual({ role: "user", content: "sdk queued" })
+      }).pipe(Effect.ensuring(Deferred.succeed(gate, void 0))),
+    )
+  })
+
   serverPathParity("matches generated SDK prompt streaming through fake LLM", (serverPath) =>
     withFakeLlm(serverPath, ({ sdk, llm }) =>
       Effect.gen(function* () {

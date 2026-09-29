@@ -18,6 +18,7 @@ import { isOverflow as overflow, usable } from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { SessionQueue } from "./queue"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
@@ -199,6 +200,7 @@ const layer = Layer.effect(
     const provider = yield* Provider.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const queue = yield* SessionQueue.Service
 
     const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
       tokens: SessionV1.Assistant["tokens"]
@@ -556,30 +558,35 @@ const layer = Layer.effect(
       return result
     })
 
-    const create = Effect.fn("SessionCompaction.create")(function* (input: {
-      sessionID: SessionID
-      agent: string
-      model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
-      auto: boolean
-      overflow?: boolean
-    }) {
-      const msg = yield* session.updateMessage({
-        id: MessageID.ascending(),
-        role: "user",
-        model: input.model,
-        sessionID: input.sessionID,
-        agent: input.agent,
-        time: { created: Date.now() },
-      })
-      yield* session.updatePart({
-        id: PartID.ascending(),
-        messageID: msg.id,
-        sessionID: msg.sessionID,
-        type: "compaction",
-        auto: input.auto,
-        overflow: input.overflow,
-      })
-    })
+    const create = Effect.fn("SessionCompaction.create")(
+      function* (input: {
+        sessionID: SessionID
+        agent: string
+        model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+        auto: boolean
+        overflow?: boolean
+      }) {
+        const msg = yield* session.updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          model: input.model,
+          sessionID: input.sessionID,
+          agent: input.agent,
+          time: { created: Date.now() },
+        })
+        yield* session.updatePart({
+          id: PartID.ascending(),
+          messageID: msg.id,
+          sessionID: msg.sessionID,
+          type: "compaction",
+          auto: input.auto,
+          overflow: input.overflow,
+        })
+      },
+      // Steer promotion checks for a pending compaction under this lock, so no
+      // steer lands between the compaction message and its compaction part.
+      (effect, input) => queue.exclusive(input.sessionID, effect),
+    )
 
     return Service.of({
       isOverflow,
@@ -602,6 +609,7 @@ export const node = LayerNode.make({
     Provider.node,
     EventV2Bridge.node,
     RuntimeFlags.node,
+    SessionQueue.node,
   ],
 })
 
