@@ -5,7 +5,7 @@ import { describe, expect } from "bun:test"
 import { ConfigErrorV1 } from "@opencode-ai/core/v1/config/error"
 import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { Cause, Context, Deferred, Effect, Fiber, Layer, Option } from "effect"
-import { isSqlError } from "effect/unstable/sql/SqlError"
+import { classifySqliteError, isSqlError, SqlError } from "effect/unstable/sql/SqlError"
 import { HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
 import { errorLayer } from "../../src/server/routes/instance/httpapi/middleware/error"
 import { NotFoundError } from "../../src/storage/storage"
@@ -99,7 +99,10 @@ describe("HttpApi error middleware", () => {
         const error = yield* Fiber.join(staleWrite)
         expect(error).toBeInstanceOf(EffectDrizzleQueryError)
         if (!(error instanceof EffectDrizzleQueryError)) return
-        expect(error.query).toContain("secret_marker")
+        expect(error.query).toBe("Database is locked (SQLITE_BUSY)")
+        expect(error.params).toEqual([])
+        expect(error.message).toContain("Database is locked (SQLITE_BUSY)")
+        expect(error.message).not.toContain("secret_marker")
         const cause = error.cause
         const failure = Cause.isCause(cause) ? Option.getOrUndefined(Cause.findErrorOption(cause)) : undefined
         expect(isSqlError(failure)).toBe(true)
@@ -125,6 +128,36 @@ describe("HttpApi error middleware", () => {
         expect(serialized).not.toContain("secret_marker")
       }),
     20_000,
+  )
+
+  it.live("maps a direct SQLITE_LOCKED driver error distinctly", () =>
+    Effect.gen(function* () {
+      const cause = Object.assign(new Error("database table is locked while reading secret_marker"), {
+        code: "SQLITE_LOCKED_SHAREDCACHE",
+      })
+      const error = new SqlError({
+        reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
+      })
+      expect(isSqlError(error)).toBe(true)
+      yield* HttpRouter.add("GET", "/sqlite-locked", Effect.die(error)).pipe(
+        Layer.provide(errorLayer),
+        HttpRouter.serve,
+        Layer.build,
+      )
+
+      const response = yield* HttpClientRequest.get("/sqlite-locked").pipe(HttpClient.execute)
+      const body = yield* response.json
+      const serialized = JSON.stringify(body)
+
+      expect(response.status).toBe(500)
+      expect(body).toMatchObject({
+        name: "UnknownError",
+        data: { message: "Database is locked (SQLITE_LOCKED)" },
+      })
+      expect((body as { data?: { ref?: unknown } }).data?.ref).toMatch(/^err_[0-9a-f-]{8}$/)
+      expect(serialized).not.toContain("SHAREDCACHE")
+      expect(serialized).not.toContain("secret_marker")
+    }),
   )
 
   it.live("returns invalid config defects as structured client errors", () =>

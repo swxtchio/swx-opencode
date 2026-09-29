@@ -302,60 +302,87 @@ describe("SQLite busy timeout and statement retries", () => {
     }, 10_000)
   }
 
-  test("exhausts retryable locks and preserves a nonretryable partial write cause", async () => {
-    await using tmp = await tmpdir()
-    const filename = path.join(tmp.path, "busy.sqlite")
-    const exit = await Effect.runPromiseExit(
-      Effect.scoped(
-        Effect.gen(function* () {
-          const context = yield* Layer.build(Database.layerFromPath(filename))
-          const database = Context.get(context, Database.Service).db
-          const client = database.$client
-          yield* client.unsafe(
-            "CREATE TABLE busy_retry_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL CHECK (value <> 'bad'))",
-          ).raw
-          yield* client.unsafe("PRAGMA busy_timeout = 0").raw
-          const holder = yield* Effect.promise(() => startLockHolder(filename))
+  for (const method of ["run", "values"] as const) {
+    test(`exhausts retryable ${method} locks and preserves a nonretryable partial write cause`, async () => {
+      await using tmp = await tmpdir()
+      const filename = path.join(tmp.path, "busy.sqlite")
+      const exit = await Effect.runPromiseExit(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const context = yield* Layer.build(Database.layerFromPath(filename))
+            const database = Context.get(context, Database.Service).db
+            const client = database.$client
+            yield* client.unsafe(
+              "CREATE TABLE busy_retry_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL CHECK (value <> 'bad'))",
+            ).raw
+            yield* client.unsafe("PRAGMA busy_timeout = 0").raw
+            const holder = yield* Effect.promise(() => startLockHolder(filename))
 
-          yield* Effect.gen(function* () {
-            const write = database.run("INSERT INTO busy_retry_test (id, value) VALUES (1, 'writer')").pipe(
-              Effect.timeoutOrElse({
-                duration: "5 seconds",
-                orElse: () => Effect.fail(new Error("retry did not stop")),
-              }),
-            )
-            let failure: unknown
-            yield* write.pipe(Effect.catch((error) => Effect.sync(() => (failure = error))))
-            expect(failure).toBeInstanceOf(EffectDrizzleQueryError)
-            const error = sqliteError(failure)
-            expect(isSqlError(error)).toBe(true)
-            if (!isSqlError(error)) return
-            expect(error.reason._tag).toBe("LockTimeoutError")
-            expect(error.reason.cause).toMatchObject({ code: "SQLITE_BUSY", message: "database is locked" })
-            expect(error.message).toContain("database is locked")
-            expect(error.message).toContain("SQLITE_BUSY")
+            yield* Effect.gen(function* () {
+              let failure: unknown
+              if (method === "run") {
+                yield* database.run("INSERT INTO busy_retry_test (id, value) VALUES (1, 'writer')").pipe(
+                  Effect.timeoutOrElse({
+                    duration: "5 seconds",
+                    orElse: () => Effect.fail(new Error("retry did not stop")),
+                  }),
+                  Effect.catch((error) => Effect.sync(() => (failure = error))),
+                )
+              } else {
+                yield* database
+                  .values("INSERT INTO busy_retry_test (id, value) VALUES (1, 'writer') RETURNING id")
+                  .pipe(
+                    Effect.timeoutOrElse({
+                      duration: "5 seconds",
+                      orElse: () => Effect.fail(new Error("retry did not stop")),
+                    }),
+                    Effect.catch((error) => Effect.sync(() => (failure = error))),
+                  )
+              }
+              expect(failure).toBeInstanceOf(EffectDrizzleQueryError)
+              if (!(failure instanceof EffectDrizzleQueryError)) return
+              expect(failure.query).toBe("Database is locked (SQLITE_BUSY)")
+              expect(failure.params).toEqual([])
+              expect(failure.message).toContain("Database is locked (SQLITE_BUSY)")
+              expect(failure.message).not.toContain("INSERT INTO")
+              const error = sqliteError(failure)
+              expect(isSqlError(error)).toBe(true)
+              if (!isSqlError(error)) return
+              expect(error.reason._tag).toBe("LockTimeoutError")
+              expect(error.reason.cause).toMatchObject({ code: "SQLITE_BUSY", message: "database is locked" })
+              expect(error.message).toContain("database is locked")
+              expect(error.message).toContain("SQLITE_BUSY")
 
-            yield* Effect.promise(() => holder.release())
-            const constraintFailure = yield* Effect.flip(
-              database.run("INSERT OR FAIL INTO busy_retry_test (id, value) VALUES (1, 'good'), (2, 'bad')"),
-            )
-            expect(constraintFailure).toBeInstanceOf(EffectDrizzleQueryError)
-            const constraint = sqliteError(constraintFailure)
-            expect(isSqlError(constraint)).toBe(true)
-            if (!isSqlError(constraint)) return
-            expect(constraint.reason._tag).toBe("ConstraintError")
-            expect(constraint.reason.isRetryable).toBe(false)
-            expect(constraint.reason.cause).toMatchObject({ code: "SQLITE_CONSTRAINT_CHECK" })
-            expect(yield* database.values("SELECT id, value FROM busy_retry_test ORDER BY id")).toEqual([
-              [1, "good"],
-              [100, "holder"],
-            ])
-          }).pipe(Effect.ensuring(Effect.promise(() => holder.release())))
-        }),
-      ),
-    )
-    expect(Exit.isSuccess(exit)).toBe(true)
-  }, 10_000)
+              yield* Effect.promise(() => holder.release())
+              const constraintFailure = yield* Effect.gen(function* () {
+                if (method === "run")
+                  return yield* Effect.flip(
+                    database.run("INSERT OR FAIL INTO busy_retry_test (id, value) VALUES (1, 'good'), (2, 'bad')"),
+                  )
+                return yield* Effect.flip(
+                  database.values(
+                    "INSERT OR FAIL INTO busy_retry_test (id, value) VALUES (1, 'good'), (2, 'bad') RETURNING id",
+                  ),
+                )
+              })
+              expect(constraintFailure).toBeInstanceOf(EffectDrizzleQueryError)
+              const constraint = sqliteError(constraintFailure)
+              expect(isSqlError(constraint)).toBe(true)
+              if (!isSqlError(constraint)) return
+              expect(constraint.reason._tag).toBe("ConstraintError")
+              expect(constraint.reason.isRetryable).toBe(false)
+              expect(constraint.reason.cause).toMatchObject({ code: "SQLITE_CONSTRAINT_CHECK" })
+              expect(yield* database.values("SELECT id, value FROM busy_retry_test ORDER BY id")).toEqual([
+                [1, "good"],
+                [100, "holder"],
+              ])
+            }).pipe(Effect.ensuring(Effect.promise(() => holder.release())))
+          }),
+        ),
+      )
+      expect(Exit.isSuccess(exit)).toBe(true)
+    }, 10_000)
+  }
 
   for (const method of ["run", "values"] as const) {
     test(`does not retry a nonretryable partial-write failure through ${method}`, async () => {

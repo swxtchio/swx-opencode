@@ -1,7 +1,7 @@
 /* oxlint-disable */
 import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
-import type { SqlError } from "effect/unstable/sql/SqlError"
+import { isSqlError, type SqlError } from "effect/unstable/sql/SqlError"
 import type { EffectCacheShape } from "drizzle-orm/cache/core/cache-effect"
 import { NoopCache, strategyFor } from "drizzle-orm/cache/core/cache"
 import type { WithCacheConfig } from "drizzle-orm/cache/core/types"
@@ -279,7 +279,21 @@ export class SQLiteEffectPreparedQuery<
       assertUnreachable(cacheStrat)
     }).pipe(
       Effect.catch((e) => {
-        return Effect.fail(new EffectDrizzleQueryError({ query: queryString, params, cause: Cause.fail(e) }))
+        const lockError = isSqlError(e) && e.reason._tag === "LockTimeoutError" ? e : undefined
+        const lockCause = lockError?.reason.cause
+        const locked =
+          typeof lockCause === "object" &&
+          lockCause !== null &&
+          (("code" in lockCause && typeof lockCause.code === "string" && lockCause.code.startsWith("SQLITE_LOCKED")) ||
+            ("code" in lockCause && typeof lockCause.code === "number" && (lockCause.code & 0xff) === 6) ||
+            ("errcode" in lockCause && typeof lockCause.errcode === "number" && (lockCause.errcode & 0xff) === 6))
+        return Effect.fail(
+          new EffectDrizzleQueryError({
+            query: lockError ? `Database is locked (${locked ? "SQLITE_LOCKED" : "SQLITE_BUSY"})` : queryString,
+            params: lockError ? [] : params,
+            cause: Cause.fail(e),
+          }),
+        )
       }),
     )
   }
