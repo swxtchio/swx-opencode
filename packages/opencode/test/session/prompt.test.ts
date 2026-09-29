@@ -739,10 +739,15 @@ test("holds each filed default marker only with its required framing", () => {
 // The inline capture is re-tokenized by fm_message_level_token/heartbeat_build_typed_message at b6efb8eb;
 // the summary uses heartbeat_build_bounded_long_summary with the tracked complete-solutions duty.
 // The exact-budget file is a typed-builder boundary case; the legacy capture is only for old fallback coverage.
+// The 701-character payload and its summary are paired outputs from the same typed-builder input.
 test("classifies producer-emitted heartbeat fixtures and exact budget boundaries", async () => {
   const heartbeat = await Bun.file(path.join(import.meta.dir, "fixtures", "fleet-heartbeat.txt")).text()
   const summary = await Bun.file(path.join(import.meta.dir, "fixtures", "fleet-heartbeat-summary.txt")).text()
   const boundary = await Bun.file(path.join(import.meta.dir, "fixtures", "fleet-heartbeat-inline-boundary.txt")).text()
+  const overInline = await Bun.file(path.join(import.meta.dir, "fixtures", "fleet-heartbeat-overinline.txt")).text()
+  const overInlineSummary = await Bun.file(
+    path.join(import.meta.dir, "fixtures", "fleet-heartbeat-overinline-summary.txt"),
+  ).text()
   const legacyHeartbeat = await Bun.file(path.join(import.meta.dir, "fixtures", "legacy-heartbeat-20260927.txt")).text()
   const heartbeatToken = "[fm-level:nudge:heartbeat]\x1f "
   const summaryToken = "[fm-level:nudge:heartbeat.duty.complete-solutions]\x1f "
@@ -752,6 +757,8 @@ test("classifies producer-emitted heartbeat fixtures and exact budget boundaries
   expect(heartbeat.startsWith(heartbeatToken)).toBe(true)
   expect(summary.startsWith(`${summaryToken}Heartbeat summary: `)).toBe(true)
   expect(boundary.startsWith(boundaryToken)).toBe(true)
+  expect(overInline.startsWith(`${summaryToken}2026-09-27T`)).toBe(true)
+  expect(overInlineSummary.startsWith(`${summaryToken}Heartbeat summary: `)).toBe(true)
   expect(MachineMessage.classify(heartbeat)).toBe("hold")
   expect(MachineMessage.classify(summary)).toBe("hold")
   expect(MachineMessage.classify(legacyHeartbeat)).toBe("hold")
@@ -759,13 +766,28 @@ test("classifies producer-emitted heartbeat fixtures and exact budget boundaries
 
   const boundaryBody = boundary.slice(boundaryToken.length)
   expect(Array.from(boundaryBody)).toHaveLength(700)
+  const overInlineBody = overInline.slice(summaryToken.length)
+  expect(Array.from(overInlineBody)).toHaveLength(701)
   expect(MachineMessage.classify(boundary, { critical: [heartbeatMarker] })).toBe("critical")
+  expect(MachineMessage.classify(overInlineBody)).toBeUndefined()
+  expect(MachineMessage.classify(overInline, { critical: [heartbeatMarker] })).toBe("hold")
   expect(MachineMessage.classify(summary, { critical: [heartbeatMarker] })).toBe("critical")
+  expect(MachineMessage.classify(overInlineSummary, { critical: [heartbeatMarker] })).toBe("critical")
 
   const boundaryReceipt = boundaryBody.match(receiptPattern)?.[0]
   const summaryReceipt = summary.match(receiptPattern)?.[0]
+  const overInlineReceipt = overInline.match(receiptPattern)?.[0]
+  const overInlineSummaryReceipt = overInlineSummary.match(receiptPattern)?.[0]
   const summaryBoundary = summary.indexOf("… Full message:")
-  if (!boundaryReceipt || !summaryReceipt || summaryBoundary === -1)
+  const overInlineSummaryBoundary = overInlineSummary.indexOf("… Full message:")
+  if (
+    !boundaryReceipt ||
+    !summaryReceipt ||
+    !overInlineReceipt ||
+    overInlineSummaryReceipt !== overInlineReceipt ||
+    summaryBoundary === -1 ||
+    overInlineSummaryBoundary === -1
+  )
     throw new Error("producer heartbeat fixture lost its receipt or summary boundary")
   const shortSummary = `${summary.slice(0, summaryBoundary - 1)}${summary.slice(summaryBoundary)}`
   const oversizedSummary = `${summary.slice(0, summaryBoundary)}x${summary.slice(summaryBoundary)}`
