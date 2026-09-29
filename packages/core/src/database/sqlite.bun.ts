@@ -19,9 +19,7 @@ import { Sqlite } from "./sqlite"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 const retrySchedule = Schedule.exponential("100 millis").pipe(
-  Schedule.modifyDelay((_output, delay) =>
-    Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 1_600))),
-  ),
+  Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 1_600)))),
   Schedule.take(4),
 )
 
@@ -136,8 +134,8 @@ const make = (options: Config) =>
     })
 
     const semaphore = yield* Semaphore.make(1)
-    const acquirer = semaphore.withPermits(1)(Effect.succeed(connection))
-    const transactionAcquirer = Effect.uninterruptibleMask((restore) => {
+    // Keep retries serialized on the native connection, including their backoff interval.
+    const acquirer = Effect.uninterruptibleMask((restore) => {
       const fiber = Fiber.getCurrent()!
       const scope = Context.getUnsafe(fiber.context, Scope.Scope)
       return Effect.as(
@@ -145,6 +143,7 @@ const make = (options: Config) =>
         connection,
       )
     })
+    const transactionAcquirer = acquirer
 
     const client = Object.assign(
       (yield* Client.make({
@@ -160,8 +159,8 @@ const make = (options: Config) =>
       {
         [TypeId]: TypeId,
         config: options,
-        export: Effect.flatMap(acquirer, (_) => _.export),
-        loadExtension: (path: string) => Effect.flatMap(acquirer, (_) => _.loadExtension(path)),
+        export: Effect.scoped(Effect.flatMap(acquirer, (_) => _.export)),
+        loadExtension: (path: string) => Effect.scoped(Effect.flatMap(acquirer, (_) => _.loadExtension(path))),
       },
     )
 
@@ -178,6 +177,7 @@ const nativeLayer = (config: Config) =>
         create: config.create ?? true,
       })
       yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
+      native.run("PRAGMA busy_timeout = 30000;")
       if (config.disableWAL !== true) native.run("PRAGMA journal_mode = WAL;")
       return native
     }),

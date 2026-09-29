@@ -19,22 +19,29 @@ import { Sqlite } from "./sqlite"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 const retrySchedule = Schedule.exponential("100 millis").pipe(
-  Schedule.modifyDelay((_output, delay) =>
-    Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 1_600))),
-  ),
+  Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 1_600)))),
   Schedule.take(4),
 )
 
 const statementError = (cause: unknown) => {
-  const reason = classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" })
+  const errcode =
+    typeof cause === "object" && cause !== null && "errcode" in cause && typeof cause.errcode === "number"
+      ? cause.errcode & 0xff
+      : undefined
+  const reason =
+    errcode === 5 || errcode === 6
+      ? new LockTimeoutError({ cause, message: "Failed to execute statement", operation: "execute" })
+      : classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" })
   if (reason._tag !== "LockTimeoutError") return new SqlError({ reason })
 
   const code =
-    typeof cause === "object" && cause !== null && "code" in cause && typeof cause.code === "string"
-      ? cause.code.startsWith("SQLITE_LOCKED")
-        ? cause.code
+    errcode === 6
+      ? "SQLITE_LOCKED"
+      : typeof cause === "object" && cause !== null && "code" in cause && typeof cause.code === "string"
+        ? cause.code.startsWith("SQLITE_LOCKED")
+          ? cause.code
+          : "SQLITE_BUSY"
         : "SQLITE_BUSY"
-      : "SQLITE_BUSY"
   return new SqlError({
     reason: new LockTimeoutError({
       cause,
@@ -128,8 +135,8 @@ const make = (options: Config) =>
     })
 
     const semaphore = yield* Semaphore.make(1)
-    const acquirer = semaphore.withPermits(1)(Effect.succeed(connection))
-    const transactionAcquirer = Effect.uninterruptibleMask((restore) => {
+    // Keep retries serialized on the native connection, including their backoff interval.
+    const acquirer = Effect.uninterruptibleMask((restore) => {
       const fiber = Fiber.getCurrent()!
       const scope = Context.getUnsafe(fiber.context, Scope.Scope)
       return Effect.as(
@@ -137,6 +144,7 @@ const make = (options: Config) =>
         connection,
       )
     })
+    const transactionAcquirer = acquirer
 
     const client = Object.assign(
       (yield* Client.make({
@@ -152,7 +160,7 @@ const make = (options: Config) =>
       {
         [TypeId]: TypeId,
         config: options,
-        loadExtension: (path: string) => Effect.flatMap(acquirer, (_) => _.loadExtension(path)),
+        loadExtension: (path: string) => Effect.scoped(Effect.flatMap(acquirer, (_) => _.loadExtension(path))),
       },
     )
 

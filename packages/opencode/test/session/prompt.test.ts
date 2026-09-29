@@ -281,6 +281,7 @@ const gates = {
     | { reached: Deferred.Deferred<void>; startedRun: boolean; hold?: Deferred.Deferred<void> },
   // Holds a compaction between its summary and its continue message.
   compactionContinue: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  outcomeFailure: undefined as undefined | { triggered: boolean },
 }
 
 const gatedSession = LayerNode.make({
@@ -364,6 +365,12 @@ const gatedPlugin = LayerNode.make({
       const real = yield* Plugin.Service
       const trigger = ((name, input, output) =>
         Effect.gen(function* () {
+          const failure = gates.outcomeFailure
+          if (name === "experimental.chat.messages.transform" && failure && !failure.triggered) {
+            failure.triggered = true
+            gates.outcomeFailure = undefined
+            return yield* Effect.die(new Error("injected prompt outcome failure"))
+          }
           const gate = name === "experimental.compaction.autocontinue" ? gates.compactionContinue : undefined
           if (gate) {
             gates.compactionContinue = undefined
@@ -766,6 +773,62 @@ processorDies.instance(
       }
     }),
   { config: cfg },
+  20_000,
+)
+
+gated.instance(
+  "outcome block die terminalizes the persisted assistant",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({
+        title: "Outcome block failure",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const fault = { triggered: false }
+      const errors: string[] = []
+      gates.outcomeFailure = fault
+      yield* Effect.addFinalizer(() => Effect.sync(() => (gates.outcomeFailure = undefined)))
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID !== chat.id || !data.error) return Effect.void
+        errors.push(data.error.name)
+        return Effect.void
+      })
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "hello" }],
+      })
+      const exit = yield* Effect.exit(prompt.loop({ sessionID: chat.id }))
+      const messages = yield* sessions.messages({ sessionID: chat.id, limit: 10 })
+      const assistant = messages.findLast((message) => message.info.role === "assistant")
+      const state = yield* status.get(chat.id)
+      yield* off
+
+      expect(fault.triggered).toBe(true)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(state).toMatchObject({ type: "idle" })
+      expect(assistant?.info.role).toBe("assistant")
+      if (assistant?.info.role === "assistant") {
+        expect(assistant.info.time.completed).toBeDefined()
+        const error = assistant.info.error
+        expect(error?.name).toBe("UnknownError")
+        if (error?.name === "UnknownError") {
+          expect(error.data.message).toContain("injected prompt outcome failure")
+          expect(errors).toContain(error.name)
+        }
+      }
+    }),
+  { config: cfg },
+  20_000,
 )
 
 withMcpInstructions.instance(
