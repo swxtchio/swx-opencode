@@ -6,7 +6,6 @@ type Level = "critical" | "request" | "info" | "directive" | "nudge"
 
 type LevelToken = {
   level: Level
-  key?: string
   body: string
 }
 
@@ -82,8 +81,7 @@ export function classify(input: string, config?: MarkerConfig) {
   const token = parseLevelToken(input)
   if (token && DEFAULT_CRITICAL_LEVELS.has(token.level)) return "critical" as const
   if (config?.critical?.some((marker) => matches(marker, input))) return "critical" as const
-  if (token && !isHeartbeatLevel(token)) return "hold" as const
-  if (token && isFleetHeartbeat(input)) return "hold" as const
+  if (token) return "hold" as const
   if ([...DEFAULT_HOLD_MARKERS, ...(config?.hold ?? [])].some((marker) => matches(marker, input)))
     return "hold" as const
 }
@@ -116,7 +114,7 @@ function parseLevelToken(input: string): LevelToken | undefined {
   if (specification.startsWith("nudge:")) {
     const key = specification.slice("nudge:".length)
     if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(key)) return
-    return { level: "nudge", key, body: content }
+    return { level: "nudge", body: content }
   }
   if (["critical", "request", "info", "directive"].includes(specification))
     return { level: specification as Level, body: content }
@@ -166,13 +164,6 @@ function isPeerTaskLabel(name: string) {
   const short = name.slice(0, separator)
   const id = name.slice(separator + "-fm-".length)
   return /^[a-z0-9]+$/.test(short) && short !== "fm" && id.length > 0
-}
-
-function isHeartbeatLevel(token: LevelToken) {
-  return (
-    token.level === "nudge" &&
-    (token.key === "heartbeat" || /^heartbeat\.duty\.[a-z0-9][a-z0-9-]*$/.test(token.key ?? ""))
-  )
 }
 
 function isGeneratedPayload(input: string) {

@@ -712,79 +712,128 @@ const seedUser = Effect.fn("test.seedUser")(function* (input: Omit<SessionPrompt
   return { info, parts: message.parts }
 })
 
-// Wire shapes mirror fm-marker-lib.sh, fm-heartbeat-timer.sh, fm-send.sh, and both primary OpenCode plugins.
-test("classifies current firstmate generator output", () => {
+test("holds each filed default marker only with its required framing", () => {
+  expect(MachineMessage.classify("[fm-from-peer]\x1f peer-name\x1f /peer/home\x1f p1-2-abcd\x1f peer request")).toBe(
+    "hold",
+  )
+  expect(MachineMessage.classify("[fm-from-firstmate]\x1f request from firstmate")).toBe("hold")
+  expect(MachineMessage.classify("\x1f daemon request")).toBe("hold")
+  expect(MachineMessage.classify("WATCHER FIRED [turn-ended]")).toBe("hold")
+  expect(MachineMessage.classify("OBSERVER: follow this direction")).toBe("hold")
+
+  for (const message of [
+    "[fm-from-peer] peer request",
+    "[fm-from-firstmate] request from firstmate",
+    "human text [fm-from-peer]\x1f peer request",
+    "human text [fm-from-firstmate]\x1f request from firstmate",
+    " \x1f daemon request",
+    "human text WATCHER FIRED [turn-ended]",
+    "WATCHER FIRED turn-ended",
+    "observer: follow this direction",
+    "human text OBSERVER: follow this direction",
+  ])
+    expect(MachineMessage.classify(message)).toBeUndefined()
+})
+
+test("classifies captured heartbeat fixtures across live framing and budget boundaries", async () => {
+  const heartbeat = await Bun.file(path.join(import.meta.dir, "fixtures", "fleet-heartbeat.txt")).text()
+  const summary = await Bun.file(path.join(import.meta.dir, "fixtures", "fleet-heartbeat-summary.txt")).text()
   const levelToken = (level: string, key?: string) => `[fm-level:${level}${key ? `:${key}` : ""}]\x1f `
-  const receipt = (id: string) => ` [fm-heartbeat-receipt:${id}]`
-  const heartbeatPrompt =
-    "Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.md."
+  const receiptPattern = / \[fm-heartbeat-receipt:[a-zA-Z0-9._-]+\]$/
+  const receipt = heartbeat.match(receiptPattern)?.[0]
+  if (!receipt) throw new Error("captured heartbeat fixture has no receipt")
+  const body = heartbeat.slice(0, -receipt.length)
   const anchor = " See docs/fleet-operating-process.md."
-  const promptWithoutAnchor = heartbeatPrompt.slice(0, -anchor.length)
-  const timestamp = "2026-09-29T12:30Z"
-  const ram = "System RAM: 53.2/86.1 GiB used (62%) · 33.0 GiB available"
-  const transcript = "Session transcript: unavailable (reason=no-primary-target)"
-  const context = `${timestamp} · ${ram} · ${transcript} · `
-  const heartbeat = `${levelToken("nudge", "heartbeat")}${context}${heartbeatPrompt}${receipt("hb-inline")}`
-  const watcherRequest = `${levelToken("request")}WATCHER FIRED [failure-1] - handle this retained watcher episode and continue normal supervision without running a foreground watcher or status loop.\n\nsignal: waiting: peer reply`
-  const watcherWake = `${levelToken("nudge", "watcher.wake")}WATCHER FIRED [wake-1] - drain queued wakes with bin/fm-wake-drain.sh, handle the reported wake, and continue normal supervision\n\nsignal: check: resume the peer review`
-  const turnendNudge = `${levelToken("nudge", "turnend.blind")}TURN WOULD END BLIND - supervision is off. Resume supervision according to the session-start operating block before ending the turn.\n\nwatcher: arm failed`
+  const anchorIndex = body.lastIndexOf(anchor)
+  if (anchorIndex === -1) throw new Error("captured heartbeat fixture has no producer anchor")
+  const nudgePrefix = `${body.slice(0, anchorIndex)} Periodic nudge: `
+  const suffix = `${anchor}${receipt}`
+  const padding = 700 - Array.from(`${nudgePrefix}${suffix}`).length
+  expect(padding).toBeGreaterThan(0)
+  const exactInline = `${nudgePrefix}${"x".repeat(padding)}${suffix}`
+  const overInline = `${nudgePrefix}${"x".repeat(padding + 1)}${suffix}`
+  expect(Array.from(exactInline)).toHaveLength(700)
+  expect(Array.from(overInline)).toHaveLength(701)
+
+  const summaryBoundary = summary.indexOf("… Full message:")
+  if (summaryBoundary === -1) throw new Error("captured summary fixture has no truncation boundary")
+  const shortSummary = `${summary.slice(0, summaryBoundary - 1)}${summary.slice(summaryBoundary)}`
+  const oversizedSummary = `${summary.slice(0, summaryBoundary)}x${summary.slice(summaryBoundary)}`
+  const arbitrarySummary = `Heartbeat summary: ordinary user text${summary.slice(summaryBoundary)}`
+  const heartbeatMarker = { type: "fleet-heartbeat" } as const
+  const liveHeartbeat = `${levelToken("nudge", "heartbeat")}${heartbeat}`
+  const liveSummary = `${levelToken("nudge", "heartbeat.duty.captured")}${summary}`
+  const liveExactInline = `${levelToken("nudge", "heartbeat.duty.boundary")}${exactInline}`
+  const liveOverInline = `${levelToken("nudge", "heartbeat.duty.boundary")}${overInline}`
+
+  expect(MachineMessage.classify(heartbeat)).toBe("hold")
+  expect(MachineMessage.classify(summary)).toBe("hold")
+  expect(MachineMessage.classify(liveHeartbeat)).toBe("hold")
+  expect(MachineMessage.classify(`${levelToken("nudge", "heartbeat")}${heartbeat.replace(receiptPattern, "")}`)).toBe(
+    "hold",
+  )
+  expect(MachineMessage.classify(liveSummary)).toBe("hold")
+  expect(MachineMessage.classify(exactInline)).toBe("hold")
+  expect(MachineMessage.classify(overInline)).toBeUndefined()
+  expect(MachineMessage.classify(liveExactInline, { critical: [heartbeatMarker] })).toBe("critical")
+  expect(MachineMessage.classify(liveSummary, { critical: [heartbeatMarker] })).toBe("critical")
+  expect(MachineMessage.classify(liveOverInline, { critical: [heartbeatMarker] })).toBe("hold")
+
+  for (const message of [
+    heartbeat.replace(receiptPattern, ""),
+    `${heartbeat} trailing text`,
+    summary.replace(receiptPattern, ""),
+    shortSummary,
+    arbitrarySummary,
+    oversizedSummary,
+    `human note ${heartbeat}`,
+  ])
+    expect(MachineMessage.classify(message)).toBeUndefined()
+  expect(MachineMessage.classify(`${levelToken("nudge", "heartbeat")}not a heartbeat payload`)).toBe("hold")
+})
+
+test("classifies current firstmate level-token producers", () => {
+  const levelToken = (level: string, key?: string) => `[fm-level:${level}${key ? `:${key}` : ""}]\x1f `
   const peerEnvelope = "[fm-from-peer]\x1f peer-name\x1f /peer/home\x1f p1-2-abcd\x1f "
   const peerRequest = `${peerEnvelope}${levelToken("request")}review the branch`
   const peerInfo = `${peerEnvelope}${levelToken("info")}peer status`
   const peerCritical = `${peerEnvelope}${levelToken("critical")}disk alert`
-  const secondmateRequest = `[fm-from-firstmate]\x1f${levelToken("request")}inspect the issue`
-  const secondmateCritical = `[fm-from-firstmate]\x1f${levelToken("critical")}disk alert`
+  const firstmateRequest = `[fm-from-firstmate]\x1f${levelToken("request")}inspect the issue`
+  const firstmateCritical = `[fm-from-firstmate]\x1f${levelToken("critical")}disk alert`
+  const daemonCritical = `\x1f${levelToken("critical")}disk alert`
   const observerDirective = `OBSERVER: ${levelToken("directive")}look up the open issue before editing`
-  const summarySource = `${context}${promptWithoutAnchor} Periodic nudge: ${"Review recent open work from the live queue. ".repeat(8)}${anchor}`
-  const summaryPrefix = Array.from(summarySource).slice(0, 240).join("")
-  const heartbeatSummary =
-    `${levelToken("nudge", "heartbeat.duty.review")}` +
-    `Heartbeat summary: ${summaryPrefix}… Full message: /tmp/heartbeat-payload${receipt("hb-summary")}`
-  const boundaryReceipt = receipt("hb-boundary")
-  const boundaryNudgePrefix = `${context}${promptWithoutAnchor} Periodic nudge: `
-  const boundaryPadding = 700 - Array.from(`${boundaryNudgePrefix}${anchor}${boundaryReceipt}`).length
-  expect(boundaryPadding).toBeGreaterThan(0)
-  const boundaryBody = `${boundaryNudgePrefix}${"x".repeat(boundaryPadding)}${anchor}${boundaryReceipt}`
-  const boundaryHeartbeat = `${levelToken("nudge", "heartbeat.duty.boundary")}${boundaryBody}`
+  const watcherRequest = `${levelToken("request")}WATCHER FIRED [failure-1] - handle the retained watcher episode`
+  const watcherWake = `${levelToken("nudge", "watcher.wake")}WATCHER FIRED [wake-1] - drain queued wakes`
+  const turnendNudge = `${levelToken("nudge", "turnend.blind")}TURN WOULD END BLIND - supervision is off`
   const malformedPeerCritical = `${"[fm-from-peer]\x1f peer-name\x1f /peer/home\x1f not-a-msgid\x1f "}${levelToken("critical")}disk alert`
 
-  expect(Array.from(boundaryBody)).toHaveLength(700)
-  expect(Array.from(boundaryHeartbeat).length).toBeGreaterThan(700)
   for (const message of [
-    heartbeat,
-    heartbeatSummary,
-    boundaryHeartbeat,
+    peerRequest,
+    peerInfo,
+    firstmateRequest,
+    observerDirective,
     watcherRequest,
     watcherWake,
     turnendNudge,
-    peerRequest,
-    peerInfo,
-    secondmateRequest,
-    observerDirective,
   ])
     expect(MachineMessage.classify(message)).toBe("hold")
   expect(MachineMessage.classify(peerCritical)).toBe("critical")
-  expect(MachineMessage.classify(secondmateCritical)).toBe("critical")
+  expect(MachineMessage.classify(firstmateCritical)).toBe("critical")
+  expect(MachineMessage.classify(daemonCritical)).toBe("critical")
 
-  const nearMisses = [
+  for (const message of [
     "[fm-level:unknown]\x1f WATCHER FIRED [unknown]",
     "[fm-level:nudge:BadKey]\x1f WATCHER FIRED [bad key]",
     "[fm-level:request\x1f WATCHER FIRED [unterminated]",
     "human note [fm-level:critical]\x1f disk alert",
-    heartbeat.replace(/ \[fm-heartbeat-receipt:[a-zA-Z0-9._-]+\]$/, ""),
-    `${levelToken("nudge", "heartbeat")}${context}${promptWithoutAnchor} Periodic nudge: missing-anchor`,
-  ]
-  for (const message of nearMisses) expect(MachineMessage.classify(message)).toBeUndefined()
+  ])
+    expect(MachineMessage.classify(message)).toBeUndefined()
   expect(MachineMessage.classify(malformedPeerCritical)).toBe("hold")
 
-  const custom = { type: "prefix", value: "CUSTOM:" } as const
-  expect(MachineMessage.classify("CUSTOM: deployment message", { hold: [custom] })).toBe("hold")
-  expect(MachineMessage.classify(`${peerEnvelope}ordinary peer mail`, { critical: [custom] })).toBe("hold")
-  expect(
-    MachineMessage.classify(`${peerEnvelope}ordinary peer mail`, {
-      critical: [{ type: "prefix", value: "[fm-from-peer]\x1f" }],
-    }),
-  ).toBe("critical")
+  const customHold = { type: "prefix", value: "CUSTOM-HOLD:" } as const
+  const customCritical = { type: "prefix", value: "CUSTOM-CRITICAL:" } as const
+  expect(MachineMessage.classify("CUSTOM-HOLD: deploy update", { hold: [customHold] })).toBe("hold")
+  expect(MachineMessage.classify("CUSTOM-CRITICAL: alert", { critical: [customCritical] })).toBe("critical")
 })
 
 it.instance("imports successive message batches with one persisted session admission order", () =>
@@ -1378,6 +1427,120 @@ it.instance(
           ),
         ),
       )
+    }),
+  60_000,
+)
+
+it.instance(
+  "routes configured machine_message_markers through prompt admission",
+  () =>
+    Effect.gen(function* () {
+      const markers = {
+        hold: [{ type: "prefix" as const, value: "CUSTOM-HOLD:" }],
+        critical: [{ type: "prefix" as const, value: "CUSTOM-CRITICAL:" }],
+      }
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), machine_message_markers: markers }))
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Configured machine markers",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const toolGate = yield* Deferred.make<void>()
+      const stopGate = yield* Deferred.make<void>()
+      const heldGate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() =>
+        Effect.all(
+          [toolGate, stopGate, heldGate].map((gate) => Deferred.succeed(gate, void 0).pipe(Effect.ignore)),
+          { discard: true },
+        ),
+      )
+
+      yield* llm.push(
+        reply().wait(deferredAsPromise(toolGate)).tool("first", { value: "continue" }).item(),
+        reply().wait(deferredAsPromise(stopGate)).text("configured critical handled").stop().item(),
+        reply().wait(deferredAsPromise(heldGate)).text("configured held handled").stop().item(),
+      )
+      const task = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "original task" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "provider did not receive the configured-marker task", "10 seconds")
+
+      const heldID = MessageID.ascending()
+      const heldText = "CUSTOM-HOLD: wait until the task reaches its boundary"
+      const held = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          messageID: heldID,
+          agent: "build",
+          model: ref,
+          delivery: "steer",
+          parts: [{ type: "text", text: heldText }],
+        })
+        .pipe(Effect.forkChild)
+      const queued = yield* pollWithTimeout(
+        queue.list(session.id).pipe(Effect.map((items) => items.find((item) => item.input.messageID === heldID))),
+        "configured hold marker did not queue the prompt",
+        "10 seconds",
+      )
+      expect(queued.delivery).toBe("queue")
+
+      const criticalID = MessageID.ascending()
+      const criticalText = "CUSTOM-CRITICAL: interrupt at the next eligible step"
+      const critical = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          messageID: criticalID,
+          agent: "build",
+          model: ref,
+          delivery: "queue",
+          parts: [{ type: "text", text: criticalText }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: session.id })
+          .pipe(
+            Effect.map((messages) =>
+              messages.some((message) => message.info.role === "user" && message.info.id === criticalID)
+                ? true
+                : undefined,
+            ),
+          ),
+        "configured critical marker did not promote the prompt",
+        "10 seconds",
+      )
+      expect((yield* queue.list(session.id)).map((item) => item.input.messageID)).toEqual([heldID])
+
+      yield* Deferred.succeed(toolGate, void 0)
+      yield* awaitWithTimeout(llm.wait(2), "configured critical prompt did not reach the next step", "10 seconds")
+      const criticalTurn = (yield* llm.inputs)[1]
+      if (!criticalTurn) throw new Error("expected the configured critical provider request")
+      expect(JSON.stringify(criticalTurn.messages)).toContain(criticalText)
+      expect(JSON.stringify(criticalTurn.messages)).not.toContain(heldText)
+
+      yield* Deferred.succeed(stopGate, void 0)
+      yield* awaitWithTimeout(llm.wait(3), "configured hold prompt did not reach its own turn", "10 seconds")
+      const heldTurn = (yield* llm.inputs)[2]
+      if (!heldTurn) throw new Error("expected the configured held provider request")
+      expect(JSON.stringify(heldTurn.messages)).toContain(heldText)
+
+      yield* Deferred.succeed(heldGate, void 0)
+      expect(Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(task), "task did not finish", "10 seconds"))).toBe(true)
+      expect(
+        Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(critical), "critical prompt did not finish", "10 seconds")),
+      ).toBe(true)
+      expect(
+        Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(held), "held prompt did not finish", "10 seconds")),
+      ).toBe(true)
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(yield* llm.calls).toBe(3)
     }),
   60_000,
 )
