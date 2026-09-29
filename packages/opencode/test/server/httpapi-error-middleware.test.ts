@@ -1,12 +1,16 @@
 import { NodeHttpServer, NodeServices } from "@effect/platform-node"
+import { Database } from "@opencode-ai/core/database/database"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { describe, expect } from "bun:test"
 import { ConfigErrorV1 } from "@opencode-ai/core/v1/config/error"
-import { Effect, Layer } from "effect"
-import { LockTimeoutError, SqlError } from "effect/unstable/sql/SqlError"
+import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
+import { Cause, Context, Deferred, Effect, Fiber, Layer, Option } from "effect"
+import { isSqlError } from "effect/unstable/sql/SqlError"
 import { HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
 import { errorLayer } from "../../src/server/routes/instance/httpapi/middleware/error"
 import { NotFoundError } from "../../src/storage/storage"
+import path from "path"
+import { tmpdir } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(Layer.mergeAll(NodeHttpServer.layerTest, NodeServices.layer))
@@ -54,32 +58,73 @@ describe("HttpApi error middleware", () => {
     }),
   )
 
-  it.live("identifies SQLite lock defects without exposing native details", () =>
-    Effect.gen(function* () {
-      const cause = Object.assign(new Error("database is locked while preparing SELECT secret_marker"), {
-        code: "SQLITE_BUSY",
-      })
-      const error = new SqlError({
-        reason: new LockTimeoutError({ cause, message: "Failed to execute statement", operation: "execute" }),
-      })
-      yield* HttpRouter.add("GET", "/sqlite-lock", Effect.die(error)).pipe(
-        Layer.provide(errorLayer),
-        HttpRouter.serve,
-        Layer.build,
-      )
+  it.live(
+    "identifies SQLite lock defects without exposing native details",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* Effect.promise(() => tmpdir())
+        yield* Effect.addFinalizer(() => Effect.promise(() => tmp[Symbol.asyncDispose]()))
+        const filename = path.join(tmp.path, "http-lock.sqlite")
+        const writerContext = yield* Layer.build(Database.layerFromPath(filename))
+        const writer = Context.get(writerContext, Database.Service).db
+        yield* writer.run("CREATE TABLE http_lock_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+        const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
+        const holder = new sqlite.Database(filename)
+        yield* Effect.addFinalizer(() => Effect.sync(() => holder.close()))
+        holder.run("PRAGMA journal_mode = WAL")
+        const readStarted = yield* Deferred.make<void>()
+        const continueWrite = yield* Deferred.make<void>()
 
-      const response = yield* HttpClientRequest.get("/sqlite-lock").pipe(HttpClient.execute)
-      const body = yield* response.json
-      const serialized = JSON.stringify(body)
+        const staleWrite = yield* writer.$client
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* writer.$client.unsafe("SELECT COUNT(*) FROM http_lock_test").values
+              yield* Deferred.succeed(readStarted, undefined)
+              yield* Deferred.await(continueWrite)
+              return yield* Effect.flip(
+                writer.run("INSERT INTO http_lock_test (id, value) VALUES (1, 'secret_marker')").pipe(
+                  Effect.timeoutOrElse({
+                    duration: "5 seconds",
+                    orElse: () => Effect.fail(new Error("Drizzle snapshot write did not stop")),
+                  }),
+                ),
+              )
+            }),
+          )
+          .pipe(Effect.forkChild({ startImmediately: true }))
 
-      expect(response.status).toBe(500)
-      expect(body).toMatchObject({
-        name: "UnknownError",
-        data: { message: "Database is locked (SQLITE_BUSY)" },
-      })
-      expect((body as { data?: { ref?: unknown } }).data?.ref).toMatch(/^err_[0-9a-f-]{8}$/)
-      expect(serialized).not.toContain("secret_marker")
-    }),
+        yield* Deferred.await(readStarted)
+        holder.run("INSERT INTO http_lock_test (id, value) VALUES (100, 'holder write')")
+        yield* Deferred.succeed(continueWrite, undefined)
+        const error = yield* Fiber.join(staleWrite)
+        expect(error).toBeInstanceOf(EffectDrizzleQueryError)
+        if (!(error instanceof EffectDrizzleQueryError)) return
+        expect(error.query).toContain("secret_marker")
+        const cause = error.cause
+        const failure = Cause.isCause(cause) ? Option.getOrUndefined(Cause.findErrorOption(cause)) : undefined
+        expect(isSqlError(failure)).toBe(true)
+        if (!isSqlError(failure)) return
+        expect(failure.reason.cause).toMatchObject({ code: "SQLITE_BUSY_SNAPSHOT" })
+
+        yield* HttpRouter.add("GET", "/sqlite-lock", Effect.die(error)).pipe(
+          Layer.provide(errorLayer),
+          HttpRouter.serve,
+          Layer.build,
+        )
+
+        const response = yield* HttpClientRequest.get("/sqlite-lock").pipe(HttpClient.execute)
+        const body = yield* response.json
+        const serialized = JSON.stringify(body)
+
+        expect(response.status).toBe(500)
+        expect(body).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Database is locked (SQLITE_BUSY)" },
+        })
+        expect((body as { data?: { ref?: unknown } }).data?.ref).toMatch(/^err_[0-9a-f-]{8}$/)
+        expect(serialized).not.toContain("secret_marker")
+      }),
+    20_000,
   )
 
   it.live("returns invalid config defects as structured client errors", () =>
