@@ -1315,6 +1315,80 @@ it.instance(
 )
 
 it.instance(
+  "holds a TUI-marked message after synthetic editor context",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Pinned" })
+      const taskGate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(taskGate, void 0).pipe(Effect.ignore))
+      yield* llm.push(
+        reply().wait(deferredAsPromise(taskGate)).text("task finished").stop().item(),
+        reply().text("TUI machine message handled").stop().item(),
+      )
+
+      const task = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "original task" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "provider did not receive the active task", "10 seconds")
+      const markedID = MessageID.ascending()
+      const markedText = "[fm-from-firstmate]\x1f TUI marked message"
+      const marked = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          messageID: markedID,
+          agent: "build",
+          model: ref,
+          parts: [
+            { type: "text", text: "Selected editor context from TUI", synthetic: true },
+            { type: "text", text: markedText },
+          ],
+        })
+        .pipe(Effect.forkChild)
+      const pending = yield* pollWithTimeout(
+        queue.list(session.id).pipe(Effect.map((items) => items.find((item) => item.input.messageID === markedID))),
+        "TUI marked text after synthetic editor context was not held",
+        "10 seconds",
+      )
+      expect(pending.delivery).toBe("queue")
+
+      const active = (yield* llm.inputs)[0]
+      if (!active) throw new Error("expected the active task request")
+      expect(JSON.stringify(active.messages)).not.toContain("TUI marked message")
+
+      yield* Deferred.succeed(taskGate, void 0)
+      yield* awaitWithTimeout(llm.wait(2), "TUI held message did not reach its own turn", "10 seconds")
+      const next = (yield* llm.inputs)[1]
+      if (!next) throw new Error("expected the TUI message provider request")
+      expect(lastUserContent(next)).toContain("TUI marked message")
+
+      const taskExit = yield* awaitWithTimeout(Fiber.await(task), "task did not finish", "10 seconds")
+      const markedExit = yield* awaitWithTimeout(Fiber.await(marked), "TUI prompt did not receive its reply", "10 seconds")
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const markedUser = messages.find(
+        (message) => message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === markedText),
+      )
+      if (!markedUser) throw new Error("expected the promoted TUI user message")
+      expect(Exit.isSuccess(taskExit)).toBe(true)
+      expect(Exit.isSuccess(markedExit)).toBe(true)
+      expect(
+        messages.some((message) => message.info.role === "assistant" && message.info.parentID === markedUser.info.id),
+      ).toBe(true)
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(yield* llm.calls).toBe(2)
+    }),
+  60_000,
+)
+
+it.instance(
   "steers live critical-level prompts during a continuation while holding ordinary machine mail",
   () =>
     Effect.gen(function* () {

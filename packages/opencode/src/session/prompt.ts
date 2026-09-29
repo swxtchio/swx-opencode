@@ -1094,8 +1094,12 @@ const layer = Layer.effect(
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
+      // TUI prepends synthetic editor context; only flattened user text owns marker framing.
+      const classificationText = input.parts
+        .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
+        .join("")
       const classification = MachineMessage.classify(
-        input.parts.find((part) => part.type === "text")?.text ?? "",
+        classificationText,
         (yield* config.get()).machine_message_markers,
       )
       const delivery = classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
