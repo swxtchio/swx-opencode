@@ -36,8 +36,9 @@ import {
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError } from "../errors"
+import { PermissionNotFoundError, PromptWithdrawnError } from "../errors"
 import * as SessionError from "./session-errors"
+import { SessionQueue } from "@/session/queue"
 
 const tryParseJson = (text: string) =>
   Effect.try({
@@ -302,11 +303,21 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           ...ctx.payload,
           sessionID: ctx.params.sessionID,
         })
-        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+        .pipe(Effect.mapError(promptError))
       return HttpServerResponse.stream(Stream.make(JSON.stringify(message)).pipe(Stream.encodeText), {
         contentType: "application/json",
       })
     })
+
+    // A withdrawn prompt is its own answer, so a client can tell it from a bad request.
+    const promptError = (error: unknown) =>
+      error instanceof SessionQueue.WithdrawnError
+        ? new PromptWithdrawnError({
+            sessionID: error.sessionID,
+            itemID: error.itemID,
+            message: `The prompt was withdrawn from the queue before delivery: ${error.itemID}`,
+          })
+        : new HttpApiError.BadRequest({})
 
     const promptAsync = Effect.fn("SessionHttpApi.promptAsync")(function* (ctx: {
       params: { sessionID: SessionID }
@@ -314,6 +325,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     }) {
       yield* requireSession(ctx.params.sessionID)
       yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
+        // A withdrawn prompt ended as its editor asked; it is not a session error.
+        Effect.catchTag("SessionQueueWithdrawnError", (error) =>
+          Effect.logInfo("prompt_async withdrawn before delivery", {
+            sessionID: ctx.params.sessionID,
+            itemID: error.itemID,
+          }),
+        ),
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
             yield* Effect.logError("prompt_async failed", { sessionID: ctx.params.sessionID, cause })
@@ -335,7 +353,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       yield* requireSession(ctx.params.sessionID)
       return yield* promptSvc
         .command({ ...ctx.payload, sessionID: ctx.params.sessionID })
-        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+        .pipe(Effect.mapError(promptError))
     })
 
     const shell = Effect.fn("SessionHttpApi.shell")(function* (ctx: {

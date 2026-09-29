@@ -6,7 +6,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -27,6 +27,7 @@ import { Question } from "../../src/question"
 import { Todo } from "../../src/session/todo"
 import { Session } from "@/session/session"
 import { SessionMessageTable } from "@opencode-ai/core/session/sql"
+import { SessionPromptQueueSequenceTable, SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -37,6 +38,7 @@ import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
+import { SessionQueue } from "../../src/session/queue"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -109,6 +111,14 @@ function errorTool(parts: SessionV1.Part[]) {
   return part?.state.status === "error" ? (part as ErrorToolPart) : undefined
 }
 
+// MCP resource reads for the queue promotion tests: HELD_RESOURCE returns text,
+// after waiting on `heldResource` when a test arms it; any other URI is missing,
+// which makes createUserMessage fail.
+const HELD_RESOURCE = "held://resource"
+const heldResource = {
+  gate: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+}
+
 function makeMcp(instructions: MCP.ServerInstructions[] = []) {
   return Layer.succeed(
     MCP.Service,
@@ -124,7 +134,18 @@ function makeMcp(instructions: MCP.ServerInstructions[] = []) {
       connect: () => Effect.void,
       disconnect: () => Effect.void,
       getPrompt: () => Effect.succeed(undefined),
-      readResource: () => Effect.succeed(undefined),
+      readResource: (_clientName: string, uri: string) =>
+        uri !== HELD_RESOURCE
+          ? Effect.succeed(undefined)
+          : Effect.gen(function* () {
+              const gate = heldResource.gate
+              heldResource.gate = undefined
+              if (gate) {
+                yield* Deferred.succeed(gate.entered, undefined)
+                yield* Deferred.await(gate.release)
+              }
+              return { contents: [{ uri, text: "held resource text" }] }
+            }),
       startAuth: () => Effect.die("unexpected MCP auth in prompt-effect tests"),
       authenticate: () => Effect.die("unexpected MCP auth in prompt-effect tests"),
       finishAuth: () => Effect.die("unexpected MCP auth in prompt-effect tests"),
@@ -188,6 +209,7 @@ const promptRoot = LayerNode.group([
   BackgroundJob.node,
   SessionStatus.node,
   SessionRunState.node,
+  SessionQueue.node,
   Database.node,
   EventV2Bridge.node,
   Question.node,
@@ -239,7 +261,135 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
   return makePrompt(input)
 }
 
+// Production-boundary gates for the V1 lost-wakeup regression. `finishingRead`
+// holds the next Session.findMessage call, which is the finishing run's
+// lastAssistant read; `nextEnsureRunning` resolves once the next caller of
+// SessionRunState.ensureRunning has joined or started a run, and records which.
+// With `hold`, that caller also waits after its run ends, as a slow one would.
+const gates = {
+  finishingRead: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  nextEnsureRunning: undefined as
+    | undefined
+    | { reached: Deferred.Deferred<void>; startedRun: boolean; hold?: Deferred.Deferred<void> },
+  // Holds a compaction between its summary and its continue message.
+  compactionContinue: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+}
+
+const gatedSession = LayerNode.make({
+  service: Session.Service,
+  layer: Layer.effect(
+    Session.Service,
+    Effect.gen(function* () {
+      const real = yield* Session.Service
+      return Session.Service.of({
+        ...real,
+        findMessage: (sessionID, predicate) =>
+          Effect.gen(function* () {
+            const gate = gates.finishingRead
+            gates.finishingRead = undefined
+            if (gate) {
+              yield* Deferred.succeed(gate.entered, undefined)
+              yield* Deferred.await(gate.release)
+            }
+            return yield* real.findMessage(sessionID, predicate)
+          }),
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      Session.node.implementation as Layer.Layer<
+        Session.Service,
+        never,
+        BackgroundJob.Service | RuntimeFlags.Service | Database.Service | EventV2Bridge.Service
+      >,
+    ),
+  ),
+  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
+})
+
+const gatedRunState = LayerNode.make({
+  service: SessionRunState.Service,
+  layer: Layer.effect(
+    SessionRunState.Service,
+    Effect.gen(function* () {
+      const real = yield* SessionRunState.Service
+      return SessionRunState.Service.of({
+        ...real,
+        ensureRunning: (sessionID, onInterrupt, work) =>
+          Effect.gen(function* () {
+            const marked = gates.nextEnsureRunning
+            gates.nextEnsureRunning = undefined
+            if (!marked) return yield* real.ensureRunning(sessionID, onInterrupt, work)
+            // Deferred resumption evaluates the waiting fiber synchronously, so
+            // join (or start) the run first and only then tell the test.
+            const call = yield* real
+              .ensureRunning(
+                sessionID,
+                onInterrupt,
+                Effect.sync(() => void (marked.startedRun = true)).pipe(Effect.andThen(work)),
+              )
+              .pipe(Effect.forkChild({ startImmediately: true }))
+            yield* Deferred.succeed(marked.reached, undefined)
+            const result = yield* Fiber.join(call)
+            if (marked.hold) yield* Deferred.await(marked.hold)
+            return result
+          }),
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      SessionRunState.node.implementation as Layer.Layer<
+        SessionRunState.Service,
+        never,
+        BackgroundJob.Service | SessionStatus.Service
+      >,
+    ),
+  ),
+  deps: [BackgroundJob.node, SessionStatus.node],
+})
+
+const gatedPlugin = LayerNode.make({
+  service: Plugin.Service,
+  layer: Layer.effect(
+    Plugin.Service,
+    Effect.gen(function* () {
+      const real = yield* Plugin.Service
+      const trigger = ((name, input, output) =>
+        Effect.gen(function* () {
+          const gate = name === "experimental.compaction.autocontinue" ? gates.compactionContinue : undefined
+          if (gate) {
+            gates.compactionContinue = undefined
+            yield* Deferred.succeed(gate.entered, undefined)
+            yield* Deferred.await(gate.release)
+          }
+          return yield* real.trigger(name, input, output)
+        })) as typeof real.trigger
+      return Plugin.Service.of({ ...real, trigger })
+    }),
+  ).pipe(
+    Layer.provide(
+      Plugin.node.implementation as Layer.Layer<
+        Plugin.Service,
+        never,
+        EventV2Bridge.Service | Config.Service | RuntimeFlags.Service
+      >,
+    ),
+  ),
+  deps: [EventV2Bridge.node, Config.node, RuntimeFlags.node],
+})
+
 const it = testEffect(makeHttp())
+const gated = testEffect(
+  LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, runtimeFlags],
+    [Session.node, gatedSession],
+    [SessionRunState.node, gatedRunState],
+    [Plugin.node, gatedPlugin],
+  ]),
+)
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const withMcpInstructions = testEffect(
@@ -1547,6 +1697,1185 @@ it.instance("prompt submitted during an active run is included in the next LLM i
     if (!Array.isArray(messages)) throw new Error("expected LLM messages")
     expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
   }),
+)
+
+gated.instance(
+  "prompt admitted after the finishing run's last history read is still answered",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const gate = yield* Deferred.make<void>()
+      const finishingRead = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      const joined = { reached: yield* Deferred.make<void>(), startedRun: false }
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          gates.finishingRead = undefined
+          gates.nextEnsureRunning = undefined
+        }),
+      )
+
+      yield* llm.hold("first", deferredAsPromise(gate))
+      yield* llm.text("second")
+
+      const a = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: [{ type: "text", text: "first" }] })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+
+      // The first run's last history read happens after this release; its
+      // following lastAssistant read is held open by the gated Session layer.
+      gates.finishingRead = finishingRead
+      yield* Deferred.succeed(gate, void 0)
+      yield* awaitWithTimeout(Deferred.await(finishingRead.entered), "finishing lastAssistant read never started")
+
+      gates.nextEnsureRunning = joined
+      const b = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: [{ type: "text", text: "second" }] })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(joined.reached), "second prompt never reached ensureRunning")
+      yield* Deferred.succeed(finishingRead.release, void 0)
+
+      const [ea, eb] = yield* awaitWithTimeout(
+        Effect.all([Fiber.await(a), Fiber.await(b)]),
+        "prompts never finished",
+        "10 seconds",
+      )
+      expect(Exit.isSuccess(ea)).toBe(true)
+      expect(Exit.isSuccess(eb)).toBe(true)
+      // The second prompt must have joined the finishing run; a run of its own
+      // would mean this setup never exercised the finishing window.
+      expect(joined.startedRun).toBe(false)
+      yield* awaitWithTimeout(llm.wait(2), "second prompt was never answered")
+      const messages = (yield* llm.inputs).at(1)?.messages
+      if (!Array.isArray(messages)) throw new Error("expected LLM messages")
+      expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
+      // A synchronous caller gets the reply to its own prompt, not the run it joined.
+      const asked = (yield* sessions.messages({ sessionID: chat.id })).find((msg) =>
+        msg.parts.some((part) => part.type === "text" && part.text === "second"),
+      )
+      const answer = Exit.isSuccess(eb) ? eb.value : undefined
+      expect(answer?.info.role === "assistant" ? answer.info.parentID : undefined).toBe(asked?.info.id)
+      expect(answer?.parts.some((part) => part.type === "text" && part.text === "second")).toBe(true)
+    }),
+  10_000,
+)
+
+// Prompt queue (swxtchio/swx-opencode#68). Expected model inputs come from the
+// prompts each test sends, never from the queue under test.
+
+const said = (value: string) => [{ type: "text" as const, text: value }]
+
+const modelMessages = (input: Record<string, unknown> | undefined) => {
+  const messages = input?.messages
+  if (!Array.isArray(messages)) throw new Error("expected LLM messages")
+  return messages
+}
+
+const lastUser = (input: Record<string, unknown> | undefined) => modelMessages(input).at(-1)
+
+const mentions = (input: Record<string, unknown> | undefined, value: string) =>
+  JSON.stringify(modelMessages(input)).includes(value)
+
+const queued = (sessionID: SessionID, count: number) =>
+  pollWithTimeout(
+    Effect.gen(function* () {
+      const queue = yield* SessionQueue.Service
+      const items = yield* queue.list(sessionID)
+      return items.length === count ? items : undefined
+    }),
+    `queue never held ${count} item(s)`,
+  )
+
+// Waits until a prompt was admitted, whether it is still queued or already in
+// the message history, so a regression shows up in the model inputs instead.
+const admitted = (sessionID: SessionID, text: string) =>
+  pollWithTimeout(
+    Effect.gen(function* () {
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      if (
+        (yield* queue.list(sessionID)).some((item) =>
+          item.input.parts.some((part) => part.type === "text" && part.text === text),
+        )
+      )
+        return true
+      const msgs = yield* sessions.messages({ sessionID })
+      return msgs.some((msg) => msg.parts.some((part) => part.type === "text" && part.text === text)) ? true : undefined
+    }),
+    `prompt "${text}" was never admitted`,
+  )
+
+// Joins the prompts of one test, failing on its own if a drain never ends.
+const finish = <A, E>(...fibers: Fiber.Fiber<A, E>[]) =>
+  awaitWithTimeout(Effect.all(fibers.map((fiber) => Fiber.join(fiber))), "prompts never finished", "10 seconds")
+
+const startHeld = Effect.fn("test.startHeld")(function* (input?: {
+  tool?: boolean
+  config?: (url: string) => Partial<ConfigV1.Info>
+}) {
+  const { llm } = yield* useServerConfig(input?.config ?? providerCfg)
+  const prompt = yield* SessionPrompt.Service
+  const sessions = yield* Session.Service
+  const queue = yield* SessionQueue.Service
+  const chat = yield* sessions.create({
+    title: "Pinned",
+    permission: [{ permission: "*", pattern: "*", action: "allow" }],
+  })
+  const gate = yield* Deferred.make<void>()
+  yield* input?.tool
+    ? llm.push(reply().wait(deferredAsPromise(gate)).tool("first", { value: "first" }))
+    : llm.hold("task done", deferredAsPromise(gate))
+  const task = yield* prompt
+    .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("start the task") })
+    .pipe(Effect.forkChild)
+  yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+  const send = (text: string, extra?: Partial<SessionPrompt.PromptInput>) =>
+    prompt
+      .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said(text), ...extra })
+      .pipe(Effect.forkChild)
+  const release = Deferred.succeed(gate, void 0)
+  return { llm, prompt, sessions, queue, chat, task, send, release }
+})
+
+it.instance(
+  "queued prompt waits for the task to finish and runs as its own turn",
+  () =>
+    Effect.gen(function* () {
+      const { llm, queue, chat, task, send, release } = yield* startHeld({ tool: true })
+      yield* llm.text("task done")
+      yield* llm.text("queued done")
+
+      const held = yield* send("after the task", { delivery: "queue" })
+      yield* admitted(chat.id, "after the task")
+      yield* release
+      yield* finish(task, held)
+
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(3)
+      expect(mentions(inputs[1], "after the task")).toBe(false)
+      expect(lastUser(inputs[2])).toEqual({ role: "user", content: "after the task" })
+      expect(yield* queue.list(chat.id)).toEqual([])
+    }),
+  15_000,
+)
+
+it.instance(
+  "three queued prompts run as three more turns in admission order while the session stays busy",
+  () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const { llm, chat, task, send, release } = yield* startHeld()
+      yield* llm.text("one done")
+      yield* llm.text("two done")
+      yield* llm.text("three done")
+      const idleAt: number[] = []
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === SessionStatus.Event.Idle.type && (event.data as { sessionID: string }).sessionID === chat.id
+          ? llm.calls.pipe(Effect.map((calls) => void idleAt.push(calls)))
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const first = yield* send("queued one", { delivery: "queue" })
+      yield* queued(chat.id, 1)
+      const second = yield* send("queued two", { delivery: "queue" })
+      yield* queued(chat.id, 2)
+      const third = yield* send("queued three", { delivery: "queue" })
+      yield* queued(chat.id, 3)
+      yield* release
+      yield* finish(task, first, second, third)
+
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(4)
+      expect(inputs.slice(1).map(lastUser)).toEqual([
+        { role: "user", content: "queued one" },
+        { role: "user", content: "queued two" },
+        { role: "user", content: "queued three" },
+      ])
+      // One drain: busy through every queued turn, idle once after the last.
+      expect(idleAt).toEqual([4])
+    }),
+  15_000,
+)
+
+it.instance(
+  "a later steer reaches the next step before an earlier queued prompt",
+  () =>
+    Effect.gen(function* () {
+      const { llm, chat, task, send, release } = yield* startHeld()
+      yield* llm.text("steer done")
+      yield* llm.text("queued done")
+
+      const held = yield* send("queued earlier", { delivery: "queue" })
+      yield* admitted(chat.id, "queued earlier")
+      const steer = yield* send("steer later")
+      yield* admitted(chat.id, "steer later")
+      yield* release
+      yield* finish(task, held, steer)
+
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(3)
+      expect(lastUser(inputs[1])).toEqual({ role: "user", content: "steer later" })
+      expect(mentions(inputs[1], "queued earlier")).toBe(false)
+      expect(lastUser(inputs[2])).toEqual({ role: "user", content: "queued earlier" })
+    }),
+  15_000,
+)
+
+it.instance(
+  "a queued prompt's turn starts with a fresh step allowance",
+  () =>
+    Effect.gen(function* () {
+      const { llm, chat, task, send, release } = yield* startHeld({
+        config: (url) => ({ ...providerCfg(url), agent: { build: { steps: 2 } } }),
+      })
+      yield* llm.text("queued done")
+
+      const held = yield* send("queued after a step", { delivery: "queue" })
+      yield* admitted(chat.id, "queued after a step")
+      yield* release
+      yield* finish(task, held)
+
+      const inputs = yield* llm.inputs
+      expect(lastUser(inputs[1])).toEqual({ role: "user", content: "queued after a step" })
+      // The task used one of its two steps; the queued turn must not start on the last one.
+      expect(mentions(inputs[1], "MAXIMUM STEPS REACHED")).toBe(false)
+    }),
+  15_000,
+)
+
+it.instance(
+  "a withdrawn prompt never reaches the model and a delivered one can no longer be withdrawn",
+  () =>
+    Effect.gen(function* () {
+      const { llm, queue, chat, task, send, release } = yield* startHeld()
+      yield* llm.text("kept done")
+
+      const withdrawn = yield* send("withdrawn prompt", { delivery: "queue" })
+      const [admitted] = yield* queued(chat.id, 1)
+      const kept = yield* send("kept prompt", { delivery: "queue" })
+      const [, keptItem] = yield* queued(chat.id, 2)
+
+      expect(Option.getOrUndefined(yield* queue.withdraw(chat.id, admitted!.id))).toEqual(admitted)
+      expect(Option.isNone(yield* queue.withdraw(chat.id, admitted!.id))).toBe(true)
+      yield* release
+      yield* finish(task, kept)
+      // Its own caller learns the prompt was withdrawn rather than getting someone else's reply.
+      const gone = yield* awaitWithTimeout(Fiber.await(withdrawn), "withdrawn prompt never returned")
+      expect(Exit.isFailure(gone) ? Cause.squash(gone.cause) : undefined).toBeInstanceOf(SessionQueue.WithdrawnError)
+
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(2)
+      expect(inputs.some((input) => mentions(input, "withdrawn prompt"))).toBe(false)
+      expect(lastUser(inputs[1])).toEqual({ role: "user", content: "kept prompt" })
+      expect(Option.isNone(yield* queue.withdraw(chat.id, keptItem!.id))).toBe(true)
+    }),
+  15_000,
+)
+
+it.instance(
+  "a restored prompt keeps its identity and admission order",
+  () =>
+    Effect.gen(function* () {
+      const { llm, queue, chat, task, send, release } = yield* startHeld()
+      yield* llm.text("first done")
+      yield* llm.text("second done")
+
+      const first = yield* send("restored first", { delivery: "queue" })
+      const [admitted] = yield* queued(chat.id, 1)
+      const second = yield* send("queued second", { delivery: "queue" })
+      yield* queued(chat.id, 2)
+      yield* queue.withdraw(chat.id, admitted!.id)
+      yield* queued(chat.id, 1)
+
+      expect(Option.getOrUndefined(yield* queue.restore(chat.id, admitted!.id))).toEqual(admitted)
+      expect((yield* queue.list(chat.id)).map((item) => [item.id, item.seq])).toEqual([
+        [admitted!.id, admitted!.seq],
+        [expect.any(String), admitted!.seq + 1],
+      ])
+      yield* release
+      yield* finish(task, first, second)
+
+      const inputs = yield* llm.inputs
+      expect(inputs.slice(1).map(lastUser)).toEqual([
+        { role: "user", content: "restored first" },
+        { role: "user", content: "queued second" },
+      ])
+    }),
+  15_000,
+)
+
+it.instance(
+  "an abort parks pending prompts until the next admission delivers them in order",
+  () =>
+    Effect.gen(function* () {
+      const { llm, prompt, queue, chat, task, send } = yield* startHeld()
+      const first = yield* send("parked one", { delivery: "queue" })
+      yield* queued(chat.id, 1)
+      const second = yield* send("parked two", { delivery: "queue" })
+      yield* queued(chat.id, 2)
+
+      yield* prompt.cancel(chat.id)
+      yield* finish(task, first, second)
+      expect(yield* llm.calls).toBe(1)
+      expect((yield* queue.list(chat.id)).map((item) => item.input.parts)).toEqual([
+        said("parked one"),
+        said("parked two"),
+      ])
+
+      yield* llm.text("wake done")
+      yield* llm.text("one done")
+      yield* llm.text("two done")
+      yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("wake up") })
+
+      const inputs = yield* llm.inputs
+      expect(inputs.slice(1).map(lastUser)).toEqual([
+        { role: "user", content: "wake up" },
+        { role: "user", content: "parked one" },
+        { role: "user", content: "parked two" },
+      ])
+      expect(yield* queue.list(chat.id)).toEqual([])
+    }),
+  15_000,
+)
+
+it.instance(
+  "a provider error parks pending prompts until the next admission",
+  () =>
+    Effect.gen(function* () {
+      const { llm, prompt, sessions, queue, chat, task, send, release } = yield* startHeld({ tool: true })
+      yield* llm.error(400, { error: { message: "rejected by the provider" } })
+
+      const held = yield* send("parked by the error", { delivery: "queue" })
+      yield* queued(chat.id, 1)
+      yield* release
+      yield* finish(task, held)
+      const stopped = (yield* sessions.messages({ sessionID: chat.id })).at(-1)?.info
+      expect(stopped?.role === "assistant" ? stopped.error?.name : undefined).toBe("APIError")
+      expect(yield* llm.calls).toBe(2)
+      expect((yield* queue.list(chat.id)).map((item) => item.input.parts)).toEqual([said("parked by the error")])
+
+      yield* llm.text("wake done")
+      yield* llm.text("parked done")
+      yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("wake up") })
+      expect((yield* llm.inputs).slice(2).map(lastUser)).toEqual([
+        { role: "user", content: "wake up" },
+        { role: "user", content: "parked by the error" },
+      ])
+    }),
+  15_000,
+)
+
+const resourcePart = (uri: string) => ({
+  type: "file" as const,
+  mime: "text/plain",
+  filename: "resource.txt",
+  url: uri,
+  source: { type: "resource" as const, clientName: "test", uri, text: { value: "", start: 0, end: 0 } },
+})
+
+const itemTexts = (items: ReadonlyArray<SessionQueue.Item>) =>
+  items.map((item) => item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(" "))
+
+it.instance(
+  "a steer after a compaction whose summary turn failed is delivered as its own turn",
+  () =>
+    Effect.gen(function* () {
+      const compaction = yield* SessionCompaction.Service
+      const { llm, prompt, chat, task, release } = yield* startHeld()
+      yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+      yield* llm.error(400, { error: { message: "summary rejected" } })
+      yield* release
+      yield* finish(task)
+      expect(yield* llm.calls).toBe(2)
+
+      yield* llm.text("steer done")
+      yield* awaitWithTimeout(
+        prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: said("steer after the failed summary"),
+        }),
+        "steer prompt never returned",
+        "10 seconds",
+      )
+      yield* awaitWithTimeout(llm.wait(3), "steer never reached the model", "10 seconds")
+      expect(lastUser((yield* llm.inputs)[2])).toEqual({ role: "user", content: "steer after the failed summary" })
+    }),
+  15_000,
+)
+
+it.instance(
+  "a steer after a compaction whose summary turn was aborted is delivered as its own turn",
+  () =>
+    Effect.gen(function* () {
+      const compaction = yield* SessionCompaction.Service
+      const { llm, prompt, chat, task, release } = yield* startHeld()
+      yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+      yield* llm.hang
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "summary turn never started", "10 seconds")
+      yield* prompt.cancel(chat.id)
+      yield* finish(task)
+
+      yield* llm.text("steer done")
+      yield* awaitWithTimeout(
+        prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: said("steer after the aborted summary"),
+        }),
+        "steer prompt never returned",
+        "10 seconds",
+      )
+      yield* awaitWithTimeout(llm.wait(3), "steer never reached the model", "10 seconds")
+      expect(lastUser((yield* llm.inputs)[2])).toEqual({ role: "user", content: "steer after the aborted summary" })
+    }),
+  15_000,
+)
+
+it.instance(
+  "a structured result settles the run: its caller keeps it and a queued prompt still runs",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const gate = yield* Deferred.make<void>()
+      yield* llm.push(reply().wait(deferredAsPromise(gate)).tool("StructuredOutput", { answer: "42" }))
+      yield* llm.text("queued done")
+      const events = yield* EventV2Bridge.Service
+      const idleAt: number[] = []
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === SessionStatus.Event.Idle.type && (event.data as { sessionID: string }).sessionID === chat.id
+          ? llm.calls.pipe(Effect.map((calls) => void idleAt.push(calls)))
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const format = Schema.decodeUnknownSync(SessionV1.Format)({
+        type: "json_schema",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+      })
+
+      const structured = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, format, parts: said("answer in structure") })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "structured call never started", "10 seconds")
+      const held = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, delivery: "queue", parts: said("queued after it") })
+        .pipe(Effect.forkChild)
+      yield* queued(chat.id, 1)
+      yield* Deferred.succeed(gate, void 0)
+
+      const [result, queuedReply] = yield* finish(structured, held)
+      expect(result?.info.role === "assistant" ? result.info.structured : undefined).toEqual({ answer: "42" })
+      expect(queuedReply?.info.role).toBe("assistant")
+      expect(queuedReply?.parts.some((part) => part.type === "text" && part.text === "queued done")).toBe(true)
+      yield* awaitWithTimeout(llm.wait(2), "queued prompt never ran after the structured result", "10 seconds")
+      expect(lastUser((yield* llm.inputs)[1])).toEqual({ role: "user", content: "queued after it" })
+      // One drain carries the queued turn: the session never goes idle between them.
+      expect(idleAt).toEqual([2])
+    }),
+  15_000,
+)
+
+it.instance(
+  "queue lists are published in the order their changes happened",
+  () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const firstHeld = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const early = yield* Deferred.make<void>()
+      const seen: string[][] = []
+      let calls = 0
+      // The first listener call pauses between the list snapshot and its delivery.
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== SessionQueue.Event.Updated.type) return Effect.void
+        const data = event.data as { sessionID: string; items: ReadonlyArray<SessionQueue.Item> }
+        if (data.sessionID !== chat.id) return Effect.void
+        calls += 1
+        const call = calls
+        return Effect.gen(function* () {
+          if (call === 1) {
+            yield* Deferred.succeed(firstHeld, undefined)
+            yield* Deferred.await(release)
+          }
+          if (call === 2) yield* Deferred.succeed(early, undefined)
+          seen.push(itemTexts(data.items))
+        })
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const admit = (text: string) =>
+        queue.admit({ sessionID: chat.id, agent: "build", model: ref, delivery: "queue", parts: said(text) })
+
+      const first = yield* admit("first").pipe(Effect.forkChild({ startImmediately: true }))
+      yield* awaitWithTimeout(Deferred.await(firstHeld), "first admission never published")
+      const second = yield* admit("second").pipe(Effect.forkChild({ startImmediately: true }))
+      // Only a second admission racing past the paused first one can publish now.
+      yield* Deferred.await(early).pipe(Effect.timeoutOption("1 second"))
+      yield* Deferred.succeed(release, undefined)
+      yield* finish(first, second)
+
+      expect(seen).toEqual([["first"], ["first", "second"]])
+    }),
+  15_000,
+)
+
+it.instance(
+  "a prompt stays listed while it becomes a message, and an interrupted promotion leaves it pending",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const gate = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      heldResource.gate = gate
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (heldResource.gate = undefined)))
+
+      const slow = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [...said("with a slow resource"), resourcePart(HELD_RESOURCE)],
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(gate.entered), "promotion never read the resource")
+      const listed = yield* queue.list(chat.id)
+      expect(itemTexts(listed)).toEqual(["with a slow resource"])
+
+      yield* Fiber.interrupt(slow)
+      expect((yield* queue.list(chat.id)).map((item) => item.id)).toEqual(listed.map((item) => item.id))
+
+      yield* llm.text("done")
+      yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("wake up") })
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(1)
+      expect(lastUser(inputs[0])).toEqual({ role: "user", content: "wake up" })
+      expect(JSON.stringify(modelMessages(inputs[0])).split("with a slow resource").length - 1).toBe(1)
+      expect(mentions(inputs[0], "held resource text")).toBe(true)
+      expect(yield* queue.list(chat.id)).toEqual([])
+    }),
+  15_000,
+)
+
+it.instance(
+  "an older steer that cannot become a message does not fail a new prompt",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const errors: unknown[] = []
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === Session.Event.Error.type && (event.data as { sessionID?: string }).sessionID === chat.id
+          ? Effect.sync(() => void errors.push(event.data))
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      // A steer left pending (as one held behind a compaction is) whose resource is missing.
+      yield* queue.admit({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [...said("older and broken"), resourcePart("missing://resource")],
+      })
+      yield* llm.text("newer done")
+
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: said("newer works"),
+      })
+
+      expect(result.info.role).toBe("assistant")
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(1)
+      expect(lastUser(inputs[0])).toEqual({ role: "user", content: "newer works" })
+      expect(mentions(inputs[0], "older and broken")).toBe(false)
+      expect(errors).toHaveLength(1)
+      expect(yield* queue.list(chat.id)).toEqual([])
+    }),
+  15_000,
+)
+
+it.instance(
+  "a withdraw wins over a promotion still preparing the same prompt",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const gate = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      heldResource.gate = gate
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (heldResource.gate = undefined)))
+
+      const slow = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [...said("withdrawn while preparing"), resourcePart(HELD_RESOURCE)],
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(gate.entered), "promotion never read the resource")
+      const [item] = yield* queue.list(chat.id)
+      // The session lock is free while the message is prepared, so the withdraw lands now.
+      const withdrawn = yield* awaitWithTimeout(queue.withdraw(chat.id, item!.id), "withdraw waited for the promotion")
+      expect(Option.getOrUndefined(withdrawn)?.id).toBe(item!.id)
+      yield* Deferred.succeed(gate.release, undefined)
+
+      const exit = yield* awaitWithTimeout(Fiber.await(slow), "withdrawn prompt never returned")
+      expect(Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined).toBeInstanceOf(SessionQueue.WithdrawnError)
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(
+        messages.some((msg) =>
+          msg.parts.some((part) => part.type === "text" && part.text === "withdrawn while preparing"),
+        ),
+      ).toBe(false)
+      expect(yield* llm.calls).toBe(0)
+      expect(yield* queue.list(chat.id)).toEqual([])
+    }),
+  15_000,
+)
+
+gated.instance(
+  "a prompt admitted while a stopping turn is still in flight is not parked by that stop",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const gate = yield* Deferred.make<void>()
+      yield* llm.push(reply().wait(deferredAsPromise(gate)).contentFilter())
+      yield* llm.text("after the stop")
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (gates.nextEnsureRunning = undefined)))
+
+      const task = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("start the task") })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+      // Admitted after the stopping turn's last history read, it joins that turn's
+      // run before the stop lands: the stop never saw it.
+      const joined = { reached: yield* Deferred.make<void>(), startedRun: false }
+      gates.nextEnsureRunning = joined
+      const late = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("admitted before the stop landed") })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(joined.reached), "late prompt never reached the running turn")
+      expect(joined.startedRun).toBe(false)
+      yield* Deferred.succeed(gate, void 0)
+
+      const [, answer] = yield* finish(task, late)
+      expect(yield* llm.calls).toBe(2)
+      expect(lastUser((yield* llm.inputs)[1])).toEqual({ role: "user", content: "admitted before the stop landed" })
+      expect(answer?.parts.some((part) => part.type === "text" && part.text === "after the stop")).toBe(true)
+    }),
+  15_000,
+)
+
+gated.instance(
+  "a steer admitted while a compaction writes its continue message lands after that message",
+  () =>
+    Effect.gen(function* () {
+      const compaction = yield* SessionCompaction.Service
+      const { llm, chat, task, send, release } = yield* startHeld()
+      yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: true })
+      yield* llm.text("summary of the task")
+      yield* llm.text("steer done")
+      const hook = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      gates.compactionContinue = hook
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (gates.compactionContinue = undefined)))
+
+      yield* release
+      yield* awaitWithTimeout(Deferred.await(hook.entered), "compaction never reached its continue message")
+      const steer = yield* send("steer during the continue")
+      yield* admitted(chat.id, "steer during the continue")
+      yield* Deferred.succeed(hook.release, undefined)
+      yield* finish(task, steer)
+
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(3)
+      expect(mentions(inputs[1], "steer during the continue")).toBe(false)
+      expect(mentions(inputs[2], "Continue if you have next steps")).toBe(true)
+      expect(lastUser(inputs[2])).toEqual({ role: "user", content: "steer during the continue" })
+    }),
+  15_000,
+)
+
+// Reply routing: every caller shape, asserting the assistant each caller got
+// back. A turn's reply is its final message, which the prompt that began it and
+// every steer that joined it share; a queued prompt's turn is its own.
+
+// The user message a prompt became, once it has; a steer sent during a step is
+// then known to be part of that step's history.
+const asked = (sessionID: SessionID, text: string) =>
+  pollWithTimeout(
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      return (yield* sessions.messages({ sessionID })).find(
+        (msg) => msg.info.role === "user" && msg.parts.some((part) => part.type === "text" && part.text === text),
+      )?.info.id
+    }),
+    `prompt "${text}" never became a message`,
+  )
+
+const answered = (
+  reply: SessionV1.WithParts | undefined,
+): { parentID: string; texts: string[]; error?: string } | undefined =>
+  reply?.info.role === "assistant"
+    ? {
+        parentID: reply.info.parentID,
+        texts: reply.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])),
+        error: reply.info.error?.name,
+      }
+    : undefined
+
+it.instance(
+  "a plain text turn steered mid-turn: its caller and both steers get the turn's final reply, not the step they overtook",
+  () =>
+    Effect.gen(function* () {
+      const { llm, chat, task, send, release } = yield* startHeld()
+      yield* llm.text("steered reply")
+      yield* llm.text("queued reply")
+
+      const held = yield* send("queued behind the turn", { delivery: "queue" })
+      yield* queued(chat.id, 1)
+      const first = yield* send("first steer")
+      yield* asked(chat.id, "first steer")
+      const second = yield* send("second steer")
+      yield* asked(chat.id, "second steer")
+      yield* release
+      const [original, older, newer, queuedReply] = yield* finish(task, first, second, held)
+
+      expect(yield* llm.calls).toBe(3)
+      const turn = { parentID: yield* asked(chat.id, "second steer"), texts: ["steered reply"], error: undefined }
+      expect([original, older, newer].map(answered)).toEqual([turn, turn, turn])
+      expect(answered(queuedReply)).toEqual({
+        parentID: yield* asked(chat.id, "queued behind the turn"),
+        texts: ["queued reply"],
+        error: undefined,
+      })
+    }),
+  15_000,
+)
+
+it.instance(
+  "a plain text turn steered mid-turn whose continuation errors: every caller gets the errored reply",
+  () =>
+    Effect.gen(function* () {
+      const { llm, chat, task, send, release } = yield* startHeld()
+      yield* llm.error(400, { error: { message: "rejected by the provider" } })
+
+      const first = yield* send("first steer")
+      yield* asked(chat.id, "first steer")
+      const second = yield* send("second steer")
+      yield* asked(chat.id, "second steer")
+      yield* release
+      const replies = yield* finish(task, first, second)
+
+      expect(yield* llm.calls).toBe(2)
+      const turn = { parentID: yield* asked(chat.id, "second steer"), texts: [], error: "APIError" }
+      expect(replies.map(answered)).toEqual([turn, turn, turn])
+    }),
+  15_000,
+)
+
+it.instance(
+  "a multi-step tool turn steered mid-turn: its caller and the steer get the turn's final reply",
+  () =>
+    Effect.gen(function* () {
+      const { llm, chat, task, send, release } = yield* startHeld({ tool: true })
+      const step = yield* Deferred.make<void>()
+      yield* llm.hold("task done", deferredAsPromise(step))
+      yield* llm.text("steered reply")
+      yield* llm.text("queued reply")
+
+      const held = yield* send("queued behind the turn", { delivery: "queue" })
+      yield* queued(chat.id, 1)
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "the tool turn never took its second step", "10 seconds")
+      const steer = yield* send("steer mid-turn")
+      yield* asked(chat.id, "steer mid-turn")
+      yield* Deferred.succeed(step, void 0)
+      const [original, steered, queuedReply] = yield* finish(task, steer, held)
+
+      expect(yield* llm.calls).toBe(4)
+      const turn = { parentID: yield* asked(chat.id, "steer mid-turn"), texts: ["steered reply"], error: undefined }
+      expect([original, steered].map(answered)).toEqual([turn, turn])
+      expect(answered(queuedReply)).toEqual({
+        parentID: yield* asked(chat.id, "queued behind the turn"),
+        texts: ["queued reply"],
+        error: undefined,
+      })
+    }),
+  15_000,
+)
+
+it.instance(
+  "a queued caller joining an active run gets its own turn's final reply, and the task's caller keeps its own",
+  () =>
+    Effect.gen(function* () {
+      const { llm, chat, task, send, release } = yield* startHeld()
+      const step = yield* Deferred.make<void>()
+      yield* llm.hold("queued step", deferredAsPromise(step))
+      yield* llm.text("steered reply")
+
+      const held = yield* send("queued behind the task", { delivery: "queue" })
+      yield* queued(chat.id, 1)
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "the queued turn never started", "10 seconds")
+      const steer = yield* send("steer into the queued turn")
+      yield* asked(chat.id, "steer into the queued turn")
+      yield* Deferred.succeed(step, void 0)
+      const [original, queuedReply, steered] = yield* finish(task, held, steer)
+
+      expect(yield* llm.calls).toBe(3)
+      expect(answered(original)).toEqual({
+        parentID: yield* asked(chat.id, "start the task"),
+        texts: ["task done"],
+        error: undefined,
+      })
+      const turn = {
+        parentID: yield* asked(chat.id, "steer into the queued turn"),
+        texts: ["steered reply"],
+        error: undefined,
+      }
+      expect([queuedReply, steered].map(answered)).toEqual([turn, turn])
+    }),
+  15_000,
+)
+
+gated.instance(
+  "a turn that stops answers its callers then, so one slow to collect never gets a later turn's reply",
+  () =>
+    Effect.gen(function* () {
+      const { llm, chat, task, send, release } = yield* startHeld()
+      const stop = yield* Deferred.make<void>()
+      yield* llm.push(reply().wait(deferredAsPromise(stop)).contentFilter())
+      yield* llm.text("after the stop")
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (gates.nextEnsureRunning = undefined)))
+
+      // A steer the stopping turn carries; its caller is slow to collect once its run ends.
+      const slow = { reached: yield* Deferred.make<void>(), startedRun: false, hold: yield* Deferred.make<void>() }
+      gates.nextEnsureRunning = slow
+      const steer = yield* send("steer into the stop")
+      yield* awaitWithTimeout(Deferred.await(slow.reached), "the steer never joined the running turn")
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "the steered step never started", "10 seconds")
+      // Sent after the stopping step's history read, so it gets a turn of its own.
+      const late = yield* send("sent before the stop")
+      yield* asked(chat.id, "sent before the stop")
+      yield* Deferred.succeed(stop, void 0)
+      const [original, lateReply] = yield* finish(task, late)
+      yield* Deferred.succeed(slow.hold, void 0)
+      const [steered] = yield* finish(steer)
+
+      expect(yield* llm.calls).toBe(3)
+      const stopped = { parentID: yield* asked(chat.id, "steer into the stop"), texts: [], error: "ContentFilterError" }
+      expect([original, steered].map(answered)).toEqual([stopped, stopped])
+      expect(answered(lateReply)).toEqual({
+        parentID: yield* asked(chat.id, "sent before the stop"),
+        texts: ["after the stop"],
+        error: undefined,
+      })
+    }),
+  15_000,
+)
+
+gated.instance(
+  "a cancelled turn answers its callers as it stops, so one slow to collect never gets the next turn's reply",
+  () =>
+    Effect.gen(function* () {
+      const { llm, prompt, chat, task, send, release } = yield* startHeld()
+      yield* llm.hold("never finished", new Promise(() => {}))
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (gates.nextEnsureRunning = undefined)))
+
+      const slow = { reached: yield* Deferred.make<void>(), startedRun: false, hold: yield* Deferred.make<void>() }
+      gates.nextEnsureRunning = slow
+      const steer = yield* send("steer into the cancelled turn")
+      yield* awaitWithTimeout(Deferred.await(slow.reached), "the steer never joined the running turn")
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "the steered step never started", "10 seconds")
+      yield* prompt.cancel(chat.id)
+      const [original] = yield* finish(task)
+
+      yield* llm.text("wake reply")
+      const woken = yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("wake up") })
+      yield* Deferred.succeed(slow.hold, void 0)
+      const [steered] = yield* finish(steer)
+
+      const cancelled = {
+        parentID: yield* asked(chat.id, "steer into the cancelled turn"),
+        texts: [],
+        error: "MessageAbortedError",
+      }
+      expect([original, steered].map(answered)).toEqual([cancelled, cancelled])
+      expect(answered(woken)).toEqual({
+        parentID: yield* asked(chat.id, "wake up"),
+        texts: ["wake reply"],
+        error: undefined,
+      })
+    }),
+  15_000,
+)
+
+it.instance(
+  "a withdraw that beats a new session's first queued prompt ends its caller with WithdrawnError",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const gate = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      heldResource.gate = gate
+      yield* Effect.addFinalizer(() => Effect.sync(() => void (heldResource.gate = undefined)))
+
+      const first = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          delivery: "queue",
+          parts: [...said("first and withdrawn"), resourcePart(HELD_RESOURCE)],
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(gate.entered), "first prompt was never prepared")
+      const [item] = yield* queue.list(chat.id)
+      expect(Option.isSome(yield* queue.withdraw(chat.id, item!.id))).toBe(true)
+      yield* Deferred.succeed(gate.release, undefined)
+
+      const exit = yield* awaitWithTimeout(Fiber.await(first), "withdrawn first prompt never returned")
+      expect(Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined).toBeInstanceOf(SessionQueue.WithdrawnError)
+      expect(yield* sessions.messages({ sessionID: chat.id })).toEqual([])
+      expect(yield* llm.calls).toBe(0)
+    }),
+  15_000,
+)
+
+it.instance(
+  "an interrupted caller leaves no reply tracked for its prompt",
+  () =>
+    Effect.gen(function* () {
+      const { llm, queue, chat, task, send, release } = yield* startHeld()
+      yield* llm.text("delivered anyway")
+      const abandoned = yield* send("queued then abandoned", { delivery: "queue" })
+      const [item] = yield* queued(chat.id, 1)
+      yield* Fiber.interrupt(abandoned)
+
+      yield* release
+      yield* finish(task)
+      // The run still delivers the prompt; only its caller is gone.
+      expect(lastUser((yield* llm.inputs)[1])).toEqual({ role: "user", content: "queued then abandoned" })
+      expect(yield* queue.reply(item!.id)).toBeUndefined()
+    }),
+  15_000,
+)
+
+it.instance(
+  "a run interrupted without a prompt cancel, as instance disposal does, also parks pending prompts",
+  () =>
+    Effect.gen(function* () {
+      const run = yield* SessionRunState.Service
+      const { llm, queue, chat, task, send } = yield* startHeld()
+      const held = yield* send("parked by the interrupt", { delivery: "queue" })
+      yield* queued(chat.id, 1)
+
+      yield* run.cancel(chat.id)
+      yield* finish(task, held)
+      expect(yield* llm.calls).toBe(1)
+      expect((yield* queue.list(chat.id)).map((item) => item.input.parts)).toEqual([said("parked by the interrupt")])
+    }),
+  15_000,
+)
+
+it.instance(
+  "a steer sent while a compaction task is pending reaches the first call after it, not the compaction",
+  () =>
+    Effect.gen(function* () {
+      const compaction = yield* SessionCompaction.Service
+      const { llm, chat, task, send, release } = yield* startHeld()
+      yield* llm.text("summary of the task")
+      yield* llm.text("steer done")
+
+      yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+      const steer = yield* send("steer during compaction")
+      yield* admitted(chat.id, "steer during compaction")
+      yield* release
+      yield* finish(task, steer)
+
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(3)
+      expect(mentions(inputs[1], "steer during compaction")).toBe(false)
+      expect(lastUser(inputs[2])).toEqual({ role: "user", content: "steer during compaction" })
+    }),
+  15_000,
+)
+
+it.instance(
+  "queued prompts survive a rebuild of the session services over the same database",
+  () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const { llm, prompt, chat, task, send } = yield* startHeld()
+      const held = yield* send("survives the rebuild", { delivery: "queue" })
+      const [pending] = yield* queued(chat.id, 1)
+      yield* prompt.cancel(chat.id)
+      yield* finish(task, held)
+
+      yield* llm.text("wake done")
+      yield* llm.text("held done")
+      const rebuilt = LayerNode.compile(promptRoot, [
+        [SessionSummary.node, summary],
+        [LSP.node, lsp],
+        [MCP.node, makeMcp()],
+        [RuntimeFlags.node, runtimeFlags],
+        [Database.node, Layer.succeed(Database.Service, database)],
+      ])
+      yield* Effect.gen(function* () {
+        const queue = yield* SessionQueue.Service
+        const again = yield* SessionPrompt.Service
+        expect(yield* queue.list(chat.id)).toEqual([pending])
+        yield* again.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("wake up") })
+        expect(yield* queue.list(chat.id)).toEqual([])
+      }).pipe(Effect.provide(rebuilt))
+
+      const inputs = yield* llm.inputs
+      expect(inputs.slice(1).map(lastUser)).toEqual([
+        { role: "user", content: "wake up" },
+        { role: "user", content: "survives the rebuild" },
+      ])
+    }),
+  15_000,
+)
+
+it.instance(
+  "queued prompts disappear with their session",
+  () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const { prompt, sessions, chat, task, send } = yield* startHeld()
+      const held = yield* send("deleted with the session", { delivery: "queue" })
+      yield* queued(chat.id, 1)
+      yield* prompt.cancel(chat.id)
+      yield* finish(task, held)
+
+      yield* sessions.remove(chat.id)
+      const rows = yield* db
+        .select({ id: SessionPromptQueueTable.id })
+        .from(SessionPromptQueueTable)
+        .where(eq(SessionPromptQueueTable.session_id, chat.id))
+        .all()
+      const sequences = yield* db
+        .select({ seq: SessionPromptQueueSequenceTable.seq })
+        .from(SessionPromptQueueSequenceTable)
+        .where(eq(SessionPromptQueueSequenceTable.session_id, chat.id))
+        .all()
+      expect(rows).toEqual([])
+      expect(sequences).toEqual([])
+    }),
+  15_000,
+)
+
+it.instance(
+  "a queued first prompt on a new idle session runs in the first provider call",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.text("ran at once")
+
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        delivery: "queue",
+        parts: said("queued on an idle session"),
+      })
+
+      expect(result.info.role).toBe("assistant")
+      expect(yield* llm.calls).toBe(1)
+      expect(lastUser((yield* llm.inputs)[0])).toEqual({ role: "user", content: "queued on an idle session" })
+    }),
+  15_000,
+)
+
+it.instance(
+  "noReply writes its message directly and starts no drain",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const run = yield* SessionRunState.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+
+      const message = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: said("context only"),
+      })
+
+      expect(message.info.role).toBe("user")
+      expect((yield* sessions.messages({ sessionID: chat.id })).map((msg) => msg.info.id)).toEqual([message.info.id])
+      expect(yield* queue.list(chat.id)).toEqual([])
+      yield* run.assertNotBusy(chat.id)
+      expect(yield* llm.calls).toBe(0)
+    }),
+  15_000,
+)
+
+it.instance(
+  "a queued prompt with an older supplied messageID is stored after the reply it waited for",
+  () =>
+    Effect.gen(function* () {
+      const stale = MessageID.ascending()
+      const { llm, sessions, chat, task, send, release } = yield* startHeld()
+      yield* llm.text("queued done")
+
+      const held = yield* send("supplied an old id", { delivery: "queue", messageID: stale })
+      yield* admitted(chat.id, "supplied an old id")
+      yield* release
+      yield* finish(task, held)
+
+      const msgs = yield* sessions.messages({ sessionID: chat.id })
+      const reply = msgs.find((msg) => msg.info.role === "assistant")
+      const promoted = msgs.find((msg) =>
+        msg.parts.some((part) => part.type === "text" && part.text === "supplied an old id"),
+      )
+      if (!reply || !promoted) throw new Error("expected the first reply and the promoted prompt")
+      expect(promoted.info.id).not.toBe(stale)
+      expect(promoted.info.id > reply.info.id).toBe(true)
+      const answer = msgs.at(-1)?.info
+      expect(answer?.role === "assistant" ? answer.parentID : undefined).toBe(promoted.info.id)
+    }),
+  15_000,
 )
 
 it.instance("assertNotBusy fails with BusyError when loop running", () =>

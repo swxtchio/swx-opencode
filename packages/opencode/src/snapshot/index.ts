@@ -1,5 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Duration, Effect, Layer, Schedule, Schema, Semaphore, Context } from "effect"
+import { Cause, Duration, Effect, Layer, Option, Schedule, Schema, Semaphore, Context } from "effect"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { formatPatch, structuredPatch } from "diff"
 import path from "path"
@@ -10,6 +10,7 @@ import { Hash } from "@opencode-ai/core/util/hash"
 import { Config } from "@/config/config"
 import { Global } from "@opencode-ai/core/global"
 import { Info } from "@opencode-ai/schema/file-diff"
+import { MaintenanceService, maintenanceNode } from "./maintenance"
 
 export const Patch = Schema.Struct({
   hash: Schema.String,
@@ -21,6 +22,13 @@ export const FileDiff = Info
 export type FileDiff = typeof FileDiff.Type
 
 const prune = "7.days"
+const gcInterval = Duration.toMillis(Duration.hours(1))
+const gcAdmissionWaitMillis = Duration.toMillis(Duration.minutes(5))
+const trackLockWaitMillis = Duration.toMillis(Duration.seconds(30))
+const reapGrace = Duration.toMillis(Duration.days(7))
+const reapLockLimit = 16
+const reapFailureLimit = 3
+const reapRetryInterval = Duration.toMillis(Duration.days(1))
 const limit = 2 * 1024 * 1024
 const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
 const cfg = ["-c", "core.autocrlf=false", ...core]
@@ -46,12 +54,29 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Snapshot") {}
 
-const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | Config.Service> = Layer.effect(
+const WorktreeEvidence = Schema.Struct({
+  version: Schema.Literal(1),
+  project: Schema.String,
+  worktree: Schema.String,
+  missingSince: Schema.optional(Schema.Number),
+  reapFailures: Schema.optional(Schema.Number),
+  reapParkedAt: Schema.optional(Schema.Number),
+})
+const WorktreeEvidenceJson = Schema.fromJsonString(WorktreeEvidence)
+const decodeWorktreeEvidence = Schema.decodeUnknownOption(WorktreeEvidenceJson)
+
+const layer: Layer.Layer<
+  Service,
+  never,
+  FSUtil.Service | AppProcess.Service | Config.Service | Global.Service | MaintenanceService
+> = Layer.effect(
   Service,
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
     const appProcess = yield* AppProcess.Service
     const config = yield* Config.Service
+    const global = yield* Global.Service
+    const maintenance = yield* MaintenanceService
     const locks = new Map<string, Semaphore.Semaphore>()
 
     const lock = (key: string) => {
@@ -68,7 +93,8 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
         const state = {
           directory: ctx.directory,
           worktree: ctx.worktree,
-          gitdir: path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree)),
+          project: ctx.project.id,
+          gitdir: path.join(global.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree)),
           vcs: ctx.project.vcs,
         }
 
@@ -163,6 +189,27 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
         const read = (file: string) => fs.readFileString(file).pipe(Effect.catch(() => Effect.succeed("")))
         const remove = (file: string) => fs.remove(file).pipe(Effect.catch(() => Effect.void))
         const locked = <A, E, R>(fx: Effect.Effect<A, E, R>) => lock(state.gitdir).withPermits(1)(fx)
+        const evidenceFile = (gitdir: string) => path.join(gitdir, "info", "opencode-worktree.json")
+        const evidence = (gitdir: string) => read(evidenceFile(gitdir)).pipe(Effect.map(decodeWorktreeEvidence))
+        const saveEvidence = (gitdir: string, value: typeof WorktreeEvidence.Type) =>
+          fs.writeFileString(evidenceFile(gitdir), JSON.stringify(value)).pipe(Effect.as(true), Effect.orDie)
+        const inspect = Effect.fnUntraced(function* (gitdir: string, project: string, repo: string) {
+          const decoded = Option.getOrUndefined(yield* evidence(gitdir))
+          if (!decoded || !path.isAbsolute(decoded.worktree)) return
+          if (decoded.project !== project || Hash.fast(decoded.worktree) !== repo) return
+
+          const expected = path.join(path.dirname(path.dirname(gitdir)), decoded.project, Hash.fast(decoded.worktree))
+          if (path.resolve(expected) !== path.resolve(gitdir)) return
+
+          const presence = yield* fs.stat(decoded.worktree).pipe(
+            Effect.as("present" as const),
+            Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed("missing" as const)),
+            Effect.catch(() => Effect.succeed("unknown" as const)),
+          )
+          if (presence === "unknown") return
+
+          return { decoded, presence }
+        })
 
         const enabled = Effect.fnUntraced(function* () {
           if (state.vcs !== "git") return false
@@ -297,53 +344,290 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           yield* stage(allow.filter((item) => !block.has(item)))
         })
 
-        const cleanup = Effect.fnUntraced(function* () {
-          return yield* locked(
-            Effect.gen(function* () {
-              if (!(yield* enabled())) return
-              if (!(yield* exists(state.gitdir))) return
-              const result = yield* git(args(["gc", `--prune=${prune}`]), { cwd: state.directory })
-              if (result.code !== 0) {
-                yield* Effect.logWarning("cleanup failed", {
-                  exitCode: result.code,
-                  stderr: result.stderr,
-                })
-                return
-              }
-              yield* Effect.logInfo("cleanup", { prune })
-            }),
+        const reap = Effect.fnUntraced(function* (now: number) {
+          const root = path.join(global.data, "snapshot")
+          if (!(yield* exists(root))) return
+          const budget = { locks: 0 }
+
+          const projects = yield* fs.readDirectoryEntries(root).pipe(
+            Effect.catch((cause) =>
+              Effect.logError("snapshot shadow repo scan failed", {
+                root,
+                cause: cause instanceof Error ? cause.message : String(cause),
+              }).pipe(Effect.as([] as FSUtil.DirEntry[])),
+            ),
+          )
+          yield* Effect.forEach(
+            projects.filter((item) => item.type === "directory"),
+            (project) =>
+              Effect.gen(function* () {
+                const repos = yield* fs.readDirectoryEntries(path.join(root, project.name)).pipe(
+                  Effect.catch((cause) =>
+                    Effect.logError("snapshot shadow project scan failed", {
+                      project: project.name,
+                      cause: cause instanceof Error ? cause.message : String(cause),
+                    }).pipe(Effect.as([] as FSUtil.DirEntry[])),
+                  ),
+                )
+                yield* Effect.forEach(
+                  repos.filter((item) => item.type === "directory"),
+                  (repo) =>
+                    Effect.gen(function* () {
+                      const gitdir = path.join(root, project.name, repo.name)
+                      if (!(yield* fs.isFile(path.join(gitdir, "HEAD")))) return
+                      if (!(yield* fs.isDir(path.join(gitdir, "objects")))) return
+                      if (!(yield* fs.isFile(evidenceFile(gitdir)))) return
+
+                      const initial = yield* inspect(gitdir, project.name, repo.name)
+                      if (!initial) return
+                      if (
+                        initial.presence === "present" &&
+                        initial.decoded.missingSince === undefined &&
+                        initial.decoded.reapFailures === undefined
+                      ) {
+                        return
+                      }
+                      const initialFailures = initial.decoded.reapFailures ?? 0
+                      const initialParkedAt = initial.decoded.reapParkedAt ?? initial.decoded.missingSince ?? now
+                      if (
+                        initial.presence === "missing" &&
+                        initialFailures >= reapFailureLimit &&
+                        now - initialParkedAt < reapRetryInterval
+                      ) {
+                        return
+                      }
+                      if (
+                        initial.presence === "missing" &&
+                        initial.decoded.missingSince !== undefined &&
+                        now >= initial.decoded.missingSince &&
+                        now - initial.decoded.missingSince < reapGrace
+                      ) {
+                        return
+                      }
+                      if (budget.locks >= reapLockLimit) return
+
+                      const repoLock = path.join(root, "locks", project.name, `${repo.name}.lock`)
+                      const attempt = yield* maintenance
+                        .withLocks(
+                          [
+                            { role: "repo", file: repoLock },
+                            { role: "local", semaphore: lock(gitdir) },
+                          ],
+                          Effect.gen(function* () {
+                            const current = yield* inspect(gitdir, project.name, repo.name)
+                            if (!current) return false
+
+                            if (current.presence === "present") {
+                              if (
+                                current.decoded.missingSince !== undefined ||
+                                current.decoded.reapFailures !== undefined ||
+                                current.decoded.reapParkedAt !== undefined
+                              ) {
+                                return yield* saveEvidence(gitdir, {
+                                  version: 1,
+                                  project: current.decoded.project,
+                                  worktree: current.decoded.worktree,
+                                })
+                              }
+                              return false
+                            }
+
+                            const now = yield* maintenance.now
+                            if (current.decoded.missingSince === undefined || now < current.decoded.missingSince) {
+                              return yield* saveEvidence(gitdir, {
+                                ...current.decoded,
+                                missingSince: now,
+                                reapFailures: undefined,
+                                reapParkedAt: undefined,
+                              })
+                            }
+                            const failures = current.decoded.reapFailures ?? 0
+                            const parkedAt = current.decoded.reapParkedAt ?? current.decoded.missingSince
+                            const retryParked = failures >= reapFailureLimit && now - parkedAt >= reapRetryInterval
+                            if (failures >= reapFailureLimit && !retryParked) return false
+                            if (now - current.decoded.missingSince < reapGrace) return false
+
+                            const stillMissing = yield* fs.stat(current.decoded.worktree).pipe(
+                              Effect.as(false),
+                              Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(true)),
+                              Effect.catch(() => Effect.succeed(false)),
+                            )
+                            if (!stillMissing) return false
+                            const removal = yield* fs.remove(gitdir, { recursive: true, force: true }).pipe(
+                              Effect.as({ success: true as const }),
+                              Effect.catch((cause) =>
+                                Effect.gen(function* () {
+                                  const nextFailures = (retryParked ? 0 : failures) + 1
+                                  const parked = nextFailures >= reapFailureLimit
+                                  const saved = yield* saveEvidence(gitdir, {
+                                    ...current.decoded,
+                                    reapFailures: nextFailures,
+                                    reapParkedAt: parked ? now : undefined,
+                                  })
+                                  yield* Effect.logWarning(
+                                    parked
+                                      ? "snapshot shadow repo reaping parked after repeated removal failures"
+                                      : "failed to reap snapshot shadow repo",
+                                    {
+                                      gitdir,
+                                      failures: nextFailures,
+                                      saved,
+                                      cause: cause instanceof Error ? cause.message : String(cause),
+                                    },
+                                  )
+                                  return { success: false as const }
+                                }),
+                              ),
+                            )
+                            return true
+                          }),
+                        )
+                        .pipe(
+                          Effect.catchCause((cause) =>
+                            Cause.hasInterrupts(cause)
+                              ? Effect.failCause(cause)
+                              : Effect.logError("snapshot shadow repo reaping failed", {
+                                  gitdir,
+                                  cause: Cause.pretty(cause),
+                                }).pipe(Effect.as(undefined)),
+                          ),
+                        )
+                      if (attempt?.status === "acquired" && attempt.value) budget.locks++
+                    }),
+                  { concurrency: 1 },
+                )
+              }),
+            { concurrency: 1 },
           )
         })
 
-        const track = Effect.fnUntraced(function* () {
-          return yield* locked(
+        const cleanup = Effect.fnUntraced(function* () {
+          if (!(yield* enabled())) return
+          const root = path.join(global.data, "snapshot")
+          const completion = path.join(root, "gc-completed.timestamp")
+          const repo = Hash.fast(state.worktree)
+          const repoLock = path.join(root, "locks", state.project, `${repo}.lock`)
+          const admission = yield* maintenance.withLocks(
+            [{ role: "box", file: path.join(root, "gc.lock"), wait: true, waitMillis: gcAdmissionWaitMillis }],
             Effect.gen(function* () {
-              if (!(yield* enabled())) return
-              const existed = yield* exists(state.gitdir)
-              yield* fs.ensureDir(state.gitdir).pipe(Effect.orDie)
-              if (!existed) {
-                yield* git(["init"], {
-                  env: { GIT_DIR: state.gitdir, GIT_WORK_TREE: state.worktree },
-                })
-                yield* git(["--git-dir", state.gitdir, "config", "core.autocrlf", "false"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.longpaths", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.symlinks", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.fsmonitor", "false"])
-                // Tuning for very large worktrees so the first add stays bounded.
-                yield* git(["--git-dir", state.gitdir, "config", "feature.manyFiles", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "index.version", "4"])
-                yield* git(["--git-dir", state.gitdir, "config", "index.threads", "true"])
-                yield* git(["--git-dir", state.gitdir, "config", "core.untrackedCache", "true"])
-                yield* seed()
-                yield* Effect.logInfo("initialized")
-              }
-              yield* add()
-              const result = yield* git(args(["write-tree"]), { cwd: state.directory })
-              const hash = result.text.trim()
-              yield* Effect.logInfo("tracking", { hash, cwd: state.directory, git: state.gitdir })
-              return hash
+              const reapNow = yield* maintenance.now
+              yield* reap(reapNow)
+
+              const now = yield* maintenance.now
+              const text = yield* fs.readFileString(completion).pipe(
+                Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed("")),
+                Effect.orDie,
+              )
+              const completionText = text.trim()
+              const completed = completionText ? Number(completionText) : Number.NaN
+              if (Number.isFinite(completed) && completed <= now && now - completed < gcInterval) return
+
+              yield* maintenance
+                .withLocks(
+                  [
+                    { role: "repo", file: repoLock },
+                    { role: "local", semaphore: lock(state.gitdir) },
+                  ],
+                  Effect.gen(function* () {
+                    if (!(yield* exists(state.gitdir))) return
+
+                    const git = ["git", ...args(["-c", "gc.autoDetach=false", "gc", "--auto", `--prune=${prune}`])]
+                    const nice = process.platform === "win32" ? undefined : Bun.which("nice")
+                    const ionice = process.platform === "linux" ? Bun.which("ionice") : undefined
+                    const command = [
+                      ...(nice ? [nice, "-n", "10"] : []),
+                      ...(ionice ? [ionice, "-c", "2", "-n", "7"] : []),
+                      ...git,
+                    ]
+                    const result = yield* maintenance.run({
+                      command: command[0]!,
+                      args: command.slice(1),
+                      cwd: state.directory,
+                    })
+                    if (result.exitCode !== 0) {
+                      yield* Effect.logError("snapshot cleanup failed", {
+                        exitCode: result.exitCode,
+                        stderr: result.stderr,
+                      })
+                      return
+                    }
+
+                    const completedAt = yield* maintenance.now
+                    yield* fs.ensureDir(path.dirname(completion)).pipe(Effect.orDie)
+                    yield* fs.writeFileString(completion, String(completedAt)).pipe(Effect.orDie)
+                    yield* Effect.logInfo("cleanup", { prune })
+                  }),
+                )
+                .pipe(
+                  Effect.catchCause((cause) =>
+                    Cause.hasInterrupts(cause)
+                      ? Effect.failCause(cause)
+                      : Effect.logError("snapshot per-repo cleanup failed", {
+                          project: state.project,
+                          repo,
+                          cause: Cause.pretty(cause),
+                        }).pipe(Effect.as(undefined)),
+                  ),
+                )
             }),
           )
+          if (admission.status === "contended") {
+            yield* Effect.logWarning("snapshot cleanup skipped after waiting for gc admission")
+          }
+          return
+        })
+
+        const track = Effect.fnUntraced(function* () {
+          if (!(yield* enabled())) return
+          while (true) {
+            const attempt = yield* maintenance.withLocks(
+              [
+                {
+                  role: "repo",
+                  file: path.join(global.data, "snapshot", "locks", state.project, `${Hash.fast(state.worktree)}.lock`),
+                  wait: true,
+                  waitMillis: trackLockWaitMillis,
+                },
+                { role: "local", semaphore: lock(state.gitdir), wait: true },
+              ],
+              Effect.gen(function* () {
+                const existed = yield* exists(state.gitdir)
+                yield* fs.ensureDir(state.gitdir).pipe(Effect.orDie)
+                yield* fs.ensureDir(path.join(state.gitdir, "info")).pipe(Effect.orDie)
+                yield* saveEvidence(state.gitdir, {
+                  version: 1,
+                  project: state.project,
+                  worktree: state.worktree,
+                })
+                if (!existed) {
+                  yield* git(["init"], {
+                    env: { GIT_DIR: state.gitdir, GIT_WORK_TREE: state.worktree },
+                  })
+                  yield* git(["--git-dir", state.gitdir, "config", "core.autocrlf", "false"])
+                  yield* git(["--git-dir", state.gitdir, "config", "core.longpaths", "true"])
+                  yield* git(["--git-dir", state.gitdir, "config", "core.symlinks", "true"])
+                  yield* git(["--git-dir", state.gitdir, "config", "core.fsmonitor", "false"])
+                  // Tuning for very large worktrees so the first add stays bounded.
+                  yield* git(["--git-dir", state.gitdir, "config", "feature.manyFiles", "true"])
+                  yield* git(["--git-dir", state.gitdir, "config", "index.version", "4"])
+                  yield* git(["--git-dir", state.gitdir, "config", "index.threads", "true"])
+                  yield* git(["--git-dir", state.gitdir, "config", "core.untrackedCache", "true"])
+                  yield* seed()
+                  yield* Effect.logInfo("initialized")
+                }
+                yield* add()
+                const result = yield* git(args(["write-tree"]), { cwd: state.directory })
+                const hash = result.text.trim()
+                yield* Effect.logInfo("tracking", { hash, cwd: state.directory, git: state.gitdir })
+                return hash
+              }),
+            )
+            if (attempt.status === "acquired") return attempt.value
+            if (attempt.status === "unavailable") {
+              return yield* Effect.die(new Error("snapshot tracking could not acquire its per-repo locks"))
+            }
+            yield* Effect.sleep(Duration.millis(10))
+          }
         })
 
         const patch = Effect.fnUntraced(function* (hash: string) {
@@ -758,10 +1042,11 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           )
         })
 
+        const firstDelay = Duration.minutes(Math.max(1, Math.min(60, Math.floor((yield* maintenance.random) * 60) + 1)))
         yield* cleanup().pipe(
           Effect.catchCause((cause) => Effect.logError("cleanup loop failed", { cause: Cause.pretty(cause) })),
           Effect.repeat(Schedule.spaced(Duration.hours(1))),
-          Effect.delay(Duration.minutes(1)),
+          Effect.delay(firstDelay),
           Effect.forkScoped,
         )
 
@@ -801,7 +1086,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [FSUtil.node, AppProcess.node, Config.node],
+  deps: [FSUtil.node, AppProcess.node, Config.node, Global.node, maintenanceNode],
 })
 
 export * as Snapshot from "."
