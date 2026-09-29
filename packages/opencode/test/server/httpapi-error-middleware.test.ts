@@ -3,6 +3,7 @@ import { NamedError } from "@opencode-ai/core/util/error"
 import { describe, expect } from "bun:test"
 import { ConfigErrorV1 } from "@opencode-ai/core/v1/config/error"
 import { Effect, Layer } from "effect"
+import { LockTimeoutError, SqlError } from "effect/unstable/sql/SqlError"
 import { HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
 import { errorLayer } from "../../src/server/routes/instance/httpapi/middleware/error"
 import { NotFoundError } from "../../src/storage/storage"
@@ -50,6 +51,34 @@ describe("HttpApi error middleware", () => {
       expect(response.status).toBe(500)
       expectUnknownErrorBody(body)
       expect(JSON.stringify(body)).not.toContain("secret named marker")
+    }),
+  )
+
+  it.live("identifies SQLite lock defects without exposing native details", () =>
+    Effect.gen(function* () {
+      const cause = Object.assign(new Error("database is locked while preparing SELECT secret_marker"), {
+        code: "SQLITE_BUSY",
+      })
+      const error = new SqlError({
+        reason: new LockTimeoutError({ cause, message: "Failed to execute statement", operation: "execute" }),
+      })
+      yield* HttpRouter.add("GET", "/sqlite-lock", Effect.die(error)).pipe(
+        Layer.provide(errorLayer),
+        HttpRouter.serve,
+        Layer.build,
+      )
+
+      const response = yield* HttpClientRequest.get("/sqlite-lock").pipe(HttpClient.execute)
+      const body = yield* response.json
+      const serialized = JSON.stringify(body)
+
+      expect(response.status).toBe(500)
+      expect(body).toMatchObject({
+        name: "UnknownError",
+        data: { message: "Database is locked (SQLITE_BUSY)" },
+      })
+      expect((body as { data?: { ref?: unknown } }).data?.ref).toMatch(/^err_[0-9a-f-]{8}$/)
+      expect(serialized).not.toContain("secret_marker")
     }),
   )
 

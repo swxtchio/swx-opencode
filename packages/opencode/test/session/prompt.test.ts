@@ -188,6 +188,14 @@ const blockingProcessor = Layer.succeed(
 const runtimeFlags = RuntimeFlags.layer({ experimentalEventSystem: true })
 
 const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })
+const processorCreateDie = LayerNode.make({
+  service: SessionProcessor.Service,
+  layer: Layer.succeed(
+    SessionProcessor.Service,
+    SessionProcessor.Service.of({ create: () => Effect.die(new Error("processor creation defect")) }),
+  ),
+  deps: [],
+})
 
 const promptRoot = LayerNode.group([
   SessionPrompt.node,
@@ -392,6 +400,15 @@ const gated = testEffect(
 )
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
+const processorDies = testEffect(
+  LayerNode.compile(promptRoot, [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, runtimeFlags],
+    [SessionProcessor.node, processorCreateDie],
+  ]),
+)
 const withMcpInstructions = testEffect(
   makeHttp({
     mcpInstructions: [
@@ -702,6 +719,53 @@ it.instance("loop calls LLM and returns assistant message", () =>
     expect(parts.some((p) => p.type === "text" && p.text === "world")).toBe(true)
     expect(yield* llm.hits).toHaveLength(1)
   }),
+)
+
+processorDies.instance(
+  "loop terminalizes the assistant when processor setup dies",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({
+        title: "Processor setup failure",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const errors: string[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID !== chat.id || !data.error) return Effect.void
+        errors.push(data.error.name)
+        return Effect.void
+      })
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "hello" }],
+      })
+      const exit = yield* Effect.exit(prompt.loop({ sessionID: chat.id }))
+      const messages = yield* sessions.messages({ sessionID: chat.id, limit: 10 })
+      const assistant = messages.findLast((message) => message.info.role === "assistant")
+      const state = yield* status.get(chat.id)
+      yield* off
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(state).toMatchObject({ type: "idle" })
+      expect(assistant?.info.role).toBe("assistant")
+      if (assistant?.info.role === "assistant") {
+        expect(assistant.info.time.completed).toBeDefined()
+        const error = assistant.info.error
+        expect(error?.name).toBe("UnknownError")
+        if (error?.name === "UnknownError") expect(errors).toContain(error.name)
+      }
+    }),
+  { config: cfg },
 )
 
 withMcpInstructions.instance(

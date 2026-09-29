@@ -688,14 +688,14 @@ const layer = Layer.effect(
       })
 
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
-        yield* Effect.logInfo("process", {
-          "session.id": input.sessionID,
-          messageID: input.assistantMessage.id,
-        })
-        ctx.needsCompaction = false
-        ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
-
         return yield* Effect.gen(function* () {
+          yield* Effect.logInfo("process", {
+            "session.id": input.sessionID,
+            messageID: input.assistantMessage.id,
+          })
+          ctx.needsCompaction = false
+          ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             ctx.reasoningMap = {}
@@ -742,7 +742,18 @@ const layer = Layer.effect(
           if (ctx.needsCompaction) return "compact"
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
           return "continue"
-        })
+        }).pipe(
+          Effect.catchCauseIf(
+            (cause) => !Cause.hasInterruptsOnly(cause),
+            (cause) =>
+              Effect.gen(function* () {
+                yield* halt(Cause.squash(cause))
+                ctx.assistantMessage.time.completed ??= Date.now()
+                yield* session.updateMessage(ctx.assistantMessage)
+                return "stop" as const
+              }),
+          ),
+        )
       })
 
       return {

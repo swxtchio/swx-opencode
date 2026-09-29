@@ -1,6 +1,7 @@
 import { NamedError } from "@opencode-ai/core/util/error"
 import { ConfigErrorV1 } from "@opencode-ai/core/v1/config/error"
 import { Cause, Effect } from "effect"
+import { isSqlError } from "effect/unstable/sql/SqlError"
 import { HttpRouter, HttpServerError, HttpServerRespondable, HttpServerResponse } from "effect/unstable/http"
 
 // Keep typed HttpApi failures on their declared error path; this boundary only replaces defect-only empty 500s.
@@ -27,12 +28,24 @@ export const errorLayer = HttpRouter.middleware<{ handles: unknown }>()((effect)
       }
 
       const ref = `err_${crypto.randomUUID().slice(0, 8)}`
+      const lockReason = isSqlError(error) && error.reason._tag === "LockTimeoutError" ? error.reason : undefined
+      const lockCause = lockReason?.cause
+      const lockCode =
+        typeof lockCause === "object" &&
+        lockCause !== null &&
+        "code" in lockCause &&
+        typeof lockCause.code === "string" &&
+        (lockCause.code.startsWith("SQLITE_BUSY") || lockCause.code.startsWith("SQLITE_LOCKED"))
+          ? lockCause.code
+          : "SQLITE_BUSY"
 
       return Effect.logError("failed", { ref, error, cause: Cause.pretty(cause) }).pipe(
         Effect.as(
           HttpServerResponse.jsonUnsafe(
             new NamedError.Unknown({
-              message: "Unexpected server error. Check server logs for details.",
+              message: lockReason
+                ? `Database is locked (${lockCode})`
+                : "Unexpected server error. Check server logs for details.",
               ref,
             }).toObject(),
             { status: 500 },

@@ -2,6 +2,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { afterAll, expect } from "bun:test"
 import { Database as Sqlite } from "bun:sqlite"
@@ -228,6 +229,43 @@ const replacements = [
   [SessionSummary.node, summary],
   [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
 ] as const
+
+const cleanupFault = { failed: false }
+const cleanupFaultEvent = LayerNode.make({
+  service: EventV2Bridge.Service,
+  layer: Layer.effect(
+    EventV2Bridge.Service,
+    Effect.gen(function* () {
+      const real = yield* EventV2Bridge.Service
+      const publish: EventV2.Interface["publish"] = (definition, data, options) =>
+        Effect.gen(function* () {
+          if (definition.type === SessionV1.Event.MessageUpdated.type) {
+            const update = data as typeof SessionV1.Event.MessageUpdated.data.Type
+            if (update.info.role === "assistant" && update.info.time.completed !== undefined && !cleanupFault.failed) {
+              cleanupFault.failed = true
+              return yield* Effect.die(new Error("one-shot cleanup persistence failure"))
+            }
+          }
+          return yield* real.publish(definition, data, options)
+        })
+      return EventV2Bridge.Service.of({
+        ...real,
+        publish,
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      EventV2Bridge.node.implementation as Layer.Layer<EventV2Bridge.Service, never, EventV2.Service>,
+    ),
+  ),
+  deps: [EventV2.node],
+})
+const cleanupFaultEnv = LayerNode.compile(
+  LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
+  [...replacements, [EventV2Bridge.node, cleanupFaultEvent]],
+)
+const itCleanupFault = testEffect(cleanupFaultEnv)
+
 const env = LayerNode.compile(
   LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
   replacements,
@@ -1013,6 +1051,69 @@ it.live("session.processor effect tests mark pending tools as aborted on cleanup
           expect(call.state.error).toBe("Tool execution aborted")
           expect(call.state.metadata?.interrupted).toBe(true)
           expect(call.state.time.end).toBeDefined()
+        }
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itCleanupFault.live("session.processor effect tests finalize the assistant when cleanup persistence dies", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        cleanupFault.failed = false
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const status = yield* SessionStatus.Service
+        const eventErrors: string[] = []
+
+        yield* llm.text("cleanup persistence")
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "cleanup failure")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const model = yield* provider.getModel(ref.providerID, ref.modelID)
+        const off = yield* events.listen((event) => {
+          if (event.type !== Session.Event.Error.type) return Effect.void
+          const data = event.data as typeof Session.Event.Error.data.Type
+          if (data.sessionID !== chat.id || !data.error) return Effect.void
+          eventErrors.push(data.error.name)
+          return Effect.void
+        })
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "cleanup failure" }],
+          tools: {},
+        })
+        const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+        const sessionStatus = yield* status.get(chat.id)
+        yield* off
+
+        expect(cleanupFault.failed).toBe(true)
+        expect(result).toBe("stop")
+        expect(sessionStatus).toMatchObject({ type: "idle" })
+        expect(yield* llm.calls).toBe(1)
+        expect(stored.info.role).toBe("assistant")
+        if (stored.info.role === "assistant") {
+          expect(stored.info.time.completed).toBeDefined()
+          const error = stored.info.error
+          expect(error?.name).toBe("UnknownError")
+          if (error?.name === "UnknownError") {
+            expect(error.data.message).toContain("one-shot cleanup persistence failure")
+            expect(eventErrors).toContain(error.name)
+          }
         }
       }),
     { config: (url) => providerCfg(url) },

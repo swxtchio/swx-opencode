@@ -1317,13 +1317,28 @@ const layer = Layer.effect(
             yield* sessions.updateMessage(msg)
           })
 
+          const finalizeFailedAssistant = (cause: Cause.Cause<unknown>) =>
+            Effect.gen(function* () {
+              msg.error ??= MessageV2.fromError(Cause.squash(cause), { providerID: msg.providerID })
+              msg.time.completed ??= Date.now()
+              yield* sessions.updateMessage(msg)
+              yield* events.publish(Session.Event.Error, { sessionID, error: msg.error })
+            })
+
           const handle = yield* processor
             .create({
               assistantMessage: msg,
               sessionID,
               model,
             })
-            .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
+            .pipe(
+              Effect.onInterrupt(() => finalizeInterruptedAssistant),
+              Effect.onExit((exit) =>
+                Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)
+                  ? finalizeFailedAssistant(exit.cause)
+                  : Effect.void,
+              ),
+            )
 
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
@@ -1440,6 +1455,11 @@ const layer = Layer.effect(
           }).pipe(
             Effect.ensuring(instruction.clear(handle.message.id)),
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
+            Effect.onExit((exit) =>
+              Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)
+                ? finalizeFailedAssistant(exit.cause)
+                : Effect.void,
+            ),
           )
           if (outcome === "break") break
           continue
