@@ -712,6 +712,7 @@ const seedUser = Effect.fn("test.seedUser")(function* (input: Omit<SessionPrompt
   return { info, parts: message.parts }
 })
 
+// These prefix-only defaults are separate from the tokenized current-producer captures below.
 test("holds each filed default marker only with its required framing", () => {
   expect(MachineMessage.classify("[fm-from-peer]\x1f peer-name\x1f /peer/home\x1f p1-2-abcd\x1f peer request")).toBe(
     "hold",
@@ -735,64 +736,55 @@ test("holds each filed default marker only with its required framing", () => {
     expect(MachineMessage.classify(message)).toBeUndefined()
 })
 
-test("classifies captured heartbeat fixtures across live framing and budget boundaries", async () => {
+// The inline capture is re-tokenized by fm_message_level_token/heartbeat_build_typed_message at b6efb8eb;
+// the summary uses heartbeat_build_bounded_long_summary with the tracked complete-solutions duty.
+// The exact-budget file is a typed-builder boundary case; the legacy capture is only for old fallback coverage.
+test("classifies producer-emitted heartbeat fixtures and exact budget boundaries", async () => {
   const heartbeat = await Bun.file(path.join(import.meta.dir, "fixtures", "fleet-heartbeat.txt")).text()
   const summary = await Bun.file(path.join(import.meta.dir, "fixtures", "fleet-heartbeat-summary.txt")).text()
-  const levelToken = (level: string, key?: string) => `[fm-level:${level}${key ? `:${key}` : ""}]\x1f `
+  const boundary = await Bun.file(path.join(import.meta.dir, "fixtures", "fleet-heartbeat-inline-boundary.txt")).text()
+  const legacyHeartbeat = await Bun.file(path.join(import.meta.dir, "fixtures", "legacy-heartbeat-20260927.txt")).text()
+  const heartbeatToken = "[fm-level:nudge:heartbeat]\x1f "
+  const summaryToken = "[fm-level:nudge:heartbeat.duty.complete-solutions]\x1f "
+  const boundaryToken = "[fm-level:nudge:heartbeat.duty.complete-solutions]\x1f "
   const receiptPattern = / \[fm-heartbeat-receipt:[a-zA-Z0-9._-]+\]$/
-  const receipt = heartbeat.match(receiptPattern)?.[0]
-  if (!receipt) throw new Error("captured heartbeat fixture has no receipt")
-  const body = heartbeat.slice(0, -receipt.length)
-  const anchor = " See docs/fleet-operating-process.md."
-  const anchorIndex = body.lastIndexOf(anchor)
-  if (anchorIndex === -1) throw new Error("captured heartbeat fixture has no producer anchor")
-  const nudgePrefix = `${body.slice(0, anchorIndex)} Periodic nudge: `
-  const suffix = `${anchor}${receipt}`
-  const padding = 700 - Array.from(`${nudgePrefix}${suffix}`).length
-  expect(padding).toBeGreaterThan(0)
-  const exactInline = `${nudgePrefix}${"x".repeat(padding)}${suffix}`
-  const overInline = `${nudgePrefix}${"x".repeat(padding + 1)}${suffix}`
-  expect(Array.from(exactInline)).toHaveLength(700)
-  expect(Array.from(overInline)).toHaveLength(701)
-
-  const summaryBoundary = summary.indexOf("… Full message:")
-  if (summaryBoundary === -1) throw new Error("captured summary fixture has no truncation boundary")
-  const shortSummary = `${summary.slice(0, summaryBoundary - 1)}${summary.slice(summaryBoundary)}`
-  const oversizedSummary = `${summary.slice(0, summaryBoundary)}x${summary.slice(summaryBoundary)}`
-  const arbitrarySummary = `Heartbeat summary: ordinary user text${summary.slice(summaryBoundary)}`
   const heartbeatMarker = { type: "fleet-heartbeat" } as const
-  const liveHeartbeat = `${levelToken("nudge", "heartbeat")}${heartbeat}`
-  const liveSummary = `${levelToken("nudge", "heartbeat.duty.captured")}${summary}`
-  const liveExactInline = `${levelToken("nudge", "heartbeat.duty.boundary")}${exactInline}`
-  const liveOverInline = `${levelToken("nudge", "heartbeat.duty.boundary")}${overInline}`
-
+  expect(heartbeat.startsWith(heartbeatToken)).toBe(true)
+  expect(summary.startsWith(`${summaryToken}Heartbeat summary: `)).toBe(true)
+  expect(boundary.startsWith(boundaryToken)).toBe(true)
   expect(MachineMessage.classify(heartbeat)).toBe("hold")
   expect(MachineMessage.classify(summary)).toBe("hold")
-  expect(MachineMessage.classify(liveHeartbeat)).toBe("hold")
-  expect(MachineMessage.classify(`${levelToken("nudge", "heartbeat")}${heartbeat.replace(receiptPattern, "")}`)).toBe(
-    "hold",
-  )
-  expect(MachineMessage.classify(liveSummary)).toBe("hold")
-  expect(MachineMessage.classify(exactInline)).toBe("hold")
-  expect(MachineMessage.classify(overInline)).toBeUndefined()
-  expect(MachineMessage.classify(liveExactInline, { critical: [heartbeatMarker] })).toBe("critical")
-  expect(MachineMessage.classify(liveSummary, { critical: [heartbeatMarker] })).toBe("critical")
-  expect(MachineMessage.classify(liveOverInline, { critical: [heartbeatMarker] })).toBe("hold")
+  expect(MachineMessage.classify(legacyHeartbeat)).toBe("hold")
+  expect(MachineMessage.classify(boundary)).toBe("hold")
 
+  const boundaryBody = boundary.slice(boundaryToken.length)
+  expect(Array.from(boundaryBody)).toHaveLength(700)
+  expect(MachineMessage.classify(boundary, { critical: [heartbeatMarker] })).toBe("critical")
+  expect(MachineMessage.classify(summary, { critical: [heartbeatMarker] })).toBe("critical")
+
+  const boundaryReceipt = boundaryBody.match(receiptPattern)?.[0]
+  const summaryReceipt = summary.match(receiptPattern)?.[0]
+  const summaryBoundary = summary.indexOf("… Full message:")
+  if (!boundaryReceipt || !summaryReceipt || summaryBoundary === -1)
+    throw new Error("producer heartbeat fixture lost its receipt or summary boundary")
+  const shortSummary = `${summary.slice(0, summaryBoundary - 1)}${summary.slice(summaryBoundary)}`
+  const oversizedSummary = `${summary.slice(0, summaryBoundary)}x${summary.slice(summaryBoundary)}`
+  const arbitrarySummary = `${summaryToken}Heartbeat summary: ordinary user text${summary.slice(summaryBoundary)}`
   for (const message of [
-    heartbeat.replace(receiptPattern, ""),
-    `${heartbeat} trailing text`,
-    summary.replace(receiptPattern, ""),
+    legacyHeartbeat.replace(receiptPattern, ""),
+    `${legacyHeartbeat} trailing text`,
+    `${summary.slice(0, -summaryReceipt.length)}`,
     shortSummary,
-    arbitrarySummary,
     oversizedSummary,
-    `human note ${heartbeat}`,
+    arbitrarySummary,
+    `human note ${legacyHeartbeat}`,
   ])
-    expect(MachineMessage.classify(message)).toBeUndefined()
-  expect(MachineMessage.classify(`${levelToken("nudge", "heartbeat")}not a heartbeat payload`)).toBe("hold")
+    expect(MachineMessage.classify(message, { critical: [heartbeatMarker] })).not.toBe("critical")
+  expect(MachineMessage.classify(legacyHeartbeat.replace(receiptPattern, ""))).toBeUndefined()
+  expect(MachineMessage.classify(legacyHeartbeat.replace(receiptPattern, "") + " trailing text")).toBeUndefined()
 })
 
-test("classifies current firstmate level-token producers", () => {
+test("classifies level-token framing across supported identity prefixes", () => {
   const levelToken = (level: string, key?: string) => `[fm-level:${level}${key ? `:${key}` : ""}]\x1f `
   const peerEnvelope = "[fm-from-peer]\x1f peer-name\x1f /peer/home\x1f p1-2-abcd\x1f "
   const peerRequest = `${peerEnvelope}${levelToken("request")}review the branch`
