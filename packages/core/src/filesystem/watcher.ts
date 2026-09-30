@@ -16,7 +16,7 @@ import { Git } from "../git"
 import { Location } from "../location"
 import { Ignore } from "./ignore"
 import { ParcelBinding } from "./parcel-binding"
-import type { Request, Response } from "./parcel-worker"
+import type { Reply, Request, Response } from "./parcel-worker"
 import { Protected } from "./protected"
 
 declare const OPENCODE_WATCHER_WORKER_PATH: string | undefined
@@ -132,7 +132,7 @@ const layer = Layer.effect(
     }
 
     // The root watch needs parcel's recursive ignore support, so it keeps parcel
-    // but runs the subscription in a worker (see parcel-worker.ts). Only the
+    // but subscribes through the parcel worker (see parcel-worker.ts). Only the
     // worker's acknowledgement marks it active.
     function watchRoot(directory: string, ignore: string[]) {
       return Effect.gen(function* () {
@@ -144,41 +144,32 @@ const layer = Layer.effect(
         if (!ParcelBinding.load())
           return report({ watch: "root", directory, state: "unavailable", reason: "native binding unavailable" })
 
-        const worker = yield* Effect.try({ try: () => new Worker(workerTarget()), catch: (error) => error }).pipe(
+        const host = yield* Effect.try({ try: parcelHost, catch: (error) => error }).pipe(
           Effect.catch((error) => Effect.sync(() => void report(failure("root", directory, error)))),
         )
-        if (!worker) return
-        // A worker parked in native code can never be terminated, so it must not
-        // hold the process open.
-        worker.unref()
+        if (!host) return
+        const id = host.next++
         const unsubscribed = yield* Deferred.make<void>()
-        const stopping = { value: false }
         statuses.set("root", { watch: "root", directory, state: "starting" })
 
-        worker.on("message", (response: Response) => {
-          if (response.type === "updates")
-            return response.updates.forEach((update) => publish(update.path, KINDS[update.type]))
-          if (response.type === "subscribed") return report({ watch: "root", directory, state: "active" })
-          if (response.type === "failed" || response.type === "error")
-            return report({ watch: "root", directory, state: "unavailable", reason: response.message })
-          if (response.type === "unsubscribed") Deferred.doneUnsafe(unsubscribed, Effect.void)
+        host.listeners.set(id, (reply) => {
+          if (reply.type === "updates")
+            return reply.updates.forEach((update) => publish(update.path, KINDS[update.type]))
+          if (reply.type === "subscribed") return report({ watch: "root", directory, state: "active" })
+          if (reply.type === "failed" || reply.type === "error")
+            return report({ watch: "root", directory, state: "unavailable", reason: reply.message })
+          if (reply.type === "unsubscribed") Deferred.doneUnsafe(unsubscribed, Effect.void)
         })
-        worker.on("error", (error) => report(failure("root", directory, error)))
-        worker.on("exit", (code) => {
-          if (!stopping.value)
-            report({ watch: "root", directory, state: "unavailable", reason: `worker exited (${code})` })
-        })
-        worker.postMessage({ type: "subscribe", directory, ignore, backend } satisfies Request)
+        host.worker.postMessage({ id, type: "subscribe", directory, ignore, backend } satisfies Request)
 
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
-            stopping.value = true
-            if (statuses.get("root")?.state === "active") {
-              worker.postMessage({ type: "unsubscribe" } satisfies Request)
+            // Always sent, so a subscription acknowledged after disposal is released.
+            host.worker.postMessage({ id, type: "unsubscribe" } satisfies Request)
+            // Awaited only when active: a parked worker never answers.
+            if (statuses.get("root")?.state === "active")
               yield* Deferred.await(unsubscribed).pipe(Effect.timeoutOption(SUBSCRIBE_TIMEOUT_MS))
-            }
-            // Not awaited: a worker parked in native code never finishes exiting.
-            void worker.terminate()
+            host.listeners.delete(id)
           }),
         )
         yield* Effect.sleep(SUBSCRIBE_TIMEOUT_MS).pipe(
@@ -220,6 +211,30 @@ function failure(watch: WatchStatus["watch"], directory: string, error: unknown)
     state: "unavailable",
     reason: code && !message.includes(code) ? `${code}: ${message}` : message,
   }
+}
+
+type ParcelHost = { worker: Worker; listeners: Map<number, (reply: Reply) => void>; next: number }
+
+const parcel: { host?: ParcelHost } = {}
+
+// The one worker that owns every parcel subscription in this process. It is
+// never terminated: a worker parked in native code cannot be, so it is unref'd
+// and must not hold the process open. If it dies, every subscription it held
+// becomes unavailable and the next root watch starts a new worker.
+function parcelHost() {
+  if (parcel.host) return parcel.host
+  const worker = new Worker(workerTarget())
+  worker.unref()
+  const host: ParcelHost = { worker, listeners: new Map(), next: 0 }
+  const fail = (message: string) => {
+    if (parcel.host === host) parcel.host = undefined
+    host.listeners.forEach((listener) => listener({ type: "failed", message }))
+  }
+  worker.on("message", (response: Response) => host.listeners.get(response.id)?.(response))
+  worker.on("error", (error) => fail(error.message))
+  worker.on("exit", (code) => fail(`watcher worker exited (${code})`))
+  parcel.host = host
+  return host
 }
 
 function workerTarget() {

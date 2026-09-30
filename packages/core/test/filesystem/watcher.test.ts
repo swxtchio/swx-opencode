@@ -2,7 +2,7 @@ import { $ } from "bun"
 import { describe, expect, test } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
-import { ConfigProvider, Deferred, Duration, Effect, Fiber, Layer, Option, Stream } from "effect"
+import { ConfigProvider, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Scope, Stream } from "effect"
 import { Config } from "@opencode-ai/core/config"
 import { ConfigWatcher } from "@opencode-ai/core/config/watcher"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -22,9 +22,13 @@ type WatcherEvent = { file: string; event: "add" | "change" | "unlink" }
 
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([FSUtil.node, EventV2.node])))
 
-type Options = { root?: boolean; ignore?: string[] }
+type Options = { root?: boolean; ignore?: string[]; events?: EventV2.Interface }
 
 function provide(directory: string, vcs?: Location.Interface["vcs"], options?: Options) {
+  return Effect.provide(watcherLayer(directory, vcs, options))
+}
+
+function watcherLayer(directory: string, vcs?: Location.Interface["vcs"], options?: Options) {
   const configLayer = Layer.succeed(
     Config.Service,
     Config.Service.of({
@@ -51,12 +55,11 @@ function provide(directory: string, vcs?: Location.Interface["vcs"], options?: O
     Location.Service,
     Location.Service.of(location({ directory: AbsolutePath.make(directory) }, { vcs })),
   )
-  return Effect.provide(
-    AppNodeBuilder.build(Watcher.node, [
-      [Config.node, configLayer],
-      [Location.node, locationLayer],
-    ]).pipe(Layer.provide(flagsLayer)),
-  )
+  return AppNodeBuilder.build(Watcher.node, [
+    [Config.node, configLayer],
+    [Location.node, locationLayer],
+    ...(options?.events ? [[EventV2.node, Layer.succeed(EventV2.Service, options.events)] as const] : []),
+  ]).pipe(Layer.provide(flagsLayer))
 }
 
 function withTmp<A, E, R>(
@@ -341,6 +344,45 @@ describeWatcher("Watcher", () => {
         }),
       { git: true, ignore: [".git"] },
     ),
+  )
+
+  it.live(
+    "keeps concurrent root watches independent when one is disposed",
+    () =>
+      Effect.gen(function* () {
+        const [first, second] = yield* Effect.all(
+          [0, 1].map(() =>
+            Effect.acquireRelease(
+              Effect.promise(() => tmpdir()),
+              (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+            ),
+          ),
+        )
+        const vcs = (directory: string) => ({
+          type: "git" as const,
+          store: AbsolutePath.make(path.join(directory, ".git")),
+        })
+        // Fresh layers, so each directory gets its own watcher instead of a memoized
+        // one, publishing to this test's event bus.
+        const events = yield* EventV2.Service
+        const firstScope = yield* Scope.make()
+        const firstContext = yield* Layer.buildWithScope(
+          Layer.fresh(watcherLayer(first.path, vcs(first.path), { events })),
+          firstScope,
+        )
+        const secondContext = yield* Layer.build(Layer.fresh(watcherLayer(second.path, vcs(second.path), { events })))
+        yield* ready(first.path).pipe(Effect.provide(firstContext))
+        yield* ready(second.path).pipe(Effect.provide(secondContext))
+        yield* Scope.close(firstScope, Exit.void)
+        const afs = yield* FSUtil.Service
+        const file = path.join(second.path, "after-first-disposed.txt")
+        expect(
+          yield* nextUpdate((event) => event.file === file, afs.writeFileString(file, "still")).pipe(
+            Effect.provide(secondContext),
+          ),
+        ).toEqual({ file, event: "add" })
+      }),
+    20_000,
   )
 
   const describeSymlink = process.platform !== "win32" ? describe : describe.skip
