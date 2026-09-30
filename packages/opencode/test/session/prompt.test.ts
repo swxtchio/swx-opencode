@@ -4898,6 +4898,98 @@ it.instance(
 )
 
 it.instance(
+  "holds marked noReply input out of an active run until the terminal boundary",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      yield* writeText(path.join(dir, "noReply-tool.txt"), "active run continuation")
+      const session = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const toolGate = yield* Deferred.make<void>()
+      const stopGate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() =>
+        Effect.all(
+          [toolGate, stopGate].map((gate) => Deferred.succeed(gate, void 0).pipe(Effect.ignore)),
+          { discard: true },
+        ),
+      )
+
+      yield* llm.push(
+        reply().wait(deferredAsPromise(toolGate)).tool("glob", { pattern: "noReply-tool.txt" }).item(),
+        reply().wait(deferredAsPromise(stopGate)).text("active task finished").stop().item(),
+        reply().text("held noReply handled").stop().item(),
+      )
+      const task = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          agent: "build",
+          model: ref,
+          parts: said("original task"),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "provider did not receive the active task", "10 seconds")
+
+      const messageID = MessageID.ascending()
+      const markedText = "[fm-from-firstmate]\x1f noReply machine mail"
+      const staged = yield* prompt.prompt({
+        sessionID: session.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: said(markedText),
+      })
+      if (staged.info.role !== "user") throw new Error("expected the staged noReply user")
+      expect(staged.info.noReply).toBe(true)
+      const pending = yield* pollWithTimeout(
+        queue.list(session.id).pipe(Effect.map((items) => items.find((item) => item.input.messageID === messageID))),
+        "marked noReply input was not held in the queue",
+        "10 seconds",
+      )
+      expect(pending.delivery).toBe("queue")
+      expect(
+        (yield* sessions.messages({ sessionID: session.id })).some(
+          (message) => message.info.role === "user" && message.info.id === messageID,
+        ),
+      ).toBe(false)
+      expect(yield* llm.calls).toBe(1)
+
+      yield* Deferred.succeed(toolGate, void 0)
+      yield* awaitWithTimeout(llm.wait(2), "active task continuation did not start", "10 seconds")
+      const continuation = (yield* llm.inputs)[1]
+      if (!continuation) throw new Error("expected the active task continuation")
+      expect(JSON.stringify(continuation.messages)).not.toContain("noReply machine mail")
+
+      yield* Deferred.succeed(stopGate, void 0)
+      yield* awaitWithTimeout(llm.wait(3), "held noReply message did not start after the run", "10 seconds")
+      const heldTurn = (yield* llm.inputs)[2]
+      if (!heldTurn) throw new Error("expected the held noReply provider request")
+      expect(JSON.stringify(heldTurn.messages)).toContain("noReply machine mail")
+
+      const runExit = yield* awaitWithTimeout(Fiber.await(task), "active task did not finish", "10 seconds")
+      expect(Exit.isSuccess(runExit)).toBe(true)
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const promoted = messages.find(
+        (message) =>
+          message.info.role === "user" &&
+          message.parts.some((part) => part.type === "text" && part.text === markedText),
+      )
+      if (!promoted) throw new Error("expected the promoted noReply message")
+      expect(
+        messages.some((message) => message.info.role === "assistant" && message.info.parentID === promoted.info.id),
+      ).toBe(true)
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(yield* llm.calls).toBe(3)
+    }),
+  60_000,
+)
+
+it.instance(
   "a queued prompt with an older supplied messageID is stored after the reply it waited for",
   () =>
     Effect.gen(function* () {

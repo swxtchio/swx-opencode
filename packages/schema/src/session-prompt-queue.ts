@@ -53,8 +53,9 @@ export const Input = Schema.Struct({
 })
 export type Input = Schema.Schema.Type<typeof Input>
 
-// What a pending item delivers. noReply prompts are never queued, and the
-// item's own delivery supersedes the one it was admitted with.
+// What a pending item delivers. noReply controls the admission call; a held
+// noReply can be queued and becomes a normal turn when promoted. The item's own
+// delivery supersedes the one it was admitted with.
 export const QueuedInput = Schema.Struct(Struct.omit(Input.fields, ["noReply", "delivery"])).annotate({
   identifier: "SessionPromptQueueInput",
 })

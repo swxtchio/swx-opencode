@@ -1103,19 +1103,19 @@ const layer = Layer.effect(
         (yield* config.get()).machine_message_markers,
       )
       const delivery = classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
-      // noReply keeps its direct write and never drains. Every other prompt is
-      // admitted to the durable queue first; a steer is promoted at once, unless a
-      // pending compaction must run first, so it still reaches the running turn's
-      // next step as it did before the queue.
+      const heldNoReply = input.noReply === true && classification === "hold"
+      const queuedInput = heldNoReply && !input.messageID ? { ...input, messageID: MessageID.ascending() } : input
+      // noReply normally writes directly and never drains. A marked noReply is
+      // parked instead so it cannot bypass the active run's hold boundary.
       const entry =
-        input.noReply === true
+        input.noReply === true && !heldNoReply
           ? {
               kind: "direct" as const,
               message: yield* queue.exclusive(input.sessionID, createUserMessage(input)),
             }
           : {
               kind: "queued" as const,
-              own: yield* queue.admit({ ...input, ...(delivery ? { delivery } : {}) }),
+              own: yield* queue.admit({ ...queuedInput, ...(delivery ? { delivery } : {}) }),
             }
       if (entry.kind === "queued") yield* Effect.addFinalizer(() => queue.forget(entry.own.id))
       // Only this prompt's own failure is this caller's error; an older steer
@@ -1141,6 +1141,7 @@ const layer = Layer.effect(
       }
 
       if (entry.kind === "direct") return entry.message
+      if (input.noReply === true) return yield* prepareUserMessage(queuedInput)
       return yield* drain(input.sessionID, entry.own.id)
     }, Effect.scoped)
 
