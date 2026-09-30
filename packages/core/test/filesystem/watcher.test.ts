@@ -1,9 +1,10 @@
 import { $ } from "bun"
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
 import { ConfigProvider, Deferred, Duration, Effect, Fiber, Layer, Option, Stream } from "effect"
 import { Config } from "@opencode-ai/core/config"
+import { ConfigWatcher } from "@opencode-ai/core/config/watcher"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -21,21 +22,31 @@ type WatcherEvent = { file: string; event: "add" | "change" | "unlink" }
 
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([FSUtil.node, EventV2.node])))
 
-const configLayer = Layer.succeed(
-  Config.Service,
-  Config.Service.of({
-    entries: () => Effect.succeed([]),
-  }),
-)
+type Options = { root?: boolean; ignore?: string[] }
 
-const flagsLayer = ConfigProvider.layer(
-  ConfigProvider.fromUnknown({
-    OPENCODE_EXPERIMENTAL_FILEWATCHER: "true",
-    OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: "false",
-  }),
-)
-
-function provide(directory: string, vcs?: Location.Interface["vcs"]) {
+function provide(directory: string, vcs?: Location.Interface["vcs"], options?: Options) {
+  const configLayer = Layer.succeed(
+    Config.Service,
+    Config.Service.of({
+      entries: () =>
+        Effect.succeed(
+          options?.ignore
+            ? [
+                new Config.Document({
+                  type: "document",
+                  info: new Config.Info({ watcher: new ConfigWatcher.Info({ ignore: options.ignore }) }),
+                }),
+              ]
+            : [],
+        ),
+    }),
+  )
+  const flagsLayer = ConfigProvider.layer(
+    ConfigProvider.fromUnknown({
+      OPENCODE_EXPERIMENTAL_FILEWATCHER: options?.root === false ? "false" : "true",
+      OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: "false",
+    }),
+  )
   const locationLayer = Layer.succeed(
     Location.Service,
     Location.Service.of(location({ directory: AbsolutePath.make(directory) }, { vcs })),
@@ -50,23 +61,27 @@ function provide(directory: string, vcs?: Location.Interface["vcs"]) {
 
 function withTmp<A, E, R>(
   f: (directory: string, vcs?: Location.Interface["vcs"]) => Effect.Effect<A, E, R>,
-  options?: { git?: boolean; init?: (directory: string) => Promise<void> },
+  options?: { git?: boolean; init?: (directory: string) => Promise<void> } & Options,
 ) {
   return Effect.acquireRelease(
     Effect.promise(async () => {
       const tmp = await tmpdir()
       if (!options?.git) return { tmp, vcs: undefined }
-      await $`git init`.cwd(tmp.path).quiet()
-      await $`git config core.fsmonitor false`.cwd(tmp.path).quiet()
-      await $`git config commit.gpgsign false`.cwd(tmp.path).quiet()
-      await $`git config user.email test@opencode.test`.cwd(tmp.path).quiet()
-      await $`git config user.name Test`.cwd(tmp.path).quiet()
-      await $`git commit --allow-empty -m root`.cwd(tmp.path).quiet()
+      await gitInit(tmp.path)
       await options.init?.(tmp.path)
       return { tmp, vcs: { type: "git" as const, store: AbsolutePath.make(path.join(tmp.path, ".git")) } }
     }),
     ({ tmp }) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
-  ).pipe(Effect.flatMap(({ tmp, vcs }) => f(tmp.path, vcs).pipe(provide(tmp.path, vcs))))
+  ).pipe(Effect.flatMap(({ tmp, vcs }) => f(tmp.path, vcs).pipe(provide(tmp.path, vcs, options))))
+}
+
+async function gitInit(directory: string) {
+  await $`git init`.cwd(directory).quiet()
+  await $`git config core.fsmonitor false`.cwd(directory).quiet()
+  await $`git config commit.gpgsign false`.cwd(directory).quiet()
+  await $`git config user.email test@opencode.test`.cwd(directory).quiet()
+  await $`git config user.name Test`.cwd(directory).quiet()
+  await $`git commit --allow-empty -m root`.cwd(directory).quiet()
 }
 
 function wait(check: (event: WatcherEvent) => boolean) {
@@ -232,6 +247,102 @@ describeWatcher("Watcher", () => {
     ),
   )
 
+  it.live("publishes .git/HEAD events when git switches branches", () =>
+    withTmp(
+      (directory) =>
+        Effect.gen(function* () {
+          const head = path.join(yield* Effect.promise(() => fs.realpath(path.join(directory, ".git"))), "HEAD")
+          const branch = `switch-${Math.random().toString(36).slice(2)}`
+          expect(
+            yield* nextUpdate(
+              (event) => event.file === head,
+              Effect.promise(() => $`git switch -q -c ${branch}`.cwd(directory).quiet()),
+            ),
+          ).toMatchObject({ file: head })
+        }),
+      { git: true, root: false },
+    ),
+  )
+
+  it.live("publishes .git/HEAD events for a linked worktree's git directory", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      )
+      const worktree = path.join(tmp.path, "..", `wt_${path.basename(tmp.path)}`)
+      yield* Effect.addFinalizer(() => Effect.promise(() => fs.rm(worktree, { recursive: true, force: true })))
+      const head = yield* Effect.promise(async () => {
+        await gitInit(tmp.path)
+        await $`git worktree add -q -b ${path.basename(worktree)} ${worktree}`.cwd(tmp.path).quiet()
+        const gitDirectory = (await $`git rev-parse --absolute-git-dir`.cwd(worktree).text()).trim()
+        return path.join(await fs.realpath(gitDirectory), "HEAD")
+      })
+      const branch = `switch-${Math.random().toString(36).slice(2)}`
+      expect(
+        yield* nextUpdate(
+          (event) => event.file === head,
+          Effect.promise(() => $`git switch -q -c ${branch}`.cwd(worktree).quiet()),
+        ).pipe(
+          provide(worktree, { type: "git", store: AbsolutePath.make(path.join(tmp.path, ".git")) }, { root: false }),
+        ),
+      ).toMatchObject({ file: head })
+    }),
+  )
+
+  it.live("reports each started watch active", () =>
+    withTmp(
+      (directory) =>
+        Effect.gen(function* () {
+          const git = yield* Effect.promise(() => fs.realpath(path.join(directory, ".git")))
+          yield* ready(directory)
+          const watcher = yield* Watcher.Service
+          expect(yield* watcher.status).toEqual([
+            { watch: "git", directory: git, state: "active" },
+            { watch: "root", directory, state: "active" },
+          ])
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live("keeps the root watch inactive when it is not enabled", () =>
+    withTmp(
+      (directory) =>
+        Effect.gen(function* () {
+          const afs = yield* FSUtil.Service
+          const git = yield* Effect.promise(() => fs.realpath(path.join(directory, ".git")))
+          const watcher = yield* Watcher.Service
+          expect(yield* watcher.status).toEqual([{ watch: "git", directory: git, state: "active" }])
+          const file = path.join(directory, "root-off.txt")
+          yield* noUpdate((event) => event.file === file, afs.writeFileString(file, "off"))
+          const branch = `switch-${Math.random().toString(36).slice(2)}`
+          expect(
+            yield* nextUpdate(
+              (event) => event.file === path.join(git, "HEAD"),
+              Effect.promise(() => $`git switch -q -c ${branch}`.cwd(directory).quiet()),
+            ),
+          ).toMatchObject({ file: path.join(git, "HEAD") })
+        }),
+      { git: true, root: false },
+    ),
+  )
+
+  it.live("keeps the git watch inactive when .git is ignored", () =>
+    withTmp(
+      (directory) =>
+        Effect.gen(function* () {
+          const afs = yield* FSUtil.Service
+          yield* ready(directory)
+          const watcher = yield* Watcher.Service
+          expect(yield* watcher.status).toEqual([{ watch: "root", directory, state: "active" }])
+          const head = path.join(directory, ".git", "HEAD")
+          yield* noUpdate((event) => event.file === head, afs.writeFileString(head, "ref: refs/heads/ignored\n"))
+        }),
+      { git: true, ignore: [".git"] },
+    ),
+  )
+
   const describeSymlink = process.platform !== "win32" ? describe : describe.skip
   describeSymlink("symlinked .git", () => {
     it.live("publishes .git/HEAD events through a symlinked .git directory", () =>
@@ -263,4 +374,97 @@ describeWatcher("Watcher", () => {
       ),
     )
   })
+})
+
+// Runs the production watcher in a child whose rootless user namespace caps
+// inotify instances, so the kernel really refuses them without touching the
+// shared per-user pool beyond that cap.
+const canCapInotify =
+  process.platform === "linux" &&
+  Bun.spawnSync(["unshare", "-U", "-r", "sh", "-c", "echo 1 > /proc/sys/user/max_inotify_instances"]).exitCode === 0
+const describeRefusal = canCapInotify && Watcher.hasNativeBinding() && !process.env.CI ? describe : describe.skip
+
+type ChildReport = {
+  booted: Watcher.WatchStatus[]
+  instances: number
+  progressed: boolean
+  headEvent?: string
+  settled?: Watcher.WatchStatus[]
+}
+
+async function underInotifyLimit(limit: number, options: { waitRoot?: boolean } = {}) {
+  await using tmp = await tmpdir()
+  await gitInit(tmp.path)
+  const child = Bun.spawn(
+    [
+      "unshare",
+      "-U",
+      "-r",
+      "sh",
+      "-c",
+      `echo ${limit} > /proc/sys/user/max_inotify_instances && exec "$0" "$@"`,
+      process.execPath,
+      path.join(import.meta.dir, "../fixture/watcher-child.ts"),
+      tmp.path,
+      options.waitRoot ? "wait-root" : "",
+    ],
+    { stdout: "pipe", stderr: "pipe" },
+  )
+  // A parked JavaScript thread never finishes on its own; the bound turns that
+  // into a failure of this test instead of a hang.
+  const exited = await Promise.race([child.exited, Bun.sleep(25_000).then(() => undefined)])
+  if (exited === undefined) {
+    child.kill("SIGKILL")
+    await child.exited
+    throw new Error(`watcher child under inotify limit ${limit} made no progress: its JavaScript thread is parked`)
+  }
+  const stdout = await new Response(child.stdout).text()
+  if (exited !== 0)
+    throw new Error(`watcher child exited ${exited}: ${stdout}${await new Response(child.stderr).text()}`)
+  return {
+    report: JSON.parse(stdout.trim().split("\n").at(-1)!) as ChildReport,
+    directory: await fs.realpath(tmp.path),
+  }
+}
+
+describeRefusal("Watcher under refused inotify instances", () => {
+  test("keeps its thread running and reports every refused watch as not active", async () => {
+    const { report, directory } = await underInotifyLimit(0, { waitRoot: true })
+    expect(report.progressed).toBe(true)
+    expect(report.instances).toBe(0)
+    expect(report.booted).toEqual([
+      {
+        watch: "git",
+        directory: path.join(directory, ".git"),
+        state: "unavailable",
+        reason: expect.stringContaining("EMFILE"),
+      },
+      { watch: "root", directory, state: "starting" },
+    ])
+    expect(report.headEvent).toBeUndefined()
+    expect(report.settled?.find((item) => item.watch === "root")).toMatchObject({ state: "unconfirmed" })
+  }, 40_000)
+
+  test("keeps a started git watch delivering when the root watch is refused", async () => {
+    const { report, directory } = await underInotifyLimit(1)
+    expect(report.progressed).toBe(true)
+    // The one permitted instance belongs to the git watch, so the root
+    // watch's native subscription was refused.
+    expect(report.instances).toBe(1)
+    expect(report.booted).toEqual([
+      { watch: "git", directory: path.join(directory, ".git"), state: "active" },
+      { watch: "root", directory, state: "starting" },
+    ])
+    expect(report.headEvent).toBe("change")
+  }, 40_000)
+
+  test("starts every watch under ordinary capacity", async () => {
+    const { report, directory } = await underInotifyLimit(64, { waitRoot: true })
+    expect(report.progressed).toBe(true)
+    expect(report.headEvent).toBe("change")
+    expect(report.settled).toEqual([
+      { watch: "git", directory: path.join(directory, ".git"), state: "active" },
+      { watch: "root", directory, state: "active" },
+    ])
+  }, 40_000)
 })
