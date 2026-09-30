@@ -1,5 +1,6 @@
 import { $ } from "bun"
 import { describe, expect, test } from "bun:test"
+import { mkdirSync, rmSync } from "fs"
 import fs from "fs/promises"
 import path from "path"
 import { ConfigProvider, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Scope, Stream } from "effect"
@@ -265,6 +266,44 @@ describeWatcher("Watcher", () => {
               Effect.promise(() => $`git switch -q -c ${branch}`.cwd(directory).quiet()),
             ),
           ).toMatchObject({ file: head })
+        }),
+      { git: true, root: false },
+    ),
+  )
+
+  it.live("reports the git watch unconfirmed instead of crashing when HEAD cannot be read", () =>
+    withTmp(
+      (directory) =>
+        Effect.gen(function* () {
+          const afs = yield* FSUtil.Service
+          const watcher = yield* Watcher.Service
+          const git = yield* Effect.promise(() => fs.realpath(path.join(directory, ".git")))
+          const head = path.join(git, "HEAD")
+          const gitState = (state: Watcher.WatchState) =>
+            Effect.gen(function* () {
+              const deadline = Date.now() + 10_000
+              while (true) {
+                const current = (yield* watcher.status).find((item) => item.watch === "git")
+                if (current?.state === state) return current
+                if (Date.now() > deadline)
+                  return yield* Effect.fail(new Error(`git watch never became ${state}: ${JSON.stringify(current)}`))
+                yield* Effect.promise(() => Bun.sleep(20))
+              }
+            })
+          yield* gitState("active")
+          // A directory where HEAD was exists but cannot be read as a file, so the
+          // watch callback's read fails the way a racing replacement can. Both steps
+          // are synchronous, so no callback can run between them.
+          yield* Effect.sync(() => {
+            rmSync(head)
+            mkdirSync(head)
+          })
+          expect(yield* gitState("unconfirmed")).toMatchObject({ reason: expect.stringContaining("EISDIR") })
+          yield* Effect.promise(() => fs.rmdir(head))
+          expect(
+            yield* nextUpdate((event) => event.file === head, afs.writeFileString(head, "ref: refs/heads/readable\n")),
+          ).toMatchObject({ file: head })
+          yield* gitState("active")
         }),
       { git: true, root: false },
     ),

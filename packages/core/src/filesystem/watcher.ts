@@ -112,8 +112,8 @@ export const layerWith = (options: { workerTarget?: string | URL } = {}) =>
       function watchHead(vcs: string) {
         return Effect.gen(function* () {
           const head = path.join(vcs, "HEAD")
-          const read = () => (existsSync(head) ? readFileSync(head, "utf8") : undefined)
-          const last = { value: read() }
+          const initial = readHead(head)
+          const last = { value: "error" in initial ? undefined : initial.value }
           const watcher = yield* Effect.try({
             try: () =>
               // Git replaces HEAD by renaming HEAD.lock over it, and Bun 1.3 reports that
@@ -121,10 +121,15 @@ export const layerWith = (options: { workerTarget?: string | URL } = {}) =>
               // none) re-reads HEAD, and only an actual change of content is published.
               watch(vcs, (_type, name) => {
                 if (name !== "HEAD" && name !== "HEAD.lock" && name !== null) return
-                const next = read()
-                if (next === last.value) return
-                const event = next === undefined ? "unlink" : last.value === undefined ? "add" : "change"
-                last.value = next
+                const read = readHead(head)
+                // This callback runs outside Effect, so a HEAD that cannot be read must
+                // not throw here: the watch cannot see branch changes until it can.
+                if ("error" in read) return report({ ...failure("git", vcs, read.error), state: "unconfirmed" })
+                if (statuses.get("git")?.state === "unconfirmed")
+                  report({ watch: "git", directory: vcs, state: "active" })
+                if (read.value === last.value) return
+                const event = read.value === undefined ? "unlink" : last.value === undefined ? "add" : "change"
+                last.value = read.value
                 publish(head, event)
               }),
             catch: (error) => error,
@@ -136,6 +141,7 @@ export const layerWith = (options: { workerTarget?: string | URL } = {}) =>
             report(failure("git", vcs, error))
           })
           yield* Effect.addFinalizer(() => Effect.sync(() => watcher.close()))
+          if ("error" in initial) return report({ ...failure("git", vcs, initial.error), state: "unconfirmed" })
           report({ watch: "git", directory: vcs, state: "active" })
         })
       }
@@ -229,6 +235,17 @@ const KINDS = { create: "add", update: "change", delete: "unlink" } as const sat
   ParcelWatcher.EventType,
   string
 >
+
+// Reads HEAD without throwing. A missing HEAD is absent rather than an error:
+// git replaces it by rename, so it can vanish between an event and this read.
+function readHead(head: string): { value: string | undefined } | { error: unknown } {
+  try {
+    return { value: readFileSync(head, "utf8") }
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return { value: undefined }
+    return { error }
+  }
+}
 
 function failure(watch: WatchStatus["watch"], directory: string, error: unknown): WatchStatus {
   const code = error instanceof Error && "code" in error ? String(error.code) : undefined
