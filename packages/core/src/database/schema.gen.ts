@@ -270,7 +270,7 @@ export default {
         `CREATE UNIQUE INDEX \`permission_project_action_resource_idx\` ON \`permission\` (\`project_id\`,\`action\`,\`resource\`);`,
       )
       yield* tx.run(
-        `CREATE UNIQUE INDEX \`message_session_admission_seq_idx\` ON \`message\` (\`session_id\`,\`admission_seq\`);`,
+        `CREATE UNIQUE INDEX \`message_session_admission_seq_idx\` ON \`message\` (\`session_id\`,\`admission_seq\`) WHERE "message"."admission_seq" > 0;`,
       )
       yield* tx.run(
         `CREATE INDEX \`message_session_time_created_id_idx\` ON \`message\` (\`session_id\`,\`time_created\`,\`id\`);`,

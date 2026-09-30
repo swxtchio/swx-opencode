@@ -1,5 +1,6 @@
 import { Effect } from "effect"
 import type { DatabaseMigration } from "../migration"
+import { DatabaseMessageAdmission } from "../message-admission"
 
 export default {
   id: "20260929045002_session-message-admission-order",
@@ -15,8 +16,9 @@ export default {
         SET \`admission_seq\` = (SELECT seq FROM ordered WHERE ordered.id = message.id);
       `)
       yield* tx.run(
-        `CREATE UNIQUE INDEX \`message_session_admission_seq_idx\` ON \`message\` (\`session_id\`,\`admission_seq\`);`,
+        `CREATE UNIQUE INDEX \`message_session_admission_seq_idx\` ON \`message\` (\`session_id\`,\`admission_seq\`) WHERE \`admission_seq\` > 0;`,
       )
+      yield* DatabaseMessageAdmission.installLegacyMessageAdmissionTrigger(tx)
     })
   },
 } satisfies DatabaseMigration.Migration
