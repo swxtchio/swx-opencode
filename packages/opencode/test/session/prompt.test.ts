@@ -287,6 +287,9 @@ const gates = {
   compactionContinue: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   compactionWriteFailure: undefined as undefined | { triggered: boolean },
   structuredUpdateFailure: undefined as undefined | { triggered: boolean },
+  presetErrorUpdateFailure: undefined as
+    | undefined
+    | { name: "ContentFilterError" | "StructuredOutputError"; triggered: boolean },
   outcomeFailure: undefined as undefined | { triggered: boolean },
 }
 
@@ -305,6 +308,12 @@ const gatedSession = LayerNode.make({
               structuredFailure.triggered = true
               gates.structuredUpdateFailure = undefined
               return yield* Effect.die(new Error("injected structured output persistence failure"))
+            }
+            const presetErrorFailure = gates.presetErrorUpdateFailure
+            if (presetErrorFailure && msg.role === "assistant" && msg.error?.name === presetErrorFailure.name) {
+              presetErrorFailure.triggered = true
+              gates.presetErrorUpdateFailure = undefined
+              return yield* Effect.die(new Error(`injected ${presetErrorFailure.name} persistence failure`))
             }
             return yield* real.updateMessage(msg)
           }),
@@ -1056,6 +1065,119 @@ gated.instance(
       }
       expect(JSON.stringify(modelMessages)).toContain("StructuredOutput")
       expect(eventMessages).toEqual(["injected structured output persistence failure"])
+    }),
+  { config: cfg },
+  20_000,
+)
+
+gated.instance(
+  "content-filter persistence failure publishes the follow-up error and preserves the provider error",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({ title: "Content-filter persistence failure" })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: said("Return a response that the provider filters"),
+      })
+      yield* llm.push(reply().text("partial response").contentFilter())
+      const fault = { name: "ContentFilterError" as const, triggered: false }
+      gates.presetErrorUpdateFailure = fault
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.presetErrorUpdateFailure === fault) gates.presetErrorUpdateFailure = undefined
+        }),
+      )
+      const eventMessages: string[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID !== chat.id || !data.error) return Effect.void
+        if (data.error.name === "UnknownError") eventMessages.push(data.error.data.message)
+        return Effect.void
+      })
+
+      const exit = yield* Effect.exit(prompt.loop({ sessionID: chat.id }))
+      yield* off
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const assistant = messages.findLast((message) => message.info.role === "assistant")
+
+      expect(fault.triggered).toBe(true)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(assistant?.info.role).toBe("assistant")
+      if (assistant?.info.role === "assistant") {
+        expect(assistant.info.finish).toBe("content-filter")
+        expect(assistant.info.time.completed).toBeDefined()
+        expect(assistant.info.error).toMatchObject({
+          name: "ContentFilterError",
+          data: { message: "The response was blocked by the provider's content filter" },
+        })
+      }
+      expect(eventMessages).toEqual(["injected ContentFilterError persistence failure"])
+    }),
+  { config: cfg },
+  20_000,
+)
+
+gated.instance(
+  "missing structured-output persistence failure publishes the follow-up error and preserves the provider error",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({ title: "Missing structured-output persistence failure" })
+      const format = Schema.decodeUnknownSync(SessionV1.Format)({
+        type: "json_schema",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+      })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        format,
+        noReply: true,
+        parts: said("Return a structured answer"),
+      })
+      yield* llm.push(reply().text("plain text instead of structured output"))
+      const fault = { name: "StructuredOutputError" as const, triggered: false }
+      gates.presetErrorUpdateFailure = fault
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.presetErrorUpdateFailure === fault) gates.presetErrorUpdateFailure = undefined
+        }),
+      )
+      const eventMessages: string[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID !== chat.id || !data.error) return Effect.void
+        if (data.error.name === "UnknownError") eventMessages.push(data.error.data.message)
+        return Effect.void
+      })
+
+      const exit = yield* Effect.exit(prompt.loop({ sessionID: chat.id }))
+      yield* off
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const assistant = messages.findLast((message) => message.info.role === "assistant")
+
+      expect(fault.triggered).toBe(true)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(assistant?.info.role).toBe("assistant")
+      if (assistant?.info.role === "assistant") {
+        expect(assistant.info.time.completed).toBeDefined()
+        expect(assistant.info.error).toMatchObject({
+          name: "StructuredOutputError",
+          data: { message: "Model did not produce structured output", retries: 0 },
+        })
+        expect(assistant.info.structured).toBeUndefined()
+      }
+      expect(eventMessages).toEqual(["injected StructuredOutputError persistence failure"])
     }),
   { config: cfg },
   20_000,

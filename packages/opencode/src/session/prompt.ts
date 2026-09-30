@@ -1330,21 +1330,19 @@ const layer = Layer.effect(
           const finalizeFailedAssistant = (cause: Cause.Cause<unknown>) =>
             Effect.gen(function* () {
               const error = MessageV2.fromError(Cause.squash(cause), { providerID: msg.providerID })
+              const failure = (promptFailure ??= error)
               if (msg.time.completed !== undefined && !msg.error) {
-                yield* publishFailure(error)
+                yield* publishFailure(failure)
                 return
               }
 
-              if (!msg.error) {
-                msg.error = error
-                promptFailure = error
-              }
+              msg.error ??= error
               msg.time.completed ??= Date.now()
               if (!failedAssistantPersisted) {
                 yield* sessions.updateMessage(msg)
                 failedAssistantPersisted = true
               }
-              if (promptFailure) yield* publishFailure(promptFailure)
+              yield* publishFailure(failure)
             })
 
           const handle = yield* processor

@@ -63,7 +63,7 @@ describe("tui sync", () => {
     }
   })
 
-  test("idle sessions with an incomplete assistant are failed instead of working", async () => {
+  test("restarted sessions with an incomplete assistant distinguish failed from active work", async () => {
     await using tmp = await tmpdir()
     await Bun.write(`${tmp.path}/kv.json`, "{}")
     const { app, sync } = await mount(undefined, tmp.path)
@@ -79,11 +79,22 @@ describe("tui sync", () => {
       } as unknown as Message
       sync.set("session", [session])
       sync.set("message", sessionID, [assistant])
-      sync.set("session_status", sessionID, { type: "idle" } as SessionStatus)
 
+      expect(sync.data.session_status).toEqual({})
+      expect(sync.session.status(sessionID)).toBe("failed")
+
+      sync.set("session_status", sessionID, { type: "idle" } as SessionStatus)
       expect(sync.session.status(sessionID)).toBe("failed")
 
       sync.set("session_status", sessionID, { type: "busy" } as SessionStatus)
+      expect(sync.session.status(sessionID)).toBe("working")
+
+      sync.set("session_status", sessionID, {
+        type: "retry",
+        attempt: 1,
+        message: "retrying",
+        next: Date.now(),
+      } as SessionStatus)
       expect(sync.session.status(sessionID)).toBe("working")
 
       sync.set("message", sessionID, [{ ...assistant, time: { created: 2, completed: 3 } } as Message])

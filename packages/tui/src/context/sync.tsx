@@ -590,7 +590,8 @@ export const {
           if (!last) return "idle"
           if (last.role === "user") return "working"
           if (last.time.completed) return "idle"
-          if (store.session_status[sessionID]?.type === "idle") return "failed"
+          const status = store.session_status[sessionID]
+          if (!status || status.type === "idle") return "failed"
           return "working"
         },
         async sync(sessionID: string) {

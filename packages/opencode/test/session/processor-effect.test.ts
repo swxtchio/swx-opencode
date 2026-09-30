@@ -466,6 +466,26 @@ const cleanupPartFailureEnv = LayerNode.compile(root, [
 ])
 const itCleanupPartFailure = testEffect(cleanupPartFailureEnv)
 
+const overflowCleanupFailureLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "text-1" }),
+        LLMEvent.textDelta({ id: "text-1", text: "overflow response" }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop", usage: new Usage({ inputTokens: 100, outputTokens: 0 }) }),
+        LLMEvent.finish({ reason: "stop" }),
+      ),
+  }),
+)
+const overflowCleanupFailureEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, overflowCleanupFailureLLM],
+  [EventV2Bridge.node, cleanupPartFaultEvent],
+])
+const itOverflowCleanupFailure = testEffect(overflowCleanupFailureEnv)
+
 const lockTerminalLLM = Layer.succeed(
   LLM.Service,
   LLM.Service.of({
@@ -1339,6 +1359,69 @@ itCleanupPartFailure.live(
           }
           expect(eventErrors).toHaveLength(1)
           expect(eventErrors[0]).toContain("original provider failure")
+        }),
+      { config: cfg },
+    ),
+  20_000,
+)
+
+itOverflowCleanupFailure.live(
+  "session.processor stops instead of compacting when overflow cleanup fails",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          cleanupPartFailure.failed = false
+          yield* Effect.addFinalizer(() => Effect.sync(() => void (cleanupPartFailure.failed = true)))
+          const { processors, session, provider } = yield* boot()
+          const events = yield* EventV2Bridge.Service
+          const statuses = yield* SessionStatus.Service
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "overflow cleanup failure")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const base = yield* provider.getModel(ref.providerID, ref.modelID)
+          const model = { ...base, limit: { context: 20, output: 10 } }
+          const eventErrors: string[] = []
+          const off = yield* events.listen((event) => {
+            if (event.type !== Session.Event.Error.type) return Effect.void
+            const data = event.data as typeof Session.Event.Error.data.Type
+            if (data.sessionID !== chat.id || !data.error) return Effect.void
+            if (data.error.name === "UnknownError") eventErrors.push(data.error.data.message)
+            return Effect.void
+          })
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+          const result = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "overflow cleanup failure" }],
+            tools: {},
+          })
+          const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+          yield* off
+
+          expect(cleanupPartFailure.failed).toBe(true)
+          expect(result).toBe("stop")
+          expect((yield* statuses.get(chat.id)).type).toBe("idle")
+          expect(stored.info.role).toBe("assistant")
+          if (stored.info.role === "assistant") {
+            expect(stored.info.time.completed).toBeDefined()
+            expect(stored.info.error?.name).toBe("UnknownError")
+            if (stored.info.error?.name === "UnknownError") {
+              expect(stored.info.error.data.message).toContain("one-shot text finalization failure")
+            }
+          }
+          expect(eventErrors).toHaveLength(1)
+          expect(eventErrors[0]).toContain("one-shot text finalization failure")
         }),
       { config: cfg },
     ),

@@ -764,30 +764,15 @@ const layer = Layer.effect(
               }),
             ),
             Effect.catch(halt),
-            Effect.ensuring(
-              cleanup().pipe(
-                Effect.catchCauseIf(
-                  (cause) => !Cause.hasInterruptsOnly(cause),
-                  (cause) =>
-                    Effect.gen(function* () {
-                      yield* Effect.logError("cleanup", {
-                        "session.id": ctx.sessionID,
-                        messageID: ctx.assistantMessage.id,
-                        error: Cause.pretty(cause),
-                      })
-                      yield* halt(Cause.squash(cause))
-                      ctx.assistantMessage.time.completed ??= Date.now()
-                      yield* session.updateMessage(ctx.assistantMessage)
-                    }),
-                ),
-              ),
-            ),
+            Effect.ensuring(cleanup()),
           )
 
+          if (ctx.assistantMessage.error) return "stop"
           if (ctx.needsCompaction) return "compact"
-          if (ctx.blocked || ctx.assistantMessage.error) return "stop"
+          if (ctx.blocked) return "stop"
           return "continue"
         }).pipe(
+          // Keep cleanup failures in this terminalization path so they cannot return a pending compaction.
           Effect.catchCauseIf(
             (cause) => !Cause.hasInterruptsOnly(cause),
             (cause) =>
