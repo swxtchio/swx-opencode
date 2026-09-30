@@ -7,7 +7,8 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { afterAll, expect } from "bun:test"
 import { Database as Sqlite } from "bun:sqlite"
 import { tool } from "ai"
-import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Option, Stream } from "effect"
+import { isSqlError } from "effect/unstable/sql/SqlError"
 import { rm } from "node:fs/promises"
 import path from "path"
 import z from "zod"
@@ -24,6 +25,7 @@ import { SessionSummary } from "../../src/session/summary"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { provideTmpdirInstance, provideTmpdirServer } from "../fixture/fixture"
+import { produceSqliteBusyError } from "../fixture/sqlite-lock"
 import { testEffect } from "../lib/effect"
 import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -32,7 +34,6 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { LLMEvent, Usage } from "@opencode-ai/llm"
-import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
 import { aggregateSessionStats, displayStats } from "@/cli/cmd/stats"
 import { readExport } from "@/cli/cmd/db-export-usage"
 import { servedAcrossSession, servedModelLabel } from "@/cli/cmd/run/variant.shared"
@@ -278,6 +279,7 @@ const it = testEffect(env)
 const routedEvents: LLMEvent[] = []
 const routedLLM = Layer.succeed(LLM.Service, LLM.Service.of({ stream: () => Stream.fromIterable(routedEvents) }))
 const routedExportDbPath = path.join(import.meta.dir, `.opencode-served-cost-${crypto.randomUUID()}.db`)
+const sqliteLockDbPath = path.join(import.meta.dir, `.opencode-sqlite-lock-${crypto.randomUUID()}.db`)
 const routerLabelEvents: LLMEvent[] = []
 const routerLabelLLM = Layer.succeed(LLM.Service, LLM.Service.of({ stream: () => Stream.fromIterable(routerLabelEvents) }))
 const routerLabelDbPath = path.join(import.meta.dir, `.opencode-router-label-${crypto.randomUUID()}.db`)
@@ -300,6 +302,9 @@ afterAll(async () => {
       routedExportDbPath,
       `${routedExportDbPath}-wal`,
       `${routedExportDbPath}-shm`,
+      sqliteLockDbPath,
+      `${sqliteLockDbPath}-wal`,
+      `${sqliteLockDbPath}-shm`,
       routerLabelDbPath,
       `${routerLabelDbPath}-wal`,
       `${routerLabelDbPath}-shm`,
@@ -347,20 +352,21 @@ const fragmentFailureLLM = Layer.succeed(
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
 
-const sqliteLockError = new EffectDrizzleQueryError({
-  query: "INSERT INTO secret_table (value) VALUES (?)",
-  params: ["secret_parameter"],
-  cause: Cause.fail(
-    new SqlError({
-      reason: classifySqliteError(Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY_SNAPSHOT" }), {
-        message: "Failed to execute statement",
-        operation: "execute",
-      }),
-    }),
-  ),
-})
-const sqliteLockLLM = Layer.succeed(LLM.Service, LLM.Service.of({ stream: () => Stream.die(sqliteLockError) }))
-const sqliteLockEnv = LayerNode.compile(root, [...replacements, [LLM.node, sqliteLockLLM]])
+const sqliteLockFailure = defer<unknown>()
+const sqliteLockLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.unwrap(
+        Effect.promise(() => sqliteLockFailure.promise).pipe(Effect.map((error) => Stream.die(error))),
+      ),
+  }),
+)
+const sqliteLockEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, sqliteLockLLM],
+  [Database.node, Database.layerFromPath(sqliteLockDbPath)],
+])
 const itSqliteLock = testEffect(sqliteLockEnv)
 
 const boot = Effect.fn("test.boot")(function* () {
@@ -1382,6 +1388,19 @@ itSqliteLock.live(
           const parent = yield* user(chat.id, "sqlite lock persistence")
           const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
           const model = yield* provider.getModel(ref.providerID, ref.modelID)
+          const database = yield* Database.Service
+          const error = yield* produceSqliteBusyError(database.db, sqliteLockDbPath)
+          expect(error).toBeInstanceOf(EffectDrizzleQueryError)
+          if (!(error instanceof EffectDrizzleQueryError)) return
+          expect(error.query).toBe("Database is locked (SQLITE_BUSY)")
+          expect(error.params).toEqual([])
+          const cause = error.cause
+          const failure = Cause.isCause(cause) ? Option.getOrUndefined(Cause.findErrorOption(cause)) : undefined
+          expect(isSqlError(failure)).toBe(true)
+          if (!isSqlError(failure)) return
+          expect(failure.reason._tag).toBe("LockTimeoutError")
+          expect(failure.reason.cause).toMatchObject({ code: "SQLITE_BUSY" })
+          sqliteLockFailure.resolve(error)
           const eventMessages: string[] = []
           const off = yield* events.listen((event) => {
             if (event.type !== Session.Event.Error.type) return Effect.void
