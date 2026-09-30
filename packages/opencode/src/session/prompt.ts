@@ -1225,6 +1225,7 @@ const layer = Layer.effect(
         let settled = false
         let seen = 0
         let initialRootSelected = false
+        let pinnedRootOrder: number | undefined
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1250,6 +1251,7 @@ const layer = Layer.effect(
           if (root && rootOrder === undefined)
             throw new Error(`Missing persisted admission order for run root: ${rootMessageID}`)
           if (root && rootOrder !== undefined) {
+            pinnedRootOrder = rootOrder
             msgs = msgs.filter((message) => {
               const order = history.admissionOrder.get(message.info.id)
               return (
@@ -1259,6 +1261,20 @@ const layer = Layer.effect(
             })
           }
           initialRootSelected = true
+          const rootBoundary = pinnedRootOrder
+          if (rootBoundary !== undefined) {
+            // Keep late held noReply writes beyond the pinned root out of every tool continuation.
+            const markers = (yield* config.get()).machine_message_markers
+            msgs = msgs.filter((message) => {
+              if (message.info.role !== "user" || message.info.noReply !== true) return true
+              const text = message.parts
+                .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
+                .join("")
+              if (MachineMessage.classify(text, markers) !== "hold") return true
+              const order = history.admissionOrder.get(message.info.id)
+              return order !== undefined && order <= rootBoundary
+            })
+          }
 
           const latest = MessageV2.latest(msgs, selection)
           const lastUser = root?.info ?? latest.user

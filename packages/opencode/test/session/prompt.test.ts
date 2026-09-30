@@ -292,6 +292,7 @@ const gates = {
   // Holds a compaction between its summary and its continue message.
   compactionContinue: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   noReplyAdmission: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  noReplyWrite: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
 }
 
 const gatedSession = LayerNode.make({
@@ -311,6 +312,16 @@ const gatedSession = LayerNode.make({
               yield* Deferred.await(gate.release)
             }
             return yield* real.findMessage(sessionID, predicate)
+          }),
+        updateMessage: (info) =>
+          Effect.gen(function* () {
+            const gate = info.role === "user" && info.noReply === true ? gates.noReplyWrite : undefined
+            if (gate) {
+              gates.noReplyWrite = undefined
+              yield* Deferred.succeed(gate.entered, undefined)
+              yield* Deferred.await(gate.release)
+            }
+            return yield* real.updateMessage(info)
           }),
       })
     }),
@@ -5241,6 +5252,98 @@ gated.instance(
       ).toBe(true)
       expect(yield* queue.list(session.id)).toEqual([])
       expect(yield* llm.calls).toBe(3)
+    }),
+  60_000,
+)
+
+gated.instance(
+  "keeps a rechecked marked noReply out of root-pinned tool continuations",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const run = yield* SessionRunState.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Root-pinned noReply continuation",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const toolPath = path.join(dir, "round18-root.txt")
+      yield* writeText(toolPath, "root-pinned tool continuation")
+      const root = yield* seedUser({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        parts: said("root-pinned task"),
+      })
+      const writeEntered = yield* Deferred.make<void>()
+      const writeRelease = yield* Deferred.make<void>()
+      const toolResponse = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() =>
+        Effect.all([writeRelease, toolResponse].map((gate) => Deferred.succeed(gate, undefined).pipe(Effect.ignore)), {
+          discard: true,
+        }).pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              gates.noReplyWrite = undefined
+            }),
+          ),
+        ),
+      )
+      yield* llm.push(
+        reply().wait(deferredAsPromise(toolResponse)).tool("glob", { pattern: "round18-root.txt" }).item(),
+        reply().text("root-pinned task finished").stop().item(),
+      )
+
+      gates.noReplyWrite = { entered: writeEntered, release: writeRelease }
+      const messageID = MessageID.ascending()
+      const markedText = "[fm-from-firstmate]\x1f root-pinned machine mail"
+      const noReply = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          messageID,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: said(markedText),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(
+        Deferred.await(writeEntered),
+        "marked noReply did not reach the write after its idle recheck",
+        "10 seconds",
+      )
+      expect(Exit.isSuccess(yield* run.assertNotBusy(session.id).pipe(Effect.exit))).toBe(true)
+      yield* Deferred.succeed(writeRelease, undefined)
+      const direct = yield* awaitWithTimeout(
+        Fiber.join(noReply),
+        "idle marked noReply did not finish its direct write",
+        "10 seconds",
+      )
+      if (direct.info.role !== "user") throw new Error("expected the direct noReply user")
+      expect(direct.info.noReply).toBe(true)
+      expect(
+        (yield* sessions.messages({ sessionID: session.id })).some((message) => message.info.id === messageID),
+      ).toBe(true)
+      expect(yield* queue.list(session.id)).toEqual([])
+
+      const active = yield* prompt
+        .loop({ sessionID: session.id, messageID: root.info.id })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "root-pinned provider request did not start", "10 seconds")
+      const first = (yield* llm.inputs)[0]
+      if (!first) throw new Error("expected the root-pinned first request")
+      expect(JSON.stringify(first.messages)).not.toContain("root-pinned machine mail")
+
+      yield* Deferred.succeed(toolResponse, undefined)
+      yield* awaitWithTimeout(llm.wait(2), "root-pinned tool continuation did not start", "10 seconds")
+      const continuation = (yield* llm.inputs)[1]
+      if (!continuation) throw new Error("expected the root-pinned continuation request")
+      expect(JSON.stringify(continuation.messages)).not.toContain("root-pinned machine mail")
+      const exit = yield* awaitWithTimeout(Fiber.await(active), "root-pinned run did not finish", "10 seconds")
+      expect(Exit.isSuccess(exit)).toBe(true)
+      expect(yield* llm.calls).toBe(2)
     }),
   60_000,
 )
