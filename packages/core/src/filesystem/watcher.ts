@@ -74,7 +74,11 @@ const layer = Layer.effect(
       runFork(events.publish(Event.Updated, { file, event }))
     const report = (status: WatchStatus) => {
       statuses.set(status.watch, status)
-      const fields = { watch: status.watch, directory: status.directory, reason: status.reason }
+      const fields = {
+        watch: status.watch,
+        directory: status.directory,
+        ...(status.reason ? { reason: status.reason } : {}),
+      }
       if (status.state === "active") return runFork(Effect.logInfo("watcher active", fields))
       if (status.state === "unavailable")
         return runFork(Effect.logWarning("watcher unavailable, continuing without it", fields))

@@ -2,6 +2,7 @@ import { sentryVitePlugin } from "@sentry/vite-plugin"
 import { defineConfig } from "electron-vite"
 import appPlugin from "@opencode-ai/app/vite"
 import * as fs from "node:fs/promises"
+import * as path from "node:path"
 
 const OPENCODE_SERVER_DIST = "../opencode/dist/node"
 
@@ -70,10 +71,16 @@ const require = __cjs_mod__.createRequire(import.meta.url);
       },
       {
         name: "opencode:copy-server-assets",
-        async writeBundle() {
+        // The rebundled server resolves its wasm and the file watcher's parcel worker
+        // (parcel-worker.js) relative to its own chunk, so they are copied beside it.
+        async writeBundle(options, bundle) {
+          const entry = path.resolve(OPENCODE_SERVER_DIST, "node.js")
+          const server = Object.values(bundle).find((item) => item.type === "chunk" && item.moduleIds.includes(entry))
+          if (!server || !options.dir) throw new Error(`no output chunk contains ${entry}`)
+          const dir = path.join(options.dir, path.dirname(server.fileName))
           for (const l of await fs.readdir(OPENCODE_SERVER_DIST)) {
-            if (!l.endsWith(".wasm")) continue
-            await fs.writeFile(`./out/main/chunks/${l}`, await fs.readFile(`${OPENCODE_SERVER_DIST}/${l}`))
+            if (!l.endsWith(".wasm") && l !== "parcel-worker.js") continue
+            await fs.writeFile(path.join(dir, l), await fs.readFile(`${OPENCODE_SERVER_DIST}/${l}`))
           }
         },
       },

@@ -17,6 +17,7 @@ import { location } from "./location"
 
 const directory = process.argv[2]
 const waitRoot = process.argv[3] === "wait-root"
+const rootFile = path.join(await fs.realpath(directory), "root-file.txt")
 const head = await fs.realpath(path.join(directory, ".git")).then((git) => path.join(git, "HEAD"))
 
 const inotifyInstances = async () =>
@@ -36,10 +37,13 @@ const program = Effect.gen(function* () {
   const progressed = yield* Effect.promise(() => new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 50)))
 
   const delivered = yield* Deferred.make<string>()
+  const rootDelivered = yield* Deferred.make<string>()
   yield* events.subscribe(Watcher.Event.Updated).pipe(
-    Stream.runForEach((event) =>
-      event.data.file === head ? Deferred.succeed(delivered, event.data.event).pipe(Effect.asVoid) : Effect.void,
-    ),
+    Stream.runForEach((event) => {
+      if (event.data.file === head) return Deferred.succeed(delivered, event.data.event).pipe(Effect.asVoid)
+      if (event.data.file === rootFile) return Deferred.succeed(rootDelivered, event.data.event).pipe(Effect.asVoid)
+      return Effect.void
+    }),
     Effect.forkScoped,
   )
   yield* Effect.yieldNow
@@ -57,11 +61,16 @@ const program = Effect.gen(function* () {
       }).pipe(Effect.timeoutOption("15 seconds"))
     : undefined
 
+  // Observed delivery, not the reported status, is what shows the root watch works.
+  yield* Effect.promise(() => fs.writeFile(rootFile, "root"))
+  const rootEvent = yield* Deferred.await(rootDelivered).pipe(Effect.timeoutOption("3 seconds"))
+
   return {
     booted,
     instances,
     progressed,
     headEvent: headEvent._tag === "Some" ? headEvent.value : undefined,
+    rootEvent: rootEvent._tag === "Some" ? rootEvent.value : undefined,
     settled: settled?._tag === "Some" ? settled.value : undefined,
   }
 })

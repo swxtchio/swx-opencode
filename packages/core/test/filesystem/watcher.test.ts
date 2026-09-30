@@ -431,6 +431,7 @@ type ChildReport = {
   instances: number
   progressed: boolean
   headEvent?: string
+  rootEvent?: string
   settled?: Watcher.WatchStatus[]
 }
 
@@ -485,10 +486,11 @@ describeRefusal("Watcher under refused inotify instances", () => {
     ])
     expect(report.headEvent).toBeUndefined()
     expect(report.settled?.find((item) => item.watch === "root")).toMatchObject({ state: "unconfirmed" })
+    expect(report.rootEvent).toBeUndefined()
   }, 40_000)
 
   test("keeps a started git watch delivering when the root watch is refused", async () => {
-    const { report, directory } = await underInotifyLimit(1)
+    const { report, directory } = await underInotifyLimit(1, { waitRoot: true })
     expect(report.progressed).toBe(true)
     // The one permitted instance belongs to the git watch, so the root
     // watch's native subscription was refused.
@@ -498,6 +500,17 @@ describeRefusal("Watcher under refused inotify instances", () => {
       { watch: "root", directory, state: "starting" },
     ])
     expect(report.headEvent).toBe("change")
+    // The refused root watch settles as unconfirmed, never active, and delivers nothing.
+    expect(report.settled).toEqual([
+      { watch: "git", directory: path.join(directory, ".git"), state: "active" },
+      {
+        watch: "root",
+        directory,
+        state: "unconfirmed",
+        reason: expect.stringContaining("no subscription acknowledgement"),
+      },
+    ])
+    expect(report.rootEvent).toBeUndefined()
   }, 40_000)
 
   test("starts every watch under ordinary capacity", async () => {
@@ -508,5 +521,6 @@ describeRefusal("Watcher under refused inotify instances", () => {
       { watch: "git", directory: path.join(directory, ".git"), state: "active" },
       { watch: "root", directory, state: "active" },
     ])
+    expect(report.rootEvent).toBe("add")
   }, 40_000)
 })
