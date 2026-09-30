@@ -4,7 +4,7 @@ import type ParcelWatcher from "@parcel/watcher"
 import { makeLocationNode } from "../effect/app-node"
 import { Cause, Context, Deferred, Effect, Layer } from "effect"
 import { FileSystemWatcher } from "@opencode-ai/schema/filesystem-watcher"
-import { existsSync, watch } from "fs"
+import { existsSync, readFileSync, watch } from "fs"
 import path from "path"
 import { fileURLToPath } from "url"
 import { Worker } from "worker_threads"
@@ -16,7 +16,7 @@ import { Git } from "../git"
 import { Location } from "../location"
 import { Ignore } from "./ignore"
 import { ParcelBinding } from "./parcel-binding"
-import type { Reply, Request, Response } from "./parcel-worker"
+import type { Reply, Request, Response } from "./parcel-service"
 import { Protected } from "./protected"
 
 declare const OPENCODE_WATCHER_WORKER_PATH: string | undefined
@@ -112,15 +112,19 @@ export const layerWith = (options: { workerTarget?: string | URL } = {}) =>
       function watchHead(vcs: string) {
         return Effect.gen(function* () {
           const head = path.join(vcs, "HEAD")
-          const present = { value: existsSync(head) }
+          const read = () => (existsSync(head) ? readFileSync(head, "utf8") : undefined)
+          const last = { value: read() }
           const watcher = yield* Effect.try({
             try: () =>
-              watch(vcs, (type, name) => {
-                if (name !== "HEAD") return
-                if (type === "change") return publish(head, "change")
-                const exists = existsSync(head)
-                const event = !exists ? "unlink" : present.value ? "change" : "add"
-                present.value = exists
+              // Git replaces HEAD by renaming HEAD.lock over it, and Bun 1.3 reports that
+              // rename only under the name HEAD.lock. So an event for either name (or
+              // none) re-reads HEAD, and only an actual change of content is published.
+              watch(vcs, (_type, name) => {
+                if (name !== "HEAD" && name !== "HEAD.lock" && name !== null) return
+                const next = read()
+                if (next === last.value) return
+                const event = next === undefined ? "unlink" : last.value === undefined ? "add" : "change"
+                last.value = next
                 publish(head, event)
               }),
             catch: (error) => error,

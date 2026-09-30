@@ -58,6 +58,22 @@ const rootState = (watcher: Watcher.Interface, state: Watcher.WatchState) =>
     }
   })
 
+// Waits for the gate to report a held acknowledgement. A root watch that became
+// unavailable instead (the gated worker failed) ends the wait with its reason.
+const awaitHeld = (watcher: Watcher.Interface) =>
+  Effect.gen(function* () {
+    const state = { held: false }
+    void held.promise.then(() => (state.held = true))
+    const deadline = Date.now() + 60_000
+    while (!state.held) {
+      const current = yield* root(watcher)
+      if (current?.state === "unavailable")
+        return yield* Effect.fail(new Error(`root watch unavailable before its acknowledgement: ${current.reason}`))
+      if (Date.now() > deadline) return yield* Effect.fail(new Error("the gate never held an acknowledgement"))
+      yield* Effect.promise(() => Bun.sleep(20))
+    }
+  })
+
 const root = (watcher: Watcher.Interface) =>
   watcher.status.pipe(Effect.map((items) => items.find((item) => item.watch === "root")))
 
@@ -85,7 +101,7 @@ const scenarios: Record<string, Effect.Effect<unknown, Error, Watcher.Service | 
   // Acknowledged first, then the backstop expires.
   backstop: Effect.gen(function* () {
     const watcher = yield* Watcher.Service
-    yield* Effect.promise(() => held.promise)
+    yield* awaitHeld(watcher)
     channel.postMessage({ type: "release" })
     yield* rootState(watcher, "active")
     const before = [...logs]
@@ -101,7 +117,7 @@ const scenarios: Record<string, Effect.Effect<unknown, Error, Watcher.Service | 
   // so only the late acknowledgement can activate the watch.
   late: Effect.gen(function* () {
     const watcher = yield* Watcher.Service
-    yield* Effect.promise(() => held.promise)
+    yield* awaitHeld(watcher)
     yield* TestClock.adjust(TIMEOUT)
     const expired = yield* root(watcher)
     channel.postMessage({ type: "release" })
@@ -111,7 +127,7 @@ const scenarios: Record<string, Effect.Effect<unknown, Error, Watcher.Service | 
   // A callback error on an active watch, then a real event re-confirms it.
   reactivate: Effect.gen(function* () {
     const watcher = yield* Watcher.Service
-    yield* Effect.promise(() => held.promise)
+    yield* awaitHeld(watcher)
     channel.postMessage({ type: "release" })
     yield* rootState(watcher, "active")
     channel.postMessage({ type: "error", message: "Events were dropped by the FSEvents client." })
