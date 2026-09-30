@@ -2,7 +2,20 @@ import { $ } from "bun"
 import { describe, expect, test } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
-import { ConfigProvider, Deferred, Duration, Effect, Exit, Fiber, Layer, Logger, Option, Scope, Stream } from "effect"
+import {
+  ConfigProvider,
+  Context,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Logger,
+  Option,
+  Scope,
+  Stream,
+} from "effect"
 import { Config } from "@opencode-ai/core/config"
 import { ConfigWatcher } from "@opencode-ai/core/config/watcher"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -12,6 +25,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
+import { TestClock } from "effect/testing"
 import { location } from "../fixture/location"
 import { tmpdir } from "../fixture/tmpdir"
 import { testEffect } from "../lib/effect"
@@ -79,6 +93,40 @@ function withTmp<A, E, R>(
     }),
     ({ tmp }) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
   ).pipe(Effect.flatMap(({ tmp, vcs }) => f(tmp.path, vcs).pipe(provide(tmp.path, vcs, options))))
+}
+
+// Polls the root watch's reported state in real time, since the TestClock does not
+// advance on its own; the deadline is a failure backstop.
+function rootState(watcher: Watcher.Interface, state: Watcher.WatchState) {
+  return Effect.gen(function* () {
+    const deadline = Date.now() + 15_000
+    while (true) {
+      const root = (yield* watcher.status).find((item) => item.watch === "root")
+      if (root?.state === state) return root
+      if (Date.now() > deadline)
+        return yield* Effect.fail(new Error(`root watch never became ${state}: ${JSON.stringify(root)}`))
+      yield* Effect.promise(() => Bun.sleep(20))
+    }
+  })
+}
+
+// Waits in real time for one watcher event for `file` after `trigger`.
+function delivered<E>(file: string, trigger: Effect.Effect<void, E>) {
+  return Effect.acquireUseRelease(
+    wait((event) => event.file === file),
+    ({ deferred }) =>
+      trigger.pipe(
+        Effect.andThen(
+          Effect.raceFirst(
+            Deferred.await(deferred),
+            Effect.promise(() => Bun.sleep(10_000)).pipe(
+              Effect.andThen(Effect.fail(new Error(`no watcher event for ${file}`))),
+            ),
+          ),
+        ),
+      ),
+    ({ fiber }) => Fiber.interrupt(fiber),
+  )
 }
 
 // Records the watcher's emitted status log lines for the root watch.
@@ -410,59 +458,74 @@ describeWatcher("Watcher", () => {
     20_000,
   )
 
-  it.live("keeps an acknowledged root watch active after its subscribe backstop elapses", () => {
-    const logs = captureLogs()
-    return withTmp(
-      (directory) =>
-        Effect.gen(function* () {
-          const afs = yield* FSUtil.Service
-          const watcher = yield* Watcher.Service
-          yield* ready(directory)
-          // Past the 100ms backstop; what is asserted is the reported state and delivery.
-          yield* Effect.sleep("400 millis")
-          expect((yield* watcher.status).find((item) => item.watch === "root")).toEqual({
-            watch: "root",
-            directory,
-            state: "active",
-          })
-          expect(logs.root()).toEqual(["watcher active"])
-          const file = path.join(directory, "after-backstop.txt")
-          expect(yield* nextUpdate((event) => event.file === file, afs.writeFileString(file, "x"))).toEqual({
-            file,
-            event: "add",
-          })
-        }),
-      { git: true, subscribeTimeout: 100 },
-    ).pipe(Effect.provide(logs.layer))
-  })
+  // These run on the TestClock, so the subscribe backstop fires only when the test
+  // advances the clock; the worker's acknowledgement and file events stay real.
+  it.effect(
+    "keeps an acknowledged root watch active after its subscribe backstop elapses",
+    () => {
+      const logs = captureLogs()
+      return withTmp(
+        (directory) =>
+          Effect.gen(function* () {
+            const afs = yield* FSUtil.Service
+            const watcher = yield* Watcher.Service
+            // Startup is proven by the acknowledgement, however long a cold worker takes.
+            yield* rootState(watcher, "active")
+            expect(logs.root()).toEqual(["watcher active"])
+            yield* TestClock.adjust("10 seconds")
+            expect((yield* watcher.status).find((item) => item.watch === "root")).toEqual({
+              watch: "root",
+              directory,
+              state: "active",
+            })
+            expect(logs.root()).toEqual(["watcher active"])
+            const file = path.join(directory, "after-backstop.txt")
+            expect(yield* delivered(file, afs.writeFileString(file, "x"))).toEqual({ file, event: "add" })
+          }),
+        { git: true, subscribeTimeout: 10_000 },
+      ).pipe(Effect.provide(logs.layer))
+    },
+    30_000,
+  )
 
-  it.live("activates a root watch whose acknowledgement arrives after it was reported unconfirmed", () => {
-    const logs = captureLogs()
-    return withTmp(
-      (directory) =>
-        Effect.gen(function* () {
-          const afs = yield* FSUtil.Service
-          const watcher = yield* Watcher.Service
-          yield* ready(directory)
-          expect(logs.root()).toEqual([
-            "watcher not confirmed, continuing without it until it confirms",
-            "watcher active",
-          ])
-          expect((yield* watcher.status).find((item) => item.watch === "root")).toEqual({
-            watch: "root",
-            directory,
-            state: "active",
-          })
-          const file = path.join(directory, "after-late-ack.txt")
-          expect(yield* nextUpdate((event) => event.file === file, afs.writeFileString(file, "x"))).toEqual({
-            file,
-            event: "add",
-          })
-        }),
-      // A 1ms backstop elapses before the worker can acknowledge.
-      { git: true, subscribeTimeout: 1 },
-    ).pipe(Effect.provide(logs.layer))
-  })
+  it.effect(
+    "activates a root watch whose acknowledgement arrives after it was reported unconfirmed",
+    () =>
+      Effect.gen(function* () {
+        const events = yield* EventV2.Service
+        const afs = yield* FSUtil.Service
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir()),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        yield* Effect.promise(() => gitInit(tmp.path))
+        const vcs = { type: "git" as const, store: AbsolutePath.make(path.join(tmp.path, ".git")) }
+        // The backstop must expire before the worker's reply is processed. A warm
+        // worker can reply first; that attempt proves nothing and is discarded.
+        const attempt = (index: number) => {
+          const logs = captureLogs()
+          return Effect.gen(function* () {
+            const context = yield* Layer.build(
+              Layer.fresh(watcherLayer(tmp.path, vcs, { events, subscribeTimeout: 10_000 })),
+            )
+            const watcher = Context.get(context, Watcher.Service)
+            yield* TestClock.adjust("10 seconds")
+            if ((yield* watcher.status).find((item) => item.watch === "root")?.state !== "unconfirmed") return false
+            yield* rootState(watcher, "active")
+            expect(logs.root()).toEqual([
+              "watcher not confirmed, continuing without it until it confirms",
+              "watcher active",
+            ])
+            const file = path.join(tmp.path, `after-late-ack-${index}.txt`)
+            expect(yield* delivered(file, afs.writeFileString(file, "x"))).toEqual({ file, event: "add" })
+            return true
+          }).pipe(Effect.scoped, Effect.provide(logs.layer))
+        }
+        for (const index of [0, 1, 2, 3, 4, 5, 6, 7]) if (yield* attempt(index)) return
+        return yield* Effect.fail(new Error("every attempt's acknowledgement arrived before the backstop expired"))
+      }),
+    60_000,
+  )
 
   const describeSymlink = process.platform !== "win32" ? describe : describe.skip
   describeSymlink("symlinked .git", () => {

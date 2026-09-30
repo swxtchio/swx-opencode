@@ -1,5 +1,5 @@
 import { $ } from "bun"
-import { describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -31,21 +31,26 @@ async function buildMain(outDir: string) {
 }
 
 describeSidecar("desktop sidecar file watcher", () => {
+  const built = { dir: "" }
+  // Building both bundles is setup, not the behaviour under test, so it gets its own
+  // generous bound: on a loaded box it can take minutes.
+  beforeAll(async () => {
+    // Under the package's out/, like the real out/main, so externalized dependencies
+    // resolve from its node_modules. out/ is gitignored, so a clean checkout lacks it.
+    await fs.mkdir(path.join(desktop, "out"), { recursive: true })
+    built.dir = await fs.mkdtemp(path.join(desktop, "out", "sidecar-test-"))
+    await buildMain(path.join(built.dir, "main"))
+  }, 900_000)
+  afterAll(() => (built.dir ? fs.rm(built.dir, { recursive: true, force: true }) : undefined))
+
   test("delivers root file create, update and delete events from the built sidecar", async () => {
     await using tmp = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-sidecar-")).then((dir) => ({
-      dir,
-      [Symbol.asyncDispose]: () => fs.rm(dir, { recursive: true, force: true }),
-    }))
-    // Under the package's out/, like the real out/main, so externalized dependencies
-    // resolve from its node_modules.
-    await using built = await fs.mkdtemp(path.join(desktop, "out", "sidecar-test-")).then((dir) => ({
       dir,
       [Symbol.asyncDispose]: () => fs.rm(dir, { recursive: true, force: true }),
     }))
     const outDir = path.join(built.dir, "main")
     const repo = path.join(tmp.dir, "repo")
     const home = path.join(tmp.dir, "home")
-    await buildMain(outDir)
     await fs.mkdir(repo, { recursive: true })
     await $`git init -q`.cwd(repo).quiet()
     await $`git -c user.email=test@opencode.test -c user.name=Test commit -q --allow-empty -m root`.cwd(repo).quiet()
@@ -121,7 +126,7 @@ describeSidecar("desktop sidecar file watcher", () => {
       sidecar.kill("SIGKILL")
       await sidecar.exited
     }
-  }, 180_000)
+  }, 120_000)
 })
 
 function auth(password: string) {
