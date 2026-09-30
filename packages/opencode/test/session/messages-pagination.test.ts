@@ -1,18 +1,80 @@
 import { describe, expect, test } from "bun:test"
+import { asc, eq, sql } from "drizzle-orm"
+import { Database } from "@opencode-ai/core/database/database"
+import { DatabaseMigration } from "@opencode-ai/core/database/migration"
+import sessionMessageAdmissionOrderMigration from "@opencode-ai/core/database/migration/20260929045002_session-message-admission-order"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { EventV2 } from "@opencode-ai/core/event"
+import { ProjectV2 } from "@opencode-ai/core/project"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { MessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Effect, Option } from "effect"
+import path from "path"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
-import { MessageID, PartID, type SessionID } from "../../src/session/schema"
+import { MessageID, PartID, SessionID } from "../../src/session/schema"
 
 import { NotFoundError } from "@/storage/storage"
-import { testEffect } from "../lib/effect"
-import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
+import type { Provider } from "@/provider/provider"
+import { tmpdir } from "../fixture/fixture"
+import { testEffect } from "../lib/effect"
 
 const it = testEffect(LayerNode.compile(LayerNode.group([SessionNs.node, MessageV2.node, SessionProjector.node])))
+
+const model: Provider.Model = {
+  id: ModelV2.ID.make("test-model"),
+  providerID: ProviderV2.ID.make("test"),
+  api: {
+    id: "test-model",
+    url: "https://example.com",
+    npm: "@ai-sdk/openai",
+  },
+  name: "Test Model",
+  capabilities: {
+    temperature: true,
+    reasoning: false,
+    attachment: false,
+    toolcall: true,
+    input: {
+      text: true,
+      audio: false,
+      image: false,
+      video: false,
+      pdf: false,
+    },
+    output: {
+      text: true,
+      audio: false,
+      image: false,
+      video: false,
+      pdf: false,
+    },
+    interleaved: false,
+  },
+  cost: {
+    input: 0,
+    output: 0,
+    cache: {
+      read: 0,
+      write: 0,
+    },
+  },
+  limit: {
+    context: 0,
+    input: 0,
+    output: 0,
+  },
+  status: "active",
+  options: {},
+  headers: {},
+  release_date: "2026-01-01",
+}
 
 const withSession = <A, E, R>(
   fn: (input: { session: SessionNs.Interface; sessionID: SessionID }) => Effect.Effect<A, E, R>,
@@ -124,7 +186,185 @@ const addCompactionPart = Effect.fn("Test.addCompactionPart")(function* (
     type: "compaction",
     auto: true,
     tail_start_id: tailStartID,
-  } as any)
+    } as any)
+})
+
+describe("mixed-version message admission migration", () => {
+  test("reproduces the previous full-index failure for repeated legacy inserts", async () => {
+    const sqlite = await import("bun:sqlite")
+    const previous = new sqlite.Database(":memory:")
+    try {
+      previous.exec(`
+        CREATE TABLE message (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          admission_seq INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE UNIQUE INDEX message_session_admission_seq_idx ON message (session_id, admission_seq);
+        INSERT INTO message (id, session_id, admission_seq) VALUES ('msg_existing', 'ses_legacy', 1);
+      `)
+      const oldInsert = previous.query("INSERT INTO message (id, session_id) VALUES (?, ?)")
+      oldInsert.run("msg_legacy_one", "ses_legacy")
+      expect(() => oldInsert.run("msg_legacy_two", "ses_legacy")).toThrow(
+        /UNIQUE constraint failed: message\.session_id, message\.admission_seq/,
+      )
+    } finally {
+      previous.close()
+    }
+  })
+
+  test("keeps legacy and current writers ordered and model-visible through migration", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "mixed-version.sqlite")
+    const sqlite = await import("bun:sqlite")
+    const legacy = new sqlite.Database(filename)
+    const layer = AppNodeBuilder.build(
+      LayerNode.group([EventV2.node, SessionProjector.node, MessageV2.node]),
+      [[Database.node, Database.layerFromPath(filename)]],
+    )
+
+    try {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { db } = yield* Database.Service
+          const events = yield* EventV2.Service
+          const sessionID = SessionID.make("ses_mixed_version")
+          const projectID = ProjectV2.ID.global
+
+          yield* db
+            .insert(ProjectTable)
+            .values({ id: projectID, worktree: AbsolutePath.make(tmp.path), sandboxes: [] })
+            .run()
+          yield* db
+            .insert(SessionTable)
+            .values({
+              id: sessionID,
+              project_id: projectID,
+              slug: "mixed-version",
+              directory: AbsolutePath.make(tmp.path),
+              title: "Mixed-version migration test",
+              version: "test",
+            })
+            .run()
+
+          yield* db.run(sql`DROP TRIGGER IF EXISTS message_admission_seq_legacy_insert`)
+          yield* db.run(sql`DROP INDEX IF EXISTS message_session_admission_seq_idx`)
+          yield* db.run(sql`ALTER TABLE message DROP COLUMN admission_seq`)
+          yield* db.run(sql`DELETE FROM migration WHERE id = ${sessionMessageAdmissionOrderMigration.id}`)
+
+          const legacySessionID = sessionID as unknown as SessionV1.User["sessionID"]
+          const oldMessageInsert = legacy.query(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+          )
+          const oldPartInsert = legacy.query(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+          )
+          const oldReader = legacy.query(
+            "SELECT id, session_id, time_created, time_updated, data FROM message WHERE session_id = ? ORDER BY time_created, id",
+          )
+          const writeLegacy = (id: string, partID: string, created: number, text: string) => {
+            oldMessageInsert.run(
+              id,
+              legacySessionID,
+              created,
+              created,
+              JSON.stringify({
+                role: "user",
+                time: { created },
+                agent: "legacy",
+                model: { providerID: "test", modelID: "test-model" },
+                tools: {},
+                mode: "",
+              }),
+            )
+            oldPartInsert.run(
+              partID,
+              id,
+              legacySessionID,
+              created,
+              created,
+              JSON.stringify({ type: "text", text }),
+            )
+          }
+          const writeCurrent = (id: string, partID: string, created: number, text: string) => {
+            const info = {
+              id: SessionV1.MessageID.make(id),
+              sessionID: legacySessionID,
+              role: "user",
+              time: { created },
+              agent: "current",
+              model: { providerID: "test", modelID: "test-model" },
+              tools: {},
+              mode: "",
+            } as unknown as SessionV1.User
+            return Effect.gen(function* () {
+              yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID: legacySessionID, info })
+              yield* events.publish(SessionV1.Event.PartUpdated, {
+                sessionID: legacySessionID,
+                part: {
+                  id: SessionV1.PartID.make(partID),
+                  sessionID: legacySessionID,
+                  messageID: info.id,
+                  type: "text",
+                  text,
+                } as unknown as SessionV1.Part,
+                time: created,
+              })
+            })
+          }
+
+          yield* Effect.sync(() => writeLegacy("msg_legacy_before", "prt_legacy_before", 900, "legacy before migration"))
+
+          yield* DatabaseMigration.applyOnly(db, [sessionMessageAdmissionOrderMigration])
+
+          yield* Effect.sync(() => writeLegacy("msg_legacy_one", "prt_legacy_one", 700, "legacy after migration one"))
+          yield* writeCurrent("msg_current_one", "prt_current_one", 500, "current after legacy one")
+          yield* Effect.sync(() => writeLegacy("msg_legacy_two", "prt_legacy_two", 300, "legacy after migration two"))
+          yield* writeCurrent("msg_current_two", "prt_current_two", 100, "current after legacy two")
+
+          const expectedIDs = [
+            MessageID.make("msg_legacy_before"),
+            MessageID.make("msg_legacy_one"),
+            MessageID.make("msg_current_one"),
+            MessageID.make("msg_legacy_two"),
+            MessageID.make("msg_current_two"),
+          ]
+          const ordered = yield* db
+            .select({ id: MessageTable.id, admission_seq: MessageTable.admission_seq })
+            .from(MessageTable)
+            .where(eq(MessageTable.session_id, sessionID))
+            .orderBy(asc(MessageTable.admission_seq))
+            .all()
+          expect(ordered.map((row) => row.id)).toEqual(expectedIDs)
+          expect(ordered.map((row) => row.admission_seq)).toEqual([1, 2, 3, 4, 5])
+          expect(oldReader.all(legacySessionID)).toHaveLength(expectedIDs.length)
+
+          const latest = yield* MessageV2.page({ sessionID, limit: 3 })
+          expect(latest.items.map((item) => item.info.id)).toEqual(expectedIDs.slice(2))
+          expect(latest.more).toBe(true)
+          if (!latest.cursor) throw new Error("expected a cursor for the earlier mixed-version messages")
+          const earlier = yield* MessageV2.page({ sessionID, limit: 3, before: latest.cursor })
+          expect(earlier.items.map((item) => item.info.id)).toEqual(expectedIDs.slice(0, 2))
+          expect(earlier.more).toBe(false)
+
+          const modelMessages = yield* MessageV2.toModelMessagesEffect([...earlier.items, ...latest.items], model)
+          const serialized = JSON.stringify(modelMessages)
+          const visibleText = [
+            "legacy before migration",
+            "legacy after migration one",
+            "current after legacy one",
+            "legacy after migration two",
+            "current after legacy two",
+          ]
+          const positions = visibleText.map((text) => serialized.indexOf(text))
+          expect(positions.every((position) => position >= 0)).toBe(true)
+          expect(positions).toEqual([...positions].sort((a, b) => a - b))
+        }).pipe(Effect.scoped, Effect.provide(layer)),
+      )
+    } finally {
+      legacy.close()
+    }
+  })
 })
 
 describe("MessageV2.page", () => {
