@@ -133,20 +133,31 @@ jobs:
         env:
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
 
-      - name: Run the native inotify-refusal watcher regression
+      - name: Run the native watcher regressions
         # The watcher tests above skip under CI. This runs the real-native refusal
         # cases: each boots the production watcher in a child whose rootless user
         # namespace caps inotify instances. Ubuntu's AppArmor may block unprivileged
         # user namespaces; lifting that on this single-use runner VM is safe.
-        # OPENCODE_TEST_NATIVE_REFUSAL=1 makes a missing capability fail, not skip.
+        # It also runs the root-watch status transitions against the real parcel worker.
+        # OPENCODE_TEST_NATIVE_WATCHER=1 makes a missing capability fail, not skip.
         if: runner.os == 'Linux'
-        timeout-minutes: 5
+        timeout-minutes: 15
         working-directory: packages/core
         run: |
           if ! unshare -U -r true 2>/dev/null; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-          OPENCODE_TEST_NATIVE_REFUSAL=1 bun test test/filesystem/watcher.test.ts -t "refused inotify instances"
+          OPENCODE_TEST_NATIVE_WATCHER=1 bun test test/filesystem/watcher.test.ts -t "refused inotify instances|root status transitions"
+
+      - name: Run the desktop built-sidecar watcher regression
+        # packages/desktop has no test script, so turbo never runs its tests. This
+        # builds the desktop main process with the real electron-vite config and
+        # drives the built sidecar under Node, asserting root-file events.
+        # OPENCODE_TEST_DESKTOP_SIDECAR=1 runs it under CI instead of skipping.
+        if: runner.os == 'Linux'
+        timeout-minutes: 20
+        working-directory: packages/desktop
+        run: OPENCODE_TEST_DESKTOP_SIDECAR=1 bun test src/main/sidecar-watcher.test.ts
 
       - name: Check generated client
         if: runner.os == 'Linux'

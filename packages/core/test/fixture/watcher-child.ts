@@ -13,7 +13,10 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
+import { announce, result } from "./child-liveness"
 import { location } from "./location"
+
+announce()
 
 const directory = process.argv[2]
 const waitRoot = process.argv[3] === "wait-root"
@@ -100,5 +103,4 @@ const layer = AppNodeBuilder.build(LayerNode.group([Watcher.node, EventV2.node, 
   ),
 )
 
-console.log(JSON.stringify(await program.pipe(Effect.scoped, Effect.provide(layer), Effect.runPromise)))
-process.exit(0)
+result(await program.pipe(Effect.scoped, Effect.provide(layer), Effect.runPromise))

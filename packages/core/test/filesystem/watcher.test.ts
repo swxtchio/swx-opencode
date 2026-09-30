@@ -2,20 +2,7 @@ import { $ } from "bun"
 import { describe, expect, test } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
-import {
-  ConfigProvider,
-  Context,
-  Deferred,
-  Duration,
-  Effect,
-  Exit,
-  Fiber,
-  Layer,
-  Logger,
-  Option,
-  Scope,
-  Stream,
-} from "effect"
+import { ConfigProvider, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Scope, Stream } from "effect"
 import { Config } from "@opencode-ai/core/config"
 import { ConfigWatcher } from "@opencode-ai/core/config/watcher"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -25,7 +12,6 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
-import { TestClock } from "effect/testing"
 import { location } from "../fixture/location"
 import { tmpdir } from "../fixture/tmpdir"
 import { testEffect } from "../lib/effect"
@@ -93,62 +79,6 @@ function withTmp<A, E, R>(
     }),
     ({ tmp }) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
   ).pipe(Effect.flatMap(({ tmp, vcs }) => f(tmp.path, vcs).pipe(provide(tmp.path, vcs, options))))
-}
-
-// Polls the root watch's reported state in real time, since the TestClock does not
-// advance on its own; the deadline is a failure backstop.
-function rootState(watcher: Watcher.Interface, state: Watcher.WatchState) {
-  return Effect.gen(function* () {
-    const deadline = Date.now() + 15_000
-    while (true) {
-      const root = (yield* watcher.status).find((item) => item.watch === "root")
-      if (root?.state === state) return root
-      if (Date.now() > deadline)
-        return yield* Effect.fail(new Error(`root watch never became ${state}: ${JSON.stringify(root)}`))
-      yield* Effect.promise(() => Bun.sleep(20))
-    }
-  })
-}
-
-// Waits in real time for one watcher event for `file` after `trigger`.
-function delivered<E>(file: string, trigger: Effect.Effect<void, E>) {
-  return Effect.acquireUseRelease(
-    wait((event) => event.file === file),
-    ({ deferred }) =>
-      trigger.pipe(
-        Effect.andThen(
-          Effect.raceFirst(
-            Deferred.await(deferred),
-            Effect.promise(() => Bun.sleep(10_000)).pipe(
-              Effect.andThen(Effect.fail(new Error(`no watcher event for ${file}`))),
-            ),
-          ),
-        ),
-      ),
-    ({ fiber }) => Fiber.interrupt(fiber),
-  )
-}
-
-// Records the watcher's emitted status log lines for the root watch.
-function captureLogs() {
-  const messages: unknown[][] = []
-  return {
-    layer: Logger.layer(
-      [
-        Logger.make(
-          (options) => void messages.push(Array.isArray(options.message) ? options.message : [options.message]),
-        ),
-      ],
-      { mergeWithExisting: true },
-    ),
-    root: () =>
-      messages.flatMap((message) => {
-        const fields = message[1]
-        return typeof fields === "object" && fields !== null && "watch" in fields && fields.watch === "root"
-          ? [String(message[0])]
-          : []
-      }),
-  }
 }
 
 async function gitInit(directory: string) {
@@ -458,75 +388,6 @@ describeWatcher("Watcher", () => {
     20_000,
   )
 
-  // These run on the TestClock, so the subscribe backstop fires only when the test
-  // advances the clock; the worker's acknowledgement and file events stay real.
-  it.effect(
-    "keeps an acknowledged root watch active after its subscribe backstop elapses",
-    () => {
-      const logs = captureLogs()
-      return withTmp(
-        (directory) =>
-          Effect.gen(function* () {
-            const afs = yield* FSUtil.Service
-            const watcher = yield* Watcher.Service
-            // Startup is proven by the acknowledgement, however long a cold worker takes.
-            yield* rootState(watcher, "active")
-            expect(logs.root()).toEqual(["watcher active"])
-            yield* TestClock.adjust("10 seconds")
-            expect((yield* watcher.status).find((item) => item.watch === "root")).toEqual({
-              watch: "root",
-              directory,
-              state: "active",
-            })
-            expect(logs.root()).toEqual(["watcher active"])
-            const file = path.join(directory, "after-backstop.txt")
-            expect(yield* delivered(file, afs.writeFileString(file, "x"))).toEqual({ file, event: "add" })
-          }),
-        { git: true, subscribeTimeout: 10_000 },
-      ).pipe(Effect.provide(logs.layer))
-    },
-    30_000,
-  )
-
-  it.effect(
-    "activates a root watch whose acknowledgement arrives after it was reported unconfirmed",
-    () =>
-      Effect.gen(function* () {
-        const events = yield* EventV2.Service
-        const afs = yield* FSUtil.Service
-        const tmp = yield* Effect.acquireRelease(
-          Effect.promise(() => tmpdir()),
-          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
-        )
-        yield* Effect.promise(() => gitInit(tmp.path))
-        const vcs = { type: "git" as const, store: AbsolutePath.make(path.join(tmp.path, ".git")) }
-        // The backstop must expire before the worker's reply is processed. A warm
-        // worker can reply first; that attempt proves nothing and is discarded.
-        const attempt = (index: number) => {
-          const logs = captureLogs()
-          return Effect.gen(function* () {
-            const context = yield* Layer.build(
-              Layer.fresh(watcherLayer(tmp.path, vcs, { events, subscribeTimeout: 10_000 })),
-            )
-            const watcher = Context.get(context, Watcher.Service)
-            yield* TestClock.adjust("10 seconds")
-            if ((yield* watcher.status).find((item) => item.watch === "root")?.state !== "unconfirmed") return false
-            yield* rootState(watcher, "active")
-            expect(logs.root()).toEqual([
-              "watcher not confirmed, continuing without it until it confirms",
-              "watcher active",
-            ])
-            const file = path.join(tmp.path, `after-late-ack-${index}.txt`)
-            expect(yield* delivered(file, afs.writeFileString(file, "x"))).toEqual({ file, event: "add" })
-            return true
-          }).pipe(Effect.scoped, Effect.provide(logs.layer))
-        }
-        for (const index of [0, 1, 2, 3, 4, 5, 6, 7]) if (yield* attempt(index)) return
-        return yield* Effect.fail(new Error("every attempt's acknowledgement arrived before the backstop expired"))
-      }),
-    60_000,
-  )
-
   const describeSymlink = process.platform !== "win32" ? describe : describe.skip
   describeSymlink("symlinked .git", () => {
     it.live("publishes .git/HEAD events through a symlinked .git directory", () =>
@@ -566,12 +427,11 @@ describeWatcher("Watcher", () => {
 const canCapInotify =
   process.platform === "linux" &&
   Bun.spawnSync(["unshare", "-U", "-r", "sh", "-c", "echo 1 > /proc/sys/user/max_inotify_instances"]).exitCode === 0
-// CI opts in with OPENCODE_TEST_NATIVE_REFUSAL=1, which runs these even when the
+// CI opts in with OPENCODE_TEST_NATIVE_WATCHER=1, which runs these even when the
 // namespace cannot be created, so a runner without the capability fails loudly.
+const nativeRequired = process.env.OPENCODE_TEST_NATIVE_WATCHER === "1"
 const describeRefusal =
-  process.env.OPENCODE_TEST_NATIVE_REFUSAL === "1" || (canCapInotify && Watcher.hasNativeBinding() && !process.env.CI)
-    ? describe
-    : describe.skip
+  nativeRequired || (canCapInotify && Watcher.hasNativeBinding() && !process.env.CI) ? describe : describe.skip
 
 type ChildReport = {
   booted: Watcher.WatchStatus[]
@@ -585,7 +445,7 @@ type ChildReport = {
 async function underInotifyLimit(limit: number, options: { waitRoot?: boolean } = {}) {
   await using tmp = await tmpdir()
   await gitInit(tmp.path)
-  const child = Bun.spawn(
+  const report = (await runChild(
     [
       "unshare",
       "-U",
@@ -598,24 +458,63 @@ async function underInotifyLimit(limit: number, options: { waitRoot?: boolean } 
       tmp.path,
       options.waitRoot ? "wait-root" : "",
     ],
-    { stdout: "pipe", stderr: "pipe" },
-  )
-  // A parked JavaScript thread never finishes on its own; the bound turns that
-  // into a failure of this test instead of a hang.
-  const exited = await Promise.race([child.exited, Bun.sleep(25_000).then(() => undefined)])
-  if (exited === undefined) {
+    `watcher child under inotify limit ${limit}`,
+  )) as ChildReport
+  return { report, directory: await fs.realpath(tmp.path) }
+}
+
+// Runs a fixture that speaks test/fixture/child-liveness.ts. Liveness is decided by
+// replies: a slow but responsive child keeps answering pings however long it
+// takes, while a parked JavaScript thread stops answering. The deadlines only
+// bound failure.
+async function runChild(command: string[], label: string) {
+  const child = Bun.spawn(command, { stdin: "pipe", stdout: "pipe", stderr: "pipe" })
+  const state = { started: false, reply: Date.now(), result: undefined as unknown, output: "" }
+  const reading = (async () => {
+    const decoder = new TextDecoder()
+    const pending = { text: "" }
+    for await (const chunk of child.stdout) {
+      pending.text += decoder.decode(chunk)
+      const lines = pending.text.split("\n")
+      pending.text = lines.pop() ?? ""
+      for (const line of lines) {
+        state.output += line + "\n"
+        const message = Schema.decodeUnknownOption(ChildLine)(line)
+        if (Option.isNone(message)) continue
+        state.reply = Date.now()
+        if (message.value.type === "started") state.started = true
+        if (message.value.type === "result") state.result = message.value.value
+      }
+    }
+  })()
+  const spawned = Date.now()
+  const fail = async (reason: string) => {
     child.kill("SIGKILL")
     await child.exited
-    throw new Error(`watcher child under inotify limit ${limit} made no progress: its JavaScript thread is parked`)
+    throw new Error(`${label} ${reason}`)
   }
-  const stdout = await new Response(child.stdout).text()
-  if (exited !== 0)
-    throw new Error(`watcher child exited ${exited}: ${stdout}${await new Response(child.stderr).text()}`)
-  return {
-    report: JSON.parse(stdout.trim().split("\n").at(-1)!) as ChildReport,
-    directory: await fs.realpath(tmp.path),
+  while ((await Promise.race([child.exited, Bun.sleep(1_000).then(() => undefined)])) === undefined) {
+    child.stdin.write("ping\n")
+    child.stdin.flush()
+    const now = Date.now()
+    if (!state.started && now - spawned > 120_000) await fail("never started within 120s")
+    if (state.started && now - state.reply > 20_000)
+      await fail("made no progress: its JavaScript thread answered no ping for 20s, so it is parked")
+    if (now - spawned > 600_000) await fail("kept answering pings but did not finish within 600s")
   }
+  await reading
+  const code = await child.exited
+  if (code !== 0 || state.result === undefined)
+    throw new Error(`${label} exited ${code}: ${state.output}${await new Response(child.stderr).text()}`)
+  return state.result
 }
+
+const ChildLine = Schema.fromJsonString(
+  Schema.Union([
+    Schema.Struct({ type: Schema.Literals(["started", "pong"]) }),
+    Schema.Struct({ type: Schema.Literal("result"), value: Schema.Unknown }),
+  ]),
+)
 
 describeRefusal("Watcher under refused inotify instances", () => {
   test("keeps its thread running and reports every refused watch as not active", async () => {
@@ -634,7 +533,7 @@ describeRefusal("Watcher under refused inotify instances", () => {
     expect(report.headEvent).toBeUndefined()
     expect(report.settled?.find((item) => item.watch === "root")).toMatchObject({ state: "unconfirmed" })
     expect(report.rootEvent).toBeUndefined()
-  }, 40_000)
+  }, 660_000)
 
   test("keeps a started git watch delivering when the root watch is refused", async () => {
     const { report, directory } = await underInotifyLimit(1, { waitRoot: true })
@@ -658,7 +557,7 @@ describeRefusal("Watcher under refused inotify instances", () => {
       },
     ])
     expect(report.rootEvent).toBeUndefined()
-  }, 40_000)
+  }, 660_000)
 
   test("starts every watch under ordinary capacity", async () => {
     const { report, directory } = await underInotifyLimit(64, { waitRoot: true })
@@ -669,5 +568,51 @@ describeRefusal("Watcher under refused inotify instances", () => {
       { watch: "root", directory, state: "active" },
     ])
     expect(report.rootEvent).toBe("add")
-  }, 40_000)
+  }, 660_000)
+})
+
+// Each transition runs in its own process (the process has one parcel host) with
+// the gated worker, so the test decides when the real acknowledgement arrives.
+const describeTransitions = nativeRequired || (Watcher.hasNativeBinding() && !process.env.CI) ? describe : describe.skip
+
+async function transition(scenario: "backstop" | "late" | "reactivate") {
+  await using tmp = await tmpdir()
+  await gitInit(tmp.path)
+  const value = await runChild(
+    [process.execPath, path.join(import.meta.dir, "../fixture/watcher-gate-child.ts"), tmp.path, scenario],
+    `watcher gate child (${scenario})`,
+  )
+  return { value: value as Record<string, unknown>, directory: await fs.realpath(tmp.path) }
+}
+
+const CONFIRMED = "watcher active"
+const UNCONFIRMED = "watcher not confirmed, continuing without it until it confirms"
+
+describeTransitions("Watcher root status transitions", () => {
+  test("keeps an acknowledged root watch active after its subscribe backstop expires", async () => {
+    const { value, directory } = await transition("backstop")
+    expect(value.before).toEqual([CONFIRMED])
+    expect(value.after).toEqual({ watch: "root", directory, state: "active" })
+    expect(value.logs).toEqual([CONFIRMED])
+    expect(value.event).toBe("add")
+  }, 660_000)
+
+  test("activates an unconfirmed root watch when its acknowledgement arrives late", async () => {
+    const { value } = await transition("late")
+    expect(value.expired).toMatchObject({ state: "unconfirmed" })
+    expect(value.logs).toEqual([UNCONFIRMED, CONFIRMED])
+  }, 660_000)
+
+  test("re-confirms a root watch by delivery after a callback error", async () => {
+    const { value, directory } = await transition("reactivate")
+    expect(value.errored).toEqual({
+      watch: "root",
+      directory,
+      state: "unconfirmed",
+      reason: "Events were dropped by the FSEvents client.",
+    })
+    expect(value.event).toBe("add")
+    expect(value.after).toEqual({ watch: "root", directory, state: "active" })
+    expect(value.logs).toEqual([CONFIRMED, UNCONFIRMED, CONFIRMED])
+  }, 660_000)
 })

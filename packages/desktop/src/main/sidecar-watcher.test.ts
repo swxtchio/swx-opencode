@@ -10,7 +10,11 @@ import { resolveConfig } from "electron-vite"
 // its sidecar.js under Node, so root file events are observed from the shipped
 // sidecar output rather than from the intermediate opencode dist/node bundle.
 const desktop = path.join(import.meta.dir, "../..")
-const canRun = process.platform !== "win32" && !!Bun.which("node") && !process.env.CI
+// CI opts in with OPENCODE_TEST_DESKTOP_SIDECAR=1.
+const canRun =
+  process.platform !== "win32" &&
+  !!Bun.which("node") &&
+  (!process.env.CI || process.env.OPENCODE_TEST_DESKTOP_SIDECAR === "1")
 const describeSidecar = canRun ? describe : describe.skip
 
 // Electron's utility process provides process.parentPort; Node's IPC channel
