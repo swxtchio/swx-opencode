@@ -211,6 +211,44 @@ describe("SQLite busy timeout and statement retries", () => {
     }, 10_000)
   }
 
+  test("exhausts an immediate transaction begin into a direct SqlError", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "immediate-busy.sqlite")
+    const exit = await Effect.runPromiseExit(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const context = yield* Layer.build(Database.layerFromPath(filename))
+          const database = Context.get(context, Database.Service).db
+          yield* database.run("CREATE TABLE busy_retry_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+          yield* database.$client.unsafe("PRAGMA busy_timeout = 0").raw
+          const holder = yield* Effect.promise(() => startLockHolder(filename))
+
+          yield* Effect.gen(function* () {
+            let failure: unknown
+            const write = database
+              .transaction((tx) => tx.run("INSERT INTO busy_retry_test (id, value) VALUES (1, 'transaction-writer')"), {
+                behavior: "immediate",
+              })
+              .pipe(
+                Effect.timeoutOrElse({
+                  duration: "5 seconds",
+                  orElse: () => Effect.fail(new Error("immediate transaction retries did not stop")),
+                }),
+              )
+            yield* write.pipe(Effect.catch((error) => Effect.sync(() => (failure = error))))
+            expect(isSqlError(failure)).toBe(true)
+            if (!isSqlError(failure)) return
+            expect(failure).not.toBeInstanceOf(EffectDrizzleQueryError)
+            expect(failure.reason._tag).toBe("LockTimeoutError")
+            expect(failure.reason.cause).toMatchObject({ code: "SQLITE_BUSY", message: "database is locked" })
+            expect(failure.message).toContain("SQLITE_BUSY")
+          }).pipe(Effect.ensuring(Effect.promise(() => holder.release())))
+        }),
+      ),
+    )
+    if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
+  }, 10_000)
+
   for (const method of ["run", "values"] as const) {
     test(`retries ${method} after a second process releases its write lock`, async () => {
       await using tmp = await tmpdir()

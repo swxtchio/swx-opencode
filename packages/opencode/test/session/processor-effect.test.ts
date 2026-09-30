@@ -1438,7 +1438,7 @@ itSqliteLock.live(
           }
           expect(eventMessages).toContain(lockMessage)
           expect(JSON.stringify({ assistant: handle.message.error, stored, eventMessages })).not.toContain(
-            "secret_table",
+            "secret_lock_fixture",
           )
           expect(JSON.stringify({ assistant: handle.message.error, stored, eventMessages })).not.toContain(
             "secret_parameter",
