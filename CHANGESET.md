@@ -59,7 +59,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
-- **#TBD** A refused inotify instance no longer parks the server thread (swxtchio/swx-opencode#90): the git
+- **#98** A refused inotify instance no longer parks the server thread (swxtchio/swx-opencode#90): the git
   `HEAD` watch uses a non-recursive `fs.watch` that reports the refusal with its errno, and the opt-in root watch
   runs its `@parcel/watcher` subscription in a worker, active only once the worker acknowledges it. Each watch's
   state is on `Watcher.Service.status`, and `OPENCODE_EXPERIMENTAL_WATCHER_SUBSCRIBE_TIMEOUT_MS` sets when an
