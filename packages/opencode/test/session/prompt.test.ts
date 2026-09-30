@@ -1106,6 +1106,7 @@ rootlessLoopPrompt.instance(
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
       const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
       const sessions = yield* Session.Service
       const session = yield* sessions.create({ title: "Rootless admission order" })
       const earlier = yield* seedUser({
@@ -1126,6 +1127,7 @@ rootlessLoopPrompt.instance(
       expect(admission.order.get(earlier.info.id)).toBeLessThan(admission.order.get(root.info.id) ?? Infinity)
 
       const markedGate = yield* Deferred.make<void>()
+      const markedText = "[fm-from-firstmate]\x1f queued during rootless initialization"
       yield* llm.push(
         reply().text("rootless task finished").stop().item(),
         reply().wait(deferredAsPromise(markedGate)).text("marked message handled").stop().item(),
@@ -1138,33 +1140,28 @@ rootlessLoopPrompt.instance(
       )
 
       const markedID = MessageID.make("msg_rootless_marked")
-      yield* seedUser({
-        sessionID: session.id,
-        messageID: markedID,
-        agent: "build",
-        model: ref,
-        parts: [{ type: "text", text: "[fm-from-firstmate]\x1f committed during rootless initialization" }],
-      })
-      yield* pollWithTimeout(
-        sessions
-          .messages({ sessionID: session.id })
-          .pipe(
-            Effect.map((messages) =>
-              messages.some((message) => message.info.role === "user" && message.info.id === markedID)
-                ? true
-                : undefined,
-            ),
-          ),
+      const marked = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          messageID: markedID,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: markedText }],
+        })
+        .pipe(Effect.forkChild)
+      const pending = yield* pollWithTimeout(
+        queue.list(session.id).pipe(Effect.map((items) => items.find((item) => item.input.messageID === markedID))),
         "marked rootless input was not admitted",
         "10 seconds",
       )
+      expect(pending.delivery).toBe("queue")
 
       yield* Effect.sync(() => rootlessLoopGate.release.resolve())
       yield* awaitWithTimeout(llm.wait(1), "rootless loop did not reach the provider", "10 seconds")
       const taskRequest = (yield* llm.inputs)[0]
       if (!taskRequest) throw new Error("expected the rootless task request")
       expect(JSON.stringify(taskRequest.messages)).toContain("latest admitted task")
-      expect(JSON.stringify(taskRequest.messages)).not.toContain("committed during rootless initialization")
+      expect(JSON.stringify(taskRequest.messages)).not.toContain("queued during rootless initialization")
       expect(
         (yield* sessions.messages({ sessionID: session.id })).some(
           (message) => message.info.role === "assistant" && message.info.parentID === root.info.id,
@@ -1174,9 +1171,11 @@ rootlessLoopPrompt.instance(
       yield* awaitWithTimeout(llm.wait(2), "marked message did not run after the rootless task", "10 seconds")
       const markedRequest = (yield* llm.inputs)[1]
       if (!markedRequest) throw new Error("expected the marked follow-up request")
-      expect(JSON.stringify(markedRequest.messages)).toContain("committed during rootless initialization")
+      expect(JSON.stringify(markedRequest.messages)).toContain("queued during rootless initialization")
       yield* Deferred.succeed(markedGate, void 0)
       yield* awaitWithTimeout(Fiber.await(run), "rootless loop did not finish", "10 seconds")
+      const markedExit = yield* awaitWithTimeout(Fiber.await(marked), "marked prompt did not finish", "10 seconds")
+      expect(Exit.isSuccess(markedExit)).toBe(true)
       expect(yield* llm.calls).toBe(2)
     }).pipe(Effect.ensuring(Effect.sync(() => rootlessLoopGate.release.resolve()))),
   60_000,
