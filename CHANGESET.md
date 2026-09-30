@@ -62,7 +62,12 @@ Newest first. Each entry names the upstream range brought in.
 - **#80** Codex OAuth accepts complete canonical GPT versions and catalog-backed named variants (including GPT-6 Astra from the [models.dev OpenAI catalog](https://models.dev/api.json)); malformed numeric aliases and unsupported suffixes stay filtered. _Fork-only._
 - **#78** Coordinate snapshot maintenance with a box-wide hourly gc cooldown (issue #70 Fix-1) and serialized cleanups; `Snapshot.track()` waits through contention and never silently skips snapshot updates. _Fork-only._
 - **#76** Classify mid-stream OpenAI-compatible context overflow errors as `ContextOverflowError` so automatic compaction can resume; cover SDK error shapes and session continuation. The unpatched-router reproduction is recorded in [docs/stream-overflow-e2e.md](docs/stream-overflow-e2e.md). (swxtchio/swx-opencode#66). _Fork-only._
-- **#89** Hold framed machine messages until the active turn ends, then run them in admission order; built-in `[fm-level:critical]` messages and unmarked captain prompts remain immediately eligible. Marked `noReply` prompts are held only during an active run; idle `noReply` keeps direct-write/no-drain behavior. Persist admission order in `admission_seq` (migration `20260929045002`, unique `(session_id, admission_seq)` index), and paginate with `{id, seq}` cursors. _Fork-only._
+- **#89** Hold framed machine messages until the active turn ends, then run them in admission order; the built-in
+  `[fm-level:critical]` token default and unmarked captain prompts remain immediately eligible. Marked `noReply`
+  prompts are held only during an active run; idle `noReply` keeps direct-write/no-drain behavior. Add `noReply` to the
+  V1 User schema and persist order in `admission_seq` (migration `20260929045002`, unique `(session_id, admission_seq)`
+  index). Pagination orders by admission sequence, emits `{id, seq}` cursors and accepts legacy `{id, time}` cursors.
+  _Fork-only._
 - **#49** `--effort` works on `opencode`, `--mini` and `attach` (one rule: it applies to whichever model declares
   it, until an in-app choice, and is never saved); an unknown CLI argument is now named after the help; and `run`
   prints the server's real validation error instead of a generic 500. _Fork-only; the unknown-argument message is

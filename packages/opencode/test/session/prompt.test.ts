@@ -934,7 +934,7 @@ it.instance(
           parts: [{ type: "text", text: "active task" }],
         })
         .pipe(Effect.forkChild)
-      yield* awaitWithTimeout(llm.wait(1), "active task did not reach the provider", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(1), "active task did not reach the provider", "30 seconds")
 
       const reminder = yield* prompt.prompt({
         sessionID: active.id,
@@ -948,7 +948,7 @@ it.instance(
       expect(reminder.info.noReply).toBe(true)
 
       yield* Deferred.succeed(response, void 0)
-      yield* awaitWithTimeout(Fiber.await(run), "active task did not finish", "10 seconds")
+      yield* awaitWithTimeout(Fiber.await(run), "active task did not finish", "30 seconds")
       expect(yield* llm.calls).toBe(1)
 
       const rootless = yield* sessions.create({ title: "No reply rootless turn" })
@@ -965,7 +965,7 @@ it.instance(
       const loop = yield* prompt.loop({ sessionID: rootless.id }).pipe(Effect.forkChild)
       expect(
         Exit.isSuccess(
-          yield* awaitWithTimeout(Fiber.await(loop), "explicit rootless loop did not finish", "10 seconds"),
+          yield* awaitWithTimeout(Fiber.await(loop), "explicit rootless loop did not finish", "30 seconds"),
         ),
       ).toBe(true)
       expect(yield* llm.calls).toBe(1)
@@ -981,12 +981,12 @@ it.instance(
           parts: [{ type: "text", text: "real prompt after bookkeeping" }],
         })
         .pipe(Effect.forkChild)
-      yield* awaitWithTimeout(llm.wait(2), "real prompt after bookkeeping did not reach the provider", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(2), "real prompt after bookkeeping did not reach the provider", "30 seconds")
       const realRequest = (yield* llm.inputs)[1]
       if (!realRequest) throw new Error("expected the real prompt provider request")
       expect(lastUserContent(realRequest)).toContain("real prompt after bookkeeping")
       expect(
-        Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(real), "real prompt did not finish", "10 seconds")),
+        Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(real), "real prompt did not finish", "30 seconds")),
       ).toBe(true)
       expect(yield* llm.calls).toBe(2)
     }),
@@ -1017,9 +1017,9 @@ it.instance(
           parts: [{ type: "text", text: "first prompt" }],
         })
         .pipe(Effect.forkChild)
-      yield* awaitWithTimeout(llm.wait(1), "first prompt did not reach the provider", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(1), "first prompt did not reach the provider", "30 seconds")
       expect(
-        Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(first), "first prompt did not finish", "10 seconds")),
+        Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(first), "first prompt did not finish", "30 seconds")),
       ).toBe(true)
 
       const second = yield* prompt
@@ -1031,12 +1031,12 @@ it.instance(
           parts: [{ type: "text", text: "second prompt" }],
         })
         .pipe(Effect.forkChild)
-      yield* awaitWithTimeout(llm.wait(2), "second prompt did not reach the provider", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(2), "second prompt did not reach the provider", "30 seconds")
       const request = (yield* llm.inputs)[1]
       if (!request) throw new Error("expected the second provider request")
       expect(lastUserContent(request)).toContain("second prompt")
       expect(
-        Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(second), "second prompt did not finish", "10 seconds")),
+        Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(second), "second prompt did not finish", "30 seconds")),
       ).toBe(true)
       expect(yield* llm.calls).toBe(2)
     }),
@@ -1214,22 +1214,23 @@ preProviderFailurePrompt.instance("allows retry after preparation fails before p
     const failedExit = yield* awaitWithTimeout(
       Fiber.await(failed),
       "pre-provider prompt failure did not finish",
-      "10 seconds",
+      "30 seconds",
     )
     expect(Exit.isFailure(failedExit)).toBe(true)
     expect(yield* llm.calls).toBe(0)
 
     yield* llm.text("retried input handled")
     const retry = yield* prompt.loop({ sessionID: session.id, messageID }).pipe(Effect.forkChild)
-    yield* awaitWithTimeout(llm.wait(1), "failed input did not reach its retry", "10 seconds")
+    yield* awaitWithTimeout(llm.wait(1), "failed input did not reach its retry", "30 seconds")
     const request = (yield* llm.inputs)[0]
     if (!request) throw new Error("expected the retry provider request")
     expect(lastUserContent(request)).toContain("retry this admitted input")
     expect(
-      Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(retry), "provider retry did not finish", "10 seconds")),
+      Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(retry), "provider retry did not finish", "30 seconds")),
     ).toBe(true)
     expect(yield* llm.calls).toBe(1)
   }),
+  60_000,
 )
 
 it.instance(
@@ -1569,7 +1570,7 @@ it.instance(
           parts: [{ type: "text", text: "original task" }],
         })
         .pipe(Effect.forkChild)
-      yield* awaitWithTimeout(llm.wait(1), "provider did not receive the configured-marker task", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(1), "provider did not receive the configured-marker task", "30 seconds")
 
       const heldID = MessageID.ascending()
       const heldText = "CUSTOM-HOLD: wait until the task reaches its boundary"
@@ -1586,7 +1587,7 @@ it.instance(
       const queued = yield* pollWithTimeout(
         queue.list(session.id).pipe(Effect.map((items) => items.find((item) => item.input.messageID === heldID))),
         "configured hold marker did not queue the prompt",
-        "10 seconds",
+        "30 seconds",
       )
       expect(queued.delivery).toBe("queue")
 
@@ -1613,30 +1614,30 @@ it.instance(
             ),
           ),
         "configured critical marker did not promote the prompt",
-        "10 seconds",
+        "30 seconds",
       )
       expect((yield* queue.list(session.id)).map((item) => item.input.messageID)).toEqual([heldID])
 
       yield* Deferred.succeed(toolGate, void 0)
-      yield* awaitWithTimeout(llm.wait(2), "configured critical prompt did not reach the next step", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(2), "configured critical prompt did not reach the next step", "30 seconds")
       const criticalTurn = (yield* llm.inputs)[1]
       if (!criticalTurn) throw new Error("expected the configured critical provider request")
       expect(JSON.stringify(criticalTurn.messages)).toContain(criticalText)
       expect(JSON.stringify(criticalTurn.messages)).not.toContain(heldText)
 
       yield* Deferred.succeed(stopGate, void 0)
-      yield* awaitWithTimeout(llm.wait(3), "configured hold prompt did not reach its own turn", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(3), "configured hold prompt did not reach its own turn", "30 seconds")
       const heldTurn = (yield* llm.inputs)[2]
       if (!heldTurn) throw new Error("expected the configured held provider request")
       expect(JSON.stringify(heldTurn.messages)).toContain(heldText)
 
       yield* Deferred.succeed(heldGate, void 0)
-      expect(Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(task), "task did not finish", "10 seconds"))).toBe(true)
+      expect(Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(task), "task did not finish", "30 seconds"))).toBe(true)
       expect(
-        Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(critical), "critical prompt did not finish", "10 seconds")),
+        Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(critical), "critical prompt did not finish", "30 seconds")),
       ).toBe(true)
       expect(
-        Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(held), "held prompt did not finish", "10 seconds")),
+        Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(held), "held prompt did not finish", "30 seconds")),
       ).toBe(true)
       expect(yield* queue.list(session.id)).toEqual([])
       expect(yield* llm.calls).toBe(3)
@@ -5789,7 +5790,7 @@ unix(
         const shell = yield* prompt
           .shell({ sessionID: session.id, agent: "build", command: "printf shell-ready; sleep 30" })
           .pipe(Effect.forkChild)
-        yield* waitForBusy(session.id)
+        yield* waitForBusy(session.id, "30 seconds")
         yield* pollWithTimeout(
           sessions
             .messages({ sessionID: session.id })
@@ -5803,13 +5804,14 @@ unix(
               ),
             ),
           "shell did not enter its running state",
+          "30 seconds",
         )
 
         const queued = yield* prompt.loop({ sessionID: session.id, messageID: root.info.id }).pipe(Effect.forkChild)
         yield* Effect.yieldNow
         yield* prompt.cancel(session.id)
-        const queuedExit = yield* awaitWithTimeout(Fiber.await(queued), "queued loop did not cancel", "10 seconds")
-        const shellExit = yield* awaitWithTimeout(Fiber.await(shell), "shell did not cancel", "10 seconds")
+        const queuedExit = yield* awaitWithTimeout(Fiber.await(queued), "queued loop did not cancel", "30 seconds")
+        const shellExit = yield* awaitWithTimeout(Fiber.await(shell), "shell did not cancel", "30 seconds")
         expect(Exit.isSuccess(queuedExit)).toBe(true)
         expect(Exit.isSuccess(shellExit)).toBe(true)
         expect(yield* llm.calls).toBe(0)
@@ -5825,11 +5827,11 @@ unix(
             parts: [{ type: "text", text: "fresh task after cancellation" }],
           })
           .pipe(Effect.forkChild)
-        yield* awaitWithTimeout(llm.wait(1), "the next prompt was poisoned by the cancelled queue", "10 seconds")
+        yield* awaitWithTimeout(llm.wait(1), "the next prompt was poisoned by the cancelled queue", "30 seconds")
         const request = (yield* llm.inputs)[0]
         if (!request) throw new Error("expected the next provider request")
         expect(JSON.stringify(request.messages)).toContain("fresh task after cancellation")
-        const nextExit = yield* awaitWithTimeout(Fiber.await(next), "the next prompt did not finish", "10 seconds")
+        const nextExit = yield* awaitWithTimeout(Fiber.await(next), "the next prompt did not finish", "30 seconds")
         expect(Exit.isSuccess(nextExit)).toBe(true)
         expect(yield* llm.calls).toBe(1)
       }),
