@@ -37,6 +37,20 @@ export class WithdrawnError extends Schema.TaggedErrorClass<WithdrawnError>()("S
 
 export interface Interface {
   readonly admit: (input: AdmitInput) => Effect.Effect<Item>
+  /**
+   * Prepare under the session lock, recheck run state, then either persist the
+   * noReply message directly or admit it for the next boundary.
+   */
+  readonly writeOrAdmit: <P, E>(input: {
+    readonly admission: AdmitInput
+    readonly isBusy: Effect.Effect<boolean>
+    readonly prepare: Effect.Effect<P, E>
+    readonly write: (prepared: P) => Effect.Effect<SessionV1.WithParts>
+  }) => Effect.Effect<
+    | { readonly kind: "direct"; readonly message: SessionV1.WithParts }
+    | { readonly kind: "queued"; readonly own: Item; readonly prepared: P },
+    E
+  >
   readonly list: (sessionID: SessionID) => Effect.Effect<Item[]>
   /**
    * Withdraws an item for editing so it cannot be delivered mid-edit, even while
@@ -216,6 +230,21 @@ const layer = Layer.effect(
       return fromRow(row)
     })
 
+    const writeOrAdmit: Interface["writeOrAdmit"] = (input) =>
+      exclusive(
+        input.admission.sessionID,
+        Effect.gen(function* () {
+          const prepared = yield* input.prepare
+          if (yield* input.isBusy)
+            return {
+              kind: "queued" as const,
+              own: yield* admitLocked(input.admission),
+              prepared,
+            }
+          return { kind: "direct" as const, message: yield* input.write(prepared) }
+        }),
+      )
+
     const withdraw = Effect.fn("SessionQueue.withdraw")(function* (sessionID: SessionID, itemID: ItemID) {
       return yield* exclusive(
         sessionID,
@@ -288,15 +317,13 @@ const layer = Layer.effect(
       running.has(sessionID)
         ? Effect.succeed(true)
         : Effect.gen(function* () {
-            const msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+            const history = yield* MessageV2.snapshot(sessionID).pipe(
               Effect.provideService(Database.Service, database),
             )
-            const admission = yield* MessageV2.admission(sessionID).pipe(
-              Effect.provideService(Database.Service, database),
-            )
-            return openTasks(msgs, { admissionOrder: admission.order, excludeNoReply: true }).some(
-              (task) => task.type === "compaction",
-            )
+            return openTasks(history.messages, {
+              admissionOrder: history.admissionOrder,
+              excludeNoReply: true,
+            }).some((task) => task.type === "compaction")
           })
 
     const whileCompacting: Interface["whileCompacting"] = (sessionID, effect) =>
@@ -628,6 +655,7 @@ const layer = Layer.effect(
 
     return Service.of({
       admit,
+      writeOrAdmit,
       list,
       withdraw,
       restore,

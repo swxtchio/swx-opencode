@@ -186,7 +186,7 @@ const addCompactionPart = Effect.fn("Test.addCompactionPart")(function* (
     type: "compaction",
     auto: true,
     tail_start_id: tailStartID,
-    } as any)
+  } as any)
 })
 
 describe("mixed-version message admission migration", () => {

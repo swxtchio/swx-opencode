@@ -94,9 +94,11 @@ const part = (row: typeof PartTable.$inferSelect) =>
     messageID: row.message_id,
   }) as Part
 
+type MessageQuery = Pick<Database.Interface["db"], "select">
+
 const older = (seq: number) => lt(MessageTable.admission_seq, seq)
 
-function hydrate(db: Database.Interface["db"], rows: (typeof MessageTable.$inferSelect)[]) {
+function hydrate(db: MessageQuery, rows: (typeof MessageTable.$inferSelect)[]) {
   const ids = rows.map((row) => row.id)
   const partByMessage = new Map<string, Part[]>()
   return Effect.gen(function* () {
@@ -626,6 +628,46 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
 
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
   return filterCompacted(yield* stream(sessionID))
+})
+
+export const snapshot = Effect.fnUntraced(function* (sessionID: SessionID) {
+  const { db } = yield* Database.Service
+  return yield* db.transaction((tx) =>
+    Effect.gen(function* () {
+      const rows = [] as (typeof MessageTable.$inferSelect)[]
+      const pageSize = 50
+      let before: number | undefined
+      while (true) {
+        const where =
+          before === undefined
+            ? eq(MessageTable.session_id, sessionID)
+            : and(eq(MessageTable.session_id, sessionID), lt(MessageTable.admission_seq, before))
+        const page = yield* tx
+          .select()
+          .from(MessageTable)
+          .where(where)
+          .orderBy(desc(MessageTable.admission_seq))
+          .limit(pageSize)
+          .all()
+          .pipe(Effect.orDie)
+        if (page.length === 0) break
+        rows.push(...page)
+        if (page.length < pageSize) break
+        const last = page.at(-1)
+        if (!last) break
+        before = last.admission_seq
+      }
+
+      const messages: WithParts[] = []
+      for (let index = 0; index < rows.length; index += pageSize) {
+        messages.push(...(yield* hydrate(tx, rows.slice(index, index + pageSize))))
+      }
+      return {
+        messages: filterCompacted(messages),
+        admissionOrder: new Map(rows.map((row) => [row.id, row.admission_seq])),
+      }
+    }),
+  ).pipe(Effect.orDie)
 })
 
 export function latest(

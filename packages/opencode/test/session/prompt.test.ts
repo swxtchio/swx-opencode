@@ -5135,6 +5135,171 @@ gated.instance(
   30_000,
 )
 
+gated.instance(
+  "rechecks an idle marked noReply before writing during a tool-call run",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const run = yield* SessionRunState.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Inverse noReply admission race",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const toolPath = path.join(dir, "round17-inverse.txt")
+      yield* writeText(toolPath, "active tool-call run")
+      const admissionEntered = yield* Deferred.make<void>()
+      const admissionRelease = yield* Deferred.make<void>()
+      const toolResponse = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() =>
+        Effect.all([admissionRelease, toolResponse].map((gate) => Deferred.succeed(gate, undefined).pipe(Effect.ignore)), {
+          discard: true,
+        }).pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              gates.noReplyAdmission = undefined
+            }),
+          ),
+        ),
+      )
+      yield* llm.push(
+        reply().wait(deferredAsPromise(toolResponse)).tool("glob", { pattern: "round17-inverse.txt" }).item(),
+        reply().text("active task finished").stop().item(),
+        reply().text("held noReply handled").stop().item(),
+      )
+
+      gates.noReplyAdmission = { entered: admissionEntered, release: admissionRelease }
+      const messageID = MessageID.ascending()
+      const markedText = "[fm-from-firstmate]\x1f round17 inverse machine mail"
+      const staged = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          messageID,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: said(markedText),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(
+        Deferred.await(admissionEntered),
+        "marked noReply did not sample the idle run state",
+        "10 seconds",
+      )
+      expect(Exit.isSuccess(yield* run.assertNotBusy(session.id).pipe(Effect.exit))).toBe(true)
+
+      const task = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          agent: "build",
+          model: ref,
+          parts: said("ordinary task starts a tool-call run"),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "ordinary task did not start its provider run", "10 seconds")
+      expect(Exit.isFailure(yield* run.assertNotBusy(session.id).pipe(Effect.exit))).toBe(true)
+
+      yield* Deferred.succeed(admissionRelease, undefined)
+      const stagedMessage = yield* awaitWithTimeout(
+        Fiber.join(staged),
+        "marked noReply did not finish its idle-to-busy admission",
+        "10 seconds",
+      )
+      if (stagedMessage.info.role !== "user") throw new Error("expected the staged noReply user")
+      expect(stagedMessage.info.noReply).toBe(true)
+      const pending = (yield* queue.list(session.id)).find((item) => item.input.messageID === messageID)
+      if (!pending) throw new Error("marked noReply was written directly after the run became active")
+      expect(pending.delivery).toBe("queue")
+      expect(
+        (yield* sessions.messages({ sessionID: session.id })).some((message) => message.info.id === messageID),
+      ).toBe(false)
+      expect(yield* llm.calls).toBe(1)
+
+      yield* Deferred.succeed(toolResponse, undefined)
+      yield* awaitWithTimeout(llm.wait(2), "active task tool continuation did not start", "10 seconds")
+      const continuation = (yield* llm.inputs)[1]
+      if (!continuation) throw new Error("expected the active task continuation request")
+      expect(JSON.stringify(continuation.messages)).not.toContain("round17 inverse machine mail")
+
+      yield* awaitWithTimeout(llm.wait(3), "held noReply did not start after the active run", "10 seconds")
+      const held = (yield* llm.inputs)[2]
+      if (!held) throw new Error("expected the held noReply request")
+      expect(JSON.stringify(held.messages)).toContain("round17 inverse machine mail")
+      const taskExit = yield* awaitWithTimeout(Fiber.await(task), "active task did not finish", "10 seconds")
+      expect(Exit.isSuccess(taskExit)).toBe(true)
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const promoted = messages.find(
+        (message) =>
+          message.info.role === "user" &&
+          message.parts.some((part) => part.type === "text" && part.text === markedText),
+      )
+      if (!promoted) throw new Error("expected the queued marked noReply message after the run")
+      expect(
+        messages.some((message) => message.info.role === "assistant" && message.info.parentID === promoted.info.id),
+      ).toBe(true)
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(yield* llm.calls).toBe(3)
+    }),
+  60_000,
+)
+
+it.instance("does not combine a pre-cleanup history with a post-cleanup admission map", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const revert = yield* SessionRevert.Service
+    const session = yield* sessions.create({ title: "Revert history read race" })
+    const kept = yield* seedUser({
+      sessionID: session.id,
+      agent: "build",
+      model: ref,
+      parts: said("kept message"),
+    })
+    const removed = yield* seedUser({
+      sessionID: session.id,
+      agent: "build",
+      model: ref,
+      parts: said("reverted message"),
+    })
+    yield* sessions.setRevert({
+      sessionID: session.id,
+      revert: { messageID: removed.info.id },
+      summary: { additions: 0, deletions: 0, files: 0 },
+    })
+
+    const staleMessages = yield* MessageV2.filterCompactedEffect(session.id)
+    const snapshot = yield* MessageV2.snapshot(session.id)
+    const info = yield* sessions.get(session.id)
+    yield* revert.cleanup(info)
+    const postCleanupAdmission = yield* MessageV2.admission(session.id)
+
+    expect(() =>
+      MessageV2.latest(staleMessages, { admissionOrder: postCleanupAdmission.order, excludeNoReply: true }),
+    ).toThrow(/Missing persisted admission order/)
+    expect(
+      MessageV2.latest(snapshot.messages, { admissionOrder: snapshot.admissionOrder, excludeNoReply: true }).user?.id,
+    ).toBe(removed.info.id)
+
+    const afterCleanup = yield* MessageV2.snapshot(session.id)
+    expect(afterCleanup.messages.map((message) => message.info.id)).toEqual([kept.info.id])
+    expect(
+      MessageV2.latest(afterCleanup.messages, {
+        admissionOrder: afterCleanup.admissionOrder,
+        excludeNoReply: true,
+      }).user?.id,
+    ).toBe(kept.info.id)
+
+    yield* llm.text("remaining message processed")
+    const result = yield* prompt.loop({ sessionID: session.id })
+    expect(result.info.role).toBe("assistant")
+    expect(result.parts.some((part) => part.type === "text" && part.text === "remaining message processed")).toBe(true)
+  }),
+  30_000,
+)
+
 it.instance(
   "a queued prompt with an older supplied messageID is stored after the reply it waited for",
   () =>

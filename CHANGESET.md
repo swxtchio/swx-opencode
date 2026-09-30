@@ -65,9 +65,10 @@ Newest first. Each entry names the upstream range brought in.
 - **#89** Hold framed machine messages until the active turn ends, then run them in admission order; the built-in
   `[fm-level:critical]` token default and unmarked captain prompts remain immediately eligible. Marked `noReply`
   prompts are held only during an active run; idle `noReply` keeps direct-write/no-drain behavior. Add `noReply` to the
-  V1 User schema and persist order in `admission_seq` (migration `20260929045002`, unique `(session_id, admission_seq)`
-  index). Pagination orders by admission sequence, emits `{id, seq}` cursors and accepts legacy `{id, time}` cursors.
-  _Fork-only._
+  V1 User schema and persist order in `admission_seq` (migration `20260929045002`, a partial unique index on
+  `(session_id, admission_seq)` for positive values, and an insert trigger that assigns admission order to legacy
+  writers that omit the new column). Pagination orders by admission sequence, emits `{id, seq}` cursors and accepts
+  legacy `{id, time}` cursors. _Fork-only._
 - **#49** `--effort` works on `opencode`, `--mini` and `attach` (one rule: it applies to whichever model declares
   it, until an in-app choice, and is never saved); an unknown CLI argument is now named after the help; and `run`
   prints the server's real validation error instead of a generic 500. _Fork-only; the unknown-argument message is

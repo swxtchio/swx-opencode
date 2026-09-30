@@ -1103,24 +1103,45 @@ const layer = Layer.effect(
         (yield* config.get()).machine_message_markers,
       )
       const delivery = classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
-      const heldNoReply =
-        input.noReply === true &&
-        classification === "hold" &&
+      const markedNoReply = input.noReply === true && classification === "hold"
+      const initiallyHeldNoReply =
+        markedNoReply &&
         Exit.isFailure(yield* state.assertNotBusy(input.sessionID).pipe(Effect.exit))
-      const queuedInput = heldNoReply && !input.messageID ? { ...input, messageID: MessageID.ascending() } : input
-      // noReply normally writes directly and never drains. During an active run,
-      // a marked noReply is parked and drains after admission to avoid losing a
-      // run that reaches idle before the queue row lands.
+      const queuedInput = markedNoReply && !input.messageID ? { ...input, messageID: MessageID.ascending() } : input
+      // Preparation can yield while another prompt starts a run. Revalidate at
+      // the write boundary so a newly active run receives the marked message as
+      // queued input instead of seeing it in its next history reload. The queue
+      // lock also makes the busy result and fallback admission one transition.
+      const noReplyDecision =
+        markedNoReply && !initiallyHeldNoReply
+          ? yield* queue.writeOrAdmit({
+              admission: { ...queuedInput, ...(delivery ? { delivery } : {}) },
+              isBusy: state.assertNotBusy(input.sessionID).pipe(Effect.exit, Effect.map(Exit.isFailure)),
+              prepare: prepareUserMessage(queuedInput),
+              write: writeUserMessage,
+            })
+          : undefined
+      const heldNoReply =
+        markedNoReply && (initiallyHeldNoReply || noReplyDecision?.kind === "queued")
       const entry =
-        input.noReply === true && !heldNoReply
-          ? {
-              kind: "direct" as const,
-              message: yield* queue.exclusive(input.sessionID, createUserMessage(input)),
-            }
-          : {
-              kind: "queued" as const,
-              own: yield* queue.admit({ ...queuedInput, ...(delivery ? { delivery } : {}) }),
-            }
+        markedNoReply
+          ? noReplyDecision
+            ? noReplyDecision
+            : {
+                kind: "queued" as const,
+                own: yield* queue.admit({ ...queuedInput, ...(delivery ? { delivery } : {}) }),
+                prepared: undefined,
+              }
+          : input.noReply === true
+            ? {
+                kind: "direct" as const,
+                message: yield* queue.exclusive(input.sessionID, createUserMessage(input)),
+              }
+            : {
+                kind: "queued" as const,
+                own: yield* queue.admit({ ...queuedInput, ...(delivery ? { delivery } : {}) }),
+                prepared: undefined,
+              }
       if (entry.kind === "queued") yield* Effect.addFinalizer(() => queue.forget(entry.own.id))
       // Only this prompt's own failure is this caller's error; an older steer
       // promoted alongside it is reported on its own.
@@ -1146,7 +1167,7 @@ const layer = Layer.effect(
 
       if (entry.kind === "direct") return entry.message
       if (input.noReply === true)
-        return yield* prepareUserMessage(queuedInput).pipe(
+        return yield* (entry.prepared ? Effect.succeed(entry.prepared) : prepareUserMessage(queuedInput)).pipe(
           Effect.onExit(() =>
             heldNoReply
               ? drain(input.sessionID).pipe(
@@ -1211,13 +1232,11 @@ const layer = Layer.effect(
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
           seen = yield* queue.consume(sessionID)
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+          const history = yield* MessageV2.snapshot(sessionID).pipe(
             Effect.provideService(Database.Service, database),
           )
-          const admission = yield* MessageV2.admission(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
-          const selection = { admissionOrder: admission.order, excludeNoReply: true }
+          let msgs = history.messages
+          const selection = { admissionOrder: history.admissionOrder, excludeNoReply: true }
           const root =
             !initialRootSelected && rootMessageID
               ? msgs.find(
@@ -1227,12 +1246,12 @@ const layer = Layer.effect(
               : undefined
           if (!initialRootSelected && rootMessageID && !root)
             throw new Error(`Run root message not found: ${rootMessageID}`)
-          const rootOrder = rootMessageID ? admission.order.get(rootMessageID) : undefined
+          const rootOrder = rootMessageID ? history.admissionOrder.get(rootMessageID) : undefined
           if (root && rootOrder === undefined)
             throw new Error(`Missing persisted admission order for run root: ${rootMessageID}`)
           if (root && rootOrder !== undefined) {
             msgs = msgs.filter((message) => {
-              const order = admission.order.get(message.info.id)
+              const order = history.admissionOrder.get(message.info.id)
               return (
                 (order !== undefined && order <= rootOrder) ||
                 (message.info.role === "assistant" && message.info.parentID === root.info.id)
@@ -1549,13 +1568,13 @@ const layer = Layer.effect(
         (yield* queue.exclusive(
           input.sessionID,
           Effect.gen(function* () {
-            const msgs = yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(
+            const history = yield* MessageV2.snapshot(input.sessionID).pipe(
               Effect.provideService(Database.Service, database),
             )
-            const admission = yield* MessageV2.admission(input.sessionID).pipe(
-              Effect.provideService(Database.Service, database),
-            )
-            return MessageV2.latest(msgs, { admissionOrder: admission.order, excludeNoReply: true }).user?.id
+            return MessageV2.latest(history.messages, {
+              admissionOrder: history.admissionOrder,
+              excludeNoReply: true,
+            }).user?.id
           }),
         ))
       return yield* drain(input.sessionID, undefined, messageID).pipe(Effect.orDie)
