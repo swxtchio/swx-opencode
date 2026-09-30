@@ -2,7 +2,7 @@ import { $ } from "bun"
 import { describe, expect, test } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
-import { ConfigProvider, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Scope, Stream } from "effect"
+import { ConfigProvider, Deferred, Duration, Effect, Exit, Fiber, Layer, Logger, Option, Scope, Stream } from "effect"
 import { Config } from "@opencode-ai/core/config"
 import { ConfigWatcher } from "@opencode-ai/core/config/watcher"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -22,7 +22,7 @@ type WatcherEvent = { file: string; event: "add" | "change" | "unlink" }
 
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([FSUtil.node, EventV2.node])))
 
-type Options = { root?: boolean; ignore?: string[]; events?: EventV2.Interface }
+type Options = { root?: boolean; ignore?: string[]; events?: EventV2.Interface; subscribeTimeout?: number }
 
 function provide(directory: string, vcs?: Location.Interface["vcs"], options?: Options) {
   return Effect.provide(watcherLayer(directory, vcs, options))
@@ -49,6 +49,9 @@ function watcherLayer(directory: string, vcs?: Location.Interface["vcs"], option
     ConfigProvider.fromUnknown({
       OPENCODE_EXPERIMENTAL_FILEWATCHER: options?.root === false ? "false" : "true",
       OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: "false",
+      ...(options?.subscribeTimeout === undefined
+        ? {}
+        : { OPENCODE_EXPERIMENTAL_WATCHER_SUBSCRIBE_TIMEOUT_MS: String(options.subscribeTimeout) }),
     }),
   )
   const locationLayer = Layer.succeed(
@@ -76,6 +79,28 @@ function withTmp<A, E, R>(
     }),
     ({ tmp }) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
   ).pipe(Effect.flatMap(({ tmp, vcs }) => f(tmp.path, vcs).pipe(provide(tmp.path, vcs, options))))
+}
+
+// Records the watcher's emitted status log lines for the root watch.
+function captureLogs() {
+  const messages: unknown[][] = []
+  return {
+    layer: Logger.layer(
+      [
+        Logger.make(
+          (options) => void messages.push(Array.isArray(options.message) ? options.message : [options.message]),
+        ),
+      ],
+      { mergeWithExisting: true },
+    ),
+    root: () =>
+      messages.flatMap((message) => {
+        const fields = message[1]
+        return typeof fields === "object" && fields !== null && "watch" in fields && fields.watch === "root"
+          ? [String(message[0])]
+          : []
+      }),
+  }
 }
 
 async function gitInit(directory: string) {
@@ -385,6 +410,60 @@ describeWatcher("Watcher", () => {
     20_000,
   )
 
+  it.live("keeps an acknowledged root watch active after its subscribe backstop elapses", () => {
+    const logs = captureLogs()
+    return withTmp(
+      (directory) =>
+        Effect.gen(function* () {
+          const afs = yield* FSUtil.Service
+          const watcher = yield* Watcher.Service
+          yield* ready(directory)
+          // Past the 100ms backstop; what is asserted is the reported state and delivery.
+          yield* Effect.sleep("400 millis")
+          expect((yield* watcher.status).find((item) => item.watch === "root")).toEqual({
+            watch: "root",
+            directory,
+            state: "active",
+          })
+          expect(logs.root()).toEqual(["watcher active"])
+          const file = path.join(directory, "after-backstop.txt")
+          expect(yield* nextUpdate((event) => event.file === file, afs.writeFileString(file, "x"))).toEqual({
+            file,
+            event: "add",
+          })
+        }),
+      { git: true, subscribeTimeout: 100 },
+    ).pipe(Effect.provide(logs.layer))
+  })
+
+  it.live("activates a root watch whose acknowledgement arrives after it was reported unconfirmed", () => {
+    const logs = captureLogs()
+    return withTmp(
+      (directory) =>
+        Effect.gen(function* () {
+          const afs = yield* FSUtil.Service
+          const watcher = yield* Watcher.Service
+          yield* ready(directory)
+          expect(logs.root()).toEqual([
+            "watcher not confirmed, continuing without it until it confirms",
+            "watcher active",
+          ])
+          expect((yield* watcher.status).find((item) => item.watch === "root")).toEqual({
+            watch: "root",
+            directory,
+            state: "active",
+          })
+          const file = path.join(directory, "after-late-ack.txt")
+          expect(yield* nextUpdate((event) => event.file === file, afs.writeFileString(file, "x"))).toEqual({
+            file,
+            event: "add",
+          })
+        }),
+      // A 1ms backstop elapses before the worker can acknowledge.
+      { git: true, subscribeTimeout: 1 },
+    ).pipe(Effect.provide(logs.layer))
+  })
+
   const describeSymlink = process.platform !== "win32" ? describe : describe.skip
   describeSymlink("symlinked .git", () => {
     it.live("publishes .git/HEAD events through a symlinked .git directory", () =>
@@ -424,7 +503,12 @@ describeWatcher("Watcher", () => {
 const canCapInotify =
   process.platform === "linux" &&
   Bun.spawnSync(["unshare", "-U", "-r", "sh", "-c", "echo 1 > /proc/sys/user/max_inotify_instances"]).exitCode === 0
-const describeRefusal = canCapInotify && Watcher.hasNativeBinding() && !process.env.CI ? describe : describe.skip
+// CI opts in with OPENCODE_TEST_NATIVE_REFUSAL=1, which runs these even when the
+// namespace cannot be created, so a runner without the capability fails loudly.
+const describeRefusal =
+  process.env.OPENCODE_TEST_NATIVE_REFUSAL === "1" || (canCapInotify && Watcher.hasNativeBinding() && !process.env.CI)
+    ? describe
+    : describe.skip
 
 type ChildReport = {
   booted: Watcher.WatchStatus[]

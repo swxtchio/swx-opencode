@@ -62,7 +62,9 @@ Newest first. Each entry names the upstream range brought in.
 - **#TBD** A refused inotify instance no longer parks the server thread (swxtchio/swx-opencode#90): the git
   `HEAD` watch uses a non-recursive `fs.watch` that reports the refusal with its errno, and the opt-in root watch
   runs its `@parcel/watcher` subscription in a worker, active only once the worker acknowledges it. Each watch's
-  state is on `Watcher.Service.status`. _Upstreamable._
+  state is on `Watcher.Service.status`, and `OPENCODE_EXPERIMENTAL_WATCHER_SUBSCRIBE_TIMEOUT_MS` sets when an
+  unacknowledged root watch is reported unconfirmed. The desktop build ships the worker beside its rebundled server.
+  CI runs the real-native refusal cases in a rootless user namespace. _Upstreamable._
 - **#80** Codex OAuth accepts complete canonical GPT versions and catalog-backed named variants (including GPT-6 Astra from the [models.dev OpenAI catalog](https://models.dev/api.json)); malformed numeric aliases and unsupported suffixes stay filtered. _Fork-only._
 - **#78** Coordinate snapshot maintenance with a box-wide hourly gc cooldown (issue #70 Fix-1) and serialized cleanups; `Snapshot.track()` waits through contention and never silently skips snapshot updates. _Fork-only._
 - **#76** Classify mid-stream OpenAI-compatible context overflow errors as `ContextOverflowError` so automatic compaction can resume; cover SDK error shapes and session continuation. The unpatched-router reproduction is recorded in [docs/stream-overflow-e2e.md](docs/stream-overflow-e2e.md). (swxtchio/swx-opencode#66). _Fork-only._

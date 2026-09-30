@@ -33,12 +33,13 @@ if (port) {
   // Ids unsubscribed before their subscribe() settled, so a late subscription
   // is released instead of leaking.
   const cancelled = new Set<number>()
+  const pending = new Set<number>()
 
   port.on("message", async (request: Request) => {
     const post = (reply: Reply) => port.postMessage({ id: request.id, ...reply } satisfies Response)
     if (request.type === "unsubscribe") {
       const subscription = subscriptions.get(request.id)
-      if (!subscription) cancelled.add(request.id)
+      if (pending.has(request.id)) cancelled.add(request.id)
       await subscription?.unsubscribe().catch(() => {})
       subscriptions.delete(request.id)
       post({ type: "unsubscribed" })
@@ -47,6 +48,7 @@ if (port) {
 
     const binding = ParcelBinding.load()
     if (!binding) return post({ type: "failed", message: "native @parcel/watcher binding is unavailable" })
+    pending.add(request.id)
     await binding
       .subscribe(
         request.directory,
@@ -59,11 +61,13 @@ if (port) {
       )
       .then(
         async (subscription) => {
+          pending.delete(request.id)
           if (cancelled.delete(request.id)) return subscription.unsubscribe().catch(() => {})
           subscriptions.set(request.id, subscription)
           post({ type: "subscribed" })
         },
         (error: unknown) => {
+          pending.delete(request.id)
           cancelled.delete(request.id)
           post({ type: "failed", message: error instanceof Error ? error.message : String(error) })
         },

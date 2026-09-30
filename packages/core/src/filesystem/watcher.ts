@@ -21,10 +21,6 @@ import { Protected } from "./protected"
 
 declare const OPENCODE_WATCHER_WORKER_PATH: string | undefined
 
-// Backstop only: an unanswered root subscription is reported as unconfirmed
-// after this long, and still becomes active if the worker acknowledges later.
-const SUBSCRIBE_TIMEOUT_MS = 10_000
-
 export const Event = FileSystemWatcher.Event
 
 function getBackend() {
@@ -152,16 +148,32 @@ const layer = Layer.effect(
           Effect.catch((error) => Effect.sync(() => void report(failure("root", directory, error)))),
         )
         if (!host) return
+        // Backstop only: an unanswered subscription is reported unconfirmed after
+        // this long, and still becomes active if the worker acknowledges later.
+        const timeout = yield* Flag.OPENCODE_EXPERIMENTAL_WATCHER_SUBSCRIBE_TIMEOUT_MS
         const id = host.next++
         const unsubscribed = yield* Deferred.make<void>()
         statuses.set("root", { watch: "root", directory, state: "starting" })
 
+        const acknowledged = { value: false }
         host.listeners.set(id, (reply) => {
-          if (reply.type === "updates")
+          if (reply.type === "updates") {
+            // Delivery proves the subscription is alive again after a callback error.
+            if (acknowledged.value && statuses.get("root")?.state !== "active")
+              report({ watch: "root", directory, state: "active" })
             return reply.updates.forEach((update) => publish(update.path, KINDS[update.type]))
-          if (reply.type === "subscribed") return report({ watch: "root", directory, state: "active" })
-          if (reply.type === "failed" || reply.type === "error")
+          }
+          if (reply.type === "subscribed") {
+            acknowledged.value = true
+            return report({ watch: "root", directory, state: "active" })
+          }
+          if (reply.type === "failed")
             return report({ watch: "root", directory, state: "unavailable", reason: reply.message })
+          // A callback error does not say whether the subscription stopped: parcel's
+          // inotify errors clear its callbacks, while FSEvents reports dropped events
+          // and keeps delivering. Only a later delivery re-confirms it.
+          if (reply.type === "error")
+            return report({ watch: "root", directory, state: "unconfirmed", reason: reply.message })
           if (reply.type === "unsubscribed") Deferred.doneUnsafe(unsubscribed, Effect.void)
         })
         host.worker.postMessage({ id, type: "subscribe", directory, ignore, backend } satisfies Request)
@@ -172,11 +184,11 @@ const layer = Layer.effect(
             host.worker.postMessage({ id, type: "unsubscribe" } satisfies Request)
             // Awaited only when active: a parked worker never answers.
             if (statuses.get("root")?.state === "active")
-              yield* Deferred.await(unsubscribed).pipe(Effect.timeoutOption(SUBSCRIBE_TIMEOUT_MS))
+              yield* Deferred.await(unsubscribed).pipe(Effect.timeoutOption(timeout))
             host.listeners.delete(id)
           }),
         )
-        yield* Effect.sleep(SUBSCRIBE_TIMEOUT_MS).pipe(
+        yield* Effect.sleep(timeout).pipe(
           Effect.andThen(
             Effect.sync(() => {
               if (statuses.get("root")?.state !== "starting") return
@@ -184,7 +196,7 @@ const layer = Layer.effect(
                 watch: "root",
                 directory,
                 state: "unconfirmed",
-                reason: `no subscription acknowledgement within ${SUBSCRIBE_TIMEOUT_MS}ms`,
+                reason: `no subscription acknowledgement within ${timeout}ms`,
               })
             }),
           ),
@@ -222,9 +234,12 @@ type ParcelHost = { worker: Worker; listeners: Map<number, (reply: Reply) => voi
 const parcel: { host?: ParcelHost } = {}
 
 // The one worker that owns every parcel subscription in this process. It is
-// never terminated: a worker parked in native code cannot be, so it is unref'd
-// and must not hold the process open. If it dies, every subscription it held
-// becomes unavailable and the next root watch starts a new worker.
+// never terminated, because a worker parked in native code cannot be. unref()
+// only keeps it from holding the event loop open: Bun then exits normally, but
+// Node's process.exit() still waits for the parked thread and hangs, so a Node
+// host must be killed (the desktop sidecar's parent does this after its stop
+// timeout; swxtchio/swx-opencode#92). If the worker dies, every subscription it
+// held becomes unavailable and the next root watch starts a new worker.
 function parcelHost() {
   if (parcel.host) return parcel.host
   const worker = new Worker(workerTarget())
