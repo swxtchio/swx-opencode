@@ -650,7 +650,6 @@ export function latest(
     if (info.role === "assistant" && info.finish && isLater(info, finished, options.admissionOrder)) finished = info
   }
   const tasks = msgs.flatMap((msg) => {
-    const parentID = msg.info.role === "user" ? msg.info.id : msg.info.parentID
     if (finished && !isLater(msg.info, finished, options.admissionOrder)) return []
     return msg.parts.filter(
       (part): part is CompactionPart | SubtaskPart => part.type === "compaction" || part.type === "subtask",

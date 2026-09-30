@@ -1109,7 +1109,8 @@ const layer = Layer.effect(
         Exit.isFailure(yield* state.assertNotBusy(input.sessionID).pipe(Effect.exit))
       const queuedInput = heldNoReply && !input.messageID ? { ...input, messageID: MessageID.ascending() } : input
       // noReply normally writes directly and never drains. During an active run,
-      // a marked noReply is parked so it cannot bypass the hold boundary.
+      // a marked noReply is parked and drains after admission to avoid losing a
+      // run that reaches idle before the queue row lands.
       const entry =
         input.noReply === true && !heldNoReply
           ? {
@@ -1144,7 +1145,21 @@ const layer = Layer.effect(
       }
 
       if (entry.kind === "direct") return entry.message
-      if (input.noReply === true) return yield* prepareUserMessage(queuedInput)
+      if (input.noReply === true)
+        return yield* prepareUserMessage(queuedInput).pipe(
+          Effect.onExit(() =>
+            heldNoReply
+              ? drain(input.sessionID).pipe(
+                  Effect.catchCause((cause) =>
+                    Effect.logError("held noReply drain failed", { "session.id": input.sessionID, cause }).pipe(
+                      Effect.andThen(rejected(input.sessionID)(cause)),
+                    ),
+                  ),
+                  Effect.forkIn(scope, { startImmediately: true }),
+                )
+              : Effect.void,
+          ),
+        )
       return yield* drain(input.sessionID, entry.own.id)
     }, Effect.scoped)
 

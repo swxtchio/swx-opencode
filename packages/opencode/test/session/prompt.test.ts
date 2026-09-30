@@ -291,6 +291,7 @@ const gates = {
     | { reached: Deferred.Deferred<void>; startedRun: boolean; hold?: Deferred.Deferred<void> },
   // Holds a compaction between its summary and its continue message.
   compactionContinue: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  noReplyAdmission: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
 }
 
 const gatedSession = LayerNode.make({
@@ -333,6 +334,17 @@ const gatedRunState = LayerNode.make({
       const real = yield* SessionRunState.Service
       return SessionRunState.Service.of({
         ...real,
+        assertNotBusy: (sessionID) =>
+          Effect.gen(function* () {
+            const result = yield* real.assertNotBusy(sessionID).pipe(Effect.exit)
+            const gate = gates.noReplyAdmission
+            gates.noReplyAdmission = undefined
+            if (gate) {
+              yield* Deferred.succeed(gate.entered, undefined)
+              yield* Deferred.await(gate.release)
+            }
+            if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause)
+          }),
         ensureRunning: (sessionID, onInterrupt, work) =>
           Effect.gen(function* () {
             const marked = gates.nextEnsureRunning
@@ -5019,6 +5031,107 @@ it.instance(
       expect(yield* llm.calls).toBe(3)
     }),
   60_000,
+)
+
+gated.instance(
+  "drains marked noReply admitted after the active run has finished",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const run = yield* SessionRunState.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Held noReply admission race",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const runResponse = yield* Deferred.make<void>()
+      const admissionEntered = yield* Deferred.make<void>()
+      const admissionRelease = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() =>
+        Effect.all(
+          [runResponse, admissionRelease].map((gate) => Deferred.succeed(gate, undefined).pipe(Effect.ignore)),
+          { discard: true },
+        ).pipe(Effect.andThen(Effect.sync(() => void (gates.noReplyAdmission = undefined)))),
+      )
+      yield* llm.push(
+        reply().wait(deferredAsPromise(runResponse)).text("active task finished").stop().item(),
+        reply().text("held noReply handled").stop().item(),
+      )
+
+      const task = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          agent: "build",
+          model: ref,
+          parts: said("active task before held input"),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "active task did not reach the provider", "10 seconds")
+
+      gates.noReplyAdmission = { entered: admissionEntered, release: admissionRelease }
+      const messageID = MessageID.ascending()
+      const markedText = "[fm-from-firstmate]\x1f noReply machine mail after run"
+      const staged = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          messageID,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: said(markedText),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(
+        Deferred.await(admissionEntered),
+        "marked noReply admission did not reach the gate after its busy check",
+        "10 seconds",
+      )
+      expect(Exit.isFailure(yield* run.assertNotBusy(session.id).pipe(Effect.exit))).toBe(true)
+
+      yield* Deferred.succeed(runResponse, undefined)
+      const taskExit = yield* awaitWithTimeout(Fiber.await(task), "active task did not finish", "10 seconds")
+      expect(Exit.isSuccess(taskExit)).toBe(true)
+      expect(Exit.isSuccess(yield* run.assertNotBusy(session.id).pipe(Effect.exit))).toBe(true)
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(
+        (yield* sessions.messages({ sessionID: session.id })).some((message) =>
+          message.parts.some((part) => part.type === "text" && part.text === markedText),
+        ),
+      ).toBe(false)
+
+      yield* Deferred.succeed(admissionRelease, undefined)
+      const stagedMessage = yield* awaitWithTimeout(Fiber.join(staged), "held noReply did not return", "10 seconds")
+      if (stagedMessage.info.role !== "user") throw new Error("expected the staged noReply user")
+      expect(stagedMessage.info.noReply).toBe(true)
+      yield* awaitWithTimeout(llm.wait(2), "held noReply admission was stranded after the active run", "10 seconds")
+      const input = (yield* llm.inputs)[1]
+      if (!input) throw new Error("expected the held noReply provider request")
+      expect(JSON.stringify(input.messages)).toContain("noReply machine mail after run")
+
+      const delivered = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const messages = yield* sessions.messages({ sessionID: session.id })
+          const user = messages.find(
+            (message) =>
+              message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === markedText),
+          )
+          if (!user) return undefined
+          return messages.some(
+            (message) => message.info.role === "assistant" && message.info.parentID === user.info.id,
+          )
+            ? true
+            : undefined
+        }),
+        "held noReply was not delivered after the original run",
+        "10 seconds",
+      )
+      expect(delivered).toBe(true)
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(yield* llm.calls).toBe(2)
+    }),
+  30_000,
 )
 
 it.instance(
