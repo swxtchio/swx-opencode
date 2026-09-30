@@ -1305,6 +1305,9 @@ const layer = Layer.effect(
             time: { created: Date.now() },
             sessionID,
           }
+          let promptFailure: NonNullable<SessionV1.Assistant["error"]> | undefined
+          let failedAssistantPersisted = false
+          let failureEventPublished = false
           yield* sessions.updateMessage(msg)
 
           const finalizeInterruptedAssistant = Effect.gen(function* () {
@@ -1317,12 +1320,31 @@ const layer = Layer.effect(
             yield* sessions.updateMessage(msg)
           })
 
+          const publishFailure = (error: NonNullable<typeof msg.error>) =>
+            Effect.gen(function* () {
+              if (failureEventPublished) return
+              yield* events.publish(Session.Event.Error, { sessionID, error })
+              failureEventPublished = true
+            })
+
           const finalizeFailedAssistant = (cause: Cause.Cause<unknown>) =>
             Effect.gen(function* () {
-              msg.error ??= MessageV2.fromError(Cause.squash(cause), { providerID: msg.providerID })
+              const error = MessageV2.fromError(Cause.squash(cause), { providerID: msg.providerID })
+              if (msg.time.completed !== undefined && !msg.error) {
+                yield* publishFailure(error)
+                return
+              }
+
+              if (!msg.error) {
+                msg.error = error
+                promptFailure = error
+              }
               msg.time.completed ??= Date.now()
-              yield* sessions.updateMessage(msg)
-              yield* events.publish(Session.Event.Error, { sessionID, error: msg.error })
+              if (!failedAssistantPersisted) {
+                yield* sessions.updateMessage(msg)
+                failedAssistantPersisted = true
+              }
+              if (promptFailure) yield* publishFailure(promptFailure)
             })
 
           const handle = yield* processor

@@ -600,63 +600,87 @@ const layer = Layer.effect(
       })
 
       const cleanup = Effect.fn("SessionProcessor.cleanup")(function* () {
+        let cleanupFailure: Cause.Cause<unknown> | undefined
+        const attempt = <A, E, R>(self: Effect.Effect<A, E, R>) =>
+          Effect.gen(function* () {
+            const exit = yield* Effect.exit(self)
+            if (Exit.isFailure(exit) && !cleanupFailure) cleanupFailure = exit.cause
+            return exit
+          })
+
         if (ctx.snapshot) {
-          const patch = yield* snapshot.patch(ctx.snapshot)
-          if (patch.files.length) {
-            yield* session.updatePart({
-              id: PartID.ascending(),
-              messageID: ctx.assistantMessage.id,
-              sessionID: ctx.sessionID,
-              type: "patch",
-              hash: patch.hash,
-              files: patch.files,
-            })
+          const patchExit = yield* attempt(snapshot.patch(ctx.snapshot))
+          if (Exit.isSuccess(patchExit)) {
+            if (patchExit.value.files.length) {
+              const partExit = yield* attempt(
+                session.updatePart({
+                  id: PartID.ascending(),
+                  messageID: ctx.assistantMessage.id,
+                  sessionID: ctx.sessionID,
+                  type: "patch",
+                  hash: patchExit.value.hash,
+                  files: patchExit.value.files,
+                }),
+              )
+              if (Exit.isSuccess(partExit)) ctx.snapshot = undefined
+            } else {
+              ctx.snapshot = undefined
+            }
           }
-          ctx.snapshot = undefined
         }
 
         if (ctx.currentText) {
           const end = Date.now()
           ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
-          yield* session.updatePart(ctx.currentText)
-          ctx.currentText = undefined
+          const exit = yield* attempt(session.updatePart(ctx.currentText))
+          if (Exit.isSuccess(exit)) ctx.currentText = undefined
         }
 
-        for (const part of Object.values(ctx.reasoningMap)) {
+        for (const [id, part] of Object.entries(ctx.reasoningMap)) {
           const end = Date.now()
-          yield* session.updatePart({
-            ...part,
-            time: { start: part.time.start ?? end, end },
-          })
+          const exit = yield* attempt(
+            session.updatePart({
+              ...part,
+              time: { start: part.time.start ?? end, end },
+            }),
+          )
+          if (Exit.isSuccess(exit)) delete ctx.reasoningMap[id]
         }
-        ctx.reasoningMap = {}
 
-        yield* Effect.forEach(
-          Object.values(ctx.toolcalls),
-          (call) => Deferred.await(call.done).pipe(Effect.timeout("250 millis"), Effect.ignore),
-          { concurrency: "unbounded" },
+        yield* attempt(
+          Effect.forEach(
+            Object.values(ctx.toolcalls),
+            (call) => Deferred.await(call.done).pipe(Effect.timeout("250 millis"), Effect.ignore),
+            { concurrency: "unbounded" },
+          ),
         )
 
         for (const toolCallID of Object.keys(ctx.toolcalls)) {
-          const match = yield* readToolCall(toolCallID)
+          const readExit = yield* attempt(readToolCall(toolCallID))
+          if (Exit.isFailure(readExit)) continue
+          const match = readExit.value
           if (!match) continue
           const part = match.part
           const end = Date.now()
           const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
-          yield* session.updatePart({
-            ...part,
-            state: {
-              ...part.state,
-              status: "error",
-              error: "Tool execution aborted",
-              metadata: { ...metadata, interrupted: true },
-              time: { start: "time" in part.state ? part.state.time.start : end, end },
-            },
-          })
+          const exit = yield* attempt(
+            session.updatePart({
+              ...part,
+              state: {
+                ...part.state,
+                status: "error",
+                error: "Tool execution aborted",
+                metadata: { ...metadata, interrupted: true },
+                time: { start: "time" in part.state ? part.state.time.start : end, end },
+              },
+            }),
+          )
+          if (Exit.isSuccess(exit)) delete ctx.toolcalls[toolCallID]
         }
         ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()
-        yield* session.updateMessage(ctx.assistantMessage)
+        yield* attempt(session.updateMessage(ctx.assistantMessage))
+        if (cleanupFailure) yield* Effect.failCause(cleanupFailure).pipe(Effect.orDie)
       })
 
       const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
@@ -666,6 +690,10 @@ const layer = Layer.effect(
           error: errorMessage(e),
           stack: e instanceof Error ? e.stack : undefined,
         })
+        if (ctx.assistantMessage.error) {
+          yield* status.set(ctx.sessionID, { type: "idle" })
+          return
+        }
         const error = parse(e)
         if (SessionV1.ContextOverflowError.isInstance(error)) {
           if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
@@ -736,7 +764,24 @@ const layer = Layer.effect(
               }),
             ),
             Effect.catch(halt),
-            Effect.ensuring(cleanup()),
+            Effect.ensuring(
+              cleanup().pipe(
+                Effect.catchCauseIf(
+                  (cause) => !Cause.hasInterruptsOnly(cause),
+                  (cause) =>
+                    Effect.gen(function* () {
+                      yield* Effect.logError("cleanup", {
+                        "session.id": ctx.sessionID,
+                        messageID: ctx.assistantMessage.id,
+                        error: Cause.pretty(cause),
+                      })
+                      yield* halt(Cause.squash(cause))
+                      ctx.assistantMessage.time.completed ??= Date.now()
+                      yield* session.updateMessage(ctx.assistantMessage)
+                    }),
+                ),
+              ),
+            ),
           )
 
           if (ctx.needsCompaction) return "compact"

@@ -2,7 +2,7 @@
 import { describe, expect, test } from "bun:test"
 import { tmpdir } from "../../../fixture/fixture"
 import { mount, wait } from "./sync-fixture"
-import type { GlobalEvent } from "@opencode-ai/sdk/v2"
+import type { GlobalEvent, Message, Session, SessionStatus } from "@opencode-ai/sdk/v2"
 
 function branchEvent(branch: string, workspace?: string): GlobalEvent {
   return {
@@ -58,6 +58,37 @@ describe("tui sync", () => {
       await wait(() => sync.data.vcs?.branch === "feature")
 
       expect(sync.data.vcs?.branch).toBe("feature")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("idle sessions with an incomplete assistant are failed instead of working", async () => {
+    await using tmp = await tmpdir()
+    await Bun.write(`${tmp.path}/kv.json`, "{}")
+    const { app, sync } = await mount(undefined, tmp.path)
+
+    try {
+      const sessionID = "ses_incomplete"
+      const session = { id: sessionID, time: { created: 1, updated: 1 } } as unknown as Session
+      const assistant = {
+        id: "msg_incomplete",
+        sessionID,
+        role: "assistant",
+        time: { created: 2 },
+      } as unknown as Message
+      sync.set("session", [session])
+      sync.set("message", sessionID, [assistant])
+      sync.set("session_status", sessionID, { type: "idle" } as SessionStatus)
+
+      expect(sync.session.status(sessionID)).toBe("failed")
+
+      sync.set("session_status", sessionID, { type: "busy" } as SessionStatus)
+      expect(sync.session.status(sessionID)).toBe("working")
+
+      sync.set("message", sessionID, [{ ...assistant, time: { created: 2, completed: 3 } } as Message])
+      sync.set("session_status", sessionID, { type: "idle" } as SessionStatus)
+      expect(sync.session.status(sessionID)).toBe("idle")
     } finally {
       app.renderer.destroy()
     }

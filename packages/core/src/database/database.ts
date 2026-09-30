@@ -11,6 +11,7 @@ import { InstallationChannel } from "../installation/version"
 import { makeGlobalNode } from "../effect/app-node"
 
 const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
+const nativeBusyTimeoutMs = 5
 type DatabaseShape = Effect.Success<typeof makeDatabase>
 
 export interface Interface {
@@ -26,7 +27,7 @@ const layer = Layer.effect(
 
     yield* db.run("PRAGMA journal_mode = WAL")
     yield* db.run("PRAGMA synchronous = NORMAL")
-    yield* db.run("PRAGMA busy_timeout = 30000")
+    yield* db.run(`PRAGMA busy_timeout = ${nativeBusyTimeoutMs}`)
     yield* db.run("PRAGMA cache_size = -64000")
     yield* db.run("PRAGMA foreign_keys = ON")
     yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")

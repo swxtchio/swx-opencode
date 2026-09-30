@@ -14,6 +14,7 @@ import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
 import { Provider } from "@/provider/provider"
+import { BackgroundJob } from "@/background/job"
 
 import { Session } from "@/session/session"
 import { LLM } from "../../src/session/llm"
@@ -234,6 +235,7 @@ const replacements = [
 ] as const
 
 const cleanupFault = { failed: false }
+const cleanupPartFailure = { failed: false }
 const cleanupFaultEvent = LayerNode.make({
   service: EventV2Bridge.Service,
   layer: Layer.effect(
@@ -257,11 +259,94 @@ const cleanupFaultEvent = LayerNode.make({
       })
     }),
   ).pipe(
-    Layer.provide(
-      EventV2Bridge.node.implementation as Layer.Layer<EventV2Bridge.Service, never, EventV2.Service>,
-    ),
+    Layer.provide(EventV2Bridge.node.implementation as Layer.Layer<EventV2Bridge.Service, never, EventV2.Service>),
   ),
   deps: [EventV2.node],
+})
+const cleanupPartFaultEvent = LayerNode.make({
+  service: EventV2Bridge.Service,
+  layer: Layer.effect(
+    EventV2Bridge.Service,
+    Effect.gen(function* () {
+      const real = yield* EventV2Bridge.Service
+      const publish: EventV2.Interface["publish"] = (definition, data, options) =>
+        Effect.gen(function* () {
+          if (definition.type === SessionV1.Event.PartUpdated.type) {
+            const update = data as typeof SessionV1.Event.PartUpdated.data.Type
+            if (
+              update.part.type === "text" &&
+              "time" in update.part &&
+              update.part.time?.end !== undefined &&
+              !cleanupPartFailure.failed
+            ) {
+              cleanupPartFailure.failed = true
+              return yield* Effect.die(new Error("one-shot text finalization failure"))
+            }
+          }
+          return yield* real.publish(definition, data, options)
+        })
+      return EventV2Bridge.Service.of({
+        ...real,
+        publish,
+      })
+    }),
+  ).pipe(
+    Layer.provide(EventV2Bridge.node.implementation as Layer.Layer<EventV2Bridge.Service, never, EventV2.Service>),
+  ),
+  deps: [EventV2.node],
+})
+type LockTerminalFault = {
+  armed: boolean
+  remaining: number
+  error: unknown
+  failed: number
+  messageID: MessageID
+}
+const lockTerminalFaults = new Map<SessionID, LockTerminalFault>()
+const trip = <A, E, R>(fault: LockTerminalFault, self: Effect.Effect<A, E, R>) =>
+  Effect.suspend(() => {
+    if (!fault.armed || fault.remaining === 0) return self
+    fault.remaining--
+    fault.failed++
+    return Effect.die(fault.error)
+  })
+const lockTerminalSession = LayerNode.make({
+  service: Session.Service,
+  layer: Layer.effect(
+    Session.Service,
+    Effect.gen(function* () {
+      const real = yield* Session.Service
+      return Session.Service.of({
+        ...real,
+        updatePart: <T extends SessionV1.Part>(part: T) => {
+          const fault = lockTerminalFaults.get(part.sessionID)
+          if (!fault || part.messageID !== fault.messageID) return real.updatePart(part)
+          if (
+            part.type === "reasoning" &&
+            part.time.end !== undefined &&
+            !fault.armed &&
+            fault.remaining > 0
+          ) {
+            fault.armed = true
+          }
+          return trip(fault, real.updatePart(part))
+        },
+        updateMessage: <T extends SessionV1.Info>(msg: T) => {
+          const fault = lockTerminalFaults.get(msg.sessionID)
+          return fault?.messageID === msg.id ? trip(fault, real.updateMessage(msg)) : real.updateMessage(msg)
+        },
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      Session.node.implementation as Layer.Layer<
+        Session.Service,
+        never,
+        BackgroundJob.Service | RuntimeFlags.Service | Database.Service | EventV2Bridge.Service
+      >,
+    ),
+  ),
+  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
 })
 const cleanupFaultEnv = LayerNode.compile(
   LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
@@ -283,6 +368,10 @@ const sqliteLockDbPath = path.join(import.meta.dir, `.opencode-sqlite-lock-${cry
 const routerLabelEvents: LLMEvent[] = []
 const routerLabelLLM = Layer.succeed(LLM.Service, LLM.Service.of({ stream: () => Stream.fromIterable(routerLabelEvents) }))
 const routerLabelDbPath = path.join(import.meta.dir, `.opencode-router-label-${crypto.randomUUID()}.db`)
+const sqliteTerminalDbPaths = ([2, 3] as const).map((failures) => ({
+  failures,
+  path: path.join(import.meta.dir, `.opencode-sqlite-terminal-${failures}-${crypto.randomUUID()}.db`),
+}))
 const routedEnv = LayerNode.compile(root, [
   ...replacements,
   [LLM.node, routedLLM],
@@ -305,6 +394,7 @@ afterAll(async () => {
       sqliteLockDbPath,
       `${sqliteLockDbPath}-wal`,
       `${sqliteLockDbPath}-shm`,
+      ...sqliteTerminalDbPaths.flatMap((item) => [item.path, `${item.path}-wal`, `${item.path}-shm`]),
       routerLabelDbPath,
       `${routerLabelDbPath}-wal`,
       `${routerLabelDbPath}-shm`,
@@ -352,6 +442,44 @@ const fragmentFailureLLM = Layer.succeed(
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
 
+const cleanupPartFailureLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.reasoningStart({ id: "reasoning-1" }),
+        LLMEvent.reasoningDelta({ id: "reasoning-1", text: "thinking" }),
+        LLMEvent.textStart({ id: "text-1" }),
+        LLMEvent.textDelta({ id: "text-1", text: "partial" }),
+        LLMEvent.toolInputStart({ id: "call-1", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "call-1", name: "lookup" }),
+        LLMEvent.toolCall({ id: "call-1", name: "lookup", input: { query: "weather" } }),
+        LLMEvent.providerError({ message: "original provider failure" }),
+      ),
+  }),
+)
+const cleanupPartFailureEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, cleanupPartFailureLLM],
+  [EventV2Bridge.node, cleanupPartFaultEvent],
+])
+const itCleanupPartFailure = testEffect(cleanupPartFailureEnv)
+
+const lockTerminalLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.reasoningStart({ id: "reasoning-1" }),
+        LLMEvent.reasoningDelta({ id: "reasoning-1", text: "thinking" }),
+        LLMEvent.reasoningEnd({ id: "reasoning-1" }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ),
+  }),
+)
 const sqliteLockFailure = defer<unknown>()
 const sqliteLockLLM = Layer.succeed(
   LLM.Service,
@@ -1081,68 +1209,228 @@ it.live("session.processor effect tests mark pending tools as aborted on cleanup
   ),
 )
 
-itCleanupFault.live("session.processor effect tests finalize the assistant when cleanup persistence dies", () =>
-  provideTmpdirServer(
-    ({ dir, llm }) =>
-      Effect.gen(function* () {
-        cleanupFault.failed = false
-        const { processors, session, provider } = yield* boot()
-        const events = yield* EventV2Bridge.Service
-        const status = yield* SessionStatus.Service
-        const eventErrors: string[] = []
+itCleanupFault.live(
+  "session.processor effect tests finalize the assistant when cleanup persistence dies",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          cleanupFault.failed = false
+          const { processors, session, provider } = yield* boot()
+          const events = yield* EventV2Bridge.Service
+          const status = yield* SessionStatus.Service
+          const eventErrors: string[] = []
 
-        yield* llm.text("cleanup persistence")
+          yield* llm.text("cleanup persistence")
 
-        const chat = yield* session.create({})
-        const parent = yield* user(chat.id, "cleanup failure")
-        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-        const model = yield* provider.getModel(ref.providerID, ref.modelID)
-        const off = yield* events.listen((event) => {
-          if (event.type !== Session.Event.Error.type) return Effect.void
-          const data = event.data as typeof Session.Event.Error.data.Type
-          if (data.sessionID !== chat.id || !data.error) return Effect.void
-          eventErrors.push(data.error.name)
-          return Effect.void
-        })
-        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
-        const result = yield* handle.process({
-          user: {
-            id: parent.id,
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "cleanup failure")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const model = yield* provider.getModel(ref.providerID, ref.modelID)
+          const off = yield* events.listen((event) => {
+            if (event.type !== Session.Event.Error.type) return Effect.void
+            const data = event.data as typeof Session.Event.Error.data.Type
+            if (data.sessionID !== chat.id || !data.error) return Effect.void
+            eventErrors.push(data.error.name)
+            return Effect.void
+          })
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+          const result = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
             sessionID: chat.id,
-            role: "user",
-            time: parent.time,
-            agent: parent.agent,
-            model: { providerID: ref.providerID, modelID: ref.modelID },
-          } satisfies SessionV1.User,
-          sessionID: chat.id,
-          model,
-          agent: agent(),
-          system: [],
-          messages: [{ role: "user", content: "cleanup failure" }],
-          tools: {},
-        })
-        const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
-        const sessionStatus = yield* status.get(chat.id)
-        yield* off
+            model,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "cleanup failure" }],
+            tools: {},
+          })
+          const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+          const sessionStatus = yield* status.get(chat.id)
+          yield* off
 
-        expect(cleanupFault.failed).toBe(true)
-        expect(result).toBe("stop")
-        expect(sessionStatus).toMatchObject({ type: "idle" })
-        expect(yield* llm.calls).toBe(1)
-        expect(stored.info.role).toBe("assistant")
-        if (stored.info.role === "assistant") {
-          expect(stored.info.time.completed).toBeDefined()
-          const error = stored.info.error
-          expect(error?.name).toBe("UnknownError")
-          if (error?.name === "UnknownError") {
-            expect(error.data.message).toContain("one-shot cleanup persistence failure")
-            expect(eventErrors).toContain(error.name)
+          expect(cleanupFault.failed).toBe(true)
+          expect(result).toBe("stop")
+          expect(sessionStatus).toMatchObject({ type: "idle" })
+          expect(yield* llm.calls).toBe(1)
+          expect(stored.info.role).toBe("assistant")
+          if (stored.info.role === "assistant") {
+            expect(stored.info.time.completed).toBeDefined()
+            const error = stored.info.error
+            expect(error?.name).toBe("UnknownError")
+            if (error?.name === "UnknownError") {
+              expect(error.data.message).toContain("one-shot cleanup persistence failure")
+              expect(eventErrors).toContain(error.name)
+            }
           }
-        }
-      }),
-    { config: (url) => providerCfg(url) },
-  ),
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  20_000,
 )
+
+itCleanupPartFailure.live(
+  "session.processor effect tests preserve the provider error and finish remaining cleanup parts",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          cleanupPartFailure.failed = false
+          yield* Effect.addFinalizer(() => Effect.sync(() => void (cleanupPartFailure.failed = true)))
+          const { processors, session, provider } = yield* boot()
+          const events = yield* EventV2Bridge.Service
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "cleanup part failure")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const model = yield* provider.getModel(ref.providerID, ref.modelID)
+          const eventErrors: string[] = []
+          const off = yield* events.listen((event) => {
+            if (event.type !== Session.Event.Error.type) return Effect.void
+            const data = event.data as typeof Session.Event.Error.data.Type
+            if (data.sessionID !== chat.id || !data.error) return Effect.void
+            if (data.error.name === "UnknownError") eventErrors.push(data.error.data.message)
+            return Effect.void
+          })
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+          const result = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "cleanup part failure" }],
+            tools: {},
+          })
+          const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+          const parts = yield* MessageV2.parts(msg.id)
+          const reasoning = parts.find((part): part is SessionV1.ReasoningPart => part.type === "reasoning")
+          const toolCall = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+          yield* off
+
+          expect(cleanupPartFailure.failed).toBe(true)
+          expect(result).toBe("stop")
+          expect(stored.info.role).toBe("assistant")
+          if (stored.info.role === "assistant") {
+            expect(stored.info.time.completed).toBeDefined()
+            expect(stored.info.error?.name).toBe("UnknownError")
+            if (stored.info.error?.name === "UnknownError") {
+              expect(stored.info.error.data.message).toContain("original provider failure")
+              expect(stored.info.error.data.message).not.toContain("text finalization failure")
+            }
+          }
+          expect(reasoning?.time.end).toBeDefined()
+          expect(toolCall?.state.status).toBe("error")
+          if (toolCall?.state.status === "error") {
+            expect(toolCall.state.error).toBe("Tool execution aborted")
+            expect(toolCall.state.time.end).toBeDefined()
+          }
+          expect(eventErrors).toHaveLength(1)
+          expect(eventErrors[0]).toContain("original provider failure")
+        }),
+      { config: cfg },
+    ),
+  20_000,
+)
+
+for (const { failures, path: databasePath } of sqliteTerminalDbPaths) {
+  const itLockTerminal = testEffect(
+    LayerNode.compile(root, [
+      ...replacements,
+      [Database.node, Database.layerFromPath(databasePath)],
+      [Session.node, lockTerminalSession],
+      [LLM.node, lockTerminalLLM],
+    ]),
+  )
+  itLockTerminal.live(
+    `processor terminalizes the persisted turn after ${failures} produced SQLite lock failures`,
+    () =>
+      provideTmpdirInstance(
+        (dir) =>
+          Effect.gen(function* () {
+            const { processors, session, provider } = yield* boot()
+            const database = yield* Database.Service
+            const produced = yield* produceSqliteBusyError(database.db, databasePath)
+            expect(produced).toBeInstanceOf(EffectDrizzleQueryError)
+            if (!(produced instanceof EffectDrizzleQueryError) || !Cause.isCause(produced.cause)) return
+            const error = Option.getOrUndefined(Cause.findErrorOption(produced.cause))
+            expect(isSqlError(error)).toBe(true)
+            if (!isSqlError(error)) return
+            expect(error.reason._tag).toBe("LockTimeoutError")
+            expect(error.message).toContain("database is locked")
+
+            const events = yield* EventV2Bridge.Service
+            const statuses = yield* SessionStatus.Service
+            const chat = yield* session.create({})
+            const parent = yield* user(chat.id, "terminalize produced lock failure")
+            const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+            const model = yield* provider.getModel(ref.providerID, ref.modelID)
+            const fault = { armed: false, remaining: failures, error, failed: 0, messageID: msg.id }
+            lockTerminalFaults.set(chat.id, fault)
+            yield* Effect.addFinalizer(() => Effect.sync(() => void lockTerminalFaults.delete(chat.id)))
+            const eventErrors: string[] = []
+            const off = yield* events.listen((event) => {
+              if (event.type !== Session.Event.Error.type) return Effect.void
+              const data = event.data as typeof Session.Event.Error.data.Type
+              if (data.sessionID !== chat.id || !data.error) return Effect.void
+              eventErrors.push(data.error.name === "UnknownError" ? data.error.data.message : data.error.name)
+              return Effect.void
+            })
+            const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+            const exit = yield* Effect.exit(
+              handle.process({
+                user: {
+                  id: parent.id,
+                  sessionID: chat.id,
+                  role: "user",
+                  time: parent.time,
+                  agent: parent.agent,
+                  model: { providerID: ref.providerID, modelID: ref.modelID },
+                } satisfies SessionV1.User,
+                sessionID: chat.id,
+                model,
+                agent: agent(),
+                system: [],
+                messages: [{ role: "user", content: "terminalize produced lock failure" }],
+                tools: {},
+              }),
+            )
+            const injected = fault.failed
+            lockTerminalFaults.delete(chat.id)
+            yield* off
+            const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+
+            expect(injected).toBe(failures)
+            expect(Exit.isSuccess(exit)).toBe(true)
+            if (Exit.isSuccess(exit)) expect(exit.value).toBe("stop")
+            expect((yield* statuses.get(chat.id)).type).toBe("idle")
+            expect(stored.info.role).toBe("assistant")
+            if (stored.info.role === "assistant") {
+              expect(stored.info.time.completed).toBeDefined()
+              expect(stored.info.error?.name).toBe("UnknownError")
+              if (stored.info.error?.name === "UnknownError") {
+                expect(stored.info.error.data.message.toLowerCase()).toContain("database is locked")
+              }
+            }
+            expect(eventErrors.some((message) => message.toLowerCase().includes("database is locked"))).toBe(true)
+          }),
+        { config: cfg },
+      ),
+    20_000,
+  )
+}
 
 it.live("session.processor effect tests record aborted errors and idle state", () =>
   provideTmpdirServer(

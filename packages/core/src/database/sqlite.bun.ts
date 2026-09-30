@@ -18,8 +18,10 @@ import * as Statement from "effect/unstable/sql/Statement"
 import { Sqlite } from "./sqlite"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
-const retrySchedule = Schedule.exponential("100 millis").pipe(
-  Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 1_600)))),
+const nativeBusyTimeoutMs = 5
+// Five 5ms native attempts plus four 25/50/75/75ms backoffs target ~250ms total.
+const retrySchedule = Schedule.exponential("25 millis").pipe(
+  Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 75)))),
   Schedule.take(4),
 )
 
@@ -177,7 +179,7 @@ const nativeLayer = (config: Config) =>
         create: config.create ?? true,
       })
       yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
-      native.run("PRAGMA busy_timeout = 30000;")
+      native.run(`PRAGMA busy_timeout = ${nativeBusyTimeoutMs};`)
       if (config.disableWAL !== true) native.run("PRAGMA journal_mode = WAL;")
       return native
     }),

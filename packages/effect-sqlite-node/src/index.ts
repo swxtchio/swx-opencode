@@ -18,8 +18,10 @@ import { classifySqliteError, LockTimeoutError, SqlError } from "effect/unstable
 import * as Statement from "effect/unstable/sql/Statement"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
-const retrySchedule = Schedule.exponential("100 millis").pipe(
-  Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 1_600)))),
+const nativeBusyTimeoutMs = 5
+// Five 5ms native attempts plus four 25/50/75/75ms backoffs target ~250ms total.
+const retrySchedule = Schedule.exponential("25 millis").pipe(
+  Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 75)))),
   Schedule.take(4),
 )
 
@@ -92,7 +94,7 @@ export const make = (
     const makeConnection = Effect.gen(function* () {
       const db = new DatabaseSync(options.filename, {
         readOnly: options.readonly,
-        timeout: options.timeout ?? 30_000,
+        timeout: options.timeout ?? nativeBusyTimeoutMs,
         allowExtension: options.allowExtension,
         enableForeignKeyConstraints: true,
         open: true,
