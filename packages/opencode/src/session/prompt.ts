@@ -1103,10 +1103,13 @@ const layer = Layer.effect(
         (yield* config.get()).machine_message_markers,
       )
       const delivery = classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
-      const heldNoReply = input.noReply === true && classification === "hold"
+      const heldNoReply =
+        input.noReply === true &&
+        classification === "hold" &&
+        Exit.isFailure(yield* state.assertNotBusy(input.sessionID).pipe(Effect.exit))
       const queuedInput = heldNoReply && !input.messageID ? { ...input, messageID: MessageID.ascending() } : input
-      // noReply normally writes directly and never drains. A marked noReply is
-      // parked instead so it cannot bypass the active run's hold boundary.
+      // noReply normally writes directly and never drains. During an active run,
+      // a marked noReply is parked so it cannot bypass the hold boundary.
       const entry =
         input.noReply === true && !heldNoReply
           ? {

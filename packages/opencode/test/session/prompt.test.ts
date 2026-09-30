@@ -4898,6 +4898,39 @@ it.instance(
 )
 
 it.instance(
+  "writes an idle marked noReply directly without queueing or draining",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const run = yield* SessionRunState.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Idle noReply" })
+      const markedText = "[fm-from-firstmate]\x1f idle machine mail"
+      expect(MachineMessage.classify(markedText)).toBe("hold")
+
+      const message = yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: said(markedText),
+      })
+      if (message.info.role !== "user") throw new Error("expected the idle noReply user")
+      expect(message.info.noReply).toBe(true)
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      expect(messages).toHaveLength(1)
+      expect(messages[0]?.info.id).toBe(message.info.id)
+      expect(messages[0]?.parts.some((part) => part.type === "text" && part.text === markedText)).toBe(true)
+      expect(yield* queue.list(session.id)).toEqual([])
+      yield* run.assertNotBusy(session.id)
+      expect(yield* llm.calls).toBe(0)
+    }),
+  15_000,
+)
+
+it.instance(
   "holds marked noReply input out of an active run until the terminal boundary",
   () =>
     Effect.gen(function* () {
