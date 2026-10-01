@@ -64,6 +64,7 @@ export interface Handle {
       attachments?: SessionV1.FilePart[]
     },
   ) => Effect.Effect<void>
+  readonly finalizeFailure: (cause: Cause.Cause<unknown>, terminalize?: boolean) => Effect.Effect<void>
   readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
 }
 
@@ -134,6 +135,17 @@ const layer = Layer.effect(
         reasoningMap: {},
       }
       let aborted = false
+      let terminalMessagePersisted = false
+      let persistedTerminalError: SessionV1.Assistant["error"]
+      const publishedFailures = new Set<string>()
+
+      const publishFailure = (error: NonNullable<SessionV1.Assistant["error"]>) =>
+        Effect.gen(function* () {
+          const key = JSON.stringify(error) ?? error.name
+          if (publishedFailures.has(key)) return
+          yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
+          publishedFailures.add(key)
+        })
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
@@ -679,7 +691,11 @@ const layer = Layer.effect(
         }
         ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()
-        yield* attempt(session.updateMessage(ctx.assistantMessage))
+        const messageExit = yield* attempt(session.updateMessage(ctx.assistantMessage))
+        if (Exit.isSuccess(messageExit)) {
+          terminalMessagePersisted = true
+          persistedTerminalError = ctx.assistantMessage.error
+        }
         if (cleanupFailure) yield* Effect.failCause(cleanupFailure).pipe(Effect.orDie)
       })
 
@@ -699,20 +715,43 @@ const layer = Layer.effect(
           if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
             ctx.assistantMessage.error = error
             ctx.assistantMessage.finish = "error"
-            yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
+            yield* publishFailure(error)
             yield* status.set(ctx.sessionID, { type: "idle" })
             return
           }
           ctx.needsCompaction = true
-          yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
+          yield* publishFailure(error)
           return
         }
         ctx.assistantMessage.error = error
-        yield* events.publish(Session.Event.Error, {
-          sessionID: ctx.assistantMessage.sessionID,
-          error: ctx.assistantMessage.error,
-        })
+        yield* publishFailure(error)
         yield* status.set(ctx.sessionID, { type: "idle" })
+      })
+
+      const finalizeFailure = Effect.fn("SessionProcessor.finalizeFailure")(function* (
+        cause: Cause.Cause<unknown>,
+        terminalize = false,
+      ) {
+        const error = MessageV2.fromError(Cause.squash(cause), { providerID: ctx.assistantMessage.providerID })
+        if (
+          terminalMessagePersisted &&
+          ctx.assistantMessage.time.completed !== undefined &&
+          !ctx.assistantMessage.error &&
+          (!terminalize || Cause.hasInterruptsOnly(cause))
+        ) {
+          if (!Cause.hasInterruptsOnly(cause)) yield* publishFailure(error)
+          return
+        }
+
+        ctx.assistantMessage.error ??= error
+        ctx.assistantMessage.time.completed ??= Date.now()
+        if (!terminalMessagePersisted || persistedTerminalError !== ctx.assistantMessage.error) {
+          yield* session.updateMessage(ctx.assistantMessage)
+          terminalMessagePersisted = true
+          persistedTerminalError = ctx.assistantMessage.error
+        }
+        if (!Cause.hasInterruptsOnly(cause)) yield* publishFailure(error)
+        if ((yield* status.get(ctx.sessionID)).type !== "idle") yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
@@ -775,14 +814,9 @@ const layer = Layer.effect(
           // Keep cleanup failures in this terminalization path so they cannot return a pending compaction.
           Effect.catchCauseIf(
             (cause) => !Cause.hasInterruptsOnly(cause),
-            (cause) =>
-              Effect.gen(function* () {
-                yield* halt(Cause.squash(cause))
-                ctx.assistantMessage.time.completed ??= Date.now()
-                yield* session.updateMessage(ctx.assistantMessage)
-                return "stop" as const
-              }),
+            (cause) => finalizeFailure(cause, true).pipe(Effect.as("stop" as const)),
           ),
+          Effect.onExit((exit) => (Exit.isFailure(exit) ? finalizeFailure(exit.cause, true) : Effect.void)),
         )
       })
 
@@ -792,6 +826,7 @@ const layer = Layer.effect(
         },
         updateToolCall,
         completeToolCall,
+        finalizeFailure,
         process,
       } satisfies Handle
     })

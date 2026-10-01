@@ -1357,8 +1357,9 @@ itCleanupPartFailure.live(
             expect(toolCall.state.error).toBe("Tool execution aborted")
             expect(toolCall.state.time.end).toBeDefined()
           }
-          expect(eventErrors).toHaveLength(1)
+          expect(eventErrors).toHaveLength(2)
           expect(eventErrors[0]).toContain("original provider failure")
+          expect(eventErrors[1]).toContain("one-shot text finalization failure")
         }),
       { config: cfg },
     ),

@@ -1327,6 +1327,7 @@ const layer = Layer.effect(
               failureEventPublished = true
             })
 
+          // This fallback covers processor creation failures before its shared Handle finalizer exists.
           const finalizeFailedAssistant = (cause: Cause.Cause<unknown>) =>
             Effect.gen(function* () {
               const error = MessageV2.fromError(Cause.squash(cause), { providerID: msg.providerID })
@@ -1477,7 +1478,7 @@ const layer = Layer.effect(
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
             Effect.onExit((exit) =>
               Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)
-                ? finalizeFailedAssistant(exit.cause)
+                ? handle.finalizeFailure(exit.cause)
                 : Effect.void,
             ),
           )
