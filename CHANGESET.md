@@ -62,7 +62,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
-- **#PR** A fresh `opencode serve` answers a request that arrives as its port opens (swxtchio/swx-abbe#441).
+- **#108** A fresh `opencode serve` answers a request that arrives as its port opens (swxtchio/swx-abbe#441).
   `NodeHttpServer` listened before attaching its request handler, so such a request was read and never answered;
   the server now holds early requests and hands them to the handler once it attaches. An early websocket upgrade
   arrives as a request too and is answered the same way. _Upstreamable._
