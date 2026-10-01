@@ -2,11 +2,14 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { EventV2 } from "@opencode-ai/core/event"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { Global } from "@opencode-ai/core/global"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect, test } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
+import { HttpClient } from "effect/unstable/http"
 import path from "path"
 import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -61,6 +64,7 @@ import { InstanceRef } from "@/effect/instance-ref"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { runImport } from "../../src/cli/cmd/import"
 import { ShareNext } from "../../src/share/share-next"
 
@@ -182,16 +186,64 @@ const lsp = Layer.succeed(
 )
 
 const processorCreateStarted: Array<() => void> = []
-const blockingProcessor = Layer.succeed(
-  SessionProcessor.Service,
-  SessionProcessor.Service.of({
-    create: () => Effect.sync(() => processorCreateStarted.shift()?.()).pipe(Effect.andThen(Effect.never)),
-  }),
+const processorImplementation = SessionProcessor.node.implementation
+if (!processorImplementation) throw new Error("SessionProcessor node has no implementation")
+const processorDependencies = [
+  Session.node,
+  Config.node,
+  Snapshot.node,
+  AgentSvc.node,
+  LLM.node,
+  Permission.node,
+  Plugin.node,
+  SessionSummary.node,
+  SessionStatus.node,
+  Image.node,
+  EventV2Bridge.node,
+  Database.node,
+  ProviderSvc.node,
+] as const
+function processorWithCreate(create: SessionProcessor.Interface["create"]) {
+  return LayerNode.make({
+    service: SessionProcessor.Service,
+    layer: Layer.effect(
+      SessionProcessor.Service,
+      Effect.gen(function* () {
+        const real = yield* SessionProcessor.Service
+        return SessionProcessor.Service.of({ ...real, create })
+      }),
+    ).pipe(
+      Layer.provide(
+        processorImplementation as Layer.Layer<
+          SessionProcessor.Service,
+          never,
+          | Session.Service
+          | Config.Service
+          | Snapshot.Service
+          | AgentSvc.Service
+          | LLM.Service
+          | Permission.Service
+          | Plugin.Service
+          | SessionSummary.Service
+          | SessionStatus.Service
+          | Image.Service
+          | EventV2Bridge.Service
+          | Database.Service
+          | ProviderSvc.Service
+        >,
+      ),
+    ),
+    deps: processorDependencies,
+  })
+}
+const blockingProcessor = processorWithCreate(() =>
+  Effect.sync(() => processorCreateStarted.shift()?.()).pipe(Effect.andThen(Effect.never)),
 )
 
 const runtimeFlags = RuntimeFlags.layer({ experimentalEventSystem: true })
 
 const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })
+const processorCreateDie = processorWithCreate(() => Effect.die(new Error("processor creation defect")))
 
 const promptRoot = LayerNode.group([
   SessionPrompt.node,
@@ -291,6 +343,12 @@ const gates = {
     | { reached: Deferred.Deferred<void>; startedRun: boolean; hold?: Deferred.Deferred<void> },
   // Holds a compaction between its summary and its continue message.
   compactionContinue: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  compactionWriteFailure: undefined as undefined | { triggered: boolean },
+  structuredUpdateFailure: undefined as undefined | { triggered: boolean },
+  presetErrorUpdateFailure: undefined as
+    | undefined
+    | { name: "ContentFilterError" | "StructuredOutputError"; triggered: boolean },
+  outcomeFailure: undefined as undefined | { triggered: boolean },
   noReplyAdmission: undefined as
     | undefined
     | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void>; skip?: number },
@@ -305,6 +363,28 @@ const gatedSession = LayerNode.make({
       const real = yield* Session.Service
       return Session.Service.of({
         ...real,
+        updateMessage: <T extends SessionV1.Info>(msg: T) =>
+          Effect.gen(function* () {
+            const structuredFailure = gates.structuredUpdateFailure
+            if (structuredFailure && msg.role === "assistant" && msg.structured !== undefined) {
+              structuredFailure.triggered = true
+              gates.structuredUpdateFailure = undefined
+              return yield* Effect.die(new Error("injected structured output persistence failure"))
+            }
+            const presetErrorFailure = gates.presetErrorUpdateFailure
+            if (presetErrorFailure && msg.role === "assistant" && msg.error?.name === presetErrorFailure.name) {
+              presetErrorFailure.triggered = true
+              gates.presetErrorUpdateFailure = undefined
+              return yield* Effect.die(new Error(`injected ${presetErrorFailure.name} persistence failure`))
+            }
+            const gate = msg.role === "user" && msg.noReply === true ? gates.noReplyWrite : undefined
+            if (gate) {
+              gates.noReplyWrite = undefined
+              yield* Deferred.succeed(gate.entered, undefined)
+              yield* Deferred.await(gate.release)
+            }
+            return yield* real.updateMessage(msg)
+          }),
         findMessage: (sessionID, predicate) =>
           Effect.gen(function* () {
             const gate = gates.finishingRead
@@ -314,16 +394,6 @@ const gatedSession = LayerNode.make({
               yield* Deferred.await(gate.release)
             }
             return yield* real.findMessage(sessionID, predicate)
-          }),
-        updateMessage: (info) =>
-          Effect.gen(function* () {
-            const gate = info.role === "user" && info.noReply === true ? gates.noReplyWrite : undefined
-            if (gate) {
-              gates.noReplyWrite = undefined
-              yield* Deferred.succeed(gate.entered, undefined)
-              yield* Deferred.await(gate.release)
-            }
-            return yield* real.updateMessage(info)
           }),
       })
     }),
@@ -337,6 +407,67 @@ const gatedSession = LayerNode.make({
     ),
   ),
   deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
+})
+
+const gatedEventV2Bridge = LayerNode.make({
+  service: EventV2Bridge.Service,
+  layer: Layer.effect(
+    EventV2Bridge.Service,
+    Effect.gen(function* () {
+      const real = yield* EventV2Bridge.Service
+      const publish: EventV2.Interface["publish"] = (definition, data, options) =>
+        Effect.gen(function* () {
+          if (definition.type === SessionV1.Event.MessageUpdated.type) {
+            const update = data as typeof SessionV1.Event.MessageUpdated.data.Type
+            const failure = gates.compactionWriteFailure
+            if (failure && update.info.role === "user" && !failure.triggered) {
+              failure.triggered = true
+              gates.compactionWriteFailure = undefined
+              return yield* Effect.die(new Error("injected compaction write failure"))
+            }
+          }
+          return yield* real.publish(definition, data, options)
+        })
+      return EventV2Bridge.Service.of({ ...real, publish })
+    }),
+  ).pipe(
+    Layer.provide(EventV2Bridge.node.implementation as Layer.Layer<EventV2Bridge.Service, never, EventV2.Service>),
+  ),
+  deps: [EventV2.node],
+})
+
+const instructionClearFailure = { armed: false, triggered: false }
+const instructionImplementation = Instruction.node.implementation
+if (!instructionImplementation) throw new Error("Instruction node has no implementation")
+const gatedInstruction = LayerNode.make({
+  service: Instruction.Service,
+  layer: Layer.effect(
+    Instruction.Service,
+    Effect.gen(function* () {
+      const real = yield* Instruction.Service
+      return Instruction.Service.of({
+        ...real,
+        clear: (messageID) =>
+          Effect.gen(function* () {
+            if (instructionClearFailure.armed && !instructionClearFailure.triggered) {
+              instructionClearFailure.triggered = true
+              instructionClearFailure.armed = false
+              return yield* Effect.die(new Error("injected instruction.clear failure"))
+            }
+            return yield* real.clear(messageID)
+          }),
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      instructionImplementation as Layer.Layer<
+        Instruction.Service,
+        never,
+        Config.Service | FSUtil.Service | Global.Service | RuntimeFlags.Service | HttpClient.HttpClient
+      >,
+    ),
+  ),
+  deps: [Config.node, FSUtil.node, Global.node, RuntimeFlags.node, httpClient],
 })
 
 const gatedRunState = LayerNode.make({
@@ -400,6 +531,12 @@ const gatedPlugin = LayerNode.make({
       const real = yield* Plugin.Service
       const trigger = ((name, input, output) =>
         Effect.gen(function* () {
+          const failure = gates.outcomeFailure
+          if (name === "experimental.chat.messages.transform" && failure && !failure.triggered) {
+            failure.triggered = true
+            gates.outcomeFailure = undefined
+            return yield* Effect.die(new Error("injected prompt outcome failure"))
+          }
           const gate = name === "experimental.compaction.autocontinue" ? gates.compactionContinue : undefined
           if (gate) {
             gates.compactionContinue = undefined
@@ -429,13 +566,32 @@ const gated = testEffect(
     [LSP.node, lsp],
     [MCP.node, makeMcp()],
     [RuntimeFlags.node, runtimeFlags],
+    [EventV2Bridge.node, gatedEventV2Bridge],
     [Session.node, gatedSession],
     [SessionRunState.node, gatedRunState],
     [Plugin.node, gatedPlugin],
   ]),
 )
+const instructionClearFailureTest = testEffect(
+  LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, runtimeFlags],
+    [Instruction.node, gatedInstruction],
+  ]),
+)
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
+const processorDies = testEffect(
+  LayerNode.compile(promptRoot, [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, runtimeFlags],
+    [SessionProcessor.node, processorCreateDie],
+  ]),
+)
 const withMcpInstructions = testEffect(
   makeHttp({
     mcpInstructions: [
@@ -1232,6 +1388,10 @@ preProviderFailurePrompt.instance("allows retry after preparation fails before p
     )
     expect(Exit.isFailure(failedExit)).toBe(true)
     expect(yield* llm.calls).toBe(0)
+    const failedMessages = yield* sessions.messages({ sessionID: session.id })
+    const failedAssistant = failedMessages.findLast((message) => message.info.role === "assistant")
+    expect(failedAssistant?.info.role).toBe("assistant")
+    if (failedAssistant?.info.role === "assistant") expect(failedAssistant.info.error?.name).toBe("UnknownError")
 
     yield* llm.text("retried input handled")
     const retry = yield* prompt.loop({ sessionID: session.id, messageID }).pipe(Effect.forkChild)
@@ -2233,6 +2393,417 @@ it.instance("loop calls LLM and returns assistant message", () =>
     expect(parts.some((p) => p.type === "text" && p.text === "world")).toBe(true)
     expect(yield* llm.hits).toHaveLength(1)
   }),
+)
+
+processorDies.instance(
+  "loop terminalizes the assistant when processor setup dies",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({
+        title: "Processor setup failure",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const errors: string[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID !== chat.id || !data.error) return Effect.void
+        errors.push(data.error.name)
+        return Effect.void
+      })
+
+      yield* seedUser({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: said("hello"),
+      })
+      const exit = yield* Effect.exit(prompt.loop({ sessionID: chat.id }))
+      const messages = yield* sessions.messages({ sessionID: chat.id, limit: 10 })
+      const assistant = messages.findLast((message) => message.info.role === "assistant")
+      const state = yield* status.get(chat.id)
+      yield* off
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(state).toMatchObject({ type: "idle" })
+      expect(assistant?.info.role).toBe("assistant")
+      if (assistant?.info.role === "assistant") {
+        expect(assistant.info.time.completed).toBeDefined()
+        const error = assistant.info.error
+        expect(error?.name).toBe("UnknownError")
+        if (error?.name === "UnknownError") expect(errors).toContain(error.name)
+      }
+    }),
+  { config: cfg },
+  20_000,
+)
+
+gated.instance(
+  "outcome block die terminalizes the persisted assistant",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({
+        title: "Outcome block failure",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const fault = { triggered: false }
+      const errors: string[] = []
+      gates.outcomeFailure = fault
+      yield* Effect.addFinalizer(() => Effect.sync(() => (gates.outcomeFailure = undefined)))
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID !== chat.id || !data.error) return Effect.void
+        errors.push(data.error.name)
+        return Effect.void
+      })
+
+      yield* seedUser({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: said("hello"),
+      })
+      const exit = yield* Effect.exit(prompt.loop({ sessionID: chat.id }))
+      const messages = yield* sessions.messages({ sessionID: chat.id, limit: 10 })
+      const assistant = messages.findLast((message) => message.info.role === "assistant")
+      const state = yield* status.get(chat.id)
+      yield* off
+
+      expect(fault.triggered).toBe(true)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(state).toMatchObject({ type: "idle" })
+      expect(assistant?.info.role).toBe("assistant")
+      if (assistant?.info.role === "assistant") {
+        expect(assistant.info.time.completed).toBeDefined()
+        const error = assistant.info.error
+        expect(error?.name).toBe("UnknownError")
+        if (error?.name === "UnknownError") {
+          expect(error.data.message).toContain("injected prompt outcome failure")
+          expect(errors).toContain(error.name)
+        }
+      }
+    }),
+  { config: cfg },
+  20_000,
+)
+
+gated.instance(
+  "failed compaction write preserves the completed answer and tool context",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), compaction: { auto: true } }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const provider = yield* ProviderSvc.Service
+      const instance = yield* TestInstance
+      const chat = yield* sessions.create({ title: "Compaction write failure" })
+      const model = yield* provider.getModel(ref.providerID, ref.modelID)
+      const probe = path.join(instance.directory, "probe.txt")
+      yield* writeText(probe, "probe")
+      yield* seedUser({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: said("Use the tool, answer, and then compact"),
+      })
+      yield* llm.tool("glob", { pattern: "**/*.txt" })
+      yield* llm.push(
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-test",
+              object: "chat.completion.chunk",
+              created: 1790550000,
+              model: "test-model",
+              choices: [{ index: 0, delta: { role: "assistant", content: "partial response" }, finish_reason: null }],
+            },
+            { error: "Your input exceeds the context window of this model" },
+          ],
+        }),
+      )
+      const fault = { triggered: false }
+      gates.compactionWriteFailure = fault
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.compactionWriteFailure === fault) gates.compactionWriteFailure = undefined
+        }),
+      )
+      const eventMessages: string[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID !== chat.id || !data.error) return Effect.void
+        if (data.error.name === "UnknownError") eventMessages.push(data.error.data.message)
+        return Effect.void
+      })
+
+      const exit = yield* Effect.exit(prompt.loop({ sessionID: chat.id }))
+      yield* off
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const assistant = messages.findLast((message) => message.info.role === "assistant")
+      const tool = messages
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "glob")
+      const modelMessages = yield* MessageV2.toModelMessagesEffect(messages, model)
+      const modelContext = JSON.stringify(modelMessages)
+
+      expect(fault.triggered).toBe(true)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(assistant?.info.role).toBe("assistant")
+      if (assistant?.info.role === "assistant") {
+        expect(assistant.info.time.completed).toBeDefined()
+        expect(assistant.info.error).toBeUndefined()
+        expect(assistant.parts.some((part) => part.type === "text" && part.text.includes("partial response"))).toBe(
+          true,
+        )
+      }
+      expect(tool?.state.status).toBe("completed")
+      expect(tool?.state.status === "completed" ? tool.state.output : "").toContain("probe.txt")
+      expect(modelContext).toContain("partial response")
+      expect(modelContext).toContain("probe.txt")
+      expect(eventMessages).toEqual(["injected compaction write failure"])
+    }),
+  { config: { ...cfg, compaction: { auto: true } } },
+  20_000,
+)
+
+gated.instance(
+  "structured output persistence failure preserves the completed assistant",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const provider = yield* ProviderSvc.Service
+      const chat = yield* sessions.create({ title: "Structured output write failure" })
+      const model = yield* provider.getModel(ref.providerID, ref.modelID)
+      const format = Schema.decodeUnknownSync(SessionV1.Format)({
+        type: "json_schema",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+      })
+      yield* seedUser({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        format,
+        parts: said("Return the structured answer"),
+      })
+      yield* llm.push(reply().tool("StructuredOutput", { answer: "42" }))
+      const fault = { triggered: false }
+      gates.structuredUpdateFailure = fault
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.structuredUpdateFailure === fault) gates.structuredUpdateFailure = undefined
+        }),
+      )
+      const eventMessages: string[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID !== chat.id || !data.error) return Effect.void
+        if (data.error.name === "UnknownError") eventMessages.push(data.error.data.message)
+        return Effect.void
+      })
+
+      const exit = yield* Effect.exit(prompt.loop({ sessionID: chat.id }))
+      yield* off
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const assistant = messages.findLast((message) => message.info.role === "assistant")
+      const modelMessages = yield* MessageV2.toModelMessagesEffect(messages, model)
+
+      expect(fault.triggered).toBe(true)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(assistant?.info.role).toBe("assistant")
+      if (assistant?.info.role === "assistant") {
+        expect(assistant.info.time.completed).toBeDefined()
+        expect(assistant.info.error).toBeUndefined()
+        expect(assistant.parts.some((part) => part.type === "tool" && part.tool === "StructuredOutput")).toBe(true)
+      }
+      expect(JSON.stringify(modelMessages)).toContain("StructuredOutput")
+      expect(eventMessages).toEqual(["injected structured output persistence failure"])
+    }),
+  { config: cfg },
+  20_000,
+)
+
+gated.instance(
+  "content-filter persistence failure publishes the follow-up error and preserves the provider error",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({ title: "Content-filter persistence failure" })
+      yield* seedUser({
+        sessionID: chat.id,
+        agent: "build",
+        parts: said("Return a response that the provider filters"),
+      })
+      yield* llm.push(reply().text("partial response").contentFilter())
+      const fault = { name: "ContentFilterError" as const, triggered: false }
+      gates.presetErrorUpdateFailure = fault
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.presetErrorUpdateFailure === fault) gates.presetErrorUpdateFailure = undefined
+        }),
+      )
+      const eventMessages: string[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID !== chat.id || !data.error) return Effect.void
+        if (data.error.name === "UnknownError") eventMessages.push(data.error.data.message)
+        return Effect.void
+      })
+
+      const exit = yield* Effect.exit(prompt.loop({ sessionID: chat.id }))
+      yield* off
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const assistant = messages.findLast((message) => message.info.role === "assistant")
+
+      expect(fault.triggered).toBe(true)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(assistant?.info.role).toBe("assistant")
+      if (assistant?.info.role === "assistant") {
+        expect(assistant.info.finish).toBe("content-filter")
+        expect(assistant.info.time.completed).toBeDefined()
+        expect(assistant.info.error).toMatchObject({
+          name: "ContentFilterError",
+          data: { message: "The response was blocked by the provider's content filter" },
+        })
+      }
+      expect(eventMessages).toEqual(["injected ContentFilterError persistence failure"])
+    }),
+  { config: cfg },
+  20_000,
+)
+
+gated.instance(
+  "missing structured-output persistence failure publishes the follow-up error and preserves the provider error",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({ title: "Missing structured-output persistence failure" })
+      const format = Schema.decodeUnknownSync(SessionV1.Format)({
+        type: "json_schema",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+      })
+      yield* seedUser({
+        sessionID: chat.id,
+        agent: "build",
+        format,
+        parts: said("Return a structured answer"),
+      })
+      yield* llm.push(reply().text("plain text instead of structured output"))
+      const fault = { name: "StructuredOutputError" as const, triggered: false }
+      gates.presetErrorUpdateFailure = fault
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.presetErrorUpdateFailure === fault) gates.presetErrorUpdateFailure = undefined
+        }),
+      )
+      const eventMessages: string[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID !== chat.id || !data.error) return Effect.void
+        if (data.error.name === "UnknownError") eventMessages.push(data.error.data.message)
+        return Effect.void
+      })
+
+      const exit = yield* Effect.exit(prompt.loop({ sessionID: chat.id }))
+      yield* off
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const assistant = messages.findLast((message) => message.info.role === "assistant")
+
+      expect(fault.triggered).toBe(true)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(assistant?.info.role).toBe("assistant")
+      if (assistant?.info.role === "assistant") {
+        expect(assistant.info.time.completed).toBeDefined()
+        expect(assistant.info.error).toMatchObject({
+          name: "StructuredOutputError",
+          data: { message: "Model did not produce structured output", retries: 0 },
+        })
+        expect(assistant.info.structured).toBeUndefined()
+      }
+      expect(eventMessages).toEqual(["injected StructuredOutputError persistence failure"])
+    }),
+  { config: cfg },
+  20_000,
+)
+
+instructionClearFailureTest.instance(
+  "instruction.clear failure preserves the completed assistant",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const provider = yield* ProviderSvc.Service
+      const chat = yield* sessions.create({ title: "Instruction clear failure" })
+      const model = yield* provider.getModel(ref.providerID, ref.modelID)
+      yield* seedUser({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: said("Preserve this answer after instruction cleanup"),
+      })
+      yield* llm.text("answer before instruction clear")
+      instructionClearFailure.armed = true
+      instructionClearFailure.triggered = false
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          instructionClearFailure.armed = false
+          instructionClearFailure.triggered = false
+        }),
+      )
+      const eventMessages: string[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID !== chat.id || !data.error) return Effect.void
+        if (data.error.name === "UnknownError") eventMessages.push(data.error.data.message)
+        return Effect.void
+      })
+
+      const exit = yield* Effect.exit(prompt.loop({ sessionID: chat.id }))
+      yield* off
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const assistant = messages.findLast((message) => message.info.role === "assistant")
+      const modelMessages = yield* MessageV2.toModelMessagesEffect(messages, model)
+
+      expect(instructionClearFailure.triggered).toBe(true)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(assistant?.info.role).toBe("assistant")
+      if (assistant?.info.role === "assistant") {
+        expect(assistant.info.time.completed).toBeDefined()
+        expect(assistant.info.error).toBeUndefined()
+        expect(
+          assistant.parts.some((part) => part.type === "text" && part.text.includes("answer before instruction clear")),
+        ).toBe(true)
+      }
+      expect(JSON.stringify(modelMessages)).toContain("answer before instruction clear")
+      expect(eventMessages).toEqual(["injected instruction.clear failure"])
+    }),
+  { config: cfg },
+  20_000,
 )
 
 withMcpInstructions.instance(

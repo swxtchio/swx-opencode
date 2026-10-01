@@ -1217,10 +1217,12 @@ const layer = Layer.effect(
     })
 
     // Root pins bind only when this caller starts the run; a joiner keeps the active run's root.
-    const runLoop: (sessionID: SessionID, rootMessageID?: MessageID) => Effect.Effect<SessionV1.WithParts> = Effect.fn(
-      "SessionPrompt.run",
-    )(
-      function* (sessionID: SessionID, rootMessageID?: MessageID) {
+    const runLoop: (
+      sessionID: SessionID,
+      rootMessageID?: MessageID,
+      retryFailedRoot?: boolean,
+    ) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
+      function* (sessionID: SessionID, rootMessageID?: MessageID, retryFailedRoot = false) {
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
@@ -1228,6 +1230,7 @@ const layer = Layer.effect(
         let seen = 0
         let initialRootSelected = false
         let pinnedRootOrder: number | undefined
+        const retriedAssistantIDs = new Set<MessageID>()
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1261,7 +1264,26 @@ const layer = Layer.effect(
                 (message.info.role === "assistant" && message.info.parentID === root.info.id)
               )
             })
+            const previousAssistant = msgs.findLast(
+              (message) => message.info.role === "assistant" && message.info.parentID === root.info.id,
+            )
+            // An explicit root replay retries a failed attempt without erasing its
+            // terminal error row from history or showing it as model context.
+            if (
+              retryFailedRoot &&
+              previousAssistant?.info.role === "assistant" &&
+              previousAssistant.info.error !== undefined
+            ) {
+              for (const message of msgs) {
+                if (message.info.role === "assistant" && message.info.parentID === root.info.id)
+                  retriedAssistantIDs.add(message.info.id)
+              }
+            }
           }
+          if (retriedAssistantIDs.size > 0)
+            msgs = msgs.filter(
+              (message) => message.info.role !== "assistant" || !retriedAssistantIDs.has(message.info.id),
+            )
           initialRootSelected = true
           const rootBoundary = pinnedRootOrder
           if (rootBoundary !== undefined) {
@@ -1420,15 +1442,21 @@ const layer = Layer.effect(
           }
           yield* sessions.updateMessage(msg)
 
-          const finalizeInterruptedAssistant = Effect.gen(function* () {
-            if (msg.time.completed) return
-            msg.error ??= MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
+          const finalizeInterruptedAssistant = processor.finalizeFailure({
+            assistantMessage: msg,
+            error: MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
               providerID: msg.providerID,
               aborted: true,
-            })
-            msg.time.completed = Date.now()
-            yield* sessions.updateMessage(msg)
+            }),
+            terminalize: true,
           })
+
+          const finalizeFailedAssistant = (cause: Cause.Cause<unknown>) =>
+            processor.finalizeFailure({
+              assistantMessage: msg,
+              cause,
+              terminalize: true,
+            })
 
           const handle = yield* processor
             .create({
@@ -1436,7 +1464,14 @@ const layer = Layer.effect(
               sessionID,
               model,
             })
-            .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
+            .pipe(
+              Effect.onInterrupt(() => finalizeInterruptedAssistant),
+              Effect.onExit((exit) =>
+                Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)
+                  ? finalizeFailedAssistant(exit.cause)
+                  : Effect.void,
+              ),
+            )
 
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
@@ -1553,6 +1588,11 @@ const layer = Layer.effect(
           }).pipe(
             Effect.ensuring(instruction.clear(handle.message.id)),
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
+            Effect.onExit((exit) =>
+              Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)
+                ? handle.finalizeFailure(exit.cause)
+                : Effect.void,
+            ),
           )
           if (outcome === "break") break
           continue
@@ -1595,7 +1635,7 @@ const layer = Layer.effect(
             }).user?.id
           }),
         ))
-      return yield* drain(input.sessionID, undefined, messageID).pipe(Effect.orDie)
+      return yield* drain(input.sessionID, undefined, messageID, input.messageID !== undefined).pipe(Effect.orDie)
     })
 
     // Runs or joins the session's drain. With `own`, returns the reply the turn
@@ -1605,9 +1645,15 @@ const layer = Layer.effect(
       sessionID: SessionID,
       own?: SessionQueue.ItemID,
       rootMessageID?: MessageID,
+      retryFailedRoot?: boolean,
     ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError> = Effect.fn(
       "SessionPrompt.loop",
-    )(function* (sessionID: SessionID, own?: SessionQueue.ItemID, rootMessageID?: MessageID) {
+    )(function* (
+      sessionID: SessionID,
+      own?: SessionQueue.ItemID,
+      rootMessageID?: MessageID,
+      retryFailedRoot?: boolean,
+    ) {
       const withdrawn = own
         ? queue
             .withdrawn(sessionID, own)
@@ -1637,7 +1683,11 @@ const layer = Layer.effect(
         yield* first("queue")
         if (yield* queue.empty(sessionID)) return yield* withdrawn.pipe(Effect.andThen(lastAssistant(sessionID)))
       }
-      const result = yield* state.ensureRunning(sessionID, lastAssistant(sessionID), runLoop(sessionID, rootMessageID))
+      const result = yield* state.ensureRunning(
+        sessionID,
+        lastAssistant(sessionID),
+        runLoop(sessionID, rootMessageID, retryFailedRoot),
+      )
       // Work admitted after the joined run's last history read would otherwise
       // wait for another prompt. This caller stays with the drains until one has
       // read its own prompt and finished; anyone else's is woken in the background.
@@ -1645,7 +1695,7 @@ const layer = Layer.effect(
       if (own) {
         const unread = waiting && (yield* queue.unread(sessionID, own))
         if (unread || Exit.isFailure(yield* state.assertNotBusy(sessionID).pipe(Effect.exit)))
-          return yield* drain(sessionID, own, rootMessageID)
+          return yield* drain(sessionID, own, rootMessageID, retryFailedRoot)
       }
       if (waiting) {
         yield* drain(sessionID).pipe(

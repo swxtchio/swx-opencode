@@ -2,6 +2,7 @@ import { NamedError } from "@opencode-ai/core/util/error"
 import { ConfigErrorV1 } from "@opencode-ai/core/v1/config/error"
 import { Cause, Effect } from "effect"
 import { HttpRouter, HttpServerError, HttpServerRespondable, HttpServerResponse } from "effect/unstable/http"
+import { sqliteLockMessage } from "@/util/sqlite-error"
 
 // Keep typed HttpApi failures on their declared error path; this boundary only replaces defect-only empty 500s.
 export const errorLayer = HttpRouter.middleware<{ handles: unknown }>()((effect) =>
@@ -27,12 +28,13 @@ export const errorLayer = HttpRouter.middleware<{ handles: unknown }>()((effect)
       }
 
       const ref = `err_${crypto.randomUUID().slice(0, 8)}`
+      const lockMessage = sqliteLockMessage(error)
 
       return Effect.logError("failed", { ref, error, cause: Cause.pretty(cause) }).pipe(
         Effect.as(
           HttpServerResponse.jsonUnsafe(
             new NamedError.Unknown({
-              message: "Unexpected server error. Check server logs for details.",
+              message: lockMessage ?? "Unexpected server error. Check server logs for details.",
               ref,
             }).toObject(),
             { status: 500 },

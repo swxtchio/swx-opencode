@@ -1,21 +1,57 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite"
 import { drizzle } from "drizzle-orm/node-sqlite"
 import * as Context from "effect/Context"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import { identity } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
+import * as Schedule from "effect/Schedule"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as Client from "effect/unstable/sql/SqlClient"
 import type { Connection } from "effect/unstable/sql/SqlConnection"
-import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
+import { classifySqliteError, LockTimeoutError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
 import { Sqlite } from "./sqlite"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
+const nativeBusyTimeoutMs = 5
+// Five 5ms native attempts plus four 25/50/75/75ms backoffs target ~250ms total.
+const retrySchedule = Schedule.exponential("25 millis").pipe(
+  Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 75)))),
+  Schedule.take(4),
+)
+
+const statementError = (cause: unknown) => {
+  const errcode =
+    typeof cause === "object" && cause !== null && "errcode" in cause && typeof cause.errcode === "number"
+      ? cause.errcode & 0xff
+      : undefined
+  const reason =
+    errcode === 5 || errcode === 6
+      ? new LockTimeoutError({ cause, message: "Failed to execute statement", operation: "execute" })
+      : classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" })
+  if (reason._tag !== "LockTimeoutError") return new SqlError({ reason })
+
+  const code =
+    errcode === 6
+      ? "SQLITE_LOCKED"
+      : typeof cause === "object" && cause !== null && "code" in cause && typeof cause.code === "string"
+        ? cause.code.startsWith("SQLITE_LOCKED")
+          ? cause.code
+          : "SQLITE_BUSY"
+        : "SQLITE_BUSY"
+  return new SqlError({
+    reason: new LockTimeoutError({
+      cause,
+      message: `Failed to execute statement: database is locked (${code})`,
+      operation: "execute",
+    }),
+  })
+}
 
 const TypeId = "~@opencode-ai/core/database/SqliteNode" as const
 type TypeId = typeof TypeId
@@ -57,15 +93,10 @@ const make = (options: Config) =>
       Effect.withFiber<Array<Record<string, unknown>>, SqlError>((fiber) => {
         const statement = native.prepare(query)
         statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
-        try {
-          return Effect.succeed(statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>)
-        } catch (cause) {
-          return Effect.fail(
-            new SqlError({
-              reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
-            }),
-          )
-        }
+        return Effect.try({
+          try: () => statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>,
+          catch: statementError,
+        }).pipe(Effect.retry({ schedule: retrySchedule, while: (error) => error.reason.isRetryable }))
       })
 
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
@@ -73,17 +104,10 @@ const make = (options: Config) =>
         const statement = native.prepare(query)
         statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
         statement.setReturnArrays(true)
-        try {
-          return Effect.succeed(
-            statement.all(...(params as SQLInputValue[])) as unknown as ReadonlyArray<ReadonlyArray<unknown>>,
-          )
-        } catch (cause) {
-          return Effect.fail(
-            new SqlError({
-              reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
-            }),
-          )
-        }
+        return Effect.try({
+          try: () => statement.all(...(params as SQLInputValue[])) as unknown as ReadonlyArray<ReadonlyArray<unknown>>,
+          catch: statementError,
+        }).pipe(Effect.retry({ schedule: retrySchedule, while: (error) => error.reason.isRetryable }))
       })
 
     const connection = identity<SqliteConnection>({
@@ -113,8 +137,8 @@ const make = (options: Config) =>
     })
 
     const semaphore = yield* Semaphore.make(1)
-    const acquirer = semaphore.withPermits(1)(Effect.succeed(connection))
-    const transactionAcquirer = Effect.uninterruptibleMask((restore) => {
+    // Keep retries serialized on the native connection, including their backoff interval.
+    const acquirer = Effect.uninterruptibleMask((restore) => {
       const fiber = Fiber.getCurrent()!
       const scope = Context.getUnsafe(fiber.context, Scope.Scope)
       return Effect.as(
@@ -122,6 +146,7 @@ const make = (options: Config) =>
         connection,
       )
     })
+    const transactionAcquirer = acquirer
 
     const client = Object.assign(
       (yield* Client.make({
@@ -137,7 +162,7 @@ const make = (options: Config) =>
       {
         [TypeId]: TypeId,
         config: options,
-        loadExtension: (path: string) => Effect.flatMap(acquirer, (_) => _.loadExtension(path)),
+        loadExtension: (path: string) => Effect.scoped(Effect.flatMap(acquirer, (_) => _.loadExtension(path))),
       },
     )
 
@@ -150,7 +175,7 @@ const nativeLayer = (config: Config) =>
     Effect.gen(function* () {
       const native = new DatabaseSync(config.filename, {
         readOnly: config.readonly,
-        timeout: config.timeout,
+        timeout: config.timeout ?? nativeBusyTimeoutMs,
         allowExtension: config.allowExtension,
         enableForeignKeyConstraints: true,
         open: true,

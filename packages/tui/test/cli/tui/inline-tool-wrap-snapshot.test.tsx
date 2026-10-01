@@ -7,6 +7,7 @@ import {
   formatSubagentRetry,
   formatSubagentTitle,
   formatSubagentToolcalls,
+  isSessionToolActive,
   InlineToolRow,
   parseApplyPatchFiles,
   parseDiagnostics,
@@ -209,6 +210,15 @@ function FailedCompleteToolFixture() {
   )
 }
 
+function UnresolvedPendingToolFixture() {
+  const active = isSessionToolActive({ status: "unknown", state: "running", message: { time: { created: 1 } } })
+  return (
+    <InlineToolRow icon="→" complete={false} pending="Status unknown" spinner={active}>
+      Running shell command
+    </InlineToolRow>
+  )
+}
+
 async function renderFrame(component: () => JSX.Element, options: { width: number; height: number }) {
   testSetup = await testRender(component, options)
   await testSetup.renderOnce()
@@ -238,6 +248,20 @@ describe("TUI inline tool wrapping", () => {
     const frame = await renderFrame(() => <FailedCompleteToolFixture />, { width: 72, height: 3 })
     expect(frame).toContain("Read src/index.ts")
     expect(frame).not.toContain("Read failed")
+  })
+
+  test("shows unresolved tool status without displaying a working spinner", async () => {
+    const frame = await renderFrame(() => <UnresolvedPendingToolFixture />, { width: 72, height: 3 })
+    expect(frame).toContain("Status unknown")
+    expect(frame).not.toContain("Running shell command")
+  })
+
+  test("does not treat unknown session status as active tool work", () => {
+    const message = { time: { created: 1 } }
+    expect(isSessionToolActive({ status: "unknown", state: "running", message })).toBe(false)
+    expect(isSessionToolActive({ status: "working", state: "running", message })).toBe(true)
+    expect(isSessionToolActive({ status: "working", state: "pending", message })).toBe(true)
+    expect(isSessionToolActive({ status: "working", state: "completed", message })).toBe(false)
   })
 
   test("filters malformed nested tool wire data", () => {

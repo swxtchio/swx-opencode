@@ -97,6 +97,17 @@ const GO_UPSELL_PROVIDERS = new Set(["opencode", "opencode-go"])
 export const alwaysSeparate = new WeakSet<BoxRenderable>()
 
 type RetryAction = Extract<SessionStatus, { type: "retry" }>["action"]
+type SessionTurnStatus = "idle" | "compacting" | "working" | "failed" | "unknown"
+
+export function isSessionToolActive(input: {
+  status: SessionTurnStatus
+  state: ToolPart["state"]["status"]
+  message?: { time: { created: number; completed?: number }; error?: unknown }
+}) {
+  if (input.state !== "pending" && input.state !== "running") return false
+  if (!input.message || input.message.time.completed !== undefined || input.message.error !== undefined) return false
+  return input.status === "working" || input.status === "compacting"
+}
 
 function goUpsellKeys(action: RetryAction) {
   if (!action) return
@@ -1537,6 +1548,9 @@ function AssistantMessage(props: {
   const { theme } = useTheme()
   const sync = useSync()
   const messages = createMemo(() => sync.data.message[props.message.sessionID] ?? [])
+  const turnStatus = createMemo(() => sync.session.status(props.message.sessionID))
+  const failedTurn = createMemo(() => props.last && turnStatus() === "failed")
+  const unresolvedTurn = createMemo(() => props.last && turnStatus() === "unknown" && !props.message.error)
 
   const final = createMemo(() => {
     return props.message.finish && !["tool-calls", "unknown"].includes(props.message.finish)
@@ -1609,6 +1623,16 @@ function AssistantMessage(props: {
           <text fg={theme.textMuted}>{errorMessage(props.message.error)}</text>
         </box>
       </Show>
+      <Show when={failedTurn() && !props.message.error}>
+        <box ref={(el: BoxRenderable) => alwaysSeparate.add(el)} paddingLeft={3}>
+          <text fg={theme.error}>⚠</text>
+        </box>
+      </Show>
+      <Show when={unresolvedTurn()}>
+        <box ref={(el: BoxRenderable) => alwaysSeparate.add(el)} paddingLeft={3}>
+          <text fg={theme.textMuted}>Status unknown</text>
+        </box>
+      </Show>
       <Switch>
         <Match when={props.last || final() || props.message.error?.name === "MessageAbortedError"}>
           <box ref={(el: BoxRenderable) => alwaysSeparate.add(el)} paddingLeft={3}>
@@ -1658,6 +1682,7 @@ const INLINE_TOOL_ICON_WIDTH = 2
 function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: AssistantMessage }) {
   const { theme } = useTheme()
   const ctx = use()
+  const sync = useSync()
   // Collapsed by default in hide mode: a single line throughout, so the
   // layout never shifts. Click to open the full markdown block, click to close.
   const [expanded, setExpanded] = createSignal(false)
@@ -1667,9 +1692,22 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
     return props.part.text.replace("[REDACTED]", "").trim()
   })
   const opaque = createMemo(() => !content() && Boolean(props.part.metadata))
-  // Reasoning is finalized when the server sets `time.end` (see processor.ts).
-  // Flips independently of the parent message completing.
-  const isDone = createMemo(() => props.part.time.end !== undefined)
+  const status = createMemo(() => sync.session.status(props.message.sessionID))
+  const unresolved = createMemo(
+    () =>
+      props.part.time.end === undefined &&
+      props.message.time.completed === undefined &&
+      props.message.error === undefined &&
+      status() === "unknown",
+  )
+  const isDone = createMemo(
+    () =>
+      props.part.time.end !== undefined ||
+      props.message.time.completed !== undefined ||
+      props.message.error !== undefined ||
+      status() === "failed" ||
+      unresolved(),
+  )
   const inMinimal = createMemo(() => ctx.thinkingMode() === "hide")
   const duration = createMemo(() => {
     const end = props.part.time.end
@@ -1697,6 +1735,7 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
             toggleable={inMinimal() && !opaque()}
             open={!inMinimal() || expanded()}
             done={isDone()}
+            unknown={unresolved()}
             title={summary().title}
             duration={isDone() ? Locale.duration(duration()) : undefined}
             encrypted={opaque()}
@@ -1724,6 +1763,7 @@ function ReasoningHeader(props: {
   toggleable: boolean
   open: boolean
   done: boolean
+  unknown?: boolean
   title: string | null
   duration?: string
   encrypted?: boolean
@@ -1741,6 +1781,11 @@ function ReasoningHeader(props: {
 
   return (
     <Switch>
+      <Match when={props.unknown}>
+        <text fg={theme.textMuted} wrapMode="none">
+          {props.toggleable ? (props.open ? "- " : "+ ") : ""}Thinking status unknown
+        </text>
+      </Match>
       <Match when={!props.done}>
         <box flexDirection="row">
           <Spinner color={fg()}>{props.title ? "Thinking: " + props.title : "Thinking"}</Spinner>
@@ -1932,6 +1977,39 @@ function InlineTool(props: {
   })
 
   const error = createMemo(() => (props.part.state.status === "error" ? props.part.state.error : undefined))
+  const message = createMemo(() =>
+    sync.data.message[props.part.sessionID]?.find((item) => item.id === props.part.messageID),
+  )
+  const status = createMemo(() => sync.session.status(props.part.sessionID))
+  const unresolved = createMemo(() => {
+    if (props.part.state.status !== "pending" && props.part.state.status !== "running") return false
+    const current = message()
+    if (current?.role !== "assistant") return false
+    return (
+      current.time.completed === undefined &&
+      current.error === undefined &&
+      status() === "unknown"
+    )
+  })
+  const active = createMemo(() => {
+    const current = message()
+    return isSessionToolActive({
+      status: status(),
+      state: props.part.state.status,
+      message: current?.role === "assistant" ? current : undefined,
+    })
+  })
+  const stopped = createMemo(() => {
+    if (props.part.state.status !== "pending" && props.part.state.status !== "running") return false
+    const current = message()
+    if (current?.role !== "assistant") return false
+    return (
+      current.time.completed !== undefined ||
+      current.error !== undefined ||
+      status() === "failed" ||
+      unresolved()
+    )
+  })
 
   const denied = createMemo(
     () =>
@@ -1941,9 +2019,10 @@ function InlineTool(props: {
       error()?.includes("user dismissed"),
   )
 
-  const failed = createMemo(() => Boolean(error() && !denied()))
+  const failed = createMemo(() => Boolean(error() && !denied()) || (stopped() && !unresolved()))
   const clickable = createMemo(() => Boolean(props.onClick || failed()))
   const fg = createMemo(() => {
+    if (unresolved()) return theme.textMuted
     if (props.color) return props.color
     if (permission()) return theme.warning
     if (failed()) return theme.error
@@ -1963,9 +2042,9 @@ function InlineTool(props: {
       error={error()}
       errorExpanded={errorExpanded()}
       complete={props.complete}
-      pending={props.pending}
+      pending={unresolved() ? "Status unknown" : props.pending}
       failure={props.failure}
-      spinner={props.spinner}
+      spinner={props.spinner && active()}
       separate={props.separate}
       onMouseOver={() => clickable() && setHover(true)}
       onMouseOut={() => setHover(false)}
@@ -2071,9 +2150,33 @@ function BlockTool(props: {
   spinner?: boolean
 }) {
   const { theme } = useTheme()
+  const sync = useSync()
   const renderer = useRenderer()
   const [hover, setHover] = createSignal(false)
   const error = createMemo(() => (props.part?.state.status === "error" ? props.part.state.error : undefined))
+  const message = createMemo(() =>
+    props.part
+      ? sync.data.message[props.part.sessionID]?.find((item) => item.id === props.part?.messageID)
+      : undefined,
+  )
+  const status = createMemo(() => (props.part ? sync.session.status(props.part.sessionID) : "idle"))
+  const unresolved = createMemo(() => {
+    if (!props.part || (props.part.state.status !== "pending" && props.part.state.status !== "running")) return false
+    const current = message()
+    if (current?.role !== "assistant") return false
+    return current.time.completed === undefined && current.error === undefined && status() === "unknown"
+  })
+  const stopped = createMemo(() => {
+    if (!props.part || (props.part.state.status !== "pending" && props.part.state.status !== "running")) return false
+    const current = message()
+    if (current?.role !== "assistant") return false
+    return (
+      current.time.completed !== undefined ||
+      current.error !== undefined ||
+      status() === "failed" ||
+      unresolved()
+    )
+  })
   return (
     <box
       ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
@@ -2085,7 +2188,7 @@ function BlockTool(props: {
       gap={1}
       backgroundColor={hover() ? theme.backgroundMenu : theme.backgroundPanel}
       customBorderChars={SplitBorder.customBorderChars}
-      borderColor={theme.background}
+      borderColor={stopped() ? (unresolved() ? theme.textMuted : theme.error) : theme.background}
       onMouseOver={() => props.onClick && setHover(true)}
       onMouseOut={() => setHover(false)}
       onMouseUp={() => {
@@ -2096,7 +2199,7 @@ function BlockTool(props: {
       <Show when={props.title}>
         {(title) => (
           <Show
-            when={props.spinner}
+            when={props.spinner && !stopped()}
             fallback={
               <text paddingLeft={3} fg={theme.textMuted}>
                 {title()}
@@ -2119,7 +2222,20 @@ function Shell(props: ToolProps) {
   const { theme } = useTheme()
   const pathFormatter = usePathFormatter()
   const ctx = use()
-  const isRunning = createMemo(() => props.part.state.status === "running")
+  const sync = useSync()
+  const message = createMemo(() =>
+    sync.data.message[props.part.sessionID]?.find((item) => item.id === props.part.messageID),
+  )
+  const status = createMemo(() => sync.session.status(props.part.sessionID))
+  const isRunning = createMemo(() => {
+    if (props.part.state.status !== "running") return false
+    const current = message()
+    return isSessionToolActive({
+      status: status(),
+      state: props.part.state.status,
+      message: current?.role === "assistant" ? current : undefined,
+    })
+  })
   const output = createMemo(() => stripAnsi(stringValue(props.metadata.output)?.trim() ?? ""))
   const [expanded, setExpanded] = createSignal(false)
   const maxLines = 10

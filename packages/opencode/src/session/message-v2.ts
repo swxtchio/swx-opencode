@@ -32,6 +32,7 @@ import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
 import { errorMessage } from "@/util/error"
 import { isMedia } from "@/util/media"
+import { sqliteLockMessage } from "@/util/sqlite-error"
 import { isContextOverflow } from "@opencode-ai/llm"
 import type { SystemError } from "bun"
 import type { Provider } from "@/provider/provider"
@@ -720,6 +721,9 @@ export function fromError(
   e: unknown,
   ctx: { providerID: ProviderV2.ID; aborted?: boolean },
 ): NonNullable<Assistant["error"]> {
+  const lockMessage = sqliteLockMessage(e)
+  if (lockMessage) return new NamedError.Unknown({ message: lockMessage }, { cause: e }).toObject()
+
   switch (true) {
     case e instanceof DOMException && e.name === "AbortError":
       return new AbortedError(

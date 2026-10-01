@@ -1,8 +1,8 @@
 /** @jsxImportSource @opentui/solid */
 import { describe, expect, test } from "bun:test"
 import { tmpdir } from "../../../fixture/fixture"
-import { mount, wait } from "./sync-fixture"
-import type { GlobalEvent } from "@opencode-ai/sdk/v2"
+import { json, mount, wait } from "./sync-fixture"
+import type { GlobalEvent, Message, Session, SessionStatus } from "@opencode-ai/sdk/v2"
 
 function branchEvent(branch: string, workspace?: string): GlobalEvent {
   return {
@@ -59,6 +59,72 @@ describe("tui sync", () => {
 
       expect(sync.data.vcs?.branch).toBe("feature")
     } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("restarted sessions distinguish unknown status from failed and active work", async () => {
+    await using tmp = await tmpdir()
+    await Bun.write(`${tmp.path}/kv.json`, "{}")
+    let resolveStatus!: (response: Response) => void
+    let statusRequested!: () => void
+    const statusResponse = new Promise<Response>((resolve) => {
+      resolveStatus = resolve
+    })
+    const requested = new Promise<void>((resolve) => {
+      statusRequested = resolve
+    })
+    const { app, sync } = await mount(
+      (url) => {
+        if (url.pathname !== "/session/status") return
+        statusRequested()
+        return statusResponse
+      },
+      tmp.path,
+      false,
+    )
+
+    try {
+      const sessionID = "ses_incomplete"
+      const session = { id: sessionID, time: { created: 1, updated: 1 } } as unknown as Session
+      const assistant = {
+        id: "msg_incomplete",
+        sessionID,
+        role: "assistant",
+        time: { created: 2 },
+      } as unknown as Message
+      sync.set("session", [session])
+      sync.set("message", sessionID, [assistant])
+
+      expect(sync.data.session_status).toEqual({})
+      await requested
+      expect(sync.status).not.toBe("complete")
+      expect(sync.session.status(sessionID)).toBe("unknown")
+
+      resolveStatus(json({}))
+      await wait(() => sync.status === "complete")
+      expect(sync.data.session_status).toEqual({})
+      expect(sync.session.status(sessionID)).toBe("unknown")
+
+      sync.set("session_status", sessionID, { type: "idle" } as SessionStatus)
+      expect(sync.session.status(sessionID)).toBe("failed")
+
+      sync.set("session_status", sessionID, { type: "busy" } as SessionStatus)
+      expect(sync.session.status(sessionID)).toBe("working")
+
+      sync.set("session_status", sessionID, {
+        type: "retry",
+        attempt: 1,
+        message: "retrying",
+        next: Date.now(),
+      } as SessionStatus)
+      expect(sync.session.status(sessionID)).toBe("working")
+
+      sync.set("message", sessionID, [{ ...assistant, time: { created: 2, completed: 3 } } as Message])
+      sync.set("session_status", sessionID, { type: "idle" } as SessionStatus)
+      expect(sync.session.status(sessionID)).toBe("idle")
+    } finally {
+      resolveStatus(json({}))
       app.renderer.destroy()
     }
   })

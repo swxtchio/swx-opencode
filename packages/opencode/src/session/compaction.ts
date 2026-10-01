@@ -12,7 +12,7 @@ import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
 import { NotFoundError } from "@/storage/storage"
 
-import { Effect, Layer, Context } from "effect"
+import { Effect, Exit, Layer, Context } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { isOverflow as overflow, usable } from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -419,11 +419,19 @@ const layer = Layer.effect(
         },
       }
       yield* session.updateMessage(msg)
-      const processor = yield* processors.create({
-        assistantMessage: msg,
-        sessionID: input.sessionID,
-        model,
-      })
+      const processor = yield* processors
+        .create({
+          assistantMessage: msg,
+          sessionID: input.sessionID,
+          model,
+        })
+        .pipe(
+          Effect.onExit((exit) =>
+            Exit.isFailure(exit)
+              ? processors.finalizeFailure({ assistantMessage: msg, cause: exit.cause, terminalize: true })
+              : Effect.void,
+          ),
+        )
       const result = yield* processor.process({
         user: userMessage,
         agent,

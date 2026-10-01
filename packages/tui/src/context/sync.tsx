@@ -589,7 +589,11 @@ export const {
           const last = messages.at(-1)
           if (!last) return "idle"
           if (last.role === "user") return "working"
-          return last.time.completed ? "idle" : "working"
+          if (last.time.completed) return "idle"
+          const status = store.session_status[sessionID]
+          if (!status) return "unknown"
+          if (status.type === "idle") return "failed"
+          return "working"
         },
         async sync(sessionID: string) {
           if (fullSyncedSessions.has(sessionID)) return

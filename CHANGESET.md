@@ -75,6 +75,14 @@ Newest first. Each entry names the upstream range brought in.
   state is on `Watcher.Service.status`, and `OPENCODE_EXPERIMENTAL_WATCHER_SUBSCRIBE_TIMEOUT_MS` sets when an
   unacknowledged root watch is reported unconfirmed. The desktop build ships the worker beside its rebundled server.
   CI runs the real-native refusal and root-status cases, and the desktop built-sidecar check. _Upstreamable._
+- **#88** Retry SQLite BUSY/LOCKED statements with a bounded driver schedule and serialized same-connection
+  backoff; terminalize failed assistant turns when writes recover, including prelude interrupts and compaction
+  setup/cleanup failures; preserve completed answers through later cleanup failures, publish follow-up persistence
+  errors without replacing existing provider errors, stop failed overflow turns before compaction, allow explicit
+  message-ID retries of terminal failures while retaining their error rows without queue-wake retries, and show idle
+  or absent-status sessions with non-terminal assistant rows as failed or unknown, respectively, in the TUI while
+  busy/retry statuses remain working. Persist and return only the classified lock diagnosis in messages and HTTP
+  errors. _Fork-only._
 - **#80** Codex OAuth accepts complete canonical GPT versions and catalog-backed named variants (including GPT-6 Astra from the [models.dev OpenAI catalog](https://models.dev/api.json)); malformed numeric aliases and unsupported suffixes stay filtered. _Fork-only._
 - **#78** Coordinate snapshot maintenance with a box-wide hourly gc cooldown (issue #70 Fix-1) and serialized cleanups; `Snapshot.track()` waits through contention and never silently skips snapshot updates. _Fork-only._
 - **#76** Classify mid-stream OpenAI-compatible context overflow errors as `ContextOverflowError` so automatic compaction can resume; cover SDK error shapes and session continuation. The unpatched-router reproduction is recorded in [docs/stream-overflow-e2e.md](docs/stream-overflow-e2e.md). (swxtchio/swx-opencode#66). _Fork-only._

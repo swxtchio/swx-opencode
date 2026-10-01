@@ -3,6 +3,7 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { BackgroundJob } from "@/background/job"
 import { APICallError } from "ai"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import * as Stream from "effect/Stream"
@@ -11,6 +12,7 @@ import { LLM } from "../../src/session/llm"
 import { SessionCompaction } from "../../src/session/compaction"
 import { Token } from "@/util/token"
 import { Plugin } from "../../src/plugin"
+import { Snapshot } from "@/snapshot"
 import { provideTmpdirInstance, TestInstance } from "../fixture/fixture"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -204,6 +206,7 @@ function fake(
     },
     updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
+    finalizeFailure: () => Effect.void,
     process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),
   } satisfies SessionProcessorModule.SessionProcessor.Handle
 }
@@ -213,6 +216,7 @@ function processorLayer(result: "continue" | "compact") {
     SessionProcessorModule.SessionProcessor.Service,
     SessionProcessorModule.SessionProcessor.Service.of({
       create: Effect.fn("TestSessionProcessor.create")((input) => Effect.succeed(fake(input, result))),
+      finalizeFailure: () => Effect.void,
     }),
   )
 }
@@ -226,11 +230,64 @@ const defaultProvider = wide()
 const compactionTestNode = LayerNode.group([
   SessionCompaction.node,
   SessionNs.node,
+  SessionStatus.node,
   SessionProjector.node,
   Database.node,
   EventV2Bridge.node,
   CrossSpawnSpawner.node,
 ])
+
+const compactionCleanupFault = { armed: false, triggered: false }
+const compactionCleanupFaultSession = LayerNode.make({
+  service: SessionNs.Service,
+  layer: Layer.effect(
+    SessionNs.Service,
+    Effect.gen(function* () {
+      const real = yield* SessionNs.Service
+      return SessionNs.Service.of({
+        ...real,
+        updateMessage: <T extends SessionV1.Info>(msg: T) =>
+          Effect.gen(function* () {
+            if (
+              compactionCleanupFault.armed &&
+              msg.role === "assistant" &&
+              msg.summary &&
+              msg.time.completed !== undefined &&
+              !compactionCleanupFault.triggered
+            ) {
+              compactionCleanupFault.armed = false
+              compactionCleanupFault.triggered = true
+              return yield* Effect.die(new Error("one-shot compaction cleanup persistence failure"))
+            }
+            return yield* real.updateMessage(msg)
+          }),
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      SessionNs.node.implementation as Layer.Layer<
+        SessionNs.Service,
+        never,
+        BackgroundJob.Service | RuntimeFlags.Service | Database.Service | EventV2Bridge.Service
+      >,
+    ),
+  ),
+  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
+})
+const snapshotTrackFailure = { triggered: false }
+const failingSnapshotTrack = LayerNode.make({
+  service: Snapshot.Service,
+  layer: Layer.mock(Snapshot.Service)({
+    track: () => {
+      if (snapshotTrackFailure.triggered) return Effect.succeed(undefined)
+      return Effect.sync(() => void (snapshotTrackFailure.triggered = true)).pipe(
+        Effect.andThen(Effect.die(new Error("one-shot Snapshot.track failure"))),
+      )
+    },
+  }),
+  deps: [],
+})
+
 const env = AppNodeBuilder.build(compactionTestNode, [
   [Provider.node, defaultProvider.layer],
   [SessionProcessorModule.SessionProcessor.node, processorLayer("continue")],
@@ -1259,6 +1316,154 @@ describe("session.compaction.process", () => {
           expect(Date.now() - start).toBeLessThan(250)
         }
       }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+    { timeout: 10_000 },
+  )
+
+  itCompaction.instance(
+    "terminalizes an interrupted compaction when cleanup persistence fails",
+    () => {
+      const stub = llm()
+      let calls = 0
+      return Effect.gen(function* () {
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        compactionCleanupFault.armed = false
+        compactionCleanupFault.triggered = false
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            compactionCleanupFault.armed = false
+          }),
+        )
+        stub.push(() => {
+          calls++
+          return Stream.concat(
+            Stream.make(
+              LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.textStart({ id: "text-1" }),
+              LLMEvent.textDelta({ id: "text-1", text: "partial summary" }),
+            ),
+            Stream.unwrap(
+              Deferred.succeed(started, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.as(Stream.empty),
+              ),
+            ),
+          )
+        })
+
+        const ssn = yield* SessionNs.Service
+        const events = yield* EventV2Bridge.Service
+        const status = yield* SessionStatus.Service
+        const session = yield* ssn.create({})
+        const parent = yield* createUserMessage(session.id, "hello")
+        const messages = yield* ssn.messages({ sessionID: session.id })
+        const errors: string[] = []
+        const off = yield* events.listen((event) => {
+          if (event.type !== SessionNs.Event.Error.type) return Effect.void
+          const data = event.data as typeof SessionNs.Event.Error.data.Type
+          if (data.sessionID === session.id && data.error) errors.push(data.error.name)
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => off)
+
+        const fiber = yield* SessionCompaction.use
+          .process({
+            parentID: parent.id,
+            messages,
+            sessionID: session.id,
+            auto: false,
+          })
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(started).pipe(Effect.timeout("5 seconds"))
+        compactionCleanupFault.armed = true
+        yield* Fiber.interrupt(fiber)
+        const exit = yield* Fiber.await(fiber)
+        const stored = yield* ssn.messages({ sessionID: session.id })
+        const assistant = stored.findLast((item) => item.info.role === "assistant" && item.info.summary)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(calls).toBe(1)
+        expect(compactionCleanupFault.triggered).toBe(true)
+        expect((yield* status.get(session.id)).type).toBe("idle")
+        expect(assistant?.info.role).toBe("assistant")
+        if (assistant?.info.role === "assistant") {
+          expect(assistant.info.time.completed).toBeDefined()
+          expect(assistant.info.error?.name).toBe("MessageAbortedError")
+        }
+        expect(errors).toEqual(["MessageAbortedError", "UnknownError"])
+      }).pipe(
+        Effect.provide(
+          AppNodeBuilder.build(compactionTestNode, [
+            [Provider.node, defaultProvider.layer],
+            [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
+            [SessionSummary.node, summary],
+            [LLM.node, stub.llmLayer],
+            [SessionNs.node, compactionCleanupFaultSession],
+          ]),
+        ),
+      )
+    },
+    { git: true },
+    { timeout: 10_000 },
+  )
+
+  itCompaction.instance(
+    "terminalizes the summary when snapshot setup fails",
+    () => {
+      const stub = llm()
+      return Effect.gen(function* () {
+        snapshotTrackFailure.triggered = false
+        const ssn = yield* SessionNs.Service
+        const events = yield* EventV2Bridge.Service
+        const status = yield* SessionStatus.Service
+        const session = yield* ssn.create({})
+        const parent = yield* createUserMessage(session.id, "hello")
+        const messages = yield* ssn.messages({ sessionID: session.id })
+        const errors: string[] = []
+        const off = yield* events.listen((event) => {
+          if (event.type !== SessionNs.Event.Error.type) return Effect.void
+          const data = event.data as typeof SessionNs.Event.Error.data.Type
+          if (data.sessionID === session.id && data.error) errors.push(data.error.name)
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => off)
+
+        const exit = yield* Effect.exit(
+          SessionCompaction.use.process({
+            parentID: parent.id,
+            messages,
+            sessionID: session.id,
+            auto: false,
+          }),
+        )
+        const stored = yield* ssn.messages({ sessionID: session.id })
+        const assistant = stored.findLast((item) => item.info.role === "assistant" && item.info.summary)
+
+        expect(snapshotTrackFailure.triggered).toBe(true)
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect((yield* status.get(session.id)).type).toBe("idle")
+        expect(assistant?.info.role).toBe("assistant")
+        if (assistant?.info.role === "assistant") {
+          expect(assistant.info.time.completed).toBeDefined()
+          expect(assistant.info.error?.name).toBe("UnknownError")
+          if (assistant.info.error?.name === "UnknownError") {
+            expect(assistant.info.error.data.message).toContain("one-shot Snapshot.track failure")
+          }
+        }
+        expect(errors).toEqual(["UnknownError"])
+      }).pipe(
+        Effect.provide(
+          AppNodeBuilder.build(compactionTestNode, [
+            [Provider.node, defaultProvider.layer],
+            [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
+            [SessionSummary.node, summary],
+            [LLM.node, stub.llmLayer],
+            [Snapshot.node, failingSnapshotTrack],
+          ]),
+        ),
+      )
     },
     { git: true },
     { timeout: 10_000 },
