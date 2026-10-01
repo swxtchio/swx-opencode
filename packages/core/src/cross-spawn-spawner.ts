@@ -397,7 +397,16 @@ export const make = Effect.gen(function* () {
               const send = (s: NodeJS.Signals) =>
                 Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
               const sig = command.options.killSignal ?? "SIGTERM"
-              const attempt = send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
+              // The handle's scope is closing, so nothing reads its pipes any more. A consumer
+              // interrupted before it registered its finalizer, as Stream.merge's sides are when
+              // interrupted before they start, leaves a listener on unread output. That pipe never
+              // ends, so "close" never fires; destroying our ends lets "close" confirm the exit.
+              const detach = Effect.sync(() => proc.stdio.forEach((stream) => stream?.destroy()))
+              const attempt = send(sig).pipe(
+                Effect.andThen(detach),
+                Effect.andThen(Deferred.await(signal)),
+                Effect.asVoid,
+              )
               const escalated = command.options.forceKillAfter
                 ? Effect.timeoutOrElse(attempt, {
                     duration: command.options.forceKillAfter,

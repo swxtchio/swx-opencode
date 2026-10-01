@@ -62,6 +62,11 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#NNN** `prompt.cancel` returns after interrupting a running shell (swxtchio/swx-opencode#110). Interrupted
+  straight after spawn, `Stream.merge`'s output sides never start, so the listener they already attached leaves
+  stdout's output unread; that pipe never ends, and the spawner's release waited forever for the child's `close`. The
+  release now destroys the child's pipes after signalling it, so `close` still confirms the exit. Seen on Bun 1.3.14.
+  _Upstreamable._
 - **#108** A fresh `opencode serve` answers an HTTP request that arrives as its port opens (swxtchio/swx-abbe#441).
   `NodeHttpServer` listened before attaching its request handler, so such a request was read and never answered;
   the server now holds early HTTP requests and hands them to the handler once it attaches. Early WebSocket upgrades
