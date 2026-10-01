@@ -6,6 +6,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm"
 import { Cause, Context, Effect, Exit, Layer, Option, Schema, Semaphore, Struct } from "effect"
+import { isDeepStrictEqual } from "node:util"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { MessageV2 } from "./message-v2"
 import { MessageID, SessionID } from "./schema"
@@ -41,7 +42,7 @@ export interface Interface {
    * Prepare under the session lock, recheck run state around a direct write,
    * and queue it if a run starts while the message is being persisted.
    */
-  readonly writeOrAdmit: <P, E>(input: {
+  readonly writeOrAdmit: <P extends SessionV1.WithParts, E>(input: {
     readonly admission: AdmitInput
     readonly isBusy: Effect.Effect<boolean>
     readonly prepare: Effect.Effect<P, E>
@@ -236,26 +237,48 @@ const layer = Layer.effect(
         input.admission.sessionID,
         Effect.gen(function* () {
           const prepared = yield* input.prepare
-          if (yield* input.isBusy)
-            return {
-              kind: "queued" as const,
-              own: yield* admitLocked(input.admission),
-              prepared,
-            }
-          const existing = input.admission.messageID
+          const busy = yield* input.isBusy
+          const existingRow = input.admission.messageID
             ? yield* db
-                .select({ id: MessageTable.id })
+                .select({ session_id: MessageTable.session_id })
                 .from(MessageTable)
                 .where(eq(MessageTable.id, input.admission.messageID))
                 .get()
                 .pipe(Effect.orDie)
             : undefined
-          const message = yield* input.write(prepared)
-          if (yield* input.isBusy) {
-            if (!existing) yield* input.discard(message)
+          const existing =
+            existingRow?.session_id === input.admission.sessionID && input.admission.messageID
+              ? yield* MessageV2.get({
+                  sessionID: input.admission.sessionID,
+                  messageID: input.admission.messageID,
+                }).pipe(
+                  Effect.provideService(Database.Service, database),
+                  Effect.catchTag("NotFoundError", () => Effect.succeed(undefined)),
+                )
+              : undefined
+          if (existingRow) {
+            if (existing && sameMessage(existing, prepared)) return { kind: "direct" as const, message: existing }
+            const messageID = MessageID.ascending()
+            const admission = { ...input.admission, messageID }
+            const queued = rekeyMessage(prepared, messageID)
             return {
               kind: "queued" as const,
-              own: yield* admitLocked(existing ? Struct.omit(input.admission, ["messageID"]) : input.admission),
+              own: yield* admitLocked(admission),
+              prepared: queued,
+            }
+          }
+          if (busy)
+            return {
+              kind: "queued" as const,
+              own: yield* admitLocked(input.admission),
+              prepared,
+            }
+          const message = yield* input.write(prepared)
+          if (yield* input.isBusy) {
+            yield* input.discard(message)
+            return {
+              kind: "queued" as const,
+              own: yield* admitLocked(input.admission),
               prepared,
             }
           }
@@ -726,6 +749,38 @@ function fromRow(row: typeof SessionPromptQueueTable.$inferSelect): Item {
     input: decodeInput(row.input),
     time: { created: row.time_created },
   }
+}
+
+function sameMessage(left: SessionV1.WithParts, right: SessionV1.WithParts) {
+  // Prompt preparation assigns fresh part IDs and timestamps for an identical retry.
+  return isDeepStrictEqual(
+    withoutUndefined({
+      info: Struct.omit(left.info, ["time"]),
+      parts: left.parts.map((part) => Struct.omit(part, ["id"])),
+    }),
+    withoutUndefined({
+      info: Struct.omit(right.info, ["time"]),
+      parts: right.parts.map((part) => Struct.omit(part, ["id"])),
+    }),
+  )
+}
+
+function withoutUndefined(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutUndefined)
+  if (value === null || typeof value !== "object") return value
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, item]) => item !== undefined)
+      .map(([key, item]) => [key, withoutUndefined(item)]),
+  )
+}
+
+function rekeyMessage<P extends SessionV1.WithParts>(message: P, messageID: MessageID): P {
+  return {
+    ...message,
+    info: { ...message.info, id: messageID },
+    parts: message.parts.map((part) => ({ ...part, messageID })),
+  } as P
 }
 
 export const node = LayerNode.make({ service: Service, layer, deps: [Database.node, EventV2Bridge.node] })

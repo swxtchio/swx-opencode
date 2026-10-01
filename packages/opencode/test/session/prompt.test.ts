@@ -291,7 +291,9 @@ const gates = {
     | { reached: Deferred.Deferred<void>; startedRun: boolean; hold?: Deferred.Deferred<void> },
   // Holds a compaction between its summary and its continue message.
   compactionContinue: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
-  noReplyAdmission: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  noReplyAdmission: undefined as
+    | undefined
+    | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void>; skip?: number },
   noReplyWrite: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
 }
 
@@ -349,8 +351,9 @@ const gatedRunState = LayerNode.make({
           Effect.gen(function* () {
             const result = yield* real.assertNotBusy(sessionID).pipe(Effect.exit)
             const gate = gates.noReplyAdmission
-            gates.noReplyAdmission = undefined
-            if (gate) {
+            if (gate?.skip) gate.skip--
+            else if (gate) {
+              gates.noReplyAdmission = undefined
               yield* Deferred.succeed(gate.entered, undefined)
               yield* Deferred.await(gate.release)
             }
@@ -5374,6 +5377,181 @@ gated.instance(
       ).toBe(true)
       expect(yield* queue.list(session.id)).toEqual([])
       expect(yield* llm.calls).toBe(3)
+    }),
+  60_000,
+)
+
+it.instance(
+  "does not rewrite an exact marked noReply messageID retry",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Exact marked retry" })
+      const messageID = MessageID.ascending()
+      const markedText = "[fm-from-firstmate]\x1f exact retry machine mail"
+      const input = {
+        sessionID: session.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: said(markedText),
+      }
+
+      const original = yield* prompt.prompt(input)
+      const retry = yield* prompt.prompt(input)
+      if (original.info.role !== "user" || retry.info.role !== "user")
+        throw new Error("expected both exact retry results to be user messages")
+      expect(retry.info.id).toBe(original.info.id)
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      expect(messages).toHaveLength(1)
+      expect(messages[0]?.parts.filter((part) => part.type === "text" && part.text === markedText)).toHaveLength(1)
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(yield* llm.calls).toBe(0)
+    }),
+  30_000,
+)
+
+gated.instance(
+  "holds a changed marked noReply messageID retry out of an older rootful run and promotes it once",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const run = yield* SessionRunState.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Same-ID marked retry race",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const messageID = MessageID.ascending()
+      const originalText = "[fm-from-firstmate]\x1f same-ID original machine mail"
+      const changedText = "[fm-from-firstmate]\x1f changed during active task"
+      const original = yield* prompt.prompt({
+        sessionID: session.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: said(originalText),
+      })
+      if (original.info.role !== "user") throw new Error("expected the original marked message")
+      const root = yield* seedUser({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        parts: said("same-ID active task"),
+      })
+      const admissionEntered = yield* Deferred.make<void>()
+      const admissionRelease = yield* Deferred.make<void>()
+      const writeEntered = yield* Deferred.make<void>()
+      const writeRelease = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() =>
+        Effect.all(
+          [admissionRelease, writeRelease].map((gate) => Deferred.succeed(gate, undefined).pipe(Effect.ignore)),
+          { discard: true },
+        ).pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              gates.noReplyAdmission = undefined
+              gates.noReplyWrite = undefined
+            }),
+          ),
+        ),
+      )
+      yield* llm.push(
+        reply().text("root task finished").stop().item(),
+        reply().text("held retry handled").stop().item(),
+      )
+
+      gates.noReplyAdmission = { entered: admissionEntered, release: admissionRelease, skip: 1 }
+      gates.noReplyWrite = { entered: writeEntered, release: writeRelease }
+      const retry = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          messageID,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: said(changedText),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(
+        Deferred.await(admissionEntered),
+        "same-ID retry did not pause after its idle write-boundary sample",
+        "10 seconds",
+      )
+
+      const active = yield* prompt.loop({ sessionID: session.id, messageID: root.info.id }).pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        run.assertNotBusy(session.id).pipe(
+          Effect.exit,
+          Effect.map((exit) => (Exit.isFailure(exit) ? true : undefined)),
+        ),
+        "rootful run did not start between the retry check and its write",
+        "10 seconds",
+      )
+      expect(yield* llm.calls).toBe(0)
+      yield* Deferred.succeed(admissionRelease, undefined)
+
+      const outcome = yield* Effect.raceFirst(
+        Deferred.await(writeEntered).pipe(Effect.as("writing" as const)),
+        pollWithTimeout(
+          queue.list(session.id).pipe(
+            Effect.map((items) =>
+              items.find((item) => item.input.parts.some((part) => part.type === "text" && part.text === changedText)),
+            ),
+          ),
+          "same-ID retry was neither written nor held",
+          "10 seconds",
+        ).pipe(Effect.as("held" as const)),
+      )
+      if (outcome === "writing") yield* Deferred.succeed(writeRelease, undefined)
+      const retryExit = yield* awaitWithTimeout(Fiber.await(retry), "same-ID retry did not finish", "10 seconds")
+      expect(Exit.isSuccess(retryExit)).toBe(true)
+      const pending = (yield* queue.list(session.id)).find((item) =>
+        item.input.parts.some((part) => part.type === "text" && part.text === changedText),
+      )
+      if (!pending) throw new Error("changed same-ID retry was not held for later promotion")
+      expect(pending.delivery).toBe("queue")
+
+      yield* awaitWithTimeout(llm.wait(1), "rootful run did not reach the provider", "10 seconds")
+      const first = (yield* llm.inputs)[0]
+      if (!first) throw new Error("expected the rootful first provider request")
+      const firstHistory = JSON.stringify(first.messages)
+      expect(firstHistory).toContain("same-ID original machine mail")
+      expect(firstHistory).not.toContain("changed during active task")
+
+      yield* awaitWithTimeout(llm.wait(2), "held same-ID retry did not reach its own turn", "10 seconds")
+      const held = (yield* llm.inputs)[1]
+      if (!held) throw new Error("expected the promoted same-ID retry request")
+      const heldHistory = JSON.stringify(held.messages)
+      expect(heldHistory.split("changed during active task").length - 1).toBe(1)
+      const activeExit = yield* awaitWithTimeout(Fiber.await(active), "rootful run did not finish", "10 seconds")
+      expect(Exit.isSuccess(activeExit)).toBe(true)
+
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const persistedOriginal = messages.find((message) => message.info.id === messageID)
+      if (!persistedOriginal || persistedOriginal.info.role !== "user")
+        throw new Error("expected the original historical row to remain persisted")
+      expect(persistedOriginal.parts.filter((part) => part.type === "text" && part.text === originalText)).toHaveLength(1)
+      expect(persistedOriginal.parts.some((part) => part.type === "text" && part.text === changedText)).toBe(false)
+      const promoted = messages.find(
+        (message) => message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === changedText),
+      )
+      if (!promoted || promoted.info.role !== "user") throw new Error("expected the held retry to be promoted once")
+      expect(promoted.info.id).not.toBe(messageID)
+      expect(promoted.info.noReply).toBeUndefined()
+      expect(messages.filter((message) => message.parts.some((part) => part.type === "text" && part.text === changedText))).toHaveLength(1)
+      expect(
+        messages.filter((message) => message.info.role === "assistant" && message.info.parentID === promoted.info.id),
+      ).toHaveLength(1)
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(yield* llm.calls).toBe(2)
     }),
   60_000,
 )
