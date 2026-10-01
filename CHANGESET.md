@@ -38,6 +38,9 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Fork maintenance and CI
 
+- **#98** `tests/run.sh` runs the unit suite from the repository root as CI's "Run unit tests" step does
+  (`GITHUB_ACTIONS=false bun turbo test`), returning its exit status, and fails when Bun or the installed workspace
+  is missing. The root `npm test` still refuses. _Fork-only._
 - **#52** `sync-upstream.ts` publishes the `dev` mirror through GitHub's fork sync (`gh repo sync --source
 <upstream>`) for a GitHub fork, since the `upstream` ruleset allows only fetch-and-merge on `dev`; the first real
   sync's push was refused. Every destination is read back: a mirror at or past the pinned commit on upstream's own
