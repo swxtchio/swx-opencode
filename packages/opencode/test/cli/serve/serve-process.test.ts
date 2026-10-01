@@ -47,9 +47,12 @@ describe("opencode serve (subprocess)", () => {
         const port = yield* Effect.promise(freePort)
         const password = "first-request"
         const client = yield* HttpClient.HttpClient
-        const sent = { at: 0 }
+        // Effect.suspend re-runs on every retry, so this records when the
+        // attempt that finally connected was sent, not the first refused one.
+        const sent = { at: 0, attempts: 0 }
         const first = yield* Effect.suspend(() => {
           sent.at = Date.now()
+          sent.attempts++
           return client.execute(
             HttpClientRequest.post(`http://127.0.0.1:${port}/session`).pipe(
               HttpClientRequest.setUrlParam("directory", home),
@@ -77,8 +80,10 @@ describe("opencode serve (subprocess)", () => {
         const listeningAt = Date.now()
         const result = yield* Fiber.join(first)
 
-        // The request must have gone out before the listening line, or this
-        // run did not exercise the window at all.
+        // The connected attempt must have gone out before the listening line,
+        // or this run did not exercise the window at all. Retries before it
+        // were refused connections, so the server saw no request earlier.
+        expect(sent.attempts).toBeGreaterThan(1)
         expect(sent.at).toBeLessThan(listeningAt)
         expect(result.status).toBe(200)
         expect(result.body).toMatchObject({ id: expect.stringMatching(/^ses_/) })
