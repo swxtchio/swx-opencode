@@ -121,7 +121,7 @@ describe("DatabaseMigration", () => {
       // Under contention from the suite's concurrent packages the real check can finish much later
       // without being wrong, so its own exit and output are the only success signal. GNU timeout is a
       // bounded backstop for a hung check: it signals the whole process group, drizzle-kit included,
-      // and exits 124.
+      // so a hang ends in a nonzero exit instead of an indefinite wait.
       const result =
         await $`timeout --kill-after=10s ${migrationCheckBackstop} bun ${fileURLToPath(new URL("../script/migration.ts", import.meta.url))} --check`
           .quiet()
