@@ -5,6 +5,7 @@ import { Effect, Semaphore } from "effect"
 import type { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { migrations } from "./migration.gen"
 import schema from "./schema.gen"
+import { DatabaseMessageAdmission } from "./message-admission"
 
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0]
@@ -26,6 +27,7 @@ export function apply(db: Database) {
       yield* db.transaction((tx) =>
         Effect.gen(function* () {
           yield* schema.up(tx)
+          yield* DatabaseMessageAdmission.installLegacyMessageAdmissionTrigger(tx)
           yield* tx.run(
             sql`CREATE TABLE ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`,
           )

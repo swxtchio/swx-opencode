@@ -4,8 +4,9 @@ import { SessionPromptQueueSequenceTable, SessionPromptQueueTable } from "@openc
 import { MessageTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
-import { and, asc, desc, eq, isNotNull, isNull, sql } from "drizzle-orm"
+import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm"
 import { Cause, Context, Effect, Exit, Layer, Option, Schema, Semaphore, Struct } from "effect"
+import { isDeepStrictEqual } from "node:util"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { MessageV2 } from "./message-v2"
 import { MessageID, SessionID } from "./schema"
@@ -37,6 +38,22 @@ export class WithdrawnError extends Schema.TaggedErrorClass<WithdrawnError>()("S
 
 export interface Interface {
   readonly admit: (input: AdmitInput) => Effect.Effect<Item>
+  /**
+   * Prepare under the session lock, recheck run state around a direct write,
+   * and queue it if a run starts while the message is being persisted.
+   */
+  readonly writeOrAdmit: <P extends SessionV1.WithParts, E>(input: {
+    readonly admission: AdmitInput
+    readonly forceQueue?: boolean
+    readonly isBusy: Effect.Effect<boolean>
+    readonly prepare: () => Effect.Effect<P, E>
+    readonly write: (prepared: P) => Effect.Effect<SessionV1.WithParts>
+    readonly discard: (message: SessionV1.WithParts) => Effect.Effect<void>
+  }) => Effect.Effect<
+    | { readonly kind: "direct"; readonly message: SessionV1.WithParts }
+    | { readonly kind: "queued"; readonly own: Item; readonly prepared?: P },
+    E
+  >
   readonly list: (sessionID: SessionID) => Effect.Effect<Item[]>
   /**
    * Withdraws an item for editing so it cannot be delivered mid-edit, even while
@@ -216,6 +233,84 @@ const layer = Layer.effect(
       return fromRow(row)
     })
 
+    const writeOrAdmit: Interface["writeOrAdmit"] = (input) =>
+      exclusive(
+        input.admission.sessionID,
+        Effect.gen(function* () {
+          const busy = input.forceQueue === true || (yield* input.isBusy)
+          const existingRow = input.admission.messageID
+            ? yield* db
+                .select({ session_id: MessageTable.session_id })
+                .from(MessageTable)
+                .where(eq(MessageTable.id, input.admission.messageID))
+                .get()
+                .pipe(Effect.orDie)
+            : undefined
+          if (existingRow) {
+            const prepared = yield* input.prepare()
+            const existing =
+              existingRow.session_id === input.admission.sessionID && input.admission.messageID
+                ? yield* MessageV2.get({
+                    sessionID: input.admission.sessionID,
+                    messageID: input.admission.messageID,
+                  }).pipe(
+                    Effect.provideService(Database.Service, database),
+                    Effect.catchTag("NotFoundError", () => Effect.succeed(undefined)),
+                  )
+                : undefined
+            if (existing && sameMessage(existing, prepared)) return { kind: "direct" as const, message: existing }
+            const duplicate = input.admission.messageID
+              ? (yield* list(input.admission.sessionID)).find(
+                  (item) =>
+                    item.input.messageID === input.admission.messageID &&
+                    sameQueuedInput(item.input, input.admission),
+                )
+              : undefined
+            if (duplicate) return { kind: "queued" as const, own: duplicate, prepared }
+            const active = busy || (yield* input.isBusy)
+            if (existing && !active) return { kind: "direct" as const, message: existing }
+            if (existing && active)
+              return {
+                kind: "queued" as const,
+                own: yield* admitLocked(input.admission),
+                prepared,
+              }
+            const messageID = MessageID.ascending()
+            const admission = { ...input.admission, messageID }
+            const rekeyed = rekeyMessage(prepared, messageID)
+            if (active) return { kind: "queued" as const, own: yield* admitLocked(admission), prepared: rekeyed }
+            const message = yield* input.write(rekeyed)
+            if (yield* input.isBusy) {
+              yield* input.discard(message)
+              return { kind: "queued" as const, own: yield* admitLocked(admission), prepared: rekeyed }
+            }
+            return { kind: "direct" as const, message }
+          }
+          if (busy)
+            return {
+              kind: "queued" as const,
+              own: yield* admitLocked(input.admission),
+            }
+          const prepared = yield* input.prepare()
+          if (yield* input.isBusy)
+            return {
+              kind: "queued" as const,
+              own: yield* admitLocked(input.admission),
+              prepared,
+            }
+          const message = yield* input.write(prepared)
+          if (yield* input.isBusy) {
+            yield* input.discard(message)
+            return {
+              kind: "queued" as const,
+              own: yield* admitLocked(input.admission),
+              prepared,
+            }
+          }
+          return { kind: "direct" as const, message }
+        }),
+      )
+
     const withdraw = Effect.fn("SessionQueue.withdraw")(function* (sessionID: SessionID, itemID: ItemID) {
       return yield* exclusive(
         sessionID,
@@ -287,10 +382,15 @@ const layer = Layer.effect(
     const compacting = (sessionID: SessionID) =>
       running.has(sessionID)
         ? Effect.succeed(true)
-        : MessageV2.filterCompactedEffect(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-            Effect.map((msgs) => openTasks(msgs).some((task) => task.type === "compaction")),
-          )
+        : Effect.gen(function* () {
+            const history = yield* MessageV2.snapshot(sessionID).pipe(
+              Effect.provideService(Database.Service, database),
+            )
+            return openTasks(history.messages, {
+              admissionOrder: history.admissionOrder,
+              excludeNoReply: true,
+            }).some((task) => task.type === "compaction")
+          })
 
     const whileCompacting: Interface["whileCompacting"] = (sessionID, effect) =>
       exclusive(
@@ -582,23 +682,33 @@ const layer = Layer.effect(
       return row === undefined
     })
 
-    // Promotions run one at a time, and a promoted message's id sorts after every
-    // message written before its reservation (see `messageID`), so the prompts at
-    // or before a turn's user message are the ones its history held.
+    // Admission order, not caller-supplied message IDs, defines which prompts a turn answered.
     const answer: Interface["answer"] = (sessionID, turn, reply) =>
-      Effect.sync(() =>
-        [...channels.values()]
-          .filter(
-            (channel) =>
-              channel.sessionID === sessionID &&
-              !channel.reply &&
-              channel.message !== undefined &&
-              channel.message <= turn,
-          )
-          .forEach((channel) => {
-            channel.reply = reply
-          }),
-      )
+      Effect.gen(function* () {
+        const target = yield* db
+          .select({ seq: MessageTable.admission_seq })
+          .from(MessageTable)
+          .where(and(eq(MessageTable.session_id, sessionID), eq(MessageTable.id, turn)))
+          .get()
+          .pipe(Effect.orDie)
+        if (!target) return
+        const pending = [...channels.entries()].filter(
+          ([, channel]) => channel.sessionID === sessionID && !channel.reply && channel.message !== undefined,
+        )
+        const messageIDs = pending.flatMap(([, channel]) => (channel.message ? [channel.message] : []))
+        if (messageIDs.length === 0) return
+        const rows = yield* db
+          .select({ id: MessageTable.id, seq: MessageTable.admission_seq })
+          .from(MessageTable)
+          .where(and(eq(MessageTable.session_id, sessionID), inArray(MessageTable.id, messageIDs)))
+          .all()
+          .pipe(Effect.orDie)
+        const order = new Map(rows.map((row) => [row.id, row.seq]))
+        pending.forEach(([, channel]) => {
+          const seq = channel.message ? order.get(channel.message) : undefined
+          if (seq !== undefined && seq <= target.seq) channel.reply = reply
+        })
+      })
 
     const forget = (itemID: ItemID) => Effect.sync(() => void channels.delete(itemID))
 
@@ -611,6 +721,7 @@ const layer = Layer.effect(
 
     return Service.of({
       admit,
+      writeOrAdmit,
       list,
       withdraw,
       restore,
@@ -642,11 +753,11 @@ const layer = Layer.effect(
  * Stopping here matches how a stopped run parks; if the context is still too
  * large, the loop's overflow check starts a new compaction.
  */
-export function openTasks(msgs: SessionV1.WithParts[]) {
+export function openTasks(msgs: SessionV1.WithParts[], options: Parameters<typeof MessageV2.latest>[1]) {
   const stopped = new Set(
     msgs.flatMap((msg) => (msg.info.role === "assistant" && msg.info.error !== undefined ? [msg.info.parentID] : [])),
   )
-  return MessageV2.latest(msgs).tasks.filter((task) => task.type !== "compaction" || !stopped.has(task.messageID))
+  return MessageV2.latest(msgs, options).tasks.filter((task) => task.type !== "compaction" || !stopped.has(task.messageID))
 }
 
 // Rows hold the encoded input; `format`, for one, only becomes its class again
@@ -663,6 +774,45 @@ function fromRow(row: typeof SessionPromptQueueTable.$inferSelect): Item {
     input: decodeInput(row.input),
     time: { created: row.time_created },
   }
+}
+
+function sameMessage(left: SessionV1.WithParts, right: SessionV1.WithParts) {
+  // Prompt preparation assigns fresh part IDs and timestamps for an identical retry.
+  return isDeepStrictEqual(
+    withoutUndefined({
+      info: Struct.omit(left.info, ["time"]),
+      parts: left.parts.map((part) => Struct.omit(part, ["id"])),
+    }),
+    withoutUndefined({
+      info: Struct.omit(right.info, ["time"]),
+      parts: right.parts.map((part) => Struct.omit(part, ["id"])),
+    }),
+  )
+}
+
+function sameQueuedInput(left: SessionPromptQueue.QueuedInput, right: AdmitInput) {
+  return isDeepStrictEqual(
+    withoutUndefined(Struct.omit(left, ["messageID"])),
+    withoutUndefined(Struct.omit(right, ["sessionID", "messageID", "noReply", "delivery"])),
+  )
+}
+
+function withoutUndefined(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutUndefined)
+  if (value === null || typeof value !== "object") return value
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, item]) => item !== undefined)
+      .map(([key, item]) => [key, withoutUndefined(item)]),
+  )
+}
+
+function rekeyMessage<P extends SessionV1.WithParts>(message: P, messageID: MessageID): P {
+  return {
+    ...message,
+    info: { ...message.info, id: messageID },
+    parts: message.parts.map((part) => ({ ...part, messageID })),
+  } as P
 }
 
 export const node = LayerNode.make({ service: Service, layer, deps: [Database.node, EventV2Bridge.node] })

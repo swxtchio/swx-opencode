@@ -24,7 +24,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { provideTmpdirServer } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
 import { TestLLMServer } from "../lib/llm-server"
 import { deadline, scaleNote } from "../lib/deadline"
 
@@ -145,16 +145,16 @@ it.live(
         })
         yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes("bash"), "done")
 
-        // Seed user message
-        yield* prompt.prompt({
-          sessionID: session.id,
-          agent: "build",
-          noReply: true,
-          parts: [{ type: "text", text: "create the file" }],
-        })
-
         // Run the agent loop
-        const result = yield* prompt.loop({ sessionID: session.id })
+        const result = yield* awaitWithTimeout(
+          prompt.prompt({
+            sessionID: session.id,
+            agent: "build",
+            parts: [{ type: "text", text: "create the file" }],
+          }),
+          "prompt did not finish",
+          "30 seconds",
+        )
         expect(result.info.role).toBe("assistant")
 
         // Verify the file was created

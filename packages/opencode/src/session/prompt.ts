@@ -58,6 +58,9 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { MachineMessage } from "./machine-message"
+
+type UserWithParts = Omit<SessionV1.WithParts, "info"> & { info: SessionV1.User }
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -692,6 +695,7 @@ const layer = Layer.effect(
         },
         system: input.system,
         format: input.format,
+        ...(input.noReply === true ? { noReply: true } : {}),
       }
 
       yield* Effect.addFinalizer(() => instruction.clear(info.id))
@@ -1090,14 +1094,56 @@ const layer = Layer.effect(
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
-      // noReply keeps its direct write and never drains. Every other prompt is
-      // admitted to the durable queue first; a steer is promoted at once, unless a
-      // pending compaction must run first, so it still reaches the running turn's
-      // next step as it did before the queue.
+      // TUI prepends synthetic editor context; only flattened user text owns marker framing.
+      const classificationText = input.parts
+        .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
+        .join("")
+      const classification = MachineMessage.classify(
+        classificationText,
+        (yield* config.get()).machine_message_markers,
+      )
+      const delivery = classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
+      const markedNoReply = input.noReply === true && classification === "hold"
+      const initiallyHeldNoReply =
+        markedNoReply &&
+        Exit.isFailure(yield* state.assertNotBusy(input.sessionID).pipe(Effect.exit))
+      const queuedInput = markedNoReply && !input.messageID ? { ...input, messageID: MessageID.ascending() } : input
+      // Preparation can yield while another prompt starts a run. Revalidate at
+      // the write boundary so a newly active run receives the marked message as
+      // queued input instead of seeing it in its next history reload. The queue
+      // lock also makes the busy result and fallback admission one transition.
+      const noReplyDecision =
+        markedNoReply && (!initiallyHeldNoReply || input.messageID !== undefined)
+          ? yield* queue.writeOrAdmit({
+              admission: { ...queuedInput, ...(delivery ? { delivery } : {}) },
+              forceQueue: initiallyHeldNoReply,
+              isBusy: state.assertNotBusy(input.sessionID).pipe(Effect.exit, Effect.map(Exit.isFailure)),
+              prepare: () => prepareUserMessage(queuedInput),
+              write: writeUserMessage,
+              discard: (message) => sessions.removeMessage({ sessionID: input.sessionID, messageID: message.info.id }),
+            })
+          : undefined
+      const heldNoReply =
+        markedNoReply && (initiallyHeldNoReply || noReplyDecision?.kind === "queued")
       const entry =
-        input.noReply === true
-          ? { kind: "direct" as const, message: yield* createUserMessage(input) }
-          : { kind: "queued" as const, own: yield* queue.admit(input) }
+        markedNoReply
+          ? noReplyDecision
+            ? noReplyDecision
+            : {
+                kind: "queued" as const,
+                own: yield* queue.admit({ ...queuedInput, ...(delivery ? { delivery } : {}) }),
+                prepared: undefined,
+              }
+          : input.noReply === true
+            ? {
+                kind: "direct" as const,
+                message: yield* queue.exclusive(input.sessionID, createUserMessage(input)),
+              }
+            : {
+                kind: "queued" as const,
+                own: yield* queue.admit({ ...queuedInput, ...(delivery ? { delivery } : {}) }),
+                prepared: undefined,
+              }
       if (entry.kind === "queued") yield* Effect.addFinalizer(() => queue.forget(entry.own.id))
       // Only this prompt's own failure is this caller's error; an older steer
       // promoted alongside it is reported on its own.
@@ -1122,6 +1168,21 @@ const layer = Layer.effect(
       }
 
       if (entry.kind === "direct") return entry.message
+      if (input.noReply === true)
+        return yield* (entry.prepared ? Effect.succeed(entry.prepared) : prepareUserMessage(queuedInput)).pipe(
+          Effect.onExit(() =>
+            heldNoReply
+              ? drain(input.sessionID).pipe(
+                  Effect.catchCause((cause) =>
+                    Effect.logError("held noReply drain failed", { "session.id": input.sessionID, cause }).pipe(
+                      Effect.andThen(rejected(input.sessionID)(cause)),
+                    ),
+                  ),
+                  Effect.forkIn(scope, { startImmediately: true }),
+                )
+              : Effect.void,
+          ),
+        )
       return yield* drain(input.sessionID, entry.own.id)
     }, Effect.scoped)
 
@@ -1155,13 +1216,18 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID) {
+    // Root pins bind only when this caller starts the run; a joiner keeps the active run's root.
+    const runLoop: (sessionID: SessionID, rootMessageID?: MessageID) => Effect.Effect<SessionV1.WithParts> = Effect.fn(
+      "SessionPrompt.run",
+    )(
+      function* (sessionID: SessionID, rootMessageID?: MessageID) {
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
         let settled = false
         let seen = 0
+        let initialRootSelected = false
+        let pinnedRootOrder: number | undefined
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1169,15 +1235,64 @@ const layer = Layer.effect(
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
           seen = yield* queue.consume(sessionID)
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+          const history = yield* MessageV2.snapshot(sessionID).pipe(
             Effect.provideService(Database.Service, database),
           )
+          let msgs = history.messages
+          const selection = { admissionOrder: history.admissionOrder, excludeNoReply: true }
+          const root =
+            !initialRootSelected && rootMessageID
+              ? msgs.find(
+                  (message): message is UserWithParts =>
+                    message.info.role === "user" && message.info.id === rootMessageID,
+                )
+              : undefined
+          if (!initialRootSelected && rootMessageID && !root)
+            throw new Error(`Run root message not found: ${rootMessageID}`)
+          const rootOrder = rootMessageID ? history.admissionOrder.get(rootMessageID) : undefined
+          if (root && rootOrder === undefined)
+            throw new Error(`Missing persisted admission order for run root: ${rootMessageID}`)
+          if (root && rootOrder !== undefined) {
+            pinnedRootOrder = rootOrder
+            msgs = msgs.filter((message) => {
+              const order = history.admissionOrder.get(message.info.id)
+              return (
+                (order !== undefined && order <= rootOrder) ||
+                (message.info.role === "assistant" && message.info.parentID === root.info.id)
+              )
+            })
+          }
+          initialRootSelected = true
+          const rootBoundary = pinnedRootOrder
+          if (rootBoundary !== undefined) {
+            // Keep late held noReply writes beyond the pinned root out of every tool continuation.
+            const markers = (yield* config.get()).machine_message_markers
+            msgs = msgs.filter((message) => {
+              if (message.info.role !== "user" || message.info.noReply !== true) return true
+              const text = message.parts
+                .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
+                .join("")
+              if (MachineMessage.classify(text, markers) !== "hold") return true
+              const order = history.admissionOrder.get(message.info.id)
+              return order !== undefined && order <= rootBoundary
+            })
+          }
 
-          const { user: lastUser, assistant: lastAssistant, finished: lastFinished } = MessageV2.latest(msgs)
+          const latest = MessageV2.latest(msgs, selection)
+          const lastUser = root?.info ?? latest.user
+          const lastAssistant = latest.assistant
+          const lastFinished = latest.finished
 
           // Steers parked by an abort or held behind a compaction reach the next step.
           if (yield* promoteInLoop(sessionID, "steer")) continue
-          if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+          if (!lastUser) {
+            if (yield* promoteInLoop(sessionID, "queue")) {
+              step = 0
+              continue
+            }
+            settled = true
+            break
+          }
 
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1239,9 +1354,8 @@ const layer = Layer.effect(
             }).pipe(Effect.ignore, Effect.forkIn(scope))
 
           const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
-          // A compaction whose summary turn stopped is over; retrying it would make
-          // the next prompt its parent.
-          const task = SessionQueue.openTasks(msgs).pop()
+          // A stopped summary is terminal; re-read it so the terminal-turn path can release held mail.
+          const task = SessionQueue.openTasks(msgs, selection).pop()
 
           if (task?.type === "subtask") {
             yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
@@ -1251,7 +1365,7 @@ const layer = Layer.effect(
           if (task?.type === "compaction") {
             // No steer is promoted until the summary and its replay or continue
             // message are written, so none lands between them.
-            const result = yield* queue.whileCompacting(
+            yield* queue.whileCompacting(
               sessionID,
               compaction.process({
                 messages: msgs,
@@ -1261,7 +1375,6 @@ const layer = Layer.effect(
                 overflow: task.overflow,
               }),
             )
-            if (result === "stop") break
             continue
           }
 
@@ -1465,8 +1578,25 @@ const layer = Layer.effect(
     })
 
     // Without an own item there is nothing that can be withdrawn from under it.
-    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = (input) =>
-      drain(input.sessionID).pipe(Effect.orDie)
+    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
+      input: LoopInput,
+    ) {
+      const messageID =
+        input.messageID ??
+        (yield* queue.exclusive(
+          input.sessionID,
+          Effect.gen(function* () {
+            const history = yield* MessageV2.snapshot(input.sessionID).pipe(
+              Effect.provideService(Database.Service, database),
+            )
+            return MessageV2.latest(history.messages, {
+              admissionOrder: history.admissionOrder,
+              excludeNoReply: true,
+            }).user?.id
+          }),
+        ))
+      return yield* drain(input.sessionID, undefined, messageID).pipe(Effect.orDie)
+    })
 
     // Runs or joins the session's drain. With `own`, returns the reply the turn
     // that prompt joined recorded for it: the drain's final message may answer
@@ -1474,9 +1604,10 @@ const layer = Layer.effect(
     const drain: (
       sessionID: SessionID,
       own?: SessionQueue.ItemID,
+      rootMessageID?: MessageID,
     ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError> = Effect.fn(
       "SessionPrompt.loop",
-    )(function* (sessionID: SessionID, own?: SessionQueue.ItemID) {
+    )(function* (sessionID: SessionID, own?: SessionQueue.ItemID, rootMessageID?: MessageID) {
       const withdrawn = own
         ? queue
             .withdrawn(sessionID, own)
@@ -1506,7 +1637,7 @@ const layer = Layer.effect(
         yield* first("queue")
         if (yield* queue.empty(sessionID)) return yield* withdrawn.pipe(Effect.andThen(lastAssistant(sessionID)))
       }
-      const result = yield* state.ensureRunning(sessionID, lastAssistant(sessionID), runLoop(sessionID))
+      const result = yield* state.ensureRunning(sessionID, lastAssistant(sessionID), runLoop(sessionID, rootMessageID))
       // Work admitted after the joined run's last history read would otherwise
       // wait for another prompt. This caller stays with the drains until one has
       // read its own prompt and finished; anyone else's is woken in the background.
@@ -1514,7 +1645,7 @@ const layer = Layer.effect(
       if (own) {
         const unread = waiting && (yield* queue.unread(sessionID, own))
         if (unread || Exit.isFailure(yield* state.assertNotBusy(sessionID).pipe(Effect.exit)))
-          return yield* drain(sessionID, own)
+          return yield* drain(sessionID, own, rootMessageID)
       }
       if (waiting) {
         yield* drain(sessionID).pipe(
@@ -1694,6 +1825,7 @@ export type PromptInput = Schema.Schema.Type<typeof PromptInput>
 
 export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput")({
   sessionID: SessionID,
+  messageID: Schema.optional(MessageID),
 }) {}
 
 export const ShellInput = Schema.Struct({

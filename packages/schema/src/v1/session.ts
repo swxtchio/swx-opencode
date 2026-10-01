@@ -342,6 +342,7 @@ export const User = Schema.Struct({
   time: Schema.Struct({
     created: Timestamp,
   }),
+  noReply: optional(Schema.Boolean),
   format: Schema.optional(Format),
   summary: Schema.optional(
     Schema.Struct({

@@ -430,6 +430,119 @@ describe("session HttpApi", () => {
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
   )
 
+  it.live(
+    "summarize keeps its initiating compaction root when queued behind a shell",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({
+          git: true,
+          config: () => ({ ...testProviderConfig(llm.url), shell: "/bin/sh" }),
+        })
+        const session = yield* createSession({ title: "queued summarize root" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const admitNoReply = (text: string) =>
+          request(pathFor(SessionPaths.promptAsync, { sessionID: session.id }), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              noReply: true,
+              parts: [{ type: "text", text }],
+            }),
+          }).pipe(
+            Effect.flatMap((response) => {
+              expect(response.status).toBe(204)
+              return pollWithTimeout(
+                requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, { sessionID: session.id }), {
+                  headers,
+                }).pipe(
+                  Effect.map((messages) =>
+                    messages.find(
+                      (message) =>
+                        message.info.role === "user" &&
+                        message.parts.some((part) => part.type === "text" && part.text === text),
+                    ),
+                  ),
+                ),
+                `HTTP prompt_async did not persist ${text}`,
+                "10 seconds",
+              )
+            }),
+          )
+
+        const startedFile = path.join(directory, ".http-summarize-started")
+        const shell = yield* request(pathFor(SessionPaths.shell, { sessionID: session.id }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            command: `printf started > "${startedFile}"; sleep 15`,
+          }),
+        }).pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          Effect.promise(async () => (await Bun.file(startedFile).exists()) || undefined),
+          "HTTP shell did not start",
+          "10 seconds",
+        )
+
+        yield* llm.text("latest persisted input handled")
+        const summarize = yield* request(pathFor(SessionPaths.summarize, { sessionID: session.id }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ providerID: "test", modelID: "test-model", auto: false }),
+        }).pipe(Effect.forkChild)
+        const compactionRoot = yield* pollWithTimeout(
+          requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, { sessionID: session.id }), {
+            headers,
+          }).pipe(
+            Effect.map((messages) =>
+              messages.find(
+                (message) => message.info.role === "user" && message.parts.some((part) => part.type === "compaction"),
+              ),
+            ),
+          ),
+          "HTTP summarize did not persist its compaction input",
+          "10 seconds",
+        )
+        if (compactionRoot.info.role !== "user") throw new Error("expected the initiating compaction message")
+        expect(summarize.pollUnsafe()).toBeUndefined()
+
+        const later = yield* admitNoReply("later noReply summarize input")
+        if (later.info.role !== "user") throw new Error("expected the later user input")
+        expect(later.info.noReply).toBe(true)
+        expect(yield* llm.inputs).toHaveLength(0)
+
+        const summarizeResponse = yield* awaitWithTimeout(
+          Fiber.join(summarize),
+          "HTTP summarize did not finish after the shell released",
+          "30 seconds",
+        )
+        expect(summarizeResponse.status).toBe(200)
+        expect(yield* json<boolean>(summarizeResponse)).toBe(true)
+        const shellResponse = yield* awaitWithTimeout(Fiber.join(shell), "HTTP shell did not finish", "10 seconds")
+        expect(shellResponse.status).toBe(200)
+
+        const messages = yield* requestJson<SessionV1.WithParts[]>(
+          pathFor(SessionPaths.messages, { sessionID: session.id }),
+          { headers },
+        )
+        const summary = messages.findLast(
+          (message) => message.info.role === "assistant" && message.info.parentID === compactionRoot.info.id,
+        )
+        expect(summary?.info.role).toBe("assistant")
+        expect(summary?.info.role === "assistant" ? summary.info.summary : undefined).toBe(true)
+        expect(
+          messages.some((message) => message.info.role === "assistant" && message.info.parentID === later.info.id),
+        ).toBe(false)
+        expect(JSON.stringify(yield* llm.inputs)).not.toContain("later noReply summarize input")
+        expect(yield* llm.calls).toBe(1)
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    60_000,
+  )
+
   it.instance(
     "returns v2 public request errors for cursor and workspace query failures",
     () =>

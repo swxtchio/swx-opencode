@@ -1,4 +1,5 @@
 import type { Session as SDKSession, Message, Part } from "@opencode-ai/sdk/v2"
+import { sql } from "drizzle-orm"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Session } from "@/session/session"
 import { MessageV2 } from "../../session/message-v2"
@@ -107,8 +108,7 @@ export const ImportCommand = effectCmd({
   }),
 })
 
-const runImport = Effect.fn("Cli.import.body")(function* (file: string, ctx: InstanceContext) {
-  const share = yield* ShareNext.Service
+export const runImport = Effect.fn("Cli.import.body")(function* (file: string, ctx: InstanceContext) {
   const fs = yield* FSUtil.Service
   const { db } = yield* Database.Service
 
@@ -117,6 +117,7 @@ const runImport = Effect.fn("Cli.import.body")(function* (file: string, ctx: Ins
   const isUrl = file.startsWith("http://") || file.startsWith("https://")
 
   if (isUrl) {
+    const share = yield* ShareNext.Service
     const slug = parseShareUrl(file)
     if (!slug) {
       const baseUrl = yield* Effect.orDie(share.url())
@@ -201,6 +202,7 @@ const runImport = Effect.fn("Cli.import.body")(function* (file: string, ctx: Ins
       .values({
         id,
         session_id: row.id,
+        admission_seq: sql<number>`(SELECT COALESCE(MAX(${MessageTable.admission_seq}), 0) + 1 FROM ${MessageTable} WHERE ${MessageTable.session_id} = ${row.id})`,
         time_created: msgInfo.time?.created ?? Date.now(),
         data: msgData as never,
       })
