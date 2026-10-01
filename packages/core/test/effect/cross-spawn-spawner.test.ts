@@ -284,8 +284,8 @@ describe("cross-spawn spawner", () => {
         if (process.platform === "win32") return
 
         const spawned = yield* Deferred.make<number>()
-        // Interrupted straight after spawn, handle.all's merged sides never start reading,
-        // so "ready" stays buffered on stdout while the scope releases the child.
+        // Interrupted straight after spawn, handle.all's merged sides may never start reading;
+        // the scope must release the child whether or not it has written anything yet.
         const consumer = yield* Effect.gen(function* () {
           const handle = yield* ChildProcessSpawner.ChildProcessSpawner.use((svc) =>
             svc.spawn(

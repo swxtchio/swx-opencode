@@ -397,11 +397,11 @@ export const make = Effect.gen(function* () {
               const send = (s: NodeJS.Signals) =>
                 Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
               const sig = command.options.killSignal ?? "SIGTERM"
-              // "close" waits for every pipe to end, and a pipe whose output is never read never
-              // ends. Once this scope closes nothing will read them, yet a consumer interrupted
+              // "close" waits for every pipe to end, and a pipe nobody reads cannot be relied on
+              // to end. Once this scope closes nothing will read them, yet a consumer interrupted
               // before its cleanup ran (Stream.merge's sides, when interrupted before they start)
-              // can leave a listener holding unread output. Releasing the pipes keeps this wait
-              // tied to the child's own exit instead of to a reader that is gone.
+              // can leave its listener attached. Releasing the pipes keeps this wait tied to the
+              // child's own exit instead of to a reader that is gone.
               const detach = Effect.sync(() => proc.stdio.forEach((stream) => stream?.destroy()))
               const attempt = send(sig).pipe(
                 Effect.andThen(detach),
