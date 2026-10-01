@@ -115,14 +115,13 @@ describe("DatabaseMigration", () => {
     )
   })
   if (process.platform === "linux") {
-    // About three times the slowest admitted-load run measured for #117.
+    // Sized from the admitted-load measurements recorded in swxtchio/swx-opencode#117.
     const migrationCheckBackstop = "180s"
     test("declared schema has no ungenerated migrations", async () => {
-      // The check does a fixed ~8s of CPU work (two drizzle-kit runs), but its wall time scales with
-      // contention. On a 16-core host at load 88-97 it took 13s alone and up to ~60s with nine more
-      // checks running beside it, as turbo runs up to ten package suites at once
-      // (swxtchio/swx-opencode#117). Only its own exit judges the schema. GNU timeout is the backstop
-      // for a wedged child: it signals the whole process group, drizzle-kit included, and exits 124.
+      // Under contention from the suite's concurrent packages the real check can finish much later
+      // without being wrong, so its own exit and output are the only success signal. GNU timeout is a
+      // bounded backstop for a hung check: it signals the whole process group, drizzle-kit included,
+      // and exits 124.
       const result =
         await $`timeout --kill-after=10s ${migrationCheckBackstop} bun ${fileURLToPath(new URL("../script/migration.ts", import.meta.url))} --check`
           .quiet()
