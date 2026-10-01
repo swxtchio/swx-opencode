@@ -127,6 +127,10 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Tests
 
+- **#115** The declared-schema migration check keeps judging the real `script/migration.ts --check`, now behind a
+  180s process-group backstop instead of a 30s test limit that a correct run exceeded under the suite's admitted
+  concurrency (swxtchio/swx-opencode#117). A schema drift still fails, and a wedged check fails at the backstop.
+  _Fork-only._
 - **#115** `routes configured machine_message_markers through prompt admission` waits for the queue to mark the
   critical prompt promoted before asserting the held prompt is the only pending item; it read the queue as soon as
   the message landed, before its row was marked (swxtchio/swx-opencode#114). _Fork-only._

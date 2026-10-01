@@ -115,13 +115,26 @@ describe("DatabaseMigration", () => {
     )
   })
   if (process.platform === "linux") {
+    // About three times the slowest admitted-load run measured for #117.
+    const migrationCheckBackstop = "180s"
     test("declared schema has no ungenerated migrations", async () => {
-      const result = await $`bun ${fileURLToPath(new URL("../script/migration.ts", import.meta.url))} --check`
-        .quiet()
-        .nothrow()
-      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      // The check does a fixed ~8s of CPU work (two drizzle-kit runs), but its wall time scales with
+      // contention. On a 16-core host at load 88-97 it took 13s alone and up to ~60s with nine more
+      // checks running beside it, as turbo runs up to ten package suites at once
+      // (swxtchio/swx-opencode#117). Only its own exit judges the schema. GNU timeout is the backstop
+      // for a wedged child: it signals the whole process group, drizzle-kit included, and exits 124.
+      const result =
+        await $`timeout --kill-after=10s ${migrationCheckBackstop} bun ${fileURLToPath(new URL("../script/migration.ts", import.meta.url))} --check`
+          .quiet()
+          .nothrow()
+      expect(
+        result.exitCode,
+        result.exitCode === 124
+          ? `migration check gave no result within ${migrationCheckBackstop}`
+          : result.stderr.toString(),
+      ).toBe(0)
       expect(result.stdout.toString()).toContain("No schema changes, nothing to migrate")
-    }, 30_000)
+    }, 210_000)
   }
 
   test("applies tracked migrations to an empty database", async () => {
