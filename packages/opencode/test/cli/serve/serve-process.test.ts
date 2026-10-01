@@ -6,9 +6,10 @@
 // and kills the process when the test scope closes. The OS-assigned port is
 // parsed off the "listening on http://..." line.
 import { describe, expect } from "bun:test"
-import { Effect } from "effect"
-import { HttpClient } from "effect/unstable/http"
-import { cliIt } from "../../lib/cli-process"
+import { Duration, Effect, Fiber, Schedule } from "effect"
+import { HttpClient, HttpClientRequest } from "effect/unstable/http"
+import { createServer } from "node:net"
+import { cliIt, deadline } from "../../lib/cli-process"
 
 describe("opencode serve (subprocess)", () => {
   // Smoke test: server starts, binds a port, and /global/health responds.
@@ -29,6 +30,58 @@ describe("opencode serve (subprocess)", () => {
         // enough proof the routing + auth-bypass + instance loading is alive.
         const body = yield* res.json
         expect(body).toBeDefined()
+      }),
+    60_000,
+  )
+
+  // swx-abbe#441: a request that reached a fresh server as its port opened was
+  // read and never answered, because the HTTP server listened before it
+  // attached its request handler. The fixture's listening line comes after
+  // that window, so this test picks the port itself and sends its first
+  // request, the authenticated POST /session Abbe's adapter sends, as soon
+  // as the port accepts a connection.
+  cliIt.live(
+    "answers the first request sent as the port starts accepting",
+    ({ opencode, home }) =>
+      Effect.gen(function* () {
+        const port = yield* Effect.promise(freePort)
+        const password = "first-request"
+        const client = yield* HttpClient.HttpClient
+        const sent = { at: 0 }
+        const first = yield* Effect.suspend(() => {
+          sent.at = Date.now()
+          return client.execute(
+            HttpClientRequest.post(`http://127.0.0.1:${port}/session`).pipe(
+              HttpClientRequest.setUrlParam("directory", home),
+              HttpClientRequest.basicAuth("opencode", password),
+              HttpClientRequest.bodyJsonUnsafe({ title: "first request" }),
+            ),
+          )
+        }).pipe(
+          // Only a refused connection is retried; a request the server
+          // accepted but never answers runs into the timeout below.
+          Effect.retry({
+            while: (error) => error.reason._tag === "TransportError",
+            schedule: Schedule.spaced("5 millis"),
+          }),
+          Effect.flatMap((res) => Effect.map(res.json, (body) => ({ status: res.status, body }))),
+          Effect.timeout(Duration.millis(deadline(20_000))),
+          Effect.forkScoped,
+        )
+
+        yield* opencode.serve({
+          port,
+          extraArgs: ["--pure", "--print-logs"],
+          env: { OPENCODE_SERVER_PASSWORD: password },
+        })
+        const listeningAt = Date.now()
+        const result = yield* Fiber.join(first)
+
+        // The request must have gone out before the listening line, or this
+        // run did not exercise the window at all.
+        expect(sent.at).toBeLessThan(listeningAt)
+        expect(result.status).toBe(200)
+        expect(result.body).toMatchObject({ id: expect.stringMatching(/^ses_/) })
       }),
     60_000,
   )
@@ -59,3 +112,15 @@ describe("opencode serve (subprocess)", () => {
     60_000,
   )
 })
+
+function freePort() {
+  return new Promise<number>((resolve, reject) => {
+    const server = createServer()
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address()
+      const port = typeof address === "object" && address ? address.port : 0
+      server.close(() => resolve(port))
+    })
+  })
+}

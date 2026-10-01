@@ -5,7 +5,7 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { ConfigProvider, Context, Effect, Exit, Layer, Scope } from "effect"
 import { HttpRouter, HttpServer } from "effect/unstable/http"
 import { OpenApi } from "effect/unstable/httpapi"
-import { createServer } from "node:http"
+import { createServer, type Server } from "node:http"
 import { MDNS } from "./mdns"
 import { HttpApiApp } from "./routes/instance/httpapi/server"
 import { disposeMiddleware } from "./routes/instance/httpapi/lifecycle"
@@ -198,6 +198,8 @@ function forceClose(state: ListenerState) {
 
 function serverLayer(opts: { port: number; hostname: string }) {
   const server = createServer()
+  holdUntilServed(server, "request")
+  holdUntilServed(server, "upgrade")
   const serverRef = { closeStarted: false, forceStop: false }
   const close = server.close.bind(server)
   // Keep shutdown owned by NodeHttpServer, but honor listener.stop(true) by
@@ -221,6 +223,26 @@ function serverLayer(opts: { port: number; hostname: string }) {
       }),
     ),
   )
+}
+
+// NodeHttpServer listens while its layer builds, but attaches its request and
+// upgrade handlers only when HttpRouter.serve runs, after the route layers
+// build. Node drops an event emitted with no listener, so a request that
+// reached a fresh server in that window was never answered (swx-abbe#441).
+// Hold such events and hand them to the handler once it attaches.
+function holdUntilServed(server: Server, event: "request" | "upgrade") {
+  const held: unknown[][] = []
+  const hold = (...args: unknown[]) => {
+    held.push(args)
+  }
+  server.on(event, hold)
+  server.on("newListener", function replay(name: string | symbol, listener: (...args: unknown[]) => void) {
+    if (name !== event) return
+    server.off("newListener", replay)
+    server.off(event, hold)
+    // Replay after `on` returns, so the handler is attached when it runs.
+    queueMicrotask(() => held.splice(0).forEach((args) => listener.apply(server, args)))
+  })
 }
 
 export * as Server from "./server"
