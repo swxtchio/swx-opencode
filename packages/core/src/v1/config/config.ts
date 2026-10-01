@@ -24,6 +24,24 @@ export const WellKnown = Schema.Struct({
   remote_config: Schema.optional(Schema.Json),
 })
 
+export const MachineMessageMarker = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("prefix"), value: Schema.String }),
+  Schema.Struct({ type: Schema.Literal("fleet-heartbeat") }),
+]).annotate({ identifier: "MachineMessageMarker" })
+
+const MachineMessageMarkers = Schema.Struct({
+  hold: Schema.optional(Schema.mutable(Schema.Array(MachineMessageMarker))).annotate({
+    description:
+      "Markers held until the active prompt turn finishes. Prefix markers match at the start of the message.",
+  }),
+  critical: Schema.optional(Schema.mutable(Schema.Array(MachineMessageMarker))).annotate({
+    description:
+      "Markers that let messages steer an active prompt immediately. The generated [fm-level:critical] token is built in; configured markers add deployment-specific critical matches.",
+  }),
+}).annotate({
+  description: "Delivery rules for machine-generated session messages.",
+})
+
 const LogLevelRef = Schema.Literals(["DEBUG", "INFO", "WARN", "ERROR"]).annotate({
   identifier: "LogLevel",
   description: "Log level",
@@ -41,6 +59,7 @@ export const Info = Schema.Struct({
   command: Schema.optional(Schema.Record(Schema.String, ConfigCommandV1.Info)).annotate({
     description: "Command configuration, see https://opencode.ai/docs/commands",
   }),
+  machine_message_markers: Schema.optional(MachineMessageMarkers),
   skills: Schema.optional(ConfigSkillsV1.Info).annotate({ description: "Additional skill folder paths" }),
   references: Schema.optional(ConfigReference.Info).annotate({
     description: "Named git or local directory references",

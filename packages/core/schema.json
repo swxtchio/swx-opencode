@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "cd7fa1fc-32aa-4d19-bf5c-96318df972bb",
+  "id": "1b57e6eb-f423-4b30-a122-08148e532a83",
   "prevIds": [
-    "f14a9b18-8207-487e-a3d3-227e629ba9ad"
+    "cd7fa1fc-32aa-4d19-bf5c-96318df972bb"
   ],
   "ddl": [
     {
@@ -907,6 +907,16 @@
       "default": null,
       "generated": null,
       "name": "session_id",
+      "entityType": "columns",
+      "table": "message"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "admission_seq",
       "entityType": "columns",
       "table": "message"
     },
@@ -2118,6 +2128,24 @@
       "name": "permission_project_action_resource_idx",
       "entityType": "indexes",
       "table": "permission"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        },
+        {
+          "value": "admission_seq",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "message_session_admission_seq_idx",
+      "entityType": "indexes",
+      "table": "message"
     },
     {
       "columns": [

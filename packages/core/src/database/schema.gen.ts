@@ -149,6 +149,7 @@ export default {
         CREATE TABLE \`message\` (
           \`id\` text PRIMARY KEY,
           \`session_id\` text NOT NULL,
+          \`admission_seq\` integer DEFAULT 0 NOT NULL,
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL,
           \`data\` text NOT NULL,
@@ -267,6 +268,9 @@ export default {
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
       yield* tx.run(
         `CREATE UNIQUE INDEX \`permission_project_action_resource_idx\` ON \`permission\` (\`project_id\`,\`action\`,\`resource\`);`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`message_session_admission_seq_idx\` ON \`message\` (\`session_id\`,\`admission_seq\`) WHERE "message"."admission_seq" > 0;`,
       )
       yield* tx.run(
         `CREATE INDEX \`message_session_time_created_id_idx\` ON \`message\` (\`session_id\`,\`time_created\`,\`id\`);`,
