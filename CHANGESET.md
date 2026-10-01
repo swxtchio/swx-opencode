@@ -63,8 +63,8 @@ Newest first. Each entry names the upstream range brought in.
   backoff; terminalize failed assistant turns when writes recover, including interrupted compaction cleanup; preserve
   completed answers through later cleanup failures, publish follow-up persistence errors without replacing existing
   provider errors, stop failed overflow turns before compaction, and show idle or absent-status sessions with
-  non-terminal assistant rows as failed in the TUI (cross-process status ambiguity is tracked in #96). Persist and
-  return only the classified lock diagnosis in messages and HTTP errors. _Fork-only._
+  non-terminal assistant rows as failed or unknown, respectively, in the TUI while busy/retry statuses remain
+  working. Persist and return only the classified lock diagnosis in messages and HTTP errors. _Fork-only._
 - **#80** Codex OAuth accepts complete canonical GPT versions and catalog-backed named variants (including GPT-6 Astra from the [models.dev OpenAI catalog](https://models.dev/api.json)); malformed numeric aliases and unsupported suffixes stay filtered. _Fork-only._
 - **#78** Coordinate snapshot maintenance with a box-wide hourly gc cooldown (issue #70 Fix-1) and serialized cleanups; `Snapshot.track()` waits through contention and never silently skips snapshot updates. _Fork-only._
 - **#76** Classify mid-stream OpenAI-compatible context overflow errors as `ContextOverflowError` so automatic compaction can resume; cover SDK error shapes and session continuation. The unpatched-router reproduction is recorded in [docs/stream-overflow-e2e.md](docs/stream-overflow-e2e.md). (swxtchio/swx-opencode#66). _Fork-only._
