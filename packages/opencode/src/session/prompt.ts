@@ -1113,11 +1113,12 @@ const layer = Layer.effect(
       // queued input instead of seeing it in its next history reload. The queue
       // lock also makes the busy result and fallback admission one transition.
       const noReplyDecision =
-        markedNoReply && !initiallyHeldNoReply
+        markedNoReply && (!initiallyHeldNoReply || input.messageID !== undefined)
           ? yield* queue.writeOrAdmit({
               admission: { ...queuedInput, ...(delivery ? { delivery } : {}) },
+              forceQueue: initiallyHeldNoReply,
               isBusy: state.assertNotBusy(input.sessionID).pipe(Effect.exit, Effect.map(Exit.isFailure)),
-              prepare: prepareUserMessage(queuedInput),
+              prepare: () => prepareUserMessage(queuedInput),
               write: writeUserMessage,
               discard: (message) => sessions.removeMessage({ sessionID: input.sessionID, messageID: message.info.id }),
             })

@@ -44,13 +44,14 @@ export interface Interface {
    */
   readonly writeOrAdmit: <P extends SessionV1.WithParts, E>(input: {
     readonly admission: AdmitInput
+    readonly forceQueue?: boolean
     readonly isBusy: Effect.Effect<boolean>
-    readonly prepare: Effect.Effect<P, E>
+    readonly prepare: () => Effect.Effect<P, E>
     readonly write: (prepared: P) => Effect.Effect<SessionV1.WithParts>
     readonly discard: (message: SessionV1.WithParts) => Effect.Effect<void>
   }) => Effect.Effect<
     | { readonly kind: "direct"; readonly message: SessionV1.WithParts }
-    | { readonly kind: "queued"; readonly own: Item; readonly prepared: P },
+    | { readonly kind: "queued"; readonly own: Item; readonly prepared?: P },
     E
   >
   readonly list: (sessionID: SessionID) => Effect.Effect<Item[]>
@@ -236,8 +237,7 @@ const layer = Layer.effect(
       exclusive(
         input.admission.sessionID,
         Effect.gen(function* () {
-          const prepared = yield* input.prepare
-          const busy = yield* input.isBusy
+          const busy = input.forceQueue === true || (yield* input.isBusy)
           const existingRow = input.admission.messageID
             ? yield* db
                 .select({ session_id: MessageTable.session_id })
@@ -246,28 +246,53 @@ const layer = Layer.effect(
                 .get()
                 .pipe(Effect.orDie)
             : undefined
-          const existing =
-            existingRow?.session_id === input.admission.sessionID && input.admission.messageID
-              ? yield* MessageV2.get({
-                  sessionID: input.admission.sessionID,
-                  messageID: input.admission.messageID,
-                }).pipe(
-                  Effect.provideService(Database.Service, database),
-                  Effect.catchTag("NotFoundError", () => Effect.succeed(undefined)),
+          if (existingRow) {
+            const prepared = yield* input.prepare()
+            const existing =
+              existingRow.session_id === input.admission.sessionID && input.admission.messageID
+                ? yield* MessageV2.get({
+                    sessionID: input.admission.sessionID,
+                    messageID: input.admission.messageID,
+                  }).pipe(
+                    Effect.provideService(Database.Service, database),
+                    Effect.catchTag("NotFoundError", () => Effect.succeed(undefined)),
+                  )
+                : undefined
+            if (existing && sameMessage(existing, prepared)) return { kind: "direct" as const, message: existing }
+            const duplicate = input.admission.messageID
+              ? (yield* list(input.admission.sessionID)).find(
+                  (item) =>
+                    item.input.messageID === input.admission.messageID &&
+                    sameQueuedInput(item.input, input.admission),
                 )
               : undefined
-          if (existingRow) {
-            if (existing && sameMessage(existing, prepared)) return { kind: "direct" as const, message: existing }
+            if (duplicate) return { kind: "queued" as const, own: duplicate, prepared }
+            const active = busy || (yield* input.isBusy)
+            if (existing && !active) return { kind: "direct" as const, message: existing }
+            if (existing && active)
+              return {
+                kind: "queued" as const,
+                own: yield* admitLocked(input.admission),
+                prepared,
+              }
             const messageID = MessageID.ascending()
             const admission = { ...input.admission, messageID }
-            const queued = rekeyMessage(prepared, messageID)
-            return {
-              kind: "queued" as const,
-              own: yield* admitLocked(admission),
-              prepared: queued,
+            const rekeyed = rekeyMessage(prepared, messageID)
+            if (active) return { kind: "queued" as const, own: yield* admitLocked(admission), prepared: rekeyed }
+            const message = yield* input.write(rekeyed)
+            if (yield* input.isBusy) {
+              yield* input.discard(message)
+              return { kind: "queued" as const, own: yield* admitLocked(admission), prepared: rekeyed }
             }
+            return { kind: "direct" as const, message }
           }
           if (busy)
+            return {
+              kind: "queued" as const,
+              own: yield* admitLocked(input.admission),
+            }
+          const prepared = yield* input.prepare()
+          if (yield* input.isBusy)
             return {
               kind: "queued" as const,
               own: yield* admitLocked(input.admission),
@@ -762,6 +787,13 @@ function sameMessage(left: SessionV1.WithParts, right: SessionV1.WithParts) {
       info: Struct.omit(right.info, ["time"]),
       parts: right.parts.map((part) => Struct.omit(part, ["id"])),
     }),
+  )
+}
+
+function sameQueuedInput(left: SessionPromptQueue.QueuedInput, right: AdmitInput) {
+  return isDeepStrictEqual(
+    withoutUndefined(Struct.omit(left, ["messageID"])),
+    withoutUndefined(Struct.omit(right, ["sessionID", "messageID", "noReply", "delivery"])),
   )
 }
 

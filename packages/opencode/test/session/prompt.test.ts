@@ -5415,6 +5415,204 @@ it.instance(
   30_000,
 )
 
+it.instance(
+  "keeps an idle changed marked noReply messageID retry from starting a provider turn",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Idle changed marked retry" })
+      const messageID = MessageID.ascending()
+      const originalText = "[fm-from-firstmate]\x1f idle original machine mail"
+      const changedText = "[fm-from-firstmate]\x1f idle changed machine mail"
+      const original = yield* prompt.prompt({
+        sessionID: session.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: said(originalText),
+      })
+      if (original.info.role !== "user") throw new Error("expected the original marked message")
+
+      const retry = yield* prompt.prompt({
+        sessionID: session.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: said(changedText),
+      })
+      if (retry.info.role !== "user") throw new Error("expected the idle retry result")
+      expect(retry.info.id).toBe(messageID)
+      expect(yield* llm.calls).toBe(0)
+      expect(yield* queue.list(session.id)).toEqual([])
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      expect(messages).toHaveLength(1)
+      expect(messages[0]?.info.id).toBe(messageID)
+      expect(messages[0]?.parts.some((part) => part.type === "text" && part.text === originalText)).toBe(true)
+      expect(messages[0]?.parts.some((part) => part.type === "text" && part.text === changedText)).toBe(false)
+    }),
+  30_000,
+)
+
+it.instance(
+  "deduplicates repeated changed marked same-ID retries during a busy multi-step run",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Repeated busy same-ID retry",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* writeText(path.join(dir, "round20-repeat-id.txt"), "root tool")
+      const messageID = MessageID.ascending()
+      const originalText = "[fm-from-firstmate]\x1f busy original machine mail"
+      const changedText = "[fm-from-firstmate]\x1f repeated busy machine mail"
+      const original = yield* prompt.prompt({
+        sessionID: session.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: said(originalText),
+      })
+      if (original.info.role !== "user") throw new Error("expected the original marked message")
+      const root = yield* seedUser({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        parts: said("repeated retry active root"),
+      })
+      const toolResponse = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(toolResponse, undefined).pipe(Effect.ignore))
+      yield* llm.push(
+        reply().wait(deferredAsPromise(toolResponse)).tool("glob", { pattern: "round20-repeat-id.txt" }).item(),
+        reply().text("root task finished").stop().item(),
+        reply().text("one held retry handled").stop().item(),
+        reply().text("duplicate retry handled").stop().item(),
+      )
+      const active = yield* prompt.loop({ sessionID: session.id, messageID: root.info.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "active root did not reach the provider", "10 seconds")
+
+      const retryInput = {
+        sessionID: session.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: said(changedText),
+      }
+      yield* prompt.prompt(retryInput)
+      const firstQueue = yield* pollWithTimeout(
+        queue.list(session.id).pipe(Effect.map((items) => items.find((item) => item.input.messageID === messageID))),
+        "first changed same-ID retry was not held",
+        "10 seconds",
+      )
+      yield* prompt.prompt(retryInput)
+      const pending = yield* queue.list(session.id)
+      expect(pending).toHaveLength(1)
+      expect(pending[0]?.id).toBe(firstQueue.id)
+      expect(pending[0]?.seq).toBe(firstQueue.seq)
+      expect(pending[0]?.delivery).toBe("queue")
+      expect(yield* llm.calls).toBe(1)
+
+      yield* Deferred.succeed(toolResponse, undefined)
+      yield* awaitWithTimeout(llm.wait(2), "active root continuation did not start", "10 seconds")
+      const continuation = (yield* llm.inputs)[1]
+      if (!continuation) throw new Error("expected the active root continuation")
+      expect(JSON.stringify(continuation.messages)).not.toContain("repeated busy machine mail")
+      yield* awaitWithTimeout(llm.wait(3), "held same-ID retry did not reach its turn", "10 seconds")
+      const held = (yield* llm.inputs)[2]
+      if (!held) throw new Error("expected the single held retry request")
+      expect(JSON.stringify(held.messages).split("repeated busy machine mail").length - 1).toBe(1)
+      const exit = yield* awaitWithTimeout(Fiber.await(active), "active root did not finish", "10 seconds")
+      expect(Exit.isSuccess(exit)).toBe(true)
+
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const originalRow = messages.find((message) => message.info.id === messageID)
+      if (!originalRow || originalRow.info.role !== "user") throw new Error("expected the old row to remain")
+      expect(originalRow.parts.some((part) => part.type === "text" && part.text === originalText)).toBe(true)
+      expect(originalRow.parts.some((part) => part.type === "text" && part.text === changedText)).toBe(false)
+      const promoted = messages.find(
+        (message) => message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === changedText),
+      )
+      if (!promoted || promoted.info.role !== "user") throw new Error("expected the retry to promote exactly once")
+      expect(promoted.info.id).not.toBe(messageID)
+      expect(messages.filter((message) => message.parts.some((part) => part.type === "text" && part.text === changedText))).toHaveLength(1)
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(yield* llm.calls).toBe(3)
+    }),
+  60_000,
+)
+
+it.instance(
+  "does not queue an initially-busy exact marked same-ID retry of a persisted message",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Busy exact same-ID retry",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* writeText(path.join(dir, "round20-exact-id.txt"), "root tool")
+      const messageID = MessageID.ascending()
+      const markedText = "[fm-from-firstmate]\x1f exact busy machine mail"
+      const input = {
+        sessionID: session.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: said(markedText),
+      }
+      const original = yield* prompt.prompt(input)
+      if (original.info.role !== "user") throw new Error("expected the original marked message")
+      const root = yield* seedUser({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        parts: said("busy exact retry root"),
+      })
+      const toolResponse = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(toolResponse, undefined).pipe(Effect.ignore))
+      yield* llm.push(
+        reply().wait(deferredAsPromise(toolResponse)).tool("glob", { pattern: "round20-exact-id.txt" }).item(),
+        reply().text("root task finished").stop().item(),
+        reply().text("unexpected duplicate exact retry").stop().item(),
+      )
+      const active = yield* prompt.loop({ sessionID: session.id, messageID: root.info.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "active root did not reach the provider", "10 seconds")
+
+      const retry = yield* prompt.prompt(input)
+      if (retry.info.role !== "user") throw new Error("expected the exact retry result")
+      expect(retry.info.id).toBe(messageID)
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(yield* llm.calls).toBe(1)
+      yield* Deferred.succeed(toolResponse, undefined)
+      yield* awaitWithTimeout(llm.wait(2), "active root continuation did not start", "10 seconds")
+      const continuation = (yield* llm.inputs)[1]
+      if (!continuation) throw new Error("expected the active root continuation")
+      expect(JSON.stringify(continuation.messages)).toContain("exact busy machine mail")
+      const exit = yield* awaitWithTimeout(Fiber.await(active), "active root did not finish", "10 seconds")
+      expect(Exit.isSuccess(exit)).toBe(true)
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(yield* llm.calls).toBe(2)
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      expect(messages.filter((message) => message.info.role === "user" && message.info.id === messageID)).toHaveLength(1)
+      expect(messages.filter((message) => message.info.role === "assistant" && message.info.parentID === messageID)).toHaveLength(0)
+    }),
+  60_000,
+)
+
 gated.instance(
   "holds a changed marked noReply messageID retry out of an older rootful run and promotes it once",
   () =>
