@@ -5,7 +5,7 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { ConfigProvider, Context, Effect, Exit, Layer, Scope } from "effect"
 import { HttpRouter, HttpServer } from "effect/unstable/http"
 import { OpenApi } from "effect/unstable/httpapi"
-import { createServer, type Server } from "node:http"
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http"
 import { MDNS } from "./mdns"
 import { HttpApiApp } from "./routes/instance/httpapi/server"
 import { disposeMiddleware } from "./routes/instance/httpapi/lifecycle"
@@ -198,8 +198,7 @@ function forceClose(state: ListenerState) {
 
 function serverLayer(opts: { port: number; hostname: string }) {
   const server = createServer()
-  holdUntilServed(server, "request")
-  holdUntilServed(server, "upgrade")
+  holdRequestsUntilServed(server)
   const serverRef = { closeStarted: false, forceStop: false }
   const close = server.close.bind(server)
   // Keep shutdown owned by NodeHttpServer, but honor listener.stop(true) by
@@ -225,23 +224,24 @@ function serverLayer(opts: { port: number; hostname: string }) {
   )
 }
 
-// NodeHttpServer listens while its layer builds, but attaches its request and
-// upgrade handlers only when HttpRouter.serve runs, after the route layers
-// build. Node drops an event emitted with no listener, so a request that
-// reached a fresh server in that window was never answered (swx-abbe#441).
-// Hold such events and hand them to the handler once it attaches.
-function holdUntilServed(server: Server, event: "request" | "upgrade") {
-  const held: unknown[][] = []
-  const hold = (...args: unknown[]) => {
-    held.push(args)
+// NodeHttpServer listens while its layer builds, but attaches its request
+// handler only when HttpRouter.serve runs, after the route layers build. Node
+// drops a request emitted with no listener, so a request that reached a fresh
+// server in that window was never answered (swx-abbe#441). Hold such requests
+// and hand them to the handler once it attaches. Upgrades need no hold of their
+// own: until an upgrade handler attaches, Node emits an upgrade as a request.
+function holdRequestsUntilServed(server: Server) {
+  const held: [IncomingMessage, ServerResponse][] = []
+  const hold = (request: IncomingMessage, response: ServerResponse) => {
+    held.push([request, response])
   }
-  server.on(event, hold)
-  server.on("newListener", function replay(name: string | symbol, listener: (...args: unknown[]) => void) {
-    if (name !== event) return
+  server.on("request", hold)
+  server.on("newListener", function replay(name: string | symbol, listener: typeof hold) {
+    if (name !== "request") return
     server.off("newListener", replay)
-    server.off(event, hold)
+    server.off("request", hold)
     // Replay after `on` returns, so the handler is attached when it runs.
-    queueMicrotask(() => held.splice(0).forEach((args) => listener.apply(server, args)))
+    queueMicrotask(() => held.splice(0).forEach(([request, response]) => listener.call(server, request, response)))
   })
 }
 
