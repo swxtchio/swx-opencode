@@ -64,7 +64,8 @@ export const Event = {
 
 const Cursor = Schema.Struct({
   id: MessageID,
-  time: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
+  seq: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
+  time: Schema.optional(Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))),
 })
 type Cursor = typeof Cursor.Type
 
@@ -94,10 +95,11 @@ const part = (row: typeof PartTable.$inferSelect) =>
     messageID: row.message_id,
   }) as Part
 
-const older = (row: Cursor) =>
-  or(lt(MessageTable.time_created, row.time), and(eq(MessageTable.time_created, row.time), lt(MessageTable.id, row.id)))
+type MessageQuery = Pick<Database.Interface["db"], "select">
 
-function hydrate(db: Database.Interface["db"], rows: (typeof MessageTable.$inferSelect)[]) {
+const older = (seq: number) => lt(MessageTable.admission_seq, seq)
+
+function hydrate(db: MessageQuery, rows: (typeof MessageTable.$inferSelect)[]) {
   const ids = rows.map((row) => row.id)
   const partByMessage = new Map<string, Part[]>()
   return Effect.gen(function* () {
@@ -435,14 +437,42 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
 }) {
   const { db } = yield* Database.Service
   const before = input.before ? cursor.decode(input.before) : undefined
-  const where = before
-    ? and(eq(MessageTable.session_id, input.sessionID), older(before))
-    : eq(MessageTable.session_id, input.sessionID)
+  const legacyTime = before?.seq === undefined ? before?.time : undefined
+  const beforeSeq =
+    before?.seq !== undefined
+      ? before.seq
+      : before && legacyTime === undefined
+        ? (yield* db
+            .select({ seq: MessageTable.admission_seq })
+            .from(MessageTable)
+            .where(and(eq(MessageTable.session_id, input.sessionID), eq(MessageTable.id, before.id)))
+            .get()
+            .pipe(Effect.orDie))?.seq
+        : undefined
+  if (before && beforeSeq === undefined && legacyTime === undefined)
+    throw new Error(`Message cursor anchor not found and has no legacy time: ${before.id}`)
+  const session = eq(MessageTable.session_id, input.sessionID)
+  const where =
+    beforeSeq !== undefined
+      ? and(session, older(beforeSeq))
+      : legacyTime !== undefined && before
+        ? and(
+            session,
+            or(
+              lt(MessageTable.time_created, legacyTime),
+              and(eq(MessageTable.time_created, legacyTime), lt(MessageTable.id, before.id)),
+            ),
+          )
+        : session
+  const order =
+    legacyTime === undefined
+      ? [desc(MessageTable.admission_seq)]
+      : [desc(MessageTable.time_created), desc(MessageTable.id)]
   const rows = yield* db
     .select()
     .from(MessageTable)
     .where(where)
-    .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
+    .orderBy(...order)
     .limit(input.limit + 1)
     .all()
     .pipe(Effect.orDie)
@@ -468,7 +498,27 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
   return {
     items,
     more,
-    cursor: more && tail ? cursor.encode({ id: tail.id, time: tail.time_created }) : undefined,
+    cursor:
+      more && tail
+        ? cursor.encode(
+            legacyTime === undefined
+              ? { id: tail.id, seq: tail.admission_seq }
+              : { id: tail.id, time: tail.time_created },
+          )
+        : undefined,
+  }
+})
+
+export const admission = Effect.fn("MessageV2.admission")(function* (sessionID: SessionID) {
+  const { db } = yield* Database.Service
+  const rows = yield* db
+    .select({ id: MessageTable.id, seq: MessageTable.admission_seq })
+    .from(MessageTable)
+    .where(eq(MessageTable.session_id, sessionID))
+    .all()
+    .pipe(Effect.orDie)
+  return {
+    order: new Map(rows.map((row) => [row.id, row.seq])),
   }
 })
 
@@ -581,32 +631,90 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
   return filterCompacted(yield* stream(sessionID))
 })
 
-// filterCompacted reorders messages for model consumption
-// ([compaction-user, summary, ...retained tail..., continue-user]), so array
-// position is not chronological. IDs are only a deterministic tie-breaker
-// because imported messages do not necessarily have monotonic IDs.
-export function latest(msgs: WithParts[]) {
+export const snapshot = Effect.fnUntraced(function* (
+  sessionID: SessionID,
+  afterMessages?: () => Effect.Effect<void>,
+) {
+  const { db } = yield* Database.Service
+  return yield* db.transaction((tx) =>
+    Effect.gen(function* () {
+      const rows = [] as (typeof MessageTable.$inferSelect)[]
+      const pageSize = 50
+      let before: number | undefined
+      while (true) {
+        const where =
+          before === undefined
+            ? eq(MessageTable.session_id, sessionID)
+            : and(eq(MessageTable.session_id, sessionID), lt(MessageTable.admission_seq, before))
+        const page = yield* tx
+          .select()
+          .from(MessageTable)
+          .where(where)
+          .orderBy(desc(MessageTable.admission_seq))
+          .limit(pageSize)
+          .all()
+          .pipe(Effect.orDie)
+        if (page.length === 0) break
+        rows.push(...page)
+        if (page.length < pageSize) break
+        const last = page.at(-1)
+        if (!last) break
+        before = last.admission_seq
+      }
+
+      const messages: WithParts[] = []
+      for (let index = 0; index < rows.length; index += pageSize) {
+        messages.push(...(yield* hydrate(tx, rows.slice(index, index + pageSize))))
+      }
+      const filtered = filterCompacted(messages)
+      if (afterMessages) yield* afterMessages()
+      return {
+        messages: filtered,
+        admissionOrder: new Map(rows.map((row) => [row.id, row.admission_seq])),
+      }
+    }),
+  ).pipe(Effect.orDie)
+})
+
+export function latest(
+  msgs: WithParts[],
+  options: {
+    admissionOrder: ReadonlyMap<MessageID, number>
+    excludeNoReply?: boolean
+  },
+) {
   let user: User | undefined
   let assistant: Assistant | undefined
   let finished: Assistant | undefined
   for (const msg of msgs) {
     const info = msg.info
-    if (info.role === "user" && isAfter(info, user)) user = info
-    if (info.role === "assistant" && isAfter(info, assistant)) assistant = info
-    if (info.role === "assistant" && info.finish && isAfter(info, finished)) finished = info
+    if (
+      info.role === "user" &&
+      (!options.excludeNoReply || info.noReply !== true) &&
+      isLater(info, user, options.admissionOrder)
+    )
+      user = info
+    if (info.role === "assistant" && isLater(info, assistant, options.admissionOrder)) assistant = info
+    if (info.role === "assistant" && info.finish && isLater(info, finished, options.admissionOrder)) finished = info
   }
-  const tasks = msgs.flatMap((m) =>
-    finished && !isAfter(m.info, finished)
-      ? []
-      : m.parts.filter((p): p is CompactionPart | SubtaskPart => p.type === "compaction" || p.type === "subtask"),
-  )
+  const tasks = msgs.flatMap((msg) => {
+    if (finished && !isLater(msg.info, finished, options.admissionOrder)) return []
+    return msg.parts.filter(
+      (part): part is CompactionPart | SubtaskPart => part.type === "compaction" || part.type === "subtask",
+    )
+  })
   return { user, assistant, finished, tasks }
 }
 
-function isAfter(info: Info, other?: Info) {
+function isLater(info: Info, other: Info | undefined, order: ReadonlyMap<MessageID, number>) {
   if (!other) return true
-  if (info.time.created !== other.time.created) return info.time.created > other.time.created
-  return info.id > other.id
+  return orderOf(info.id, order) > orderOf(other.id, order)
+}
+
+function orderOf(messageID: MessageID, order: ReadonlyMap<MessageID, number>) {
+  const result = order.get(messageID)
+  if (result === undefined) throw new Error(`Missing persisted admission order for message: ${messageID}`)
+  return result
 }
 
 export function fromError(

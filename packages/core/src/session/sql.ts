@@ -1,4 +1,5 @@
 import { sqliteTable, text, integer, index, primaryKey, real, uniqueIndex } from "drizzle-orm/sqlite-core"
+import { sql } from "drizzle-orm"
 import * as DatabasePath from "../database/path"
 import { ProjectTable } from "../project/sql"
 import type { SessionMessage } from "./message"
@@ -73,10 +74,16 @@ export const MessageTable = sqliteTable(
       .$type<SessionSchema.ID>()
       .notNull()
       .references(() => SessionTable.id, { onDelete: "cascade" }),
+    admission_seq: integer().notNull().default(0),
     ...Timestamps,
     data: text({ mode: "json" }).notNull().$type<V1MessageData>(),
   },
-  (table) => [index("message_session_time_created_id_idx").on(table.session_id, table.time_created, table.id)],
+  (table) => [
+    uniqueIndex("message_session_admission_seq_idx")
+      .on(table.session_id, table.admission_seq)
+      .where(sql`${table.admission_seq} > 0`),
+    index("message_session_time_created_id_idx").on(table.session_id, table.time_created, table.id),
+  ],
 )
 
 export const PartTable = sqliteTable(

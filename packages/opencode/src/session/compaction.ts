@@ -182,7 +182,7 @@ export interface Interface {
     model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
     auto: boolean
     overflow?: boolean
-  }) => Effect.Effect<void>
+  }) => Effect.Effect<MessageID>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionCompaction") {}
@@ -590,6 +590,7 @@ const layer = Layer.effect(
           auto: input.auto,
           overflow: input.overflow,
         })
+        return msg.id
       },
       // Steer promotion checks for a pending compaction under this lock, so no
       // steer lands between the compaction message and its compaction part.

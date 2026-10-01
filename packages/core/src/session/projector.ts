@@ -263,10 +263,14 @@ const layer = Layer.effectDiscard(
         const id = event.data.info.id
         const sessionID = event.data.info.sessionID
         const data = messageData(event.data.info)
+        const admission_seq = sql<number>`(SELECT COALESCE(MAX(${MessageTable.admission_seq}), 0) + 1 FROM ${MessageTable} WHERE ${MessageTable.session_id} = ${sessionID})`
         yield* db
           .insert(MessageTable)
-          .values({ id, session_id: sessionID, time_created, data })
-          .onConflictDoUpdate({ target: MessageTable.id, set: { data } })
+          .values({ id, session_id: sessionID, admission_seq, time_created, data })
+          .onConflictDoUpdate({
+            target: MessageTable.id,
+            set: { data },
+          })
           .run()
           .pipe(Effect.orDie)
       }),
