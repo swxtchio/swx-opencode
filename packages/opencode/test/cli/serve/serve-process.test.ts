@@ -47,8 +47,8 @@ describe("opencode serve (subprocess)", () => {
         const port = yield* Effect.promise(freePort)
         const password = "first-request"
         const client = yield* HttpClient.HttpClient
-        // Effect.suspend re-runs on every retry, so this records when the
-        // attempt that finally connected was sent, not the first refused one.
+        // Effect.suspend re-runs on every retry, so this records the attempt
+        // that was finally accepted, not the first refused one.
         const sent = { at: 0, attempts: 0 }
         const first = yield* Effect.suspend(() => {
           sent.at = Date.now()
@@ -61,13 +61,16 @@ describe("opencode serve (subprocess)", () => {
             ),
           )
         }).pipe(
-          // Only a refused connection is retried; a request the server
-          // accepted but never answers runs into the timeout below.
+          // Retry only a refused connection, which the server never saw. An
+          // accepted request that is reset fails here, and one that is never
+          // answered runs into the timeout below.
           Effect.retry({
-            while: (error) => error.reason._tag === "TransportError",
+            while: (error) => error.reason._tag === "TransportError" && isConnectionRefused(error.reason.cause),
             schedule: Schedule.spaced("5 millis"),
           }),
           Effect.flatMap((res) => Effect.map(res.json, (body) => ({ status: res.status, body }))),
+          // Kept well below the test timeout at every TIMEOUT_SCALE, so a
+          // swallowed request fails here rather than as a Bun test timeout.
           Effect.timeout(Duration.millis(deadline(20_000))),
           Effect.forkScoped,
         )
@@ -76,19 +79,23 @@ describe("opencode serve (subprocess)", () => {
           port,
           extraArgs: ["--pure", "--print-logs"],
           env: { OPENCODE_SERVER_PASSWORD: password },
+          readyTimeoutMs: deadline(15_000),
         })
         const listeningAt = Date.now()
         const result = yield* Fiber.join(first)
 
-        // The connected attempt must have gone out before the listening line,
-        // or this run did not exercise the window at all. Retries before it
-        // were refused connections, so the server saw no request earlier.
+        // Evidence that the answered request was the server's first and came
+        // in the early window: earlier attempts were refused, so the server
+        // saw no request before it; it was sent before the listening line;
+        // and it got a session back. The send time alone does not show when
+        // the server accepted it, so the red runs against the unfixed server
+        // (a swallowed request times out above) are what tie this to the bug.
         expect(sent.attempts).toBeGreaterThan(1)
         expect(sent.at).toBeLessThan(listeningAt)
         expect(result.status).toBe(200)
         expect(result.body).toMatchObject({ id: expect.stringMatching(/^ses_/) })
       }),
-    60_000,
+    deadline(60_000),
   )
 
   // The scope-close finalizer must actually terminate the child. Without this
@@ -117,6 +124,17 @@ describe("opencode serve (subprocess)", () => {
     60_000,
   )
 })
+
+// Bun's fetch reports a refused connection as ConnectionRefused; Node uses
+// ECONNREFUSED.
+function isConnectionRefused(cause: unknown) {
+  return (
+    typeof cause === "object" &&
+    cause !== null &&
+    "code" in cause &&
+    (cause.code === "ConnectionRefused" || cause.code === "ECONNREFUSED")
+  )
+}
 
 function freePort() {
   return new Promise<number>((resolve, reject) => {
