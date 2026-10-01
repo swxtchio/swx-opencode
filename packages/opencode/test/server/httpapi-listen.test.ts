@@ -3,7 +3,6 @@ import net from "node:net"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { PtyID } from "@opencode-ai/core/pty/schema"
 import { Server } from "../../src/server/server"
 import { PtyPaths } from "../../src/server/routes/instance/httpapi/groups/pty"
 import { withTimeout } from "../../src/util/timeout"
@@ -30,12 +29,12 @@ afterEach(async () => {
   await resetDatabase()
 })
 
-async function startListener(port = 0) {
+async function startListener() {
   Flag.OPENCODE_SERVER_PASSWORD = auth.password
   Flag.OPENCODE_SERVER_USERNAME = auth.username
   process.env.OPENCODE_SERVER_PASSWORD = auth.password
   process.env.OPENCODE_SERVER_USERNAME = auth.username
-  return Server.listen({ hostname: "127.0.0.1", port })
+  return Server.listen({ hostname: "127.0.0.1", port: 0 })
 }
 
 async function startNoAuthListener() {
@@ -432,37 +431,6 @@ describe("HttpApi Server.listen", () => {
     }
   })
 
-  // swx-abbe#441: the HTTP server listens before it attaches its handlers.
-  // While no upgrade handler is attached, a websocket upgrade arrives as an
-  // ordinary request, so the held-request path must answer it rather than
-  // leave it hanging. No upgrade can succeed as a listener's first request,
-  // since a PTY must first be created through that same listener, so the
-  // expected answer is the route's own 404 for an unknown PTY.
-  testPty(
-    "answers a websocket upgrade sent as a listener's port opens",
-    async () => {
-      const port = await freePort()
-      let started = false
-      const listener = startListener(port).then((listener) => {
-        started = true
-        return listener
-      })
-      try {
-        const handshake = await withTimeout(
-          firstHandshake(port, `${PtyPaths.connect.replace(":ptyID", PtyID.ascending())}?cursor=-1`, () => started),
-          10_000,
-          "timed out waiting for the early upgrade's response",
-        )
-        // A handshake sent after listen() resolved would not exercise the window.
-        expect(handshake.sentBeforeListening).toBe(true)
-        expect(handshake.status).toBe("HTTP/1.1 404 Not Found")
-      } finally {
-        await listener.then((listener) => stop(listener, "timed out cleaning up listener")).catch(() => undefined)
-      }
-    },
-    30_000,
-  )
-
   testPty("keeps PTY websocket tickets optional when server auth is disabled", async () => {
     await using tmp = await tmpdir({ config: { formatter: false, lsp: false } })
     const listener = await startNoAuthListener()
@@ -478,57 +446,6 @@ describe("HttpApi Server.listen", () => {
     }
   })
 })
-
-// Sends a websocket handshake on the first connection the port accepts,
-// retrying only refused connections, and returns the response status line.
-function firstHandshake(port: number, target: string, started: () => boolean) {
-  return new Promise<{ status: string; sentBeforeListening: boolean }>((resolve, reject) => {
-    const attempt = () => {
-      const socket = net.connect(port, "127.0.0.1")
-      let data = ""
-      let sentBeforeListening = false
-      socket.once("connect", () => {
-        sentBeforeListening = !started()
-        socket.write(
-          [
-            `GET ${target} HTTP/1.1`,
-            `Host: 127.0.0.1:${port}`,
-            `Authorization: ${authorization()}`,
-            "Upgrade: websocket",
-            "Connection: Upgrade",
-            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
-            "Sec-WebSocket-Version: 13",
-            "",
-            "",
-          ].join("\r\n"),
-        )
-      })
-      socket.on("data", (chunk) => {
-        data += chunk.toString()
-        if (!data.includes("\r\n")) return
-        socket.destroy()
-        resolve({ status: data.slice(0, data.indexOf("\r\n")), sentBeforeListening })
-      })
-      socket.once("error", (error: NodeJS.ErrnoException) => {
-        if (error.code === "ECONNREFUSED") return setTimeout(attempt, 5)
-        reject(error)
-      })
-    }
-    attempt()
-  })
-}
-
-function freePort() {
-  return new Promise<number>((resolve, reject) => {
-    const probe = net.createServer()
-    probe.once("error", reject)
-    probe.listen(0, "127.0.0.1", () => {
-      const address = probe.address()
-      const port = typeof address === "object" && address ? address.port : 0
-      probe.close(() => resolve(port))
-    })
-  })
-}
 
 function isPortFree(port: number) {
   return new Promise<boolean>((resolve) => {

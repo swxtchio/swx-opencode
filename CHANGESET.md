@@ -64,8 +64,7 @@ Newest first. Each entry names the upstream range brought in.
 
 - **#108** A fresh `opencode serve` answers a request that arrives as its port opens (swxtchio/swx-abbe#441).
   `NodeHttpServer` listened before attaching its request handler, so such a request was read and never answered;
-  the server now holds early requests and hands them to the handler once it attaches. An early websocket upgrade
-  arrives as a request too and is answered the same way. _Upstreamable._
+  the server now holds early requests and hands them to the handler once it attaches. _Upstreamable._
 - **#98** A command that exits or closes its stdin before reading all of it no longer raises an uncaught `EPIPE`:
   Bun fails the buffered stdin write after reporting it finished, when nothing is listening, so the spawner now
   keeps a listener on child stdin and leaves the outcome to the exit code. _Upstreamable._

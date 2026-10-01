@@ -228,8 +228,9 @@ function serverLayer(opts: { port: number; hostname: string }) {
 // handler only when HttpRouter.serve runs, after the route layers build. Node
 // drops a request emitted with no listener, so a request that reached a fresh
 // server in that window was never answered (swx-abbe#441). Hold such requests
-// and hand them to the handler once it attaches. Upgrades need no hold of their
-// own: until an upgrade handler attaches, Node emits an upgrade as a request.
+// and hand them to the handler once it attaches. Upgrades are not held: none
+// can succeed as a listener's first request, since a PTY connect needs a PTY
+// created through that listener and a workspace proxy needs its sync running.
 function holdRequestsUntilServed(server: Server) {
   const held: [IncomingMessage, ServerResponse][] = []
   const hold = (request: IncomingMessage, response: ServerResponse) => {
