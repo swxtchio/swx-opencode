@@ -62,6 +62,9 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#98** A command that exits or closes its stdin before reading all of it no longer raises an uncaught `EPIPE`:
+  Bun fails the buffered stdin write after reporting it finished, when nothing is listening, so the spawner now
+  keeps a listener on child stdin and leaves the outcome to the exit code. _Upstreamable._
 - **#98** A refused inotify instance no longer parks the server thread (swxtchio/swx-opencode#90): the git
   `HEAD` watch uses a non-recursive `fs.watch` that reports the refusal with its errno, and the opt-in root watch
   runs its `@parcel/watcher` subscription in a worker, active only once the worker acknowledges it. Each watch's

@@ -226,6 +226,27 @@ describe("cross-spawn spawner", () => {
         expect(out).toBe("a b c")
       }),
     )
+
+    // Bun's child stdin reports "finish" and only then fails the buffered write
+    // with EPIPE, after the sink has dropped its error listener. Unhandled, that
+    // error is an uncaught exception that fails whatever test is running.
+    fx.effect(
+      "ignores input the command closed its stdin before reading",
+      Effect.gen(function* () {
+        const closed = Promise.withResolvers<void>()
+        const stdin = Stream.fromEffect(
+          Effect.promise(() => closed.promise).pipe(Effect.as(new TextEncoder().encode("unread"))),
+        )
+        const handle = yield* ChildProcess.make("sh", ["-c", "exec 0<&-; echo closed; sleep 1"], { stdin })
+        const out = yield* handle.stdout.pipe(
+          Stream.decodeText(),
+          Stream.tap((text) => Effect.sync(() => text.includes("closed") && closed.resolve())),
+          Stream.mkString,
+        )
+        expect(out.trim()).toBe("closed")
+        expect(yield* handle.exitCode).toBe(ChildProcessSpawner.ExitCode(0))
+      }),
+    )
   })
 
   describe("process control", () => {
