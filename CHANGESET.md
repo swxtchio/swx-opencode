@@ -75,8 +75,9 @@ Newest first. Each entry names the upstream range brought in.
 - **#78** Coordinate snapshot maintenance with a box-wide hourly gc cooldown (issue #70 Fix-1) and serialized cleanups; `Snapshot.track()` waits through contention and never silently skips snapshot updates. _Fork-only._
 - **#76** Classify mid-stream OpenAI-compatible context overflow errors as `ContextOverflowError` so automatic compaction can resume; cover SDK error shapes and session continuation. The unpatched-router reproduction is recorded in [docs/stream-overflow-e2e.md](docs/stream-overflow-e2e.md). (swxtchio/swx-opencode#66). _Fork-only._
 - **#89** Hold framed machine messages until the active turn ends, then run them in admission order; the built-in
-  `[fm-level:critical]` token default and unmarked captain prompts remain immediately eligible. Marked `noReply`
-  prompts are held only during an active run; idle `noReply` keeps direct-write/no-drain behavior. Add `noReply` to the
+  `[fm-level:critical]` token default and unmarked captain prompts remain immediately eligible. Fresh idle marked
+  `noReply` inputs keep direct-write/no-drain behavior; an idle retry reusing a persisted message ID reconciles to the
+  existing row without delivering changed text. Add `noReply` to the
   V1 User schema and persist order in `admission_seq` (migration `20260929045002`, a partial unique index on
   `(session_id, admission_seq)` for positive values, and an insert trigger that assigns admission order to legacy
   writers that omit the new column). Pagination orders by admission sequence, emits `{id, seq}` cursors and accepts
