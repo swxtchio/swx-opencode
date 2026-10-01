@@ -672,6 +672,15 @@ const useServerConfig = Effect.fn("test.useServerConfig")(function* (config: (ur
   return { dir, llm }
 })
 
+function alive(pid: number) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
 // Wait for a session's runner to enter a busy state. SessionStatus is flipped
 // inside Runner.startShell's serialized transition, so cancel can't no-op once
 // we observe it.
@@ -1777,20 +1786,28 @@ it.instance(
           parts: [{ type: "text", text: criticalText }],
         })
         .pipe(Effect.forkChild)
-      yield* pollWithTimeout(
-        sessions
-          .messages({ sessionID: session.id })
-          .pipe(
-            Effect.map((messages) =>
-              messages.some((message) => message.info.role === "user" && message.info.id === criticalID)
-                ? true
-                : undefined,
-            ),
-          ),
+      // A promotion writes the message before it marks the row promoted, so wait until the queue
+      // itself stops listing the critical prompt instead of reading the queue once the message lands.
+      const admitted = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const pending = yield* queue.list(session.id)
+          if (pending.some((item) => item.input.messageID === criticalID)) return undefined
+          const messages = yield* sessions.messages({ sessionID: session.id })
+          return messages.some((message) => message.info.role === "user" && message.info.id === criticalID)
+            ? { pending, messages }
+            : undefined
+        }),
         "configured critical marker did not promote the prompt",
         "30 seconds",
       )
-      expect((yield* queue.list(session.id)).map((item) => item.input.messageID)).toEqual([heldID])
+      expect(admitted.pending.map((item) => [item.input.messageID, item.delivery])).toEqual([[heldID, "queue"]])
+      expect(
+        admitted.messages.some(
+          (message) =>
+            message.info.role === "user" &&
+            message.parts.some((part) => part.type === "text" && part.text === heldText),
+        ),
+      ).toBe(false)
 
       yield* Deferred.succeed(toolGate, void 0)
       yield* awaitWithTimeout(llm.wait(2), "configured critical prompt did not reach the next step", "30 seconds")
@@ -7159,6 +7176,7 @@ unix(
     withSh(() =>
       Effect.gen(function* () {
         const { llm } = yield* useServerConfig(providerCfg)
+        const { directory: dir } = yield* TestInstance
         const prompt = yield* SessionPrompt.Service
         const sessions = yield* Session.Service
         const session = yield* sessions.create({ title: "Queued loop cancellation" })
@@ -7168,34 +7186,48 @@ unix(
           model: ref,
           parts: [{ type: "text", text: "queued task" }],
         })
+        // Each run appends its own pid, so the file names the real child and counts replays.
+        const runs = path.join(dir, "shell-runs")
+        const readRuns = Effect.promise(() =>
+          Bun.file(runs)
+            .text()
+            .catch(() => ""),
+        ).pipe(Effect.map((text) => text.split("\n").filter(Boolean).map(Number)))
+        // Detached, so a cancel that never settles fails its own bound instead of stalling teardown.
         const shell = yield* prompt
-          .shell({ sessionID: session.id, agent: "build", command: "printf shell-ready; sleep 30" })
-          .pipe(Effect.forkChild)
-        yield* waitForBusy(session.id, "30 seconds")
+          .shell({
+            sessionID: session.id,
+            agent: "build",
+            command: `echo $$ >> '${runs}'; printf shell-ready; sleep 30`,
+          })
+          .pipe(Effect.forkDetach)
+        yield* Effect.addFinalizer(() =>
+          readRuns.pipe(Effect.map((pids) => pids.filter(alive).forEach((pid) => process.kill(-pid, "SIGKILL")))),
+        )
         yield* pollWithTimeout(
-          sessions
-            .messages({ sessionID: session.id })
-            .pipe(
-              Effect.map((messages) =>
-                messages.some((message) =>
-                  message.parts.some((part) => part.type === "tool" && part.state.status === "running"),
-                )
-                  ? true
-                  : undefined,
-              ),
-            ),
-          "shell did not enter its running state",
+          readRuns.pipe(Effect.map((pids) => (pids.length > 0 ? true : undefined))),
+          "shell did not start",
           "30 seconds",
         )
 
-        const queued = yield* prompt.loop({ sessionID: session.id, messageID: root.info.id }).pipe(Effect.forkChild)
+        const queued = yield* prompt.loop({ sessionID: session.id, messageID: root.info.id }).pipe(Effect.forkDetach)
         yield* Effect.yieldNow
-        yield* prompt.cancel(session.id)
+        yield* awaitWithTimeout(prompt.cancel(session.id), "cancel did not return", "15 seconds")
         const queuedExit = yield* awaitWithTimeout(Fiber.await(queued), "queued loop did not cancel", "30 seconds")
         const shellExit = yield* awaitWithTimeout(Fiber.await(shell), "shell did not cancel", "30 seconds")
         expect(Exit.isSuccess(queuedExit)).toBe(true)
         expect(Exit.isSuccess(shellExit)).toBe(true)
         expect(yield* llm.calls).toBe(0)
+        const pids = yield* readRuns
+        expect(pids).toHaveLength(1)
+        expect(alive(pids[0])).toBe(false)
+        const tool = (yield* sessions.messages({ sessionID: session.id }))
+          .flatMap((message) => message.parts)
+          .find((part) => part.type === "tool")
+        expect(tool?.type === "tool" ? tool.state.status : undefined).toBe("completed")
+        expect(tool?.type === "tool" && tool.state.status === "completed" ? tool.state.output : "").toContain(
+          "User aborted the command",
+        )
 
         const messageID = MessageID.make("msg_after_queued_cancel")
         yield* llm.text("fresh task finished")
@@ -7215,6 +7247,7 @@ unix(
         const nextExit = yield* awaitWithTimeout(Fiber.await(next), "the next prompt did not finish", "30 seconds")
         expect(Exit.isSuccess(nextExit)).toBe(true)
         expect(yield* llm.calls).toBe(1)
+        expect(yield* readRuns).toEqual(pids)
       }),
     ),
   { git: true, config: cfg },

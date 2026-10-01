@@ -2,7 +2,7 @@ import { describe, expect } from "bun:test"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { Effect, Exit, Stream } from "effect"
+import { Deferred, Effect, Exit, Fiber, Option, Stream } from "effect"
 import type * as PlatformError from "effect/PlatformError"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -276,6 +276,45 @@ describe("cross-spawn spawner", () => {
         const done = yield* Effect.promise(() => gone(pid))
         expect(done).toBe(true)
       }),
+    )
+
+    fx.live(
+      "scope exit releases a child whose output consumer was interrupted before it read",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const spawned = yield* Deferred.make<number>()
+        // Interrupted straight after spawn, handle.all's merged sides may never start reading;
+        // the scope must release the child whether or not it has written anything yet.
+        const consumer = yield* Effect.gen(function* () {
+          const handle = yield* ChildProcessSpawner.ChildProcessSpawner.use((svc) =>
+            svc.spawn(
+              ChildProcess.make("/bin/sh", ["-c", "printf ready; sleep 30"], {
+                stdin: "ignore",
+                forceKillAfter: "3 seconds",
+              }),
+            ),
+          )
+          yield* Deferred.succeed(spawned, Number(handle.pid))
+          yield* Stream.runForEach(handle.all, () => Effect.void)
+        }).pipe(Effect.scoped, Effect.forkDetach)
+        const pid = yield* Deferred.await(spawned)
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            if (alive(pid)) process.kill(-pid, "SIGKILL")
+          }),
+        )
+
+        // Detached, so a release that never finishes fails this bound instead of hanging the test.
+        const released = yield* Fiber.interrupt(consumer).pipe(
+          Effect.forkDetach,
+          Effect.flatMap(Fiber.await),
+          Effect.timeoutOption("5 seconds"),
+        )
+        expect(Option.isSome(released)).toBe(true)
+        expect(alive(pid)).toBe(false)
+      }),
+      15_000,
     )
 
     fx.effect(

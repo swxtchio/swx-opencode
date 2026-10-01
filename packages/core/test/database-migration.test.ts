@@ -115,13 +115,25 @@ describe("DatabaseMigration", () => {
     )
   })
   if (process.platform === "linux") {
+    // Sized from the admitted-load measurements recorded in swxtchio/swx-opencode#117.
+    const migrationCheckBackstop = "180s"
     test("declared schema has no ungenerated migrations", async () => {
-      const result = await $`bun ${fileURLToPath(new URL("../script/migration.ts", import.meta.url))} --check`
-        .quiet()
-        .nothrow()
-      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      // Under contention from the suite's concurrent packages the real check can finish much later
+      // without being wrong, so its own exit and output are the only success signal. GNU timeout is a
+      // bounded backstop for a hung check: it signals the whole process group, drizzle-kit included,
+      // so a hang ends in a nonzero exit instead of an indefinite wait.
+      const result =
+        await $`timeout --kill-after=10s ${migrationCheckBackstop} bun ${fileURLToPath(new URL("../script/migration.ts", import.meta.url))} --check`
+          .quiet()
+          .nothrow()
+      expect(
+        result.exitCode,
+        result.exitCode === 124
+          ? `migration check gave no result within ${migrationCheckBackstop}`
+          : result.stderr.toString(),
+      ).toBe(0)
       expect(result.stdout.toString()).toContain("No schema changes, nothing to migrate")
-    }, 30_000)
+    }, 210_000)
   }
 
   test("applies tracked migrations to an empty database", async () => {

@@ -62,6 +62,11 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#115** `prompt.cancel` returns after interrupting a running shell (swxtchio/swx-opencode#110). Interrupted
+  straight after spawn, `Stream.merge`'s output sides never start, so the stdout listener they already attached is
+  left with nobody reading; in the measured hang that pipe never ended, and the spawner's release waited forever for
+  the child's `close`. The release now destroys the child's pipes after signalling it, so `close` still confirms the
+  exit. Seen on Bun 1.3.14. _Upstreamable._
 - **#108** A fresh `opencode serve` answers an HTTP request that arrives as its port opens (swxtchio/swx-abbe#441).
   `NodeHttpServer` listened before attaching its request handler, so such a request was read and never answered;
   the server now holds early HTTP requests and hands them to the handler once it attaches. Early WebSocket upgrades
@@ -122,6 +127,13 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Tests
 
+- **#115** The declared-schema migration check keeps judging the real `script/migration.ts --check`, now behind a
+  180s process-group backstop instead of a 30s test limit that a correct run exceeded under the suite's admitted
+  concurrency (swxtchio/swx-opencode#117). A schema drift still fails, and a wedged check fails at the backstop.
+  _Fork-only._
+- **#115** `routes configured machine_message_markers through prompt admission` waits for the queue to mark the
+  critical prompt promoted before asserting the held prompt is the only pending item; it read the queue as soon as
+  the message landed, before its row was marked (swxtchio/swx-opencode#114). _Fork-only._
 - **#32** Scale the e2e per-call timeouts the shared scaling did not cover. _Upstreamable._
 - **#25** Environment-sensitive tests attribute their own failures instead of reporting a synthesized timeout.
   _Upstreamable._
