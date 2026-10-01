@@ -6,9 +6,10 @@
 // and kills the process when the test scope closes. The OS-assigned port is
 // parsed off the "listening on http://..." line.
 import { describe, expect } from "bun:test"
-import { Effect } from "effect"
-import { HttpClient } from "effect/unstable/http"
-import { cliIt } from "../../lib/cli-process"
+import { Duration, Effect, Fiber, Schedule } from "effect"
+import { HttpClient, HttpClientRequest } from "effect/unstable/http"
+import { createServer } from "node:net"
+import { cliIt, deadline } from "../../lib/cli-process"
 
 describe("opencode serve (subprocess)", () => {
   // Smoke test: server starts, binds a port, and /global/health responds.
@@ -31,6 +32,70 @@ describe("opencode serve (subprocess)", () => {
         expect(body).toBeDefined()
       }),
     60_000,
+  )
+
+  // swx-abbe#441: a request that reached a fresh server as its port opened was
+  // read and never answered, because the HTTP server listened before it
+  // attached its request handler. The fixture's listening line comes after
+  // that window, so this test picks the port itself and sends its first
+  // request, the authenticated POST /session Abbe's adapter sends, as soon
+  // as the port accepts a connection.
+  cliIt.live(
+    "answers the first request sent as the port starts accepting",
+    ({ opencode, home }) =>
+      Effect.gen(function* () {
+        const port = yield* Effect.promise(freePort)
+        const password = "first-request"
+        const client = yield* HttpClient.HttpClient
+        // Effect.suspend re-runs on every retry, so this records the attempt
+        // that was finally accepted, not the first refused one.
+        const sent = { at: 0, attempts: 0 }
+        const first = yield* Effect.suspend(() => {
+          sent.at = Date.now()
+          sent.attempts++
+          return client.execute(
+            HttpClientRequest.post(`http://127.0.0.1:${port}/session`).pipe(
+              HttpClientRequest.setUrlParam("directory", home),
+              HttpClientRequest.basicAuth("opencode", password),
+              HttpClientRequest.bodyJsonUnsafe({ title: "first request" }),
+            ),
+          )
+        }).pipe(
+          // Retry only a refused connection, which the server never saw. An
+          // accepted request that is reset fails here, and one that is never
+          // answered runs into the timeout below.
+          Effect.retry({
+            while: (error) => error.reason._tag === "TransportError" && isConnectionRefused(error.reason.cause),
+            schedule: Schedule.spaced("5 millis"),
+          }),
+          Effect.flatMap((res) => Effect.map(res.json, (body) => ({ status: res.status, body }))),
+          // Kept well below the test timeout at every TIMEOUT_SCALE, so a
+          // swallowed request fails here rather than as a Bun test timeout.
+          Effect.timeout(Duration.millis(deadline(20_000))),
+          Effect.forkScoped,
+        )
+
+        yield* opencode.serve({
+          port,
+          extraArgs: ["--pure", "--print-logs"],
+          env: { OPENCODE_SERVER_PASSWORD: password },
+          readyTimeoutMs: deadline(15_000),
+        })
+        const listeningAt = Date.now()
+        const result = yield* Fiber.join(first)
+
+        // Evidence that the answered request was the server's first and came
+        // in the early window: earlier attempts were refused, so the server
+        // saw no request before it; it was sent before the listening line;
+        // and it got a session back. The send time alone does not show when
+        // the server accepted it, so the red runs against the unfixed server
+        // (a swallowed request times out above) are what tie this to the bug.
+        expect(sent.attempts).toBeGreaterThan(1)
+        expect(sent.at).toBeLessThan(listeningAt)
+        expect(result.status).toBe(200)
+        expect(result.body).toMatchObject({ id: expect.stringMatching(/^ses_/) })
+      }),
+    deadline(60_000),
   )
 
   // The scope-close finalizer must actually terminate the child. Without this
@@ -59,3 +124,26 @@ describe("opencode serve (subprocess)", () => {
     60_000,
   )
 })
+
+// Bun's fetch reports a refused connection as ConnectionRefused; Node uses
+// ECONNREFUSED.
+function isConnectionRefused(cause: unknown) {
+  return (
+    typeof cause === "object" &&
+    cause !== null &&
+    "code" in cause &&
+    (cause.code === "ConnectionRefused" || cause.code === "ECONNREFUSED")
+  )
+}
+
+function freePort() {
+  return new Promise<number>((resolve, reject) => {
+    const server = createServer()
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address()
+      const port = typeof address === "object" && address ? address.port : 0
+      server.close(() => resolve(port))
+    })
+  })
+}
