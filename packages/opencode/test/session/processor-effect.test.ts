@@ -1,4 +1,5 @@
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -7,12 +8,13 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { afterAll, expect } from "bun:test"
 import { Database as Sqlite } from "bun:sqlite"
 import { tool } from "ai"
-import { Cause, Effect, Exit, Fiber, Layer, Option, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
 import { isSqlError } from "effect/unstable/sql/SqlError"
 import { rm } from "node:fs/promises"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
+import { Config } from "@/config/config"
 import { Provider } from "@/provider/provider"
 import { BackgroundJob } from "@/background/job"
 
@@ -99,6 +101,32 @@ function providerCfg(url: string) {
     },
   }
 }
+
+const preludeInterruptGate = { entered: undefined as Deferred.Deferred<void> | undefined }
+type PreludeConfigInfo = Effect.Success<ReturnType<Config.Interface["get"]>>
+const preludeConfigInfo = Schema.decodeUnknownSync(ConfigV1.Info)(cfg) as unknown as PreludeConfigInfo
+const preludeConfigService = Config.Service.of({
+  get: () =>
+    Effect.gen(function* () {
+      const entered = preludeInterruptGate.entered
+      if (!entered) return preludeConfigInfo
+      preludeInterruptGate.entered = undefined
+      yield* Deferred.succeed(entered, undefined)
+      return yield* Effect.never
+    }),
+  getGlobal: () => Effect.succeed(preludeConfigInfo),
+  getConsoleState: () => Effect.succeed({ consoleManagedProviders: [], switchableOrgCount: 0 }),
+  update: () => Effect.void,
+  updateGlobal: () => Effect.succeed({ info: preludeConfigInfo, changed: false }),
+  invalidate: () => Effect.void,
+  directories: () => Effect.succeed([]),
+  waitForDependencies: () => Effect.void,
+})
+const preludeConfigNode = LayerNode.make({
+  service: Config.Service,
+  layer: Layer.succeed(Config.Service, preludeConfigService),
+  deps: [],
+})
 
 function routedConfig() {
   return {
@@ -233,6 +261,22 @@ const replacements = [
   [SessionSummary.node, summary],
   [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
 ] as const
+const preludeInterruptStreamCalls = { count: 0 }
+const preludeInterruptLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () => {
+      preludeInterruptStreamCalls.count++
+      return Stream.empty
+    },
+  }),
+)
+const preludeInterruptEnv = LayerNode.compile(root, [
+  ...replacements,
+  [Config.node, preludeConfigNode],
+  [LLM.node, preludeInterruptLLM],
+])
+const itPreludeInterrupt = testEffect(preludeInterruptEnv)
 
 const cleanupFault = { failed: false }
 const cleanupPartFailure = { failed: false }
@@ -1515,6 +1559,70 @@ for (const { failures, path: databasePath } of sqliteTerminalDbPaths) {
     20_000,
   )
 }
+
+itPreludeInterrupt.live("session.processor classifies a prelude interrupt as an aborted assistant", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        preludeInterruptStreamCalls.count = 0
+        preludeInterruptGate.entered = undefined
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const statuses = yield* SessionStatus.Service
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "interrupt in process prelude")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const model = yield* provider.getModel(ref.providerID, ref.modelID)
+        const errors: string[] = []
+        const off = yield* events.listen((event) => {
+          if (event.type !== Session.Event.Error.type) return Effect.void
+          const data = event.data as typeof Session.Event.Error.data.Type
+          if (data.sessionID === chat.id && data.error) errors.push(data.error.name)
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => off)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+        const entered = yield* Deferred.make<void>()
+        preludeInterruptGate.entered = entered
+        yield* Effect.addFinalizer(() => Effect.sync(() => void (preludeInterruptGate.entered = undefined)))
+        const fiber = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "interrupt in process prelude" }],
+          tools: {},
+        }).pipe(Effect.forkChild)
+
+        // Config.get is the prelude immediately before the stream's onInterrupt handler is installed.
+        yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"))
+        yield* Fiber.interrupt(fiber)
+        const exit = yield* Fiber.await(fiber)
+        const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+        yield* off
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(preludeInterruptStreamCalls.count).toBe(0)
+        expect((yield* statuses.get(chat.id)).type).toBe("idle")
+        expect(stored.info.role).toBe("assistant")
+        if (stored.info.role === "assistant") {
+          expect(stored.info.time.completed).toBeDefined()
+          expect(stored.info.error?.name).toBe("MessageAbortedError")
+        }
+        expect(errors).toEqual(["MessageAbortedError"])
+      }),
+    { config: cfg },
+  ),
+  20_000,
+)
 
 it.live("session.processor effect tests record aborted errors and idle state", () =>
   provideTmpdirServer(

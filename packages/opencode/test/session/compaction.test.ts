@@ -12,6 +12,7 @@ import { LLM } from "../../src/session/llm"
 import { SessionCompaction } from "../../src/session/compaction"
 import { Token } from "@/util/token"
 import { Plugin } from "../../src/plugin"
+import { Snapshot } from "@/snapshot"
 import { provideTmpdirInstance, TestInstance } from "../fixture/fixture"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -215,6 +216,7 @@ function processorLayer(result: "continue" | "compact") {
     SessionProcessorModule.SessionProcessor.Service,
     SessionProcessorModule.SessionProcessor.Service.of({
       create: Effect.fn("TestSessionProcessor.create")((input) => Effect.succeed(fake(input, result))),
+      finalizeFailure: () => Effect.void,
     }),
   )
 }
@@ -271,6 +273,19 @@ const compactionCleanupFaultSession = LayerNode.make({
     ),
   ),
   deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
+})
+const snapshotTrackFailure = { triggered: false }
+const failingSnapshotTrack = LayerNode.make({
+  service: Snapshot.Service,
+  layer: Layer.mock(Snapshot.Service)({
+    track: () => {
+      if (snapshotTrackFailure.triggered) return Effect.succeed(undefined)
+      return Effect.sync(() => void (snapshotTrackFailure.triggered = true)).pipe(
+        Effect.andThen(Effect.die(new Error("one-shot Snapshot.track failure"))),
+      )
+    },
+  }),
+  deps: [],
 })
 
 const env = AppNodeBuilder.build(compactionTestNode, [
@@ -1386,6 +1401,66 @@ describe("session.compaction.process", () => {
             [SessionSummary.node, summary],
             [LLM.node, stub.llmLayer],
             [SessionNs.node, compactionCleanupFaultSession],
+          ]),
+        ),
+      )
+    },
+    { git: true },
+    { timeout: 10_000 },
+  )
+
+  itCompaction.instance(
+    "terminalizes the summary when snapshot setup fails",
+    () => {
+      const stub = llm()
+      return Effect.gen(function* () {
+        snapshotTrackFailure.triggered = false
+        const ssn = yield* SessionNs.Service
+        const events = yield* EventV2Bridge.Service
+        const status = yield* SessionStatus.Service
+        const session = yield* ssn.create({})
+        const parent = yield* createUserMessage(session.id, "hello")
+        const messages = yield* ssn.messages({ sessionID: session.id })
+        const errors: string[] = []
+        const off = yield* events.listen((event) => {
+          if (event.type !== SessionNs.Event.Error.type) return Effect.void
+          const data = event.data as typeof SessionNs.Event.Error.data.Type
+          if (data.sessionID === session.id && data.error) errors.push(data.error.name)
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => off)
+
+        const exit = yield* Effect.exit(
+          SessionCompaction.use.process({
+            parentID: parent.id,
+            messages,
+            sessionID: session.id,
+            auto: false,
+          }),
+        )
+        const stored = yield* ssn.messages({ sessionID: session.id })
+        const assistant = stored.findLast((item) => item.info.role === "assistant" && item.info.summary)
+
+        expect(snapshotTrackFailure.triggered).toBe(true)
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect((yield* status.get(session.id)).type).toBe("idle")
+        expect(assistant?.info.role).toBe("assistant")
+        if (assistant?.info.role === "assistant") {
+          expect(assistant.info.time.completed).toBeDefined()
+          expect(assistant.info.error?.name).toBe("UnknownError")
+          if (assistant.info.error?.name === "UnknownError") {
+            expect(assistant.info.error.data.message).toContain("one-shot Snapshot.track failure")
+          }
+        }
+        expect(errors).toEqual(["UnknownError"])
+      }).pipe(
+        Effect.provide(
+          AppNodeBuilder.build(compactionTestNode, [
+            [Provider.node, defaultProvider.layer],
+            [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
+            [SessionSummary.node, summary],
+            [LLM.node, stub.llmLayer],
+            [Snapshot.node, failingSnapshotTrack],
           ]),
         ),
       )

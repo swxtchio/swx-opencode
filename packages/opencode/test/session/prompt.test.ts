@@ -182,24 +182,64 @@ const lsp = Layer.succeed(
 )
 
 const processorCreateStarted: Array<() => void> = []
-const blockingProcessor = Layer.succeed(
-  SessionProcessor.Service,
-  SessionProcessor.Service.of({
-    create: () => Effect.sync(() => processorCreateStarted.shift()?.()).pipe(Effect.andThen(Effect.never)),
-  }),
+const processorImplementation = SessionProcessor.node.implementation
+if (!processorImplementation) throw new Error("SessionProcessor node has no implementation")
+const processorDependencies = [
+  Session.node,
+  Config.node,
+  Snapshot.node,
+  AgentSvc.node,
+  LLM.node,
+  Permission.node,
+  Plugin.node,
+  SessionSummary.node,
+  SessionStatus.node,
+  Image.node,
+  EventV2Bridge.node,
+  Database.node,
+  ProviderSvc.node,
+] as const
+function processorWithCreate(create: SessionProcessor.Interface["create"]) {
+  return LayerNode.make({
+    service: SessionProcessor.Service,
+    layer: Layer.effect(
+      SessionProcessor.Service,
+      Effect.gen(function* () {
+        const real = yield* SessionProcessor.Service
+        return SessionProcessor.Service.of({ ...real, create })
+      }),
+    ).pipe(
+      Layer.provide(
+        processorImplementation as Layer.Layer<
+          SessionProcessor.Service,
+          never,
+          | Session.Service
+          | Config.Service
+          | Snapshot.Service
+          | AgentSvc.Service
+          | LLM.Service
+          | Permission.Service
+          | Plugin.Service
+          | SessionSummary.Service
+          | SessionStatus.Service
+          | Image.Service
+          | EventV2Bridge.Service
+          | Database.Service
+          | ProviderSvc.Service
+        >,
+      ),
+    ),
+    deps: processorDependencies,
+  })
+}
+const blockingProcessor = processorWithCreate(() =>
+  Effect.sync(() => processorCreateStarted.shift()?.()).pipe(Effect.andThen(Effect.never)),
 )
 
 const runtimeFlags = RuntimeFlags.layer({ experimentalEventSystem: true })
 
 const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })
-const processorCreateDie = LayerNode.make({
-  service: SessionProcessor.Service,
-  layer: Layer.succeed(
-    SessionProcessor.Service,
-    SessionProcessor.Service.of({ create: () => Effect.die(new Error("processor creation defect")) }),
-  ),
-  deps: [],
-})
+const processorCreateDie = processorWithCreate(() => Effect.die(new Error("processor creation defect")))
 
 const promptRoot = LayerNode.group([
   SessionPrompt.node,

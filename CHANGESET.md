@@ -60,7 +60,8 @@ Newest first. Each entry names the upstream range brought in.
 ### Runtime fixes
 
 - **#88** Retry SQLite BUSY/LOCKED statements with a bounded driver schedule and serialized same-connection
-  backoff; terminalize failed assistant turns when writes recover, including interrupted compaction cleanup; preserve
+  backoff; terminalize failed assistant turns when writes recover, including prelude interrupts and compaction
+  setup/cleanup failures; preserve
   completed answers through later cleanup failures, publish follow-up persistence errors without replacing existing
   provider errors, stop failed overflow turns before compaction, and show idle or absent-status sessions with
   non-terminal assistant rows as failed or unknown, respectively, in the TUI while busy/retry statuses remain

@@ -74,8 +74,16 @@ type Input = {
   model: Provider.Model
 }
 
+type FailureInput = {
+  assistantMessage: SessionV1.Assistant
+  cause?: Cause.Cause<unknown>
+  error?: NonNullable<SessionV1.Assistant["error"]>
+  terminalize?: boolean
+}
+
 export interface Interface {
   readonly create: (input: Input) => Effect.Effect<Handle>
+  readonly finalizeFailure: (input: FailureInput) => Effect.Effect<void>
 }
 
 type ToolCall = {
@@ -83,6 +91,12 @@ type ToolCall = {
   messageID: SessionV1.ToolPart["messageID"]
   sessionID: SessionV1.ToolPart["sessionID"]
   done: Deferred.Deferred<void>
+}
+
+type FinalizationState = {
+  terminalMessagePersisted: boolean
+  persistedTerminalError: SessionV1.Assistant["error"]
+  publishedFailures: Set<string>
 }
 
 interface ProcessorContext extends Input {
@@ -116,6 +130,67 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const database = yield* Database.Service
     const provider = yield* Provider.Service
+    const finalizations = new WeakMap<SessionV1.Assistant, FinalizationState>()
+    const finalizationState = (message: SessionV1.Assistant) => {
+      const existing = finalizations.get(message)
+      if (existing) return existing
+      const state: FinalizationState = {
+        terminalMessagePersisted: false,
+        persistedTerminalError: undefined,
+        publishedFailures: new Set(),
+      }
+      finalizations.set(message, state)
+      return state
+    }
+
+    const publishFailure = Effect.fnUntraced(function* (
+      message: SessionV1.Assistant,
+      error: NonNullable<SessionV1.Assistant["error"]>,
+    ) {
+      const state = finalizationState(message)
+      const key = JSON.stringify(error) ?? error.name
+      if (state.publishedFailures.has(key)) return
+      yield* events.publish(Session.Event.Error, { sessionID: message.sessionID, error })
+      state.publishedFailures.add(key)
+    })
+
+    const finalizeFailure = Effect.fn("SessionProcessor.finalizeFailure")(function* (input: FailureInput) {
+      const message = input.assistantMessage
+      const state = finalizationState(message)
+      const interrupted = input.cause
+        ? Cause.hasInterruptsOnly(input.cause)
+        : input.error?.name === "MessageAbortedError"
+      const error = input.error ??
+        (input.cause
+          ? interrupted
+            ? MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
+                providerID: message.providerID,
+                aborted: true,
+              })
+            : MessageV2.fromError(Cause.squash(input.cause), { providerID: message.providerID })
+          : undefined)
+      if (!error) return yield* Effect.die(new Error("failure finalization requires a cause or error"))
+
+      if (
+        state.terminalMessagePersisted &&
+        message.time.completed !== undefined &&
+        !message.error &&
+        (!input.terminalize || interrupted)
+      ) {
+        if (!interrupted) yield* publishFailure(message, error)
+        return
+      }
+
+      message.error ??= state.persistedTerminalError ?? error
+      message.time.completed ??= Date.now()
+      if (!state.terminalMessagePersisted || state.persistedTerminalError !== message.error) {
+        yield* session.updateMessage(message)
+        state.terminalMessagePersisted = true
+        state.persistedTerminalError = message.error
+      }
+      yield* publishFailure(message, interrupted ? (message.error ?? error) : error)
+      if ((yield* status.get(message.sessionID)).type !== "idle") yield* status.set(message.sessionID, { type: "idle" })
+    })
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -135,17 +210,7 @@ const layer = Layer.effect(
         reasoningMap: {},
       }
       let aborted = false
-      let terminalMessagePersisted = false
-      let persistedTerminalError: SessionV1.Assistant["error"]
-      const publishedFailures = new Set<string>()
-
-      const publishFailure = (error: NonNullable<SessionV1.Assistant["error"]>) =>
-        Effect.gen(function* () {
-          const key = JSON.stringify(error) ?? error.name
-          if (publishedFailures.has(key)) return
-          yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
-          publishedFailures.add(key)
-        })
+      const finalization = finalizationState(ctx.assistantMessage)
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
@@ -693,8 +758,8 @@ const layer = Layer.effect(
         ctx.assistantMessage.time.completed = Date.now()
         const messageExit = yield* attempt(session.updateMessage(ctx.assistantMessage))
         if (Exit.isSuccess(messageExit)) {
-          terminalMessagePersisted = true
-          persistedTerminalError = ctx.assistantMessage.error
+          finalization.terminalMessagePersisted = true
+          finalization.persistedTerminalError = ctx.assistantMessage.error
         }
         if (cleanupFailure) yield* Effect.failCause(cleanupFailure).pipe(Effect.orDie)
       })
@@ -715,44 +780,21 @@ const layer = Layer.effect(
           if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
             ctx.assistantMessage.error = error
             ctx.assistantMessage.finish = "error"
-            yield* publishFailure(error)
+            yield* publishFailure(ctx.assistantMessage, error)
             yield* status.set(ctx.sessionID, { type: "idle" })
             return
           }
           ctx.needsCompaction = true
-          yield* publishFailure(error)
+          yield* publishFailure(ctx.assistantMessage, error)
           return
         }
         ctx.assistantMessage.error = error
-        yield* publishFailure(error)
+        yield* publishFailure(ctx.assistantMessage, error)
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
-      const finalizeFailure = Effect.fn("SessionProcessor.finalizeFailure")(function* (
-        cause: Cause.Cause<unknown>,
-        terminalize = false,
-      ) {
-        const error = MessageV2.fromError(Cause.squash(cause), { providerID: ctx.assistantMessage.providerID })
-        if (
-          terminalMessagePersisted &&
-          ctx.assistantMessage.time.completed !== undefined &&
-          !ctx.assistantMessage.error &&
-          (!terminalize || Cause.hasInterruptsOnly(cause))
-        ) {
-          if (!Cause.hasInterruptsOnly(cause)) yield* publishFailure(error)
-          return
-        }
-
-        ctx.assistantMessage.error ??= error
-        ctx.assistantMessage.time.completed ??= Date.now()
-        if (!terminalMessagePersisted || persistedTerminalError !== ctx.assistantMessage.error) {
-          yield* session.updateMessage(ctx.assistantMessage)
-          terminalMessagePersisted = true
-          persistedTerminalError = ctx.assistantMessage.error
-        }
-        if (!Cause.hasInterruptsOnly(cause)) yield* publishFailure(error)
-        if ((yield* status.get(ctx.sessionID)).type !== "idle") yield* status.set(ctx.sessionID, { type: "idle" })
-      })
+      const finalizeHandleFailure = (cause: Cause.Cause<unknown>, terminalize = false) =>
+        finalizeFailure({ assistantMessage: ctx.assistantMessage, cause, terminalize })
 
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
         return yield* Effect.gen(function* () {
@@ -814,9 +856,9 @@ const layer = Layer.effect(
           // Keep cleanup failures in this terminalization path so they cannot return a pending compaction.
           Effect.catchCauseIf(
             (cause) => !Cause.hasInterruptsOnly(cause),
-            (cause) => finalizeFailure(cause, true).pipe(Effect.as("stop" as const)),
+            (cause) => finalizeHandleFailure(cause, true).pipe(Effect.as("stop" as const)),
           ),
-          Effect.onExit((exit) => (Exit.isFailure(exit) ? finalizeFailure(exit.cause, true) : Effect.void)),
+          Effect.onExit((exit) => (Exit.isFailure(exit) ? finalizeHandleFailure(exit.cause, true) : Effect.void)),
         )
       })
 
@@ -826,12 +868,12 @@ const layer = Layer.effect(
         },
         updateToolCall,
         completeToolCall,
-        finalizeFailure,
+        finalizeFailure: finalizeHandleFailure,
         process,
       } satisfies Handle
     })
 
-    return Service.of({ create })
+    return Service.of({ create, finalizeFailure })
   }),
 )
 

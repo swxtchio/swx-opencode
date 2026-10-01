@@ -1305,45 +1305,22 @@ const layer = Layer.effect(
             time: { created: Date.now() },
             sessionID,
           }
-          let promptFailure: NonNullable<SessionV1.Assistant["error"]> | undefined
-          let failedAssistantPersisted = false
-          let failureEventPublished = false
           yield* sessions.updateMessage(msg)
 
-          const finalizeInterruptedAssistant = Effect.gen(function* () {
-            if (msg.time.completed) return
-            msg.error ??= MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
+          const finalizeInterruptedAssistant = processor.finalizeFailure({
+            assistantMessage: msg,
+            error: MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
               providerID: msg.providerID,
               aborted: true,
-            })
-            msg.time.completed = Date.now()
-            yield* sessions.updateMessage(msg)
+            }),
+            terminalize: true,
           })
 
-          const publishFailure = (error: NonNullable<typeof msg.error>) =>
-            Effect.gen(function* () {
-              if (failureEventPublished) return
-              yield* events.publish(Session.Event.Error, { sessionID, error })
-              failureEventPublished = true
-            })
-
-          // This fallback covers processor creation failures before its shared Handle finalizer exists.
           const finalizeFailedAssistant = (cause: Cause.Cause<unknown>) =>
-            Effect.gen(function* () {
-              const error = MessageV2.fromError(Cause.squash(cause), { providerID: msg.providerID })
-              const failure = (promptFailure ??= error)
-              if (msg.time.completed !== undefined && !msg.error) {
-                yield* publishFailure(failure)
-                return
-              }
-
-              msg.error ??= error
-              msg.time.completed ??= Date.now()
-              if (!failedAssistantPersisted) {
-                yield* sessions.updateMessage(msg)
-                failedAssistantPersisted = true
-              }
-              yield* publishFailure(failure)
+            processor.finalizeFailure({
+              assistantMessage: msg,
+              cause,
+              terminalize: true,
             })
 
           const handle = yield* processor
