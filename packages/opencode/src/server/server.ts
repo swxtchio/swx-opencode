@@ -228,9 +228,12 @@ function serverLayer(opts: { port: number; hostname: string }) {
 // handler only when HttpRouter.serve runs, after the route layers build. Node
 // drops a request emitted with no listener, so a request that reached a fresh
 // server in that window was never answered (swx-abbe#441). Hold such requests
-// and hand them to the handler once it attaches. Upgrades are not held: none
-// can succeed as a listener's first request, since a PTY connect needs a PTY
-// created through that listener and a workspace proxy needs its sync running.
+// and hand them to the handler once it attaches. This covers HTTP requests
+// only. An early WebSocket upgrade is not held or answered: on Bun 1.3.14 an
+// upgrade that arrives before the upgrade handler emits no event at all. None
+// can succeed as a listener's first request anyway, since a PTY connect needs a
+// PTY created through that listener and a workspace proxy needs its sync
+// running. On 1.3.14 a rejected upgrade goes unanswered even later (#109).
 function holdRequestsUntilServed(server: Server) {
   const held: [IncomingMessage, ServerResponse][] = []
   const hold = (request: IncomingMessage, response: ServerResponse) => {
