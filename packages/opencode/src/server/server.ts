@@ -5,7 +5,7 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { ConfigProvider, Context, Effect, Exit, Layer, Scope } from "effect"
 import { HttpRouter, HttpServer } from "effect/unstable/http"
 import { OpenApi } from "effect/unstable/httpapi"
-import { createServer } from "node:http"
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http"
 import { MDNS } from "./mdns"
 import { HttpApiApp } from "./routes/instance/httpapi/server"
 import { disposeMiddleware } from "./routes/instance/httpapi/lifecycle"
@@ -198,6 +198,7 @@ function forceClose(state: ListenerState) {
 
 function serverLayer(opts: { port: number; hostname: string }) {
   const server = createServer()
+  holdRequestsUntilServed(server)
   const serverRef = { closeStarted: false, forceStop: false }
   const close = server.close.bind(server)
   // Keep shutdown owned by NodeHttpServer, but honor listener.stop(true) by
@@ -221,6 +222,31 @@ function serverLayer(opts: { port: number; hostname: string }) {
       }),
     ),
   )
+}
+
+// NodeHttpServer listens while its layer builds, but attaches its request
+// handler only when HttpRouter.serve runs, after the route layers build. Node
+// drops a request emitted with no listener, so a request that reached a fresh
+// server in that window was never answered (swx-abbe#441). Hold such requests
+// and hand them to the handler once it attaches. This covers HTTP requests
+// only. An early WebSocket upgrade is not held or answered: on Bun 1.3.14 an
+// upgrade that arrives before the upgrade handler emits no event at all. None
+// can succeed as a listener's first request anyway, since a PTY connect needs a
+// PTY created through that listener and a workspace proxy needs its sync
+// running. On 1.3.14 a rejected upgrade goes unanswered even later (#109).
+function holdRequestsUntilServed(server: Server) {
+  const held: [IncomingMessage, ServerResponse][] = []
+  const hold = (request: IncomingMessage, response: ServerResponse) => {
+    held.push([request, response])
+  }
+  server.on("request", hold)
+  server.on("newListener", function replay(name: string | symbol, listener: typeof hold) {
+    if (name !== "request") return
+    server.off("newListener", replay)
+    server.off("request", hold)
+    // Replay after `on` returns, so the handler is attached when it runs.
+    queueMicrotask(() => held.splice(0).forEach(([request, response]) => listener.call(server, request, response)))
+  })
 }
 
 export * as Server from "./server"
