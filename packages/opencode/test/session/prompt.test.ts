@@ -1786,20 +1786,28 @@ it.instance(
           parts: [{ type: "text", text: criticalText }],
         })
         .pipe(Effect.forkChild)
-      yield* pollWithTimeout(
-        sessions
-          .messages({ sessionID: session.id })
-          .pipe(
-            Effect.map((messages) =>
-              messages.some((message) => message.info.role === "user" && message.info.id === criticalID)
-                ? true
-                : undefined,
-            ),
-          ),
+      // A promotion writes the message before it marks the row promoted, so wait until the queue
+      // itself stops listing the critical prompt instead of reading the queue once the message lands.
+      const admitted = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const pending = yield* queue.list(session.id)
+          if (pending.some((item) => item.input.messageID === criticalID)) return undefined
+          const messages = yield* sessions.messages({ sessionID: session.id })
+          return messages.some((message) => message.info.role === "user" && message.info.id === criticalID)
+            ? { pending, messages }
+            : undefined
+        }),
         "configured critical marker did not promote the prompt",
         "30 seconds",
       )
-      expect((yield* queue.list(session.id)).map((item) => item.input.messageID)).toEqual([heldID])
+      expect(admitted.pending.map((item) => [item.input.messageID, item.delivery])).toEqual([[heldID, "queue"]])
+      expect(
+        admitted.messages.some(
+          (message) =>
+            message.info.role === "user" &&
+            message.parts.some((part) => part.type === "text" && part.text === heldText),
+        ),
+      ).toBe(false)
 
       yield* Deferred.succeed(toolGate, void 0)
       yield* awaitWithTimeout(llm.wait(2), "configured critical prompt did not reach the next step", "30 seconds")

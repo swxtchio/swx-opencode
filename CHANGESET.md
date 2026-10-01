@@ -127,6 +127,9 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Tests
 
+- **#115** `routes configured machine_message_markers through prompt admission` waits for the queue to mark the
+  critical prompt promoted before asserting the held prompt is the only pending item; it read the queue as soon as
+  the message landed, before its row was marked (swxtchio/swx-opencode#114). _Fork-only._
 - **#32** Scale the e2e per-call timeouts the shared scaling did not cover. _Upstreamable._
 - **#25** Environment-sensitive tests attribute their own failures instead of reporting a synthesized timeout.
   _Upstreamable._
