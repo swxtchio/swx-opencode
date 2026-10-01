@@ -152,7 +152,9 @@ const table = sqliteTable("session", {
 
 - Avoid mocks as much as possible, you shouldn't be using globalThis.\* at all unless it's the only option.
 - Test actual implementation, do not duplicate logic into tests
-- Tests cannot run from repo root (guard: `do-not-run-tests-from-root`); run from package dirs like `packages/opencode`.
+- `bun test` and `npm test` refuse at the repo root (guard: `do-not-run-tests-from-root`). Run one package's tests
+  from its directory, like `packages/opencode`, or the whole unit suite with `tests/run.sh`, which runs every
+  package's `test` through turbo as CI does and passes extra arguments on (`tests/run.sh --filter=@opencode-ai/core`).
 
 ## Type Checking
 

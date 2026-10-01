@@ -40,6 +40,11 @@ export const Flag = {
   OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: Config.boolean("OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER").pipe(
     Config.withDefault(false),
   ),
+  // How long a root watch may wait for its subscription acknowledgement before
+  // it is reported unconfirmed. It only changes the report; the ack decides active.
+  OPENCODE_EXPERIMENTAL_WATCHER_SUBSCRIBE_TIMEOUT_MS: Config.int(
+    "OPENCODE_EXPERIMENTAL_WATCHER_SUBSCRIBE_TIMEOUT_MS",
+  ).pipe(Config.withDefault(10_000)),
   OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT:
     copy === undefined ? process.platform === "win32" : truthy("OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT"),
   OPENCODE_MODELS_URL: process.env["OPENCODE_MODELS_URL"],
