@@ -15,8 +15,10 @@ const generated = await import("./generate.ts")
 
 await Bun.build({
   target: "node",
-  entrypoints: ["./src/node.ts"],
+  // The watcher resolves its parcel worker as ./parcel-worker.js beside the bundle.
+  entrypoints: ["./src/node.ts", "../core/src/filesystem/parcel-worker.ts"],
   outdir: "./dist/node",
+  naming: "[name].[ext]",
   format: "esm",
   sourcemap: "linked",
   external: ["jsonc-parser", "@lydell/node-pty"],

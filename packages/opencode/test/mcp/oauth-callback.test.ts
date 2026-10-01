@@ -62,13 +62,14 @@ describe("McpOAuthCallback.ensureRunning", () => {
   })
 
   test("starts server with custom redirectUri port and path", async () => {
-    await McpOAuthCallback.ensureRunning("http://127.0.0.1:18000/custom/callback")
+    await McpOAuthCallback.ensureRunning(`http://127.0.0.1:${await getFreeLoopbackPort()}/custom/callback`)
     expect(McpOAuthCallback.isRunning()).toBe(true)
   })
 
   test("stops after the callback completes", async () => {
-    const redirectUri = "http://127.0.0.1:18003/custom/callback"
+    const redirectUri = `http://127.0.0.1:${await getFreeLoopbackPort()}/custom/callback`
     await McpOAuthCallback.ensureRunning(redirectUri)
+    expect(McpOAuthCallback.isRunning()).toBe(true)
     const callback = McpOAuthCallback.waitForCallback("success")
 
     const response = await fetch(`${redirectUri}?code=code&state=success`)
@@ -79,8 +80,9 @@ describe("McpOAuthCallback.ensureRunning", () => {
   })
 
   test("escapes provider error markup in callback HTML", async () => {
-    const redirectUri = "http://127.0.0.1:18001/custom/callback"
+    const redirectUri = `http://127.0.0.1:${await getFreeLoopbackPort()}/custom/callback`
     await McpOAuthCallback.ensureRunning(redirectUri)
+    expect(McpOAuthCallback.isRunning()).toBe(true)
 
     const error = `<script>alert("xss" & 'more')</script>`
     const response = await fetch(
@@ -94,8 +96,9 @@ describe("McpOAuthCallback.ensureRunning", () => {
   })
 
   test("keeps normal provider errors readable", async () => {
-    const redirectUri = "http://127.0.0.1:18002/custom/callback"
+    const redirectUri = `http://127.0.0.1:${await getFreeLoopbackPort()}/custom/callback`
     await McpOAuthCallback.ensureRunning(redirectUri)
+    expect(McpOAuthCallback.isRunning()).toBe(true)
 
     const response = await fetch(
       `${redirectUri}?state=test&error=access_denied&error_description=${encodeURIComponent("The user denied access")}`,
