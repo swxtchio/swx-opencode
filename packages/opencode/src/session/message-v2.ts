@@ -630,7 +630,10 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
   return filterCompacted(yield* stream(sessionID))
 })
 
-export const snapshot = Effect.fnUntraced(function* (sessionID: SessionID) {
+export const snapshot = Effect.fnUntraced(function* (
+  sessionID: SessionID,
+  afterMessages?: () => Effect.Effect<void>,
+) {
   const { db } = yield* Database.Service
   return yield* db.transaction((tx) =>
     Effect.gen(function* () {
@@ -662,8 +665,10 @@ export const snapshot = Effect.fnUntraced(function* (sessionID: SessionID) {
       for (let index = 0; index < rows.length; index += pageSize) {
         messages.push(...(yield* hydrate(tx, rows.slice(index, index + pageSize))))
       }
+      const filtered = filterCompacted(messages)
+      if (afterMessages) yield* afterMessages()
       return {
-        messages: filterCompacted(messages),
+        messages: filtered,
         admissionOrder: new Map(rows.map((row) => [row.id, row.admission_seq])),
       }
     }),

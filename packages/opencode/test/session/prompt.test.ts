@@ -5294,6 +5294,7 @@ gated.instance(
       yield* llm.push(
         reply().wait(deferredAsPromise(toolResponse)).tool("glob", { pattern: "round18-root.txt" }).item(),
         reply().text("root-pinned task finished").stop().item(),
+        reply().text("held root-pinned noReply handled").stop().item(),
       )
 
       gates.noReplyWrite = { entered: writeEntered, release: writeRelease }
@@ -5315,22 +5316,34 @@ gated.instance(
         "10 seconds",
       )
       expect(Exit.isSuccess(yield* run.assertNotBusy(session.id).pipe(Effect.exit))).toBe(true)
+
+      const active = yield* prompt
+        .loop({ sessionID: session.id, messageID: root.info.id })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        run.assertNotBusy(session.id).pipe(
+          Effect.exit,
+          Effect.map((exit) => (Exit.isFailure(exit) ? true : undefined)),
+        ),
+        "root-pinned run did not start during the post-recheck write",
+        "10 seconds",
+      )
+
       yield* Deferred.succeed(writeRelease, undefined)
       const direct = yield* awaitWithTimeout(
         Fiber.join(noReply),
-        "idle marked noReply did not finish its direct write",
+        "rechecked marked noReply did not finish its direct write",
         "10 seconds",
       )
       if (direct.info.role !== "user") throw new Error("expected the direct noReply user")
       expect(direct.info.noReply).toBe(true)
       expect(
         (yield* sessions.messages({ sessionID: session.id })).some((message) => message.info.id === messageID),
-      ).toBe(true)
-      expect(yield* queue.list(session.id)).toEqual([])
+      ).toBe(false)
+      const pending = (yield* queue.list(session.id)).find((item) => item.input.messageID === messageID)
+      if (!pending) throw new Error("marked noReply was not queued after the run started during its write")
+      expect(pending.delivery).toBe("queue")
 
-      const active = yield* prompt
-        .loop({ sessionID: session.id, messageID: root.info.id })
-        .pipe(Effect.forkChild)
       yield* awaitWithTimeout(llm.wait(1), "root-pinned provider request did not start", "10 seconds")
       const first = (yield* llm.inputs)[0]
       if (!first) throw new Error("expected the root-pinned first request")
@@ -5341,14 +5354,115 @@ gated.instance(
       const continuation = (yield* llm.inputs)[1]
       if (!continuation) throw new Error("expected the root-pinned continuation request")
       expect(JSON.stringify(continuation.messages)).not.toContain("root-pinned machine mail")
+
+      yield* awaitWithTimeout(llm.wait(3), "rechecked marked noReply did not get its later turn", "10 seconds")
+      const held = (yield* llm.inputs)[2]
+      if (!held) throw new Error("expected the queued marked noReply turn")
+      expect(JSON.stringify(held.messages)).toContain("root-pinned machine mail")
       const exit = yield* awaitWithTimeout(Fiber.await(active), "root-pinned run did not finish", "10 seconds")
       expect(Exit.isSuccess(exit)).toBe(true)
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const promoted = messages.find(
+        (message) =>
+          message.info.role === "user" &&
+          message.parts.some((part) => part.type === "text" && part.text === markedText),
+      )
+      if (!promoted || promoted.info.role !== "user") throw new Error("expected the queued noReply row to remain in history")
+      expect(promoted.info.noReply).toBeUndefined()
+      expect(
+        messages.some((message) => message.info.role === "assistant" && message.info.parentID === promoted.info.id),
+      ).toBe(true)
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(yield* llm.calls).toBe(3)
+    }),
+  60_000,
+)
+
+it.instance(
+  "keeps an idle marked noReply out of a gate-free root-pinned tool continuation",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Gate-free root-pinned noReply continuation",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const toolPath = path.join(dir, "round18-gate-free-root.txt")
+      yield* writeText(toolPath, "root-pinned tool continuation")
+      const root = yield* seedUser({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        parts: said("gate-free root-pinned task"),
+      })
+      const messageID = MessageID.ascending()
+      const markedText = "[fm-from-firstmate]\x1f gate-free rootful machine mail"
+      const markerContent = "gate-free rootful machine mail"
+      const direct = yield* prompt.prompt({
+        sessionID: session.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: said(markedText),
+      })
+      if (direct.info.role !== "user") throw new Error("expected the direct idle noReply user")
+      expect(direct.info.noReply).toBe(true)
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(yield* llm.calls).toBe(0)
+      const config = yield* Config.Service
+      const markers = (yield* config.get()).machine_message_markers
+      expect(MachineMessage.classify(markedText, markers)).toBe("hold")
+      const history = yield* MessageV2.snapshot(session.id)
+      expect(history.admissionOrder.get(root.info.id)).toBeLessThan(history.admissionOrder.get(messageID) ?? Infinity)
+      const persisted = history.messages.find((message) => message.info.id === messageID)
+      if (!persisted || persisted.info.role !== "user") throw new Error("expected the marked noReply history row")
+      expect(persisted.info.noReply).toBe(true)
+      expect(
+        MachineMessage.classify(
+          persisted.parts
+            .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
+            .join(""),
+          markers,
+        ),
+      ).toBe("hold")
+
+      yield* llm.push(
+        reply().tool("glob", { pattern: "round18-gate-free-root.txt" }).item(),
+        reply().text("root-pinned task finished").stop().item(),
+      )
+      const run = yield* prompt.loop({ sessionID: session.id, messageID: root.info.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "gate-free root-pinned provider request did not start", "10 seconds")
+      const first = (yield* llm.inputs)[0]
+      if (!first) throw new Error("expected the gate-free root-pinned first request")
+      expect(JSON.stringify(first.messages)).not.toContain(markerContent)
+
+      yield* awaitWithTimeout(llm.wait(2), "gate-free root-pinned continuation did not start", "10 seconds")
+      const continuation = (yield* llm.inputs)[1]
+      if (!continuation) throw new Error("expected the gate-free root-pinned continuation")
+      expect(JSON.stringify(continuation.messages)).not.toContain(markerContent)
+      const exit = yield* awaitWithTimeout(Fiber.await(run), "gate-free root-pinned run did not finish", "10 seconds")
+      expect(Exit.isSuccess(exit)).toBe(true)
+
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const retained = messages.find(
+        (message) => message.info.role === "user" && message.info.id === messageID,
+      )
+      if (!retained || retained.info.role !== "user") throw new Error("expected the idle noReply row to remain persisted")
+      expect(retained.info.noReply).toBe(true)
+      expect(
+        messages.some((message) => message.info.role === "assistant" && message.info.parentID === messageID),
+      ).toBe(false)
+      expect(yield* queue.list(session.id)).toEqual([])
       expect(yield* llm.calls).toBe(2)
     }),
   60_000,
 )
 
-it.instance("does not combine a pre-cleanup history with a post-cleanup admission map", () =>
+it.instance("keeps message history and admission order coherent across revert cleanup", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
@@ -5373,15 +5487,8 @@ it.instance("does not combine a pre-cleanup history with a post-cleanup admissio
       summary: { additions: 0, deletions: 0, files: 0 },
     })
 
-    const staleMessages = yield* MessageV2.filterCompactedEffect(session.id)
-    const snapshot = yield* MessageV2.snapshot(session.id)
     const info = yield* sessions.get(session.id)
-    yield* revert.cleanup(info)
-    const postCleanupAdmission = yield* MessageV2.admission(session.id)
-
-    expect(() =>
-      MessageV2.latest(staleMessages, { admissionOrder: postCleanupAdmission.order, excludeNoReply: true }),
-    ).toThrow(/Missing persisted admission order/)
+    const snapshot = yield* MessageV2.snapshot(session.id, () => revert.cleanup(info))
     expect(
       MessageV2.latest(snapshot.messages, { admissionOrder: snapshot.admissionOrder, excludeNoReply: true }).user?.id,
     ).toBe(removed.info.id)
@@ -5951,6 +6058,7 @@ shellQueuedLoopPrompt.instance(
       Effect.gen(function* () {
         const { directory: dir } = yield* TestInstance
         const { llm } = yield* useServerConfig(providerCfg)
+        const db = (yield* Database.Service).db
         const prompt = yield* SessionPrompt.Service
         const compaction = yield* SessionCompaction.Service
         const sessions = yield* Session.Service
@@ -5973,10 +6081,44 @@ shellQueuedLoopPrompt.instance(
           .shell({
             sessionID: session.id,
             agent: "build",
-            command: `while [ ! -f "${releaseFile}" ]; do sleep 0.01; done`,
+            command: `while [ ! -f "${releaseFile}" ]; do sleep 0.01; done; printf 'round18-shell-persisted'`,
           })
           .pipe(Effect.forkChild)
-        yield* waitForBusy(session.id)
+        const persistedShell = yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const messages = yield* sessions.messages({ sessionID: session.id })
+            const user = messages.find(
+              (message) =>
+                message.info.role === "user" &&
+                message.parts.some(
+                  (part) =>
+                    part.type === "text" &&
+                    part.synthetic === true &&
+                    part.text === "The following tool was executed by the user",
+                ),
+            )
+            const tool = messages.find(
+              (message) =>
+                message.info.role === "assistant" &&
+                message.parts.some((part) => part.type === "tool" && part.state.status === "running"),
+            )
+            if (!user || user.info.role !== "user" || !tool || tool.info.role !== "assistant") return undefined
+            return { user, tool }
+          }),
+          "shell user/part and running tool were not persisted before compaction.create",
+          "10 seconds",
+        )
+        const shellCreated = Date.now() + 60_000
+        yield* sessions.updateMessage({
+          ...persistedShell.user.info,
+          time: { ...persistedShell.user.info.time, created: shellCreated },
+        })
+        yield* db
+          .update(MessageTable)
+          .set({ time_created: shellCreated })
+          .where(eq(MessageTable.id, persistedShell.user.info.id))
+          .run()
+          .pipe(Effect.orDie)
 
         const rootMessageID = yield* compaction.create({
           sessionID: session.id,
@@ -5984,6 +6126,22 @@ shellQueuedLoopPrompt.instance(
           model: ref,
           auto: false,
         })
+        const historySnapshot = yield* MessageV2.snapshot(session.id)
+        const admission = historySnapshot.admissionOrder
+        const shellUserOrder = admission.get(persistedShell.user.info.id)
+        const shellToolOrder = admission.get(persistedShell.tool.info.id)
+        const compactionOrder = admission.get(rootMessageID)
+        if (shellUserOrder === undefined || shellToolOrder === undefined || compactionOrder === undefined)
+          throw new Error("expected persisted admission order for shell and compaction messages")
+        expect(shellUserOrder).toBeLessThan(compactionOrder)
+        expect(shellToolOrder).toBeLessThan(compactionOrder)
+        expect(
+          MessageV2.latest(historySnapshot.messages, {
+            admissionOrder: historySnapshot.admissionOrder,
+            excludeNoReply: true,
+          }).user?.id,
+        ).toBe(rootMessageID)
+
         const loop = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
         yield* llm.text("initiating compaction completed")
         yield* writeText(releaseFile, "release")
@@ -6013,8 +6171,16 @@ shellQueuedLoopPrompt.instance(
         yield* awaitWithTimeout(llm.wait(1), "queued compaction did not reach the provider", "10 seconds")
         const request = (yield* llm.inputs)[0]
         if (!request) throw new Error("expected the queued compaction provider request")
-        expect(JSON.stringify(request.messages)).toContain("rootless compaction history")
-        expect(JSON.stringify(request.messages)).not.toContain("later noReply input")
+        const providerHistory = JSON.stringify(request.messages)
+        const positions = [
+          providerHistory.indexOf("rootless compaction history"),
+          providerHistory.indexOf("The following tool was executed by the user"),
+          providerHistory.indexOf("round18-shell-persisted"),
+        ]
+        if (positions.some((position) => position < 0))
+          throw new Error(`provider history sections were missing or reordered: ${positions.join(",")}`)
+        expect(positions).toEqual([...positions].sort((a, b) => a - b))
+        expect(providerHistory).not.toContain("later noReply input")
 
         const loopExit = yield* awaitWithTimeout(
           Fiber.await(loop),

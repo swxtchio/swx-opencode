@@ -38,14 +38,15 @@ export class WithdrawnError extends Schema.TaggedErrorClass<WithdrawnError>()("S
 export interface Interface {
   readonly admit: (input: AdmitInput) => Effect.Effect<Item>
   /**
-   * Prepare under the session lock, recheck run state, then either persist the
-   * noReply message directly or admit it for the next boundary.
+   * Prepare under the session lock, recheck run state around a direct write,
+   * and queue it if a run starts while the message is being persisted.
    */
   readonly writeOrAdmit: <P, E>(input: {
     readonly admission: AdmitInput
     readonly isBusy: Effect.Effect<boolean>
     readonly prepare: Effect.Effect<P, E>
     readonly write: (prepared: P) => Effect.Effect<SessionV1.WithParts>
+    readonly discard: (message: SessionV1.WithParts) => Effect.Effect<void>
   }) => Effect.Effect<
     | { readonly kind: "direct"; readonly message: SessionV1.WithParts }
     | { readonly kind: "queued"; readonly own: Item; readonly prepared: P },
@@ -241,7 +242,24 @@ const layer = Layer.effect(
               own: yield* admitLocked(input.admission),
               prepared,
             }
-          return { kind: "direct" as const, message: yield* input.write(prepared) }
+          const existing = input.admission.messageID
+            ? yield* db
+                .select({ id: MessageTable.id })
+                .from(MessageTable)
+                .where(eq(MessageTable.id, input.admission.messageID))
+                .get()
+                .pipe(Effect.orDie)
+            : undefined
+          const message = yield* input.write(prepared)
+          if (yield* input.isBusy) {
+            if (!existing) yield* input.discard(message)
+            return {
+              kind: "queued" as const,
+              own: yield* admitLocked(existing ? Struct.omit(input.admission, ["messageID"]) : input.admission),
+              prepared,
+            }
+          }
+          return { kind: "direct" as const, message }
         }),
       )
 

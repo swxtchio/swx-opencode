@@ -1119,6 +1119,7 @@ const layer = Layer.effect(
               isBusy: state.assertNotBusy(input.sessionID).pipe(Effect.exit, Effect.map(Exit.isFailure)),
               prepare: prepareUserMessage(queuedInput),
               write: writeUserMessage,
+              discard: (message) => sessions.removeMessage({ sessionID: input.sessionID, messageID: message.info.id }),
             })
           : undefined
       const heldNoReply =
