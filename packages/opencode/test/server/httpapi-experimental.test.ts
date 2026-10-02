@@ -1,6 +1,8 @@
 import { afterEach, describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Deferred, Effect, Fiber, Layer } from "effect"
+import { AppProcess } from "@opencode-ai/core/process"
+import { stat } from "node:fs/promises"
+import { Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { eq } from "drizzle-orm"
 import { GlobalBus, type GlobalEvent } from "@/bus/global"
@@ -14,10 +16,51 @@ import { Worktree } from "../../src/worktree"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
-import { httpApiLayer, requestInDirectory } from "./httpapi-layer"
+import { awaitWithTimeout } from "../lib/effect"
+import { httpApiLayer, httpApiLayerWithAppReplacements, requestInDirectory } from "./httpapi-layer"
 
 const it = testEffect(Layer.mergeAll(LayerNode.compile(LayerNode.group([Session.node, Database.node])), httpApiLayer))
 const testWorktreeMutations = process.platform === "win32" ? it.instance.skip : it.instance
+let failWorktreeReset: string | undefined
+
+const failingAppProcess = Layer.effect(
+  AppProcess.Service,
+  Effect.gen(function* () {
+    const appProcess = yield* AppProcess.Service
+    return AppProcess.Service.of({
+      ...appProcess,
+      run: (command, options) => {
+        if (
+          failWorktreeReset &&
+          command._tag === "StandardCommand" &&
+          command.command === "git" &&
+          command.args[0] === "reset" &&
+          command.args[1] === "--hard" &&
+          command.options.cwd !== failWorktreeReset
+        ) {
+          failWorktreeReset = undefined
+          return Effect.succeed({
+            command: "git reset --hard",
+            exitCode: 1,
+            stdout: Buffer.alloc(0),
+            stderr: Buffer.from("simulated HttpApi checkout failure"),
+            stdoutTruncated: false,
+            stderrTruncated: false,
+          } satisfies AppProcess.RunResult)
+        }
+        return appProcess.run(command, options)
+      },
+    })
+  }),
+).pipe(Layer.provide(LayerNode.compile(AppProcess.node)))
+
+const failedWorktreeIt = testEffect(
+  Layer.mergeAll(
+    LayerNode.compile(LayerNode.group([Session.node, Database.node])),
+    httpApiLayerWithAppReplacements([[AppProcess.node, failingAppProcess]]),
+  ),
+)
+const failedWorktreeMutation = process.platform === "win32" ? failedWorktreeIt.instance.skip : failedWorktreeIt.instance
 
 function request(path: string, directory: string, init: RequestInit = {}) {
   return requestInDirectory(path, directory, init)
@@ -50,6 +93,38 @@ function waitReady(input: { directory?: string; name?: string }) {
         orElse: () => Effect.fail(new Error("timed out waiting for worktree.ready")),
       }),
     )
+  })
+}
+
+function watchWorktreeTerminal() {
+  return Effect.gen(function* () {
+    const events: GlobalEvent[] = []
+    const waiters = new Map<string, Deferred.Deferred<GlobalEvent>>()
+    const on = (event: GlobalEvent) => {
+      if (event.payload.type !== Worktree.Event.Ready.type && event.payload.type !== Worktree.Event.Failed.type) return
+      events.push(event)
+      const waiting = event.directory ? waiters.get(event.directory) : undefined
+      if (waiting) Deferred.doneUnsafe(waiting, Effect.succeed(event))
+    }
+    GlobalBus.on("event", on)
+    yield* Effect.addFinalizer(() => Effect.sync(() => GlobalBus.off("event", on)))
+
+    return (directory: string) =>
+      Effect.gen(function* () {
+        const waiting = yield* Deferred.make<GlobalEvent>()
+        const existing = yield* Effect.sync(() => {
+          const event = events.find((item) => item.directory === directory)
+          if (event) return event
+          waiters.set(directory, waiting)
+          return undefined
+        })
+        if (existing) return existing
+        return yield* awaitWithTimeout(
+          Deferred.await(waiting),
+          `worktree create did not publish a terminal event for ${directory}`,
+          "5 seconds",
+        )
+      })
   })
 }
 
@@ -294,5 +369,82 @@ describe("experimental HttpApi", () => {
         expect(yield* json(afterRemove)).toEqual([])
       }),
     { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  failedWorktreeMutation(
+    "reports a background worktree failure and cleans it through the HttpApi",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const terminal = yield* watchWorktreeTerminal()
+        failWorktreeReset = tmp.directory
+        yield* Effect.addFinalizer(() => Effect.sync(() => (failWorktreeReset = undefined)).pipe(Effect.asVoid))
+
+        const createdResult = yield* Effect.exit(
+          awaitWithTimeout(
+            request(ExperimentalPaths.worktree, tmp.directory, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ name: "api-failed-checkout" }),
+            }),
+            "HttpApi worktree.create did not return after setup",
+            "5 seconds",
+          ),
+        )
+        expect(Exit.isSuccess(createdResult)).toBe(true)
+        if (Exit.isFailure(createdResult)) return
+        const created = createdResult.value
+        expect(created.status).toBe(200)
+        const info = yield* json<Worktree.Info>(created)
+        yield* Effect.addFinalizer(() =>
+          request(ExperimentalPaths.worktree, tmp.directory, {
+            method: "DELETE",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ directory: info.directory }),
+          }).pipe(Effect.ignore),
+        )
+
+        const failedResult = yield* Effect.exit(
+          awaitWithTimeout(terminal(info.directory), "HttpApi worktree failure was not observed", "5 seconds"),
+        )
+        expect(Exit.isSuccess(failedResult)).toBe(true)
+        if (Exit.isFailure(failedResult)) return
+        const failed = failedResult.value
+        expect(failed.payload.type).toBe(Worktree.Event.Failed.type)
+        expect(failed.payload.properties.message).toContain("simulated HttpApi checkout failure")
+
+        const removedResult = yield* Effect.exit(
+          awaitWithTimeout(
+            request(ExperimentalPaths.worktree, tmp.directory, {
+              method: "DELETE",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ directory: info.directory }),
+            }),
+            "HttpApi worktree.remove did not complete after the failed create",
+            "5 seconds",
+          ),
+        )
+        expect(Exit.isSuccess(removedResult)).toBe(true)
+        if (Exit.isFailure(removedResult)) return
+        const removed = removedResult.value
+        expect(removed.status).toBe(200)
+        expect(yield* json<boolean>(removed)).toBe(true)
+        const listedResult = yield* Effect.exit(
+          awaitWithTimeout(
+            request(ExperimentalPaths.worktree, tmp.directory),
+            "HttpApi worktree.list did not complete after cleanup",
+            "5 seconds",
+          ),
+        )
+        expect(Exit.isSuccess(listedResult)).toBe(true)
+        if (Exit.isFailure(listedResult)) return
+        const listed = listedResult.value
+        expect(listed.status).toBe(200)
+        expect(yield* json<Worktree.Info[]>(listed)).toEqual([])
+        const directoryExists = yield* Effect.promise(() => stat(info.directory).then(() => true, () => false))
+        expect(directoryExists).toBe(false)
+      }),
+      { git: true, config: { formatter: false, lsp: false } },
+      { timeout: 15_000 },
   )
 })

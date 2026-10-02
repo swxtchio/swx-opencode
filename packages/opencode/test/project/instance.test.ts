@@ -1,13 +1,13 @@
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { registerDisposer } from "../../src/effect/instance-registry"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
-import { tmpdirScoped } from "../fixture/fixture"
-import { awaitWithTimeout, testEffect } from "../lib/effect"
+import { TestInstance, tmpdirScoped } from "../fixture/fixture"
+import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 
 let bootstrapRun: Effect.Effect<void> = Effect.void
 const noopBootstrap = Layer.succeed(
@@ -138,7 +138,11 @@ describe("InstanceStore", () => {
 
       const loading = yield* store.load({ directory: dir }).pipe(Effect.forkScoped)
       yield* awaitWithTimeout(Deferred.await(started), "instance bootstrap did not start")
-      yield* awaitWithTimeout(store.disposeDirectory(dir), "disposeDirectory waited for a pending instance load")
+      yield* awaitWithTimeout(
+        store.disposeDirectory(dir),
+        "disposeDirectory waited for a pending instance load",
+        "8 seconds",
+      )
 
       const exit = yield* Fiber.await(loading)
       expect(Exit.isFailure(exit)).toBe(true)
@@ -162,11 +166,93 @@ describe("InstanceStore", () => {
 
       const loading = yield* store.load({ directory: dir }).pipe(Effect.forkScoped)
       yield* awaitWithTimeout(Deferred.await(started), "instance bootstrap did not start")
-      yield* awaitWithTimeout(store.disposeAll(), "disposeAll waited for a pending instance load")
+      yield* awaitWithTimeout(store.disposeAll(), "disposeAll waited for a pending instance load", "8 seconds")
 
       const exit = yield* Fiber.await(loading)
       expect(Exit.isFailure(exit)).toBe(true)
     }),
+  )
+
+  it.instance(
+    "bounds disposal of a bootstrap that ignores interruption and quarantines later loads",
+    () =>
+      Effect.gen(function* () {
+        const root = yield* TestInstance
+        const instance = yield* InstanceRef
+        if (!instance) return yield* Effect.die(new Error("test instance context missing"))
+        const store = yield* InstanceStore.Service
+        const directory = `${root.directory}/non-cooperative-load`
+        const input = { directory, project: instance.project, worktree: instance.worktree }
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const finished = yield* Deferred.make<void>()
+
+        yield* setBootstrap(
+          Effect.gen(function* () {
+            if ((yield* InstanceRef)?.directory !== directory) return
+            yield* Deferred.succeed(started, undefined)
+            yield* Effect.uninterruptible(
+              Effect.gen(function* () {
+                yield* Deferred.await(release)
+                yield* Deferred.succeed(finished, undefined)
+              }),
+            )
+          }),
+        )
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
+
+        const loading = yield* store.load(input).pipe(Effect.forkScoped)
+        yield* awaitWithTimeout(Deferred.await(started), "non-cooperative bootstrap did not start")
+        const removing = yield* store.disposeDirectory(directory).pipe(Effect.forkDetach)
+        const removal = yield* Effect.exit(
+          awaitWithTimeout(
+            Fiber.await(removing),
+            "disposal did not return after its stop-confirmation bound",
+            "20 seconds",
+          ),
+        )
+        expect(Exit.isSuccess(removal)).toBe(true)
+        const loadExit = yield* Effect.exit(
+          awaitWithTimeout(Fiber.await(loading), "load waiter did not settle after disposal", "2 seconds"),
+        )
+
+        const blocked = yield* Effect.exit(
+          awaitWithTimeout(
+            Effect.exit(store.load(input)),
+            "orphaned load retry did not fail promptly",
+            "2 seconds",
+          ),
+        )
+
+        expect(Exit.isSuccess(loadExit)).toBe(true)
+        if (Exit.isSuccess(loadExit)) expect(Exit.isFailure(loadExit.value)).toBe(true)
+        expect(Exit.isSuccess(blocked)).toBe(true)
+        if (Exit.isSuccess(blocked)) {
+          expect(Exit.isFailure(blocked.value)).toBe(true)
+          if (Exit.isFailure(blocked.value))
+            expect(Cause.pretty(blocked.value.cause)).toContain("instance load is still running")
+        }
+
+        yield* Deferred.succeed(release, undefined)
+        yield* awaitWithTimeout(Deferred.await(finished), "non-cooperative bootstrap did not leave its hold")
+        const recovered = yield* pollWithTimeout(
+          store.load(input).pipe(
+            Effect.as(true),
+            Effect.catchCause(() => Effect.succeed(undefined)),
+          ),
+          "the completed orphan was not cleared for a later load",
+        )
+        expect(recovered).toBe(true)
+        yield* store.disposeDirectory(directory)
+
+        if (Exit.isSuccess(removal)) {
+          expect(Exit.isFailure(removal.value)).toBe(true)
+          if (Exit.isFailure(removal.value))
+            expect(Cause.pretty(removal.value.cause)).toContain("instance load did not stop")
+        }
+      }),
+      { git: true },
+      { timeout: 30_000 },
   )
 
   it.live("removes failed loads from the cache", () =>

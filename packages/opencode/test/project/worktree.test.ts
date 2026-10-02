@@ -11,7 +11,7 @@ import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
 import { Worktree } from "../../src/worktree"
 import { disposeAllInstances, provideInstance, TestInstance } from "../fixture/fixture"
-import { awaitWithTimeout, testEffect } from "../lib/effect"
+import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 
 const it = testEffect(
   LayerNode.compile(LayerNode.group([Worktree.node, FSUtil.node, Git.node]), [
@@ -92,6 +92,16 @@ const failedBootstrap = Layer.succeed(
 const failedBootstrapIt = testEffect(
   LayerNode.compile(LayerNode.group([Worktree.node, FSUtil.node, Git.node]), [
     [InstanceStore.bootstrapNode, failedBootstrap],
+  ]),
+)
+let controlledBootstrapRun: Effect.Effect<void> = Effect.void
+const controlledBootstrap = Layer.succeed(
+  InstanceBootstrap.Service,
+  InstanceBootstrap.Service.of({ run: Effect.suspend(() => controlledBootstrapRun) }),
+)
+const nonCooperativeBootstrapIt = testEffect(
+  LayerNode.compile(LayerNode.group([Worktree.node, FSUtil.node, Git.node]), [
+    [InstanceStore.bootstrapNode, controlledBootstrap],
   ]),
 )
 
@@ -400,6 +410,103 @@ describe("Worktree", () => {
           expect(yield* fs.exists(info.directory)).toBe(false)
         }),
       { git: true },
+    )
+
+    nonCooperativeBootstrapIt.instance(
+      "refuses worktree deletion until an uninterruptible bootstrap stops",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const store = yield* InstanceStore.Service
+          const expected = yield* svc.makeWorktreeInfo({ name: "non-cooperative-bootstrap" })
+          const started = yield* Deferred.make<void>()
+          const release = yield* Deferred.make<void>()
+          const finished = yield* Deferred.make<void>()
+          let createdDirectory: string | undefined
+          let removalFiber: Fiber.Fiber<boolean, Worktree.Error> | undefined
+
+          controlledBootstrapRun = Effect.gen(function* () {
+            if ((yield* InstanceRef)?.directory !== expected.directory) return
+            yield* Effect.uninterruptible(
+              Effect.gen(function* () {
+                yield* Deferred.succeed(started, undefined)
+                yield* Deferred.await(release)
+                yield* Deferred.succeed(finished, undefined)
+              }),
+            )
+          })
+          yield* Effect.addFinalizer(() =>
+            Effect.gen(function* () {
+              controlledBootstrapRun = Effect.void
+              yield* Deferred.succeed(release, undefined).pipe(Effect.asVoid)
+              if (removalFiber) {
+                yield* Fiber.await(removalFiber).pipe(
+                  Effect.timeoutOrElse({ duration: "20 seconds", orElse: () => Effect.succeed(undefined) }),
+                  Effect.asVoid,
+                )
+              }
+              if (createdDirectory) yield* removeCreatedWorktree(createdDirectory).pipe(Effect.ignore)
+            }),
+          )
+
+          const info = yield* svc.create({ name: expected.name })
+          createdDirectory = info.directory
+          expect(info.directory).toBe(expected.directory)
+          yield* awaitWithTimeout(Deferred.await(started), "worktree bootstrap did not start")
+
+          removalFiber = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkDetach)
+          const removalResult = yield* Effect.exit(
+            awaitWithTimeout(
+              Fiber.await(removalFiber),
+              "worktree removal did not report its stop-confirmation failure",
+              "20 seconds",
+            ),
+          )
+          expect(Exit.isSuccess(removalResult)).toBe(true)
+          if (Exit.isFailure(removalResult)) return
+          const removal = removalResult.value
+          expect(Exit.isFailure(removal)).toBe(true)
+          if (Exit.isFailure(removal)) {
+            expect(Cause.squash(removal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
+            expect(Cause.pretty(removal.cause)).toContain("instance load did not stop")
+          }
+          expect(yield* fs.exists(info.directory)).toBe(true)
+          expect(normalize(yield* git(test.directory, ["worktree", "list", "--porcelain"]))).toContain(
+            normalize(info.directory),
+          )
+          const blocked = yield* Effect.exit(
+            awaitWithTimeout(
+              Effect.exit(store.load({ directory: info.directory })),
+              "post-registration retry did not reject the still-running bootstrap",
+              "2 seconds",
+            ),
+          )
+          expect(Exit.isSuccess(blocked)).toBe(true)
+          if (Exit.isSuccess(blocked)) {
+            expect(Exit.isFailure(blocked.value)).toBe(true)
+            if (Exit.isFailure(blocked.value))
+              expect(Cause.pretty(blocked.value.cause)).toContain("instance load is still running")
+          }
+
+          yield* Deferred.succeed(release, undefined)
+          yield* awaitWithTimeout(Deferred.await(finished), "worktree bootstrap did not leave its hold")
+          const loaded = yield* pollWithTimeout(
+            store.load({ directory: info.directory }).pipe(
+              Effect.as(true),
+              Effect.catchCause(() => Effect.succeed(undefined)),
+            ),
+            "the stopped bootstrap did not clear its cache quarantine",
+            "5 seconds",
+          )
+          expect(loaded).toBe(true)
+
+          expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(false)
+        }),
+      { git: true },
+      { timeout: 30_000 },
     )
 
     it.instance(

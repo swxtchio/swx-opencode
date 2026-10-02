@@ -322,8 +322,11 @@ const layer: Layer.Layer<
         Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.succeed(false) }),
       )
       if (!registered) return yield* new RemoveFailedError({ message: `Worktree boot did not register: ${directory}` })
-      if (!entry.fiber) return
-      const stopped = yield* Fiber.interrupt(entry.fiber).pipe(
+      const fiber = entry.fiber
+      if (!fiber) return
+      // Fiber.interrupt joins its target; observe the exit separately after requesting cancellation.
+      yield* Effect.sync(() => fiber.interruptUnsafe(Fiber.getCurrent()?.id))
+      const stopped = yield* Fiber.await(fiber).pipe(
         Effect.as(true),
         Effect.timeoutOrElse({
           duration: "5 seconds",
@@ -444,7 +447,13 @@ const layer: Layer.Layer<
       if (directory !== (yield* canonical(ctx.worktree))) {
         // InstanceStore has no entry until boot reaches load, so stop the producer first.
         yield* stopBoot(directory)
-        yield* store.disposeDirectory(input.directory)
+        yield* store.disposeDirectory(input.directory).pipe(
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
+            const message = errorMessage(Cause.squash(cause)) || "Failed to dispose worktree instance"
+            return Effect.fail(new RemoveFailedError({ message }))
+          }),
+        )
       }
 
       const list = yield* git(["worktree", "list", "--porcelain"], { cwd: ctx.worktree })

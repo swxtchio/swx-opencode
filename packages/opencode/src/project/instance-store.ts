@@ -6,7 +6,7 @@ import { WorkspaceContext } from "@/control-plane/workspace-context"
 import { InstanceRef } from "@/effect/instance-ref"
 import { disposeInstance as runDisposers } from "@/effect/instance-registry"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Context, Deferred, Duration, Effect, Exit, Fiber, Layer, Scope } from "effect"
+import { Cause, Context, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
 import { type InstanceContext } from "./instance-context"
 import { InstanceBootstrap } from "./bootstrap-service"
 import * as Project from "./project"
@@ -34,6 +34,7 @@ interface Entry {
   readonly deferred: Deferred.Deferred<InstanceContext>
   readonly loadFiber: Deferred.Deferred<Fiber.Fiber<void>>
   context?: InstanceContext
+  previous?: Entry
 }
 
 const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Service> = Layer.effect(
@@ -41,8 +42,8 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
   Effect.gen(function* () {
     const project = yield* Project.Service
     const bootstrap = yield* InstanceBootstrap.Service
-    const scope = yield* Scope.Scope
     const cache = new Map<string, Entry>()
+    const orphaned = new Map<string, Set<Entry>>()
 
     const boot = (input: LoadInput & { directory: string }) =>
       Effect.gen(function* () {
@@ -75,6 +76,11 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const exit = yield* Effect.exit(restore(work))
+          if (yield* Deferred.isDone(entry.deferred)) {
+            if (Exit.isSuccess(exit)) yield* disposeContext(exit.value)
+            if (Exit.isFailure(exit)) yield* Effect.promise(() => runDisposers(directory))
+            return
+          }
           if (Exit.isFailure(exit)) yield* removeEntry(directory, entry)
           else entry.context = exit.value
           yield* Deferred.done(entry.deferred, exit).pipe(Effect.asVoid)
@@ -110,25 +116,93 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       return true
     })
 
-    const settleLoad = Effect.fnUntraced(function* (directory: string, entry: Entry) {
-      if (!(yield* Deferred.isDone(entry.deferred))) {
-        // The boot fiber is independent of the load waiters, so settle it before reading the deferred.
-        const fiber = yield* Deferred.await(entry.loadFiber).pipe(
-          Effect.timeoutOrElse({
-            duration: "5 seconds",
-            orElse: () => Effect.die(new Error(`instance load did not register: ${directory}`)),
-          }),
-        )
-        yield* Fiber.interrupt(fiber).pipe(
-          Effect.timeoutOrElse({
-            duration: "5 seconds",
-            orElse: () => Effect.die(new Error(`instance load did not stop: ${directory}`)),
-          }),
-        )
-        if (!(yield* Deferred.isDone(entry.deferred))) {
-          yield* removeEntry(directory, entry)
-          return yield* Effect.die(new Error(`instance load stopped without settling: ${directory}`))
+    const abandonLoads = Effect.fnUntraced(function* (
+      directory: string,
+      loads: Array<{ entry: Entry; fiber?: Fiber.Fiber<void> }>,
+      reason: string,
+    ) {
+      const error = new Error(`instance load ${reason}: ${directory}`)
+      yield* Effect.sync(() => {
+        const blocked = orphaned.get(directory) ?? new Set<Entry>()
+        for (const load of loads) {
+          if (!load.fiber || load.fiber.pollUnsafe() === undefined) {
+            blocked.add(load.entry)
+            if (load.fiber) {
+              load.fiber.addObserver(() => {
+                const current = orphaned.get(directory)
+                if (!current) return
+                current.delete(load.entry)
+                if (current.size === 0) orphaned.delete(directory)
+              })
+            }
+          }
+          if (cache.get(directory) === load.entry) cache.delete(directory)
+          if (!Deferred.isDoneUnsafe(load.entry.deferred)) {
+            Deferred.doneUnsafe(load.entry.deferred, Effect.die(error))
+          }
         }
+        if (blocked.size > 0) orphaned.set(directory, blocked)
+      })
+      return yield* Effect.die(error)
+    })
+
+    const settleLoad = Effect.fnUntraced(function* (directory: string, entry: Entry) {
+      if (yield* Deferred.isDone(entry.deferred)) return yield* Deferred.await(entry.deferred).pipe(Effect.exit)
+      if (orphaned.has(directory))
+        return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
+      const entries: Entry[] = []
+      for (let current: Entry | undefined = entry; current; current = current.previous) entries.push(current)
+      const fibers = yield* Effect.forEach(
+        entries,
+        (item) =>
+          Deferred.await(item.loadFiber).pipe(
+            Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.succeed(undefined) }),
+          ),
+        { concurrency: "unbounded" },
+      )
+      const unregistered = entries.flatMap((item, index) => (fibers[index] ? [] : [{ entry: item }]))
+      if (unregistered.length > 0) return yield* abandonLoads(directory, unregistered, "did not register")
+
+      const registered = entries.flatMap((item, index) => {
+        const fiber = fibers[index]
+        return fiber ? [{ entry: item, fiber }] : []
+      })
+      const settled = yield* Effect.forEach(
+        registered,
+        (item) =>
+          Fiber.await(item.fiber).pipe(
+            Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.succeed(undefined) }),
+          ),
+        { concurrency: "unbounded" },
+      )
+      const pending = registered.filter((_, index) => settled[index] === undefined)
+      if (pending.length > 0) {
+        yield* Effect.sync(() => {
+          const interruptor = Fiber.getCurrent()?.id
+          pending.forEach((item) => item.fiber.interruptUnsafe(interruptor))
+        })
+        const stopped = yield* Effect.forEach(
+          pending,
+          (item) =>
+            Fiber.await(item.fiber).pipe(
+              Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.succeed(undefined) }),
+            ),
+          { concurrency: "unbounded" },
+        )
+        const unconfirmed = pending.filter((_, index) => stopped[index] === undefined)
+        if (unconfirmed.length > 0) return yield* abandonLoads(directory, unconfirmed, "did not stop")
+      }
+
+      const unresolved = entries.filter((item) => !Deferred.isDoneUnsafe(item.deferred))
+      if (unresolved.length > 0) {
+        return yield* abandonLoads(
+          directory,
+          unresolved.map((item) => ({
+            entry: item,
+            fiber: fibers[entries.indexOf(item)],
+          })),
+          "stopped without publishing its exit",
+        )
       }
       return yield* Deferred.await(entry.deferred).pipe(Effect.exit)
     })
@@ -137,6 +211,9 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       const directory = FSUtil.resolve(input.directory)
       return Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
+          if (orphaned.has(directory)) {
+            return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
+          }
           const existing = cache.get(directory)
           if (existing) return yield* restore(Deferred.await(existing.deferred))
 
@@ -152,7 +229,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
               yield* Effect.logInfo("creating instance", { directory: directory })
               return yield* boot({ ...input, directory })
             }),
-          ).pipe(Effect.forkIn(scope, { startImmediately: true }))
+          ).pipe(Effect.forkDetach({ startImmediately: true }))
           yield* Deferred.succeed(entry.loadFiber, fiber)
           return yield* restore(Deferred.await(entry.deferred))
         }),
@@ -163,10 +240,14 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       const directory = FSUtil.resolve(input.directory)
       return Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
+          if (orphaned.has(directory)) {
+            return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
+          }
           const previous = cache.get(directory)
           const entry: Entry = {
             deferred: Deferred.makeUnsafe<InstanceContext>(),
             loadFiber: Deferred.makeUnsafe<Fiber.Fiber<void>>(),
+            ...(previous ? { previous } : {}),
           }
           cache.set(directory, entry)
           const fiber = yield* completeEntry(
@@ -181,7 +262,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
               }
               return yield* boot({ ...input, directory })
             }),
-          ).pipe(Effect.forkIn(scope, { startImmediately: true }))
+          ).pipe(Effect.forkDetach({ startImmediately: true }))
           yield* Deferred.succeed(entry.loadFiber, fiber)
           return yield* restore(Deferred.await(entry.deferred))
         }),
@@ -189,6 +270,8 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     }
 
     const dispose = Effect.fn("InstanceStore.dispose")(function* (ctx: InstanceContext) {
+      if (orphaned.has(ctx.directory))
+        return yield* Effect.die(new Error(`instance load is still running for ${ctx.directory}`))
       const entry = cache.get(ctx.directory)
       if (!entry) return yield* disposeContext(ctx)
       if (entry.context !== ctx) return
@@ -201,6 +284,8 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
 
     const disposeDirectory = Effect.fn("InstanceStore.disposeDirectory")(function* (input: string) {
       const directory = FSUtil.resolve(input)
+      if (orphaned.has(directory))
+        return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
       const entry = cache.get(directory)
       if (!entry) return
       const exit = yield* settleLoad(directory, entry)
