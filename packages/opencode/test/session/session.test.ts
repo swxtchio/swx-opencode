@@ -344,6 +344,10 @@ describe("Session writes racing removal", () => {
           .pipe(Effect.asVoid, Effect.exit)
         return { removeMessage, removePart }
       }).pipe(Effect.forkChild)
+      // On every exit, let a parked writer go and stop waiting for it.
+      yield* Effect.addFinalizer(() =>
+        Deferred.succeed(removed, undefined).pipe(Effect.andThen(Fiber.interrupt(writer))),
+      )
 
       yield* awaitDeferred(obtained, "timed out waiting for the writer to obtain the Session")
       yield* session.remove(info.id)
@@ -378,6 +382,8 @@ describe("Session writes racing removal", () => {
       const writer = yield* session
         .setTitle({ sessionID: info.id, title: "late" })
         .pipe(Effect.withTracer(spans.tracer), Effect.exit, Effect.forkChild)
+      // On every exit, let a held writer go and stop waiting for it.
+      yield* Effect.addFinalizer(() => hold.disarm.pipe(Effect.andThen(Fiber.interrupt(writer))))
 
       yield* awaitDeferredEffect(hold.reached, "timed out waiting for setTitle to read the Session")
       yield* session.remove(info.id)

@@ -1837,6 +1837,16 @@ describe("session HttpApi writes racing removal", () => {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     })
 
+  // A bound on reaching the hold, well clear of the real work some routes do first (revert snapshots the
+  // worktree); reaching it is the signal, so this only decides how long a broken route takes to fail.
+  const ready = "30 seconds"
+  const racing = 60_000
+
+  // Lets a held request continue and stops waiting for it on every exit, so a failed race never leaves a server
+  // request parked behind the hold.
+  const released = (release: Effect.Effect<void>, response: Fiber.Fiber<unknown, unknown>) =>
+    release.pipe(Effect.andThen(Fiber.interrupt(response)), Effect.asVoid)
+
   // Holds the request right after `hold` (a Session read under a named span) and removes the Session there. A
   // request that lost the race must answer the route's declared not found, never success or a 500, and leave no
   // aggregate behind.
@@ -1849,14 +1859,16 @@ describe("session HttpApi writes racing removal", () => {
       const hold = yield* racingSpans.arm(input.hold)
       const response = yield* input.request.pipe(Effect.forkChild)
 
-      yield* awaitWithTimeout(hold.reached, `request never read the Session under ${input.hold.parent}`)
-      yield* Session.use.remove(input.sessionID)
-      yield* hold.release
-      const answered = yield* Fiber.join(response)
+      yield* Effect.gen(function* () {
+        yield* awaitWithTimeout(hold.reached, `request never read the Session under ${input.hold.parent}`, ready)
+        yield* Session.use.remove(input.sessionID)
+        yield* hold.release
+        const answered = yield* Fiber.join(response)
 
-      expect(answered.status).toBe(404)
-      expect(yield* responseJson(answered)).toMatchObject({ name: "NotFoundError" })
-      expect(yield* aggregate(input.sessionID)).toEqual({ seq: -1, events: 0 })
+        expect(answered.status).toBe(404)
+        expect(yield* responseJson(answered)).toMatchObject({ name: "NotFoundError" })
+        expect(yield* aggregate(input.sessionID)).toEqual({ seq: -1, events: 0 })
+      }).pipe(Effect.ensuring(released(hold.disarm, response)))
     })
 
   // Session.patch reads the Session and then publishes; these hold a setter between the two.
@@ -1879,6 +1891,7 @@ describe("session HttpApi writes racing removal", () => {
         })
       }),
     options,
+    racing,
   )
 
   itRacing.instance(
@@ -1904,16 +1917,19 @@ describe("session HttpApi writes racing removal", () => {
           metadata: { late: true },
         }).pipe(Effect.forkChild)
 
-        yield* awaitWithTimeout(Deferred.await(titled), "update never committed its title")
-        yield* Session.use.remove(created.id)
-        yield* Deferred.succeed(removed, undefined)
-        const answered = yield* Fiber.join(response)
+        yield* Effect.gen(function* () {
+          yield* awaitWithTimeout(Deferred.await(titled), "update never committed its title", ready)
+          yield* Session.use.remove(created.id)
+          yield* Deferred.succeed(removed, undefined)
+          const answered = yield* Fiber.join(response)
 
-        expect(answered.status).toBe(404)
-        expect(yield* responseJson(answered)).toMatchObject({ name: "NotFoundError" })
-        expect(yield* aggregate(created.id)).toEqual({ seq: -1, events: 0 })
+          expect(answered.status).toBe(404)
+          expect(yield* responseJson(answered)).toMatchObject({ name: "NotFoundError" })
+          expect(yield* aggregate(created.id)).toEqual({ seq: -1, events: 0 })
+        }).pipe(Effect.ensuring(released(Deferred.succeed(removed, undefined).pipe(Effect.asVoid), response)))
       }),
     options,
+    racing,
   )
 
   itRacing.instance(
@@ -1934,6 +1950,7 @@ describe("session HttpApi writes racing removal", () => {
         })
       }),
     options,
+    racing,
   )
 
   itRacing.instance(
@@ -1954,6 +1971,7 @@ describe("session HttpApi writes racing removal", () => {
         })
       }),
     options,
+    racing,
   )
 
   itRacing.instance(
@@ -1975,6 +1993,7 @@ describe("session HttpApi writes racing removal", () => {
         })
       }),
     options,
+    racing,
   )
 
   itRacing.instance(
@@ -1993,6 +2012,7 @@ describe("session HttpApi writes racing removal", () => {
         })
       }),
     options,
+    racing,
   )
 
   itRacing.instance(
@@ -2010,6 +2030,7 @@ describe("session HttpApi writes racing removal", () => {
         })
       }),
     options,
+    racing,
   )
 
   itRacing.instance(
@@ -2025,6 +2046,7 @@ describe("session HttpApi writes racing removal", () => {
         })
       }),
     options,
+    racing,
   )
 
   itRacing.instance(
@@ -2045,6 +2067,7 @@ describe("session HttpApi writes racing removal", () => {
         })
       }),
     options,
+    racing,
   )
 
   itRacing.instance(
@@ -2064,6 +2087,7 @@ describe("session HttpApi writes racing removal", () => {
         })
       }),
     options,
+    racing,
   )
 
   it.effect("leaves defects other than a removed Session as defects", () =>
@@ -2098,6 +2122,7 @@ describe("session HttpApi writes racing removal", () => {
         expect(yield* aggregate(created.id)).toEqual({ seq: before.seq + 2, events: before.events + 2 })
       }),
     options,
+    racing,
   )
 
   itRacing.instance(
@@ -2132,5 +2157,6 @@ describe("session HttpApi writes racing removal", () => {
         expect(yield* aggregate(created.id)).toEqual({ seq: before.seq + 3, events: before.events + 3 })
       }),
     options,
+    racing,
   )
 })

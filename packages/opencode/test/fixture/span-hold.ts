@@ -15,7 +15,7 @@ type Hold = {
  *
  * A Session write such as `Session.patch` reads the Session and then commits in one fiber with no observable step
  * between them, so this is how a test lets a removal land after that read without adding a hook to production code.
- * Run the producer with `tracer`, `arm` a hold, await its `reached`, act, then `release` it.
+ * Run the producer with `tracer`, `arm` a hold, await its `reached`, act, then `release` it; `disarm` on every exit.
  */
 export function spanHold() {
   const state = {
@@ -56,9 +56,16 @@ export function spanHold() {
     Effect.gen(function* () {
       const hold = { ...input, reached: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
       state.armed = hold
+      const release = Deferred.succeed(hold.release, undefined)
       return {
         reached: Deferred.await(hold.reached),
-        release: Deferred.succeed(hold.release, undefined),
+        release,
+        // Clears this hold whether or not it fired and lets a held fiber continue, so a failed test cannot leave a
+        // request parked or a stale hold armed for the next test.
+        disarm: Effect.sync(() => {
+          if (state.armed === hold) state.armed = undefined
+          if (state.held?.hold === hold) state.held = undefined
+        }).pipe(Effect.andThen(release), Effect.asVoid),
       }
     })
   return { tracer, arm }
