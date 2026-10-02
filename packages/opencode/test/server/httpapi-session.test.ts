@@ -4,7 +4,7 @@ import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer, Queue, Stream } from "effect"
+import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer, Queue, Stream, Tracer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -25,10 +25,14 @@ import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/grou
 import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
 import { SessionQueuePaths } from "../../src/server/routes/instance/httpapi/groups/session-queue"
 import { EventPaths } from "../../src/server/routes/instance/httpapi/groups/event"
+import { WorkspacePaths } from "../../src/server/routes/instance/httpapi/groups/workspace"
 import type { SessionQueue } from "../../src/session/queue"
 import { Session } from "@/session/session"
 import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from "../../src/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
+import { EventTable } from "@opencode-ai/core/event/sql"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -40,6 +44,7 @@ import { disposeAllInstances, provideInstanceEffect, TestInstance, tmpdirScoped 
 import { reply, TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
+import { spanHold } from "../fixture/span-hold"
 
 const originalWorkspaces = Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
 const noopBootstrapLayer = Layer.succeed(
@@ -63,6 +68,26 @@ const httpApiLayer = servedRoutes.pipe(
   Layer.provideMerge(NodeServices.layer),
 )
 const it = testEffect(Layer.mergeAll(appLayer, httpApiLayer))
+// Its own served routes, so request fibers carry the hold tracer whatever the shared server was built with.
+const racingSpans = spanHold()
+const racingRoutes: Layer.Layer<never, Config.ConfigError, HttpServer.HttpServer> = HttpRouter.serve(
+  HttpApiApp.routes,
+  {
+    disableListenLog: true,
+    disableLogger: true,
+  },
+)
+const itRacing = testEffect(
+  Layer.mergeAll(
+    appLayer,
+    AppNodeBuilder.build(EventV2Bridge.node),
+    racingRoutes.pipe(
+      Layer.provide(layerWebSocketConstructorGlobal),
+      Layer.provideMerge(NodeHttpServer.layerTest),
+      Layer.provideMerge(NodeServices.layer),
+    ),
+  ).pipe(Layer.provide(Layer.succeed(Tracer.Tracer, racingSpans.tracer))),
+)
 
 function pathFor(path: string, params: Record<string, string>) {
   return Object.entries(params).reduce((result, [key, value]) => result.replace(`:${key}`, value), path)
@@ -1790,5 +1815,348 @@ describe("session HttpApi", () => {
       )
     },
     30_000,
+  )
+})
+
+describe("session HttpApi writes racing removal", () => {
+  const options = { git: true, config: { formatter: false, lsp: false, share: "disabled" as const } }
+
+  const aggregate = (sessionID: SessionIDType) =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      return {
+        seq: yield* EventV2.latestSequence(db, sessionID),
+        events: (yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, sessionID)).all()).length,
+      }
+    })
+
+  const send = (directory: string, path: string, method: string, body?: unknown) =>
+    request(path, {
+      method,
+      headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    })
+
+  // A bound on reaching the hold, well clear of the real work some routes do first (revert snapshots the
+  // worktree); reaching it is the signal, so this only decides how long a broken route takes to fail.
+  const ready = "30 seconds"
+  const racing = 60_000
+
+  // Lets a held request continue and stops waiting for it on every exit, so a failed race never leaves a server
+  // request parked behind the hold.
+  const released = (release: Effect.Effect<void>, response: Fiber.Fiber<unknown, unknown>) =>
+    release.pipe(Effect.andThen(Fiber.interrupt(response)), Effect.asVoid)
+
+  // Holds the request right after `hold` (a Session read under a named span) and removes the Session there. A
+  // request that lost the race must answer the route's declared not found, never success or a 500, and leave no
+  // aggregate behind.
+  const expectRemovedDuring = (input: {
+    readonly sessionID: SessionIDType
+    readonly hold: { readonly name: string; readonly parent: string }
+    readonly request: Effect.Effect<HttpClientResponse.HttpClientResponse, unknown, HttpClient.HttpClient>
+  }) =>
+    Effect.gen(function* () {
+      const hold = yield* racingSpans.arm(input.hold)
+      const response = yield* input.request.pipe(Effect.forkChild)
+
+      yield* Effect.gen(function* () {
+        yield* awaitWithTimeout(hold.reached, `request never read the Session under ${input.hold.parent}`, ready)
+        yield* Session.use.remove(input.sessionID)
+        yield* hold.release
+        const answered = yield* Fiber.join(response)
+
+        expect(answered.status).toBe(404)
+        expect(yield* responseJson(answered)).toMatchObject({ name: "NotFoundError" })
+        expect(yield* aggregate(input.sessionID)).toEqual({ seq: -1, events: 0 })
+      }).pipe(Effect.ensuring(released(hold.disarm, response)))
+    })
+
+  // Session.patch reads the Session and then publishes; these hold a setter between the two.
+  const insidePatch = (setter: string) => ({ name: "Session.get", parent: setter })
+  // These handlers check the Session and then write without reading it again.
+  const afterCheck = { name: "Session.get", parent: "SessionHttpApi.requireSession" }
+
+  itRacing.instance(
+    "answers not found when the title write commits after the Session was removed",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "removed during patch" })
+        yield* expectRemovedDuring({
+          sessionID: created.id,
+          hold: insidePatch("Session.setTitle"),
+          request: send(test.directory, pathFor(SessionPaths.update, { sessionID: created.id }), "PATCH", {
+            title: "late",
+          }),
+        })
+      }),
+    options,
+    racing,
+  )
+
+  itRacing.instance(
+    "answers not found when the Session is removed between two of the update's writes",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const events = yield* EventV2Bridge.Service
+        const created = yield* createSession({ title: "removed between writes" })
+        const titled = yield* Deferred.make<void>()
+        const removed = yield* Deferred.make<void>()
+        // Durable listeners run in the publishing request after its commit, so this holds the request after setTitle.
+        const unsubscribe = yield* events.listen((event) =>
+          event.type === Session.Event.Updated.type &&
+          (event.data as { sessionID?: string }).sessionID === created.id &&
+          (event.data as { info?: { title?: string } }).info?.title === "titled"
+            ? Deferred.succeed(titled, undefined).pipe(Effect.andThen(Deferred.await(removed)))
+            : Effect.void,
+        )
+        yield* Effect.addFinalizer(() => unsubscribe)
+        const response = yield* send(test.directory, pathFor(SessionPaths.update, { sessionID: created.id }), "PATCH", {
+          title: "titled",
+          metadata: { late: true },
+        }).pipe(Effect.forkChild)
+
+        yield* Effect.gen(function* () {
+          yield* awaitWithTimeout(Deferred.await(titled), "update never committed its title", ready)
+          yield* Session.use.remove(created.id)
+          yield* Deferred.succeed(removed, undefined)
+          const answered = yield* Fiber.join(response)
+
+          expect(answered.status).toBe(404)
+          expect(yield* responseJson(answered)).toMatchObject({ name: "NotFoundError" })
+          expect(yield* aggregate(created.id)).toEqual({ seq: -1, events: 0 })
+        }).pipe(Effect.ensuring(released(Deferred.succeed(removed, undefined).pipe(Effect.asVoid), response)))
+      }),
+    options,
+    racing,
+  )
+
+  itRacing.instance(
+    "answers not found when a message delete commits after the Session was removed",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "message delete race" })
+        const { info } = yield* createTextMessage(created.id, "doomed")
+        yield* expectRemovedDuring({
+          sessionID: created.id,
+          hold: afterCheck,
+          request: send(
+            test.directory,
+            pathFor(SessionPaths.deleteMessage, { sessionID: created.id, messageID: info.id }),
+            "DELETE",
+          ),
+        })
+      }),
+    options,
+    racing,
+  )
+
+  itRacing.instance(
+    "answers not found when a part delete commits after the Session was removed",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "part delete race" })
+        const { info, part } = yield* createTextMessage(created.id, "doomed")
+        yield* expectRemovedDuring({
+          sessionID: created.id,
+          hold: afterCheck,
+          request: send(
+            test.directory,
+            pathFor(SessionPaths.deletePart, { sessionID: created.id, messageID: info.id, partID: part.id }),
+            "DELETE",
+          ),
+        })
+      }),
+    options,
+    racing,
+  )
+
+  itRacing.instance(
+    "answers not found when a part update commits after the Session was removed",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "part update race" })
+        const { info, part } = yield* createTextMessage(created.id, "before")
+        yield* expectRemovedDuring({
+          sessionID: created.id,
+          hold: afterCheck,
+          request: send(
+            test.directory,
+            pathFor(SessionPaths.updatePart, { sessionID: created.id, messageID: info.id, partID: part.id }),
+            "PATCH",
+            { ...part, text: "after" },
+          ),
+        })
+      }),
+    options,
+    racing,
+  )
+
+  itRacing.instance(
+    "answers not found when a revert records after the Session was removed",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "revert race" })
+        const { info } = yield* createTextMessage(created.id, "revert to here")
+        yield* expectRemovedDuring({
+          sessionID: created.id,
+          hold: insidePatch("Session.setRevert"),
+          request: send(test.directory, pathFor(SessionPaths.revert, { sessionID: created.id }), "POST", {
+            messageID: info.id,
+          }),
+        })
+      }),
+    options,
+    racing,
+  )
+
+  itRacing.instance(
+    "answers not found when an unrevert clears after the Session was removed",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "unrevert race" })
+        const { info } = yield* createTextMessage(created.id, "reverted")
+        yield* Session.use.setRevert({ sessionID: created.id, revert: { messageID: info.id }, summary: undefined })
+        yield* expectRemovedDuring({
+          sessionID: created.id,
+          hold: insidePatch("Session.clearRevert"),
+          request: send(test.directory, pathFor(SessionPaths.unrevert, { sessionID: created.id }), "POST"),
+        })
+      }),
+    options,
+    racing,
+  )
+
+  itRacing.instance(
+    "answers not found when an unshare records after the Session was removed",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "unshare race" })
+        yield* expectRemovedDuring({
+          sessionID: created.id,
+          hold: insidePatch("Session.setShare"),
+          request: send(test.directory, pathFor(SessionPaths.share, { sessionID: created.id }), "DELETE"),
+        })
+      }),
+    options,
+    racing,
+  )
+
+  itRacing.instance(
+    "answers not found when a summarize records its compaction after the Session was removed",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "summarize race" })
+        yield* createTextMessage(created.id, "summarize me")
+        yield* expectRemovedDuring({
+          sessionID: created.id,
+          // The last Session read before the compaction message is written.
+          hold: { name: "Session.messages", parent: "SessionHttpApi.summarize" },
+          request: send(test.directory, pathFor(SessionPaths.summarize, { sessionID: created.id }), "POST", {
+            providerID: "test",
+            modelID: "test",
+          }),
+        })
+      }),
+    options,
+    racing,
+  )
+
+  itRacing.instance(
+    "answers not found when a warp records its workspace after the Session was removed",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "warp race" })
+        yield* expectRemovedDuring({
+          sessionID: created.id,
+          hold: insidePatch("Session.setWorkspace"),
+          request: send(test.directory, WorkspacePaths.warp, "POST", {
+            id: null,
+            sessionID: created.id,
+            copyChanges: false,
+          }),
+        })
+      }),
+    options,
+    racing,
+  )
+
+  it.effect("leaves other defects as defects", () =>
+    Effect.gen(function* () {
+      const defect = new Error("unrelated failure")
+      const exit = yield* HttpSessionError.mapSessionWriteNotFound(Effect.die(defect)).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBe(defect)
+    }),
+  )
+
+  itRacing.instance(
+    "still updates a Session that is not removed",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "kept" })
+        const before = yield* aggregate(created.id)
+
+        const answered = yield* send(test.directory, pathFor(SessionPaths.update, { sessionID: created.id }), "PATCH", {
+          title: "renamed",
+          metadata: { kept: true },
+        })
+
+        expect(answered.status).toBe(200)
+        expect(yield* responseJson(answered)).toMatchObject({
+          id: created.id,
+          title: "renamed",
+          metadata: { kept: true },
+        })
+        expect(yield* aggregate(created.id)).toEqual({ seq: before.seq + 2, events: before.events + 2 })
+      }),
+    options,
+    racing,
+  )
+
+  itRacing.instance(
+    "still edits and deletes parts and messages of a Session that is not removed",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "kept messages" })
+        const { info, part } = yield* createTextMessage(created.id, "before")
+        const before = yield* aggregate(created.id)
+        const partPath = pathFor(SessionPaths.updatePart, {
+          sessionID: created.id,
+          messageID: info.id,
+          partID: part.id,
+        })
+
+        expect((yield* send(test.directory, partPath, "PATCH", { ...part, text: "after" })).status).toBe(200)
+        expect(
+          (yield* send(
+            test.directory,
+            pathFor(SessionPaths.deletePart, { sessionID: created.id, messageID: info.id, partID: part.id }),
+            "DELETE",
+          )).status,
+        ).toBe(200)
+        expect(
+          (yield* send(
+            test.directory,
+            pathFor(SessionPaths.deleteMessage, { sessionID: created.id, messageID: info.id }),
+            "DELETE",
+          )).status,
+        ).toBe(200)
+        expect(yield* aggregate(created.id)).toEqual({ seq: before.seq + 3, events: before.events + 3 })
+      }),
+    options,
+    racing,
   )
 })
