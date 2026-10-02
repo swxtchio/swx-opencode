@@ -214,6 +214,58 @@ describe("InstanceStore", () => {
     }),
   )
 
+  it.live("disposeDirectory settles a reload interrupted in its held disposer", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const disposing = yield* Deferred.make<void>()
+      const releaseDispose = yield* Deferred.make<() => void>()
+      const disposeFinished = yield* Deferred.make<void>()
+      const disposed: Array<string> = []
+
+      yield* registerDisposerScoped((directory) => {
+        disposed.push(directory)
+        return new Promise<void>((resolve) => {
+          Deferred.doneUnsafe(disposing, Effect.void)
+          Deferred.doneUnsafe(releaseDispose, Effect.succeed(resolve))
+        }).then(() => {
+          Deferred.doneUnsafe(disposeFinished, Effect.void)
+        })
+      })
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function* () {
+          if (!(yield* Deferred.isDone(releaseDispose))) return
+          const release = yield* Deferred.await(releaseDispose)
+          yield* Effect.sync(release)
+        }),
+      )
+
+      const first = yield* store.load({ directory: dir })
+      const reload = yield* store.reload({ directory: dir }).pipe(Effect.forkScoped)
+      yield* awaitWithTimeout(Deferred.await(disposing), "reload did not reach its held disposer")
+
+      const removing = yield* store.disposeDirectory(dir).pipe(Effect.forkScoped)
+      const removal = yield* Effect.exit(
+        awaitWithTimeout(Fiber.join(removing), "disposeDirectory did not finish the interrupted reload", "8 seconds"),
+      )
+      const reloaded = yield* Effect.exit(
+        awaitWithTimeout(Fiber.await(reload), "reload caller remained blocked after its worker exited", "2 seconds"),
+      )
+
+      const release = yield* Deferred.await(releaseDispose)
+      yield* Effect.sync(release)
+      yield* awaitWithTimeout(Deferred.await(disposeFinished), "held disposer did not finish")
+      const next = yield* awaitWithTimeout(store.load({ directory: dir }), "reload left a poisoned cache entry")
+
+      expect(Exit.isSuccess(removal)).toBe(true)
+      expect(Exit.isSuccess(reloaded)).toBe(true)
+      if (Exit.isSuccess(reloaded)) expect(Exit.isFailure(reloaded.value)).toBe(true)
+      expect(next.directory).toBe(dir)
+      expect(first.directory).toBe(dir)
+      expect(disposed).toEqual([dir])
+    }),
+  )
+
   it.live("stale dispose does not delete an in-flight reload", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped({ git: true })

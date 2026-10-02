@@ -70,11 +70,10 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         return true
       })
 
-    const completeLoad = (directory: string, input: LoadInput, entry: Entry) =>
+    const completeEntry = (directory: string, entry: Entry, work: Effect.Effect<InstanceContext>) =>
       Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
-          // A stopped load still has to publish its exit so every waiter can finish.
-          const exit = yield* Effect.exit(restore(boot({ ...input, directory })))
+          const exit = yield* Effect.exit(restore(work))
           if (Exit.isFailure(exit)) yield* removeEntry(directory, entry)
           yield* Deferred.done(entry.deferred, exit).pipe(Effect.asVoid)
         }),
@@ -124,6 +123,10 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             orElse: () => Effect.die(new Error(`instance load did not stop: ${directory}`)),
           }),
         )
+        if (!(yield* Deferred.isDone(entry.deferred))) {
+          yield* removeEntry(directory, entry)
+          return yield* Effect.die(new Error(`instance load stopped without settling: ${directory}`))
+        }
       }
       return yield* Deferred.await(entry.deferred).pipe(Effect.exit)
     })
@@ -140,10 +143,14 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             loadFiber: Deferred.makeUnsafe<Fiber.Fiber<void>>(),
           }
           cache.set(directory, entry)
-          const fiber = yield* Effect.gen(function* () {
-            yield* Effect.logInfo("creating instance", { directory: directory })
-            yield* completeLoad(directory, input, entry)
-          }).pipe(Effect.forkIn(scope, { startImmediately: true }))
+          const fiber = yield* completeEntry(
+            directory,
+            entry,
+            Effect.gen(function* () {
+              yield* Effect.logInfo("creating instance", { directory: directory })
+              return yield* boot({ ...input, directory })
+            }),
+          ).pipe(Effect.forkIn(scope, { startImmediately: true }))
           yield* Deferred.succeed(entry.loadFiber, fiber)
           return yield* restore(Deferred.await(entry.deferred))
         }),
@@ -160,15 +167,19 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             loadFiber: Deferred.makeUnsafe<Fiber.Fiber<void>>(),
           }
           cache.set(directory, entry)
-          const fiber = yield* Effect.gen(function* () {
-            yield* Effect.logInfo("reloading instance", { directory: directory })
-            if (previous) {
-              yield* Deferred.await(previous.deferred).pipe(Effect.ignore)
-              yield* Effect.promise(() => runDisposers(directory))
-              yield* emitDisposed({ directory, project: input.project?.id })
-            }
-            yield* completeLoad(directory, input, entry)
-          }).pipe(Effect.forkIn(scope, { startImmediately: true }))
+          const fiber = yield* completeEntry(
+            directory,
+            entry,
+            Effect.gen(function* () {
+              yield* Effect.logInfo("reloading instance", { directory: directory })
+              if (previous) {
+                yield* Deferred.await(previous.deferred).pipe(Effect.ignore)
+                yield* Effect.promise(() => runDisposers(directory))
+                yield* emitDisposed({ directory, project: input.project?.id })
+              }
+              return yield* boot({ ...input, directory })
+            }),
+          ).pipe(Effect.forkIn(scope, { startImmediately: true }))
           yield* Deferred.succeed(entry.loadFiber, fiber)
           return yield* restore(Deferred.await(entry.deferred))
         }),
