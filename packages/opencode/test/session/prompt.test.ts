@@ -313,14 +313,13 @@ function makePrompt(input?: PromptTestOptions) {
   return LayerNode.compile(promptRoot, replacements)
 }
 
-function makeHttp(input?: PromptTestOptions, database?: Layer.Layer<Database.Service>) {
+function makeHttp(input?: PromptTestOptions) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
     [RuntimeFlags.node, runtimeFlags],
-    ...(database ? ([[Database.node, database]] as const) : []),
     ...(input?.status ? [[SessionStatus.node, input.status] as const] : []),
     ...(input?.compaction ? [[SessionCompaction.node, input.compaction] as const] : []),
     ...(input?.plugin ? [[Plugin.node, input.plugin] as const] : []),
@@ -329,6 +328,16 @@ function makeHttp(input?: PromptTestOptions, database?: Layer.Layer<Database.Ser
     return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
   }
   return LayerNode.compile(root, replacements)
+}
+
+function makeHttpWithDatabase(database: Layer.Layer<Database.Service>) {
+  return LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, runtimeFlags],
+    [Database.node, database],
+  ])
 }
 
 function makeHttpNoLLMServer(input?: PromptTestOptions) {
@@ -610,7 +619,7 @@ const withMcpInstructions = testEffect(
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
 const nonOwnerCancelDatabasePath = path.join(os.tmpdir(), `opencode-non-owner-cancel-${randomUUID()}.db`)
-const nonOwnerCancel = testEffect(makeHttp(undefined, Database.layerFromPath(nonOwnerCancelDatabasePath)))
+const nonOwnerCancel = testEffect(makeHttpWithDatabase(Database.layerFromPath(nonOwnerCancelDatabasePath)))
 const nonOwnerRunState = LayerNode.compile(
   LayerNode.group([SessionRunState.node, SessionStatus.node, EventV2Bridge.node, Database.node]),
   [[Database.node, Database.layerFromPath(nonOwnerCancelDatabasePath)]],
@@ -4529,9 +4538,17 @@ nonOwnerCancel.instance(
       const ownerIdleEvents: string[] = []
       const unsubscribeOwner = yield* events.listen((event) => {
         if (event.type === SessionStatus.Event.Status.type) {
-          ownerStatusEvents.push({ sessionID: event.data.sessionID, status: event.data.status.type })
+          return Effect.sync(() => {
+            const data = Schema.decodeUnknownSync(SessionStatus.Event.Status.data)(event.data)
+            ownerStatusEvents.push({ sessionID: data.sessionID, status: data.status.type })
+          })
         }
-        if (event.type === SessionStatus.Event.Idle.type) ownerIdleEvents.push(event.data.sessionID)
+        if (event.type === SessionStatus.Event.Idle.type) {
+          return Effect.sync(() => {
+            const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+            ownerIdleEvents.push(data.sessionID)
+          })
+        }
         return Effect.void
       })
 
@@ -4547,11 +4564,13 @@ nonOwnerCancel.instance(
         Effect.gen(function* () {
           const messages = yield* sessions.messages({ sessionID: chat.id })
           const assistant = messages.findLast((message) => message.info.role === "assistant")
-          if (assistant?.info.role !== "assistant" || assistant.info.time.completed !== undefined) return undefined
+          if (!assistant || assistant.info.role !== "assistant" || assistant.info.time.completed !== undefined)
+            return undefined
           return assistant
         }),
         "owner assistant was not persisted before cancellation",
       )
+      if (unfinished.info.role !== "assistant") throw new Error("expected the persisted unfinished assistant")
       expect(unfinished.info.time.completed).toBeUndefined()
 
       const nonOwnerDirectory = yield* tmpdirScoped()
@@ -4563,9 +4582,17 @@ nonOwnerCancel.instance(
         const runState = yield* SessionRunState.Service
         const unsubscribe = yield* events.listen((event) => {
           if (event.type === SessionStatus.Event.Status.type) {
-            nonOwnerStatusEvents.push({ sessionID: event.data.sessionID, status: event.data.status.type })
+            return Effect.sync(() => {
+              const data = Schema.decodeUnknownSync(SessionStatus.Event.Status.data)(event.data)
+              nonOwnerStatusEvents.push({ sessionID: data.sessionID, status: data.status.type })
+            })
           }
-          if (event.type === SessionStatus.Event.Idle.type) nonOwnerIdleEvents.push(event.data.sessionID)
+          if (event.type === SessionStatus.Event.Idle.type) {
+            return Effect.sync(() => {
+              const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+              nonOwnerIdleEvents.push(data.sessionID)
+            })
+          }
           return Effect.void
         })
         yield* runState.cancel(chat.id)
@@ -4579,23 +4606,22 @@ nonOwnerCancel.instance(
       expect(nonOwnerIdleEvents).toEqual([])
       expect((yield* status.list()).get(chat.id)?.type).toBe("busy")
       const afterNonOwnerCancel = (yield* sessions.messages({ sessionID: chat.id })).findLast(
-        (message) => message.info.role === "assistant" && message.info.id === unfinished.info.id,
+        (message) => message.info.id === unfinished.info.id,
       )
-      expect(afterNonOwnerCancel?.info.role).toBe("assistant")
-      if (afterNonOwnerCancel?.info.role === "assistant") {
-        expect(afterNonOwnerCancel.info.time.completed).toBeUndefined()
-        expect(afterNonOwnerCancel.info.error).toBeUndefined()
-      }
+      if (afterNonOwnerCancel?.info.role !== "assistant") throw new Error("owner assistant disappeared after cancel")
+      expect(afterNonOwnerCancel.info.time.completed).toBeUndefined()
+      expect(afterNonOwnerCancel.info.error).toBeUndefined()
 
       yield* release
-      const completed = yield* finish(task)
-      expect(completed.info.role).toBe("assistant")
-      if (completed.info.role === "assistant") expect(completed.info.time.completed).toBeDefined()
+      const [completed] = yield* finish(task)
+      if (!completed || completed.info.role !== "assistant") throw new Error("owner turn did not return its assistant")
+      expect(completed.info.time.completed).toBeDefined()
+      expect((yield* status.list()).has(chat.id)).toBe(false)
       const persisted = (yield* sessions.messages({ sessionID: chat.id })).findLast(
-        (message) => message.info.role === "assistant" && message.info.id === unfinished.info.id,
+        (message) => message.info.id === unfinished.info.id,
       )
-      expect(persisted?.info.role).toBe("assistant")
-      if (persisted?.info.role === "assistant") expect(persisted.info.time.completed).toBeDefined()
+      if (persisted?.info.role !== "assistant") throw new Error("completed owner assistant was not persisted")
+      expect(persisted.info.time.completed).toBeDefined()
       expect(ownerStatusEvents.some((event) => event.sessionID === chat.id && event.status === "busy")).toBe(true)
       expect(ownerStatusEvents.some((event) => event.sessionID === chat.id && event.status === "idle")).toBe(true)
       expect(ownerIdleEvents).toContain(chat.id)
@@ -4608,18 +4634,26 @@ nonOwnerCancel.instance(
       const localStatusEvents: string[] = []
       const localIdleEvents: string[] = []
       const unsubscribeLocal = yield* events.listen((event) => {
-        if (event.type === SessionStatus.Event.Status.type && event.data.sessionID === locallyCancelled.id) {
-          localStatusEvents.push(event.data.status.type)
-          if (event.data.status.type === "idle") return Deferred.succeed(statusIdle, undefined).pipe(Effect.asVoid)
+        if (event.type === SessionStatus.Event.Status.type) {
+          return Effect.gen(function* () {
+            const data = Schema.decodeUnknownSync(SessionStatus.Event.Status.data)(event.data)
+            if (data.sessionID !== locallyCancelled.id) return
+            localStatusEvents.push(data.status.type)
+            if (data.status.type === "idle") yield* Deferred.succeed(statusIdle, undefined)
+          })
         }
-        if (event.type === SessionStatus.Event.Idle.type && event.data.sessionID === locallyCancelled.id) {
-          localIdleEvents.push(event.data.sessionID)
-          return Deferred.succeed(deprecatedIdle, undefined).pipe(Effect.asVoid)
+        if (event.type === SessionStatus.Event.Idle.type) {
+          return Effect.gen(function* () {
+            const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+            if (data.sessionID !== locallyCancelled.id) return
+            localIdleEvents.push(data.sessionID)
+            yield* Deferred.succeed(deprecatedIdle, undefined)
+          })
         }
         return Effect.void
       })
       const localTurn = yield* runState
-        .ensureRunning(
+        .startShell(
           locallyCancelled.id,
           Effect.succeed(completed),
           Effect.gen(function* () {
@@ -4641,6 +4675,7 @@ nonOwnerCancel.instance(
       yield* awaitWithTimeout(Deferred.await(deprecatedIdle), "local cancel did not publish session.idle")
       const localExit = yield* awaitWithTimeout(Fiber.await(localTurn), "local runner did not settle after cancel")
       expect(Exit.isSuccess(localExit)).toBe(true)
+      expect((yield* status.list()).has(locallyCancelled.id)).toBe(false)
       expect(localStatusEvents).toContain("busy")
       expect(localStatusEvents).toContain("idle")
       expect(localIdleEvents).toContain(locallyCancelled.id)
