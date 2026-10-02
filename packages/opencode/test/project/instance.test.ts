@@ -214,6 +214,24 @@ describe("InstanceStore", () => {
     }),
   )
 
+  it.live("dispose preserves the ready context's normal cleanup", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const disposed: Array<string> = []
+      yield* registerDisposerScoped(async (directory) => {
+        disposed.push(directory)
+      })
+
+      const first = yield* store.load({ directory: dir })
+      yield* store.dispose(first)
+      expect(disposed).toEqual([dir])
+
+      const second = yield* store.load({ directory: dir })
+      expect(second).not.toBe(first)
+    }),
+  )
+
   it.live("disposeDirectory settles a reload interrupted in its held disposer", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped({ git: true })
@@ -270,12 +288,28 @@ describe("InstanceStore", () => {
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped({ git: true })
       const store = yield* InstanceStore.Service
+      const disposing = yield* Deferred.make<void>()
+      const releaseDispose = yield* Deferred.make<() => void>()
+      const disposeFinished = yield* Deferred.make<void>()
       const reloading = yield* Deferred.make<void>()
       const releaseReload = yield* Deferred.make<void>()
       const disposed: Array<string> = []
-      yield* registerDisposerScoped(async (directory) => {
+      yield* registerDisposerScoped((directory) => {
         disposed.push(directory)
+        return new Promise<void>((resolve) => {
+          Deferred.doneUnsafe(disposing, Effect.void)
+          Deferred.doneUnsafe(releaseDispose, Effect.succeed(resolve))
+        }).then(() => {
+          Deferred.doneUnsafe(disposeFinished, Effect.void)
+        })
       })
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function* () {
+          if (!(yield* Deferred.isDone(releaseDispose))) return
+          const release = yield* Deferred.await(releaseDispose)
+          yield* Effect.sync(release)
+        }),
+      )
 
       const first = yield* store.load({ directory: dir })
       yield* setBootstrap(
@@ -286,8 +320,19 @@ describe("InstanceStore", () => {
       )
       const reload = yield* store.reload({ directory: dir }).pipe(Effect.forkScoped)
 
-      yield* Deferred.await(reloading)
+      yield* awaitWithTimeout(Deferred.await(disposing), "reload did not reach its held disposer")
       const staleDispose = yield* store.dispose(first).pipe(Effect.forkScoped)
+      const stale = yield* awaitWithTimeout(
+        Fiber.await(staleDispose),
+        "stale dispose waited on the newer pending entry",
+        "2 seconds",
+      )
+      expect(Exit.isSuccess(stale)).toBe(true)
+
+      const release = yield* Deferred.await(releaseDispose)
+      yield* Effect.sync(release)
+      yield* awaitWithTimeout(Deferred.await(disposeFinished), "held disposer did not finish")
+      yield* awaitWithTimeout(Deferred.await(reloading), "reload did not resume after its disposer")
       yield* Deferred.succeed(releaseReload, undefined)
 
       const second = yield* Fiber.join(reload)

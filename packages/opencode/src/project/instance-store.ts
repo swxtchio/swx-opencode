@@ -33,6 +33,7 @@ export const use = serviceUse(Service)
 interface Entry {
   readonly deferred: Deferred.Deferred<InstanceContext>
   readonly loadFiber: Deferred.Deferred<Fiber.Fiber<void>>
+  context?: InstanceContext
 }
 
 const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Service> = Layer.effect(
@@ -75,6 +76,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         Effect.gen(function* () {
           const exit = yield* Effect.exit(restore(work))
           if (Exit.isFailure(exit)) yield* removeEntry(directory, entry)
+          else entry.context = exit.value
           yield* Deferred.done(entry.deferred, exit).pipe(Effect.asVoid)
         }),
       )
@@ -189,6 +191,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     const dispose = Effect.fn("InstanceStore.dispose")(function* (ctx: InstanceContext) {
       const entry = cache.get(ctx.directory)
       if (!entry) return yield* disposeContext(ctx)
+      if (entry.context !== ctx) return
 
       const exit = yield* settleLoad(ctx.directory, entry)
       if (Exit.isFailure(exit)) return yield* removeEntry(ctx.directory, entry).pipe(Effect.asVoid)
