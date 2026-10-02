@@ -21,13 +21,7 @@ export function mapBusy<A, R>(self: Effect.Effect<A, Session.BusyError, R>) {
   )
 }
 
-/**
- * Maps exactly two defects to the route's not-found answer, both meaning this Session was removed while the request
- * was writing to it: `SessionProjector.SessionNotProjected`, raised when a write's commit lands after removal, and a
- * storage `NotFoundError` that a V1 setter's `orDie` turned into a defect when its own read found the Session gone.
- * Typed failures and every other defect pass through unchanged.
- */
-export function mapRemovedDuringWrite<A, E, R>(self: Effect.Effect<A, E, R>) {
+export function mapSessionWriteNotFound<A, E, R>(self: Effect.Effect<A, E, R>) {
   return self.pipe(
     Effect.catchDefect((defect) => {
       if (defect instanceof SessionProjector.SessionNotProjected)

@@ -2090,10 +2090,10 @@ describe("session HttpApi writes racing removal", () => {
     racing,
   )
 
-  it.effect("leaves defects other than a removed Session as defects", () =>
+  it.effect("leaves other defects as defects", () =>
     Effect.gen(function* () {
       const defect = new Error("unrelated failure")
-      const exit = yield* HttpSessionError.mapRemovedDuringWrite(Effect.die(defect)).pipe(Effect.exit)
+      const exit = yield* HttpSessionError.mapSessionWriteNotFound(Effect.die(defect)).pipe(Effect.exit)
 
       expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(true)
       if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBe(defect)

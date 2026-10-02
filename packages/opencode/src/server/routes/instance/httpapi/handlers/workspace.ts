@@ -63,7 +63,7 @@ export const workspaceHandlers = HttpApiBuilder.group(InstanceHttpApi, "workspac
     })
 
     const warp = Effect.fn("WorkspaceHttpApi.warp")(function* (ctx: { payload: typeof WarpPayload.Type }) {
-      yield* SessionError.mapRemovedDuringWrite(
+      yield* SessionError.mapSessionWriteNotFound(
         workspace
           .sessionWarp({
             workspaceID: ctx.payload.id,

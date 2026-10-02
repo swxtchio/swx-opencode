@@ -186,7 +186,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof UpdatePayload.Type
     }) {
       const current = yield* requireSession(ctx.params.sessionID)
-      yield* SessionError.mapRemovedDuringWrite(
+      yield* SessionError.mapSessionWriteNotFound(
         Effect.gen(function* () {
           if (ctx.payload.title !== undefined) {
             yield* session.setTitle({ sessionID: ctx.params.sessionID, title: ctx.payload.title })
@@ -263,7 +263,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     // every failure to a 400 BadRequest.
     const share = Effect.fn("SessionHttpApi.share")(function* (ctx: { params: { sessionID: SessionID } }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* SessionError.mapRemovedDuringWrite(
+      yield* SessionError.mapSessionWriteNotFound(
         shareSvc.share(ctx.params.sessionID).pipe(Effect.mapError(() => new HttpApiError.InternalServerError({}))),
       )
       return yield* requireSession(ctx.params.sessionID)
@@ -271,7 +271,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
 
     const unshare = Effect.fn("SessionHttpApi.unshare")(function* (ctx: { params: { sessionID: SessionID } }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* SessionError.mapRemovedDuringWrite(
+      yield* SessionError.mapSessionWriteNotFound(
         shareSvc.unshare(ctx.params.sessionID).pipe(Effect.mapError(() => new HttpApiError.InternalServerError({}))),
       )
       return yield* requireSession(ctx.params.sessionID)
@@ -281,12 +281,12 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof SummarizePayload.Type
     }) {
-      yield* SessionError.mapRemovedDuringWrite(revertSvc.cleanup(yield* requireSession(ctx.params.sessionID)))
+      yield* SessionError.mapSessionWriteNotFound(revertSvc.cleanup(yield* requireSession(ctx.params.sessionID)))
       const messages = yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
       const defaultAgent = yield* agentSvc.defaultAgent()
       const currentAgent = messages.findLast((message) => message.info.role === "user")?.info.agent ?? defaultAgent
 
-      const messageID = yield* SessionError.mapRemovedDuringWrite(
+      const messageID = yield* SessionError.mapSessionWriteNotFound(
         compactSvc.create({
           sessionID: ctx.params.sessionID,
           agent: currentAgent,
@@ -377,14 +377,14 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof RevertPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      return yield* SessionError.mapRemovedDuringWrite(
+      return yield* SessionError.mapSessionWriteNotFound(
         SessionError.mapBusy(revertSvc.revert({ sessionID: ctx.params.sessionID, ...ctx.payload })),
       )
     })
 
     const unrevert = Effect.fn("SessionHttpApi.unrevert")(function* (ctx: { params: { sessionID: SessionID } }) {
       yield* requireSession(ctx.params.sessionID)
-      return yield* SessionError.mapRemovedDuringWrite(
+      return yield* SessionError.mapSessionWriteNotFound(
         SessionError.mapBusy(revertSvc.unrevert({ sessionID: ctx.params.sessionID })),
       )
     })
@@ -412,7 +412,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     }) {
       yield* requireSession(ctx.params.sessionID)
       yield* SessionError.mapBusy(runState.assertNotBusy(ctx.params.sessionID))
-      yield* SessionError.mapRemovedDuringWrite(session.removeMessage(ctx.params))
+      yield* SessionError.mapSessionWriteNotFound(session.removeMessage(ctx.params))
       return true
     })
 
@@ -420,7 +420,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID; messageID: MessageID; partID: PartID }
     }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* SessionError.mapRemovedDuringWrite(session.removePart(ctx.params))
+      yield* SessionError.mapSessionWriteNotFound(session.removePart(ctx.params))
       return true
     })
 
@@ -437,7 +437,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       ) {
         return yield* new HttpApiError.BadRequest({})
       }
-      return yield* SessionError.mapRemovedDuringWrite(session.updatePart(payload))
+      return yield* SessionError.mapSessionWriteNotFound(session.updatePart(payload))
     })
 
     return handlers
