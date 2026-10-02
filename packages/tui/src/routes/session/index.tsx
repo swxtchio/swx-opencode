@@ -105,15 +105,44 @@ export function isSessionToolActive(input: {
   message?: { time: { created: number; completed?: number }; error?: unknown }
 }) {
   if (input.state !== "pending" && input.state !== "running") return false
+  return isAssistantTurnActive(input)
+}
+
+export function isAssistantTurnActive(input: {
+  status: SessionTurnStatus
+  message?: { time: { created: number; completed?: number }; error?: unknown }
+}) {
   if (!input.message || input.message.time.completed !== undefined || input.message.error !== undefined) return false
   return input.status === "working" || input.status === "compacting"
 }
 
-function assistantStatus(sync: ReturnType<typeof useSync>, message: AssistantMessage) {
-  // Session status belongs to the latest assistant, not older rows retained in history.
+function assistantRowSuperseded(sync: ReturnType<typeof useSync>, message: AssistantMessage) {
   const latest = sync.data.message[message.sessionID]?.findLast((item) => item.role === "assistant")
-  if (latest?.id !== message.id) return "unknown" as const
+  return latest !== undefined && latest.id !== message.id
+}
+
+function assistantStatus(sync: ReturnType<typeof useSync>, message: AssistantMessage) {
+  if (assistantRowSuperseded(sync, message)) return "unknown" as const
   return sync.session.status(message.sessionID)
+}
+
+export function activeForegroundTasks(sync: ReturnType<typeof useSync>, messages: Message[]) {
+  return messages.flatMap((message) => {
+    if (message.role !== "assistant") return []
+    if (assistantRowSuperseded(sync, message)) return []
+    return (sync.data.part[message.id] ?? []).filter(
+      (part): part is ToolPart =>
+        part.type === "tool" &&
+        part.tool === "task" &&
+        part.state.status === "running" &&
+        part.state.metadata?.background !== true,
+    )
+  })
+}
+
+export function activeTaskRetry(status: SessionStatus | undefined, active: boolean) {
+  if (!active || status?.type !== "retry") return
+  return status
 }
 
 function goUpsellKeys(action: RetryAction) {
@@ -238,17 +267,7 @@ export function Session() {
     return index === -1 ? messages() : messages().slice(0, index)
   }
   const foregroundTasks = createMemo(() =>
-    sync.data.capabilities.experimentalBackgroundSubagents
-      ? messages().flatMap((message) =>
-          (sync.data.part[message.id] ?? []).filter(
-            (part): part is ToolPart =>
-              part.type === "tool" &&
-              part.tool === "task" &&
-              part.state.status === "running" &&
-              part.state.metadata?.background !== true,
-          ),
-        )
-      : [],
+    sync.data.capabilities.experimentalBackgroundSubagents ? activeForegroundTasks(sync, messages()) : [],
   )
   const permissions = createMemo(() => {
     if (session()?.parentID) return []
@@ -1599,13 +1618,7 @@ function AssistantMessage(props: {
             <Show
               when={
                 sync.data.capabilities.experimentalBackgroundSubagents &&
-                props.parts.some(
-                  (x) =>
-                    x.type === "tool" &&
-                    x.tool === "task" &&
-                    x.state.status === "running" &&
-                    x.state.metadata?.background !== true,
-                )
+                activeForegroundTasks(sync, [props.message]).length > 0
               }
             >
               <span style={{ fg: theme.textMuted }}> · </span>
@@ -2014,12 +2027,7 @@ function InlineTool(props: {
     if (props.part.state.status !== "pending" && props.part.state.status !== "running") return false
     const current = message()
     if (current?.role !== "assistant") return false
-    return (
-      current.time.completed !== undefined ||
-      current.error !== undefined ||
-      status() === "failed" ||
-      unresolved()
-    )
+    return current.time.completed !== undefined || current.error !== undefined || status() === "failed" || unresolved()
   })
 
   const denied = createMemo(
@@ -2433,6 +2441,13 @@ function Task(props: ToolProps) {
 
   const sessionID = createMemo(() => stringValue(props.metadata.sessionId))
   const messages = createMemo(() => sync.data.message[sessionID() ?? ""] ?? [])
+  const parent = createMemo(() =>
+    sync.data.message[props.part.sessionID]?.find((message) => message.id === props.part.messageID),
+  )
+  const superseded = createMemo(() => {
+    const message = parent()
+    return message?.role !== "assistant" || assistantRowSuperseded(sync, message)
+  })
 
   const tools = createMemo(() => {
     return messages().flatMap((msg) =>
@@ -2448,6 +2463,7 @@ function Task(props: ToolProps) {
 
   const status = createMemo(() => sync.data.session_status[sessionID() ?? ""])
   const isRunning = createMemo(() => {
+    if (superseded()) return false
     const value = status()
     return (
       props.part.state.status === "running" ||
@@ -2455,9 +2471,7 @@ function Task(props: ToolProps) {
     )
   })
   const retry = createMemo(() => {
-    const value = status()
-    if (value?.type !== "retry") return
-    return value
+    return activeTaskRetry(status(), !superseded())
   })
 
   const duration = createMemo(() => {
