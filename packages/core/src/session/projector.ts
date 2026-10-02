@@ -12,6 +12,7 @@ import { SessionMessage } from "./message"
 import { SessionMessageUpdater } from "./message-updater"
 import { SessionInput } from "./input"
 import { WorkspaceV2 } from "../workspace"
+import { SessionSchema } from "./schema"
 import { MessageTable, PartTable, SessionInputTable, SessionMessageTable, SessionTable } from "./sql"
 import type { DeepMutable } from "../schema"
 
@@ -21,6 +22,13 @@ const decodeMessage = Schema.decodeUnknownSync(SessionMessage.Message)
 const encodeMessage = Schema.encodeSync(SessionMessage.Message)
 
 export class SessionAlreadyProjected extends Error {}
+
+/** A Session durable event committed for a Session whose projected row is gone, such as a write racing removal. */
+export class SessionNotProjected extends Error {
+  constructor(readonly sessionID: string) {
+    super(`Session ${sessionID} is not projected`)
+  }
+}
 
 type Usage = {
   cost: number
@@ -189,6 +197,19 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
   })
 }
 
+function requireSession(db: DatabaseService, sessionID: string | undefined) {
+  if (sessionID === undefined) return Effect.die("Durable Session event is missing aggregate sequence")
+  return db
+    .select({ id: SessionTable.id })
+    .from(SessionTable)
+    .where(eq(SessionTable.id, SessionSchema.ID.make(sessionID)))
+    .get()
+    .pipe(
+      Effect.orDie,
+      Effect.flatMap((row) => (row ? Effect.void : Effect.die(new SessionNotProjected(sessionID)))),
+    )
+}
+
 function insertMessage(db: DatabaseService, event: SessionEvent.Event, message: SessionMessage.Message) {
   if (event.durable === undefined) return Effect.die("Durable Session event is missing aggregate sequence")
   const encoded = encodeMessage(message)
@@ -211,6 +232,20 @@ const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const events = yield* EventV2.Service
     const { db } = yield* Database.Service
+    // event_sequence has no foreign key to session, and Session.remove drops the aggregate after deleting the row, so a
+    // write committing after removal would restart the aggregate at seq 0 for a Session that no longer exists. Refusing
+    // inside the commit transaction leaves no event, sequence or notification. Registered first so it runs before the
+    // domain projectors; creation makes the row and deletion is followed by the aggregate's removal.
+    yield* Effect.forEach(
+      [...SessionV1.Event.Definitions, ...SessionEvent.DurableDefinitions].filter(
+        (definition) =>
+          definition.durable !== undefined &&
+          definition !== SessionV1.Event.Created &&
+          definition !== SessionV1.Event.Deleted,
+      ),
+      (definition) => events.project(definition, (event) => requireSession(db, event.durable?.aggregateID)),
+      { discard: true },
+    )
     yield* events.project(SessionV1.Event.Created, (event) =>
       Effect.gen(function* () {
         const stored = yield* db
