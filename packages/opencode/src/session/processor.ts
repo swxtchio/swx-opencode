@@ -100,8 +100,9 @@ type ToolCall = {
 
 type FinalizationState = {
   terminalMessagePersisted: boolean
-  // Set while, and after, a background retry owns the terminal write; cleared only if that retry fails.
-  terminalRecovering: boolean
+  // Set once the background retry has claimed the terminal write, and kept after it finishes so later finalizers
+  // never write the message again; cleared only if that retry fails.
+  terminalWriteRecoveryClaimed: boolean
   persistedTerminalError: SessionV1.Assistant["error"]
   publishedFailures: Set<string>
 }
@@ -143,7 +144,7 @@ const layer = Layer.effect(
       if (existing) return existing
       const state: FinalizationState = {
         terminalMessagePersisted: false,
-        terminalRecovering: false,
+        terminalWriteRecoveryClaimed: false,
         persistedTerminalError: undefined,
         publishedFailures: new Set(),
       }
@@ -192,7 +193,7 @@ const layer = Layer.effect(
       message.error ??= state.persistedTerminalError ?? error
       message.time.completed ??= Date.now()
       if (
-        !state.terminalRecovering &&
+        !state.terminalWriteRecoveryClaimed &&
         (!state.terminalMessagePersisted || state.persistedTerminalError !== message.error)
       ) {
         const written = yield* Effect.exit(session.updateMessage(message))
@@ -214,7 +215,7 @@ const layer = Layer.effect(
       message: SessionV1.Assistant,
       state: FinalizationState,
     ) {
-      state.terminalRecovering = true
+      state.terminalWriteRecoveryClaimed = true
       yield* Effect.logWarning("persisting failed assistant once SQLite is writable", {
         "session.id": message.sessionID,
         messageID: message.id,
@@ -251,7 +252,7 @@ const layer = Layer.effect(
           (cause) => !Cause.hasInterruptsOnly(cause),
           (cause) =>
             Effect.gen(function* () {
-              state.terminalRecovering = false
+              state.terminalWriteRecoveryClaimed = false
               yield* Effect.logError("failed to persist failed assistant", {
                 "session.id": message.sessionID,
                 messageID: message.id,
