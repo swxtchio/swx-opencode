@@ -4973,6 +4973,7 @@ registerEnvironmentTest(
   { git: true, config: cfg },
   120_000,
 )
+)
 
 nonOwnerCancel.instance(
   "a cancel without a local runner does not signal idle for a live owner turn",
