@@ -29,7 +29,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
-// Retries a failed turn's terminal write until another writer releases the database: 100ms doubling to a 2s cap.
+// Retries a failed turn's terminal write until another writer releases the database.
 const terminalRecoverySchedule = Schedule.exponential("100 millis").pipe(
   Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 2000)))),
 )
