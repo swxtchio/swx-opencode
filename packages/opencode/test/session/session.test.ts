@@ -11,6 +11,7 @@ import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { provideInstance, tmpdirScoped } from "../fixture/fixture"
+import { spanHold } from "../fixture/span-hold"
 import { testEffect } from "../lib/effect"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -45,6 +46,9 @@ const awaitDeferred = <T>(deferred: Deferred.Deferred<T>, message: string) =>
     Deferred.await(deferred),
     Effect.sleep("2 seconds").pipe(Effect.flatMap(() => Effect.fail(new Error(message)))),
   )
+
+const awaitDeferredEffect = (wait: Effect.Effect<void>, message: string) =>
+  Effect.race(wait, Effect.sleep("2 seconds").pipe(Effect.flatMap(() => Effect.fail(new Error(message)))))
 
 const remove = (id: SessionID) => SessionNs.use.remove(id)
 
@@ -357,6 +361,38 @@ describe("Session writes racing removal", () => {
         expect(Exit.isFailure(exit)).toBe(true)
         if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionProjector.SessionNotProjected)
       }
+      expect(notified).toEqual([])
+      expect(Exit.isFailure(yield* session.get(info.id).pipe(Effect.exit))).toBe(true)
+      expect(yield* aggregate(info.id)).toEqual({ seq: -1, events: 0 })
+    }),
+  )
+
+  it.instance("refuses a title write whose own read saw the Session before removal committed", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const bus = yield* EventV2Bridge.Service
+      const info = yield* session.create({ title: "removed-during-patch" })
+      const spans = spanHold()
+      // Session.patch reads the Session and then publishes; hold setTitle between the two.
+      const hold = yield* spans.arm({ name: "Session.get", parent: "Session.setTitle" })
+      const writer = yield* session
+        .setTitle({ sessionID: info.id, title: "late" })
+        .pipe(Effect.withTracer(spans.tracer), Effect.exit, Effect.forkChild)
+
+      yield* awaitDeferredEffect(hold.reached, "timed out waiting for setTitle to read the Session")
+      yield* session.remove(info.id)
+      const notified = new Array<string>()
+      const unsubscribe = yield* bus.listen((event) =>
+        Effect.sync(() => {
+          if ((event.data as { sessionID?: string } | undefined)?.sessionID === info.id) notified.push(event.type)
+        }),
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      yield* hold.release
+      const exit = yield* Fiber.join(writer)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionProjector.SessionNotProjected)
       expect(notified).toEqual([])
       expect(Exit.isFailure(yield* session.get(info.id).pipe(Effect.exit))).toBe(true)
       expect(yield* aggregate(info.id)).toEqual({ seq: -1, events: 0 })
