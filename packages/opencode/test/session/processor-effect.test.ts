@@ -24,6 +24,7 @@ import { MessageV2 } from "../../src/session/message-v2"
 import { SessionProcessor } from "../../src/session/processor"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
+import { SessionRunState } from "../../src/session/run-state"
 import { SessionSummary } from "../../src/session/summary"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
@@ -416,6 +417,7 @@ const sqliteTerminalDbPaths = ([2, 3] as const).map((failures) => ({
   failures,
   path: path.join(import.meta.dir, `.opencode-sqlite-terminal-${failures}-${crypto.randomUUID()}.db`),
 }))
+const heldLockDbPath = path.join(import.meta.dir, `.opencode-sqlite-held-lock-${crypto.randomUUID()}.db`)
 const routedEnv = LayerNode.compile(root, [
   ...replacements,
   [LLM.node, routedLLM],
@@ -439,6 +441,9 @@ afterAll(async () => {
       `${sqliteLockDbPath}-wal`,
       `${sqliteLockDbPath}-shm`,
       ...sqliteTerminalDbPaths.flatMap((item) => [item.path, `${item.path}-wal`, `${item.path}-shm`]),
+      heldLockDbPath,
+      `${heldLockDbPath}-wal`,
+      `${heldLockDbPath}-shm`,
       routerLabelDbPath,
       `${routerLabelDbPath}-wal`,
       `${routerLabelDbPath}-shm`,
@@ -541,6 +546,70 @@ const lockTerminalLLM = Layer.succeed(
         LLMEvent.reasoningEnd({ id: "reasoning-1" }),
         LLMEvent.stepFinish({ index: 0, reason: "stop" }),
         LLMEvent.finish({ reason: "stop" }),
+      ),
+  }),
+)
+type HeldLock = { messageID: MessageID; holder?: Sqlite }
+const heldLocks = new Map<SessionID, HeldLock>()
+const heldLockSession = LayerNode.make({
+  service: Session.Service,
+  layer: Layer.effect(
+    Session.Service,
+    Effect.gen(function* () {
+      const real = yield* Session.Service
+      return Session.Service.of({
+        ...real,
+        updatePart: <T extends SessionV1.Part>(part: T) =>
+          Effect.suspend(() => {
+            const lock = heldLocks.get(part.sessionID)
+            // A second connection takes the write lock just before the turn's reasoning-end write.
+            if (
+              lock &&
+              !lock.holder &&
+              part.messageID === lock.messageID &&
+              part.type === "reasoning" &&
+              part.time.end !== undefined
+            ) {
+              lock.holder = new Sqlite(heldLockDbPath)
+              lock.holder.run("BEGIN IMMEDIATE")
+            }
+            return real.updatePart(part)
+          }),
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      Session.node.implementation as Layer.Layer<
+        Session.Service,
+        never,
+        BackgroundJob.Service | RuntimeFlags.Service | Database.Service | EventV2Bridge.Service
+      >,
+    ),
+  ),
+  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
+})
+const heldLockTurn = { streaming: defer<void>(), resume: defer<void>() }
+const heldLockLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.concat(
+        Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.reasoningStart({ id: "reasoning-1" }),
+          LLMEvent.reasoningDelta({ id: "reasoning-1", text: "thinking" }),
+        ),
+        Stream.unwrap(
+          Effect.promise(async () => {
+            heldLockTurn.streaming.resolve()
+            await heldLockTurn.resume.promise
+            return Stream.make(
+              LLMEvent.reasoningEnd({ id: "reasoning-1" }),
+              LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+              LLMEvent.finish({ reason: "stop" }),
+            )
+          }),
+        ),
       ),
   }),
 )
@@ -1559,6 +1628,107 @@ for (const { failures, path: databasePath } of sqliteTerminalDbPaths) {
     20_000,
   )
 }
+
+const itHeldLock = testEffect(
+  LayerNode.compile(LayerNode.group([root, SessionRunState.node]), [
+    ...replacements,
+    [Database.node, Database.layerFromPath(heldLockDbPath)],
+    [Session.node, heldLockSession],
+    [LLM.node, heldLockLLM],
+  ]),
+)
+
+itHeldLock.live(
+  "processor persists a failed turn once a lock held across every terminalizing write is released",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+          const events = yield* EventV2Bridge.Service
+          const statuses = yield* SessionStatus.Service
+          const runs = yield* SessionRunState.Service
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "hold the write lock")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const model = yield* provider.getModel(ref.providerID, ref.modelID)
+          const lock: HeldLock = { messageID: msg.id }
+          heldLocks.set(chat.id, lock)
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              heldLocks.delete(chat.id)
+              if (lock.holder?.inTransaction) lock.holder.run("ROLLBACK")
+              lock.holder?.close()
+            }),
+          )
+          const terminal = yield* Deferred.make<void>()
+          const off = yield* events.listen((event) => {
+            if (event.type !== SessionV1.Event.MessageUpdated.type) return Effect.void
+            const info = (event.data as typeof SessionV1.Event.MessageUpdated.data.Type).info
+            if (info.id !== msg.id || info.role !== "assistant" || info.time.completed === undefined) return Effect.void
+            return Deferred.succeed(terminal, undefined).pipe(Effect.asVoid)
+          })
+          yield* Effect.addFinalizer(() => off)
+
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+          const run = yield* handle
+            .process({
+              user: {
+                id: parent.id,
+                sessionID: chat.id,
+                role: "user",
+                time: parent.time,
+                agent: parent.agent,
+                model: { providerID: ref.providerID, modelID: ref.modelID },
+              } satisfies SessionV1.User,
+              sessionID: chat.id,
+              model,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "hold the write lock" }],
+              tools: {},
+            })
+            .pipe(Effect.exit, Effect.forkChild)
+
+          // Mid-stream, the owner reports the turn as active and it is not terminal.
+          yield* Effect.promise(() => heldLockTurn.streaming.promise)
+          expect((yield* statuses.get(chat.id)).type).toBe("busy")
+          const streaming = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+          expect(streaming.info.role === "assistant" && streaming.info.time.completed).toBeUndefined()
+          heldLockTurn.resume.resolve()
+          const exit = yield* Fiber.join(run)
+
+          // The turn failed with the lock still held, so none of its terminalizing writes landed,
+          // and cancelling the now-idle session does not stand in for terminalizing it.
+          expect(lock.holder?.inTransaction).toBe(true)
+          yield* runs.cancel(chat.id)
+          expect((yield* statuses.get(chat.id)).type).toBe("idle")
+          const locked = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+          expect(locked.info.role === "assistant" && locked.info.time.completed).toBeUndefined()
+
+          lock.holder?.run("ROLLBACK")
+          yield* Deferred.await(terminal).pipe(
+            Effect.timeoutOrElse({
+              duration: "10 seconds",
+              orElse: () => Effect.die(new Error("the failed turn was not persisted after the lock was released")),
+            }),
+          )
+          const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+          expect(stored.info.role).toBe("assistant")
+          if (stored.info.role === "assistant") {
+            expect(stored.info.time.completed).toBeDefined()
+            expect(stored.info.error?.name).toBe("UnknownError")
+            if (stored.info.error?.name === "UnknownError") {
+              expect(stored.info.error.data.message.toLowerCase()).toContain("database is locked")
+            }
+          }
+          expect(Exit.isSuccess(exit)).toBe(true)
+          if (Exit.isSuccess(exit)) expect(exit.value).toBe("stop")
+        }),
+      { config: cfg },
+    ),
+  30_000,
+)
 
 itPreludeInterrupt.live("session.processor classifies a prelude interrupt as an aborted assistant", () =>
   provideTmpdirInstance(
