@@ -109,6 +109,13 @@ export function isSessionToolActive(input: {
   return input.status === "working" || input.status === "compacting"
 }
 
+function assistantStatus(sync: ReturnType<typeof useSync>, message: AssistantMessage) {
+  // Session status belongs to the latest assistant, not older rows retained in history.
+  const latest = sync.data.message[message.sessionID]?.findLast((item) => item.role === "assistant")
+  if (latest?.id !== message.id) return "unknown" as const
+  return sync.session.status(message.sessionID)
+}
+
 function goUpsellKeys(action: RetryAction) {
   if (!action) return
   if (!GO_UPSELL_PROVIDERS.has(action.provider)) return
@@ -167,7 +174,7 @@ const sessionGlobalBindingCommands = [
 
 const sessionGlobalUnfocusedBindingCommands = ["session.first", "session.last"] as const
 
-const context = createContext<{
+export const SessionContext = createContext<{
   width: number
   sessionID: string
   conceal: () => boolean
@@ -183,7 +190,7 @@ const context = createContext<{
 }>()
 
 function use() {
-  const ctx = useContext(context)
+  const ctx = useContext(SessionContext)
   if (!ctx) throw new Error("useContext must be used within a Session component")
   return ctx
 }
@@ -1226,7 +1233,7 @@ export function Session() {
 
   return (
     <LocationProvider location={location()}>
-      <context.Provider
+      <SessionContext.Provider
         value={{
           get width() {
             return contentWidth()
@@ -1427,7 +1434,7 @@ export function Session() {
             </Switch>
           </Show>
         </box>
-      </context.Provider>
+      </SessionContext.Provider>
     </LocationProvider>
   )
 }
@@ -1673,13 +1680,13 @@ function AssistantMessage(props: {
 
 const PART_MAPPING = {
   text: TextPart,
-  tool: ToolPart,
-  reasoning: ReasoningPart,
+  tool: ToolPartView,
+  reasoning: ReasoningPartView,
 }
 
 const INLINE_TOOL_ICON_WIDTH = 2
 
-function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: AssistantMessage }) {
+export function ReasoningPartView(props: { last: boolean; part: ReasoningPart; message: AssistantMessage }) {
   const { theme } = useTheme()
   const ctx = use()
   const sync = useSync()
@@ -1692,7 +1699,7 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
     return props.part.text.replace("[REDACTED]", "").trim()
   })
   const opaque = createMemo(() => !content() && Boolean(props.part.metadata))
-  const status = createMemo(() => sync.session.status(props.message.sessionID))
+  const status = createMemo(() => assistantStatus(sync, props.message))
   const unresolved = createMemo(
     () =>
       props.part.time.end === undefined &&
@@ -1823,7 +1830,7 @@ function TextPart(props: { last: boolean; part: TextPart; message: AssistantMess
 
 // Pending messages moved to individual tool pending functions
 
-function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMessage }) {
+export function ToolPartView(props: { last: boolean; part: ToolPart; message: AssistantMessage }) {
   const ctx = use()
   const display = createMemo(() => toolDisplay(props.part.tool))
 
@@ -1980,7 +1987,11 @@ function InlineTool(props: {
   const message = createMemo(() =>
     sync.data.message[props.part.sessionID]?.find((item) => item.id === props.part.messageID),
   )
-  const status = createMemo(() => sync.session.status(props.part.sessionID))
+  const status = createMemo(() => {
+    const current = message()
+    if (current?.role !== "assistant") return "unknown" as const
+    return assistantStatus(sync, current)
+  })
   const unresolved = createMemo(() => {
     if (props.part.state.status !== "pending" && props.part.state.status !== "running") return false
     const current = message()
@@ -2159,7 +2170,12 @@ function BlockTool(props: {
       ? sync.data.message[props.part.sessionID]?.find((item) => item.id === props.part?.messageID)
       : undefined,
   )
-  const status = createMemo(() => (props.part ? sync.session.status(props.part.sessionID) : "idle"))
+  const status = createMemo(() => {
+    if (!props.part) return "idle" as const
+    const current = message()
+    if (current?.role !== "assistant") return "unknown" as const
+    return assistantStatus(sync, current)
+  })
   const unresolved = createMemo(() => {
     if (!props.part || (props.part.state.status !== "pending" && props.part.state.status !== "running")) return false
     const current = message()
@@ -2226,7 +2242,11 @@ function Shell(props: ToolProps) {
   const message = createMemo(() =>
     sync.data.message[props.part.sessionID]?.find((item) => item.id === props.part.messageID),
   )
-  const status = createMemo(() => sync.session.status(props.part.sessionID))
+  const status = createMemo(() => {
+    const current = message()
+    if (current?.role !== "assistant") return "unknown" as const
+    return assistantStatus(sync, current)
+  })
   const isRunning = createMemo(() => {
     if (props.part.state.status !== "running") return false
     const current = message()

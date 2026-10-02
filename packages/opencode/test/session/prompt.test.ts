@@ -10,7 +10,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { afterAll, expect, test } from "bun:test"
 import { randomUUID } from "node:crypto"
 import { rm } from "node:fs/promises"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
 import { HttpClient } from "effect/unstable/http"
 import os from "os"
 import path from "path"
@@ -35,6 +35,7 @@ import { Session } from "@/session/session"
 import { MessageTable, SessionMessageTable } from "@opencode-ai/core/session/sql"
 import { SessionPromptQueueSequenceTable, SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
 import { LLM } from "../../src/session/llm"
+import { LLMEvent } from "@opencode-ai/llm"
 import { MessageV2 } from "../../src/session/message-v2"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { SessionCompaction } from "../../src/session/compaction"
@@ -239,6 +240,56 @@ function processorWithCreate(create: SessionProcessor.Interface["create"]) {
     deps: processorDependencies,
   })
 }
+
+const abruptAssistantLLMCalls = { value: 0 }
+const abruptAssistantLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () => {
+      abruptAssistantLLMCalls.value++
+      if (abruptAssistantLLMCalls.value > 1)
+        return Stream.fromIterable([
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.reasoningStart({
+            id: "completed_reasoning",
+            providerMetadata: { openai: { itemID: "completed_reasoning" } },
+          }),
+          LLMEvent.reasoningDelta({
+            id: "completed_reasoning",
+            text: "completed later reasoning",
+            providerMetadata: { openai: { itemID: "completed_reasoning" } },
+          }),
+          LLMEvent.reasoningEnd({ id: "completed_reasoning" }),
+          LLMEvent.textStart({ id: "completed_answer" }),
+          LLMEvent.textDelta({ id: "completed_answer", text: "later turn completed" }),
+          LLMEvent.textEnd({ id: "completed_answer" }),
+          LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+          LLMEvent.finish({ reason: "stop" }),
+        ])
+      return Stream.concat(
+        Stream.fromIterable([
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.reasoningStart({
+            id: "reasoning_before_process_exit",
+            providerMetadata: { openai: { itemID: "reasoning_before_process_exit" } },
+          }),
+          LLMEvent.reasoningDelta({
+            id: "reasoning_before_process_exit",
+            text: "reasoning before process exit",
+            providerMetadata: { openai: { itemID: "reasoning_before_process_exit" } },
+          }),
+          LLMEvent.toolCall({
+            id: "call_before_process_exit",
+            name: "read",
+            input: { filePath: "/tmp/unfinished.ts" },
+          }),
+        ]),
+        Stream.never,
+      )
+    },
+  }),
+)
+
 const blockingProcessor = processorWithCreate(() =>
   Effect.sync(() => processorCreateStarted.shift()?.()).pipe(Effect.andThen(Effect.never)),
 )
@@ -295,6 +346,7 @@ type PromptTestOptions = {
   status?: Layer.Layer<SessionStatus.Service>
   compaction?: Layer.Layer<SessionCompaction.Service>
   plugin?: Layer.Layer<Plugin.Service>
+  llm?: Layer.Layer<LLM.Service>
 }
 
 function makePrompt(input?: PromptTestOptions) {
@@ -306,6 +358,7 @@ function makePrompt(input?: PromptTestOptions) {
     ...(input?.status ? [[SessionStatus.node, input.status] as const] : []),
     ...(input?.compaction ? [[SessionCompaction.node, input.compaction] as const] : []),
     ...(input?.plugin ? [[Plugin.node, input.plugin] as const] : []),
+    ...(input?.llm ? [[LLM.node, input.llm] as const] : []),
   ] as const
   if (input?.processor === "blocking") {
     return LayerNode.compile(promptRoot, [...replacements, [SessionProcessor.node, blockingProcessor]])
@@ -323,6 +376,7 @@ function makeHttp(input?: PromptTestOptions) {
     ...(input?.status ? [[SessionStatus.node, input.status] as const] : []),
     ...(input?.compaction ? [[SessionCompaction.node, input.compaction] as const] : []),
     ...(input?.plugin ? [[Plugin.node, input.plugin] as const] : []),
+    ...(input?.llm ? [[LLM.node, input.llm] as const] : []),
   ] as const
   if (input?.processor === "blocking") {
     return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
@@ -573,6 +627,7 @@ const gatedPlugin = LayerNode.make({
 })
 
 const it = testEffect(makeHttp())
+const abruptPrompt = testEffect(makeHttp({ llm: abruptAssistantLLM }))
 const gated = testEffect(
   LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
     [SessionSummary.node, summary],
@@ -4526,6 +4581,398 @@ const startHeld = Effect.fn("test.startHeld")(function* (input?: {
   const release = Deferred.succeed(gate, void 0)
   return { llm, prompt, sessions, queue, chat, task, send, release }
 })
+
+function registerEnvironmentTest(name: string, enabled: boolean, register: () => void) {
+  if (enabled) return register()
+  test.skip(name, () => {})
+}
+
+registerEnvironmentTest(
+  "dangling-assistant-process-worker persists unfinished reasoning and tool parts before process exit",
+  process.env.OPENCODE_DANGLING_ASSISTANT_OUTPUT !== undefined,
+  () =>
+    abruptPrompt.instance(
+      "dangling-assistant-process-worker persists unfinished reasoning and tool parts before process exit",
+      () =>
+        Effect.gen(function* () {
+          const output = process.env.OPENCODE_DANGLING_ASSISTANT_OUTPUT
+          if (!output) return
+
+          const directory = yield* TestInstance
+          const prompt = yield* SessionPrompt.Service
+          const sessions = yield* Session.Service
+          const chat = yield* sessions.create({
+            title: "Dangling assistant process",
+            permission: [{ permission: "*", pattern: "*", action: "allow" }],
+          })
+          abruptAssistantLLMCalls.value = 0
+          yield* prompt
+            .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("start unfinished work") })
+            .pipe(Effect.forkChild)
+
+          const unfinished = yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const history = yield* sessions.messages({ sessionID: chat.id })
+              const assistant = history.findLast(
+                (message) => message.info.role === "assistant" && message.info.time.completed === undefined,
+              )
+              if (!assistant || assistant.info.role !== "assistant" || assistant.parts.length < 3) return undefined
+              return assistant
+            }),
+            "the production turn did not persist any assistant parts",
+            "15 seconds",
+          )
+          const hasOpenReasoning = unfinished.parts.some(
+            (part) => part.type === "reasoning" && part.time.end === undefined && part.metadata !== undefined,
+          )
+          const runningTool = unfinished.parts.find(
+            (part): part is SessionV1.ToolPart => part.type === "tool" && part.state.status === "running",
+          )
+          if (!hasOpenReasoning || !runningTool)
+            throw new Error(`production parts were not both open: ${JSON.stringify(unfinished.parts)}`)
+          const messages = yield* sessions.messages({ sessionID: chat.id })
+
+          const session = yield* sessions.get(chat.id)
+          yield* Effect.promise(() =>
+            Bun.write(output, JSON.stringify({ session, messages, directory: directory.directory })),
+          )
+          process.exit(0)
+        }),
+      { git: true, config: cfg },
+      30_000,
+    ),
+)
+
+registerEnvironmentTest(
+  "dangling-assistant-shell-worker persists a running shell tool before process exit",
+  process.env.OPENCODE_DANGLING_SHELL_OUTPUT !== undefined,
+  () =>
+    it.instance(
+      "dangling-assistant-shell-worker persists a running shell tool before process exit",
+      () =>
+        Effect.gen(function* () {
+          const output = process.env.OPENCODE_DANGLING_SHELL_OUTPUT
+          const sourcePath = process.env.OPENCODE_DANGLING_SOURCE
+          const command = process.env.OPENCODE_DANGLING_COMMAND
+          if (!output || !sourcePath || !command) return
+
+          const prompt = yield* SessionPrompt.Service
+          const sessions = yield* Session.Service
+          const source = Schema.decodeUnknownSync(Schema.Struct({ messages: Schema.Array(SessionV1.WithParts) }))(
+            Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(yield* Effect.promise(() => Bun.file(sourcePath).text())),
+          )
+          const chat = yield* sessions.create({
+            title: "Dangling assistant shell",
+            permission: [{ permission: "*", pattern: "*", action: "allow" }],
+          })
+          yield* Effect.forEach(
+            source.messages,
+            (message) =>
+              Effect.gen(function* () {
+                const info = Schema.decodeUnknownSync(SessionV1.Info)({ ...message.info, sessionID: chat.id })
+                // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- the legacy writer requires mutable V1 records after schema validation
+                const mutableInfo = info as SessionV1.Info
+                yield* sessions.updateMessage(mutableInfo)
+                yield* Effect.forEach(
+                  message.parts,
+                  (part) =>
+                    Effect.gen(function* () {
+                      const validated = Schema.decodeUnknownSync(SessionV1.Part)({ ...part, sessionID: chat.id })
+                      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- the legacy writer requires mutable V1 parts after schema validation
+                      const mutable = validated as SessionV1.Part
+                      yield* sessions.updatePart(mutable)
+                    }),
+                  { discard: true },
+                )
+              }),
+            { discard: true },
+          )
+          yield* prompt.shell({ sessionID: chat.id, agent: "build", model: ref, command }).pipe(Effect.forkChild)
+          const messages = yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const history = yield* sessions.messages({ sessionID: chat.id })
+              const assistant = history.findLast(
+                (message) =>
+                  message.info.role === "assistant" &&
+                  message.parts.some(
+                    (part) =>
+                      part.type === "tool" &&
+                      part.tool === "bash" &&
+                      part.state.status === "running" &&
+                      part.state.metadata?.output?.includes("started"),
+                  ),
+              )
+              return assistant ? history : undefined
+            }),
+            "the production shell tool did not persist its running output",
+            "15 seconds",
+          )
+          const directory = yield* TestInstance
+          const session = yield* sessions.get(chat.id)
+          yield* Effect.promise(() =>
+            Bun.write(output, JSON.stringify({ session, messages, directory: directory.directory })),
+          )
+          process.exit(0)
+        }),
+      { git: true, config: cfg },
+      30_000,
+    ),
+)
+
+registerEnvironmentTest(
+  "dangling-assistant-production-integration emits real active and completed history for the TUI regression",
+  process.env.OPENCODE_DANGLING_ASSISTANT_SNAPSHOT !== undefined,
+  () =>
+    abruptPrompt.instance(
+      "dangling-assistant-production-integration emits real active and completed history for the TUI regression",
+      () =>
+        Effect.gen(function* () {
+          const output = process.env.OPENCODE_DANGLING_ASSISTANT_SNAPSHOT
+          if (!output) return
+
+        const instance = yield* TestInstance
+        const dir = instance.directory
+        const workerOutput = path.join(dir, "unfinished-assistant.json")
+        const workerDatabase = `${workerOutput}.db`
+        const runChild = (name: string, extra: Record<string, string>, database = workerDatabase) => {
+          const workerEnv = Object.fromEntries(
+            Object.entries(process.env).flatMap(([key, value]) => (value === undefined ? [] : [[key, value]])),
+          )
+          Object.assign(workerEnv, { OPENCODE_DB: database }, extra)
+          return Bun.spawn(
+            [process.execPath, "test", "test/session/prompt.test.ts", `--test-name-pattern=${name}`],
+            {
+              cwd: path.join(import.meta.dir, "../.."),
+              env: workerEnv,
+              stdout: "pipe",
+              stderr: "pipe",
+            },
+          )
+        }
+        const worker = runChild("dangling-assistant-process-worker", {
+          OPENCODE_DANGLING_ASSISTANT_OUTPUT: workerOutput,
+        })
+        yield* Effect.addFinalizer(() => Effect.sync(() => worker.kill()))
+        const [workerCode, workerStdout, workerStderr] = yield* awaitWithTimeout(
+          Effect.promise(() =>
+            Promise.all([
+              worker.exited,
+              Bun.readableStreamToText(worker.stdout),
+              Bun.readableStreamToText(worker.stderr),
+            ]),
+          ),
+          "the production worker did not exit after persisting its unfinished turn",
+          "30 seconds",
+        )
+        expect(workerCode, `${workerStdout}\n${workerStderr}`).toBe(0)
+
+        const serialized = Schema.decodeUnknownSync(
+          Schema.Struct({
+            session: SessionV1.SessionInfo,
+            messages: Schema.Array(SessionV1.WithParts),
+            directory: Schema.String,
+          }),
+        )(Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(yield* Effect.promise(() => Bun.file(workerOutput).text())))
+        yield* Effect.addFinalizer(() => Effect.promise(() => rm(serialized.directory, { recursive: true, force: true })))
+        const source = serialized.messages.findLast(
+          (message) => message.info.role === "assistant" && message.info.time.completed === undefined,
+        )
+        if (!source || source.info.role !== "assistant") throw new Error("producer did not preserve its unfinished assistant")
+        expect(source.info.error).toBeUndefined()
+        expect(source.parts.some((part) => part.type === "reasoning" && part.time.end === undefined)).toBe(true)
+        expect(source.parts.some((part) => part.type === "reasoning" && part.metadata !== undefined)).toBe(true)
+
+        const shellScript = path.join(dir, "hold-shell.mjs")
+        const shellRelease = path.join(dir, "release-shell")
+        const shellPID = path.join(dir, "shell.pid")
+        yield* Effect.promise(() =>
+          Bun.write(
+            shellScript,
+            [
+              'import { existsSync, watch, writeFileSync } from "node:fs"',
+              'import { basename, dirname } from "node:path"',
+              "const [release, pid] = process.argv.slice(2)",
+              "writeFileSync(pid, String(process.pid))",
+              'process.stdout.write("started\\n")',
+              "if (!existsSync(release)) await new Promise((resolve, reject) => {",
+              "  const watcher = watch(dirname(release), (_event, name) => {",
+              "    if (name?.toString() !== basename(release) || !existsSync(release)) return",
+              "    watcher.close()",
+              "    resolve()",
+              "  })",
+              "  watcher.on(\"error\", reject)",
+              "})",
+              'process.stdout.write("finished\\n")',
+            ].join("\n"),
+          ),
+        )
+        const shellCommand = `"${process.execPath}" "${shellScript}" "${shellRelease}" "${shellPID}"`
+        const shellOutput = path.join(dir, "running-shell.json")
+        const shellWorker = runChild(
+          "dangling-assistant-shell-worker",
+          {
+            OPENCODE_DANGLING_SHELL_OUTPUT: shellOutput,
+            OPENCODE_DANGLING_SOURCE: workerOutput,
+            OPENCODE_DANGLING_COMMAND: shellCommand,
+          },
+          `${shellOutput}.db`,
+        )
+        yield* Effect.addFinalizer(() => Effect.sync(() => shellWorker.kill()))
+        const [shellCode, shellStdout, shellStderr] = yield* awaitWithTimeout(
+          Effect.promise(() =>
+            Promise.all([
+              shellWorker.exited,
+              Bun.readableStreamToText(shellWorker.stdout),
+              Bun.readableStreamToText(shellWorker.stderr),
+            ]),
+          ),
+          "the running shell worker did not exit after persisting its tool",
+          "30 seconds",
+        )
+        expect(shellCode, `${shellStdout}\n${shellStderr}`).toBe(0)
+        const runningShell = Schema.decodeUnknownSync(
+          Schema.Struct({
+            session: SessionV1.SessionInfo,
+            messages: Schema.Array(SessionV1.WithParts),
+            directory: Schema.String,
+          }),
+        )(Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(yield* Effect.promise(() => Bun.file(shellOutput).text())))
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(async () => {
+            const pid = Number(await Bun.file(shellPID).text().catch(() => ""))
+            if (Number.isSafeInteger(pid) && pid > 0 && alive(pid)) {
+              if (process.platform === "win32") process.kill(pid)
+              else process.kill(pid, "SIGKILL")
+            }
+            await rm(runningShell.directory, { recursive: true, force: true })
+          }),
+        )
+        yield* Effect.promise(() => Bun.write(shellRelease, "release"))
+        const pid = Number(yield* Effect.promise(() => Bun.file(shellPID).text()))
+        if (alive(pid)) {
+          if (process.platform === "win32") process.kill(pid)
+          else process.kill(pid, "SIGKILL")
+        }
+
+        const sessions = yield* Session.Service
+        const prompt = yield* SessionPrompt.Service
+        const status = yield* SessionStatus.Service
+        const chat = yield* sessions.create({
+          title: "Dangling assistant recovery",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+      yield* Effect.forEach(
+        runningShell.messages,
+          (message) =>
+            Effect.gen(function* () {
+              const info = Schema.decodeUnknownSync(SessionV1.Info)({ ...message.info, sessionID: chat.id })
+              // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- the legacy writer requires mutable V1 records after schema validation
+              const mutableInfo = info as SessionV1.Info
+              yield* sessions.updateMessage(mutableInfo)
+              yield* Effect.forEach(
+                message.parts,
+                (part) => {
+                  const validated = Schema.decodeUnknownSync(SessionV1.Part)({ ...part, sessionID: chat.id })
+                  // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- the legacy writer requires mutable V1 parts after schema validation
+                  const mutable = validated as SessionV1.Part
+                  return sessions.updatePart(mutable)
+                },
+                { discard: true },
+              )
+            }),
+        { discard: true },
+      )
+
+      abruptAssistantLLMCalls.value = 0
+      const task = yield* prompt
+          .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("start a later turn") })
+          .pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const history = yield* sessions.messages({ sessionID: chat.id })
+            const current = history.findLast(
+              (message) => message.info.role === "assistant" && message.info.id !== source.info.id,
+            )
+            if (!current || current.info.role !== "assistant" || current.info.time.completed !== undefined)
+              return undefined
+            const hasReasoning = current.parts.some(
+              (part) => part.type === "reasoning" && part.time.end === undefined && part.metadata !== undefined,
+            )
+            const activeRead = current.parts.find(
+              (part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "read",
+            )
+            return hasReasoning && activeRead?.state.status === "running" ? true : undefined
+          }),
+          "the later production turn did not persist its live reasoning and running tool",
+          "15 seconds",
+        )
+        const activeMessages = yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const history = yield* sessions.messages({ sessionID: chat.id })
+            const current = history.findLast(
+              (message) => message.info.role === "assistant" && message.info.id !== source.info.id,
+            )
+            if (!current || current.info.role !== "assistant" || current.info.time.completed !== undefined)
+              return undefined
+            const activeRead = current.parts.find(
+              (part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "read",
+            )
+            if (!activeRead || activeRead.state.status !== "running") return undefined
+            return history
+          }),
+          "the later production tool did not enter its running state",
+          "15 seconds",
+        )
+        const activeAssistant = activeMessages.findLast(
+          (message) => message.info.role === "assistant" && message.info.id !== source.info.id,
+        )
+        if (!activeAssistant || activeAssistant.info.role !== "assistant")
+          throw new Error("expected the later production assistant to be active")
+        const activeStatus = yield* status.get(chat.id)
+        expect(activeStatus.type).toBe("busy")
+
+        yield* awaitWithTimeout(prompt.cancel(chat.id), "the later production turn did not cancel", "15 seconds")
+        yield* awaitWithTimeout(Fiber.await(task), "the cancelled production turn did not stop", "15 seconds")
+        const finalTask = yield* prompt
+          .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("complete a later turn") })
+          .pipe(Effect.forkChild)
+        yield* awaitWithTimeout(Fiber.join(finalTask), "the final production turn did not finish", "15 seconds")
+        const completedMessages = yield* sessions.messages({ sessionID: chat.id })
+        const completedAssistant = completedMessages.findLast(
+          (message) => message.info.role === "assistant" && message.info.id !== source.info.id,
+        )
+        if (!completedAssistant || completedAssistant.info.role !== "assistant")
+          throw new Error("expected the later production assistant to complete")
+        expect(completedAssistant.info.time.completed).toBeDefined()
+        expect(completedAssistant.info.error).toBeUndefined()
+        const completedStatus = yield* status.get(chat.id)
+        expect(completedStatus.type).toBe("idle")
+
+        const unchangedOld = completedMessages.find((message) => message.info.id === source.info.id)
+        if (unchangedOld?.info.role !== "assistant") throw new Error("the original producer row disappeared")
+        expect(unchangedOld.info.time.completed).toBeUndefined()
+        expect(unchangedOld.info.error).toBeUndefined()
+        const finalSession = yield* sessions.get(chat.id)
+        yield* Effect.promise(() =>
+          Bun.write(
+            output,
+            JSON.stringify({
+              session: finalSession,
+              oldAssistantID: source.info.id,
+              shellAssistantID: runningShell.messages.findLast(
+                (message) => message.info.role === "assistant" && message.info.id !== source.info.id,
+              )?.info.id,
+              currentAssistantID: activeAssistant.info.id,
+              completedAssistantID: completedAssistant.info.id,
+              active: { messages: activeMessages, status: activeStatus },
+              completed: { messages: completedMessages, status: completedStatus },
+            }),
+          ),
+        )
+      }),
+  { git: true, config: cfg },
+  120_000,
+)
 
 nonOwnerCancel.instance(
   "a cancel without a local runner does not signal idle for a live owner turn",
