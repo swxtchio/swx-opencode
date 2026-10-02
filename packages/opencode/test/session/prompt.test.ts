@@ -7,9 +7,12 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Global } from "@opencode-ai/core/global"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { expect, test } from "bun:test"
+import { afterAll, expect, test } from "bun:test"
+import { randomUUID } from "node:crypto"
+import { rm } from "node:fs/promises"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
 import { HttpClient } from "effect/unstable/http"
+import os from "os"
 import path from "path"
 import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -56,7 +59,7 @@ import { Truncate } from "@/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
-import { TestInstance } from "../fixture/fixture"
+import { provideInstanceEffect, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -325,6 +328,16 @@ function makeHttp(input?: PromptTestOptions) {
     return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
   }
   return LayerNode.compile(root, replacements)
+}
+
+function makeHttpWithDatabase(database: Layer.Layer<Database.Service>) {
+  return LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, runtimeFlags],
+    [Database.node, database],
+  ])
 }
 
 function makeHttpNoLLMServer(input?: PromptTestOptions) {
@@ -605,6 +618,20 @@ const withMcpInstructions = testEffect(
 )
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
+const nonOwnerCancelDatabasePath = path.join(os.tmpdir(), `opencode-non-owner-cancel-${randomUUID()}.db`)
+const nonOwnerCancel = testEffect(makeHttpWithDatabase(Database.layerFromPath(nonOwnerCancelDatabasePath)))
+const nonOwnerRunState = LayerNode.compile(
+  LayerNode.group([SessionRunState.node, SessionStatus.node, EventV2Bridge.node, Database.node]),
+  [[Database.node, Database.layerFromPath(nonOwnerCancelDatabasePath)]],
+)
+
+afterAll(async () => {
+  await Promise.all(
+    [nonOwnerCancelDatabasePath, `${nonOwnerCancelDatabasePath}-wal`, `${nonOwnerCancelDatabasePath}-shm`].map((file) =>
+      rm(file, { force: true }),
+    ),
+  )
+})
 
 // Config that registers a custom "test" provider with a "test-model" model
 // so provider model lookup succeeds inside the loop.
@@ -4499,6 +4526,165 @@ const startHeld = Effect.fn("test.startHeld")(function* (input?: {
   const release = Deferred.succeed(gate, void 0)
   return { llm, prompt, sessions, queue, chat, task, send, release }
 })
+
+nonOwnerCancel.instance(
+  "a cancel without a local runner does not signal idle for a live owner turn",
+  () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const status = yield* SessionStatus.Service
+      const runState = yield* SessionRunState.Service
+      const ownerStatusEvents: { sessionID: string; status: string }[] = []
+      const ownerIdleEvents: string[] = []
+      const unsubscribeOwner = yield* events.listen((event) => {
+        if (event.type === SessionStatus.Event.Status.type) {
+          return Effect.sync(() => {
+            const data = Schema.decodeUnknownSync(SessionStatus.Event.Status.data)(event.data)
+            ownerStatusEvents.push({ sessionID: data.sessionID, status: data.status.type })
+          })
+        }
+        if (event.type === SessionStatus.Event.Idle.type) {
+          return Effect.sync(() => {
+            const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+            ownerIdleEvents.push(data.sessionID)
+          })
+        }
+        return Effect.void
+      })
+
+      const { llm, sessions, chat, task, release } = yield* startHeld()
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = (yield* status.list()).get(chat.id)
+          return current?.type === "busy" ? true : undefined
+        }),
+        "owner turn never reported busy",
+      )
+      const unfinished = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const messages = yield* sessions.messages({ sessionID: chat.id })
+          const assistant = messages.findLast((message) => message.info.role === "assistant")
+          if (!assistant || assistant.info.role !== "assistant" || assistant.info.time.completed !== undefined)
+            return undefined
+          return assistant
+        }),
+        "owner assistant was not persisted before cancellation",
+      )
+      if (unfinished.info.role !== "assistant") throw new Error("expected the persisted unfinished assistant")
+      expect(unfinished.info.time.completed).toBeUndefined()
+
+      const nonOwnerDirectory = yield* tmpdirScoped()
+      const nonOwnerStatusEvents: { sessionID: string; status: string }[] = []
+      const nonOwnerIdleEvents: string[] = []
+      const nonOwner = yield* Effect.gen(function* () {
+        const events = yield* EventV2Bridge.Service
+        const status = yield* SessionStatus.Service
+        const runState = yield* SessionRunState.Service
+        const unsubscribe = yield* events.listen((event) => {
+          if (event.type === SessionStatus.Event.Status.type) {
+            return Effect.sync(() => {
+              const data = Schema.decodeUnknownSync(SessionStatus.Event.Status.data)(event.data)
+              nonOwnerStatusEvents.push({ sessionID: data.sessionID, status: data.status.type })
+            })
+          }
+          if (event.type === SessionStatus.Event.Idle.type) {
+            return Effect.sync(() => {
+              const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+              nonOwnerIdleEvents.push(data.sessionID)
+            })
+          }
+          return Effect.void
+        })
+        yield* runState.cancel(chat.id)
+        const statuses = yield* status.list()
+        yield* unsubscribe
+        return statuses
+      }).pipe(Effect.provide(nonOwnerRunState), provideInstanceEffect(nonOwnerDirectory))
+
+      expect(nonOwner.size).toBe(0)
+      expect(nonOwnerStatusEvents).toEqual([])
+      expect(nonOwnerIdleEvents).toEqual([])
+      expect((yield* status.list()).get(chat.id)?.type).toBe("busy")
+      const afterNonOwnerCancel = (yield* sessions.messages({ sessionID: chat.id })).findLast(
+        (message) => message.info.id === unfinished.info.id,
+      )
+      if (afterNonOwnerCancel?.info.role !== "assistant") throw new Error("owner assistant disappeared after cancel")
+      expect(afterNonOwnerCancel.info.time.completed).toBeUndefined()
+      expect(afterNonOwnerCancel.info.error).toBeUndefined()
+
+      yield* release
+      const [completed] = yield* finish(task)
+      if (!completed || completed.info.role !== "assistant") throw new Error("owner turn did not return its assistant")
+      expect(completed.info.time.completed).toBeDefined()
+      expect((yield* status.list()).has(chat.id)).toBe(false)
+      const persisted = (yield* sessions.messages({ sessionID: chat.id })).findLast(
+        (message) => message.info.id === unfinished.info.id,
+      )
+      if (persisted?.info.role !== "assistant") throw new Error("completed owner assistant was not persisted")
+      expect(persisted.info.time.completed).toBeDefined()
+      expect(ownerStatusEvents.some((event) => event.sessionID === chat.id && event.status === "busy")).toBe(true)
+      expect(ownerStatusEvents.some((event) => event.sessionID === chat.id && event.status === "idle")).toBe(true)
+      expect(ownerIdleEvents).toContain(chat.id)
+
+      const locallyCancelled = yield* sessions.create({ title: "Local cancel idle signal" })
+      const localStarted = yield* Deferred.make<void>()
+      const localHold = yield* Deferred.make<void>()
+      const statusIdle = yield* Deferred.make<void>()
+      const deprecatedIdle = yield* Deferred.make<void>()
+      const localStatusEvents: string[] = []
+      const localIdleEvents: string[] = []
+      const unsubscribeLocal = yield* events.listen((event) => {
+        if (event.type === SessionStatus.Event.Status.type) {
+          return Effect.gen(function* () {
+            const data = Schema.decodeUnknownSync(SessionStatus.Event.Status.data)(event.data)
+            if (data.sessionID !== locallyCancelled.id) return
+            localStatusEvents.push(data.status.type)
+            if (data.status.type === "idle") yield* Deferred.succeed(statusIdle, undefined)
+          })
+        }
+        if (event.type === SessionStatus.Event.Idle.type) {
+          return Effect.gen(function* () {
+            const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+            if (data.sessionID !== locallyCancelled.id) return
+            localIdleEvents.push(data.sessionID)
+            yield* Deferred.succeed(deprecatedIdle, undefined)
+          })
+        }
+        return Effect.void
+      })
+      const localTurn = yield* runState
+        .startShell(
+          locallyCancelled.id,
+          Effect.succeed(completed),
+          Effect.gen(function* () {
+            yield* Deferred.succeed(localStarted, undefined)
+            yield* Deferred.await(localHold)
+            return completed
+          }),
+        )
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(localStarted), "local runner never started")
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          return (yield* status.list()).get(locallyCancelled.id)?.type === "busy" ? true : undefined
+        }),
+        "local runner never reported busy",
+      )
+      yield* runState.cancel(locallyCancelled.id)
+      yield* awaitWithTimeout(Deferred.await(statusIdle), "local cancel did not publish session.status idle")
+      yield* awaitWithTimeout(Deferred.await(deprecatedIdle), "local cancel did not publish session.idle")
+      const localExit = yield* awaitWithTimeout(Fiber.await(localTurn), "local runner did not settle after cancel")
+      expect(Exit.isSuccess(localExit)).toBe(true)
+      expect((yield* status.list()).has(locallyCancelled.id)).toBe(false)
+      expect(localStatusEvents).toContain("busy")
+      expect(localStatusEvents).toContain("idle")
+      expect(localIdleEvents).toContain(locallyCancelled.id)
+      yield* unsubscribeLocal
+      yield* unsubscribeOwner
+      expect(yield* llm.calls).toBe(1)
+    }),
+  30_000,
+)
 
 it.instance(
   "queued prompt waits for the task to finish and runs as its own turn",
