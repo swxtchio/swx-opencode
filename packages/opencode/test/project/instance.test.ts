@@ -1,13 +1,13 @@
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Deferred, Effect, Fiber, Layer } from "effect"
+import { Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { registerDisposer } from "../../src/effect/instance-registry"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
 import { tmpdirScoped } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
 
 let bootstrapRun: Effect.Effect<void> = Effect.void
 const noopBootstrap = Layer.succeed(
@@ -118,6 +118,54 @@ describe("InstanceStore", () => {
       const [firstCtx, secondCtx] = yield* Effect.all([Fiber.join(first), Fiber.join(second)])
       expect(secondCtx).toBe(firstCtx)
       expect(initialized).toBe(1)
+    }),
+  )
+
+  it.live("disposeDirectory stops and settles a pending instance load", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+
+      yield* setBootstrap(
+        Effect.gen(function* () {
+          yield* Deferred.succeed(started, undefined)
+          yield* Deferred.await(release)
+        }),
+      )
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
+
+      const loading = yield* store.load({ directory: dir }).pipe(Effect.forkScoped)
+      yield* awaitWithTimeout(Deferred.await(started), "instance bootstrap did not start")
+      yield* awaitWithTimeout(store.disposeDirectory(dir), "disposeDirectory waited for a pending instance load")
+
+      const exit = yield* Fiber.await(loading)
+      expect(Exit.isFailure(exit)).toBe(true)
+    }),
+  )
+
+  it.live("disposeAll interrupts a pending instance load", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+
+      yield* setBootstrap(
+        Effect.gen(function* () {
+          yield* Deferred.succeed(started, undefined)
+          yield* Deferred.await(release)
+        }),
+      )
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
+
+      const loading = yield* store.load({ directory: dir }).pipe(Effect.forkScoped)
+      yield* awaitWithTimeout(Deferred.await(started), "instance bootstrap did not start")
+      yield* awaitWithTimeout(store.disposeAll(), "disposeAll waited for a pending instance load")
+
+      const exit = yield* Fiber.await(loading)
+      expect(Exit.isFailure(exit)).toBe(true)
     }),
   )
 

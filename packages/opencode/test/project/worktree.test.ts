@@ -1,15 +1,17 @@
 import { afterEach, describe, expect } from "bun:test"
 import path from "path"
+import { AppProcess } from "@opencode-ai/core/process"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
+import { InstanceRef } from "../../src/effect/instance-ref"
 import { Git } from "../../src/git"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
 import { Worktree } from "../../src/worktree"
 import { disposeAllInstances, provideInstance, TestInstance } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
 
 const it = testEffect(
   LayerNode.compile(LayerNode.group([Worktree.node, FSUtil.node, Git.node]), [
@@ -17,6 +19,81 @@ const it = testEffect(
   ]),
 )
 const wintest = process.platform !== "win32" ? it.instance : it.instance.skip
+
+type BootControl =
+  | {
+      mode: "hold"
+      directory: string
+      started: Deferred.Deferred<void>
+      release: Deferred.Deferred<void>
+      interrupted: Deferred.Deferred<void>
+    }
+  | { mode: "fail"; directory: string }
+
+let bootControl: BootControl | undefined
+
+const gatedAppProcess = Layer.effect(
+  AppProcess.Service,
+  Effect.gen(function* () {
+    const appProcess = yield* AppProcess.Service
+    return AppProcess.Service.of({
+      ...appProcess,
+      run: (command, options) => {
+        const control = bootControl
+        if (
+          !control ||
+          command._tag !== "StandardCommand" ||
+          command.command !== "git" ||
+          command.args[0] !== "reset" ||
+          command.args[1] !== "--hard" ||
+          command.options.cwd !== control.directory
+        ) {
+          return appProcess.run(command, options)
+        }
+        if (control.mode === "fail") {
+          return Effect.succeed({
+            command: "git reset --hard",
+            exitCode: 1,
+            stdout: Buffer.alloc(0),
+            stderr: Buffer.from("simulated worktree checkout failure"),
+            stdoutTruncated: false,
+            stderrTruncated: false,
+          } satisfies AppProcess.RunResult)
+        }
+        return Effect.gen(function* () {
+          yield* Deferred.succeed(control.started, undefined)
+          yield* Deferred.await(control.release).pipe(
+            Effect.onInterrupt(() => Deferred.succeed(control.interrupted, undefined).pipe(Effect.asVoid)),
+          )
+          return yield* appProcess.run(command, options)
+        })
+      },
+    })
+  }),
+).pipe(Layer.provide(LayerNode.compile(AppProcess.node)))
+
+const raceIt = testEffect(
+  LayerNode.compile(LayerNode.group([Worktree.node, FSUtil.node, Git.node]), [
+    [InstanceStore.bootstrapNode, InstanceBootstrap.node],
+    [AppProcess.node, gatedAppProcess],
+  ]),
+)
+let failedBootstrapDirectory: string | undefined
+const failedBootstrap = Layer.succeed(
+  InstanceBootstrap.Service,
+  InstanceBootstrap.Service.of({
+    run: Effect.gen(function* () {
+      if ((yield* InstanceRef)?.directory === failedBootstrapDirectory) {
+        return yield* Effect.die(new Error("simulated instance bootstrap failure"))
+      }
+    }),
+  }),
+)
+const failedBootstrapIt = testEffect(
+  LayerNode.compile(LayerNode.group([Worktree.node, FSUtil.node, Git.node]), [
+    [InstanceStore.bootstrapNode, failedBootstrap],
+  ]),
+)
 
 function normalize(input: string) {
   return input.replace(/\\/g, "/").toLowerCase()
@@ -39,6 +116,20 @@ const waitReady = Effect.fn("WorktreeTest.waitReady")(function* () {
     }),
   )
 })
+
+const subscribeTerminal = (directory: string) =>
+  Effect.gen(function* () {
+    const terminal = yield* Deferred.make<GlobalEvent>()
+    const on = (evt: GlobalEvent) => {
+      if (evt.directory !== directory) return
+      if (evt.payload.type !== Worktree.Event.Ready.type && evt.payload.type !== Worktree.Event.Failed.type) return
+      Deferred.doneUnsafe(terminal, Effect.succeed(evt))
+    }
+
+    GlobalBus.on("event", on)
+    yield* Effect.addFinalizer(() => Effect.sync(() => GlobalBus.off("event", on)))
+    return terminal
+  })
 
 const removeCreatedWorktree = (directory: string) =>
   Effect.gen(function* () {
@@ -183,11 +274,131 @@ describe("Worktree", () => {
       () =>
         withCreatedWorktree(undefined, ({ info }) =>
           Effect.gen(function* () {
+            const test = yield* TestInstance
+            const fs = yield* FSUtil.Service
+            const svc = yield* Worktree.Service
             expect(info.name).toBeDefined()
             expect(info.branch ?? "").toStartWith("opencode/")
             expect(info.directory).toBeDefined()
+
+            expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+            expect(yield* fs.exists(info.directory)).toBe(false)
+            const branch = yield* gitResult(test.directory, [
+              "show-ref",
+              "--verify",
+              "--quiet",
+              `refs/heads/${info.branch}`,
+            ])
+            expect(branch.exitCode).not.toBe(0)
           }),
         ),
+      { git: true },
+    )
+
+    raceIt.instance(
+      "stops an unregistered worktree boot before removal deletes its directory",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const expected = yield* svc.makeWorktreeInfo({ name: "boot-before-registration" })
+          const control: BootControl = {
+            mode: "hold",
+            directory: expected.directory,
+            started: yield* Deferred.make<void>(),
+            release: yield* Deferred.make<void>(),
+            interrupted: yield* Deferred.make<void>(),
+          }
+          bootControl = control
+          yield* Effect.addFinalizer(() =>
+            Effect.gen(function* () {
+              bootControl = undefined
+              yield* Deferred.succeed(control.release, undefined).pipe(Effect.asVoid)
+            }),
+          )
+
+          const info = yield* svc.create({ name: expected.name })
+          expect(info.directory).toBe(expected.directory)
+          yield* awaitWithTimeout(Deferred.await(control.started), "worktree boot did not reach checkout", "5 seconds")
+          yield* Effect.addFinalizer(() => removeCreatedWorktree(info.directory).pipe(Effect.ignore))
+
+          const removing = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkScoped)
+          const stopped = yield* Deferred.await(control.interrupted).pipe(
+            Effect.as(true),
+            Effect.timeoutOrElse({ duration: "2 seconds", orElse: () => Effect.succeed(false) }),
+          )
+          expect(stopped).toBe(true)
+
+          expect(yield* awaitWithTimeout(Fiber.join(removing), "worktree removal did not finish", "5 seconds")).toBe(
+            true,
+          )
+          expect(yield* fs.exists(info.directory)).toBe(false)
+          const branch = yield* gitResult(test.directory, [
+            "show-ref",
+            "--verify",
+            "--quiet",
+            `refs/heads/${info.branch ?? ""}`,
+          ])
+          expect(branch.exitCode).not.toBe(0)
+        }),
+      { git: true },
+    )
+
+    raceIt.instance(
+      "publishes a failed checkout before removing the failed worktree",
+      () =>
+        Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const expected = yield* svc.makeWorktreeInfo({ name: "failed-worktree-checkout" })
+          const terminal = yield* subscribeTerminal(expected.directory)
+          bootControl = { mode: "fail", directory: expected.directory }
+          yield* Effect.addFinalizer(() => Effect.sync(() => (bootControl = undefined)).pipe(Effect.asVoid))
+
+          const info = yield* svc.create({ name: expected.name })
+          yield* Effect.addFinalizer(() => removeCreatedWorktree(info.directory).pipe(Effect.ignore))
+          expect(info.directory).toBe(expected.directory)
+          const event = yield* awaitWithTimeout(
+            Deferred.await(terminal),
+            "worktree checkout did not publish its failure",
+            "5 seconds",
+          )
+          expect(event.payload.type).toBe(Worktree.Event.Failed.type)
+          expect(event.payload.properties.message).toContain("simulated worktree checkout failure")
+
+          expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(false)
+        }),
+      { git: true },
+    )
+
+    failedBootstrapIt.instance(
+      "publishes bootstrap defects as failed worktree events before removal",
+      () =>
+        Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const expected = yield* svc.makeWorktreeInfo({ name: "failed-instance-bootstrap" })
+          const terminal = yield* subscribeTerminal(expected.directory)
+          failedBootstrapDirectory = expected.directory
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => (failedBootstrapDirectory = undefined)).pipe(Effect.asVoid),
+          )
+
+          const info = yield* svc.create({ name: expected.name })
+          yield* Effect.addFinalizer(() => removeCreatedWorktree(info.directory).pipe(Effect.ignore))
+          const event = yield* awaitWithTimeout(
+            Deferred.await(terminal),
+            "worktree bootstrap defect did not publish a terminal event",
+            "5 seconds",
+          )
+          expect(event.payload.type).toBe(Worktree.Event.Failed.type)
+          expect(event.payload.properties.message).toContain("simulated instance bootstrap failure")
+
+          expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(false)
+        }),
       { git: true },
     )
 

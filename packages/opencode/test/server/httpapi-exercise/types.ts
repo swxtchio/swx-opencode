@@ -7,6 +7,7 @@ import type { Worktree } from "../../../src/worktree"
 import type { MessageV2 } from "../../../src/session/message-v2"
 import type { SessionID } from "../../../src/session/schema"
 import type { SessionQueue } from "../../../src/session/queue"
+import type { GlobalEvent } from "../../../src/bus/global"
 
 export const OpenApiMethods = ["get", "post", "put", "delete", "patch"] as const
 export const Methods = ["GET", "POST", "PUT", "DELETE", "PATCH"] as const
@@ -66,7 +67,8 @@ export type ScenarioContext = {
   queue: (sessionID: SessionID) => Effect.Effect<SessionQueue.Item[]>
   todos: (sessionID: SessionID, todos: TodoInfo[]) => Effect.Effect<void>
   worktree: (input?: { name?: string }) => Effect.Effect<Worktree.Info>
-  worktreeRemove: (directory: string) => Effect.Effect<void>
+  worktreeRemove: (directory: string) => Effect.Effect<boolean>
+  worktreeTerminal: (directory: string) => Effect.Effect<GlobalEvent>
   llmText: (value: string) => Effect.Effect<void>
   llmWait: (count: number) => Effect.Effect<void>
   tuiRequest: (request: { path: string; body: unknown }) => Effect.Effect<void>

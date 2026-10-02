@@ -6,7 +6,7 @@ import { WorkspaceContext } from "@/control-plane/workspace-context"
 import { InstanceRef } from "@/effect/instance-ref"
 import { disposeInstance as runDisposers } from "@/effect/instance-registry"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Context, Deferred, Duration, Effect, Exit, Layer, Scope } from "effect"
+import { Context, Deferred, Duration, Effect, Exit, Fiber, Layer, Scope } from "effect"
 import { type InstanceContext } from "./instance-context"
 import { InstanceBootstrap } from "./bootstrap-service"
 import * as Project from "./project"
@@ -32,6 +32,7 @@ export const use = serviceUse(Service)
 
 interface Entry {
   readonly deferred: Deferred.Deferred<InstanceContext>
+  readonly loadFiber: Deferred.Deferred<Fiber.Fiber<void>>
 }
 
 const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Service> = Layer.effect(
@@ -70,11 +71,14 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       })
 
     const completeLoad = (directory: string, input: LoadInput, entry: Entry) =>
-      Effect.gen(function* () {
-        const exit = yield* Effect.exit(boot({ ...input, directory }))
-        if (Exit.isFailure(exit)) yield* removeEntry(directory, entry)
-        yield* Deferred.done(entry.deferred, exit).pipe(Effect.asVoid)
-      })
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          // A stopped load still has to publish its exit so every waiter can finish.
+          const exit = yield* Effect.exit(restore(boot({ ...input, directory })))
+          if (Exit.isFailure(exit)) yield* removeEntry(directory, entry)
+          yield* Deferred.done(entry.deferred, exit).pipe(Effect.asVoid)
+        }),
+      )
 
     const emitDisposed = (input: { directory: string; project?: string }) =>
       Effect.sync(() =>
@@ -105,6 +109,25 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       return true
     })
 
+    const settleLoad = Effect.fnUntraced(function* (directory: string, entry: Entry) {
+      if (!(yield* Deferred.isDone(entry.deferred))) {
+        // The boot fiber is independent of the load waiters, so settle it before reading the deferred.
+        const fiber = yield* Deferred.await(entry.loadFiber).pipe(
+          Effect.timeoutOrElse({
+            duration: "5 seconds",
+            orElse: () => Effect.die(new Error(`instance load did not register: ${directory}`)),
+          }),
+        )
+        yield* Fiber.interrupt(fiber).pipe(
+          Effect.timeoutOrElse({
+            duration: "5 seconds",
+            orElse: () => Effect.die(new Error(`instance load did not stop: ${directory}`)),
+          }),
+        )
+      }
+      return yield* Deferred.await(entry.deferred).pipe(Effect.exit)
+    })
+
     const load = (input: LoadInput): Effect.Effect<InstanceContext> => {
       const directory = FSUtil.resolve(input.directory)
       return Effect.uninterruptibleMask((restore) =>
@@ -112,12 +135,16 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           const existing = cache.get(directory)
           if (existing) return yield* restore(Deferred.await(existing.deferred))
 
-          const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>() }
+          const entry: Entry = {
+            deferred: Deferred.makeUnsafe<InstanceContext>(),
+            loadFiber: Deferred.makeUnsafe<Fiber.Fiber<void>>(),
+          }
           cache.set(directory, entry)
-          yield* Effect.gen(function* () {
+          const fiber = yield* Effect.gen(function* () {
             yield* Effect.logInfo("creating instance", { directory: directory })
             yield* completeLoad(directory, input, entry)
           }).pipe(Effect.forkIn(scope, { startImmediately: true }))
+          yield* Deferred.succeed(entry.loadFiber, fiber)
           return yield* restore(Deferred.await(entry.deferred))
         }),
       ).pipe(Effect.withSpan("InstanceStore.load"))
@@ -128,9 +155,12 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       return Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const previous = cache.get(directory)
-          const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>() }
+          const entry: Entry = {
+            deferred: Deferred.makeUnsafe<InstanceContext>(),
+            loadFiber: Deferred.makeUnsafe<Fiber.Fiber<void>>(),
+          }
           cache.set(directory, entry)
-          yield* Effect.gen(function* () {
+          const fiber = yield* Effect.gen(function* () {
             yield* Effect.logInfo("reloading instance", { directory: directory })
             if (previous) {
               yield* Deferred.await(previous.deferred).pipe(Effect.ignore)
@@ -139,6 +169,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             }
             yield* completeLoad(directory, input, entry)
           }).pipe(Effect.forkIn(scope, { startImmediately: true }))
+          yield* Deferred.succeed(entry.loadFiber, fiber)
           return yield* restore(Deferred.await(entry.deferred))
         }),
       ).pipe(Effect.withSpan("InstanceStore.reload"))
@@ -148,7 +179,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       const entry = cache.get(ctx.directory)
       if (!entry) return yield* disposeContext(ctx)
 
-      const exit = yield* Deferred.await(entry.deferred).pipe(Effect.exit)
+      const exit = yield* settleLoad(ctx.directory, entry)
       if (Exit.isFailure(exit)) return yield* removeEntry(ctx.directory, entry).pipe(Effect.asVoid)
       if (exit.value !== ctx) return
       yield* disposeEntry(ctx.directory, entry, ctx).pipe(Effect.asVoid)
@@ -158,7 +189,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       const directory = FSUtil.resolve(input)
       const entry = cache.get(directory)
       if (!entry) return
-      const exit = yield* Deferred.await(entry.deferred).pipe(Effect.exit)
+      const exit = yield* settleLoad(directory, entry)
       if (Exit.isFailure(exit)) return yield* removeEntry(directory, entry).pipe(Effect.asVoid)
       yield* disposeEntry(directory, entry, exit.value).pipe(Effect.asVoid)
     })
@@ -169,7 +200,15 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         [...cache.entries()],
         (item) =>
           Effect.gen(function* () {
-            const exit = yield* Deferred.await(item[1].deferred).pipe(Effect.exit)
+            const exit = yield* settleLoad(item[0], item[1]).pipe(
+              Effect.catchCause((cause) =>
+                Effect.gen(function* () {
+                  yield* Effect.logWarning("instance dispose failed", { key: item[0], cause })
+                  return undefined
+                }),
+              ),
+            )
+            if (!exit) return
             if (Exit.isFailure(exit)) {
               yield* Effect.logWarning("instance dispose failed", { key: item[0], cause: exit.cause })
               yield* removeEntry(item[0], item[1])

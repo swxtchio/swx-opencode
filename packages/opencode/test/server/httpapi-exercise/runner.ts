@@ -1,9 +1,10 @@
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Duration, Effect, Layer, Scope } from "effect"
+import { Cause, Deferred, Duration, Effect, Layer, Scope } from "effect"
 import { TestLLMServer } from "../../lib/llm-server"
 import type { Config } from "../../../src/config/config"
+import { GlobalBus, type GlobalEvent } from "../../../src/bus/global"
 
 import type { MessageV2 } from "../../../src/session/message-v2"
 import { MessageID, PartID } from "../../../src/session/schema"
@@ -13,18 +14,18 @@ import { runtime } from "./runtime"
 import type { ActiveScenario, Options, ProjectOptions, Result, Scenario, ScenarioContext, SeededContext } from "./types"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { WorktreeEvent } from "@opencode-ai/schema/worktree-event"
 
 export function runScenario(options: Options) {
   return (scenario: Scenario) => {
     if (scenario.kind === "todo") return Effect.succeed({ status: "skip", scenario } as Result)
-    return runActive(options, scenario).pipe(
+    return Effect.scoped(runActive(options, scenario)).pipe(
       Effect.timeoutOrElse({
         duration: options.scenarioTimeout,
         orElse: () => Effect.die(new Error(`scenario timed out after ${Duration.format(options.scenarioTimeout)}`)),
       }),
       Effect.as({ status: "pass", scenario } as Result),
       Effect.catchCause((cause) => Effect.succeed({ status: "fail" as const, scenario, message: Cause.pretty(cause) })),
-      Effect.scoped,
     )
   }
 }
@@ -123,6 +124,21 @@ function withContext<A, E>(
           if (!context.llm) throw new Error("scenario needs fake LLM")
           return context.llm
         }
+        const worktreeEvents =
+          scenario.name === "worktree.create"
+            ? { events: [] as GlobalEvent[], waiters: new Map<string, Deferred.Deferred<GlobalEvent>>() }
+            : undefined
+        if (worktreeEvents) {
+          const on = (event: GlobalEvent) => {
+            if (event.payload.type !== WorktreeEvent.Ready.type && event.payload.type !== WorktreeEvent.Failed.type)
+              return
+            worktreeEvents.events.push(event)
+            const waiting = event.directory ? worktreeEvents.waiters.get(event.directory) : undefined
+            if (waiting) Deferred.doneUnsafe(waiting, Effect.succeed(event))
+          }
+          GlobalBus.on("event", on)
+          yield* Effect.addFinalizer(() => Effect.sync(() => GlobalBus.off("event", on)))
+        }
         const base: ScenarioContext = {
           directory: context.dir?.path,
           headers: (extra) => ({
@@ -196,7 +212,27 @@ function withContext<A, E>(
           todos: (sessionID, todos) => run(modules.Todo.Service.use((svc) => svc.update({ sessionID, todos }))),
           worktree: (input) => run(modules.Worktree.Service.use((svc) => svc.create(input).pipe(Effect.orDie))),
           worktreeRemove: (directory) =>
-            run(modules.Worktree.Service.use((svc) => svc.remove({ directory })).pipe(Effect.ignore)),
+            run(modules.Worktree.Service.use((svc) => svc.remove({ directory })).pipe(Effect.orDie)),
+          worktreeTerminal: (directory) => {
+            const events = worktreeEvents
+            if (!events) return Effect.die(new Error("scenario did not subscribe to worktree boot events"))
+            return Effect.gen(function* () {
+              const waiting = yield* Deferred.make<GlobalEvent>()
+              const existing = yield* Effect.sync(() => {
+                const event = events.events.find((item) => item.directory === directory)
+                if (event) return event
+                events.waiters.set(directory, waiting)
+                return undefined
+              })
+              if (existing) return existing
+              return yield* Deferred.await(waiting).pipe(
+                Effect.timeoutOrElse({
+                  duration: "20 seconds",
+                  orElse: () => Effect.die(new Error(`worktree boot did not reach a terminal state: ${directory}`)),
+                }),
+              )
+            }).pipe(Effect.ensuring(Effect.sync(() => events.waiters.delete(directory)).pipe(Effect.asVoid)))
+          },
           llmText: (value) => Effect.suspend(() => llm().text(value)),
           llmWait: (count) => Effect.suspend(() => llm().wait(count)),
           tuiRequest: (request) => Effect.sync(() => modules.Tui.submitTuiRequest(request)),
