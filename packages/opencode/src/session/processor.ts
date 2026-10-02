@@ -2,7 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Deferred, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Layer, Context, Schedule, Scope, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
@@ -22,12 +22,17 @@ import { Provider } from "@/provider/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
+import { sqliteLockMessage } from "@/util/sqlite-error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
+// Retries a failed turn's terminal write until another writer releases the database: 100ms doubling to a 2s cap.
+const terminalRecoverySchedule = Schedule.exponential("100 millis").pipe(
+  Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 2000)))),
+)
 export type Result = "compact" | "stop" | "continue"
 
 function hasKnownPrice(model: Provider.Model) {
@@ -95,6 +100,7 @@ type ToolCall = {
 
 type FinalizationState = {
   terminalMessagePersisted: boolean
+  terminalRecovering: boolean
   persistedTerminalError: SessionV1.Assistant["error"]
   publishedFailures: Set<string>
 }
@@ -136,6 +142,7 @@ const layer = Layer.effect(
       if (existing) return existing
       const state: FinalizationState = {
         terminalMessagePersisted: false,
+        terminalRecovering: false,
         persistedTerminalError: undefined,
         publishedFailures: new Set(),
       }
@@ -183,13 +190,54 @@ const layer = Layer.effect(
 
       message.error ??= state.persistedTerminalError ?? error
       message.time.completed ??= Date.now()
-      if (!state.terminalMessagePersisted || state.persistedTerminalError !== message.error) {
-        yield* session.updateMessage(message)
-        state.terminalMessagePersisted = true
-        state.persistedTerminalError = message.error
+      if (
+        !state.terminalRecovering &&
+        (!state.terminalMessagePersisted || state.persistedTerminalError !== message.error)
+      ) {
+        const written = yield* Effect.exit(session.updateMessage(message))
+        if (Exit.isSuccess(written)) {
+          state.terminalMessagePersisted = true
+          state.persistedTerminalError = message.error
+        }
+        if (Exit.isFailure(written) && !sqliteLockMessage(Cause.squash(written.cause)))
+          return yield* Effect.failCause(written.cause)
+        if (Exit.isFailure(written)) yield* recoverTerminalMessage(message, state)
       }
       yield* publishFailure(message, interrupted ? (message.error ?? error) : error)
       if ((yield* status.get(message.sessionID)).type !== "idle") yield* status.set(message.sessionID, { type: "idle" })
+    })
+
+    // The lock that failed this turn can outlast every write that would end it. Keep retrying the terminal
+    // write in the background, so the turn is persisted as failed once the database is writable again.
+    const recoverTerminalMessage = Effect.fnUntraced(function* (
+      message: SessionV1.Assistant,
+      state: FinalizationState,
+    ) {
+      state.terminalRecovering = true
+      yield* Effect.logWarning("persisting failed assistant once SQLite is writable", {
+        "session.id": message.sessionID,
+        messageID: message.id,
+      })
+      yield* Effect.suspend(() => session.updateMessage(message)).pipe(
+        Effect.catchDefect((defect) => (sqliteLockMessage(defect) ? Effect.fail(defect) : Effect.die(defect))),
+        Effect.retry(terminalRecoverySchedule),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            state.terminalMessagePersisted = true
+            state.persistedTerminalError = message.error
+          }),
+        ),
+        Effect.catchCause((cause) =>
+          Effect.logError("failed to persist failed assistant", {
+            "session.id": message.sessionID,
+            messageID: message.id,
+            error: errorMessage(Cause.squash(cause)),
+          }),
+        ),
+        Effect.ensuring(Effect.sync(() => void (state.terminalRecovering = false))),
+        Effect.interruptible,
+        Effect.forkIn(scope),
+      )
     })
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
