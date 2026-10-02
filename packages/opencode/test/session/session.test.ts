@@ -2,7 +2,10 @@ import { describe, expect } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Deferred, Effect, Exit, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { eq } from "drizzle-orm"
+import { Database } from "@opencode-ai/core/database/database"
+import { EventTable } from "@opencode-ai/core/event/sql"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
@@ -23,6 +26,7 @@ const it = testEffect(
       SessionNs.node,
       EventV2Bridge.node,
       SessionProjector.node,
+      Database.node,
       CrossSpawnSpawner.node,
       InstanceStore.node,
     ]),
@@ -280,6 +284,94 @@ describe("Session", () => {
 
       expect(created.metadata).toBeUndefined()
       expect(saved.metadata).toBeUndefined()
+    }),
+  )
+})
+
+describe("Session writes racing removal", () => {
+  const seedMessage = (session: SessionNs.Interface, sessionID: SessionID, created: number) =>
+    session.updateMessage({
+      id: MessageID.ascending(),
+      sessionID,
+      role: "user",
+      time: { created },
+      agent: "user",
+      model: { providerID: "test", modelID: "test" },
+    } as SessionV1.User)
+
+  const seedPart = (session: SessionNs.Interface, sessionID: SessionID, messageID: MessageID) =>
+    session.updatePart({ id: PartID.ascending(), sessionID, messageID, type: "text", text: "part" } as SessionV1.TextPart)
+
+  const aggregate = (sessionID: SessionID) =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      return {
+        seq: yield* EventV2.latestSequence(db, sessionID),
+        events: (yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, sessionID)).all()).length,
+      }
+    })
+
+  it.instance("refuses an in-flight write that commits after the Session was removed", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const bus = yield* EventV2Bridge.Service
+      const info = yield* session.create({ title: "removed-while-writing" })
+      const message = yield* seedMessage(session, info.id, 1)
+      const part = yield* seedPart(session, info.id, message.id)
+      const obtained = yield* Deferred.make<void>()
+      const removed = yield* Deferred.make<void>()
+
+      // The writer obtains the Session like the HTTP message and part delete handlers, then waits for removal to complete.
+      const writer = yield* Effect.gen(function* () {
+        yield* session.get(info.id)
+        yield* Deferred.succeed(obtained, undefined)
+        yield* Deferred.await(removed)
+        const removeMessage = yield* session.removeMessage({ sessionID: info.id, messageID: message.id }).pipe(Effect.exit)
+        const removePart = yield* session
+          .removePart({ sessionID: info.id, messageID: message.id, partID: part.id })
+          .pipe(Effect.exit)
+        return { removeMessage, removePart }
+      }).pipe(Effect.forkChild)
+
+      yield* awaitDeferred(obtained, "timed out waiting for the writer to obtain the Session")
+      yield* session.remove(info.id)
+      const notified = new Array<string>()
+      const unsubscribe = yield* bus.listen((event) =>
+        Effect.sync(() => {
+          if ((event.data as { sessionID?: string } | undefined)?.sessionID === info.id) notified.push(event.type)
+        }),
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      yield* Deferred.succeed(removed, undefined)
+      const result = yield* Fiber.join(writer)
+
+      for (const exit of [result.removeMessage, result.removePart]) {
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionProjector.SessionNotProjected)
+      }
+      expect(notified).toEqual([])
+      expect(Exit.isFailure(yield* session.get(info.id).pipe(Effect.exit))).toBe(true)
+      expect(yield* aggregate(info.id)).toEqual({ seq: -1, events: 0 })
+    }),
+  )
+
+  it.instance("commits ordinary writes while the Session exists", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const info = yield* Effect.acquireRelease(session.create({ title: "active-writes" }), (created) =>
+        session.remove(created.id).pipe(Effect.ignore),
+      )
+      const message = yield* seedMessage(session, info.id, 1)
+      const part = yield* seedPart(session, info.id, message.id)
+      const before = yield* aggregate(info.id)
+
+      yield* session.setTitle({ sessionID: info.id, title: "renamed" })
+      yield* session.removePart({ sessionID: info.id, messageID: message.id, partID: part.id })
+      yield* session.removeMessage({ sessionID: info.id, messageID: message.id })
+
+      expect(yield* aggregate(info.id)).toEqual({ seq: before.seq + 3, events: before.events + 3 })
+      expect((yield* session.get(info.id)).title).toBe("renamed")
+      expect(yield* session.messages({ sessionID: info.id })).toEqual([])
     }),
   )
 })
