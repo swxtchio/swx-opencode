@@ -62,6 +62,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#122** A failed turn is persisted as failed once SQLite is writable again, even when the lock outlasts every write that would end it (swxtchio/swx-opencode#96). The processor hands a terminal assistant write that loses the lock to a background retry with capped backoff (`terminalRecoverySchedule` and `recoverTerminalMessage` in `packages/opencode/src/session/processor.ts`), which runs until the write commits or fails for another reason, so the row gets its completion and error without a new prompt. The retry is update-only: `Session.updateExistingMessage` checks the row inside the event's own write transaction through a new `EventV2.publish` `precondition`, so an assistant removed while the lock was held is not recreated. While the lock keeps refusing it, the retry logs a rate-limited warning naming the session, message and attempt count, so a stuck recovery stays visible. Only the process that ran the turn writes it, and driver busy waits are unchanged. _Fork-only._
 - **#115** `prompt.cancel` returns after interrupting a running shell (swxtchio/swx-opencode#110). Interrupted
   straight after spawn, `Stream.merge`'s output sides never start, so the stdout listener they already attached is
   left with nobody reading; in the measured hang that pipe never ended, and the spawner's release waited forever for

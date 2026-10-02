@@ -26,7 +26,7 @@ import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
 import type { SQL } from "drizzle-orm"
-import { PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { MessageV2 } from "./message-v2"
 import type { InstanceContext } from "../project/instance-context"
@@ -449,6 +449,8 @@ export interface Interface {
   readonly children: (parentID: SessionID) => Effect.Effect<Info[]>
   readonly remove: (sessionID: SessionID) => Effect.Effect<void, NotFound>
   readonly updateMessage: <T extends SessionV1.Info>(msg: T) => Effect.Effect<T>
+  /** Updates a message only if its row still exists, and reports whether it did. */
+  readonly updateExistingMessage: (msg: SessionV1.Info) => Effect.Effect<boolean>
   readonly removeMessage: (input: { sessionID: SessionID; messageID: MessageID }) => Effect.Effect<MessageID>
   readonly removePart: (input: { sessionID: SessionID; messageID: MessageID; partID: PartID }) => Effect.Effect<PartID>
   readonly getPart: (input: {
@@ -634,6 +636,28 @@ const layer: Layer.Layer<
         })
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))
+
+    // The existence check runs in the event's write transaction, so a removal cannot commit between it and the
+    // update and have the update recreate the removed message.
+    const updateExistingMessage = Effect.fn("Session.updateExistingMessage")(function* (msg: SessionV1.Info) {
+      let exists = false
+      yield* events.publish(
+        SessionV1.Event.MessageUpdated,
+        { sessionID: msg.sessionID, info: msg },
+        {
+          precondition: db
+            .select({ id: MessageTable.id })
+            .from(MessageTable)
+            .where(and(eq(MessageTable.id, msg.id), eq(MessageTable.session_id, msg.sessionID)))
+            .get()
+            .pipe(
+              Effect.orDie,
+              Effect.map((row) => (exists = row !== undefined)),
+            ),
+        },
+      )
+      return exists
+    })
 
     const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
       Effect.gen(function* () {
@@ -928,6 +952,7 @@ const layer: Layer.Layer<
       children,
       remove,
       updateMessage,
+      updateExistingMessage,
       removeMessage,
       removePart,
       updatePart,
