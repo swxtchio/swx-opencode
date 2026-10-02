@@ -8,7 +8,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { afterAll, expect } from "bun:test"
 import { Database as Sqlite } from "bun:sqlite"
 import { tool } from "ai"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, Schema, Stream } from "effect"
 import { isSqlError } from "effect/unstable/sql/SqlError"
 import { rm } from "node:fs/promises"
 import path from "path"
@@ -1768,6 +1768,52 @@ itHeldLock.live(
       { config: cfg },
     ),
   30_000,
+)
+
+itHeldLock.live(
+  "processor keeps reporting a terminal write that a held lock keeps refusing",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const progress: unknown[] = []
+          const capture = Logger.make((options) => {
+            const [text, fields] = Array.isArray(options.message) ? options.message : [options.message]
+            if (text === "still waiting for SQLite to persist failed assistant") progress.push(fields)
+          })
+          const loggers = yield* Effect.service(Logger.CurrentLoggers)
+          const { chat, msg, lock, terminal } = yield* failTurnUnderHeldLock(dir).pipe(
+            Effect.provideService(Logger.CurrentLoggers, new Set([...loggers, capture])),
+          )
+
+          // The retry keeps reporting while the lock refuses it, naming only the session, message and attempts.
+          yield* waitFor(
+            Effect.sync(() => (progress.length >= 2 ? true : undefined)),
+            "the refused terminal write reported no progress",
+            30_000,
+          )
+          expect(progress.slice(0, 2)).toEqual([
+            { "session.id": chat.id, messageID: msg.id, attempts: 4 },
+            { "session.id": chat.id, messageID: msg.id, attempts: 8 },
+          ])
+          // Reporting progress is not persisting: the row stays non-terminal until the write commits.
+          expect(yield* Deferred.isDone(terminal)).toBe(false)
+          const waiting = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+          expect(waiting.info.role === "assistant" && waiting.info.time.completed).toBeUndefined()
+
+          lock.holder?.run("ROLLBACK")
+          yield* Deferred.await(terminal).pipe(
+            Effect.timeoutOrElse({
+              duration: "10 seconds",
+              orElse: () => Effect.die(new Error("the failed turn was not persisted after the lock was released")),
+            }),
+          )
+          const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+          expect(stored.info.role === "assistant" && stored.info.time.completed).toBeDefined()
+        }),
+      { config: cfg },
+    ),
+  60_000,
 )
 
 itHeldLock.live(

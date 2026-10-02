@@ -219,9 +219,23 @@ const layer = Layer.effect(
         "session.id": message.sessionID,
         messageID: message.id,
       })
+      // Report progress on refused attempts at doubling counts, then at a fixed count, so an indefinitely held
+      // lock stays visible without its log growing with every retry.
+      let refused = 0
+      let reportAt = 4
       // Update-only: if the assistant was removed while the lock was held, the retry must not recreate it.
       yield* Effect.suspend(() => session.updateExistingMessage(message)).pipe(
         Effect.catchDefect((defect) => (sqliteLockMessage(defect) ? Effect.fail(defect) : Effect.die(defect))),
+        Effect.tapError(() => {
+          refused++
+          if (refused < reportAt) return Effect.void
+          reportAt = Math.min(reportAt * 2, reportAt + 32)
+          return Effect.logWarning("still waiting for SQLite to persist failed assistant", {
+            "session.id": message.sessionID,
+            messageID: message.id,
+            attempts: refused,
+          })
+        }),
         Effect.retry(terminalRecoverySchedule),
         Effect.flatMap((written) => {
           if (!written)
