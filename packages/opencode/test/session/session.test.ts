@@ -300,7 +300,13 @@ describe("Session writes racing removal", () => {
     } as SessionV1.User)
 
   const seedPart = (session: SessionNs.Interface, sessionID: SessionID, messageID: MessageID) =>
-    session.updatePart({ id: PartID.ascending(), sessionID, messageID, type: "text", text: "part" } as SessionV1.TextPart)
+    session.updatePart({
+      id: PartID.ascending(),
+      sessionID,
+      messageID,
+      type: "text",
+      text: "part",
+    } as SessionV1.TextPart)
 
   const aggregate = (sessionID: SessionID) =>
     Effect.gen(function* () {
@@ -326,10 +332,12 @@ describe("Session writes racing removal", () => {
         yield* session.get(info.id)
         yield* Deferred.succeed(obtained, undefined)
         yield* Deferred.await(removed)
-        const removeMessage = yield* session.removeMessage({ sessionID: info.id, messageID: message.id }).pipe(Effect.exit)
+        const removeMessage = yield* session
+          .removeMessage({ sessionID: info.id, messageID: message.id })
+          .pipe(Effect.asVoid, Effect.exit)
         const removePart = yield* session
           .removePart({ sessionID: info.id, messageID: message.id, partID: part.id })
-          .pipe(Effect.exit)
+          .pipe(Effect.asVoid, Effect.exit)
         return { removeMessage, removePart }
       }).pipe(Effect.forkChild)
 

@@ -18,6 +18,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
 import { PermissionV2 } from "@opencode-ai/core/permission"
 import { EventTable } from "@opencode-ai/core/event/sql"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { QuestionV2 } from "@opencode-ai/core/question"
@@ -3461,6 +3462,60 @@ describe("SessionRunnerLLM", () => {
       expect(yield* session.resume(sessionID).pipe(Effect.catchDefect(Effect.succeed))).toBe(
         "Tool input delta before start: call-1",
       )
+    }),
+  )
+
+  it.effect("fails a held provider turn whose Session is removed before it records output", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const removedID = SessionV2.ID.make("ses_runner_removed")
+      yield* insertSession(removedID)
+      yield* session.prompt({ sessionID: removedID, prompt: Prompt.make({ text: "Work" }), resume: false })
+      requests.length = 0
+      response = [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "text-late" }),
+        LLMEvent.textDelta({ id: "text-late", text: "Late" }),
+        LLMEvent.textEnd({ id: "text-late" }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ]
+      streamGate = yield* Deferred.make<void>()
+      streamStarted = yield* Deferred.make<void>()
+
+      const turn = yield* session.resume(removedID).pipe(Effect.exit, Effect.forkChild)
+      yield* Deferred.await(streamStarted)
+      // The two durable steps of V1 Session.remove, which lives in the opencode package: project the deletion, then
+      // drop the aggregate.
+      yield* events.publish(SessionV1.Event.Deleted, {
+        sessionID: removedID,
+        info: {
+          id: removedID,
+          slug: removedID,
+          projectID: Project.ID.global,
+          directory: "/project",
+          title: "test",
+          version: "test",
+          time: { created: 0, updated: 0 },
+        },
+      })
+      yield* events.remove(removedID)
+      yield* Deferred.succeed(streamGate, undefined)
+      const exit = yield* Fiber.join(turn)
+      streamGate = undefined
+      streamStarted = undefined
+
+      expect(requests).toHaveLength(1)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionProjector.SessionNotProjected)
+      expect(yield* EventV2.latestSequence(db, removedID)).toBe(-1)
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, removedID)).all()).toEqual([])
+      expect(
+        yield* db.select().from(SessionMessageTable).where(eq(SessionMessageTable.session_id, removedID)).all(),
+      ).toEqual([])
     }),
   )
 })
