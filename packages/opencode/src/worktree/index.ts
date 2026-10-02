@@ -286,24 +286,42 @@ const layer: Layer.Layer<
       const entry: { fiber?: Fiber.Fiber<void>; registered: Deferred.Deferred<void> } = {
         registered: Deferred.makeUnsafe<void>(),
       }
-      boots.set(directory, entry)
-      const fiber = yield* boot(info, startCommand).pipe(
-        Effect.catchCause((cause) => Effect.logError("worktree bootstrap failed", { cause })),
-        Effect.ensuring(
-          Effect.sync(() => {
-            if (boots.get(directory) === entry) boots.delete(directory)
-          }),
+      yield* Effect.uninterruptibleMask(() =>
+        Effect.gen(function* () {
+          // Publish the entry and its fiber handle as one uninterrupted handoff.
+          boots.set(directory, entry)
+          const fiber = yield* boot(info, startCommand).pipe(
+            Effect.catchCause((cause) => Effect.logError("worktree bootstrap failed", { cause })),
+            Effect.ensuring(
+              Effect.sync(() => {
+                if (boots.get(directory) === entry) boots.delete(directory)
+              }),
+            ),
+            Effect.interruptible,
+            Effect.forkIn(scope),
+          )
+          entry.fiber = fiber
+          yield* Deferred.succeed(entry.registered, undefined)
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (Deferred.isDoneUnsafe(entry.registered)) return
+              if (!entry.fiber && boots.get(directory) === entry) boots.delete(directory)
+              Deferred.doneUnsafe(entry.registered, Effect.void)
+            }).pipe(Effect.asVoid),
+          ),
         ),
-        Effect.forkIn(scope),
       )
-      entry.fiber = fiber
-      yield* Deferred.succeed(entry.registered, undefined)
     })
 
     const stopBoot = Effect.fnUntraced(function* (directory: string) {
       const entry = boots.get(directory)
       if (!entry) return
-      yield* Deferred.await(entry.registered)
+      const registered = yield* Deferred.await(entry.registered).pipe(
+        Effect.as(true),
+        Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.succeed(false) }),
+      )
+      if (!registered) return yield* new RemoveFailedError({ message: `Worktree boot did not register: ${directory}` })
       if (!entry.fiber) return
       const stopped = yield* Fiber.interrupt(entry.fiber).pipe(
         Effect.as(true),
