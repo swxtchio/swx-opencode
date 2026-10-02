@@ -121,6 +121,8 @@ export interface PublishOptions {
   readonly location?: Location.Ref
   /** Local operational projection committed atomically with a new durable event. Not replayed or serialized. */
   readonly commit?: (seq: number) => Effect.Effect<void>
+  /** Checked inside a new durable event's write transaction; when false, the event is neither committed nor published. */
+  readonly precondition?: Effect.Effect<boolean>
 }
 
 export interface Interface {
@@ -212,6 +214,7 @@ export const layerWith = (options?: LayerOptions) =>
           readonly strictOwner?: boolean
         },
         commit?: (seq: number) => Effect.Effect<void>,
+        precondition?: Effect.Effect<boolean>,
       ) {
         return Effect.gen(function* () {
           const durable = definition?.durable
@@ -240,6 +243,7 @@ export const layerWith = (options?: LayerOptions) =>
                     .transaction(
                       () =>
                         Effect.gen(function* () {
+                          if (precondition && !(yield* precondition)) return
                           const row = yield* db
                             .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
                             .from(EventSequenceTable)
@@ -366,7 +370,12 @@ export const layerWith = (options?: LayerOptions) =>
         })
       }
 
-      function publishEvent<D extends Definition>(definition: D, event: Payload<D>, commit?: PublishOptions["commit"]) {
+      function publishEvent<D extends Definition>(
+        definition: D,
+        event: Payload<D>,
+        commit?: PublishOptions["commit"],
+        precondition?: PublishOptions["precondition"],
+      ) {
         return Effect.gen(function* () {
           if (!definition?.durable && commit)
             return yield* Effect.die(
@@ -375,8 +384,15 @@ export const layerWith = (options?: LayerOptions) =>
                 message: "Local commit hooks require a durable event",
               }),
             )
+          if (!definition?.durable && precondition)
+            return yield* Effect.die(
+              new InvalidDurableEventError({
+                type: event.type,
+                message: "Preconditions require a durable event",
+              }),
+            )
           if (definition?.durable) {
-            const committed = yield* commitDurableEvent(definition, event as Payload, undefined, commit)
+            const committed = yield* commitDurableEvent(definition, event as Payload, undefined, commit, precondition)
             if (committed) {
               event = {
                 ...event,
@@ -389,6 +405,7 @@ export const layerWith = (options?: LayerOptions) =>
               yield* notify(event as Payload, true)
               return event
             }
+            if (precondition) return event
           }
           yield* notify(event as Payload, false)
           return event
@@ -434,6 +451,7 @@ export const layerWith = (options?: LayerOptions) =>
               data,
             } as Payload<D>,
             options?.commit,
+            options?.precondition,
           )
         })
       }

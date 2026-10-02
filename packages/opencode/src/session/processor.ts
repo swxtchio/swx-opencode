@@ -100,6 +100,7 @@ type ToolCall = {
 
 type FinalizationState = {
   terminalMessagePersisted: boolean
+  // Set while, and after, a background retry owns the terminal write; cleared only if that retry fails.
   terminalRecovering: boolean
   persistedTerminalError: SessionV1.Assistant["error"]
   publishedFailures: Set<string>
@@ -218,23 +219,33 @@ const layer = Layer.effect(
         "session.id": message.sessionID,
         messageID: message.id,
       })
-      yield* Effect.suspend(() => session.updateMessage(message)).pipe(
+      // Update-only: if the assistant was removed while the lock was held, the retry must not recreate it.
+      yield* Effect.suspend(() => session.updateExistingMessage(message)).pipe(
         Effect.catchDefect((defect) => (sqliteLockMessage(defect) ? Effect.fail(defect) : Effect.die(defect))),
         Effect.retry(terminalRecoverySchedule),
-        Effect.tap(() =>
-          Effect.sync(() => {
+        Effect.flatMap((written) => {
+          if (!written)
+            return Effect.logInfo("failed assistant was removed before it was persisted", {
+              "session.id": message.sessionID,
+              messageID: message.id,
+            })
+          return Effect.sync(() => {
             state.terminalMessagePersisted = true
             state.persistedTerminalError = message.error
-          }),
+          })
+        }),
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterruptsOnly(cause),
+          (cause) =>
+            Effect.gen(function* () {
+              state.terminalRecovering = false
+              yield* Effect.logError("failed to persist failed assistant", {
+                "session.id": message.sessionID,
+                messageID: message.id,
+                error: errorMessage(Cause.squash(cause)),
+              })
+            }),
         ),
-        Effect.catchCause((cause) =>
-          Effect.logError("failed to persist failed assistant", {
-            "session.id": message.sessionID,
-            messageID: message.id,
-            error: errorMessage(Cause.squash(cause)),
-          }),
-        ),
-        Effect.ensuring(Effect.sync(() => void (state.terminalRecovering = false))),
         Effect.interruptible,
         Effect.forkIn(scope),
       )

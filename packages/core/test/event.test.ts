@@ -213,6 +213,41 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("commits and publishes nothing when a durable event's precondition fails", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const received = new Array<string>()
+      const aggregateID = EventV2.ID.create()
+      yield* events.project(SyncMessage, (event) => Effect.sync(() => received.push(`projected:${event.data.text}`)))
+      yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type === SyncMessage.type) received.push(`published:${(event.data as { text: string }).text}`)
+        }),
+      )
+
+      yield* events.publish(SyncMessage, { id: aggregateID, text: "refused" }, { precondition: Effect.succeed(false) })
+      expect(received).toEqual([])
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toEqual([])
+
+      yield* events.publish(SyncMessage, { id: aggregateID, text: "allowed" }, { precondition: Effect.succeed(true) })
+      expect(received).toEqual(["projected:allowed", "published:allowed"])
+      const stored = yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()
+      expect(stored.map((row) => row.seq)).toEqual([0])
+    }),
+  )
+
+  it.effect("rejects preconditions on live-only events", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const exit = yield* events
+        .publish(Message, { text: "hello" }, { precondition: Effect.succeed(true) })
+        .pipe(Effect.exit)
+
+      expect(String(exit)).toContain("Preconditions require a durable event")
+    }),
+  )
+
   it.effect("rejects local commit hooks on live-only events", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service

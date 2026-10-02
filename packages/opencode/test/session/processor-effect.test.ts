@@ -30,6 +30,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { provideTmpdirInstance, provideTmpdirServer } from "../fixture/fixture"
 import { produceSqliteBusyError } from "../fixture/sqlite-lock"
+import { sqliteLockMessage } from "@/util/sqlite-error"
 import { testEffect } from "../lib/effect"
 import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -186,9 +187,9 @@ function defer<T>() {
   return { promise, resolve }
 }
 
-const waitFor = <A>(check: Effect.Effect<A | undefined>, message: string) =>
+const waitFor = <A>(check: Effect.Effect<A | undefined>, message: string, timeout = 500) =>
   Effect.gen(function* () {
-    const stop = Date.now() + 500
+    const stop = Date.now() + timeout
     while (Date.now() < stop) {
       const value = yield* check
       if (value !== undefined) return value
@@ -549,31 +550,60 @@ const lockTerminalLLM = Layer.succeed(
       ),
   }),
 )
-type HeldLock = { messageID: MessageID; holder?: Sqlite }
+type HeldLock = {
+  messageID: MessageID
+  holder?: Sqlite
+  streaming: ReturnType<typeof defer<void>>
+  resume: ReturnType<typeof defer<void>>
+  // The first lock failure the held lock produced in the turn's own writes.
+  produced?: unknown
+  // While set, writes of the turn's message fail with this instead of reaching the database.
+  replay?: unknown
+  replayed: number
+  skipped?: Deferred.Deferred<void>
+}
 const heldLocks = new Map<SessionID, HeldLock>()
+const heldLockWrite = <A, E, R>(lock: HeldLock | undefined, write: Effect.Effect<A, E, R>) =>
+  Effect.suspend(() => {
+    if (!lock) return write
+    if (lock.replay !== undefined) {
+      lock.replayed++
+      return Effect.die(lock.replay)
+    }
+    return write.pipe(Effect.tapCause((cause) => Effect.sync(() => void (lock.produced ??= Cause.squash(cause)))))
+  })
 const heldLockSession = LayerNode.make({
   service: Session.Service,
   layer: Layer.effect(
     Session.Service,
     Effect.gen(function* () {
       const real = yield* Session.Service
+      const lockFor = (sessionID: SessionID, messageID: MessageID) => {
+        const lock = heldLocks.get(sessionID)
+        return lock?.messageID === messageID ? lock : undefined
+      }
       return Session.Service.of({
         ...real,
         updatePart: <T extends SessionV1.Part>(part: T) =>
           Effect.suspend(() => {
-            const lock = heldLocks.get(part.sessionID)
+            const lock = lockFor(part.sessionID, part.messageID)
             // A second connection takes the write lock just before the turn's reasoning-end write.
-            if (
-              lock &&
-              !lock.holder &&
-              part.messageID === lock.messageID &&
-              part.type === "reasoning" &&
-              part.time.end !== undefined
-            ) {
+            if (lock && !lock.holder && part.type === "reasoning" && part.time.end !== undefined) {
               lock.holder = new Sqlite(heldLockDbPath)
               lock.holder.run("BEGIN IMMEDIATE")
             }
-            return real.updatePart(part)
+            return heldLockWrite(lock, real.updatePart(part))
+          }),
+        updateMessage: <T extends SessionV1.Info>(msg: T) =>
+          Effect.suspend(() => heldLockWrite(lockFor(msg.sessionID, msg.id), real.updateMessage(msg))),
+        updateExistingMessage: (msg: SessionV1.Info) =>
+          Effect.suspend(() => {
+            const lock = lockFor(msg.sessionID, msg.id)
+            return heldLockWrite(lock, real.updateExistingMessage(msg)).pipe(
+              Effect.tap((written) =>
+                !written && lock?.skipped ? Deferred.succeed(lock.skipped, undefined) : Effect.void,
+              ),
+            )
           }),
       })
     }),
@@ -588,11 +618,10 @@ const heldLockSession = LayerNode.make({
   ),
   deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
 })
-const heldLockTurn = { streaming: defer<void>(), resume: defer<void>() }
 const heldLockLLM = Layer.succeed(
   LLM.Service,
   LLM.Service.of({
-    stream: () =>
+    stream: (input) =>
       Stream.concat(
         Stream.make(
           LLMEvent.stepStart({ index: 0 }),
@@ -601,8 +630,9 @@ const heldLockLLM = Layer.succeed(
         ),
         Stream.unwrap(
           Effect.promise(async () => {
-            heldLockTurn.streaming.resolve()
-            await heldLockTurn.resume.promise
+            const lock = heldLocks.get(input.sessionID as SessionID)
+            lock?.streaming.resolve()
+            await lock?.resume.promise
             return Stream.make(
               LLMEvent.reasoningEnd({ id: "reasoning-1" }),
               LLMEvent.stepFinish({ index: 0, reason: "stop" }),
@@ -1638,73 +1668,83 @@ const itHeldLock = testEffect(
   ]),
 )
 
+// Runs a turn whose reasoning-end write takes a real write lock that stays held after the processor exits.
+const failTurnUnderHeldLock = Effect.fn("test.failTurnUnderHeldLock")(function* (dir: string) {
+  const { processors, session, provider } = yield* boot()
+  const events = yield* EventV2Bridge.Service
+  const statuses = yield* SessionStatus.Service
+  const chat = yield* session.create({})
+  const parent = yield* user(chat.id, "hold the write lock")
+  const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+  const model = yield* provider.getModel(ref.providerID, ref.modelID)
+  const lock: HeldLock = { messageID: msg.id, streaming: defer<void>(), resume: defer<void>(), replayed: 0 }
+  heldLocks.set(chat.id, lock)
+  yield* Effect.addFinalizer(() =>
+    Effect.sync(() => {
+      heldLocks.delete(chat.id)
+      if (lock.holder?.inTransaction) lock.holder.run("ROLLBACK")
+      lock.holder?.close()
+    }),
+  )
+  const terminal = yield* Deferred.make<void>()
+  const off = yield* events.listen((event) => {
+    if (event.type !== SessionV1.Event.MessageUpdated.type) return Effect.void
+    const info = (event.data as typeof SessionV1.Event.MessageUpdated.data.Type).info
+    if (info.id !== msg.id || info.role !== "assistant" || info.time.completed === undefined) return Effect.void
+    return Deferred.succeed(terminal, undefined).pipe(Effect.asVoid)
+  })
+  yield* Effect.addFinalizer(() => off)
+
+  const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+  const run = yield* handle
+    .process({
+      user: {
+        id: parent.id,
+        sessionID: chat.id,
+        role: "user",
+        time: parent.time,
+        agent: parent.agent,
+        model: { providerID: ref.providerID, modelID: ref.modelID },
+      } satisfies SessionV1.User,
+      sessionID: chat.id,
+      model,
+      agent: agent(),
+      system: [],
+      messages: [{ role: "user", content: "hold the write lock" }],
+      tools: {},
+    })
+    .pipe(Effect.exit, Effect.forkChild)
+
+  // Mid-stream, the owner reports the turn as active and it is not terminal.
+  yield* Effect.promise(() => lock.streaming.promise)
+  expect((yield* statuses.get(chat.id)).type).toBe("busy")
+  const streaming = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+  expect(streaming.info.role === "assistant" && streaming.info.time.completed).toBeUndefined()
+  lock.resume.resolve()
+  const exit = yield* Fiber.join(run)
+
+  // The turn failed with the lock still held, so none of its terminalizing writes landed.
+  expect(lock.holder?.inTransaction).toBe(true)
+  const locked = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+  expect(locked.info.role === "assistant" && locked.info.time.completed).toBeUndefined()
+  return { chat, msg, lock, exit, terminal }
+})
+
 itHeldLock.live(
   "processor persists a failed turn once a lock held across every terminalizing write is released",
   () =>
     provideTmpdirInstance(
       (dir) =>
         Effect.gen(function* () {
-          const { processors, session, provider } = yield* boot()
-          const events = yield* EventV2Bridge.Service
           const statuses = yield* SessionStatus.Service
           const runs = yield* SessionRunState.Service
-          const chat = yield* session.create({})
-          const parent = yield* user(chat.id, "hold the write lock")
-          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-          const model = yield* provider.getModel(ref.providerID, ref.modelID)
-          const lock: HeldLock = { messageID: msg.id }
-          heldLocks.set(chat.id, lock)
-          yield* Effect.addFinalizer(() =>
-            Effect.sync(() => {
-              heldLocks.delete(chat.id)
-              if (lock.holder?.inTransaction) lock.holder.run("ROLLBACK")
-              lock.holder?.close()
-            }),
-          )
-          const terminal = yield* Deferred.make<void>()
-          const off = yield* events.listen((event) => {
-            if (event.type !== SessionV1.Event.MessageUpdated.type) return Effect.void
-            const info = (event.data as typeof SessionV1.Event.MessageUpdated.data.Type).info
-            if (info.id !== msg.id || info.role !== "assistant" || info.time.completed === undefined) return Effect.void
-            return Deferred.succeed(terminal, undefined).pipe(Effect.asVoid)
-          })
-          yield* Effect.addFinalizer(() => off)
+          const { chat, msg, lock, exit, terminal } = yield* failTurnUnderHeldLock(dir)
 
-          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
-          const run = yield* handle
-            .process({
-              user: {
-                id: parent.id,
-                sessionID: chat.id,
-                role: "user",
-                time: parent.time,
-                agent: parent.agent,
-                model: { providerID: ref.providerID, modelID: ref.modelID },
-              } satisfies SessionV1.User,
-              sessionID: chat.id,
-              model,
-              agent: agent(),
-              system: [],
-              messages: [{ role: "user", content: "hold the write lock" }],
-              tools: {},
-            })
-            .pipe(Effect.exit, Effect.forkChild)
-
-          // Mid-stream, the owner reports the turn as active and it is not terminal.
-          yield* Effect.promise(() => heldLockTurn.streaming.promise)
-          expect((yield* statuses.get(chat.id)).type).toBe("busy")
-          const streaming = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
-          expect(streaming.info.role === "assistant" && streaming.info.time.completed).toBeUndefined()
-          heldLockTurn.resume.resolve()
-          const exit = yield* Fiber.join(run)
-
-          // The turn failed with the lock still held, so none of its terminalizing writes landed,
-          // and cancelling the now-idle session does not stand in for terminalizing it.
-          expect(lock.holder?.inTransaction).toBe(true)
+          // Cancelling the now-idle session does not stand in for terminalizing it.
           yield* runs.cancel(chat.id)
           expect((yield* statuses.get(chat.id)).type).toBe("idle")
-          const locked = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
-          expect(locked.info.role === "assistant" && locked.info.time.completed).toBeUndefined()
+          const cancelled = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+          expect(cancelled.info.role === "assistant" && cancelled.info.time.completed).toBeUndefined()
 
           lock.holder?.run("ROLLBACK")
           yield* Deferred.await(terminal).pipe(
@@ -1724,6 +1764,51 @@ itHeldLock.live(
           }
           expect(Exit.isSuccess(exit)).toBe(true)
           if (Exit.isSuccess(exit)) expect(exit.value).toBe("stop")
+        }),
+      { config: cfg },
+    ),
+  30_000,
+)
+
+itHeldLock.live(
+  "processor does not recreate a failed turn removed before the lock-blocked terminal write lands",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const { chat, msg, lock, terminal } = yield* failTurnUnderHeldLock(dir)
+          expect(lock.produced && sqliteLockMessage(lock.produced)).toBe("Database is locked (SQLITE_BUSY)")
+
+          // Keep the retry off the database while the lock is released and the assistant is removed.
+          const skipped = yield* Deferred.make<void>()
+          lock.skipped = skipped
+          lock.replay = lock.produced
+          yield* waitFor(
+            Effect.sync(() => (lock.replayed > 0 ? true : undefined)),
+            "the terminal write was not retried",
+            5_000,
+          )
+          lock.holder?.run("ROLLBACK")
+          yield* session.removeMessage({ sessionID: chat.id, messageID: msg.id })
+          expect(Exit.isFailure(yield* Effect.exit(MessageV2.get({ sessionID: chat.id, messageID: msg.id })))).toBe(
+            true,
+          )
+          lock.replay = undefined
+
+          const outcome = yield* Effect.raceFirst(
+            Deferred.await(terminal).pipe(Effect.as("recreated" as const)),
+            Deferred.await(skipped).pipe(Effect.as("skipped" as const)),
+          ).pipe(
+            Effect.timeoutOrElse({
+              duration: "10 seconds",
+              orElse: () => Effect.die(new Error("the terminal write was not retried after the removal")),
+            }),
+          )
+          expect(outcome).toBe("skipped")
+          expect(Exit.isFailure(yield* Effect.exit(MessageV2.get({ sessionID: chat.id, messageID: msg.id })))).toBe(
+            true,
+          )
         }),
       { config: cfg },
     ),
