@@ -263,15 +263,17 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     // every failure to a 400 BadRequest.
     const share = Effect.fn("SessionHttpApi.share")(function* (ctx: { params: { sessionID: SessionID } }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* shareSvc.share(ctx.params.sessionID).pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
+      yield* SessionError.mapRemovedDuringWrite(
+        shareSvc.share(ctx.params.sessionID).pipe(Effect.mapError(() => new HttpApiError.InternalServerError({}))),
+      )
       return yield* requireSession(ctx.params.sessionID)
     })
 
     const unshare = Effect.fn("SessionHttpApi.unshare")(function* (ctx: { params: { sessionID: SessionID } }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* shareSvc
-        .unshare(ctx.params.sessionID)
-        .pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
+      yield* SessionError.mapRemovedDuringWrite(
+        shareSvc.unshare(ctx.params.sessionID).pipe(Effect.mapError(() => new HttpApiError.InternalServerError({}))),
+      )
       return yield* requireSession(ctx.params.sessionID)
     })
 
@@ -279,20 +281,22 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof SummarizePayload.Type
     }) {
-      yield* revertSvc.cleanup(yield* requireSession(ctx.params.sessionID))
+      yield* SessionError.mapRemovedDuringWrite(revertSvc.cleanup(yield* requireSession(ctx.params.sessionID)))
       const messages = yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
       const defaultAgent = yield* agentSvc.defaultAgent()
       const currentAgent = messages.findLast((message) => message.info.role === "user")?.info.agent ?? defaultAgent
 
-      const messageID = yield* compactSvc.create({
-        sessionID: ctx.params.sessionID,
-        agent: currentAgent,
-        model: {
-          providerID: ctx.payload.providerID,
-          modelID: ctx.payload.modelID,
-        },
-        auto: ctx.payload.auto ?? false,
-      })
+      const messageID = yield* SessionError.mapRemovedDuringWrite(
+        compactSvc.create({
+          sessionID: ctx.params.sessionID,
+          agent: currentAgent,
+          model: {
+            providerID: ctx.payload.providerID,
+            modelID: ctx.payload.modelID,
+          },
+          auto: ctx.payload.auto ?? false,
+        }),
+      )
       yield* promptSvc.loop({ sessionID: ctx.params.sessionID, messageID })
       return true
     })
@@ -373,12 +377,16 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof RevertPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      return yield* SessionError.mapBusy(revertSvc.revert({ sessionID: ctx.params.sessionID, ...ctx.payload }))
+      return yield* SessionError.mapRemovedDuringWrite(
+        SessionError.mapBusy(revertSvc.revert({ sessionID: ctx.params.sessionID, ...ctx.payload })),
+      )
     })
 
     const unrevert = Effect.fn("SessionHttpApi.unrevert")(function* (ctx: { params: { sessionID: SessionID } }) {
       yield* requireSession(ctx.params.sessionID)
-      return yield* SessionError.mapBusy(revertSvc.unrevert({ sessionID: ctx.params.sessionID }))
+      return yield* SessionError.mapRemovedDuringWrite(
+        SessionError.mapBusy(revertSvc.unrevert({ sessionID: ctx.params.sessionID })),
+      )
     })
 
     const permissionRespond = Effect.fn("SessionHttpApi.permissionRespond")(function* (ctx: {
@@ -404,7 +412,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     }) {
       yield* requireSession(ctx.params.sessionID)
       yield* SessionError.mapBusy(runState.assertNotBusy(ctx.params.sessionID))
-      yield* session.removeMessage(ctx.params)
+      yield* SessionError.mapRemovedDuringWrite(session.removeMessage(ctx.params))
       return true
     })
 
@@ -412,7 +420,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID; messageID: MessageID; partID: PartID }
     }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* session.removePart(ctx.params)
+      yield* SessionError.mapRemovedDuringWrite(session.removePart(ctx.params))
       return true
     })
 
@@ -429,7 +437,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       ) {
         return yield* new HttpApiError.BadRequest({})
       }
-      return yield* session.updatePart(payload)
+      return yield* SessionError.mapRemovedDuringWrite(session.updatePart(payload))
     })
 
     return handlers

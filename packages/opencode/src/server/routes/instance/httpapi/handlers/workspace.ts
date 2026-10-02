@@ -6,6 +6,7 @@ import { Cause, Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import { notFound } from "../errors"
+import * as SessionError from "./session-errors"
 import { ApiVcsApplyError } from "../groups/instance"
 import { ApiWorkspaceCreateError, ApiWorkspaceWarpError, CreatePayload, WarpPayload } from "../groups/workspace"
 
@@ -62,32 +63,34 @@ export const workspaceHandlers = HttpApiBuilder.group(InstanceHttpApi, "workspac
     })
 
     const warp = Effect.fn("WorkspaceHttpApi.warp")(function* (ctx: { payload: typeof WarpPayload.Type }) {
-      yield* workspace
-        .sessionWarp({
-          workspaceID: ctx.payload.id,
-          sessionID: ctx.payload.sessionID,
-          copyChanges: ctx.payload.copyChanges,
-        })
-        .pipe(
-          Effect.mapError((error) => {
-            if (error instanceof Workspace.WorkspaceNotFoundError) return notFound(error.message)
-            if (error instanceof Vcs.PatchApplyError) {
-              return new ApiVcsApplyError({
-                name: "VcsApplyError",
+      yield* SessionError.mapRemovedDuringWrite(
+        workspace
+          .sessionWarp({
+            workspaceID: ctx.payload.id,
+            sessionID: ctx.payload.sessionID,
+            copyChanges: ctx.payload.copyChanges,
+          })
+          .pipe(
+            Effect.mapError((error) => {
+              if (error instanceof Workspace.WorkspaceNotFoundError) return notFound(error.message)
+              if (error instanceof Vcs.PatchApplyError) {
+                return new ApiVcsApplyError({
+                  name: "VcsApplyError",
+                  data: {
+                    message: error.message,
+                    reason: error.reason,
+                  },
+                })
+              }
+              return new ApiWorkspaceWarpError({
+                name: "WorkspaceWarpError",
                 data: {
                   message: error.message,
-                  reason: error.reason,
                 },
               })
-            }
-            return new ApiWorkspaceWarpError({
-              name: "WorkspaceWarpError",
-              data: {
-                message: error.message,
-              },
-            })
-          }),
-        )
+            }),
+          ),
+      )
     })
 
     return handlers
