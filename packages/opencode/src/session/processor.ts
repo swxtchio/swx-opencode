@@ -100,8 +100,7 @@ type ToolCall = {
 
 type FinalizationState = {
   terminalMessagePersisted: boolean
-  // Set once the background retry has claimed the terminal write, and kept after it finishes so later finalizers
-  // never write the message again; cleared only if that retry fails.
+  // Keep the terminal write claimed after recovery so later finalizers cannot rewrite or recreate it.
   terminalWriteRecoveryClaimed: boolean
   persistedTerminalError: SessionV1.Assistant["error"]
   publishedFailures: Set<string>
