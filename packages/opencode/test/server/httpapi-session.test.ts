@@ -4,7 +4,7 @@ import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer, Queue, Stream } from "effect"
+import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer, Queue, Stream, Tracer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -29,6 +29,9 @@ import type { SessionQueue } from "../../src/session/queue"
 import { Session } from "@/session/session"
 import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from "../../src/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
+import { EventTable } from "@opencode-ai/core/event/sql"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -40,6 +43,7 @@ import { disposeAllInstances, provideInstanceEffect, TestInstance, tmpdirScoped 
 import { reply, TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
+import { spanHold } from "../fixture/span-hold"
 
 const originalWorkspaces = Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
 const noopBootstrapLayer = Layer.succeed(
@@ -63,6 +67,26 @@ const httpApiLayer = servedRoutes.pipe(
   Layer.provideMerge(NodeServices.layer),
 )
 const it = testEffect(Layer.mergeAll(appLayer, httpApiLayer))
+// Its own served routes, so request fibers carry the hold tracer whatever the shared server was built with.
+const racingSpans = spanHold()
+const racingRoutes: Layer.Layer<never, Config.ConfigError, HttpServer.HttpServer> = HttpRouter.serve(
+  HttpApiApp.routes,
+  {
+    disableListenLog: true,
+    disableLogger: true,
+  },
+)
+const itRacing = testEffect(
+  Layer.mergeAll(
+    appLayer,
+    AppNodeBuilder.build(EventV2Bridge.node),
+    racingRoutes.pipe(
+      Layer.provide(layerWebSocketConstructorGlobal),
+      Layer.provideMerge(NodeHttpServer.layerTest),
+      Layer.provideMerge(NodeServices.layer),
+    ),
+  ).pipe(Layer.provide(Layer.succeed(Tracer.Tracer, racingSpans.tracer))),
+)
 
 function pathFor(path: string, params: Record<string, string>) {
   return Object.entries(params).reduce((result, [key, value]) => result.replace(`:${key}`, value), path)
@@ -1790,5 +1814,110 @@ describe("session HttpApi", () => {
       )
     },
     30_000,
+  )
+})
+
+describe("session HttpApi update racing removal", () => {
+  const aggregate = (sessionID: SessionIDType) =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      return {
+        seq: yield* EventV2.latestSequence(db, sessionID),
+        events: (yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, sessionID)).all()).length,
+      }
+    })
+
+  const update = (directory: string, sessionID: SessionIDType, body: unknown) =>
+    request(pathFor(SessionPaths.update, { sessionID }), {
+      method: "PATCH",
+      headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    })
+
+  itRacing.instance(
+    "answers not found when the title write commits after the Session was removed",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "removed during patch" })
+        // Session.patch reads the Session and then publishes; hold the request's setTitle between the two.
+        const hold = yield* racingSpans.arm({ name: "Session.get", parent: "Session.setTitle" })
+        const response = yield* update(test.directory, created.id, { title: "late" }).pipe(Effect.forkChild)
+
+        yield* awaitWithTimeout(hold.reached, "update never read the Session in setTitle")
+        yield* Session.use.remove(created.id)
+        yield* hold.release
+        const answered = yield* Fiber.join(response)
+
+        expect(answered.status).toBe(404)
+        expect(yield* responseJson(answered)).toMatchObject({ name: "NotFoundError" })
+        expect(yield* aggregate(created.id)).toEqual({ seq: -1, events: 0 })
+      }),
+    { git: true, config: { formatter: false, lsp: false, share: "disabled" } },
+  )
+
+  itRacing.instance(
+    "answers not found when the Session is removed between two of the update's writes",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const events = yield* EventV2Bridge.Service
+        const created = yield* createSession({ title: "removed between writes" })
+        const titled = yield* Deferred.make<void>()
+        const removed = yield* Deferred.make<void>()
+        // Durable listeners run in the publishing request after its commit, so this holds the request after setTitle.
+        const unsubscribe = yield* events.listen((event) =>
+          event.type === Session.Event.Updated.type &&
+          (event.data as { sessionID?: string }).sessionID === created.id &&
+          (event.data as { info?: { title?: string } }).info?.title === "titled"
+            ? Deferred.succeed(titled, undefined).pipe(Effect.andThen(Deferred.await(removed)))
+            : Effect.void,
+        )
+        yield* Effect.addFinalizer(() => unsubscribe)
+        const response = yield* update(test.directory, created.id, { title: "titled", metadata: { late: true } }).pipe(
+          Effect.forkChild,
+        )
+
+        yield* awaitWithTimeout(Deferred.await(titled), "update never committed its title")
+        yield* Session.use.remove(created.id)
+        yield* Deferred.succeed(removed, undefined)
+        const answered = yield* Fiber.join(response)
+
+        expect(answered.status).toBe(404)
+        expect(yield* responseJson(answered)).toMatchObject({ name: "NotFoundError" })
+        expect(yield* aggregate(created.id)).toEqual({ seq: -1, events: 0 })
+      }),
+    { git: true, config: { formatter: false, lsp: false, share: "disabled" } },
+  )
+
+  it.effect("leaves defects other than a removed Session as defects", () =>
+    Effect.gen(function* () {
+      const defect = new Error("unrelated failure")
+      const exit = yield* HttpSessionError.mapRemovedDuringWrite(Effect.die(defect)).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBe(defect)
+    }),
+  )
+
+  itRacing.instance(
+    "still updates a Session that is not removed",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "kept" })
+        const before = yield* aggregate(created.id)
+
+        const answered = yield* update(test.directory, created.id, { title: "renamed", metadata: { kept: true } })
+
+        expect(answered.status).toBe(200)
+        expect(yield* responseJson(answered)).toMatchObject({
+          id: created.id,
+          title: "renamed",
+          metadata: { kept: true },
+        })
+        expect(yield* aggregate(created.id)).toEqual({ seq: before.seq + 2, events: before.events + 2 })
+      }),
+    { git: true, config: { formatter: false, lsp: false, share: "disabled" } },
   )
 })

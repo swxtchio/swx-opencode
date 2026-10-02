@@ -186,21 +186,25 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof UpdatePayload.Type
     }) {
       const current = yield* requireSession(ctx.params.sessionID)
-      if (ctx.payload.title !== undefined) {
-        yield* session.setTitle({ sessionID: ctx.params.sessionID, title: ctx.payload.title })
-      }
-      if (ctx.payload.metadata !== undefined) {
-        yield* session.setMetadata({ sessionID: ctx.params.sessionID, metadata: ctx.payload.metadata })
-      }
-      if (ctx.payload.permission !== undefined) {
-        yield* session.setPermission({
-          sessionID: ctx.params.sessionID,
-          permission: Permission.merge(current.permission ?? [], ctx.payload.permission),
-        })
-      }
-      if (ctx.payload.time?.archived !== undefined) {
-        yield* session.setArchived({ sessionID: ctx.params.sessionID, time: ctx.payload.time.archived })
-      }
+      yield* SessionError.mapRemovedDuringWrite(
+        Effect.gen(function* () {
+          if (ctx.payload.title !== undefined) {
+            yield* session.setTitle({ sessionID: ctx.params.sessionID, title: ctx.payload.title })
+          }
+          if (ctx.payload.metadata !== undefined) {
+            yield* session.setMetadata({ sessionID: ctx.params.sessionID, metadata: ctx.payload.metadata })
+          }
+          if (ctx.payload.permission !== undefined) {
+            yield* session.setPermission({
+              sessionID: ctx.params.sessionID,
+              permission: Permission.merge(current.permission ?? [], ctx.payload.permission),
+            })
+          }
+          if (ctx.payload.time?.archived !== undefined) {
+            yield* session.setArchived({ sessionID: ctx.params.sessionID, time: ctx.payload.time.archived })
+          }
+        }),
+      )
       return yield* requireSession(ctx.params.sessionID)
     })
 
