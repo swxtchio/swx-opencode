@@ -219,8 +219,7 @@ const layer = Layer.effect(
         "session.id": message.sessionID,
         messageID: message.id,
       })
-      // Report progress on refused attempts at doubling counts, then at a fixed count, so an indefinitely held
-      // lock stays visible without its log growing with every retry.
+      // Keeps a lock held indefinitely visible without logging every retry.
       let refused = 0
       let reportAt = 4
       // Update-only: if the assistant was removed while the lock was held, the retry must not recreate it.
