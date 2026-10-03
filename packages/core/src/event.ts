@@ -5,7 +5,7 @@ import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 import { and, asc, eq, gt, inArray } from "drizzle-orm"
 import { Database } from "./database/database"
-import { EventSequenceTable, EventTable } from "./event/sql"
+import { EventRetentionTable, EventSequenceTable, EventTable } from "./event/sql"
 import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
 import { isDeepStrictEqual } from "node:util"
@@ -47,6 +47,32 @@ export class InvalidDurableEventError extends Schema.TaggedErrorClass<InvalidDur
   },
 ) {}
 
+export class UnreplayableAggregateError extends Schema.TaggedErrorClass<UnreplayableAggregateError>()(
+  "EventV2.UnreplayableAggregate",
+  {
+    aggregateID: Schema.String,
+    message: Schema.String,
+  },
+) {}
+
+function requireReplayable(db: Database.Interface["db"], aggregateID: string) {
+  return db
+    .select({ aggregateID: EventRetentionTable.aggregate_id })
+    .from(EventRetentionTable)
+    .where(eq(EventRetentionTable.aggregate_id, aggregateID))
+    .get()
+    .pipe(
+      Effect.orDie,
+      Effect.flatMap((row) =>
+        row
+          ? Effect.die(
+              new UnreplayableAggregateError({ aggregateID, message: `Aggregate ${aggregateID} is unreplayable` }),
+            )
+          : Effect.void,
+      ),
+    )
+}
+
 const decodeSerializedEvent = (event: SerializedEvent): Payload => {
   const definition = Durable.get(event.type)
   if (!definition?.durable) {
@@ -72,6 +98,7 @@ export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
     }
   },
 ) {
+  yield* requireReplayable(db, input.aggregateID)
   const after = input.after ?? -1
   const rows = yield* db
     .select()
@@ -145,6 +172,7 @@ export interface Interface {
     events: SerializedEvent[],
     options?: { readonly publish?: boolean; readonly ownerID?: string; readonly strictOwner?: boolean },
   ) => Effect.Effect<string | undefined>
+  readonly assertReplayable: (aggregateID: string) => Effect.Effect<void>
   readonly remove: (aggregateID: string) => Effect.Effect<void>
   readonly claim: (aggregateID: string, ownerID: string) => Effect.Effect<void>
 }
@@ -182,6 +210,8 @@ export const layerWith = (options?: LayerOptions) =>
       // TODO: Bind durable projectors to exact type+version before supporting incompatible historical payloads.
       const listeners = new Array<Subscriber>()
       const { db } = yield* Database.Service
+
+      const assertReplayable = (aggregateID: string) => requireReplayable(db, aggregateID)
 
       const getOrCreate = (definition: Definition) =>
         Effect.gen(function* () {
@@ -244,6 +274,7 @@ export const layerWith = (options?: LayerOptions) =>
                       () =>
                         Effect.gen(function* () {
                           if (precondition && !(yield* precondition)) return
+                          yield* requireReplayable(db, aggregateID)
                           const row = yield* db
                             .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
                             .from(EventSequenceTable)
@@ -461,6 +492,7 @@ export const layerWith = (options?: LayerOptions) =>
         options?: { readonly publish?: boolean; readonly ownerID?: string; readonly strictOwner?: boolean },
       ) {
         return Effect.gen(function* () {
+          yield* requireReplayable(db, event.aggregateID)
           const definition = Durable.get(event.type)
           if (!definition?.durable) {
             yield* Effect.die(
@@ -510,6 +542,7 @@ export const layerWith = (options?: LayerOptions) =>
               }),
             )
           }
+          yield* requireReplayable(db, source)
           const start = events[0]?.seq ?? 0
           for (const [index, event] of events.entries()) {
             const seq = start + index
@@ -558,6 +591,7 @@ export const layerWith = (options?: LayerOptions) =>
 
       const readAfter = (aggregateID: string, after: number) =>
         (options?.beforeAggregateRead?.(aggregateID) ?? Effect.void).pipe(
+          Effect.andThen(requireReplayable(db, aggregateID)),
           Effect.andThen(
             db
               .select()
@@ -646,6 +680,7 @@ export const layerWith = (options?: LayerOptions) =>
         project,
         replay,
         replayAll,
+        assertReplayable,
         remove,
         claim,
       })
