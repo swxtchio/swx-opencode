@@ -777,7 +777,7 @@ describe("Worktree", () => {
               "export default {",
               '  id: "test.round-eight-runtime-hook",',
               "  server: async () => ({",
-              '    "shell.env": async () => PluginGate.waitForTrigger(),',
+              '    "shell.env": (input) => input.cwd === "sync" ? undefined : PluginGate.waitForTrigger(),',
               "  }),",
               "}",
             ].join("\n"),
@@ -792,6 +792,13 @@ describe("Worktree", () => {
           createdDirectory = info.directory
           yield* Fiber.join(readySignal)
           const ready = yield* store.load({ directory: info.directory })
+          const syncOutput = { env: {} as Record<string, string> }
+          expect(
+            yield* store.provide(
+              { directory: info.directory },
+              plugin.trigger("shell.env", { cwd: "sync" }, syncOutput),
+            ),
+          ).toBe(syncOutput)
           triggering = yield* store
             .provide(
               { directory: info.directory },
