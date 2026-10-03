@@ -11,10 +11,16 @@ type CallOptions = {
   }
 }
 
-export function call(scenario: ActiveScenario, ctx: SeededContext<unknown>, options: CallOptions = {}) {
-  return Effect.promise(async () =>
-    capture(await app(await runtime(), options).request(toRequest(scenario, ctx)), scenario.capture),
-  )
+export function call(
+  scenario: ActiveScenario,
+  ctx: SeededContext<unknown>,
+  options: CallOptions = {},
+  modules?: Runtime,
+) {
+  return Effect.promise(async () => {
+    const active = modules ?? (await runtime())
+    return capture(await app(active, options).request(toRequest(scenario, ctx)), scenario.capture)
+  })
 }
 
 export function callAuthProbe(scenario: ActiveScenario, credentials: "missing" | "valid" = "missing") {
@@ -64,7 +70,7 @@ function app(modules: Runtime, options: CallOptions) {
         ),
       ),
     ),
-    { disableLogger: true, memoMap: modules.memoMap },
+    { disableLogger: true, memoMap: modules.routeMemoMap ?? modules.memoMap },
   )
   return (appCache[cacheKey] = {
     dispose: web.dispose,

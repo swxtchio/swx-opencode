@@ -6,6 +6,7 @@ import { InstanceRef } from "../../src/effect/instance-ref"
 import { registerDisposer } from "../../src/effect/instance-registry"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
+import type { InstanceContext } from "../../src/project/instance-context"
 import { TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 
@@ -173,6 +174,77 @@ describe("InstanceStore", () => {
     }),
   )
 
+  it.live(
+    "lets a healthy load finish inside the disposal grace before cleaning it",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const store = yield* InstanceStore.Service
+        const started = yield* Deferred.make<void>()
+        const releaseBootstrap = yield* Deferred.make<void>()
+        const disposing = yield* Deferred.make<void>()
+        const releaseDispose = yield* Deferred.make<() => void>()
+        const disposeFinished = yield* Deferred.make<void>()
+        const disposed: Array<string> = []
+        let unregister: (() => void) | undefined
+
+        yield* setBootstrap(
+          Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(releaseBootstrap)
+          }),
+        )
+        yield* Effect.sync(() => {
+          unregister = registerDisposer((directory) => {
+            if (directory !== dir) return Promise.resolve()
+            disposed.push(directory)
+            return new Promise<void>((resolve) => {
+              Deferred.doneUnsafe(disposing, Effect.void)
+              Deferred.doneUnsafe(releaseDispose, Effect.succeed(resolve))
+            }).then(() => {
+              Deferred.doneUnsafe(disposeFinished, Effect.void)
+            })
+          })
+        })
+        yield* Effect.addFinalizer(() =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(releaseBootstrap, undefined)
+            if (yield* Deferred.isDone(releaseDispose)) {
+              const release = yield* Deferred.await(releaseDispose)
+              yield* Effect.sync(release)
+            }
+            if (unregister) yield* Effect.sync(unregister)
+          }),
+        )
+
+        const loading = yield* store.load({ directory: dir }).pipe(Effect.forkScoped)
+        yield* awaitWithTimeout(Deferred.await(started), "healthy bootstrap did not start")
+        const removing = yield* store.disposeDirectory(dir).pipe(Effect.forkDetach({ startImmediately: true }))
+        yield* Deferred.succeed(releaseBootstrap, undefined)
+
+        const loaded = yield* awaitWithTimeout(
+          Fiber.await(loading),
+          "load waiter did not complete successfully during the disposal grace",
+          "5 seconds",
+        )
+        expect(Exit.isSuccess(loaded)).toBe(true)
+        if (Exit.isSuccess(loaded)) expect(loaded.value.directory).toBe(dir)
+        yield* awaitWithTimeout(Deferred.await(disposing), "dispose did not run after the healthy load completed")
+
+        const release = yield* Deferred.await(releaseDispose)
+        yield* Effect.sync(release)
+        yield* awaitWithTimeout(Deferred.await(disposeFinished), "healthy-load disposer did not finish")
+        const removed = yield* awaitWithTimeout(Fiber.await(removing), "disposeDirectory did not finish cleanup")
+        expect(Exit.isSuccess(removed)).toBe(true)
+        expect(disposed).toEqual([dir])
+        if (unregister) {
+          yield* Effect.sync(unregister)
+          unregister = undefined
+        }
+      }),
+    { timeout: 15_000 },
+  )
+
   it.instance(
     "bounds disposal of a bootstrap that ignores interruption and quarantines later loads",
     () =>
@@ -255,6 +327,76 @@ describe("InstanceStore", () => {
       { timeout: 30_000 },
   )
 
+  it.live(
+    "keeps a Promise-backed bootstrap quarantined until its Promise settles",
+    () =>
+      Effect.gen(function* () {
+        const directory = yield* tmpdirScoped({ git: true })
+        const store = yield* InstanceStore.Service
+        const started = yield* Deferred.make<void>()
+        const finished = yield* Deferred.make<void>()
+        let releasePromise: (() => void) | undefined
+
+        yield* setBootstrap(
+          Effect.gen(function* () {
+            if ((yield* InstanceRef)?.directory !== directory) return
+            yield* Effect.promise(
+              () =>
+                new Promise<void>((resolve) => {
+                  releasePromise = resolve
+                  Deferred.doneUnsafe(started, Effect.void)
+                }).then(() => {
+                  Deferred.doneUnsafe(finished, Effect.void)
+                }),
+            )
+          }),
+        )
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => releasePromise?.()),
+        )
+
+        const loading = yield* store.load({ directory }).pipe(Effect.forkScoped)
+        yield* awaitWithTimeout(Deferred.await(started), "Promise-backed bootstrap did not start")
+        const removing = yield* store.disposeDirectory(directory).pipe(Effect.forkDetach)
+        const removal = yield* awaitWithTimeout(
+          Fiber.await(removing),
+          "disposeDirectory did not refuse the unsettled bootstrap Promise",
+          "15 seconds",
+        )
+        expect(Exit.isFailure(removal)).toBe(true)
+        if (Exit.isFailure(removal))
+          expect(Cause.pretty(removal.cause)).toContain("instance load did not stop")
+        const loadExit = yield* Fiber.await(loading)
+        expect(Exit.isFailure(loadExit)).toBe(true)
+        const blocked = yield* Effect.exit(
+          awaitWithTimeout(
+            Effect.exit(store.load({ directory })),
+            "load retried while the bootstrap Promise was still running",
+            "2 seconds",
+          ),
+        )
+        expect(Exit.isSuccess(blocked)).toBe(true)
+        if (Exit.isSuccess(blocked)) expect(Exit.isFailure(blocked.value)).toBe(true)
+
+        if (!releasePromise) return yield* Effect.die(new Error("bootstrap Promise did not publish its release handle"))
+        yield* Effect.sync(releasePromise)
+        releasePromise = undefined
+        yield* awaitWithTimeout(Deferred.await(finished), "Promise-backed bootstrap did not settle")
+        yield* setBootstrap(Effect.void)
+        const recovered = yield* pollWithTimeout(
+          store.load({ directory }).pipe(
+            Effect.as(true),
+            Effect.catchCause(() => Effect.succeed(undefined)),
+          ),
+          "settled bootstrap owner did not complete cleanup",
+          "10 seconds",
+        )
+        expect(recovered).toBe(true)
+        yield* store.disposeDirectory(directory)
+      }),
+    { timeout: 30_000 },
+  )
+
   it.live("removes failed loads from the cache", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped({ git: true })
@@ -300,6 +442,108 @@ describe("InstanceStore", () => {
     }),
   )
 
+  it.live(
+    "releases predecessor contexts after successful reloads",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const store = yield* InstanceStore.Service
+        const predecessors = yield* Effect.gen(function* () {
+          const reloadAndWeaken = Effect.fnUntraced(function* (previous: InstanceContext) {
+            const next = yield* store.reload({ directory: dir })
+            return { next, previous: new WeakRef(previous) }
+          })
+          let current = yield* store.load({ directory: dir })
+          const refs: WeakRef<InstanceContext>[] = []
+
+          for (const _ of Array.from({ length: 8 })) {
+            const reloaded = yield* reloadAndWeaken(current)
+            refs.push(reloaded.previous)
+            current = reloaded.next
+          }
+          return refs
+        })
+
+        const collected = yield* Effect.exit(
+          pollWithTimeout(
+            Effect.sync(() => {
+              Bun.gc(true)
+              return predecessors.every((previous) => previous.deref() === undefined) ? true : undefined
+            }),
+            "successful reloads retained predecessor contexts",
+            "5 seconds",
+          ),
+        )
+        expect(Exit.isSuccess(collected)).toBe(true)
+        if (Exit.isSuccess(collected)) expect(collected.value).toBe(true)
+        yield* store.disposeDirectory(dir)
+      }),
+    { timeout: 15_000 },
+  )
+
+  it.live(
+    "does not lose an active predecessor when disposing overlapping reloads",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const store = yield* InstanceStore.Service
+        const firstStarted = yield* Deferred.make<void>()
+        const releaseFirst = yield* Deferred.make<void>()
+        const firstFinished = yield* Deferred.make<void>()
+        yield* store.load({ directory: dir })
+        yield* setBootstrap(
+          Effect.gen(function* () {
+            if ((yield* InstanceRef)?.directory !== dir) return
+            yield* Deferred.succeed(firstStarted, undefined)
+            yield* Effect.uninterruptible(
+              Effect.gen(function* () {
+                yield* Deferred.await(releaseFirst)
+                yield* Deferred.succeed(firstFinished, undefined)
+              }),
+            )
+          }),
+        )
+        yield* Effect.addFinalizer(() => Deferred.succeed(releaseFirst, undefined).pipe(Effect.asVoid))
+
+        const firstReload = yield* store.reload({ directory: dir }).pipe(Effect.forkScoped)
+        yield* awaitWithTimeout(Deferred.await(firstStarted), "first reload did not reach its bootstrap hold")
+        const secondReload = yield* store.reload({ directory: dir }).pipe(Effect.forkScoped({ startImmediately: true }))
+        const removing = yield* store.disposeDirectory(dir).pipe(Effect.forkScoped({ startImmediately: true }))
+        const removal = yield* awaitWithTimeout(
+          Fiber.await(removing),
+          "disposeDirectory did not refuse an active predecessor before its hold was released",
+          "12 seconds",
+        )
+        expect(Exit.isFailure(removal)).toBe(true)
+        if (Exit.isFailure(removal))
+          expect(Cause.pretty(removal.cause)).toContain("instance load did not stop")
+        expect(yield* Deferred.isDone(firstFinished)).toBe(false)
+
+        yield* Deferred.succeed(releaseFirst, undefined)
+        yield* awaitWithTimeout(Deferred.await(firstFinished), "held predecessor did not finish")
+        const [firstExit, secondExit] = yield* Effect.all(
+          [
+            awaitWithTimeout(Fiber.await(firstReload), "first reload did not settle after release"),
+            awaitWithTimeout(Fiber.await(secondReload), "second reload did not settle after release"),
+          ],
+          { concurrency: "unbounded" },
+        )
+        expect(Exit.isFailure(firstExit)).toBe(true)
+        expect(Exit.isFailure(secondExit)).toBe(true)
+        const recovered = yield* pollWithTimeout(
+          store.load({ directory: dir }).pipe(
+            Effect.as(true),
+            Effect.catchCause(() => Effect.succeed(undefined)),
+          ),
+          "reload cleanup left its predecessor cached",
+          "5 seconds",
+        )
+        expect(recovered).toBe(true)
+        yield* store.disposeDirectory(dir)
+      }),
+    { timeout: 25_000 },
+  )
+
   it.live("dispose preserves the ready context's normal cleanup", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped({ git: true })
@@ -318,7 +562,7 @@ describe("InstanceStore", () => {
     }),
   )
 
-  it.live("disposeDirectory settles a reload interrupted in its held disposer", () =>
+  it.live("refuses reload disposal until its non-cancellable disposer Promise settles", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped({ git: true })
       const store = yield* InstanceStore.Service
@@ -326,21 +570,30 @@ describe("InstanceStore", () => {
       const releaseDispose = yield* Deferred.make<() => void>()
       const disposeFinished = yield* Deferred.make<void>()
       const disposed: Array<string> = []
+      let disposeCalls = 0
+      let unregister: (() => void) | undefined
 
-      yield* registerDisposerScoped((directory) => {
-        disposed.push(directory)
-        return new Promise<void>((resolve) => {
-          Deferred.doneUnsafe(disposing, Effect.void)
-          Deferred.doneUnsafe(releaseDispose, Effect.succeed(resolve))
-        }).then(() => {
-          Deferred.doneUnsafe(disposeFinished, Effect.void)
+      yield* Effect.sync(() => {
+        unregister = registerDisposer((directory) => {
+          if (directory !== dir) return Promise.resolve()
+          disposed.push(directory)
+          disposeCalls++
+          if (disposeCalls > 1) return Promise.resolve()
+          return new Promise<void>((resolve) => {
+            Deferred.doneUnsafe(disposing, Effect.void)
+            Deferred.doneUnsafe(releaseDispose, Effect.succeed(resolve))
+          }).then(() => {
+            Deferred.doneUnsafe(disposeFinished, Effect.void)
+          })
         })
       })
       yield* Effect.addFinalizer(() =>
         Effect.gen(function* () {
-          if (!(yield* Deferred.isDone(releaseDispose))) return
-          const release = yield* Deferred.await(releaseDispose)
-          yield* Effect.sync(release)
+          if (yield* Deferred.isDone(releaseDispose)) {
+            const release = yield* Deferred.await(releaseDispose)
+            yield* Effect.sync(release)
+          }
+          if (unregister) yield* Effect.sync(unregister)
         }),
       )
 
@@ -350,24 +603,51 @@ describe("InstanceStore", () => {
 
       const removing = yield* store.disposeDirectory(dir).pipe(Effect.forkScoped)
       const removal = yield* Effect.exit(
-        awaitWithTimeout(Fiber.join(removing), "disposeDirectory did not finish the interrupted reload", "8 seconds"),
+        awaitWithTimeout(Fiber.await(removing), "disposeDirectory did not refuse a held disposer", "12 seconds"),
       )
       const reloaded = yield* Effect.exit(
-        awaitWithTimeout(Fiber.await(reload), "reload caller remained blocked after its worker exited", "2 seconds"),
+        awaitWithTimeout(Fiber.await(reload), "reload caller did not settle its failed handoff", "8 seconds"),
       )
+      const blocked = yield* Effect.exit(
+        awaitWithTimeout(
+          Effect.exit(store.load({ directory: dir })),
+          "load did not refuse while its disposer Promise was active",
+          "2 seconds",
+        ),
+      )
+
+      expect(Exit.isSuccess(removal)).toBe(true)
+      if (Exit.isSuccess(removal)) {
+        expect(Exit.isFailure(removal.value)).toBe(true)
+        if (Exit.isFailure(removal.value))
+          expect(Cause.pretty(removal.value.cause)).toContain("instance disposer did not settle")
+      }
+      expect(Exit.isSuccess(reloaded)).toBe(true)
+      if (Exit.isSuccess(reloaded)) expect(Exit.isFailure(reloaded.value)).toBe(true)
+      expect(Exit.isSuccess(blocked)).toBe(true)
+      if (Exit.isSuccess(blocked)) {
+        expect(Exit.isFailure(blocked.value)).toBe(true)
+        if (Exit.isFailure(blocked.value))
+          expect(Cause.pretty(blocked.value.cause)).toContain("instance disposal is still running")
+      }
 
       const release = yield* Deferred.await(releaseDispose)
       yield* Effect.sync(release)
       yield* awaitWithTimeout(Deferred.await(disposeFinished), "held disposer did not finish")
-      const next = yield* awaitWithTimeout(store.load({ directory: dir }), "reload left a poisoned cache entry")
+      if (unregister) {
+        yield* Effect.sync(unregister)
+        unregister = undefined
+      }
+      const next = yield* pollWithTimeout(
+        store.load({ directory: dir }).pipe(Effect.catchCause(() => Effect.succeed(undefined))),
+        "reload left a poisoned cache entry",
+      )
 
-      expect(Exit.isSuccess(removal)).toBe(true)
-      expect(Exit.isSuccess(reloaded)).toBe(true)
-      if (Exit.isSuccess(reloaded)) expect(Exit.isFailure(reloaded.value)).toBe(true)
       expect(next.directory).toBe(dir)
       expect(first.directory).toBe(dir)
       expect(disposed).toEqual([dir])
     }),
+    { timeout: 25_000 },
   )
 
   it.live("stale dispose does not delete an in-flight reload", () =>

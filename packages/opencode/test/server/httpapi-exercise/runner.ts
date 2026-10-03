@@ -10,16 +10,16 @@ import type { MessageV2 } from "../../../src/session/message-v2"
 import { MessageID, PartID } from "../../../src/session/schema"
 import { call, callAuthProbe, disposeApps } from "./backend"
 import { original } from "./environment"
-import { runtime } from "./runtime"
+import { runtime, type Runtime } from "./runtime"
 import type { ActiveScenario, Options, ProjectOptions, Result, Scenario, ScenarioContext, SeededContext } from "./types"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { WorktreeEvent } from "@opencode-ai/schema/worktree-event"
 
-export function runScenario(options: Options) {
+export function runScenario(options: Options, runtimeOverride?: Runtime) {
   return (scenario: Scenario) => {
     if (scenario.kind === "todo") return Effect.succeed({ status: "skip", scenario } as Result)
-    return Effect.scoped(runActive(options, scenario)).pipe(
+    return Effect.scoped(runActive(options, scenario, runtimeOverride)).pipe(
       Effect.timeoutOrElse({
         duration: options.scenarioTimeout,
         orElse: () => Effect.die(new Error(`scenario timed out after ${Duration.format(options.scenarioTimeout)}`)),
@@ -30,18 +30,19 @@ export function runScenario(options: Options) {
   }
 }
 
-function runActive(options: Options, scenario: ActiveScenario) {
+function runActive(options: Options, scenario: ActiveScenario, runtimeOverride?: Runtime) {
   if (options.mode === "auth") return runAuth(scenario)
 
-  return withContext(options, scenario, "shared", (ctx) =>
+  return withContext(options, scenario, "shared", (ctx, modules) =>
     Effect.gen(function* () {
       yield* trace(options, scenario, "request start")
-      const result = yield* call(scenario, ctx)
+      const result = yield* call(scenario, ctx, {}, modules)
       yield* trace(options, scenario, `response ${result.status}`)
       yield* trace(options, scenario, "expect start")
       yield* scenario.expect(ctx, ctx.state, result)
       yield* trace(options, scenario, "expect done")
     }),
+    runtimeOverride,
   )
 }
 
@@ -64,18 +65,20 @@ function withContext<A, E>(
   options: Options,
   scenario: ActiveScenario,
   label: string,
-  use: (ctx: SeededContext<unknown>) => Effect.Effect<A, E>,
+  use: (ctx: SeededContext<unknown>, modules: Runtime) => Effect.Effect<A, E>,
+  runtimeOverride?: Runtime,
 ) {
   return Effect.acquireRelease(
     Effect.gen(function* () {
       yield* trace(options, scenario, `${label} context acquire start`)
+      const modules = runtimeOverride ?? (yield* Effect.promise(() => runtime()))
       const llm = scenario.project?.llm ? yield* TestLLMServer : undefined
       const project = scenario.project
       const dir = project
-        ? yield* Effect.promise(async () => (await runtime()).tmpdir(projectOptions(project, llm?.url)))
+        ? yield* Effect.promise(async () => modules.tmpdir(projectOptions(project, llm?.url)))
         : undefined
       yield* trace(options, scenario, `${label} context acquire done`)
-      return { dir, llm }
+      return { dir, llm, modules }
     }),
     (ctx) =>
       Effect.gen(function* () {
@@ -89,7 +92,7 @@ function withContext<A, E>(
     Effect.flatMap((context) =>
       Effect.gen(function* () {
         yield* trace(options, scenario, `${label} runtime start`)
-        const modules = yield* Effect.promise(() => runtime())
+        const modules = context.modules
         const scope = yield* Scope.Scope
         const app = yield* Layer.buildWithMemoMap(modules.AppLayer, modules.memoMap, scope)
         yield* trace(options, scenario, `${label} runtime done`)
@@ -241,7 +244,7 @@ function withContext<A, E>(
         const state = yield* scenario.seed(base)
         yield* trace(options, scenario, `${label} seed done`)
         yield* trace(options, scenario, `${label} use start`)
-        const result = yield* use({ ...base, state })
+        const result = yield* use({ ...base, state }, modules)
         yield* trace(options, scenario, `${label} use done`)
         return result
       }).pipe(Effect.ensuring(context.llm ? context.llm.reset : Effect.void)),

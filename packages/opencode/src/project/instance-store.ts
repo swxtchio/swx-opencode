@@ -34,7 +34,18 @@ interface Entry {
   readonly deferred: Deferred.Deferred<InstanceContext>
   readonly loadFiber: Deferred.Deferred<Fiber.Fiber<void>>
   context?: InstanceContext
+  disposersDone?: boolean
+  disposedEventEmitted?: boolean
   previous?: Entry
+}
+
+type DisposerResult = { success: true } | { success: false; error: unknown }
+
+interface DisposerRun {
+  readonly completion: Deferred.Deferred<DisposerResult>
+  readonly entries: Set<Entry>
+  readonly observers: Set<() => void>
+  readonly autoFinalize: Set<Entry>
 }
 
 const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Service> = Layer.effect(
@@ -44,6 +55,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     const bootstrap = yield* InstanceBootstrap.Service
     const cache = new Map<string, Entry>()
     const orphaned = new Map<string, Set<Entry>>()
+    const disposerRuns = new Map<string, DisposerRun>()
 
     const boot = (input: LoadInput & { directory: string }) =>
       Effect.gen(function* () {
@@ -61,7 +73,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
                   project: result.project,
                 })),
               )
-        yield* bootstrap.run.pipe(Effect.provideService(InstanceRef, ctx))
+        yield* Effect.uninterruptible(bootstrap.run.pipe(Effect.provideService(InstanceRef, ctx)))
         return ctx
       }).pipe(Effect.withSpan("InstanceStore.boot"))
 
@@ -72,45 +84,130 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         return true
       })
 
+    const emitDisposedSync = (input: { directory: string; project?: string }) =>
+      GlobalBus.emit("event", {
+        directory: input.directory,
+        project: input.project,
+        workspace: WorkspaceContext.workspaceID,
+        payload: {
+          type: "server.instance.disposed",
+          properties: {
+            directory: input.directory,
+          },
+        },
+      })
+
+    const completeDisposerRun = (directory: string, run: DisposerRun, result: DisposerResult) => {
+      if (disposerRuns.get(directory) === run) disposerRuns.delete(directory)
+      if (result.success) {
+        run.entries.forEach((entry) => (entry.disposersDone = true))
+        run.autoFinalize.forEach((entry) => {
+          if (!entry.context || entry.disposedEventEmitted) return
+          if (cache.get(directory) === entry) cache.delete(directory)
+          entry.disposedEventEmitted = true
+          emitDisposedSync({ directory, project: entry.context.project.id })
+        })
+      }
+      Deferred.doneUnsafe(run.completion, Effect.succeed(result))
+      run.observers.forEach((observer) => observer())
+      run.observers.clear()
+    }
+
+    const awaitDisposerRun = (directory: string, run: DisposerRun) =>
+      Deferred.await(run.completion).pipe(
+        Effect.timeoutOrElse({
+          duration: "5 seconds",
+          orElse: () => Effect.die(new Error(`instance disposer did not settle: ${directory}`)),
+        }),
+        Effect.flatMap((result) => (result.success ? Effect.void : Effect.die(result.error))),
+      )
+
+    const startDisposerRun = (directory: string, entry?: Entry) => {
+      const current = disposerRuns.get(directory)
+      if (entry?.disposersDone && !current) return undefined
+      const run = current ?? {
+        completion: Deferred.makeUnsafe<DisposerResult>(),
+        entries: new Set<Entry>(),
+        observers: new Set<() => void>(),
+        autoFinalize: new Set<Entry>(),
+      }
+      if (entry) run.entries.add(entry)
+      if (!current) {
+        disposerRuns.set(directory, run)
+        // The JS Promise is the cleanup owner; interrupting an Effect waiter does not stop it.
+        void runDisposers(directory).then(
+          () => completeDisposerRun(directory, run, { success: true }),
+          (error: unknown) => completeDisposerRun(directory, run, { success: false, error }),
+        )
+      }
+      return run
+    }
+
+    const awaitDisposerRunTracked = (directory: string, run: DisposerRun, entry?: Entry) =>
+      awaitDisposerRun(directory, run).pipe(
+        Effect.onInterrupt(() =>
+          Effect.sync(() => {
+            if (entry && disposerRuns.get(directory) === run) run.autoFinalize.add(entry)
+          }),
+        ),
+        Effect.catchCause((cause) =>
+          Effect.gen(function* () {
+            if (entry && disposerRuns.get(directory) === run) {
+              yield* Effect.sync(() => run.autoFinalize.add(entry))
+            }
+            return yield* Effect.failCause(cause)
+          }),
+        ),
+      )
+
+    const runDisposersTracked = Effect.fnUntraced(function* (directory: string, entry?: Entry) {
+      const run = yield* Effect.sync(() => startDisposerRun(directory, entry))
+      if (!run) return
+      yield* awaitDisposerRunTracked(directory, run, entry)
+    })
+
+    const waitForDisposers = Effect.fnUntraced(function* (directory: string) {
+      const run = disposerRuns.get(directory)
+      if (!run) return
+      yield* awaitDisposerRun(directory, run)
+    })
+
     const completeEntry = (directory: string, entry: Entry, work: Effect.Effect<InstanceContext>) =>
       Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const exit = yield* Effect.exit(restore(work))
           if (yield* Deferred.isDone(entry.deferred)) {
-            if (Exit.isSuccess(exit)) yield* disposeContext(exit.value)
-            if (Exit.isFailure(exit)) yield* Effect.promise(() => runDisposers(directory))
+            if (Exit.isSuccess(exit)) entry.context = exit.value
+            const run = yield* Effect.sync(() => startDisposerRun(directory, entry))
+            if (run) yield* Effect.sync(() => run.autoFinalize.add(entry)).pipe(Effect.asVoid)
             return
           }
           if (Exit.isFailure(exit)) yield* removeEntry(directory, entry)
           else entry.context = exit.value
           yield* Deferred.done(entry.deferred, exit).pipe(Effect.asVoid)
+          if (Exit.isSuccess(exit)) entry.previous = undefined
         }),
       )
 
-    const emitDisposed = (input: { directory: string; project?: string }) =>
-      Effect.sync(() =>
-        GlobalBus.emit("event", {
-          directory: input.directory,
-          project: input.project,
-          workspace: WorkspaceContext.workspaceID,
-          payload: {
-            type: "server.instance.disposed",
-            properties: {
-              directory: input.directory,
-            },
-          },
-        }),
-      )
+    const emitDisposed = (input: { directory: string; project?: string }, entry?: Entry) =>
+      Effect.sync(() => {
+        if (entry?.disposedEventEmitted) return
+        emitDisposedSync(input)
+        if (entry) entry.disposedEventEmitted = true
+      })
 
-    const disposeContext = Effect.fn("InstanceStore.disposeContext")(function* (ctx: InstanceContext) {
-      yield* Effect.logInfo("disposing instance", { directory: ctx.directory })
-      yield* Effect.promise(() => runDisposers(ctx.directory))
-      yield* emitDisposed({ directory: ctx.directory, project: ctx.project.id })
-    })
+    const disposeContext = Effect.fn("InstanceStore.disposeContext")(
+      function* (ctx: InstanceContext, entry?: Entry, run?: DisposerRun) {
+        yield* Effect.logInfo("disposing instance", { directory: ctx.directory })
+        if (run) yield* awaitDisposerRunTracked(ctx.directory, run, entry)
+        else yield* runDisposersTracked(ctx.directory, entry)
+        yield* emitDisposed({ directory: ctx.directory, project: ctx.project.id }, entry)
+      },
+    )
 
     const disposeEntry = Effect.fnUntraced(function* (directory: string, entry: Entry, ctx: InstanceContext) {
       if (cache.get(directory) !== entry) return false
-      yield* disposeContext(ctx)
+      yield* disposeContext(ctx, entry)
       if (cache.get(directory) !== entry) return false
       cache.delete(directory)
       return true
@@ -124,17 +221,21 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       const error = new Error(`instance load ${reason}: ${directory}`)
       yield* Effect.sync(() => {
         const blocked = orphaned.get(directory) ?? new Set<Entry>()
+        const disposal = disposerRuns.get(directory)
+        const interruptor = Fiber.getCurrent()?.id
         for (const load of loads) {
-          if (!load.fiber || load.fiber.pollUnsafe() === undefined) {
+          const fiberPending = !load.fiber || load.fiber.pollUnsafe() === undefined
+          if (fiberPending || disposal) {
             blocked.add(load.entry)
-            if (load.fiber) {
-              load.fiber.addObserver(() => {
-                const current = orphaned.get(directory)
-                if (!current) return
-                current.delete(load.entry)
-                if (current.size === 0) orphaned.delete(directory)
-              })
+            const removeOrphan = () => {
+              const current = orphaned.get(directory)
+              if (!current) return
+              current.delete(load.entry)
+              if (current.size === 0) orphaned.delete(directory)
             }
+            if (load.fiber && fiberPending) load.fiber.addObserver(removeOrphan)
+            disposal?.observers.add(removeOrphan)
+            if (load.fiber && fiberPending) load.fiber.interruptUnsafe(interruptor)
           }
           if (cache.get(directory) === load.entry) cache.delete(directory)
           if (!Deferred.isDoneUnsafe(load.entry.deferred)) {
@@ -147,11 +248,12 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     })
 
     const settleLoad = Effect.fnUntraced(function* (directory: string, entry: Entry) {
-      if (yield* Deferred.isDone(entry.deferred)) return yield* Deferred.await(entry.deferred).pipe(Effect.exit)
       if (orphaned.has(directory))
         return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
       const entries: Entry[] = []
       for (let current: Entry | undefined = entry; current; current = current.previous) entries.push(current)
+      yield* waitForDisposers(directory)
+      if (yield* Deferred.isDone(entry.deferred)) return yield* Deferred.await(entry.deferred).pipe(Effect.exit)
       const fibers = yield* Effect.forEach(
         entries,
         (item) =>
@@ -193,6 +295,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         if (unconfirmed.length > 0) return yield* abandonLoads(directory, unconfirmed, "did not stop")
       }
 
+      yield* waitForDisposers(directory)
       const unresolved = entries.filter((item) => !Deferred.isDoneUnsafe(item.deferred))
       if (unresolved.length > 0) {
         return yield* abandonLoads(
@@ -214,6 +317,9 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           if (orphaned.has(directory)) {
             return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
           }
+          if (disposerRuns.has(directory)) {
+            return yield* Effect.die(new Error(`instance disposal is still running for ${directory}`))
+          }
           const existing = cache.get(directory)
           if (existing) return yield* restore(Deferred.await(existing.deferred))
 
@@ -222,6 +328,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             loadFiber: Deferred.makeUnsafe<Fiber.Fiber<void>>(),
           }
           cache.set(directory, entry)
+          // Admission is masked; the detached producer must still observe later stop requests.
           const fiber = yield* completeEntry(
             directory,
             entry,
@@ -229,7 +336,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
               yield* Effect.logInfo("creating instance", { directory: directory })
               return yield* boot({ ...input, directory })
             }),
-          ).pipe(Effect.forkDetach({ startImmediately: true }))
+          ).pipe(Effect.interruptible, Effect.forkDetach({ startImmediately: true }))
           yield* Deferred.succeed(entry.loadFiber, fiber)
           return yield* restore(Deferred.await(entry.deferred))
         }),
@@ -243,6 +350,9 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           if (orphaned.has(directory)) {
             return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
           }
+          if (disposerRuns.has(directory)) {
+            return yield* Effect.die(new Error(`instance disposal is still running for ${directory}`))
+          }
           const previous = cache.get(directory)
           const entry: Entry = {
             deferred: Deferred.makeUnsafe<InstanceContext>(),
@@ -250,19 +360,20 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             ...(previous ? { previous } : {}),
           }
           cache.set(directory, entry)
+          // Keep reload producers interruptible after the cache handoff, just like load producers.
           const fiber = yield* completeEntry(
             directory,
             entry,
             Effect.gen(function* () {
               yield* Effect.logInfo("reloading instance", { directory: directory })
-              if (previous) {
-                yield* Deferred.await(previous.deferred).pipe(Effect.ignore)
-                yield* Effect.promise(() => runDisposers(directory))
-                yield* emitDisposed({ directory, project: input.project?.id })
+              if (entry.previous) {
+                yield* Deferred.await(entry.previous.deferred).pipe(Effect.ignore)
+                yield* runDisposersTracked(directory, entry.previous)
+                yield* emitDisposed({ directory, project: input.project?.id }, entry.previous)
               }
               return yield* boot({ ...input, directory })
             }),
-          ).pipe(Effect.forkDetach({ startImmediately: true }))
+          ).pipe(Effect.interruptible, Effect.forkDetach({ startImmediately: true }))
           yield* Deferred.succeed(entry.loadFiber, fiber)
           return yield* restore(Deferred.await(entry.deferred))
         }),
@@ -286,6 +397,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       const directory = FSUtil.resolve(input)
       if (orphaned.has(directory))
         return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
+      yield* waitForDisposers(directory)
       const entry = cache.get(directory)
       if (!entry) return
       const exit = yield* settleLoad(directory, entry)

@@ -5,9 +5,11 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
+import { registerDisposer } from "../../src/effect/instance-registry"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { Git } from "../../src/git"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
+import type { InstanceContext } from "../../src/project/instance-context"
 import { InstanceStore } from "../../src/project/instance-store"
 import { Worktree } from "../../src/worktree"
 import { disposeAllInstances, provideInstance, TestInstance } from "../fixture/fixture"
@@ -305,6 +307,118 @@ describe("Worktree", () => {
       { git: true },
     )
 
+    it.instance(
+      "refuses Worktree.remove while a reload disposer Promise is still running",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const store = yield* InstanceStore.Service
+          const ready = yield* waitReady().pipe(Effect.forkScoped)
+          const info = yield* svc.create({ name: "held-disposer-remove" })
+          yield* Fiber.join(ready)
+          const disposing = yield* Deferred.make<void>()
+          const releaseDispose = yield* Deferred.make<() => void>()
+          const disposeFinished = yield* Deferred.make<void>()
+          let disposeCalls = 0
+          let releasePromise: (() => void) | undefined
+          let unregister: (() => void) | undefined
+          let reload: Fiber.Fiber<InstanceContext, never> | undefined
+          let removing: Fiber.Fiber<boolean, Worktree.Error> | undefined
+
+          yield* Effect.addFinalizer(() =>
+            Effect.gen(function* () {
+              if (releasePromise) yield* Effect.sync(releasePromise)
+              if (reload) {
+                yield* Fiber.await(reload).pipe(
+                  Effect.timeoutOrElse({ duration: "15 seconds", orElse: () => Effect.succeed(undefined) }),
+                  Effect.asVoid,
+                )
+              }
+              if (removing) {
+                yield* Fiber.await(removing).pipe(
+                  Effect.timeoutOrElse({ duration: "15 seconds", orElse: () => Effect.succeed(undefined) }),
+                  Effect.asVoid,
+                )
+              }
+              if (unregister) yield* Effect.sync(unregister)
+              yield* removeCreatedWorktree(info.directory).pipe(Effect.ignore)
+            }),
+          )
+
+          unregister = yield* Effect.sync(() =>
+            registerDisposer((directory) => {
+              if (directory !== info.directory) return Promise.resolve()
+              disposeCalls++
+              if (disposeCalls > 1) return Promise.resolve()
+              return new Promise<void>((resolve) => {
+                releasePromise = resolve
+                Deferred.doneUnsafe(disposing, Effect.void)
+                Deferred.doneUnsafe(releaseDispose, Effect.succeed(resolve))
+              }).then(() => {
+                Deferred.doneUnsafe(disposeFinished, Effect.void)
+              })
+            }),
+          )
+
+          reload = yield* store.reload({ directory: info.directory }).pipe(Effect.forkScoped)
+          yield* awaitWithTimeout(Deferred.await(disposing), "reload did not reach the held disposer")
+          removing = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkScoped)
+          const removal = yield* awaitWithTimeout(
+            Fiber.await(removing),
+            "Worktree.remove did not report its bounded disposer refusal",
+            "12 seconds",
+          )
+          expect(Exit.isFailure(removal)).toBe(true)
+          if (Exit.isFailure(removal)) {
+            expect(Cause.squash(removal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
+            expect(Cause.pretty(removal.cause)).toContain("instance disposer did not settle")
+          }
+          expect(yield* fs.exists(info.directory)).toBe(true)
+          expect(normalize(yield* git(test.directory, ["worktree", "list", "--porcelain"]))).toContain(
+            normalize(info.directory),
+          )
+          const blocked = yield* Effect.exit(
+            awaitWithTimeout(
+              Effect.exit(store.load({ directory: info.directory })),
+              "worktree load retried before its disposer Promise settled",
+              "2 seconds",
+            ),
+          )
+          expect(Exit.isSuccess(blocked)).toBe(true)
+          if (Exit.isSuccess(blocked)) {
+            expect(Exit.isFailure(blocked.value)).toBe(true)
+            if (Exit.isFailure(blocked.value))
+              expect(Cause.pretty(blocked.value.cause)).toContain("instance disposal is still running")
+          }
+
+          const release = yield* Deferred.await(releaseDispose)
+          yield* Effect.sync(release)
+          releasePromise = undefined
+          yield* awaitWithTimeout(Deferred.await(disposeFinished), "held disposer did not finish")
+          const reloaded = yield* awaitWithTimeout(Fiber.await(reload), "reload did not finish after disposer completion")
+          expect(Exit.isFailure(reloaded)).toBe(true)
+          const recovered = yield* pollWithTimeout(
+            store.load({ directory: info.directory }).pipe(
+              Effect.as(true),
+              Effect.catchCause(() => Effect.succeed(undefined)),
+            ),
+            "completed disposer did not release the worktree cache quarantine",
+          )
+          expect(recovered).toBe(true)
+          if (unregister) {
+            yield* Effect.sync(unregister)
+            unregister = undefined
+          }
+          expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(false)
+          removing = undefined
+        }),
+      { git: true },
+      { timeout: 25_000 },
+    )
+
     raceIt.instance(
       "stops an unregistered worktree boot before removal deletes its directory",
       () =>
@@ -413,7 +527,7 @@ describe("Worktree", () => {
     )
 
     nonCooperativeBootstrapIt.instance(
-      "refuses worktree deletion until an uninterruptible bootstrap stops",
+      "refuses worktree deletion until a Promise-backed bootstrap settles",
       () =>
         Effect.gen(function* () {
           const test = yield* TestInstance
@@ -422,25 +536,27 @@ describe("Worktree", () => {
           const store = yield* InstanceStore.Service
           const expected = yield* svc.makeWorktreeInfo({ name: "non-cooperative-bootstrap" })
           const started = yield* Deferred.make<void>()
-          const release = yield* Deferred.make<void>()
           const finished = yield* Deferred.make<void>()
           let createdDirectory: string | undefined
           let removalFiber: Fiber.Fiber<boolean, Worktree.Error> | undefined
+          let releaseBootstrap: (() => void) | undefined
 
           controlledBootstrapRun = Effect.gen(function* () {
             if ((yield* InstanceRef)?.directory !== expected.directory) return
-            yield* Effect.uninterruptible(
-              Effect.gen(function* () {
-                yield* Deferred.succeed(started, undefined)
-                yield* Deferred.await(release)
-                yield* Deferred.succeed(finished, undefined)
-              }),
+            yield* Effect.promise(
+              () =>
+                new Promise<void>((resolve) => {
+                  releaseBootstrap = resolve
+                  Deferred.doneUnsafe(started, Effect.void)
+                }).then(() => {
+                  Deferred.doneUnsafe(finished, Effect.void)
+                }),
             )
           })
           yield* Effect.addFinalizer(() =>
             Effect.gen(function* () {
               controlledBootstrapRun = Effect.void
-              yield* Deferred.succeed(release, undefined).pipe(Effect.asVoid)
+              if (releaseBootstrap) yield* Effect.sync(releaseBootstrap)
               if (removalFiber) {
                 yield* Fiber.await(removalFiber).pipe(
                   Effect.timeoutOrElse({ duration: "20 seconds", orElse: () => Effect.succeed(undefined) }),
@@ -490,8 +606,11 @@ describe("Worktree", () => {
               expect(Cause.pretty(blocked.value.cause)).toContain("instance load is still running")
           }
 
-          yield* Deferred.succeed(release, undefined)
+          if (!releaseBootstrap) return yield* Effect.die(new Error("bootstrap Promise did not publish its release handle"))
+          yield* Effect.sync(releaseBootstrap)
+          releaseBootstrap = undefined
           yield* awaitWithTimeout(Deferred.await(finished), "worktree bootstrap did not leave its hold")
+          yield* Effect.sync(() => (controlledBootstrapRun = Effect.void))
           const loaded = yield* pollWithTimeout(
             store.load({ directory: info.directory }).pipe(
               Effect.as(true),
