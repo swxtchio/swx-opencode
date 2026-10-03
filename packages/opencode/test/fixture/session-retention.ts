@@ -4,15 +4,12 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { EventRetentionTable, EventSequenceTable } from "@opencode-ai/core/event/sql"
 import { eq } from "drizzle-orm"
 import { DbRetention, type RetentionEvidence, type SqliteAccess } from "@/cli/cmd/db-retention"
-import { tmpdirScoped } from "./fixture"
 
 const access = (db: unknown) => db as SqliteAccess
 
 export function applyRetentionFixture(sessionID: string) {
   return Effect.gen(function* () {
     const { db } = yield* Database.Service
-    const directory = yield* tmpdirScoped()
-    const databasePath = `${directory}/retention.sqlite`
     const now = Date.now()
     const ownerID =
       (yield* db
@@ -21,6 +18,13 @@ export function applyRetentionFixture(sessionID: string) {
         .where(eq(EventSequenceTable.aggregate_id, sessionID))
         .get())?.ownerID ?? null
     const proof: RetentionEvidence = {
+      customerBinding: {
+        proofID: "fixture-unbound-session-classification",
+        durable: true,
+        sessionIDs: [sessionID],
+        customerBoundSessionIDs: [],
+        nonCustomerSessionIDs: [sessionID],
+      },
       policy: {
         reviewed: true,
         cutoffEpochMs: now + 60_000,
@@ -72,10 +76,14 @@ export function applyRetentionFixture(sessionID: string) {
       },
     }
     const image = yield* (db.$client as unknown as { export: Effect.Effect<Uint8Array> }).export
-    yield* Effect.promise(() => Bun.write(databasePath, image))
-    const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
-    const database = yield* Effect.sync(() => new sqlite.Database(databasePath))
-    yield* Effect.addFinalizer(() => Effect.sync(() => database.close()))
+    const fixture = yield* Effect.promise(() => DbRetention.createFixtureDatabase(image))
+    const database = fixture.db
+    yield* Effect.addFinalizer(() =>
+      Effect.promise(async () => {
+        database.close()
+        await fixture.remove()
+      }),
+    )
     const tree = DbRetention.inventory(access(database), proof, now).trees.find(
       (item) => item.rootSessionID === sessionID,
     )

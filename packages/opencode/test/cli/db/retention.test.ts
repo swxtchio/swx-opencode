@@ -1,10 +1,11 @@
 import { expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
-import { mkdtemp, rm, stat, statfs } from "node:fs/promises"
+import { mkdtemp, rm, stat, statfs, symlink } from "node:fs/promises"
 import path from "node:path"
 import {
   apply,
   compactRestoreFixture,
+  createFixtureDatabase,
   inventory,
   type RetentionEvidence,
   type SqliteAccess,
@@ -77,6 +78,13 @@ function createSchema(db: Database) {
 const access = (db: Database) => db as unknown as SqliteAccess
 
 const evidence = (sessionIDs: string[], finalSequence: Record<string, number>, now = 1_000): RetentionEvidence => ({
+  customerBinding: {
+    proofID: "fixture-unbound-session-classification",
+    durable: true,
+    sessionIDs,
+    customerBoundSessionIDs: [],
+    nonCustomerSessionIDs: sessionIDs,
+  },
   policy: {
     reviewed: true,
     cutoffEpochMs: 100,
@@ -313,6 +321,36 @@ test("a missing measurement receipt refuses an otherwise proven tree without cha
   }
 })
 
+test("customer-bound and unclassified Session trees remain ineligible", () => {
+  const db = fixture()
+  try {
+    session(db, "ses_customer", 10)
+    event(db, "ses_customer")
+    const valid = evidence(["ses_customer"], { ses_customer: 0 })
+    const before = db.serialize()
+    const customerBound = {
+      ...valid,
+      customerBinding: {
+        ...valid.customerBinding!,
+        customerBoundSessionIDs: ["ses_customer"],
+        nonCustomerSessionIDs: [],
+      },
+    }
+    const boundTree = inventory(access(db), customerBound, 1_000).trees[0]!
+    expect(boundTree.reasons).toContain("customer-bound-session-retention-workflow-unapproved:ses_customer")
+    const refused = apply(access(db), { tree: boundTree, evidence: () => customerBound, now: () => 1_000 })
+    expect(refused.state).toBe("refused")
+    expect(refused.changedRows).toBe(0)
+    expect(db.serialize().equals(before)).toBe(true)
+
+    const unknown = inventory(access(db), { ...valid, customerBinding: undefined }, 1_000)
+    expect(unknown.trees[0]?.reasons).toContain("customer-session-classification-unavailable")
+    expect(db.serialize().equals(before)).toBe(true)
+  } finally {
+    db.close()
+  }
+})
+
 test("unknown event ownership, malformed event data, and new Session tables remain ineligible", () => {
   const db = fixture()
   try {
@@ -344,9 +382,8 @@ test("unknown event ownership, malformed event data, and new Session tables rema
 })
 
 test("apply redacts every copy in restartable batches and preserves metric values", async () => {
-  await using tmp = await tmpdir()
-  const databasePath = path.join(tmp.path, "retention.sqlite")
-  const first = new Database(databasePath)
+  await using fixtureDB = await createFixtureDatabase()
+  const first = fixtureDB.db
   createSchema(first)
   session(first, "ses_old", 10)
   event(first, "ses_old")
@@ -386,7 +423,7 @@ test("apply redacts every copy in restartable batches and preserves metric value
   ).toBe("redacting")
   first.close()
 
-  const resumed = new Database(databasePath)
+  const resumed = await fixtureDB.reopen()
   try {
     const result = apply(access(resumed), {
       tree: initial.trees[0]!,
@@ -546,6 +583,81 @@ test("apply is unavailable for database files outside the isolated fixture direc
   }
 })
 
+test(
+  "apply refuses a temporary symlink to a database target without altering it",
+  async () => {
+    await using linkRoot = await tmpdir()
+    const targetDirectory = await mkdtemp(path.join(process.cwd(), ".retention-identity-target-"))
+    const targetFilename = path.join(targetDirectory, "target.sqlite")
+    const aliasFilename = path.join(linkRoot.path, "alias.sqlite")
+    const target = new Database(targetFilename)
+    createSchema(target)
+    session(target, "ses_symlink", 10)
+    event(target, "ses_symlink")
+    const proof = evidence(["ses_symlink"], { ses_symlink: 0 })
+    target.close()
+    try {
+      await symlink(targetFilename, aliasFilename)
+      const alias = new Database(aliasFilename)
+      try {
+        const tree = inventory(access(alias), proof, 1_000).trees[0]!
+        expect(tree.eligible).toBe(true)
+        const before = alias.serialize()
+        const result = apply(access(alias), { tree, evidence: () => proof, now: () => 1_000 })
+        expect(result.state).toBe("refused")
+        expect(result.changedRows).toBe(0)
+        expect(result.reasons).toContain("apply-only-supported-for-isolated-fixtures")
+        expect(alias.serialize().equals(before)).toBe(true)
+      } finally {
+        alias.close()
+      }
+      const reopened = new Database(targetFilename, { readonly: true })
+      try {
+        expect(
+          reopened.query<{ data: string }, [string]>("SELECT data FROM event WHERE aggregate_id = ?").get("ses_symlink")
+            ?.data,
+        ).toContain("event sentinel")
+        expect(reopened.query("SELECT state FROM event_retention").get()).toBeNull()
+      } finally {
+        reopened.close()
+      }
+    } finally {
+      await rm(targetDirectory, { recursive: true, force: true })
+    }
+  },
+  { timeout: 10_000 },
+)
+
+test(
+  "apply refuses an unowned regular temporary database without altering it",
+  async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "unowned.sqlite")
+    const db = new Database(filename)
+    createSchema(db)
+    session(db, "ses_unowned", 10)
+    event(db, "ses_unowned")
+    const proof = evidence(["ses_unowned"], { ses_unowned: 0 })
+    try {
+      const tree = inventory(access(db), proof, 1_000).trees[0]!
+      expect(tree.eligible).toBe(true)
+      const before = db.serialize()
+      const result = apply(access(db), { tree, evidence: () => proof, now: () => 1_000 })
+      expect(result.state).toBe("refused")
+      expect(result.changedRows).toBe(0)
+      expect(result.reasons).toContain("apply-only-supported-for-isolated-fixtures")
+      expect(db.serialize().equals(before)).toBe(true)
+      expect(
+        db.query<{ data: string }, [string]>("SELECT data FROM event WHERE aggregate_id = ?").get("ses_unowned")?.data,
+      ).toContain("event sentinel")
+      expect(db.query("SELECT state FROM event_retention").get()).toBeNull()
+    } finally {
+      db.close()
+    }
+  },
+  { timeout: 10_000 },
+)
+
 test("apply revalidates evidence inside every batch and keeps partial history unreplayable", () => {
   const db = fixture()
   try {
@@ -580,11 +692,11 @@ test("apply revalidates evidence inside every batch and keeps partial history un
 test(
   "fixture compaction backs up, restores, and returns allocated bytes on a distinct filesystem",
   async () => {
-    await using tmp = await tmpdir()
-    const sourcePath = path.join(tmp.path, "physical.sqlite")
+    await using sourceFixture = await createFixtureDatabase()
+    const sourcePath = sourceFixture.filename
     const stagingDirectory = await mkdtemp("/dev/shm/opencode-retention-stage-")
     await using cleanupStaging = { [Symbol.asyncDispose]: () => rm(stagingDirectory, { recursive: true, force: true }) }
-    const beforeDB = new Database(sourcePath)
+    const beforeDB = sourceFixture.db
     createSchema(beforeDB)
     session(beforeDB, "ses_physical", 10)
     beforeDB.query("INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES ('ses_physical', 599, NULL)").run()
@@ -609,7 +721,7 @@ test(
     }
     beforeDB.close()
 
-    const redactionDB = new Database(sourcePath)
+    const redactionDB = await sourceFixture.reopen()
     const proof = evidence(["ses_physical"], { ses_physical: 599 })
     const beforeApply = inventory(access(redactionDB), proof, 1_000).trees.find(
       (item) => item.rootSessionID === "ses_physical",
@@ -686,8 +798,8 @@ test(
     const rootDeviceID = String((await stat("/")).dev)
     const rootDestination = await compactRestoreFixture({
       sourcePath,
-      backupPath: path.join(tmp.path, "root-backup.sqlite"),
-      stagingPath: path.join(tmp.path, "root-stage.sqlite"),
+      backupPath: path.join(path.dirname(sourcePath), "root-backup.sqlite"),
+      stagingPath: path.join(path.dirname(sourcePath), "root-stage.sqlite"),
       expectedSourceDeviceID: sourceDeviceID,
       expectedBackupDeviceID: rootDeviceID,
       expectedStagingDeviceID: rootDeviceID,

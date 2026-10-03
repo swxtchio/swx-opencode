@@ -95,6 +95,13 @@ const remove = (id: SessionID) => SessionNs.use.remove(id)
 
 function retentionEvidence(sessionID: string, seq: number, ownerID: string | null, now: number): RetentionEvidence {
   return {
+    customerBinding: {
+      proofID: "producer-fixture-unbound-session",
+      durable: true,
+      sessionIDs: [sessionID],
+      customerBoundSessionIDs: [],
+      nonCustomerSessionIDs: [sessionID],
+    },
     policy: {
       reviewed: true,
       cutoffEpochMs: now + 60_000,

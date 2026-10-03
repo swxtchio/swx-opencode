@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto"
 import { spawnSync } from "node:child_process"
-import { copyFile, lstat, open, realpath, rename, stat, statfs, unlink } from "node:fs/promises"
+import { lstatSync, realpathSync, statSync } from "node:fs"
+import { copyFile, lstat, mkdtemp, open, realpath, rename, rm, stat, statfs, unlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { Database } from "@opencode-ai/core/database/database"
@@ -27,10 +28,18 @@ export interface SqliteAccess {
   transaction<Result>(callback: () => Result): { (): Result; deferred(): Result; immediate(): Result }
   readonly inTransaction: boolean
   serialize(): Uint8Array
+  exec(source: string): void
   close(): void
 }
 
 export type RetentionEvidence = {
+  readonly customerBinding?: {
+    readonly proofID: string
+    readonly durable: boolean
+    readonly sessionIDs: readonly string[]
+    readonly customerBoundSessionIDs: readonly string[]
+    readonly nonCustomerSessionIDs: readonly string[]
+  }
   readonly policy?: {
     readonly reviewed: boolean
     readonly cutoffEpochMs: number
@@ -163,6 +172,17 @@ type ApplyInput = {
 }
 
 type RedactionRow = { cursor: string | number; value: string | number | null }
+type FixtureIdentity = { readonly filename: string; readonly device: string; readonly inode: string }
+type NativeSqliteDatabase = InstanceType<typeof import("bun:sqlite").Database>
+type FixtureDirectory = {
+  readonly filename: string
+  readonly db: NativeSqliteDatabase
+  readonly reopen: () => Promise<NativeSqliteDatabase>
+  readonly remove: () => Promise<void>
+  readonly [Symbol.asyncDispose]: () => Promise<void>
+}
+
+const fixtureHandles = new WeakMap<object, FixtureIdentity>()
 
 const redactionPlan = [
   { table: "event", scope: "aggregate_id", cursor: "seq", value: "data", kind: "json" },
@@ -303,6 +323,34 @@ const jsonCopies = [
   { table: "event", scope: "aggregate_id", value: "data" },
 ] as const
 
+export async function createFixtureDatabase(snapshot?: Uint8Array): Promise<FixtureDirectory> {
+  const directory = await mkdtemp(path.join(tmpdir(), "opencode-retention-fixture-"))
+  const filename = path.join(directory, "retention.sqlite")
+  if (snapshot) await writeFile(filename, snapshot, { flag: "wx" })
+  const sqlite = await import("bun:sqlite")
+  const db = new sqlite.Database(filename)
+  const identity = await readFixtureIdentity(db as unknown as SqliteAccess, filename)
+  fixtureHandles.set(db, identity)
+
+  const remove = () => rm(directory, { recursive: true, force: true })
+  return {
+    filename,
+    db,
+    reopen: async () => {
+      if (!fixturePathMatches(identity)) throw new Error("retention fixture identity changed before reopen")
+      const reopened = new sqlite.Database(filename) as unknown as SqliteAccess
+      if (!(await fixtureHandleMatches(reopened, identity))) {
+        reopened.close()
+        throw new Error("retention fixture identity changed while reopening")
+      }
+      fixtureHandles.set(reopened, identity)
+      return reopened as unknown as NativeSqliteDatabase
+    },
+    remove,
+    [Symbol.asyncDispose]: remove,
+  }
+}
+
 function makeProgressScope(
   rootSessionID: string,
   sessionIDs: readonly string[],
@@ -314,6 +362,15 @@ function makeProgressScope(
     reviewedReference: evidence.policy?.reviewedReference ?? null,
     policyDigest: evidence.policy?.policyDigest ?? null,
     readerContractID: evidence.policy?.readerContractID ?? null,
+    customerBinding: evidence.customerBinding
+      ? {
+          proofID: evidence.customerBinding.proofID,
+          durable: evidence.customerBinding.durable,
+          sessionIDs: evidence.customerBinding.sessionIDs,
+          customerBoundSessionIDs: evidence.customerBinding.customerBoundSessionIDs,
+          nonCustomerSessionIDs: evidence.customerBinding.nonCustomerSessionIDs,
+        }
+      : null,
     receiptID: evidence.handoff?.receiptID ?? null,
   }
   return createHash("sha256")
@@ -326,6 +383,34 @@ function makeProgressScope(
       }),
     )
     .digest("hex")
+}
+
+function customerBindingFailures(evidence: RetentionEvidence, sessionIDs: readonly string[]) {
+  const reasons = new Set<string>()
+  const binding = evidence.customerBinding
+  if (!binding) {
+    reasons.add("customer-session-classification-unavailable")
+    return Array.from(reasons)
+  }
+  if (!binding.proofID || binding.durable !== true) reasons.add("customer-session-classification-proof-unreadable")
+  if (!sameIDs(binding.sessionIDs, sessionIDs)) reasons.add("customer-session-classification-tree-scope-mismatch")
+  if (!sameIDs([...binding.customerBoundSessionIDs, ...binding.nonCustomerSessionIDs], sessionIDs)) {
+    reasons.add("customer-session-classification-incomplete")
+  }
+  const customerBound = new Set(binding.customerBoundSessionIDs)
+  const nonCustomer = new Set(binding.nonCustomerSessionIDs)
+  for (const sessionID of sessionIDs) {
+    if (customerBound.has(sessionID) && nonCustomer.has(sessionID)) {
+      reasons.add(`customer-session-classification-conflict:${sessionID}`)
+      continue
+    }
+    if (customerBound.has(sessionID)) {
+      reasons.add(`customer-bound-session-retention-workflow-unapproved:${sessionID}`)
+      continue
+    }
+    if (!nonCustomer.has(sessionID)) reasons.add(`customer-session-binding-unknown:${sessionID}`)
+  }
+  return Array.from(reasons).toSorted()
 }
 
 export function inventory(db: SqliteAccess, evidence: RetentionEvidence = {}, now = Date.now()): RetentionInventory {
@@ -412,6 +497,7 @@ function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: n
   const trees = components.map((component) => {
     const sessionIDs = component.sessionIDs
     const reasons = new Set<string>()
+    for (const reason of customerBindingFailures(evidence, sessionIDs)) reasons.add(reason)
     if (evidence.evidenceError) reasons.add(`evidence-unreadable:${evidence.evidenceError}`)
     if (
       !evidence.policy?.reviewed ||
@@ -647,6 +733,7 @@ function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: n
 
 function revalidateCandidate(db: SqliteAccess, expected: RetentionTree, evidence: RetentionEvidence, now: number) {
   const reasons = new Set<string>()
+  for (const reason of customerBindingFailures(evidence, expected.sessionIDs)) reasons.add(reason)
   if (evidence.evidenceError) reasons.add(`evidence-unreadable:${evidence.evidenceError}`)
   if (
     !evidence.policy?.reviewed ||
@@ -808,7 +895,7 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
   const completedSessionIDs = new Set<string>()
   const reasons = new Set<string>()
 
-  if (!isFixtureDatabase(db.filename)) {
+  if (!isFixtureDatabase(db)) {
     return {
       state: "refused",
       changedRows,
@@ -1072,7 +1159,7 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
       return { state: "refused", changedFiles, reasons: ["filesystem-identity-unverified"] }
     }
     const sourcePath = await realpath(input.sourcePath)
-    if (!isFixtureDatabase(sourcePath)) {
+    if (!isTemporaryFixturePath(sourcePath)) {
       return { state: "refused", changedFiles, reasons: ["compaction-only-supported-for-isolated-fixtures"] }
     }
     const sourceDirectory = await realpath(path.dirname(sourcePath))
@@ -1347,7 +1434,45 @@ function sameRetainedMetrics(...values: Record<string, unknown>[]) {
   return values.every((value) => JSON.stringify(value) === JSON.stringify(values[0]))
 }
 
-function isFixtureDatabase(filename: string) {
+function isFixtureDatabase(db: SqliteAccess) {
+  if (db.filename === ":memory:") return true
+  const identity = fixtureHandles.get(db as object)
+  return identity !== undefined && db.filename === identity.filename && fixturePathMatches(identity)
+}
+
+function fixturePathMatches(identity: FixtureIdentity) {
+  try {
+    const link = lstatSync(identity.filename)
+    const file = statSync(identity.filename)
+    return (
+      link.isFile() &&
+      !link.isSymbolicLink() &&
+      realpathSync(identity.filename) === identity.filename &&
+      String(file.dev) === identity.device &&
+      String(file.ino) === identity.inode
+    )
+  } catch {
+    return false
+  }
+}
+
+async function readFixtureIdentity(db: SqliteAccess, filename: string): Promise<FixtureIdentity> {
+  const absolute = path.resolve(filename)
+  const [canonical, link, file] = await Promise.all([realpath(absolute), lstat(absolute), stat(absolute)])
+  if (db.filename !== absolute || canonical !== absolute || !link.isFile() || link.isSymbolicLink()) {
+    db.close()
+    throw new Error("retention fixture database is not a regular file at its canonical path")
+  }
+  return { filename: absolute, device: String(file.dev), inode: String(file.ino) }
+}
+
+async function fixtureHandleMatches(db: SqliteAccess, identity: FixtureIdentity) {
+  if (db.filename !== identity.filename || !fixturePathMatches(identity)) return false
+  const current = await readFixtureIdentity(db, identity.filename)
+  return current.device === identity.device && current.inode === identity.inode
+}
+
+function isTemporaryFixturePath(filename: string) {
   if (filename === ":memory:") return true
   const temporaryRoot = path.resolve(tmpdir())
   const absolute = path.resolve(filename)
