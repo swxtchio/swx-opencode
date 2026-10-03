@@ -31,7 +31,7 @@ export function hasInstancePromises(directory: string) {
 export async function awaitInstancePromises(directory: string) {
   while (true) {
     const pending = instancePromises.get(directory)
-    if (!pending?.size) return
+    if (!pending?.size) return true
     await Promise.allSettled([...pending])
   }
 }

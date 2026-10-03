@@ -663,6 +663,159 @@ describe("Worktree", () => {
     )
 
     pluginBootstrapIt.instance(
+      "admits ready loads and reloads during runtime plugin hooks and recovers stale quarantine",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const store = yield* InstanceStore.Service
+          const plugin = yield* Plugin.Service
+          const gate = PluginGate.install()
+          let createdDirectory: string | undefined
+          let triggering: Fiber.Fiber<{ env: Record<string, string> }, never> | undefined
+          let triggeringAgain: Fiber.Fiber<{ env: Record<string, string> }, never> | undefined
+          let reloading: Fiber.Fiber<InstanceContext, never> | undefined
+          let disposingAll: Fiber.Fiber<void, never> | undefined
+          yield* Effect.addFinalizer(() =>
+            Effect.gen(function* () {
+              gate.reset()
+              pluginSpec = undefined
+              pluginSource = undefined
+              if (disposingAll) {
+                yield* Fiber.await(disposingAll).pipe(
+                  Effect.timeoutOrElse({ duration: "45 seconds", orElse: () => Effect.succeed(undefined) }),
+                  Effect.asVoid,
+                )
+              }
+              if (reloading) {
+                yield* Fiber.await(reloading).pipe(
+                  Effect.timeoutOrElse({ duration: "45 seconds", orElse: () => Effect.succeed(undefined) }),
+                  Effect.asVoid,
+                )
+              }
+              if (triggering) {
+                yield* Fiber.await(triggering).pipe(
+                  Effect.timeoutOrElse({ duration: "45 seconds", orElse: () => Effect.succeed(undefined) }),
+                  Effect.asVoid,
+                )
+              }
+              if (triggeringAgain) {
+                yield* Fiber.await(triggeringAgain).pipe(
+                  Effect.timeoutOrElse({ duration: "45 seconds", orElse: () => Effect.succeed(undefined) }),
+                  Effect.asVoid,
+                )
+              }
+              if (createdDirectory) yield* svc.remove({ directory: createdDirectory }).pipe(Effect.ignore)
+            }),
+          )
+
+          const pluginPath = path.join(test.directory, "round7-runtime-plugin.ts")
+          const gateModule = pathToFileURL(path.join(import.meta.dir, "../fixture/plugin-gate.ts")).href
+          yield* fs.writeFileString(
+            pluginPath,
+            [
+              `import { PluginGate } from ${JSON.stringify(gateModule)}`,
+              "await PluginGate.waitForLoad()",
+              "export default {",
+              '  id: "test.round-seven-runtime-owner",',
+              "  server: async () => {",
+              "    await PluginGate.waitForInit()",
+              "    return {",
+              "      config: async () => PluginGate.waitForConfig(),",
+              '      "shell.env": async () => PluginGate.waitForTrigger(),',
+              "      dispose: async () => PluginGate.waitForDispose(),",
+              "    }",
+              "  },",
+              "}",
+            ].join("\n"),
+          )
+          yield* Effect.sync(() => {
+            pluginSpec = pathToFileURL(pluginPath).href
+            pluginSource = pluginPath
+          })
+
+          const readySignal = yield* waitReady().pipe(Effect.forkScoped)
+          const info = yield* svc.create({ name: "round7-runtime-owner" })
+          createdDirectory = info.directory
+          yield* awaitWithTimeout(Effect.promise(() => gate.loadStarted), "external plugin load did not start", "10 seconds")
+          gate.releaseLoad()
+          yield* awaitWithTimeout(Effect.promise(() => gate.initStarted), "external plugin initializer did not start", "10 seconds")
+          gate.releaseInit()
+          yield* awaitWithTimeout(Effect.promise(() => gate.configStarted), "external plugin config did not start", "10 seconds")
+          gate.releaseConfig()
+          yield* Fiber.join(readySignal)
+          const directory = info.directory
+          const ready = yield* awaitWithTimeout(store.load({ directory }), "instance did not become ready", "30 seconds")
+          const firstTrigger = store.provide(
+            { directory },
+            plugin.trigger("shell.env", { cwd: directory }, { env: {} as Record<string, string> }),
+          )
+          const firstTriggerFiber = yield* firstTrigger.pipe(Effect.forkScoped({ startImmediately: true }))
+          triggering = firstTriggerFiber
+          yield* awaitWithTimeout(Effect.promise(() => gate.triggerStarted), "runtime plugin hook did not start", "10 seconds")
+          expect(hasInstancePromises(directory)).toBe(true)
+          const concurrentLoad = yield* awaitWithTimeout(
+            store.load({ directory }),
+            "ready load failed during a runtime plugin hook",
+            "3 seconds",
+          )
+          expect(concurrentLoad).toBe(ready)
+
+          reloading = yield* store.reload({ directory }).pipe(Effect.forkScoped({ startImmediately: true }))
+          expect(reloading.pollUnsafe()).toBe(undefined)
+          const loadDuringReload = yield* awaitWithTimeout(
+            store.load({ directory }),
+            "ready load failed while a healthy reload awaited its runtime owner",
+            "3 seconds",
+          )
+          expect(loadDuringReload).toBe(ready)
+          gate.releaseTrigger()
+          expect(Exit.isSuccess(yield* Fiber.await(firstTriggerFiber))).toBe(true)
+          expect(Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(reloading), "reload did not resume after its owner settled", "15 seconds"))).toBe(
+            true,
+          )
+          triggering = undefined
+          reloading = undefined
+
+          const secondTriggerStarted = gate.holdTriggerAgain()
+          const secondTrigger = store.provide(
+            { directory },
+            plugin.trigger("shell.env", { cwd: directory }, { env: {} as Record<string, string> }),
+          )
+          const secondTriggerFiber = yield* secondTrigger.pipe(Effect.forkScoped({ startImmediately: true }))
+          triggeringAgain = secondTriggerFiber
+          yield* awaitWithTimeout(Effect.promise(() => secondTriggerStarted), "second runtime plugin hook did not start", "10 seconds")
+          disposingAll = yield* store.disposeAll().pipe(Effect.forkScoped({ startImmediately: true }))
+          const shutdownRefusal = yield* awaitWithTimeout(Fiber.await(disposingAll), "disposeAll did not report incomplete cleanup", "15 seconds")
+          expect(Exit.isFailure(shutdownRefusal)).toBe(true)
+          if (Exit.isFailure(shutdownRefusal))
+            expect(Cause.pretty(shutdownRefusal.cause)).toContain("instance bootstrap Promise did not settle")
+          gate.releaseTrigger()
+          expect(Exit.isSuccess(yield* Fiber.await(secondTriggerFiber))).toBe(true)
+          triggeringAgain = undefined
+          disposingAll = undefined
+
+          reloading = yield* store.reload({ directory }).pipe(Effect.forkScoped({ startImmediately: true }))
+          const recovered = yield* awaitWithTimeout(
+            Fiber.await(reloading),
+            "direct reload did not recover stale quarantine after owner settlement",
+            "15 seconds",
+          )
+          expect(Exit.isSuccess(recovered)).toBe(true)
+          reloading = undefined
+
+          const recoveredShutdown = yield* Effect.exit(
+            awaitWithTimeout(store.disposeAll(), "disposeAll did not recover after the runtime hook settled", "15 seconds"),
+          )
+          expect(Exit.isSuccess(recoveredShutdown)).toBe(true)
+          disposingAll = undefined
+        }),
+      { git: true },
+      { timeout: 120_000 },
+    )
+
+    pluginBootstrapIt.instance(
       "refuses worktree deletion during external plugin loading and initialization",
       () =>
         Effect.gen(function* () {

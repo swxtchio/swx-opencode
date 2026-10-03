@@ -72,6 +72,10 @@ function clearPromiseQuarantine(entry?: Entry) {
   clearPromiseQuarantine(entry.previous)
 }
 
+function isReadyInstance(entry?: Entry) {
+  return entry?.context !== undefined && Deferred.isDoneUnsafe(entry.deferred)
+}
+
 interface DisposerRun {
   readonly completion: Deferred.Deferred<DisposerResult>
   readonly entries: Set<Entry>
@@ -225,12 +229,13 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     const settleTrackedPromises = (
       directory: string,
       pending: PendingLoad[],
+      duration: Duration.Input = "8 seconds",
     ): Effect.Effect<PromiseSettlement> =>
       Effect.gen(function* () {
         if (!hasInstancePromises(directory)) return { pending, settled: true }
         const settled = yield* Effect.promise(() => awaitInstancePromises(directory)).pipe(
           Effect.timeoutOrElse({
-            duration: "8 seconds",
+            duration,
             orElse: () => Effect.succeed(false),
           }),
         )
@@ -245,9 +250,29 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           { concurrency: "unbounded" },
         )
         const remaining = pending.filter((_, index) => finished[index] === undefined)
-        if (hasInstancePromises(directory)) return yield* settleTrackedPromises(directory, remaining)
+        if (hasInstancePromises(directory)) return yield* settleTrackedPromises(directory, remaining, duration)
         return { pending: remaining, settled: true }
       })
+
+    const settleReadyOwnerPromises = Effect.fnUntraced(function* (directory: string, entry?: Entry) {
+      if (hasPromiseQuarantine(entry) && !isReadyInstance(entry)) return false
+      if (hasInstancePromises(directory)) {
+        if (!isReadyInstance(entry)) {
+          quarantinePromiseOwners(entry)
+          return false
+        }
+        const settlement = yield* settleTrackedPromises(directory, [], "30 seconds")
+        if (!settlement.settled) {
+          quarantinePromiseOwners(entry)
+          return false
+        }
+      }
+      if (hasPromiseQuarantine(entry)) {
+        if (!isReadyInstance(entry)) return false
+        clearPromiseQuarantine(entry)
+      }
+      return true
+    })
 
     const completeEntry = (directory: string, entry: Entry, work: Effect.Effect<InstanceContext>) =>
       Effect.uninterruptibleMask((restore) =>
@@ -417,11 +442,11 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
           }
           const existing = cache.get(directory)
-          if (hasInstancePromises(directory)) {
-            quarantinePromiseOwners(existing)
-            return yield* Effect.die(new Error(`instance bootstrap Promise is still running for ${directory}`))
-          }
+          const disposal = disposerRuns.get(directory)
           if (existing && hasPromiseQuarantine(existing)) {
+            if (hasInstancePromises(directory)) {
+              return yield* Effect.die(new Error(`instance bootstrap Promise is still running for ${directory}`))
+            }
             const context = yield* restore(
               Deferred.await(existing.deferred).pipe(
                 Effect.timeoutOrElse({
@@ -433,7 +458,11 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             clearPromiseQuarantine(existing)
             return context
           }
-          const disposal = disposerRuns.get(directory)
+          if (hasInstancePromises(directory)) {
+            if (existing && isReadyInstance(existing) && !disposal) return yield* restore(Deferred.await(existing.deferred))
+            quarantinePromiseOwners(existing)
+            return yield* Effect.die(new Error(`instance bootstrap Promise is still running for ${directory}`))
+          }
           const reloadGroup = existing?.reloadGroup
           if (
             disposal &&
@@ -474,13 +503,19 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           if (orphaned.has(directory)) {
             return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
           }
-          const previous = cache.get(directory)
-          if (hasInstancePromises(directory)) {
-            quarantinePromiseOwners(previous)
-            return yield* Effect.die(new Error(`instance bootstrap Promise is still running for ${directory}`))
+          const beforeOwnerSettlement = cache.get(directory)
+          if (!(yield* restore(settleReadyOwnerPromises(directory, beforeOwnerSettlement)))) {
+            const reason = hasInstancePromises(directory)
+              ? `instance bootstrap Promise is still running`
+              : `instance load is still recovering`
+            return yield* Effect.die(new Error(`${reason} for ${directory}`))
           }
-          if (hasPromiseQuarantine(previous)) {
-            return yield* Effect.die(new Error(`instance load is still recovering for ${directory}`))
+          const previous = cache.get(directory)
+          if (previous !== beforeOwnerSettlement && !(yield* restore(settleReadyOwnerPromises(directory, previous)))) {
+            const reason = hasInstancePromises(directory)
+              ? `instance bootstrap Promise is still running`
+              : `instance load is still recovering`
+            return yield* Effect.die(new Error(`${reason} for ${directory}`))
           }
           const continuation =
             previous?.reloadGroup &&
@@ -552,15 +587,12 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         [...cache.entries()],
         (item) =>
           Effect.gen(function* () {
-            const exit = yield* settleLoad(item[0], item[1]).pipe(
-              Effect.catchCause((cause) =>
-                Effect.gen(function* () {
-                  yield* Effect.logWarning("instance dispose failed", { key: item[0], cause })
-                  return undefined
-                }),
-              ),
-            )
-            if (!exit) return
+            const result = yield* Effect.exit(settleLoad(item[0], item[1]))
+            if (Exit.isFailure(result)) {
+              yield* Effect.logWarning("instance dispose failed", { key: item[0], cause: result.cause })
+              return yield* Effect.failCause(result.cause)
+            }
+            const exit = result.value
             if (Exit.isFailure(exit)) {
               yield* Effect.logWarning("instance dispose failed", { key: item[0], cause: exit.cause })
               yield* removeEntry(item[0], item[1])
