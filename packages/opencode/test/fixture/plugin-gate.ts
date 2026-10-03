@@ -10,7 +10,7 @@ type Gate = {
   readonly loading: Step
   readonly initializing: Step
   readonly configuring: Step
-  triggering: Step
+  readonly triggering: Step
   readonly disposing: Step
   holdDispose: boolean
 }
@@ -57,10 +57,6 @@ export function install() {
     releaseInit: () => gate.initializing.release(),
     releaseConfig: () => gate.configuring.release(),
     releaseTrigger: () => gate.triggering.release(),
-    holdTriggerAgain: () => {
-      gate.triggering = step()
-      return gate.triggering.started
-    },
     releaseDispose: () => gate.disposing.release(),
     holdDispose: () => (gate.holdDispose = true),
     reset: () => {

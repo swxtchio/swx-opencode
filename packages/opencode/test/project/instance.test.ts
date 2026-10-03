@@ -4,7 +4,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { InstancePromise } from "../../src/effect/instance-promise"
 import { InstanceRef } from "../../src/effect/instance-ref"
-import { registerDisposer } from "../../src/effect/instance-registry"
+import { hasInstancePromises, registerDisposer } from "../../src/effect/instance-registry"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
 import type { InstanceContext } from "../../src/project/instance-context"
@@ -66,6 +66,47 @@ describe("InstanceStore", () => {
       yield* store.load({ directory: dir })
 
       expect(initializedDirectory).toBe(dir)
+    }),
+  )
+
+  it.live("stops bootstrap Promise ownership when awaited bootstrap work completes", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const startChild = yield* Deferred.make<void>()
+      const childOwnerStarted = yield* Deferred.make<void>()
+      let releasePromise = () => {}
+      let child: Fiber.Fiber<void, never> | undefined
+
+      yield* setBootstrap(
+        Effect.gen(function* () {
+          child = yield* Effect.gen(function* () {
+            yield* Deferred.await(startChild)
+            yield* InstancePromise.from(
+              () =>
+                new Promise<void>((resolve) => {
+                  releasePromise = resolve
+                  queueMicrotask(() => Deferred.doneUnsafe(childOwnerStarted, Effect.void))
+                }),
+            )
+          }).pipe(Effect.forkDetach({ startImmediately: true }))
+        }),
+      )
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(startChild, undefined)
+          releasePromise()
+          if (child) yield* Fiber.await(child).pipe(Effect.asVoid)
+        }),
+      )
+
+      const ready = yield* store.load({ directory: dir })
+      yield* Deferred.succeed(startChild, undefined)
+      yield* awaitWithTimeout(Deferred.await(childOwnerStarted), "delayed child Promise did not start")
+      expect(hasInstancePromises(dir)).toBe(false)
+      expect(yield* store.load({ directory: dir })).toBe(ready)
+      releasePromise()
+      if (child) expect(Exit.isSuccess(yield* Fiber.await(child))).toBe(true)
     }),
   )
 
@@ -175,6 +216,131 @@ describe("InstanceStore", () => {
       expect(Exit.isFailure(exit)).toBe(true)
     }),
     { timeout: 15_000 },
+  )
+
+  it.live(
+    "continues disposing healthy directories around an unsettled bootstrap owner and recovers after release",
+    () =>
+      Effect.gen(function* () {
+        const store = yield* InstanceStore.Service
+        const badFirst = yield* tmpdirScoped({ git: true })
+        const healthyLater = yield* tmpdirScoped({ git: true })
+        const healthyFirst = yield* tmpdirScoped({ git: true })
+        const badLater = yield* tmpdirScoped({ git: true })
+        const healthyLaterDisposed = yield* Deferred.make<void>()
+        const healthyFirstDisposed = yield* Deferred.make<void>()
+        const signals = new Map<string, Deferred.Deferred<void>>([
+          [healthyLater, healthyLaterDisposed],
+          [healthyFirst, healthyFirstDisposed],
+        ])
+        const disposed: string[] = []
+        const makeOwner = (directory: string, started: Deferred.Deferred<void>) => {
+          let release = () => {}
+          return {
+            directory,
+            started,
+            promise: new Promise<void>((resolve) => (release = resolve)),
+            release: () => release(),
+          }
+        }
+        let heldOwner: ReturnType<typeof makeOwner> | undefined
+        let firstLoading: Fiber.Fiber<InstanceContext, never> | undefined
+        let secondLoading: Fiber.Fiber<InstanceContext, never> | undefined
+        let firstDisposal: Fiber.Fiber<void, never> | undefined
+        let secondDisposal: Fiber.Fiber<void, never> | undefined
+        yield* setBootstrap(
+          Effect.gen(function* () {
+            const owner = heldOwner
+            if (!owner || (yield* InstanceRef)?.directory !== owner.directory) return
+            yield* InstancePromise.from(() => {
+              Deferred.doneUnsafe(owner.started, Effect.void)
+              return owner.promise
+            })
+          }),
+        )
+        yield* registerDisposerScoped(async (directory) => {
+          disposed.push(directory)
+          const signal = signals.get(directory)
+          if (!signal) return
+          Deferred.doneUnsafe(signal, Effect.void)
+        })
+        yield* Effect.addFinalizer(() => Effect.sync(() => heldOwner?.release()))
+
+        const firstStarted = yield* Deferred.make<void>()
+        heldOwner = makeOwner(badFirst, firstStarted)
+        firstLoading = yield* store.load({ directory: badFirst }).pipe(Effect.forkScoped({ startImmediately: true }))
+        yield* awaitWithTimeout(Deferred.await(firstStarted), "first bootstrap owner did not start")
+        const firstOwnerTracked = yield* pollWithTimeout(
+          Effect.sync(() => (hasInstancePromises(badFirst) ? true : undefined)),
+          "first bootstrap Promise was not tracked",
+        )
+        expect(firstOwnerTracked).toBe(true)
+        yield* store.load({ directory: healthyLater })
+
+        firstDisposal = yield* store.disposeAll().pipe(Effect.forkScoped({ startImmediately: true }))
+        yield* awaitWithTimeout(
+          Deferred.await(healthyLaterDisposed),
+          "disposeAll skipped the healthy directory inserted after the unsettled owner",
+          "20 seconds",
+        )
+        const firstFailure = yield* awaitWithTimeout(
+          Fiber.await(firstDisposal),
+          "disposeAll did not report the first directory's incomplete cleanup",
+          "5 seconds",
+        )
+        expect(Exit.isFailure(firstFailure)).toBe(true)
+        if (Exit.isFailure(firstFailure)) expect(Cause.pretty(firstFailure.cause)).toContain("failed to dispose 1 instance(s)")
+        expect(disposed).toEqual([healthyLater])
+        expect(hasInstancePromises(badFirst)).toBe(true)
+
+        heldOwner.release()
+        expect(Exit.isSuccess(yield* Fiber.await(firstLoading))).toBe(true)
+        firstLoading = undefined
+        const firstRecovery = yield* Effect.exit(
+          awaitWithTimeout(store.disposeAll(), "disposeAll did not recover after the first owner settled", "15 seconds"),
+        )
+        expect(Exit.isSuccess(firstRecovery)).toBe(true)
+        expect(disposed).toEqual([healthyLater, badFirst])
+        firstDisposal = undefined
+
+        yield* store.load({ directory: healthyFirst })
+        const secondStarted = yield* Deferred.make<void>()
+        heldOwner = makeOwner(badLater, secondStarted)
+        secondLoading = yield* store.load({ directory: badLater }).pipe(Effect.forkScoped({ startImmediately: true }))
+        yield* awaitWithTimeout(Deferred.await(secondStarted), "second bootstrap owner did not start")
+        const secondOwnerTracked = yield* pollWithTimeout(
+          Effect.sync(() => (hasInstancePromises(badLater) ? true : undefined)),
+          "second bootstrap Promise was not tracked",
+        )
+        expect(secondOwnerTracked).toBe(true)
+
+        secondDisposal = yield* store.disposeAll().pipe(Effect.forkScoped({ startImmediately: true }))
+        yield* awaitWithTimeout(
+          Deferred.await(healthyFirstDisposed),
+          "disposeAll skipped the healthy directory inserted before the unsettled owner",
+          "20 seconds",
+        )
+        const secondFailure = yield* awaitWithTimeout(
+          Fiber.await(secondDisposal),
+          "disposeAll did not report the later directory's incomplete cleanup",
+          "20 seconds",
+        )
+        expect(Exit.isFailure(secondFailure)).toBe(true)
+        if (Exit.isFailure(secondFailure)) expect(Cause.pretty(secondFailure.cause)).toContain("failed to dispose 1 instance(s)")
+        expect(disposed).toEqual([healthyLater, badFirst, healthyFirst])
+        expect(hasInstancePromises(badLater)).toBe(true)
+
+        heldOwner.release()
+        expect(Exit.isSuccess(yield* Fiber.await(secondLoading))).toBe(true)
+        secondLoading = undefined
+        const secondRecovery = yield* Effect.exit(
+          awaitWithTimeout(store.disposeAll(), "disposeAll did not recover after the later owner settled", "15 seconds"),
+        )
+        expect(Exit.isSuccess(secondRecovery)).toBe(true)
+        expect(disposed).toEqual([healthyLater, badFirst, healthyFirst, badLater])
+        secondDisposal = undefined
+      }),
+    { timeout: 90_000 },
   )
 
   it.live(

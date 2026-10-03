@@ -267,7 +267,7 @@ const layer = Layer.effect(
           Effect.forEach(
             hooks,
             (hook) =>
-              InstancePromise.tryPromise({
+              Effect.tryPromise({
                 try: () => Promise.resolve(hook.dispose?.()),
                 catch: errorMessage,
               }).pipe(
@@ -292,7 +292,7 @@ const layer = Layer.effect(
       for (const hook of s.hooks) {
         const fn = hook[name] as any
         if (!fn) continue
-        yield* InstancePromise.from(async () => fn(input, output))
+        yield* Effect.promise(() => fn(input, output))
       }
       return output
     })
