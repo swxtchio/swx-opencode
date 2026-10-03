@@ -55,6 +55,23 @@ type PromiseSettlement = { pending: PendingLoad[]; settled: boolean }
 
 type DisposerResult = { success: true } | { success: false; error: unknown }
 
+function hasPromiseQuarantine(entry?: Entry): boolean {
+  if (!entry) return false
+  return entry.promiseQuarantined === true || hasPromiseQuarantine(entry.previous)
+}
+
+function quarantinePromiseOwners(entry?: Entry) {
+  if (!entry) return
+  entry.promiseQuarantined = true
+  quarantinePromiseOwners(entry.previous)
+}
+
+function clearPromiseQuarantine(entry?: Entry) {
+  if (!entry) return
+  entry.promiseQuarantined = undefined
+  clearPromiseQuarantine(entry.previous)
+}
+
 interface DisposerRun {
   readonly completion: Deferred.Deferred<DisposerResult>
   readonly entries: Set<Entry>
@@ -239,7 +256,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           if (yield* Deferred.isDone(entry.deferred)) {
             if (Exit.isSuccess(exit)) {
               entry.context = exit.value
-              entry.promiseQuarantined = undefined
+              clearPromiseQuarantine(entry)
             }
             const run = yield* Effect.sync(() => startDisposerRun(directory, entry))
             if (run) yield* Effect.sync(() => run.autoFinalize.add(entry)).pipe(Effect.asVoid)
@@ -249,7 +266,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           if (Exit.isFailure(exit)) yield* removeEntry(directory, entry)
           else {
             entry.context = exit.value
-            entry.promiseQuarantined = undefined
+            clearPromiseQuarantine(entry)
           }
           yield* Deferred.done(entry.deferred, exit).pipe(Effect.asVoid)
           if (Exit.isSuccess(exit)) entry.previous = undefined
@@ -321,7 +338,15 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       const entries: Entry[] = []
       for (let current: Entry | undefined = entry; current; current = current.previous) entries.push(current)
       yield* waitForDisposers(directory)
-      if (yield* Deferred.isDone(entry.deferred)) return yield* Deferred.await(entry.deferred).pipe(Effect.exit)
+      if (yield* Deferred.isDone(entry.deferred)) {
+        const promiseSettlement = yield* settleTrackedPromises(directory, [])
+        if (!promiseSettlement.settled) {
+          yield* Effect.sync(() => entries.forEach((item) => (item.promiseQuarantined = true)))
+          return yield* Effect.die(new Error(`instance bootstrap Promise did not settle: ${directory}`))
+        }
+        clearPromiseQuarantine(entry)
+        return yield* Deferred.await(entry.deferred).pipe(Effect.exit)
+      }
       const fibers = yield* Effect.forEach(
         entries,
         (item) =>
@@ -392,10 +417,11 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
           }
           const existing = cache.get(directory)
-          if (existing?.promiseQuarantined) {
-            if (hasInstancePromises(directory)) {
-              return yield* Effect.die(new Error(`instance bootstrap Promise is still running for ${directory}`))
-            }
+          if (hasInstancePromises(directory)) {
+            quarantinePromiseOwners(existing)
+            return yield* Effect.die(new Error(`instance bootstrap Promise is still running for ${directory}`))
+          }
+          if (existing && hasPromiseQuarantine(existing)) {
             const context = yield* restore(
               Deferred.await(existing.deferred).pipe(
                 Effect.timeoutOrElse({
@@ -404,7 +430,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
                 }),
               ),
             )
-            existing.promiseQuarantined = undefined
+            clearPromiseQuarantine(existing)
             return context
           }
           const disposal = disposerRuns.get(directory)
@@ -449,6 +475,13 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
           }
           const previous = cache.get(directory)
+          if (hasInstancePromises(directory)) {
+            quarantinePromiseOwners(previous)
+            return yield* Effect.die(new Error(`instance bootstrap Promise is still running for ${directory}`))
+          }
+          if (hasPromiseQuarantine(previous)) {
+            return yield* Effect.die(new Error(`instance load is still recovering for ${directory}`))
+          }
           const continuation =
             previous?.reloadGroup &&
             !previous.reloadGroup.completed &&

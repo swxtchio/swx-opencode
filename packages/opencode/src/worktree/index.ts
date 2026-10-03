@@ -336,6 +336,16 @@ const layer: Layer.Layer<
       if (!stopped) return yield* new RemoveFailedError({ message: `Worktree boot did not stop: ${directory}` })
     })
 
+    const disposeWorktreeInstance = Effect.fnUntraced(function* (directory: string) {
+      yield* store.disposeDirectory(directory).pipe(
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
+          const message = errorMessage(Cause.squash(cause)) || "Failed to dispose worktree instance"
+          return Effect.fail(new RemoveFailedError({ message }))
+        }),
+      )
+    })
+
     const create = Effect.fn("Worktree.create")(function* (input?: CreateInput) {
       const info = yield* makeWorktreeInfo({ name: input?.name })
       yield* createFromInfo(info, input?.startCommand)
@@ -447,13 +457,7 @@ const layer: Layer.Layer<
       if (directory !== (yield* canonical(ctx.worktree))) {
         // InstanceStore has no entry until boot reaches load, so stop the producer first.
         yield* stopBoot(directory)
-        yield* store.disposeDirectory(input.directory).pipe(
-          Effect.catchCause((cause) => {
-            if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
-            const message = errorMessage(Cause.squash(cause)) || "Failed to dispose worktree instance"
-            return Effect.fail(new RemoveFailedError({ message }))
-          }),
-        )
+        yield* disposeWorktreeInstance(input.directory)
       }
 
       const list = yield* git(["worktree", "list", "--porcelain"], { cwd: ctx.worktree })
@@ -474,7 +478,7 @@ const layer: Layer.Layer<
       }
 
       // Git may return the original casing when a caller supplied a normalized Windows path.
-      yield* store.disposeDirectory(entry.path)
+      yield* disposeWorktreeInstance(entry.path)
       yield* stopFsmonitor(entry.path)
       const removed = yield* git(["worktree", "remove", "--force", entry.path], { cwd: ctx.worktree })
       if (removed.code !== 0) {

@@ -474,6 +474,19 @@ describe("InstanceStore", () => {
         releasePromise = undefined
         yield* awaitWithTimeout(Deferred.await(promiseFinished), "tracked Promise did not settle")
         yield* awaitWithTimeout(Deferred.await(continuationStarted), "bootstrap did not resume after Promise settlement")
+        const reloadBlocked = yield* Effect.exit(
+          awaitWithTimeout(
+            Effect.exit(store.reload({ directory })),
+            "reload replaced a quarantined predecessor while its continuation was active",
+            "3 seconds",
+          ),
+        )
+        expect(Exit.isSuccess(reloadBlocked)).toBe(true)
+        if (Exit.isSuccess(reloadBlocked)) {
+          expect(Exit.isFailure(reloadBlocked.value)).toBe(true)
+          if (Exit.isFailure(reloadBlocked.value))
+            expect(Cause.pretty(reloadBlocked.value.cause)).toContain("instance load is still recovering")
+        }
         const recovering = yield* Effect.exit(
           awaitWithTimeout(
             Effect.exit(store.load({ directory })),
