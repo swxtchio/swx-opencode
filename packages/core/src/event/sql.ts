@@ -26,7 +26,7 @@ export const EventTable = sqliteTable(
 
 export const EventRetentionTable = sqliteTable("event_retention", {
   aggregate_id: text().notNull().primaryKey(),
-  state: text().$type<"redacting" | "complete">().notNull(),
+  state: text().$type<"scanning" | "redacting" | "complete">().notNull(),
   progress_table: text(),
   progress_id: text(),
   evidence: text({ mode: "json" }).$type<Record<string, unknown>>().notNull(),

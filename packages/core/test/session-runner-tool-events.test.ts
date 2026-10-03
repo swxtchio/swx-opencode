@@ -34,6 +34,7 @@ const capture = () => {
     replay: () => Effect.void,
     replayAll: () => Effect.succeed(undefined),
     assertReplayable: () => Effect.void,
+    assertWritable: () => Effect.void,
     remove: () => Effect.void,
     claim: () => Effect.void,
   })

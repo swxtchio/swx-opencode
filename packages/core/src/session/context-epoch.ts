@@ -25,7 +25,10 @@ export function initialize(
   context: Effect.Effect<SystemContext.SystemContext>,
   sessionID: SessionSchema.ID,
 ): Effect.Effect<Prepared | undefined, SystemContext.InitializationBlocked> {
-  return initializeOnce(db, context, sessionID).pipe(Effect.withSpan("SessionContextEpoch.initialize"))
+  return EventV2.assertWritableIn(db, sessionID).pipe(
+    Effect.andThen(initializeOnce(db, context, sessionID)),
+    Effect.withSpan("SessionContextEpoch.initialize"),
+  )
 }
 
 export function prepare(
@@ -34,7 +37,10 @@ export function prepare(
   context: Effect.Effect<SystemContext.SystemContext>,
   sessionID: SessionSchema.ID,
 ): Effect.Effect<Prepared, SystemContext.InitializationBlocked | ContextSnapshotDecodeError> {
-  return prepareOnce(db, events, context, sessionID).pipe(Effect.withSpan("SessionContextEpoch.prepare"))
+  return EventV2.assertWritableIn(db, sessionID).pipe(
+    Effect.andThen(prepareOnce(db, events, context, sessionID)),
+    Effect.withSpan("SessionContextEpoch.prepare"),
+  )
 }
 
 const prepareOnce = Effect.fnUntraced(function* (
