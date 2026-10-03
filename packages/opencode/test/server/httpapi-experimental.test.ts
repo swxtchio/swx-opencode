@@ -13,8 +13,11 @@ import { Database } from "@opencode-ai/core/database/database"
 import { AccountV2 } from "@opencode-ai/core/account"
 import { AccountTable } from "@opencode-ai/core/account/sql"
 import { Worktree } from "../../src/worktree"
+import { registerDisposer } from "../../src/effect/instance-registry"
+import { InstanceBootstrap } from "../../src/project/bootstrap"
+import { InstanceStore } from "../../src/project/instance-store"
 import { resetDatabase } from "../fixture/db"
-import { disposeAllInstances, TestInstance } from "../fixture/fixture"
+import { disposeAllInstances, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { awaitWithTimeout } from "../lib/effect"
 import { httpApiLayer, httpApiLayerWithAppReplacements, requestInDirectory } from "./httpapi-layer"
@@ -61,6 +64,36 @@ const failedWorktreeIt = testEffect(
   ),
 )
 const failedWorktreeMutation = process.platform === "win32" ? failedWorktreeIt.instance.skip : failedWorktreeIt.instance
+let admissionDirectory: string | undefined
+let admissionSignal: Deferred.Deferred<void> | undefined
+const observingInstanceStore = Layer.effect(
+  InstanceStore.Service,
+  Effect.gen(function* () {
+    const store = yield* InstanceStore.Service
+    return InstanceStore.Service.of({
+      ...store,
+      load: (input) => {
+        if (input.directory !== admissionDirectory || !admissionSignal) return store.load(input)
+        const signal = admissionSignal
+        admissionSignal = undefined
+        return Effect.gen(function* () {
+          yield* Deferred.succeed(signal, undefined)
+          return yield* store.load(input)
+        })
+      },
+    })
+  }),
+).pipe(
+  Layer.provide(
+    LayerNode.compile(InstanceStore.node, [[InstanceStore.bootstrapNode, InstanceBootstrap.node]]),
+  ),
+)
+const admissionIt = testEffect(
+  Layer.mergeAll(
+    LayerNode.compile(LayerNode.group([Session.node, Database.node])),
+    httpApiLayerWithAppReplacements([[InstanceStore.node, observingInstanceStore]]),
+  ),
+)
 
 function request(path: string, directory: string, init: RequestInit = {}) {
   return requestInDirectory(path, directory, init)
@@ -212,6 +245,72 @@ afterEach(async () => {
 })
 
 describe("experimental HttpApi", () => {
+  admissionIt.live(
+    "admits a concurrent project request while initGit owns a pending reload disposer",
+    () =>
+      Effect.gen(function* () {
+        const directory = yield* tmpdirScoped()
+        const disposerStarted = yield* Deferred.make<void>()
+        const disposerFinished = yield* Deferred.make<void>()
+        let releaseDisposer: (() => void) | undefined
+        let unregister: (() => void) | undefined
+        admissionDirectory = directory
+        admissionSignal = undefined
+        yield* Effect.addFinalizer(() =>
+          Effect.gen(function* () {
+            if (releaseDisposer) yield* Effect.sync(releaseDisposer)
+            if (unregister) yield* Effect.sync(unregister)
+            yield* Effect.sync(() => {
+              admissionDirectory = undefined
+              admissionSignal = undefined
+            })
+          }),
+        )
+
+        unregister = yield* Effect.sync(() =>
+          registerDisposer((target) => {
+            if (target !== directory) return Promise.resolve()
+            return new Promise<void>((resolve) => {
+              releaseDisposer = resolve
+              Deferred.doneUnsafe(disposerStarted, Effect.void)
+            }).then(() => {
+              Deferred.doneUnsafe(disposerFinished, Effect.void)
+            })
+          }),
+        )
+        const initializing = yield* request("/project/git/init", directory, { method: "POST" }).pipe(
+          Effect.forkScoped({ startImmediately: true }),
+        )
+        yield* awaitWithTimeout(Deferred.await(disposerStarted), "project.initGit did not reach reload disposal", "10 seconds")
+
+        const requestLoadStarted = yield* Deferred.make<void>()
+        admissionSignal = requestLoadStarted
+        const current = yield* request("/project/current", directory).pipe(Effect.forkScoped({ startImmediately: true }))
+        yield* awaitWithTimeout(Deferred.await(requestLoadStarted), "concurrent project request did not enter InstanceStore.load")
+        expect(current.pollUnsafe()).toBeUndefined()
+
+        if (releaseDisposer) yield* Effect.sync(releaseDisposer)
+        releaseDisposer = undefined
+        yield* awaitWithTimeout(Deferred.await(disposerFinished), "reload disposer did not settle")
+        if (unregister) {
+          yield* Effect.sync(unregister)
+          unregister = undefined
+        }
+        const [initialized, admitted] = yield* Effect.all(
+          [
+            awaitWithTimeout(Fiber.await(initializing), "project.initGit request did not finish", "20 seconds"),
+            awaitWithTimeout(Fiber.await(current), "concurrent project request did not finish", "20 seconds"),
+          ],
+          { concurrency: "unbounded" },
+        )
+        expect(Exit.isSuccess(initialized)).toBe(true)
+        expect(Exit.isSuccess(admitted)).toBe(true)
+        if (Exit.isSuccess(initialized)) expect(initialized.value.status).toBe(200)
+        if (Exit.isSuccess(admitted)) expect(admitted.value.status).toBe(200)
+      }),
+    { timeout: 35_000 },
+  )
+
   it.instance(
     "serves read-only experimental endpoints through the default server app",
     () =>

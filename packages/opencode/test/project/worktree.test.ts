@@ -307,7 +307,7 @@ describe("Worktree", () => {
       { git: true },
     )
 
-    it.instance(
+    nonCooperativeBootstrapIt.instance(
       "refuses Worktree.remove while a reload disposer Promise is still running",
       () =>
         Effect.gen(function* () {
@@ -316,6 +316,7 @@ describe("Worktree", () => {
           const svc = yield* Worktree.Service
           const store = yield* InstanceStore.Service
           const ready = yield* waitReady().pipe(Effect.forkScoped)
+          controlledBootstrapRun = Effect.void
           const info = yield* svc.create({ name: "held-disposer-remove" })
           yield* Fiber.join(ready)
           const disposing = yield* Deferred.make<void>()
@@ -329,6 +330,7 @@ describe("Worktree", () => {
 
           yield* Effect.addFinalizer(() =>
             Effect.gen(function* () {
+              controlledBootstrapRun = Effect.void
               if (releasePromise) yield* Effect.sync(releasePromise)
               if (reload) {
                 yield* Fiber.await(reload).pipe(
@@ -375,30 +377,23 @@ describe("Worktree", () => {
             expect(Cause.squash(removal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
             expect(Cause.pretty(removal.cause)).toContain("instance disposer did not settle")
           }
+          expect(reload.pollUnsafe()).toBeUndefined()
           expect(yield* fs.exists(info.directory)).toBe(true)
           expect(normalize(yield* git(test.directory, ["worktree", "list", "--porcelain"]))).toContain(
             normalize(info.directory),
           )
-          const blocked = yield* Effect.exit(
-            awaitWithTimeout(
-              Effect.exit(store.load({ directory: info.directory })),
-              "worktree load retried before its disposer Promise settled",
-              "2 seconds",
-            ),
-          )
-          expect(Exit.isSuccess(blocked)).toBe(true)
-          if (Exit.isSuccess(blocked)) {
-            expect(Exit.isFailure(blocked.value)).toBe(true)
-            if (Exit.isFailure(blocked.value))
-              expect(Cause.pretty(blocked.value.cause)).toContain("instance disposal is still running")
-          }
+          const joined = yield* store.load({ directory: info.directory }).pipe(Effect.forkScoped({ startImmediately: true }))
+          expect(joined.pollUnsafe()).toBeUndefined()
 
           const release = yield* Deferred.await(releaseDispose)
           yield* Effect.sync(release)
           releasePromise = undefined
           yield* awaitWithTimeout(Deferred.await(disposeFinished), "held disposer did not finish")
           const reloaded = yield* awaitWithTimeout(Fiber.await(reload), "reload did not finish after disposer completion")
-          expect(Exit.isFailure(reloaded)).toBe(true)
+          const loaded = yield* awaitWithTimeout(Fiber.await(joined), "concurrent load did not join the reload owner")
+          expect(Exit.isSuccess(reloaded)).toBe(true)
+          expect(Exit.isSuccess(loaded)).toBe(true)
+          if (Exit.isSuccess(reloaded) && Exit.isSuccess(loaded)) expect(loaded.value).toBe(reloaded.value)
           const recovered = yield* pollWithTimeout(
             store.load({ directory: info.directory }).pipe(
               Effect.as(true),
@@ -543,14 +538,16 @@ describe("Worktree", () => {
 
           controlledBootstrapRun = Effect.gen(function* () {
             if ((yield* InstanceRef)?.directory !== expected.directory) return
-            yield* Effect.promise(
-              () =>
-                new Promise<void>((resolve) => {
-                  releaseBootstrap = resolve
-                  Deferred.doneUnsafe(started, Effect.void)
-                }).then(() => {
-                  Deferred.doneUnsafe(finished, Effect.void)
-                }),
+            yield* Effect.uninterruptible(
+              Effect.promise(
+                () =>
+                  new Promise<void>((resolve) => {
+                    releaseBootstrap = resolve
+                    Deferred.doneUnsafe(started, Effect.void)
+                  }).then(() => {
+                    Deferred.doneUnsafe(finished, Effect.void)
+                  }),
+              ),
             )
           })
           yield* Effect.addFinalizer(() =>

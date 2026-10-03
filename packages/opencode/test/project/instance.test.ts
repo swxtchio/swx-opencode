@@ -148,6 +148,7 @@ describe("InstanceStore", () => {
       const exit = yield* Fiber.await(loading)
       expect(Exit.isFailure(exit)).toBe(true)
     }),
+    { timeout: 15_000 },
   )
 
   it.live("disposeAll interrupts a pending instance load", () =>
@@ -172,6 +173,7 @@ describe("InstanceStore", () => {
       const exit = yield* Fiber.await(loading)
       expect(Exit.isFailure(exit)).toBe(true)
     }),
+    { timeout: 15_000 },
   )
 
   it.live(
@@ -220,6 +222,10 @@ describe("InstanceStore", () => {
         const loading = yield* store.load({ directory: dir }).pipe(Effect.forkScoped)
         yield* awaitWithTimeout(Deferred.await(started), "healthy bootstrap did not start")
         const removing = yield* store.disposeDirectory(dir).pipe(Effect.forkDetach({ startImmediately: true }))
+        // Give the concurrent remover a scheduler turn while bootstrap is still held.
+        yield* Effect.sleep(250)
+        expect(yield* Deferred.isDone(disposing)).toBe(false)
+        expect(loading.pollUnsafe()).toBeUndefined()
         yield* Deferred.succeed(releaseBootstrap, undefined)
 
         const loaded = yield* awaitWithTimeout(
@@ -340,14 +346,16 @@ describe("InstanceStore", () => {
         yield* setBootstrap(
           Effect.gen(function* () {
             if ((yield* InstanceRef)?.directory !== directory) return
-            yield* Effect.promise(
-              () =>
-                new Promise<void>((resolve) => {
-                  releasePromise = resolve
-                  Deferred.doneUnsafe(started, Effect.void)
-                }).then(() => {
-                  Deferred.doneUnsafe(finished, Effect.void)
-                }),
+            yield* Effect.uninterruptible(
+              Effect.promise(
+                () =>
+                  new Promise<void>((resolve) => {
+                    releasePromise = resolve
+                    Deferred.doneUnsafe(started, Effect.void)
+                  }).then(() => {
+                    Deferred.doneUnsafe(finished, Effect.void)
+                  }),
+              ),
             )
           }),
         )
@@ -598,52 +606,42 @@ describe("InstanceStore", () => {
       )
 
       const first = yield* store.load({ directory: dir })
-      const reload = yield* store.reload({ directory: dir }).pipe(Effect.forkScoped)
+      yield* setBootstrap(Effect.void)
+      const reload = yield* store.reload({ directory: dir }).pipe(Effect.forkScoped({ startImmediately: true }))
       yield* awaitWithTimeout(Deferred.await(disposing), "reload did not reach its held disposer")
 
-      const removing = yield* store.disposeDirectory(dir).pipe(Effect.forkScoped)
-      const removal = yield* Effect.exit(
-        awaitWithTimeout(Fiber.await(removing), "disposeDirectory did not refuse a held disposer", "12 seconds"),
+      const removing = yield* store.disposeDirectory(dir).pipe(Effect.forkScoped({ startImmediately: true }))
+      const removal = yield* awaitWithTimeout(
+        Fiber.await(removing),
+        "disposeDirectory did not refuse a held disposer",
+        "12 seconds",
       )
-      const reloaded = yield* Effect.exit(
-        awaitWithTimeout(Fiber.await(reload), "reload caller did not settle its failed handoff", "8 seconds"),
-      )
-      const blocked = yield* Effect.exit(
-        awaitWithTimeout(
-          Effect.exit(store.load({ directory: dir })),
-          "load did not refuse while its disposer Promise was active",
-          "2 seconds",
-        ),
-      )
-
-      expect(Exit.isSuccess(removal)).toBe(true)
-      if (Exit.isSuccess(removal)) {
-        expect(Exit.isFailure(removal.value)).toBe(true)
-        if (Exit.isFailure(removal.value))
-          expect(Cause.pretty(removal.value.cause)).toContain("instance disposer did not settle")
-      }
-      expect(Exit.isSuccess(reloaded)).toBe(true)
-      if (Exit.isSuccess(reloaded)) expect(Exit.isFailure(reloaded.value)).toBe(true)
-      expect(Exit.isSuccess(blocked)).toBe(true)
-      if (Exit.isSuccess(blocked)) {
-        expect(Exit.isFailure(blocked.value)).toBe(true)
-        if (Exit.isFailure(blocked.value))
-          expect(Cause.pretty(blocked.value.cause)).toContain("instance disposal is still running")
-      }
+      expect(Exit.isFailure(removal)).toBe(true)
+      if (Exit.isFailure(removal))
+        expect(Cause.pretty(removal.cause)).toContain("instance disposer did not settle")
+      expect(reload.pollUnsafe()).toBeUndefined()
+      const joined = yield* store.load({ directory: dir }).pipe(Effect.forkScoped({ startImmediately: true }))
+      expect(joined.pollUnsafe()).toBeUndefined()
 
       const release = yield* Deferred.await(releaseDispose)
+      yield* setBootstrap(Effect.void)
       yield* Effect.sync(release)
       yield* awaitWithTimeout(Deferred.await(disposeFinished), "held disposer did not finish")
       if (unregister) {
         yield* Effect.sync(unregister)
         unregister = undefined
       }
-      const next = yield* pollWithTimeout(
-        store.load({ directory: dir }).pipe(Effect.catchCause(() => Effect.succeed(undefined))),
-        "reload left a poisoned cache entry",
+      const [reloaded, loaded] = yield* Effect.all(
+        [
+          awaitWithTimeout(Fiber.await(reload), "reload owner did not finish after its disposer completed"),
+          awaitWithTimeout(Fiber.await(joined), "concurrent load did not join the healthy reload"),
+        ],
+        { concurrency: "unbounded" },
       )
-
-      expect(next.directory).toBe(dir)
+      expect(Exit.isSuccess(reloaded)).toBe(true)
+      expect(Exit.isSuccess(loaded)).toBe(true)
+      if (Exit.isSuccess(reloaded) && Exit.isSuccess(loaded)) expect(loaded.value).toBe(reloaded.value)
+      yield* store.disposeDirectory(dir)
       expect(first.directory).toBe(dir)
       expect(disposed).toEqual([dir])
     }),

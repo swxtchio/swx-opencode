@@ -46,6 +46,7 @@ interface DisposerRun {
   readonly entries: Set<Entry>
   readonly observers: Set<() => void>
   readonly autoFinalize: Set<Entry>
+  reloadOwner?: Entry
 }
 
 const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Service> = Layer.effect(
@@ -73,7 +74,8 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
                   project: result.project,
                 })),
               )
-        yield* Effect.uninterruptible(bootstrap.run.pipe(Effect.provideService(InstanceRef, ctx)))
+        // Bootstrap stays cooperative; a non-cancellable Promise must be owned at its Promise boundary.
+        yield* bootstrap.run.pipe(Effect.provideService(InstanceRef, ctx))
         return ctx
       }).pipe(Effect.withSpan("InstanceStore.boot"))
 
@@ -113,16 +115,20 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       run.observers.clear()
     }
 
-    const awaitDisposerRun = (directory: string, run: DisposerRun) =>
+    const awaitDisposerRunCompletion = (run: DisposerRun) =>
       Deferred.await(run.completion).pipe(
-        Effect.timeoutOrElse({
-          duration: "5 seconds",
-          orElse: () => Effect.die(new Error(`instance disposer did not settle: ${directory}`)),
-        }),
         Effect.flatMap((result) => (result.success ? Effect.void : Effect.die(result.error))),
       )
 
-    const startDisposerRun = (directory: string, entry?: Entry) => {
+    const awaitDisposerRun = (directory: string, run: DisposerRun, duration: Duration.Input = "5 seconds") =>
+      awaitDisposerRunCompletion(run).pipe(
+        Effect.timeoutOrElse({
+          duration,
+          orElse: () => Effect.die(new Error(`instance disposer did not settle: ${directory}`)),
+        }),
+      )
+
+    const startDisposerRun = (directory: string, entry?: Entry, reloadOwner?: Entry) => {
       const current = disposerRuns.get(directory)
       if (entry?.disposersDone && !current) return undefined
       const run = current ?? {
@@ -132,6 +138,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         autoFinalize: new Set<Entry>(),
       }
       if (entry) run.entries.add(entry)
+      if (reloadOwner) run.reloadOwner = reloadOwner
       if (!current) {
         disposerRuns.set(directory, run)
         // The JS Promise is the cleanup owner; interrupting an Effect waiter does not stop it.
@@ -143,8 +150,8 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       return run
     }
 
-    const awaitDisposerRunTracked = (directory: string, run: DisposerRun, entry?: Entry) =>
-      awaitDisposerRun(directory, run).pipe(
+    const trackDisposerWait = (directory: string, run: DisposerRun, entry: Entry | undefined, wait: Effect.Effect<void>) =>
+      wait.pipe(
         Effect.onInterrupt(() =>
           Effect.sync(() => {
             if (entry && disposerRuns.get(directory) === run) run.autoFinalize.add(entry)
@@ -160,16 +167,28 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         ),
       )
 
+    const awaitDisposerRunTracked = (directory: string, run: DisposerRun, entry?: Entry) =>
+      trackDisposerWait(directory, run, entry, awaitDisposerRun(directory, run))
+
+    const awaitDisposerRunOwned = (directory: string, run: DisposerRun, entry?: Entry) =>
+      trackDisposerWait(directory, run, entry, awaitDisposerRunCompletion(run))
+
     const runDisposersTracked = Effect.fnUntraced(function* (directory: string, entry?: Entry) {
       const run = yield* Effect.sync(() => startDisposerRun(directory, entry))
       if (!run) return
       yield* awaitDisposerRunTracked(directory, run, entry)
     })
 
+    const runDisposersOwned = Effect.fnUntraced(function* (directory: string, entry: Entry, reloadOwner: Entry) {
+      const run = yield* Effect.sync(() => startDisposerRun(directory, entry, reloadOwner))
+      if (!run) return
+      yield* awaitDisposerRunOwned(directory, run, entry)
+    })
+
     const waitForDisposers = Effect.fnUntraced(function* (directory: string) {
       const run = disposerRuns.get(directory)
       if (!run) return
-      yield* awaitDisposerRun(directory, run)
+      yield* awaitDisposerRun(directory, run, "8 seconds")
     })
 
     const completeEntry = (directory: string, entry: Entry, work: Effect.Effect<InstanceContext>) =>
@@ -317,10 +336,11 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           if (orphaned.has(directory)) {
             return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
           }
-          if (disposerRuns.has(directory)) {
+          const existing = cache.get(directory)
+          const disposal = disposerRuns.get(directory)
+          if (disposal && (!existing || disposal.reloadOwner !== existing)) {
             return yield* Effect.die(new Error(`instance disposal is still running for ${directory}`))
           }
-          const existing = cache.get(directory)
           if (existing) return yield* restore(Deferred.await(existing.deferred))
 
           const entry: Entry = {
@@ -368,7 +388,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
               yield* Effect.logInfo("reloading instance", { directory: directory })
               if (entry.previous) {
                 yield* Deferred.await(entry.previous.deferred).pipe(Effect.ignore)
-                yield* runDisposersTracked(directory, entry.previous)
+                yield* runDisposersOwned(directory, entry.previous, entry)
                 yield* emitDisposed({ directory, project: input.project?.id }, entry.previous)
               }
               return yield* boot({ ...input, directory })
