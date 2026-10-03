@@ -16,6 +16,7 @@ import { OpencodeKeymapProvider, registerOpencodeKeymap } from "../../../src/key
 import {
   activeForegroundTasks,
   activeTaskRetry,
+  assistantStatus,
   SessionContext,
   ReasoningPartView,
   ToolPartView,
@@ -28,13 +29,17 @@ import { mount, wait } from "../../cli/cmd/tui/sync-fixture"
 import { tmpdir } from "../../fixture/fixture"
 
 const ActivityStatus = Schema.Union([
-  Schema.Struct({ type: Schema.Literal("busy") }),
+  Schema.Struct({
+    type: Schema.Literal("busy"),
+    activeAssistantMessageID: Schema.optional(Schema.NullOr(SessionV1.MessageID)),
+  }),
   Schema.Struct({ type: Schema.Literal("idle") }),
   Schema.Struct({
     type: Schema.Literal("retry"),
     attempt: Schema.Number,
     message: Schema.String,
     next: Schema.Number,
+    activeAssistantMessageID: Schema.optional(Schema.NullOr(SessionV1.MessageID)),
     action: Schema.optional(Schema.Unknown),
   }),
 ])
@@ -43,11 +48,17 @@ const ActivityArm = Schema.Struct({
   status: ActivityStatus,
 })
 type ActivityArmInfo = Schema.Schema.Type<typeof ActivityArm>
+const PreAssistantActivity = Schema.Struct({
+  session: SessionV1.SessionInfo,
+  messages: Schema.Array(SessionV1.WithParts),
+  assistantID: SessionV1.MessageID,
+  status: ActivityStatus,
+})
 const ActivitySnapshotSchema = Schema.Struct({
   session: SessionV1.SessionInfo,
-  oldAssistantID: Schema.String,
-  shellAssistantID: Schema.String,
-  taskAssistantID: Schema.String,
+  oldAssistantID: SessionV1.MessageID,
+  shellAssistantID: SessionV1.MessageID,
+  taskAssistantID: SessionV1.MessageID,
   taskProducerSessionID: Schema.String,
   taskProducerSession: SessionV1.SessionInfo,
   taskProducerMessages: Schema.Array(SessionV1.WithParts),
@@ -55,8 +66,9 @@ const ActivitySnapshotSchema = Schema.Struct({
   taskChildMessages: Schema.Array(SessionV1.WithParts),
   taskChildStatus: ActivityStatus,
   taskParentStatus: ActivityStatus,
-  currentAssistantID: Schema.String,
-  completedAssistantID: Schema.String,
+  preAssistant: PreAssistantActivity,
+  currentAssistantID: SessionV1.MessageID,
+  completedAssistantID: SessionV1.MessageID,
   active: ActivityArm,
   completed: ActivityArm,
 })
@@ -243,6 +255,42 @@ function populateTaskChild(sync: ReturnType<typeof useSync>, snapshot: ActivityS
   sync.set("session_status", snapshot.taskChildSessionID, snapshot.taskChildStatus as SessionStatus)
 }
 
+function populatePreAssistant(sync: ReturnType<typeof useSync>, snapshot: ActivitySnapshot) {
+  // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- producer session is decoded and passed through the current SDK sync store
+  sync.set("session", [snapshot.preAssistant.session as unknown as Session])
+  sync.set(
+    "message",
+    snapshot.preAssistant.session.id,
+    snapshot.preAssistant.messages.map((row) => {
+      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- producer rows are decoded and passed through the current SDK sync store
+      return row.info as unknown as Message
+    }),
+  )
+  snapshot.preAssistant.messages.forEach((row) => {
+    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- producer parts are decoded and passed through the current SDK sync store
+    sync.set("part", row.info.id, row.parts as unknown as Part[])
+  })
+  sync.set("session_status", snapshot.preAssistant.session.id, snapshot.preAssistant.status as SessionStatus)
+  populateTaskChild(sync, snapshot)
+  sync.set("capabilities", { ...sync.data.capabilities, experimentalBackgroundSubagents: true })
+}
+
+async function renderPreAssistant(snapshot: ActivitySnapshot, state: string) {
+  const old = assistant(snapshot.preAssistant.messages, snapshot.preAssistant.assistantID)
+  const part = tool(old.parts, "task")
+  const app = await mount(undefined, state, true, () => (
+    <TaskActivity
+      sessionID={snapshot.preAssistant.session.id}
+      message={old}
+      part={part}
+      prepare={(sync) => populatePreAssistant(sync, snapshot)}
+    />
+  ))
+  await wait(() => app.app.captureCharFrame().includes("Inspect task ownership"))
+  await app.app.renderOnce()
+  return { app: app.app, frame: app.app.captureCharFrame(), sync: app.sync }
+}
+
 function populateTask(sync: ReturnType<typeof useSync>, snapshot: ActivitySnapshot) {
   const rows = snapshot.taskProducerMessages
   // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- producer session is decoded and passed through the current SDK sync store
@@ -389,9 +437,42 @@ describe("assistant activity rendering", () => {
       const snapshot = Schema.decodeUnknownSync(ActivitySnapshotSchema)(
         Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(await Bun.file(output).text()),
       )
+      if (snapshot.active.status.type !== "busy") throw new Error("expected the active production owner status")
+      expect(snapshot.active.status.activeAssistantMessageID).toBe(snapshot.currentAssistantID)
+      if (snapshot.taskParentStatus.type !== "busy") throw new Error("expected the Task producer owner status")
+      expect(snapshot.taskParentStatus.activeAssistantMessageID).toBe(snapshot.taskAssistantID)
+      expect(snapshot.taskProducerMessages.at(-1)?.info.role).toBe("user")
+      if (snapshot.preAssistant.status.type !== "busy") throw new Error("expected the pre-assistant busy status")
+      expect(snapshot.preAssistant.status.activeAssistantMessageID).toBeNull()
+      expect(snapshot.preAssistant.messages.at(-1)?.info.role).toBe("user")
+      expect(snapshot.preAssistant.messages.findLast((message) => message.info.role === "assistant")?.info.id).toBe(
+        snapshot.preAssistant.assistantID,
+      )
+
+      const preAssistant = await renderPreAssistant(snapshot, tmp.path)
+      try {
+        const lines = preAssistant.frame.split("\n")
+        const taskLine = lines.find((line) => line.includes("Inspect task ownership"))
+        const priorAssistant = assistant(snapshot.preAssistant.messages, snapshot.preAssistant.assistantID)
+        expect(preAssistant.sync.data.session_status[snapshot.preAssistant.session.id]).toMatchObject({
+          type: "busy",
+          activeAssistantMessageID: null,
+        })
+        expect(assistantStatus(preAssistant.sync, priorAssistant.info)).toBe("unknown")
+        expect(preAssistant.sync.session.status(snapshot.preAssistant.session.id)).toBe("working")
+        expect(taskLine).toBeDefined()
+        expect(hasSpinner(taskLine ?? "")).toBe(false)
+        expect(taskLine).not.toContain("Retrying")
+        expect(preAssistant.frame).not.toContain("task-child.txt")
+        expect(activeTaskRetry(snapshot.taskChildStatus as SessionStatus, false)).toBeUndefined()
+      } finally {
+        preAssistant.app.renderer.destroy()
+      }
+
       const taskActive = await renderTask(snapshot, tmp.path)
       try {
         const taskLine = taskActive.frame.split("\n").find((line) => line.includes("Inspect task ownership"))
+        expect(assistantStatus(taskActive.sync, taskActive.message.info)).toBe("working")
         expect(taskLine).toBeDefined()
         expect(hasSpinner(taskLine ?? "")).toBe(true)
         expect(taskActive.frame).toContain("Retrying")
@@ -421,8 +502,31 @@ describe("assistant activity rendering", () => {
         active.app.renderer.destroy()
       }
 
+      const legacy = await render(snapshot, { ...snapshot.active, status: { type: "busy" } }, tmp.path)
+      try {
+        const lines = legacy.frame.split("\n")
+        const oldReasoning = lines.find((line) => line.includes("Thinking status unknown"))
+        const oldRead = lines.find((line) => line.includes("→ Read /tmp/unfinished.ts"))
+        const activeReasoning = lines.find((line) => hasSpinner(line) && line.includes("Thinking"))
+        const activeRead = lines.find((line) => hasSpinner(line) && line.includes("Read /tmp/unfinished.ts"))
+        expect(oldReasoning).toBeDefined()
+        expect(oldRead).toBeDefined()
+        expect(activeReasoning).toBeDefined()
+        expect(activeRead).toBeDefined()
+      } finally {
+        legacy.app.renderer.destroy()
+      }
+
       const historicalTask = await renderHistoricalTask(snapshot, snapshot.active, tmp.path)
       try {
+        expect(historicalTask.sync.data.session_status[snapshot.taskProducerSessionID]).toMatchObject({
+          activeAssistantMessageID: snapshot.currentAssistantID,
+        })
+        expect(historicalTask.sync.data.message[snapshot.taskProducerSessionID]?.at(-1)?.id).toBe(
+          snapshot.currentAssistantID,
+        )
+        expect(activeForegroundTasks(historicalTask.sync, [historicalTask.message.info])).toEqual([])
+        expect(assistantStatus(historicalTask.sync, historicalTask.message.info)).toBe("unknown")
         const taskLine = historicalTask.frame.split("\n").find((line) => line.includes("Inspect task ownership"))
         expect(taskLine, historicalTask.frame).toBeDefined()
         expect(hasSpinner(taskLine ?? "")).toBe(false)
@@ -430,7 +534,6 @@ describe("assistant activity rendering", () => {
         expect(historicalTask.frame).not.toContain("task-child.txt")
         expect(historicalTask.frame).not.toContain("↳")
         expect(activeTaskRetry(snapshot.taskChildStatus as SessionStatus, false)).toBeUndefined()
-        expect(activeForegroundTasks(historicalTask.sync, [historicalTask.message.info])).toEqual([])
       } finally {
         historicalTask.app.renderer.destroy()
       }

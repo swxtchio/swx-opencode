@@ -691,9 +691,11 @@ export type SessionStatus =
         link?: string
       }
       next: number
+      activeAssistantMessageID?: string | null
     }
   | {
       type: "busy"
+      activeAssistantMessageID?: string | null
     }
 
 export type TextPartInput = {

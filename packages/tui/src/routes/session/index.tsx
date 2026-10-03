@@ -122,7 +122,12 @@ function assistantRowSuperseded(sync: ReturnType<typeof useSync>, message: Assis
   return latest !== undefined && latest.id !== message.id
 }
 
-function assistantStatus(sync: ReturnType<typeof useSync>, message: AssistantMessage) {
+export function assistantStatus(sync: ReturnType<typeof useSync>, message: AssistantMessage) {
+  const status = sync.data.session_status[message.sessionID]
+  if (!status) return "unknown" as const
+  if (status.type !== "busy" && status.type !== "retry") return "unknown" as const
+  if (status.activeAssistantMessageID !== undefined)
+    return status.activeAssistantMessageID === message.id ? sync.session.status(message.sessionID) : "unknown"
   if (assistantRowSuperseded(sync, message)) return "unknown" as const
   return sync.session.status(message.sessionID)
 }
@@ -130,7 +135,8 @@ function assistantStatus(sync: ReturnType<typeof useSync>, message: AssistantMes
 export function activeForegroundTasks(sync: ReturnType<typeof useSync>, messages: Message[]) {
   return messages.flatMap((message) => {
     if (message.role !== "assistant") return []
-    if (assistantRowSuperseded(sync, message)) return []
+    const status = assistantStatus(sync, message)
+    if (!isAssistantTurnActive({ status, message })) return []
     return (sync.data.part[message.id] ?? []).filter(
       (part): part is ToolPart =>
         part.type === "tool" &&
@@ -1856,6 +1862,9 @@ export function ToolPartView(props: { last: boolean; part: ToolPart; message: As
   })
 
   const toolprops = {
+    get message() {
+      return props.message
+    },
     get metadata() {
       return props.part.state.status === "pending" ? {} : (props.part.state.metadata ?? {})
     },
@@ -1927,6 +1936,7 @@ export function ToolPartView(props: { last: boolean; part: ToolPart; message: As
 }
 
 type ToolProps = {
+  message: AssistantMessage
   input: Record<string, unknown>
   metadata: Record<string, unknown>
   tool: string
@@ -2442,12 +2452,9 @@ function Task(props: ToolProps) {
 
   const sessionID = createMemo(() => stringValue(props.metadata.sessionId))
   const messages = createMemo(() => sync.data.message[sessionID() ?? ""] ?? [])
-  const parent = createMemo(() =>
-    sync.data.message[props.part.sessionID]?.find((message) => message.id === props.part.messageID),
-  )
-  const superseded = createMemo(() => {
-    const message = parent()
-    return message?.role !== "assistant" || assistantRowSuperseded(sync, message)
+  const turnActive = createMemo(() => {
+    const message = props.message
+    return isAssistantTurnActive({ status: assistantStatus(sync, message), message })
   })
 
   const tools = createMemo(() => {
@@ -2464,7 +2471,7 @@ function Task(props: ToolProps) {
 
   const status = createMemo(() => sync.data.session_status[sessionID() ?? ""])
   const isRunning = createMemo(() => {
-    if (superseded()) return false
+    if (!turnActive()) return false
     const value = status()
     return (
       props.part.state.status === "running" ||
@@ -2472,7 +2479,7 @@ function Task(props: ToolProps) {
     )
   })
   const retry = createMemo(() => {
-    return activeTaskRetry(status(), !superseded())
+    return activeTaskRetry(status(), turnActive())
   })
 
   const duration = createMemo(() => {

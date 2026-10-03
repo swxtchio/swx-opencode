@@ -4777,8 +4777,32 @@ registerEnvironmentTest(
             "15 seconds",
           )
           const childMessages = yield* sessions.messages({ sessionID: childSessionID })
+          yield* prompt
+            .prompt({
+              sessionID: chat.id,
+              agent: "build",
+              model: ref,
+              parts: said("steer the active Task turn"),
+            })
+            .pipe(Effect.forkChild)
+          const parentMessages = yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const messages = yield* sessions.messages({ sessionID: chat.id })
+              const last = messages.at(-1)
+              const parentStatus = yield* status.get(chat.id)
+              const hasSteer =
+                last?.info.role === "user" &&
+                last.parts.some((part) => part.type === "text" && part.text === "steer the active Task turn")
+              return hasSteer &&
+                parentStatus.type === "busy" &&
+                parentStatus.activeAssistantMessageID === task.assistant.info.id
+                ? messages
+                : undefined
+            }),
+            "the steered Task turn lost its active assistant identity",
+            "15 seconds",
+          )
           const parentStatus = yield* status.get(chat.id)
-          const parentMessages = yield* sessions.messages({ sessionID: chat.id })
           const session = yield* sessions.get(chat.id)
           yield* Effect.promise(() =>
             Bun.write(
@@ -4825,26 +4849,20 @@ registerEnvironmentTest(
             return Bun.spawn([process.execPath, "test", "test/session/prompt.test.ts", `--test-name-pattern=${name}`], {
               cwd: path.join(import.meta.dir, "../.."),
               env: workerEnv,
-              stdout: "pipe",
-              stderr: "pipe",
+              stdout: "ignore",
+              stderr: "ignore",
             })
           }
           const worker = runChild("dangling-assistant-process-worker", {
             OPENCODE_DANGLING_ASSISTANT_OUTPUT: workerOutput,
           })
           yield* Effect.addFinalizer(() => Effect.sync(() => worker.kill()))
-          const [workerCode, workerStdout, workerStderr] = yield* awaitWithTimeout(
-            Effect.promise(() =>
-              Promise.all([
-                worker.exited,
-                Bun.readableStreamToText(worker.stdout),
-                Bun.readableStreamToText(worker.stderr),
-              ]),
-            ),
+          const workerCode = yield* awaitWithTimeout(
+            Effect.promise(() => worker.exited),
             "the production worker did not exit after persisting its unfinished turn",
             "30 seconds",
           )
-          expect(workerCode, `${workerStdout}\n${workerStderr}`).toBe(0)
+          expect(workerCode).toBe(0)
 
           const serialized = Schema.decodeUnknownSync(
             Schema.Struct({
@@ -4905,18 +4923,12 @@ registerEnvironmentTest(
             `${shellOutput}.db`,
           )
           yield* Effect.addFinalizer(() => Effect.sync(() => shellWorker.kill()))
-          const [shellCode, shellStdout, shellStderr] = yield* awaitWithTimeout(
-            Effect.promise(() =>
-              Promise.all([
-                shellWorker.exited,
-                Bun.readableStreamToText(shellWorker.stdout),
-                Bun.readableStreamToText(shellWorker.stderr),
-              ]),
-            ),
+          const shellCode = yield* awaitWithTimeout(
+            Effect.promise(() => shellWorker.exited),
             "the running shell worker did not exit after persisting its tool",
             "30 seconds",
           )
-          expect(shellCode, `${shellStdout}\n${shellStderr}`).toBe(0)
+          expect(shellCode).toBe(0)
           const runningShell = Schema.decodeUnknownSync(
             Schema.Struct({
               session: SessionV1.SessionInfo,
@@ -4956,18 +4968,12 @@ registerEnvironmentTest(
             `${taskOutput}.db`,
           )
           yield* Effect.addFinalizer(() => Effect.sync(() => taskWorker.kill()))
-          const [taskCode, taskStdout, taskStderr] = yield* awaitWithTimeout(
-            Effect.promise(() =>
-              Promise.all([
-                taskWorker.exited,
-                Bun.readableStreamToText(taskWorker.stdout),
-                Bun.readableStreamToText(taskWorker.stderr),
-              ]),
-            ),
+          const taskCode = yield* awaitWithTimeout(
+            Effect.promise(() => taskWorker.exited),
             "the Task worker did not exit after persisting its running Task",
             "30 seconds",
           )
-          expect(taskCode, `${taskStdout}\n${taskStderr}`).toBe(0)
+          expect(taskCode).toBe(0)
           const taskSnapshot = Schema.decodeUnknownSync(
             Schema.Struct({
               session: SessionV1.SessionInfo,
@@ -4997,12 +5003,116 @@ registerEnvironmentTest(
           )
           if (!taskPart || taskPart.state.status !== "running")
             throw new Error("Task producer did not preserve its running Task part")
-          expect(taskSnapshot.childStatus.type).toBe("retry")
-          expect(taskSnapshot.parentStatus.type).toBe("busy")
+          const childAssistant = taskSnapshot.childMessages.findLast((message) => message.info.role === "assistant")
+          if (!childAssistant || childAssistant.info.role !== "assistant")
+            throw new Error("Task producer did not preserve its child assistant")
+          if (taskSnapshot.childStatus.type !== "retry") throw new Error("expected the Task child retry status")
+          expect(taskSnapshot.childStatus.activeAssistantMessageID).toBe(childAssistant.info.id)
+          if (taskSnapshot.parentStatus.type !== "busy") throw new Error("expected the Task parent busy status")
+          expect(taskSnapshot.parentStatus.activeAssistantMessageID).toBe(taskSnapshot.taskAssistantID)
 
           const sessions = yield* Session.Service
           const prompt = yield* SessionPrompt.Service
           const status = yield* SessionStatus.Service
+          const events = yield* EventV2Bridge.Service
+          const preAssistantChat = yield* sessions.create({
+            title: "Pre-assistant owner signal",
+            permission: [{ permission: "*", pattern: "*", action: "allow" }],
+          })
+          yield* Effect.forEach(
+            taskSnapshot.messages,
+            (message) =>
+              Effect.gen(function* () {
+                const info = Schema.decodeUnknownSync(SessionV1.Info)({
+                  ...message.info,
+                  sessionID: preAssistantChat.id,
+                })
+                // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- the legacy writer requires mutable V1 records after schema validation
+                const mutableInfo = info as SessionV1.Info
+                yield* sessions.updateMessage(mutableInfo)
+                yield* Effect.forEach(
+                  message.parts,
+                  (part) => {
+                    const validated = Schema.decodeUnknownSync(SessionV1.Part)({
+                      ...part,
+                      sessionID: preAssistantChat.id,
+                    })
+                    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- the legacy writer requires mutable V1 parts after schema validation
+                    const mutable = validated as SessionV1.Part
+                    return sessions.updatePart(mutable)
+                  },
+                  { discard: true },
+                )
+              }),
+            { discard: true },
+          )
+          const busyWithoutOwner = yield* Deferred.make<SessionStatus.Info>()
+          const unsubscribe = yield* events.listen((event) => {
+            if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+            return Effect.gen(function* () {
+              const data = Schema.decodeUnknownSync(SessionStatus.Event.Status.data)(event.data)
+              if (
+                data.sessionID === preAssistantChat.id &&
+                data.status.type === "busy" &&
+                data.status.activeAssistantMessageID === null
+              )
+                yield* Deferred.succeed(busyWithoutOwner, data.status)
+            })
+          })
+          const preAssistantPrompt = yield* prompt
+            .prompt({
+              sessionID: preAssistantChat.id,
+              agent: "build",
+              model: {
+                providerID: ProviderV2.ID.make("missing-owner-provider"),
+                modelID: ModelV2.ID.make("missing-owner-model"),
+              },
+              parts: said("admit a new turn before its assistant exists"),
+            })
+            .pipe(Effect.forkChild)
+          const preAssistantStatus = yield* awaitWithTimeout(
+            Deferred.await(busyWithoutOwner),
+            "the owner did not publish an explicit no-assistant status",
+            "15 seconds",
+          )
+          const preAssistantMessages = yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const messages = yield* sessions.messages({ sessionID: preAssistantChat.id })
+              const latest = messages.at(-1)
+              if (
+                latest?.info.role === "user" &&
+                latest.parts.some(
+                  (part) => part.type === "text" && part.text === "admit a new turn before its assistant exists",
+                )
+              )
+                return messages
+            }),
+            "the pre-assistant user input was not persisted",
+            "15 seconds",
+          )
+          const preAssistantAssistant = preAssistantMessages.findLast((message) => message.info.role === "assistant")
+          if (!preAssistantAssistant || preAssistantAssistant.info.role !== "assistant")
+            throw new Error("the pre-assistant fixture has no prior assistant")
+          const failedPreAssistantTurn = yield* awaitWithTimeout(
+            Fiber.await(preAssistantPrompt),
+            "the missing-agent pre-assistant turn did not terminate",
+            "15 seconds",
+          )
+          yield* unsubscribe
+          expect(Exit.isFailure(failedPreAssistantTurn)).toBe(true)
+          if (preAssistantStatus.type !== "busy") throw new Error("expected the explicit no-owner busy status")
+          expect(preAssistantStatus.activeAssistantMessageID).toBeNull()
+          const admittedPreAssistantUser = preAssistantMessages.at(-1)
+          if (!admittedPreAssistantUser || admittedPreAssistantUser.info.role !== "user")
+            throw new Error("the pre-assistant owner fixture did not end with its admitted user")
+          expect(
+            preAssistantMessages.some(
+              (message) =>
+                message.info.role === "assistant" && message.info.parentID === admittedPreAssistantUser.info.id,
+            ),
+          ).toBe(false)
+          const preAssistantSession = yield* sessions.get(preAssistantChat.id)
+
           const chat = yield* sessions.create({
             title: "Dangling assistant recovery",
             permission: [{ permission: "*", pattern: "*", action: "allow" }],
@@ -5075,7 +5185,11 @@ registerEnvironmentTest(
           if (!activeAssistant || activeAssistant.info.role !== "assistant")
             throw new Error("expected the later production assistant to be active")
           const activeStatus = yield* status.get(chat.id)
-          expect(activeStatus.type).toBe("busy")
+          if (activeStatus.type !== "busy") throw new Error("expected the later production status to be busy")
+          expect(activeStatus.activeAssistantMessageID).toBe(activeAssistant.info.id)
+          const activeStatusMap = (yield* status.list()).get(chat.id)
+          if (activeStatusMap?.type !== "busy") throw new Error("expected the active status-map entry")
+          expect(activeStatusMap.activeAssistantMessageID).toBe(activeAssistant.info.id)
 
           yield* awaitWithTimeout(prompt.cancel(chat.id), "the later production turn did not cancel", "15 seconds")
           yield* awaitWithTimeout(Fiber.await(task), "the cancelled production turn did not stop", "15 seconds")
@@ -5116,6 +5230,12 @@ registerEnvironmentTest(
                 taskChildMessages: taskSnapshot.childMessages,
                 taskChildStatus: taskSnapshot.childStatus,
                 taskParentStatus: taskSnapshot.parentStatus,
+                preAssistant: {
+                  session: preAssistantSession,
+                  messages: preAssistantMessages,
+                  assistantID: preAssistantAssistant.info.id,
+                  status: preAssistantStatus,
+                },
                 currentAssistantID: activeAssistant.info.id,
                 completedAssistantID: completedAssistant.info.id,
                 active: { messages: activeMessages, status: activeStatus },
