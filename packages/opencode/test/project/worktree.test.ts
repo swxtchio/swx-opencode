@@ -40,6 +40,8 @@ type BootControl =
       started: Deferred.Deferred<void>
       release: Deferred.Deferred<void>
       interrupted: Deferred.Deferred<void>
+      finished: Deferred.Deferred<void>
+      ignoreInterruption?: boolean
     }
   | { mode: "fail"; directory: string }
 
@@ -75,9 +77,11 @@ const gatedAppProcess = Layer.effect(
         }
         return Effect.gen(function* () {
           yield* Deferred.succeed(control.started, undefined)
-          yield* Deferred.await(control.release).pipe(
+          const waiting = Deferred.await(control.release).pipe(
+            Effect.tap(() => Deferred.succeed(control.finished, undefined)),
             Effect.onInterrupt(() => Deferred.succeed(control.interrupted, undefined).pipe(Effect.asVoid)),
           )
+          yield* (control.ignoreInterruption ? Effect.uninterruptible(waiting) : waiting)
           return yield* appProcess.run(command, options)
         })
       },
@@ -444,6 +448,65 @@ describe("Worktree", () => {
     )
 
     raceIt.instance(
+      "refuses removal while a registered worktree boot ignores interruption",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const expected = yield* svc.makeWorktreeInfo({ name: "registered-boot-refusal" })
+          const control: BootControl = {
+            mode: "hold",
+            directory: expected.directory,
+            started: yield* Deferred.make<void>(),
+            release: yield* Deferred.make<void>(),
+            interrupted: yield* Deferred.make<void>(),
+            finished: yield* Deferred.make<void>(),
+            ignoreInterruption: true,
+          }
+          let createdDirectory: string | undefined
+          bootControl = control
+          yield* Effect.addFinalizer(() =>
+            Effect.gen(function* () {
+              bootControl = undefined
+              yield* Deferred.succeed(control.release, undefined).pipe(Effect.asVoid)
+              if (createdDirectory) yield* removeCreatedWorktree(createdDirectory).pipe(Effect.ignore)
+            }),
+          )
+
+          const info = yield* svc.create({ name: expected.name })
+          createdDirectory = info.directory
+          expect(info.directory).toBe(expected.directory)
+          yield* awaitWithTimeout(Deferred.await(control.started), "registered worktree boot did not reach checkout", "5 seconds")
+          const removing = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkScoped({ startImmediately: true }))
+          const refusal = yield* awaitWithTimeout(
+            Fiber.await(removing),
+            "Worktree.remove did not bound its refusal for a registered boot ignoring interruption",
+            "8 seconds",
+          )
+          expect(Exit.isFailure(refusal)).toBe(true)
+          if (Exit.isFailure(refusal)) {
+            expect(Cause.squash(refusal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
+            expect(Cause.pretty(refusal.cause)).toContain("Worktree boot did not stop")
+          }
+          expect(yield* fs.exists(info.directory)).toBe(true)
+          expect(normalize(yield* git(test.directory, ["worktree", "list", "--porcelain"]))).toContain(
+            normalize(info.directory),
+          )
+
+          yield* Deferred.succeed(control.release, undefined)
+          yield* awaitWithTimeout(Deferred.await(control.finished), "registered boot did not finish its held checkout", "10 seconds")
+          expect(yield* awaitWithTimeout(svc.remove({ directory: info.directory }), "worktree removal did not recover after boot release", "15 seconds")).toBe(
+            true,
+          )
+          expect(yield* fs.exists(info.directory)).toBe(false)
+          createdDirectory = undefined
+        }),
+      { git: true },
+      { timeout: 30_000 },
+    )
+
+    raceIt.instance(
       "stops an unregistered worktree boot before removal deletes its directory",
       () =>
         Effect.gen(function* () {
@@ -457,6 +520,7 @@ describe("Worktree", () => {
             started: yield* Deferred.make<void>(),
             release: yield* Deferred.make<void>(),
             interrupted: yield* Deferred.make<void>(),
+            finished: yield* Deferred.make<void>(),
           }
           bootControl = control
           yield* Effect.addFinalizer(() =>

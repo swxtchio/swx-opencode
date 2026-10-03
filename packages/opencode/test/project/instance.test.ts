@@ -2,6 +2,7 @@ import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
 import { InstancePromise } from "../../src/effect/instance-promise"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { hasInstancePromises, registerDisposer } from "../../src/effect/instance-registry"
@@ -1063,6 +1064,113 @@ describe("InstanceStore", () => {
       expect(disposed).toEqual([dir])
       expect(yield* store.load({ directory: dir })).toBe(second)
     }),
+  )
+
+  it.live("evicts a context and publishes disposal after a timed-out disposer later settles", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const disposing = yield* Deferred.make<void>()
+      const disposeFinished = yield* Deferred.make<void>()
+      const disposedEvent = yield* Deferred.make<void>()
+      let releaseDisposer = () => {}
+      let disposeCalls = 0
+      let disposedEvents = 0
+      const on = (event: GlobalEvent) => {
+        if (event.directory !== dir || event.payload.type !== "server.instance.disposed") return
+        disposedEvents++
+        Deferred.doneUnsafe(disposedEvent, Effect.void)
+      }
+      GlobalBus.on("event", on)
+      yield* registerDisposerScoped((directory) => {
+        if (directory !== dir || disposeCalls++ > 0) return Promise.resolve()
+        return new Promise<void>((resolve) => {
+          releaseDisposer = resolve
+          Deferred.doneUnsafe(disposing, Effect.void)
+        }).then(() => {
+          Deferred.doneUnsafe(disposeFinished, Effect.void)
+        })
+      })
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function* () {
+          yield* Effect.sync(releaseDisposer)
+          yield* Effect.sync(() => GlobalBus.off("event", on))
+        }),
+      )
+
+      const first = yield* store.load({ directory: dir })
+      const disposingContext = yield* store.disposeDirectory(dir).pipe(Effect.forkScoped({ startImmediately: true }))
+      yield* awaitWithTimeout(Deferred.await(disposing), "registered disposer did not start")
+      const refusal = yield* awaitWithTimeout(
+        Fiber.await(disposingContext),
+        "disposeDirectory did not return its bounded refusal",
+        "8 seconds",
+      )
+      expect(Exit.isFailure(refusal)).toBe(true)
+      if (Exit.isFailure(refusal)) expect(Cause.pretty(refusal.cause)).toContain("instance disposer did not settle")
+
+      yield* Effect.sync(releaseDisposer)
+      yield* awaitWithTimeout(Deferred.await(disposeFinished), "late disposer completion was not observed")
+      yield* awaitWithTimeout(
+        Deferred.await(disposedEvent),
+        "late disposer completion did not publish server.instance.disposed",
+        "5 seconds",
+      )
+      expect(disposedEvents).toBe(1)
+      const recovered = yield* store.load({ directory: dir })
+      expect(recovered).not.toBe(first)
+      expect(recovered.directory).toBe(dir)
+      yield* store.disposeDirectory(dir)
+    }),
+    { timeout: 20_000 },
+  )
+
+  it.live("refuses load and reload while a ready context is being disposed", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const disposing = yield* Deferred.make<void>()
+      const disposeFinished = yield* Deferred.make<void>()
+      let releaseDisposer = () => {}
+      let disposeCalls = 0
+      yield* registerDisposerScoped((directory) => {
+        if (directory !== dir || disposeCalls++ > 0) return Promise.resolve()
+        return new Promise<void>((resolve) => {
+          releaseDisposer = resolve
+          Deferred.doneUnsafe(disposing, Effect.void)
+        }).then(() => {
+          Deferred.doneUnsafe(disposeFinished, Effect.void)
+        })
+      })
+      yield* Effect.addFinalizer(() => Effect.sync(releaseDisposer))
+
+      const first = yield* store.load({ directory: dir })
+      const disposingContext = yield* store.disposeDirectory(dir).pipe(Effect.forkScoped({ startImmediately: true }))
+      yield* awaitWithTimeout(Deferred.await(disposing), "ready context disposer did not start")
+
+      const loadRefusal = yield* awaitWithTimeout(
+        Effect.exit(store.load({ directory: dir })),
+        "load did not refuse while an ordinary context disposer was active",
+        "3 seconds",
+      )
+      expect(Exit.isFailure(loadRefusal)).toBe(true)
+      if (Exit.isFailure(loadRefusal)) expect(Cause.pretty(loadRefusal.cause)).toContain("instance disposal is still running")
+      const reloadRefusal = yield* awaitWithTimeout(
+        Effect.exit(store.reload({ directory: dir })),
+        "reload did not refuse while an ordinary context disposer was active",
+        "3 seconds",
+      )
+      expect(Exit.isFailure(reloadRefusal)).toBe(true)
+      if (Exit.isFailure(reloadRefusal)) expect(Cause.pretty(reloadRefusal.cause)).toContain("instance disposal is still running")
+
+      yield* Effect.sync(releaseDisposer)
+      yield* awaitWithTimeout(Deferred.await(disposeFinished), "ready context disposer did not settle")
+      expect(Exit.isSuccess(yield* Fiber.await(disposingContext))).toBe(true)
+      const recovered = yield* store.load({ directory: dir })
+      expect(recovered).not.toBe(first)
+      yield* store.disposeDirectory(dir)
+    }),
+    { timeout: 20_000 },
   )
 
   it.live("dedupes concurrent disposeAll calls", () =>
