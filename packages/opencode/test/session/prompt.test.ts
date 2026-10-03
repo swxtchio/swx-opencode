@@ -4658,12 +4658,28 @@ registerEnvironmentTest(
 
           const prompt = yield* SessionPrompt.Service
           const sessions = yield* Session.Service
+          const status = yield* SessionStatus.Service
+          const events = yield* EventV2Bridge.Service
           const source = Schema.decodeUnknownSync(Schema.Struct({ messages: Schema.Array(SessionV1.WithParts) }))(
             Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(yield* Effect.promise(() => Bun.file(sourcePath).text())),
           )
           const chat = yield* sessions.create({
             title: "Dangling assistant shell",
             permission: [{ permission: "*", pattern: "*", action: "allow" }],
+          })
+          const shellOwnerEvent = yield* Deferred.make<SessionStatus.Info>()
+          const unsubscribe = yield* events.listen((event) => {
+            if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+            return Effect.gen(function* () {
+              const data = Schema.decodeUnknownSync(SessionStatus.Event.Status.data)(event.data)
+              if (
+                data.sessionID === chat.id &&
+                data.status.type === "busy" &&
+                data.status.activeAssistantMessageID !== undefined &&
+                data.status.activeAssistantMessageID !== null
+              )
+                yield* Deferred.succeed(shellOwnerEvent, data.status)
+            })
           })
           yield* Effect.forEach(
             source.messages,
@@ -4688,7 +4704,7 @@ registerEnvironmentTest(
             { discard: true },
           )
           yield* prompt.shell({ sessionID: chat.id, agent: "build", model: ref, command }).pipe(Effect.forkChild)
-          const messages = yield* pollWithTimeout(
+          const owner = yield* pollWithTimeout(
             Effect.gen(function* () {
               const history = yield* sessions.messages({ sessionID: chat.id })
               const assistant = history.findLast(
@@ -4702,15 +4718,25 @@ registerEnvironmentTest(
                       part.state.metadata?.output?.includes("started"),
                   ),
               )
-              return assistant ? history : undefined
+              if (!assistant || assistant.info.role !== "assistant") return
+              const currentStatus = yield* status.get(chat.id)
+              return currentStatus.type === "busy" && currentStatus.activeAssistantMessageID === assistant.info.id
+                ? { messages: history, status: currentStatus, assistantID: assistant.info.id }
+                : undefined
             }),
-            "the production shell tool did not persist its running output",
+            "the production shell owner did not publish its running assistant identity",
             "15 seconds",
           )
+          const statusEvent = yield* awaitWithTimeout(
+            Deferred.await(shellOwnerEvent),
+            "the running shell owner event did not include its assistant ID",
+            "15 seconds",
+          )
+          yield* unsubscribe
           const directory = yield* TestInstance
           const session = yield* sessions.get(chat.id)
           yield* Effect.promise(() =>
-            Bun.write(output, JSON.stringify({ session, messages, directory: directory.directory })),
+            Bun.write(output, JSON.stringify({ ...owner, session, statusEvent, directory: directory.directory })),
           )
           process.exit(0)
         }),
@@ -4816,6 +4842,130 @@ registerEnvironmentTest(
                 childStatus,
                 parentStatus,
                 directory: dir,
+              }),
+            ),
+          )
+          process.exit(0)
+        }),
+      { git: true, config: cfg },
+      30_000,
+    ),
+)
+
+registerEnvironmentTest(
+  "dangling-assistant-subtask-process-worker persists a direct subtask owner before process exit",
+  process.env.OPENCODE_DANGLING_SUBTASK_OUTPUT !== undefined,
+  () =>
+    it.instance(
+      "dangling-assistant-subtask-process-worker persists a direct subtask owner before process exit",
+      () =>
+        Effect.gen(function* () {
+          const output = process.env.OPENCODE_DANGLING_SUBTASK_OUTPUT
+          if (!output) return
+
+          const { dir, llm } = yield* useServerConfig(providerCfg)
+          const childFile = path.join(dir, "direct-subtask-child.txt")
+          yield* writeText(childFile, "direct subtask child result")
+          const prompt = yield* SessionPrompt.Service
+          const sessions = yield* Session.Service
+          const status = yield* SessionStatus.Service
+          const chat = yield* sessions.create({
+            title: "Direct subtask owner",
+            permission: [{ permission: "*", pattern: "*", action: "allow" }],
+          })
+          yield* llm.tool("read", { filePath: childFile })
+          yield* llm.error(429, {
+            error: { message: "Provider is rate limited", type: "rate_limit_error", code: "rate_limit_exceeded" },
+          })
+          yield* llm.hang
+          const parentUser = yield* user(chat.id, "start a direct subtask")
+          yield* sessions.updatePart({
+            id: PartID.ascending(),
+            messageID: parentUser.id,
+            sessionID: chat.id,
+            type: "subtask",
+            prompt: "read direct-subtask-child.txt, then report the result",
+            description: "Inspect direct subtask ownership",
+            agent: "general",
+            model: ref,
+          })
+          yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+          const active = yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const messages = yield* sessions.messages({ sessionID: chat.id })
+              const assistant = messages.findLast(
+                (message) => message.info.role === "assistant" && message.info.agent === "general",
+              )
+              if (!assistant || assistant.info.role !== "assistant") return
+              const task = assistant.parts.find(
+                (part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task",
+              )
+              const parentStatus = yield* status.get(chat.id)
+              if (
+                task?.state.status !== "running" ||
+                typeof task.state.metadata?.sessionId !== "string" ||
+                parentStatus.type !== "busy" ||
+                parentStatus.activeAssistantMessageID !== assistant.info.id
+              )
+                return
+              return {
+                messages,
+                assistantID: assistant.info.id,
+                childSessionID: SessionID.make(task.state.metadata.sessionId),
+              }
+            }),
+            "the direct subtask producer did not publish its active assistant owner",
+            "15 seconds",
+          )
+          const childStatus = yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const value = yield* status.get(active.childSessionID)
+              return value.type === "retry" ? value : undefined
+            }),
+            "the direct subtask child did not enter retry status",
+            "15 seconds",
+          )
+          const childMessages = yield* sessions.messages({ sessionID: active.childSessionID })
+          yield* prompt
+            .prompt({
+              sessionID: chat.id,
+              agent: "build",
+              model: ref,
+              parts: said("steer the active direct subtask"),
+            })
+            .pipe(Effect.forkChild)
+          const parentMessages = yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const messages = yield* sessions.messages({ sessionID: chat.id })
+              const last = messages.at(-1)
+              const parentStatus = yield* status.get(chat.id)
+              const hasSteer =
+                last?.info.role === "user" &&
+                last.parts.some((part) => part.type === "text" && part.text === "steer the active direct subtask")
+              return hasSteer &&
+                parentStatus.type === "busy" &&
+                parentStatus.activeAssistantMessageID === active.assistantID
+                ? messages
+                : undefined
+            }),
+            "the direct subtask lost ownership after a steer",
+            "15 seconds",
+          )
+          const parentStatus = yield* status.get(chat.id)
+          const session = yield* sessions.get(chat.id)
+          const directory = yield* TestInstance
+          yield* Effect.promise(() =>
+            Bun.write(
+              output,
+              JSON.stringify({
+                session,
+                messages: parentMessages,
+                assistantID: active.assistantID,
+                childSessionID: active.childSessionID,
+                childMessages,
+                childStatus,
+                parentStatus,
+                directory: directory.directory,
               }),
             ),
           )
@@ -4933,6 +5083,9 @@ registerEnvironmentTest(
             Schema.Struct({
               session: SessionV1.SessionInfo,
               messages: Schema.Array(SessionV1.WithParts),
+              assistantID: SessionV1.MessageID,
+              status: SessionStatus.Info,
+              statusEvent: SessionStatus.Info,
               directory: Schema.String,
             }),
           )(
@@ -4954,6 +5107,10 @@ registerEnvironmentTest(
               await rm(runningShell.directory, { recursive: true, force: true })
             }),
           )
+          if (runningShell.status.type !== "busy") throw new Error("expected the running shell owner status")
+          expect(runningShell.status.activeAssistantMessageID).toBe(runningShell.assistantID)
+          if (runningShell.statusEvent.type !== "busy") throw new Error("expected the running shell owner event")
+          expect(runningShell.statusEvent.activeAssistantMessageID).toBe(runningShell.assistantID)
           yield* Effect.promise(() => Bun.write(shellRelease, "release"))
           const pid = Number(yield* Effect.promise(() => Bun.file(shellPID).text()))
           if (alive(pid)) {
@@ -4978,7 +5135,7 @@ registerEnvironmentTest(
             Schema.Struct({
               session: SessionV1.SessionInfo,
               messages: Schema.Array(SessionV1.WithParts),
-              taskAssistantID: Schema.String,
+              taskAssistantID: SessionV1.MessageID,
               childSessionID: SessionID,
               childMessages: Schema.Array(SessionV1.WithParts),
               childStatus: SessionStatus.Info,
@@ -5011,22 +5168,113 @@ registerEnvironmentTest(
           if (taskSnapshot.parentStatus.type !== "busy") throw new Error("expected the Task parent busy status")
           expect(taskSnapshot.parentStatus.activeAssistantMessageID).toBe(taskSnapshot.taskAssistantID)
 
+          const subtaskOutput = path.join(dir, "running-subtask.json")
+          const subtaskWorker = runChild(
+            "dangling-assistant-subtask-process-worker",
+            { OPENCODE_DANGLING_SUBTASK_OUTPUT: subtaskOutput },
+            `${subtaskOutput}.db`,
+          )
+          yield* Effect.addFinalizer(() => Effect.sync(() => subtaskWorker.kill()))
+          const subtaskCode = yield* awaitWithTimeout(
+            Effect.promise(() => subtaskWorker.exited),
+            "the direct subtask worker did not exit after persisting its running Task",
+            "30 seconds",
+          )
+          expect(subtaskCode).toBe(0)
+          const subtaskSnapshot = Schema.decodeUnknownSync(
+            Schema.Struct({
+              session: SessionV1.SessionInfo,
+              messages: Schema.Array(SessionV1.WithParts),
+              assistantID: SessionV1.MessageID,
+              childSessionID: SessionID,
+              childMessages: Schema.Array(SessionV1.WithParts),
+              childStatus: SessionStatus.Info,
+              parentStatus: SessionStatus.Info,
+              directory: Schema.String,
+            }),
+          )(
+            Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(
+              yield* Effect.promise(() => Bun.file(subtaskOutput).text()),
+            ),
+          )
+          yield* Effect.addFinalizer(() =>
+            Effect.promise(() => rm(subtaskSnapshot.directory, { recursive: true, force: true })),
+          )
+          const subtaskAssistant = subtaskSnapshot.messages.find(
+            (message) => message.info.id === subtaskSnapshot.assistantID,
+          )
+          if (
+            !subtaskAssistant ||
+            subtaskAssistant.info.role !== "assistant" ||
+            subtaskAssistant.info.agent !== "general"
+          )
+            throw new Error("direct subtask producer did not preserve its assistant owner")
+          const subtaskPart = subtaskAssistant.parts.find(
+            (part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task",
+          )
+          if (!subtaskPart || subtaskPart.state.status !== "running")
+            throw new Error("direct subtask producer did not preserve its running Task part")
+          if (subtaskSnapshot.childStatus.type !== "retry")
+            throw new Error("expected the direct subtask child retry status")
+          expect(subtaskSnapshot.childStatus.activeAssistantMessageID).toBe(
+            subtaskSnapshot.childMessages.findLast((message) => message.info.role === "assistant")?.info.id,
+          )
+          if (subtaskSnapshot.parentStatus.type !== "busy")
+            throw new Error("expected the direct subtask parent busy status")
+          expect(subtaskSnapshot.parentStatus.activeAssistantMessageID).toBe(subtaskSnapshot.assistantID)
+          expect(subtaskSnapshot.messages.at(-1)?.info.role).toBe("user")
+
           const sessions = yield* Session.Service
           const prompt = yield* SessionPrompt.Service
           const status = yield* SessionStatus.Service
           const events = yield* EventV2Bridge.Service
+          const preAssistantShellAssistant = runningShell.messages.findLast(
+            (message) => message.info.role === "assistant" && message.info.id !== source.info.id,
+          )
+          if (!preAssistantShellAssistant || preAssistantShellAssistant.info.role !== "assistant")
+            throw new Error("the pre-assistant fixture has no running shell assistant")
+          const preAssistantShellParentID = preAssistantShellAssistant.info.parentID
+          const preAssistantShellUser = runningShell.messages.find(
+            (message) => message.info.id === preAssistantShellParentID,
+          )
+          if (!preAssistantShellUser || preAssistantShellUser.info.role !== "user")
+            throw new Error("the pre-assistant shell row has no user parent")
+          const preAssistantRows = [
+            ...serialized.messages,
+            preAssistantShellUser,
+            preAssistantShellAssistant,
+            ...taskSnapshot.messages,
+          ]
+          const preAssistantMessageIDs = new Map(
+            preAssistantRows.map((message) => [message.info.id, MessageID.ascending()] as const),
+          )
+          if (preAssistantMessageIDs.size !== preAssistantRows.length)
+            throw new Error("pre-assistant producer fixtures reuse a message ID")
+          const preAssistantOldAssistantID = preAssistantMessageIDs.get(source.info.id)
+          const preAssistantShellAssistantID = preAssistantMessageIDs.get(preAssistantShellAssistant.info.id)
+          const preAssistantTaskAssistantID = preAssistantMessageIDs.get(taskSnapshot.taskAssistantID)
+          if (!preAssistantOldAssistantID || !preAssistantShellAssistantID || !preAssistantTaskAssistantID)
+            throw new Error("pre-assistant producer rows were not rekeyed")
           const preAssistantChat = yield* sessions.create({
             title: "Pre-assistant owner signal",
             permission: [{ permission: "*", pattern: "*", action: "allow" }],
           })
           yield* Effect.forEach(
-            taskSnapshot.messages,
+            preAssistantRows,
             (message) =>
               Effect.gen(function* () {
-                const info = Schema.decodeUnknownSync(SessionV1.Info)({
-                  ...message.info,
-                  sessionID: preAssistantChat.id,
-                })
+                const id = preAssistantMessageIDs.get(message.info.id)
+                if (!id) throw new Error(`missing rekeyed pre-assistant message ID: ${message.info.id}`)
+                const info = Schema.decodeUnknownSync(SessionV1.Info)(
+                  message.info.role === "assistant"
+                    ? {
+                        ...message.info,
+                        id,
+                        parentID: preAssistantMessageIDs.get(message.info.parentID) ?? message.info.parentID,
+                        sessionID: preAssistantChat.id,
+                      }
+                    : { ...message.info, id, sessionID: preAssistantChat.id },
+                )
                 // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- the legacy writer requires mutable V1 records after schema validation
                 const mutableInfo = info as SessionV1.Info
                 yield* sessions.updateMessage(mutableInfo)
@@ -5035,6 +5283,8 @@ registerEnvironmentTest(
                   (part) => {
                     const validated = Schema.decodeUnknownSync(SessionV1.Part)({
                       ...part,
+                      id: PartID.ascending(),
+                      messageID: id,
                       sessionID: preAssistantChat.id,
                     })
                     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- the legacy writer requires mutable V1 parts after schema validation
@@ -5093,6 +5343,7 @@ registerEnvironmentTest(
           const preAssistantAssistant = preAssistantMessages.findLast((message) => message.info.role === "assistant")
           if (!preAssistantAssistant || preAssistantAssistant.info.role !== "assistant")
             throw new Error("the pre-assistant fixture has no prior assistant")
+          expect(preAssistantAssistant.info.id).toBe(preAssistantTaskAssistantID)
           const failedPreAssistantTurn = yield* awaitWithTimeout(
             Fiber.await(preAssistantPrompt),
             "the missing-agent pre-assistant turn did not terminate",
@@ -5219,9 +5470,14 @@ registerEnvironmentTest(
               JSON.stringify({
                 session: finalSession,
                 oldAssistantID: source.info.id,
-                shellAssistantID: runningShell.messages.findLast(
-                  (message) => message.info.role === "assistant" && message.info.id !== source.info.id,
-                )?.info.id,
+                shellAssistantID: runningShell.assistantID,
+                shellProducer: {
+                  session: runningShell.session,
+                  messages: runningShell.messages,
+                  assistantID: runningShell.assistantID,
+                  status: runningShell.status,
+                  statusEvent: runningShell.statusEvent,
+                },
                 taskAssistantID: taskSnapshot.taskAssistantID,
                 taskProducerSessionID: taskSnapshot.session.id,
                 taskProducerSession: taskSnapshot.session,
@@ -5230,10 +5486,13 @@ registerEnvironmentTest(
                 taskChildMessages: taskSnapshot.childMessages,
                 taskChildStatus: taskSnapshot.childStatus,
                 taskParentStatus: taskSnapshot.parentStatus,
+                directSubtask: subtaskSnapshot,
                 preAssistant: {
                   session: preAssistantSession,
                   messages: preAssistantMessages,
-                  assistantID: preAssistantAssistant.info.id,
+                  oldAssistantID: preAssistantOldAssistantID,
+                  shellAssistantID: preAssistantShellAssistantID,
+                  taskAssistantID: preAssistantTaskAssistantID,
                   status: preAssistantStatus,
                 },
                 currentAssistantID: activeAssistant.info.id,

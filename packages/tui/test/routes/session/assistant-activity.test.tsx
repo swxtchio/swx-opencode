@@ -51,8 +51,26 @@ type ActivityArmInfo = Schema.Schema.Type<typeof ActivityArm>
 const PreAssistantActivity = Schema.Struct({
   session: SessionV1.SessionInfo,
   messages: Schema.Array(SessionV1.WithParts),
+  oldAssistantID: SessionV1.MessageID,
+  shellAssistantID: SessionV1.MessageID,
+  taskAssistantID: SessionV1.MessageID,
+  status: ActivityStatus,
+})
+const ShellActivity = Schema.Struct({
+  session: SessionV1.SessionInfo,
+  messages: Schema.Array(SessionV1.WithParts),
   assistantID: SessionV1.MessageID,
   status: ActivityStatus,
+  statusEvent: ActivityStatus,
+})
+const DirectSubtaskActivity = Schema.Struct({
+  session: SessionV1.SessionInfo,
+  messages: Schema.Array(SessionV1.WithParts),
+  assistantID: SessionV1.MessageID,
+  childSessionID: Schema.String,
+  childMessages: Schema.Array(SessionV1.WithParts),
+  childStatus: ActivityStatus,
+  parentStatus: ActivityStatus,
 })
 const ActivitySnapshotSchema = Schema.Struct({
   session: SessionV1.SessionInfo,
@@ -66,6 +84,8 @@ const ActivitySnapshotSchema = Schema.Struct({
   taskChildMessages: Schema.Array(SessionV1.WithParts),
   taskChildStatus: ActivityStatus,
   taskParentStatus: ActivityStatus,
+  directSubtask: DirectSubtaskActivity,
+  shellProducer: ShellActivity,
   preAssistant: PreAssistantActivity,
   currentAssistantID: SessionV1.MessageID,
   completedAssistantID: SessionV1.MessageID,
@@ -136,6 +156,56 @@ function History(props: {
               <ReasoningPartView last={true} message={props.current.info} part={props.currentReasoning} />
               {props.currentRead && <ToolPartView last={true} message={props.current.info} part={props.currentRead} />}
             </box>
+          </SessionContext.Provider>
+        </LocationProvider>
+      </ThemeProvider>
+    </TuiConfigProvider>
+  )
+}
+
+function PreAssistantHistory(props: {
+  sessionID: string
+  old: ReturnType<typeof assistant>
+  shell: ReturnType<typeof assistant>
+  task: ReturnType<typeof assistant>
+  oldReasoning: Extract<Part, { type: "reasoning" }>
+  oldRead: Extract<Part, { type: "tool" }>
+  shellPart: Extract<Part, { type: "tool" }>
+  taskPart: Extract<Part, { type: "tool" }>
+  prepare: (sync: ReturnType<typeof useSync>) => void
+}) {
+  const sync = useSync()
+  const config = resolve({}, { terminalSuspend: false })
+  const sessionContext = {
+    width: 100,
+    sessionID: props.sessionID,
+    conceal: () => false,
+    thinkingMode: () => "show" as const,
+    showThinking: () => true,
+    showTimestamps: () => false,
+    showDetails: () => true,
+    showGenericToolOutput: () => false,
+    diffWrapMode: () => "word" as const,
+    providers: () => new Map(),
+    sync,
+    tui: config,
+  }
+
+  return (
+    <TuiConfigProvider config={config}>
+      <ThemeProvider mode="dark">
+        <LocationProvider>
+          <SessionContext.Provider value={sessionContext}>
+            <TaskInteractionProviders sessionID={props.sessionID}>
+              <TaskSeed prepare={props.prepare}>
+                <box flexDirection="column">
+                  <ReasoningPartView last={true} message={props.old.info} part={props.oldReasoning} />
+                  <ToolPartView last={true} message={props.old.info} part={props.oldRead} />
+                  <ToolPartView last={true} message={props.shell.info} part={props.shellPart} />
+                  <ToolPartView last={true} message={props.task.info} part={props.taskPart} />
+                </box>
+              </TaskSeed>
+            </TaskInteractionProviders>
           </SessionContext.Provider>
         </LocationProvider>
       </ThemeProvider>
@@ -275,14 +345,137 @@ function populatePreAssistant(sync: ReturnType<typeof useSync>, snapshot: Activi
   sync.set("capabilities", { ...sync.data.capabilities, experimentalBackgroundSubagents: true })
 }
 
-async function renderPreAssistant(snapshot: ActivitySnapshot, state: string) {
-  const old = assistant(snapshot.preAssistant.messages, snapshot.preAssistant.assistantID)
-  const part = tool(old.parts, "task")
+function populateShellOwner(sync: ReturnType<typeof useSync>, snapshot: ActivitySnapshot) {
+  // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- producer session is decoded and passed through the current SDK sync store
+  sync.set("session", [snapshot.shellProducer.session as unknown as Session])
+  sync.set(
+    "message",
+    snapshot.shellProducer.session.id,
+    snapshot.shellProducer.messages.map((row) => {
+      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- producer rows are decoded and passed through the current SDK sync store
+      return row.info as unknown as Message
+    }),
+  )
+  snapshot.shellProducer.messages.forEach((row) => {
+    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- producer parts are decoded and passed through the current SDK sync store
+    sync.set("part", row.info.id, row.parts as unknown as Part[])
+  })
+  sync.set("session_status", snapshot.shellProducer.session.id, snapshot.shellProducer.statusEvent as SessionStatus)
+}
+
+function populateDirectSubtask(sync: ReturnType<typeof useSync>, snapshot: ActivitySnapshot) {
+  const direct = snapshot.directSubtask
+  // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- producer session is decoded and passed through the current SDK sync store
+  sync.set("session", [direct.session as unknown as Session])
+  sync.set(
+    "message",
+    direct.session.id,
+    direct.messages.map((row) => {
+      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- producer rows are decoded and passed through the current SDK sync store
+      return row.info as unknown as Message
+    }),
+  )
+  direct.messages.forEach((row) => {
+    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- producer parts are decoded and passed through the current SDK sync store
+    sync.set("part", row.info.id, row.parts as unknown as Part[])
+  })
+  sync.set("session_status", direct.session.id, direct.parentStatus as SessionStatus)
+  sync.set(
+    "message",
+    direct.childSessionID,
+    direct.childMessages.map((row) => {
+      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- producer child rows are decoded and passed through the current SDK sync store
+      return row.info as unknown as Message
+    }),
+  )
+  direct.childMessages.forEach((row) => {
+    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- producer child parts are decoded and passed through the current SDK sync store
+    sync.set("part", row.info.id, row.parts as unknown as Part[])
+  })
+  sync.set("session_status", direct.childSessionID, direct.childStatus as SessionStatus)
+  sync.set("capabilities", { ...sync.data.capabilities, experimentalBackgroundSubagents: true })
+}
+
+async function renderShellOwner(snapshot: ActivitySnapshot, state: string) {
+  const shellAssistant = assistant(snapshot.shellProducer.messages, snapshot.shellProducer.assistantID)
+  const part = tool(shellAssistant.parts, "bash")
   const app = await mount(undefined, state, true, () => (
     <TaskActivity
-      sessionID={snapshot.preAssistant.session.id}
-      message={old}
+      sessionID={snapshot.shellProducer.session.id}
+      message={shellAssistant}
       part={part}
+      prepare={(sync) => populateShellOwner(sync, snapshot)}
+    />
+  ))
+  await wait(() => app.app.captureCharFrame().includes("started"))
+  await app.app.renderOnce()
+  return { app: app.app, frame: app.app.captureCharFrame() }
+}
+
+async function renderDirectSubtask(snapshot: ActivitySnapshot, state: string) {
+  const direct = snapshot.directSubtask
+  const message = assistant(direct.messages, direct.assistantID)
+  const part = tool(message.parts, "task")
+  const app = await mount(undefined, state, true, () => (
+    <TaskActivity
+      sessionID={direct.session.id}
+      message={message}
+      part={part}
+      prepare={(sync) => populateDirectSubtask(sync, snapshot)}
+    />
+  ))
+  await wait(() => app.app.captureCharFrame().includes("Inspect direct subtask ownership"))
+  await app.app.renderOnce()
+  return { app: app.app, frame: app.app.captureCharFrame(), sync: app.sync, message }
+}
+
+function populateHistoricalSubtask(sync: ReturnType<typeof useSync>, snapshot: ActivitySnapshot, arm: ActivityArmInfo) {
+  const latestAssistant = assistant(
+    arm.messages,
+    arm.status.type === "busy" ? snapshot.currentAssistantID : snapshot.completedAssistantID,
+  )
+  populateDirectSubtask(sync, snapshot)
+  sync.set("message", snapshot.directSubtask.session.id, [
+    ...snapshot.directSubtask.messages.map((row) => {
+      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- producer rows are decoded and passed through the current SDK sync store
+      return row.info as unknown as Message
+    }),
+    latestAssistant.info,
+  ])
+  sync.set("session_status", snapshot.directSubtask.session.id, arm.status as SessionStatus)
+}
+
+async function renderHistoricalSubtask(snapshot: ActivitySnapshot, arm: ActivityArmInfo, state: string) {
+  const direct = snapshot.directSubtask
+  const message = assistant(direct.messages, direct.assistantID)
+  const part = tool(message.parts, "task")
+  const app = await mount(undefined, state, true, () => (
+    <TaskActivity
+      sessionID={direct.session.id}
+      message={message}
+      part={part}
+      prepare={(sync) => populateHistoricalSubtask(sync, snapshot, arm)}
+    />
+  ))
+  await wait(() => app.app.captureCharFrame().includes("Inspect direct subtask ownership"))
+  await app.app.renderOnce()
+  return { app: app.app, frame: app.app.captureCharFrame(), sync: app.sync, message }
+}
+
+async function renderPreAssistant(snapshot: ActivitySnapshot, state: string) {
+  const old = assistant(snapshot.preAssistant.messages, snapshot.preAssistant.oldAssistantID)
+  const shell = assistant(snapshot.preAssistant.messages, snapshot.preAssistant.shellAssistantID)
+  const task = assistant(snapshot.preAssistant.messages, snapshot.preAssistant.taskAssistantID)
+  const app = await mount(undefined, state, true, () => (
+    <PreAssistantHistory
+      sessionID={snapshot.preAssistant.session.id}
+      old={old}
+      shell={shell}
+      task={task}
+      oldReasoning={reasoning(old.parts)}
+      oldRead={tool(old.parts, "read")}
+      shellPart={tool(shell.parts, "bash")}
+      taskPart={tool(task.parts, "task")}
       prepare={(sync) => populatePreAssistant(sync, snapshot)}
     />
   ))
@@ -441,26 +634,79 @@ describe("assistant activity rendering", () => {
       expect(snapshot.active.status.activeAssistantMessageID).toBe(snapshot.currentAssistantID)
       if (snapshot.taskParentStatus.type !== "busy") throw new Error("expected the Task producer owner status")
       expect(snapshot.taskParentStatus.activeAssistantMessageID).toBe(snapshot.taskAssistantID)
+      if (snapshot.shellProducer.status.type !== "busy") throw new Error("expected the running shell owner status")
+      expect(snapshot.shellProducer.status.activeAssistantMessageID).toBe(snapshot.shellProducer.assistantID)
+      if (snapshot.shellProducer.statusEvent.type !== "busy") throw new Error("expected the running shell owner event")
+      expect(snapshot.shellProducer.statusEvent.activeAssistantMessageID).toBe(snapshot.shellProducer.assistantID)
       expect(snapshot.taskProducerMessages.at(-1)?.info.role).toBe("user")
       if (snapshot.preAssistant.status.type !== "busy") throw new Error("expected the pre-assistant busy status")
       expect(snapshot.preAssistant.status.activeAssistantMessageID).toBeNull()
       expect(snapshot.preAssistant.messages.at(-1)?.info.role).toBe("user")
       expect(snapshot.preAssistant.messages.findLast((message) => message.info.role === "assistant")?.info.id).toBe(
-        snapshot.preAssistant.assistantID,
+        snapshot.preAssistant.taskAssistantID,
       )
+
+      const shellOwner = await renderShellOwner(snapshot, tmp.path)
+      try {
+        const shellLine = shellOwner.frame.split("\n").find(hasSpinner)
+        expect(shellLine).toBeDefined()
+        expect(shellOwner.frame).toContain("started")
+      } finally {
+        shellOwner.app.renderer.destroy()
+      }
+
+      if (snapshot.directSubtask.parentStatus.type !== "busy")
+        throw new Error("expected the direct subtask parent owner status")
+      expect(snapshot.directSubtask.parentStatus.activeAssistantMessageID).toBe(snapshot.directSubtask.assistantID)
+      if (snapshot.directSubtask.childStatus.type !== "retry")
+        throw new Error("expected the direct subtask child retry status")
+      expect(snapshot.directSubtask.messages.at(-1)?.info.role).toBe("user")
+      const directChildAssistant = snapshot.directSubtask.childMessages.findLast(
+        (message) => message.info.role === "assistant",
+      )
+      if (!directChildAssistant || directChildAssistant.info.role !== "assistant")
+        throw new Error("the direct subtask snapshot has no child assistant")
+      expect(snapshot.directSubtask.childStatus.activeAssistantMessageID).toBe(directChildAssistant.info.id)
+
+      const directSubtask = await renderDirectSubtask(snapshot, tmp.path)
+      try {
+        const taskLine = directSubtask.frame
+          .split("\n")
+          .find((line) => line.includes("Inspect direct subtask ownership"))
+        expect(assistantStatus(directSubtask.sync, directSubtask.message.info)).toBe("working")
+        if (!taskLine) throw new Error(`direct subtask row missing from rendered frame:\n${directSubtask.frame}`)
+        expect(hasSpinner(taskLine ?? "")).toBe(true)
+        expect(directSubtask.frame).toContain("Retrying")
+        expect(activeForegroundTasks(directSubtask.sync, [directSubtask.message.info])).toHaveLength(1)
+      } finally {
+        directSubtask.app.renderer.destroy()
+      }
 
       const preAssistant = await renderPreAssistant(snapshot, tmp.path)
       try {
         const lines = preAssistant.frame.split("\n")
+        const old = assistant(snapshot.preAssistant.messages, snapshot.preAssistant.oldAssistantID)
+        const shell = assistant(snapshot.preAssistant.messages, snapshot.preAssistant.shellAssistantID)
+        const task = assistant(snapshot.preAssistant.messages, snapshot.preAssistant.taskAssistantID)
+        const oldReasoning = lines.find((line) => line.includes("Thinking status unknown"))
+        const oldRead = lines.find((line) => line.includes("→ Read /tmp/unfinished.ts"))
+        const shellLine = lines.find((line) => line.includes("hold-shell."))
         const taskLine = lines.find((line) => line.includes("Inspect task ownership"))
-        const priorAssistant = assistant(snapshot.preAssistant.messages, snapshot.preAssistant.assistantID)
-        expect(preAssistant.sync.data.session_status[snapshot.preAssistant.session.id]).toMatchObject({
+        if (!oldReasoning || !oldRead || !shellLine || !taskLine)
+          throw new Error(`pre-assistant rows missing from rendered frame:\n${preAssistant.frame}`)
+        const preAssistantStatus = preAssistant.sync.data.session_status[snapshot.preAssistant.session.id]
+        if (!preAssistantStatus) throw new Error("pre-assistant status was not projected to the TUI store")
+        expect(preAssistantStatus).toMatchObject({
           type: "busy",
           activeAssistantMessageID: null,
         })
-        expect(assistantStatus(preAssistant.sync, priorAssistant.info)).toBe("unknown")
+        expect(assistantStatus(preAssistant.sync, old.info)).toBe("unknown")
+        expect(assistantStatus(preAssistant.sync, shell.info)).toBe("unknown")
+        expect(assistantStatus(preAssistant.sync, task.info)).toBe("unknown")
         expect(preAssistant.sync.session.status(snapshot.preAssistant.session.id)).toBe("working")
-        expect(taskLine).toBeDefined()
+        expect(hasSpinner(oldReasoning ?? "")).toBe(false)
+        expect(hasSpinner(oldRead ?? "")).toBe(false)
+        expect(hasSpinner(shellLine ?? "")).toBe(false)
         expect(hasSpinner(taskLine ?? "")).toBe(false)
         expect(taskLine).not.toContain("Retrying")
         expect(preAssistant.frame).not.toContain("task-child.txt")
@@ -519,23 +765,36 @@ describe("assistant activity rendering", () => {
 
       const historicalTask = await renderHistoricalTask(snapshot, snapshot.active, tmp.path)
       try {
-        expect(historicalTask.sync.data.session_status[snapshot.taskProducerSessionID]).toMatchObject({
-          activeAssistantMessageID: snapshot.currentAssistantID,
-        })
+        const historicalTaskStatus = historicalTask.sync.data.session_status[snapshot.taskProducerSessionID]
+        if (!historicalTaskStatus) throw new Error("historical Task status was not projected to the TUI store")
+        expect(historicalTaskStatus).toMatchObject({ activeAssistantMessageID: snapshot.currentAssistantID })
         expect(historicalTask.sync.data.message[snapshot.taskProducerSessionID]?.at(-1)?.id).toBe(
           snapshot.currentAssistantID,
         )
-        expect(activeForegroundTasks(historicalTask.sync, [historicalTask.message.info])).toEqual([])
         expect(assistantStatus(historicalTask.sync, historicalTask.message.info)).toBe("unknown")
-        const taskLine = historicalTask.frame.split("\n").find((line) => line.includes("Inspect task ownership"))
-        expect(taskLine, historicalTask.frame).toBeDefined()
-        expect(hasSpinner(taskLine ?? "")).toBe(false)
-        expect(taskLine).not.toContain("Retrying")
+        expect(activeForegroundTasks(historicalTask.sync, [historicalTask.message.info])).toEqual([])
+        expect(historicalTask.frame).toContain("Inspect task ownership")
+        expect(hasSpinner(historicalTask.frame)).toBe(false)
+        expect(historicalTask.frame).not.toContain("Retrying")
         expect(historicalTask.frame).not.toContain("task-child.txt")
         expect(historicalTask.frame).not.toContain("↳")
         expect(activeTaskRetry(snapshot.taskChildStatus as SessionStatus, false)).toBeUndefined()
       } finally {
         historicalTask.app.renderer.destroy()
+      }
+
+      const historicalSubtask = await renderHistoricalSubtask(snapshot, snapshot.active, tmp.path)
+      try {
+        expect(assistantStatus(historicalSubtask.sync, historicalSubtask.message.info)).toBe("unknown")
+        expect(activeForegroundTasks(historicalSubtask.sync, [historicalSubtask.message.info])).toEqual([])
+        if (!historicalSubtask.frame.includes("Inspect direct subtask ownership"))
+          throw new Error(`historical direct subtask row missing from rendered frame:\n${historicalSubtask.frame}`)
+        expect(hasSpinner(historicalSubtask.frame)).toBe(false)
+        expect(historicalSubtask.frame).not.toContain("Retrying")
+        expect(historicalSubtask.frame).not.toContain("direct-subtask-child.txt")
+        expect(historicalSubtask.frame).not.toContain("↳")
+      } finally {
+        historicalSubtask.app.renderer.destroy()
       }
 
       const nonOwner = await render(snapshot, snapshot.active, tmp.path, false)
