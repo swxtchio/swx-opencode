@@ -1,5 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
 import { SessionPromptQueueSequenceTable, SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
 import { MessageTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -159,7 +160,8 @@ const layer = Layer.effect(
       return next
     }
 
-    const exclusive: Interface["exclusive"] = (sessionID, effect) => semaphore(locks, sessionID).withPermit(effect)
+    const exclusive: Interface["exclusive"] = (sessionID, effect) =>
+      semaphore(locks, sessionID).withPermit(events.assertWritable(sessionID).pipe(Effect.andThen(effect)))
 
     // Admission, restore and send-now wake the session; called under its lock.
     const wake = (sessionID: SessionID) => {
@@ -176,11 +178,18 @@ const layer = Layer.effect(
 
     const list = Effect.fn("SessionQueue.list")(function* (sessionID: SessionID) {
       const rows = yield* db
-        .select()
-        .from(SessionPromptQueueTable)
-        .where(pending(sessionID))
-        .orderBy(asc(SessionPromptQueueTable.seq))
-        .all()
+        .transaction((tx) =>
+          Effect.gen(function* () {
+            yield* EventV2.assertReplayableIn(tx, sessionID)
+            return yield* tx
+              .select()
+              .from(SessionPromptQueueTable)
+              .where(pending(sessionID))
+              .orderBy(asc(SessionPromptQueueTable.seq))
+              .all()
+              .pipe(Effect.orDie)
+          }),
+        )
         .pipe(Effect.orDie)
       return [...rows.filter((row) => row.delivery === "steer"), ...rows.filter((row) => row.delivery !== "steer")].map(
         fromRow,
@@ -201,6 +210,7 @@ const layer = Layer.effect(
       const row = yield* db
         .transaction((tx) =>
           Effect.gen(function* () {
+            yield* events.assertWritable(input.sessionID)
             const allocated = yield* tx
               .insert(SessionPromptQueueSequenceTable)
               .values({ session_id: input.sessionID, seq: 1 })
@@ -262,8 +272,7 @@ const layer = Layer.effect(
             const duplicate = input.admission.messageID
               ? (yield* list(input.admission.sessionID)).find(
                   (item) =>
-                    item.input.messageID === input.admission.messageID &&
-                    sameQueuedInput(item.input, input.admission),
+                    item.input.messageID === input.admission.messageID && sameQueuedInput(item.input, input.admission),
                 )
               : undefined
             if (duplicate) return { kind: "queued" as const, own: duplicate, prepared }
@@ -383,9 +392,7 @@ const layer = Layer.effect(
       running.has(sessionID)
         ? Effect.succeed(true)
         : Effect.gen(function* () {
-            const history = yield* MessageV2.snapshot(sessionID).pipe(
-              Effect.provideService(Database.Service, database),
-            )
+            const history = yield* MessageV2.snapshot(sessionID).pipe(Effect.provideService(Database.Service, database))
             return openTasks(history.messages, {
               admissionOrder: history.admissionOrder,
               excludeNoReply: true,
@@ -757,7 +764,9 @@ export function openTasks(msgs: SessionV1.WithParts[], options: Parameters<typeo
   const stopped = new Set(
     msgs.flatMap((msg) => (msg.info.role === "assistant" && msg.info.error !== undefined ? [msg.info.parentID] : [])),
   )
-  return MessageV2.latest(msgs, options).tasks.filter((task) => task.type !== "compaction" || !stopped.has(task.messageID))
+  return MessageV2.latest(msgs, options).tasks.filter(
+    (task) => task.type !== "compaction" || !stopped.has(task.messageID),
+  )
 }
 
 // Rows hold the encoded input; `format`, for one, only becomes its class again

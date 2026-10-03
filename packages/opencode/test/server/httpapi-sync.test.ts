@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, mock } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Context, Effect, Layer } from "effect"
+import { eq } from "drizzle-orm"
 import { Flag } from "@opencode-ai/core/flag/flag"
+import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
+import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SyncPaths } from "../../src/server/routes/instance/httpapi/groups/sync"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import { Session } from "@/session/session"
@@ -9,10 +14,11 @@ import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { httpApiLayer, requestInDirectory } from "./httpapi-layer"
+import { applyRetentionFixture } from "../fixture/session-retention"
 
 const originalWorkspaces = Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
 const context = Context.empty() as Context.Context<unknown>
-const it = testEffect(Layer.mergeAll(LayerNode.compile(Session.node), httpApiLayer))
+const it = testEffect(Layer.mergeAll(LayerNode.compile(LayerNode.group([Session.node, Database.node])), httpApiLayer))
 
 afterEach(async () => {
   mock.restore()
@@ -68,6 +74,63 @@ describe("sync HttpApi", () => {
         })
         expect(replayed.status).toBe(200)
         expect(yield* replayed.json).toEqual({ sessionID: session.id })
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "refuses sync history and replay for a redacted aggregate before returning or decoding rows",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const headers = { "x-opencode-directory": tmp.directory, "content-type": "application/json" }
+        const session = yield* Session.use.create({ title: "sync retention sentinel" })
+        const { db } = yield* Database.Service
+        yield* applyRetentionFixture(session.id)
+
+        const before = yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, session.id)).all()
+        const sequence = yield* db
+          .select({ seq: EventSequenceTable.seq })
+          .from(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, session.id))
+          .get()
+        const history = yield* requestInDirectory(SyncPaths.history, tmp.directory, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({}),
+        })
+        expect(history.status).not.toBe(200)
+        expect(yield* history.text).not.toContain("sync retention sentinel")
+        const latestSequence = before.at(-1)?.seq ?? -1
+        for (const cursor of [-1, latestSequence]) {
+          const currentHistory = yield* requestInDirectory(SyncPaths.history, tmp.directory, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ [session.id]: cursor }),
+          })
+          expect(currentHistory.status).not.toBe(200)
+          expect(yield* currentHistory.text).not.toContain("sync retention sentinel")
+        }
+
+        const replay = yield* requestInDirectory(SyncPaths.replay, tmp.directory, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            directory: tmp.directory,
+            events: [
+              {
+                id: "evt_unreadable_replay",
+                aggregateID: session.id,
+                seq: (sequence?.seq ?? -1) + 1,
+                type: EventV2.versionedType(SessionV1.Event.MessageRemoved.type, 1),
+                data: { sessionID: session.id, messageID: SessionV1.MessageID.ascending() },
+              },
+            ],
+          }),
+        })
+        expect(replay.status).not.toBe(200)
+        expect(yield* replay.text).not.toContain("sync retention sentinel")
+        expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, session.id)).all()).toEqual(before)
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )

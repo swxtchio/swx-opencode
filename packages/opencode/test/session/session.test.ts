@@ -2,10 +2,22 @@ import { describe, expect } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
-import { eq } from "drizzle-orm"
+import { SessionExecution } from "@opencode-ai/core/session/execution"
+import { SessionStore } from "@opencode-ai/core/session/store"
+import { SessionV2 } from "@opencode-ai/core/session"
+import { Prompt } from "@opencode-ai/core/session/prompt"
+import { SessionEvent } from "@opencode-ai/core/session/event"
+import { SessionMessage } from "@opencode-ai/core/session/message"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
+import { SessionDurable } from "@opencode-ai/schema/durable-event-manifest"
+import path from "node:path"
+import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { desc, eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
-import { EventTable } from "@opencode-ai/core/event/sql"
+import { EventRetentionTable, EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
+import { PartTable, SessionInputTable, SessionTable, TodoTable } from "@opencode-ai/core/session/sql"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
@@ -20,6 +32,11 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InstanceStore } from "@/project/instance-store"
 import { InstanceBootstrap } from "@/project/bootstrap"
+import { SessionQueue } from "@/session/queue"
+import { Todo } from "@/session/todo"
+import { DbRetention, type RetentionEvidence, type SqliteAccess } from "@/cli/cmd/db-retention"
+import { applyRetentionFixture } from "../fixture/session-retention"
+import { readExport } from "@/cli/cmd/db-export-usage"
 
 const it = testEffect(
   AppNodeBuilder.build(
@@ -40,6 +57,30 @@ const it = testEffect(
     ],
   ),
 )
+const retentionIt = testEffect(
+  AppNodeBuilder.build(
+    LayerNode.group([
+      SessionNs.node,
+      SessionQueue.node,
+      Todo.node,
+      SessionV2.node,
+      SessionStore.node,
+      EventV2Bridge.node,
+      SessionProjector.node,
+      Database.node,
+      CrossSpawnSpawner.node,
+      InstanceStore.node,
+    ]),
+    [
+      [RuntimeFlags.node, RuntimeFlags.layer({ experimentalWorkspaces: false })],
+      [
+        InstanceBootstrap.node,
+        Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void })),
+      ],
+      [SessionExecution.node, SessionExecution.noopLayer],
+    ],
+  ),
+)
 
 const awaitDeferred = <T>(deferred: Deferred.Deferred<T>, message: string) =>
   Effect.race(
@@ -51,6 +92,69 @@ const awaitDeferredEffect = (wait: Effect.Effect<void>, message: string) =>
   Effect.race(wait, Effect.sleep("2 seconds").pipe(Effect.flatMap(() => Effect.fail(new Error(message)))))
 
 const remove = (id: SessionID) => SessionNs.use.remove(id)
+
+function retentionEvidence(sessionID: string, seq: number, ownerID: string | null, now: number): RetentionEvidence {
+  return {
+    policy: {
+      reviewed: true,
+      cutoffEpochMs: now + 60_000,
+      reviewedReference: "swxtchio/swx-opencode#97",
+      policyDigest: "fixture-policy-digest",
+      readerContractReviewed: true,
+      readerContractID: "fixture-reader-contract",
+    },
+    liveness: {
+      proofID: "producer-fixture-liveness",
+      observedAtEpochMs: now,
+      sessionIDs: [sessionID],
+      aggregateOwners: { [sessionID]: ownerID },
+      servingProcesses: [],
+      canResume: false,
+      unfinishedOwnedWork: false,
+      validThroughEpochMs: now + 60_000,
+    },
+    handoff: {
+      receiptID: "producer-fixture-receipt",
+      durable: true,
+      sessionIDs: [sessionID],
+      finalSequence: { [sessionID]: seq },
+      axes: {
+        billing: { status: "retained" },
+        provider: { status: "retained" },
+        servingModel: { status: "retained" },
+        routeAttribution: { status: "retained" },
+        reportedCost: { status: "retained" },
+        inputTokens: { status: "retained" },
+        outputTokens: { status: "retained" },
+        reasoningTokens: { status: "retained" },
+        cacheReadTokens: { status: "retained" },
+        cacheWriteTokens: { status: "retained" },
+        correctness: { status: "unavailable", cause: "fixture has no correctness producer" },
+        performance: { status: "unavailable", cause: "fixture has no performance producer" },
+      },
+      report: {
+        windowStart: "2026-10-01T00:00:00Z",
+        windowEnd: "2026-10-02T00:00:00Z",
+        resultDigest: "producer-fixture-report",
+        denominators: { sessions: 1 },
+        unavailableCauses: {
+          correctness: "fixture has no correctness producer",
+          performance: "fixture has no performance producer",
+        },
+        rawHistoryInaccessible: true,
+      },
+    },
+  }
+}
+
+function exportFixtureDatabase(db: Database.Interface["db"], filename: string) {
+  return Effect.gen(function* () {
+    const bytes = yield* (db.$client as unknown as { export: Effect.Effect<Uint8Array> }).export
+    yield* Effect.promise(() => Bun.write(filename, bytes))
+    const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
+    return new sqlite.Database(filename)
+  })
+}
 
 describe("session.created event", () => {
   it.instance("should emit session.created event when session is created", () =>
@@ -210,6 +314,331 @@ describe("step-finish token propagation via event", () => {
         yield* session.remove(info.id)
       }),
     { timeout: 30000 },
+  )
+})
+
+describe("Session retention producer path", () => {
+  retentionIt.instance("redacts Session-produced message and part copies and fences the modified aggregate", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const events = yield* EventV2Bridge.Service
+      const { db } = yield* Database.Service
+      const info = yield* session.create({ title: "retention title sentinel" })
+      const messageID = MessageID.ascending()
+      yield* session.updateMessage({
+        id: messageID,
+        sessionID: info.id,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "user",
+        model: { providerID: "provider-a", modelID: "requested-model" },
+      } as SessionV1.User)
+      const assistantMessageID = MessageID.ascending()
+      yield* session.updateMessage({
+        id: assistantMessageID,
+        sessionID: info.id,
+        role: "assistant",
+        time: { created: Date.now(), completed: Date.now() },
+        parentID: messageID,
+        modelID: ModelV2.ID.make("requested-model"),
+        providerID: ProviderV2.ID.make("firerouter"),
+        mode: "build",
+        agent: "build",
+        path: { cwd: info.directory, root: info.directory },
+        responseModelIDs: ["served-model"],
+        cost: 0.25,
+        tokens: { total: 32, input: 12, output: 17, reasoning: 3, cache: { read: 5, write: 7 } },
+      } as SessionV1.Assistant)
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        sessionID: info.id,
+        messageID: assistantMessageID,
+        type: "text",
+        text: "producer raw sentinel",
+      } as SessionV1.TextPart)
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        sessionID: info.id,
+        messageID: assistantMessageID,
+        type: "step-finish",
+        reason: "stop",
+        responseModelID: "served-model",
+        cost: 0.25,
+        tokens: { total: 32, input: 12, output: 17, reasoning: 3, cache: { read: 5, write: 7 } },
+      } as SessionV1.StepFinishPart)
+      yield* events.publish(SessionEvent.ContextUpdated, {
+        sessionID: SessionV2.ID.make(info.id),
+        messageID: SessionMessage.ID.create(),
+        timestamp: DateTime.makeUnsafe(Date.now()),
+        text: "v2 context sentinel",
+      })
+
+      const exportDirectory = yield* tmpdirScoped()
+      const beforeExportDB = yield* exportFixtureDatabase(db, path.join(exportDirectory, "usage-before.sqlite"))
+      yield* Effect.addFinalizer(() => Effect.sync(() => beforeExportDB.close()))
+      const exportBefore = readExport(beforeExportDB)
+
+      const { database: native, result, tree, eventIdentitiesBefore } = yield* applyRetentionFixture(info.id)
+      expect(tree.eligible).toBe(true)
+      expect(tree.aggregates[0]?.rows).toBeGreaterThan(0)
+      expect(result.state).toBe("complete")
+      const retainedPart = JSON.parse(
+        native
+          .query<
+            { data: string },
+            [string]
+          >("SELECT data FROM part WHERE session_id = ? AND json_extract(data, '$.type') = 'step-finish'")
+          .get(info.id)!.data,
+      ) as {
+        responseModelID?: string
+        cost: number
+        tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
+      }
+      expect(retainedPart).toMatchObject({
+        responseModelID: "served-model",
+        cost: 0.25,
+        tokens: { input: 12, output: 17, reasoning: 3, cache: { read: 5, write: 7 } },
+      })
+      const exportAfter = readExport(native)
+      const usageAxes = (archive: ReturnType<typeof readExport>) =>
+        archive.records.map((record) => ({
+          messages: record["messages"],
+          providerID: record["providerID"],
+          modelID: record["modelID"],
+          servedModelIDs: record["servedModelIDs"],
+          tokens: record["tokens"],
+          reportedCost: record["reportedCost"],
+        }))
+      expect(usageAxes(exportAfter)).toEqual(usageAxes(exportBefore))
+      expect(exportAfter.reportedCostTotal).toBe(exportBefore.reportedCostTotal)
+      expect(exportAfter.check.ok).toBe(exportBefore.check.ok)
+      const rawCopies = [
+        ...native
+          .query<{ data: string }, [string]>("SELECT data FROM event WHERE aggregate_id = ?")
+          .all(info.id)
+          .map((row) => row.data),
+        ...native
+          .query<{ data: string }, [string]>("SELECT data FROM message WHERE session_id = ?")
+          .all(info.id)
+          .map((row) => row.data),
+        ...native
+          .query<{ data: string }, [string]>("SELECT data FROM part WHERE session_id = ?")
+          .all(info.id)
+          .map((row) => row.data),
+        ...native
+          .query<{ data: string }, [string]>("SELECT data FROM session_message WHERE session_id = ?")
+          .all(info.id)
+          .map((row) => row.data),
+        native
+          .query<{ title: string; directory: string }, [string]>("SELECT title, directory FROM session WHERE id = ?")
+          .get(info.id),
+      ]
+      expect(JSON.stringify(rawCopies)).not.toContain("producer raw sentinel")
+      expect(JSON.stringify(rawCopies)).not.toContain("v2 context sentinel")
+      expect(JSON.stringify(rawCopies)).not.toContain("retention title sentinel")
+      expect(native.query("SELECT id, seq FROM event WHERE aggregate_id = ? ORDER BY seq").all(info.id)).toEqual(
+        eventIdentitiesBefore,
+      )
+
+      const historyPage = yield* EventV2.readAggregate(db, {
+        aggregateID: info.id,
+        after: -1,
+        limit: 100,
+        manifest: SessionDurable,
+      }).pipe(Effect.exit)
+      expect(Exit.isFailure(historyPage)).toBe(true)
+      expect(String(historyPage)).toContain(`Aggregate ${info.id} is unreplayable`)
+      const currentCursor = yield* EventV2.latestSequence(db, info.id)
+      const historyAfterCurrentCursor = yield* EventV2.readAggregate(db, {
+        aggregateID: info.id,
+        after: currentCursor,
+        limit: 100,
+        manifest: SessionDurable,
+      }).pipe(Effect.exit)
+      expect(Exit.isFailure(historyAfterCurrentCursor)).toBe(true)
+      expect(String(historyAfterCurrentCursor)).toContain(`Aggregate ${info.id} is unreplayable`)
+      const history = yield* events.durable({ aggregateID: info.id }).pipe(Stream.runCollect, Effect.exit)
+      expect(Exit.isFailure(history)).toBe(true)
+      expect(String(history)).toContain(`Aggregate ${info.id} is unreplayable`)
+      const replayRow = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, info.id))
+        .orderBy(desc(EventTable.seq))
+        .get()
+      const replay = yield* events
+        .replayAll([
+          {
+            id: replayRow!.id,
+            aggregateID: replayRow!.aggregate_id,
+            seq: replayRow!.seq,
+            type: replayRow!.type,
+            data: replayRow!.data,
+          },
+        ])
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(replay)).toBe(true)
+      expect(String(replay)).toContain(`Aggregate ${info.id} is unreplayable`)
+      const messages = yield* session.messages({ sessionID: info.id }).pipe(Effect.exit)
+      expect(Exit.isFailure(messages)).toBe(true)
+      const projectedPage = yield* MessageV2.page({ sessionID: info.id, limit: 20 }).pipe(Effect.exit)
+      expect(Exit.isFailure(projectedPage)).toBe(true)
+      const projectedSnapshot = yield* MessageV2.snapshot(info.id).pipe(Effect.exit)
+      expect(Exit.isFailure(projectedSnapshot)).toBe(true)
+      const projectedParts = yield* MessageV2.parts(messageID).pipe(Effect.exit)
+      expect(Exit.isFailure(projectedParts)).toBe(true)
+      const v2Session = yield* SessionV2.Service
+      const context = yield* v2Session.context(SessionV2.ID.make(info.id)).pipe(Effect.exit)
+      expect(Exit.isFailure(context)).toBe(true)
+      if (Exit.isFailure(context))
+        expect(Cause.squash(context.cause)).toBeInstanceOf(EventV2.UnreplayableAggregateError)
+      const v2Messages = yield* v2Session.messages({ sessionID: SessionV2.ID.make(info.id) }).pipe(Effect.exit)
+      expect(Exit.isFailure(v2Messages)).toBe(true)
+      const v2Message = yield* v2Session
+        .message({ sessionID: SessionV2.ID.make(info.id), messageID: SessionMessage.ID.make(messageID) })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(v2Message)).toBe(true)
+
+      const lateWrite = yield* session
+        .updatePart({
+          id: PartID.ascending(),
+          sessionID: info.id,
+          messageID,
+          type: "text",
+          text: "late raw sentinel",
+        } as SessionV1.TextPart)
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(lateWrite)).toBe(true)
+      expect(
+        yield* db.select({ id: PartTable.id }).from(PartTable).where(eq(PartTable.session_id, info.id)).all(),
+      ).toHaveLength(2)
+      const queue = yield* SessionQueue.Service
+      const queuedWrite = yield* queue
+        .admit({ sessionID: info.id, delivery: "queue", parts: [{ type: "text", text: "late queue sentinel" }] })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(queuedWrite)).toBe(true)
+      expect(
+        yield* db
+          .select({ id: SessionPromptQueueTable.id })
+          .from(SessionPromptQueueTable)
+          .where(eq(SessionPromptQueueTable.session_id, info.id))
+          .all(),
+      ).toHaveLength(0)
+      const admittedWrite = yield* v2Session
+        .prompt({
+          sessionID: SessionV2.ID.make(info.id),
+          prompt: Prompt.make({ text: "late V2 input sentinel" }),
+          resume: false,
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(admittedWrite)).toBe(true)
+      expect(
+        yield* db
+          .select({ id: SessionInputTable.id })
+          .from(SessionInputTable)
+          .where(eq(SessionInputTable.session_id, info.id))
+          .all(),
+      ).toHaveLength(0)
+      const todo = yield* Todo.Service
+      const todoWrite = yield* todo
+        .update({
+          sessionID: info.id,
+          todos: [{ content: "late todo sentinel", status: "pending", priority: "high" }],
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(todoWrite)).toBe(true)
+      expect(
+        yield* db
+          .select({ position: TodoTable.position })
+          .from(TodoTable)
+          .where(eq(TodoTable.session_id, info.id))
+          .all(),
+      ).toHaveLength(0)
+
+      const other = yield* session.create({})
+      const otherMessageID = MessageID.ascending()
+      yield* session.updateMessage({
+        id: otherMessageID,
+        sessionID: other.id,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "user",
+        model: { providerID: "provider-a", modelID: "requested-model" },
+      } as SessionV1.User)
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        sessionID: other.id,
+        messageID: otherMessageID,
+        type: "text",
+        text: "other session remains writable",
+      } as SessionV1.TextPart)
+      expect(
+        yield* db.select({ id: PartTable.id }).from(PartTable).where(eq(PartTable.session_id, other.id)).all(),
+      ).toHaveLength(1)
+
+      yield* session.remove(info.id)
+      expect(yield* db.select().from(SessionTable).where(eq(SessionTable.id, info.id)).get()).toBeUndefined()
+      expect(
+        yield* db
+          .select({ state: EventRetentionTable.state })
+          .from(EventRetentionTable)
+          .where(eq(EventRetentionTable.aggregate_id, info.id))
+          .get(),
+      ).toEqual({ state: "complete" })
+    }),
+  )
+
+  retentionIt.instance("marks V1 queue and V2 admitted input producers ineligible", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const queue = yield* SessionQueue.Service
+      const v2 = yield* SessionV2.Service
+      const { db } = yield* Database.Service
+      const directory = yield* tmpdirScoped()
+      const databasePath = path.join(directory, "retention-inputs.sqlite")
+      const queued = yield* session.create({})
+      yield* queue.admit({ sessionID: queued.id, delivery: "queue", parts: [{ type: "text", text: "queue sentinel" }] })
+      const admitted = yield* session.create({})
+      yield* v2.prompt({
+        sessionID: SessionV2.ID.make(admitted.id),
+        prompt: Prompt.make({ text: "v2 input sentinel" }),
+        resume: false,
+      })
+      const native = yield* exportFixtureDatabase(db, databasePath)
+      yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
+      const now = Date.now()
+      const queuedProof = retentionEvidence(
+        queued.id,
+        yield* EventV2.latestSequence(db, queued.id),
+        (yield* db
+          .select({ ownerID: EventSequenceTable.owner_id })
+          .from(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, queued.id))
+          .get())?.ownerID ?? null,
+        now,
+      )
+      const queuedTree = DbRetention.inventory(native as unknown as SqliteAccess, queuedProof, now).trees.find(
+        (item) => item.rootSessionID === queued.id,
+      )
+      expect(queuedTree?.reasons).toContain("v1-prompt-queue-row-present")
+      expect(queuedTree?.eligible).toBe(false)
+
+      const admittedProof = retentionEvidence(
+        admitted.id,
+        yield* EventV2.latestSequence(db, admitted.id),
+        (yield* db
+          .select({ ownerID: EventSequenceTable.owner_id })
+          .from(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, admitted.id))
+          .get())?.ownerID ?? null,
+        now,
+      )
+      const admittedTree = DbRetention.inventory(native as unknown as SqliteAccess, admittedProof, now).trees.find(
+        (item) => item.rootSessionID === admitted.id,
+      )
+      expect(admittedTree?.reasons).toContain("v2-input-pending")
+      expect(admittedTree?.eligible).toBe(false)
+    }),
   )
 })
 

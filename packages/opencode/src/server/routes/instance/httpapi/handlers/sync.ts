@@ -72,15 +72,31 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
     const history = Effect.fn("SyncHttpApi.history")(function* (ctx: { payload: typeof HistoryPayload.Type }) {
       const exclude = Object.entries(ctx.payload)
       return yield* db
-        .select()
-        .from(EventTable)
-        .where(
-          exclude.length > 0
-            ? not(or(...exclude.map(([id, seq]) => and(eq(EventTable.aggregate_id, id), lte(EventTable.seq, seq))))!)
-            : undefined,
+        .transaction(() =>
+          Effect.gen(function* () {
+            const rows = yield* db
+              .select()
+              .from(EventTable)
+              .where(
+                exclude.length > 0
+                  ? not(
+                      or(
+                        ...exclude.map(([id, seq]) => and(eq(EventTable.aggregate_id, id), lte(EventTable.seq, seq))),
+                      )!,
+                    )
+                  : undefined,
+              )
+              .orderBy(asc(EventTable.seq))
+              .all()
+              .pipe(Effect.orDie)
+            yield* Effect.forEach(
+              new Set([...Object.keys(ctx.payload), ...rows.map((event) => event.aggregate_id)]),
+              (aggregateID) => events.assertReplayable(aggregateID),
+              { discard: true },
+            )
+            return rows
+          }),
         )
-        .orderBy(asc(EventTable.seq))
-        .all()
         .pipe(Effect.orDie)
     })
 

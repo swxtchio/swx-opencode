@@ -9,6 +9,7 @@ import { Decimal } from "decimal.js"
 import type { ProviderMetadata, Usage } from "@opencode-ai/llm"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionV2 } from "@opencode-ai/core/session"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
@@ -671,16 +672,23 @@ const layer: Layer.Layer<
 
     const getPart: Interface["getPart"] = Effect.fn("Session.getPart")(function* (input) {
       const row = yield* db
-        .select()
-        .from(PartTable)
-        .where(
-          and(
-            eq(PartTable.session_id, input.sessionID),
-            eq(PartTable.message_id, input.messageID),
-            eq(PartTable.id, input.partID),
-          ),
+        .transaction((tx) =>
+          Effect.gen(function* () {
+            yield* EventV2.assertReplayableIn(tx, input.sessionID)
+            return yield* tx
+              .select()
+              .from(PartTable)
+              .where(
+                and(
+                  eq(PartTable.session_id, input.sessionID),
+                  eq(PartTable.message_id, input.messageID),
+                  eq(PartTable.id, input.partID),
+                ),
+              )
+              .get()
+              .pipe(Effect.orDie)
+          }),
         )
-        .get()
         .pipe(Effect.orDie)
       if (!row) return
       return {
@@ -853,6 +861,7 @@ const layer: Layer.Layer<
     })
 
     const messages: Interface["messages"] = Effect.fn("Session.messages")(function* (input) {
+      yield* events.assertReplayable(input.sessionID)
       if (input.limit) {
         return (yield* MessageV2.page({ sessionID: input.sessionID, limit: input.limit }).pipe(
           Effect.provideService(Database.Service, database),
@@ -908,11 +917,13 @@ const layer: Layer.Layer<
       field: string
       delta: string
     }) {
+      yield* events.assertWritable(input.sessionID)
       yield* events.publish(MessageV2.Event.PartDelta, input)
     })
 
     /** Finds the first message matching the predicate, searching newest-first. */
     const findMessage: Interface["findMessage"] = Effect.fn("Session.findMessage")(function* (sessionID, predicate) {
+      yield* events.assertReplayable(sessionID)
       const size = 50
       let before: string | undefined
       while (true) {

@@ -6,6 +6,7 @@ import { eq } from "drizzle-orm"
 import { asc } from "drizzle-orm"
 import { TodoTable } from "@opencode-ai/core/session/sql"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { EventV2 } from "@opencode-ai/core/event"
 import { SessionTodo } from "@opencode-ai/schema/session-todo"
 
 export const Info = SessionTodo.Info
@@ -30,6 +31,7 @@ const layer = Layer.effect(
       yield* db
         .transaction((tx) =>
           Effect.gen(function* () {
+            yield* events.assertWritable(input.sessionID)
             yield* tx.delete(TodoTable).where(eq(TodoTable.session_id, input.sessionID)).run()
             if (input.todos.length === 0) return
             yield* tx
@@ -51,18 +53,25 @@ const layer = Layer.effect(
     })
 
     const get = Effect.fn("Todo.get")(function* (sessionID: SessionID) {
-      const rows = yield* db
-        .select()
-        .from(TodoTable)
-        .where(eq(TodoTable.session_id, sessionID))
-        .orderBy(asc(TodoTable.position))
-        .all()
+      return yield* db
+        .transaction((tx) =>
+          Effect.gen(function* () {
+            yield* EventV2.assertReplayableIn(tx, sessionID)
+            const rows = yield* tx
+              .select()
+              .from(TodoTable)
+              .where(eq(TodoTable.session_id, sessionID))
+              .orderBy(asc(TodoTable.position))
+              .all()
+              .pipe(Effect.orDie)
+            return rows.map((row) => ({
+              content: row.content,
+              status: row.status,
+              priority: row.priority,
+            }))
+          }),
+        )
         .pipe(Effect.orDie)
-      return rows.map((row) => ({
-        content: row.content,
-        status: row.status,
-        priority: row.priority,
-      }))
     })
 
     return Service.of({ update, get })
