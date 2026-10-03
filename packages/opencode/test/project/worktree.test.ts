@@ -595,6 +595,8 @@ describe("Worktree", () => {
             "20 seconds",
           )
           expect(hasInstancePromises(info.directory)).toBe(true)
+          const joiner = yield* store.load({ directory: info.directory }).pipe(Effect.forkScoped({ startImmediately: true }))
+          expect(joiner.pollUnsafe()).toBeUndefined()
 
           removalFiber = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkDetach({ startImmediately: true }))
           const removalResult = yield* Effect.exit(
@@ -644,15 +646,21 @@ describe("Worktree", () => {
           }
           writer.end("---\ndescription: held config command\n---\necho ready\n")
           yield* awaitWithTimeout(Effect.promise(() => finished(writer)), "held ConfigCommand reader did not finish", "15 seconds")
+          const joined = yield* awaitWithTimeout(
+            Fiber.await(joiner),
+            "concurrent load did not join the live ConfigCommand bootstrap",
+            "15 seconds",
+          )
+          expect(Exit.isSuccess(joined)).toBe(true)
           const loaded = yield* pollWithTimeout(
             store.load({ directory: info.directory }).pipe(
-              Effect.as(true),
+              Effect.map((context) => context),
               Effect.catchCause(() => Effect.succeed(undefined)),
             ),
             "load did not recover after ConfigCommand.load settled",
             "25 seconds",
           )
-          expect(loaded).toBe(true)
+          if (Exit.isSuccess(joined)) expect(loaded).toBe(joined.value)
 
           expect(yield* svc.remove({ directory: info.directory })).toBe(true)
           expect(yield* fs.exists(info.directory)).toBe(false)

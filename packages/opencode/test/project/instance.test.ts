@@ -110,6 +110,56 @@ describe("InstanceStore", () => {
     }),
   )
 
+  it.live("joins healthy live loads and waits for their producer before reloading", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const started = yield* Deferred.make<void>()
+      let release = () => {}
+      let firstBootstrap = true
+
+      yield* setBootstrap(
+        Effect.gen(function* () {
+          const context = yield* InstanceRef
+          if (!firstBootstrap || context?.directory !== dir) return
+          firstBootstrap = false
+          yield* InstancePromise.from(
+            () =>
+              new Promise<void>((resolve) => {
+                release = resolve
+                Deferred.doneUnsafe(started, Effect.void)
+              }),
+          )
+        }),
+      )
+      yield* Effect.addFinalizer(() => Effect.sync(release))
+
+      const first = yield* store.load({ directory: dir }).pipe(Effect.forkScoped({ startImmediately: true }))
+      yield* awaitWithTimeout(Deferred.await(started), "bootstrap owner did not start")
+      const ownerTracked = yield* pollWithTimeout(
+        Effect.sync(() => (hasInstancePromises(dir) ? true : undefined)),
+        "bootstrap Promise was not tracked",
+      )
+      expect(ownerTracked).toBe(true)
+      const joined = yield* store.load({ directory: dir }).pipe(Effect.forkScoped({ startImmediately: true }))
+      expect(joined.pollUnsafe()).toBeUndefined()
+      const reloading = yield* store.reload({ directory: dir }).pipe(Effect.forkScoped({ startImmediately: true }))
+      expect(reloading.pollUnsafe()).toBeUndefined()
+
+      release()
+      const [firstExit, joinedExit, reloadExit] = yield* Effect.all([
+        Fiber.await(first),
+        Fiber.await(joined),
+        Fiber.await(reloading),
+      ])
+      expect(Exit.isSuccess(firstExit)).toBe(true)
+      expect(Exit.isSuccess(joinedExit)).toBe(true)
+      expect(Exit.isSuccess(reloadExit)).toBe(true)
+      if (Exit.isSuccess(firstExit) && Exit.isSuccess(joinedExit)) expect(joinedExit.value).toBe(firstExit.value)
+      if (Exit.isSuccess(reloadExit)) expect(reloadExit.value.directory).toBe(dir)
+    }),
+  )
+
   it.live("caches loaded instance context by directory", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped({ git: true })
@@ -245,6 +295,7 @@ describe("InstanceStore", () => {
         }
         let heldOwner: ReturnType<typeof makeOwner> | undefined
         let firstLoading: Fiber.Fiber<InstanceContext, never> | undefined
+        let firstJoiner: Fiber.Fiber<InstanceContext, never> | undefined
         let secondLoading: Fiber.Fiber<InstanceContext, never> | undefined
         let firstDisposal: Fiber.Fiber<void, never> | undefined
         let secondDisposal: Fiber.Fiber<void, never> | undefined
@@ -275,6 +326,8 @@ describe("InstanceStore", () => {
           "first bootstrap Promise was not tracked",
         )
         expect(firstOwnerTracked).toBe(true)
+        firstJoiner = yield* store.load({ directory: badFirst }).pipe(Effect.forkScoped({ startImmediately: true }))
+        expect(firstJoiner.pollUnsafe()).toBeUndefined()
         yield* store.load({ directory: healthyLater })
 
         firstDisposal = yield* store.disposeAll().pipe(Effect.forkScoped({ startImmediately: true }))
@@ -292,10 +345,27 @@ describe("InstanceStore", () => {
         if (Exit.isFailure(firstFailure)) expect(Cause.pretty(firstFailure.cause)).toContain("failed to dispose 1 instance(s)")
         expect(disposed).toEqual([healthyLater])
         expect(hasInstancePromises(badFirst)).toBe(true)
+        const quarantinedLoad = yield* Effect.exit(
+          awaitWithTimeout(
+            Effect.exit(store.load({ directory: badFirst })),
+            "load did not refuse an owner quarantined by a cleanup refusal",
+            "5 seconds",
+          ),
+        )
+        expect(Exit.isSuccess(quarantinedLoad)).toBe(true)
+        if (Exit.isSuccess(quarantinedLoad)) {
+          expect(Exit.isFailure(quarantinedLoad.value)).toBe(true)
+          if (Exit.isFailure(quarantinedLoad.value))
+            expect(Cause.pretty(quarantinedLoad.value.cause)).toContain("instance bootstrap Promise is still running")
+        }
 
         heldOwner.release()
-        expect(Exit.isSuccess(yield* Fiber.await(firstLoading))).toBe(true)
+        const [firstExit, joinedExit] = yield* Effect.all([Fiber.await(firstLoading), Fiber.await(firstJoiner)])
+        expect(Exit.isSuccess(firstExit)).toBe(true)
+        expect(Exit.isSuccess(joinedExit)).toBe(true)
+        if (Exit.isSuccess(firstExit) && Exit.isSuccess(joinedExit)) expect(joinedExit.value).toBe(firstExit.value)
         firstLoading = undefined
+        firstJoiner = undefined
         const firstRecovery = yield* Effect.exit(
           awaitWithTimeout(store.disposeAll(), "disposeAll did not recover after the first owner settled", "15 seconds"),
         )

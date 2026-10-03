@@ -260,12 +260,20 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         return { pending: remaining, settled: true }
       })
 
+    const hasLiveLoadProducer = Effect.fnUntraced(function* (entry: Entry) {
+      const fiber = yield* Deferred.await(entry.loadFiber).pipe(
+        Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.succeed(undefined) }),
+      )
+      return fiber !== undefined && (fiber.pollUnsafe() === undefined || Deferred.isDoneUnsafe(entry.deferred))
+    })
+
     const settleReadyBootstrapPromises = Effect.fnUntraced(function* (directory: string, entry?: Entry) {
       if (hasPromiseQuarantine(entry) && !isReadyInstance(entry)) return false
       if (hasInstancePromises(directory)) {
         if (!isReadyInstance(entry)) {
-          quarantinePromiseOwners(entry)
-          return false
+          if (!entry || !(yield* hasLiveLoadProducer(entry))) return false
+          const completed = yield* Deferred.await(entry.deferred).pipe(Effect.exit)
+          if (Exit.isFailure(completed)) return false
         }
         const settlement = yield* settleTrackedPromises(directory, [])
         if (!settlement.settled) {
@@ -448,22 +456,6 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
           }
           const existing = cache.get(directory)
-          if (hasInstancePromises(directory)) {
-            quarantinePromiseOwners(existing)
-            return yield* Effect.die(new Error(`instance bootstrap Promise is still running for ${directory}`))
-          }
-          if (existing && hasPromiseQuarantine(existing)) {
-            const context = yield* restore(
-              Deferred.await(existing.deferred).pipe(
-                Effect.timeoutOrElse({
-                  duration: "8 seconds",
-                  orElse: () => Effect.die(new Error(`instance load is still recovering for ${directory}`)),
-                }),
-              ),
-            )
-            clearPromiseQuarantine(existing)
-            return context
-          }
           const disposal = disposerRuns.get(directory)
           const reloadGroup = existing?.reloadGroup
           if (
@@ -475,6 +467,27 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
               disposal.reloadGroup !== reloadGroup)
           ) {
             return yield* Effect.die(new Error(`instance disposal is still running for ${directory}`))
+          }
+          if (existing && hasPromiseQuarantine(existing)) {
+            if (hasInstancePromises(directory)) {
+              return yield* Effect.die(new Error(`instance bootstrap Promise is still running for ${directory}`))
+            }
+            const context = yield* restore(
+              Deferred.await(existing.deferred).pipe(
+                Effect.timeoutOrElse({
+                  duration: "8 seconds",
+                  orElse: () => Effect.die(new Error(`instance load is still recovering for ${directory}`)),
+                }),
+              ),
+            )
+            clearPromiseQuarantine(existing)
+            return context
+          }
+          if (hasInstancePromises(directory)) {
+            if (!existing || !(yield* restore(hasLiveLoadProducer(existing)))) {
+              return yield* Effect.die(new Error(`instance bootstrap Promise is still running for ${directory}`))
+            }
+            return yield* restore(Deferred.await(existing.deferred))
           }
           if (existing) return yield* restore(Deferred.await(existing.deferred))
 
@@ -506,6 +519,17 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
           }
           const beforeOwnerSettlement = cache.get(directory)
+          const activeDisposal = disposerRuns.get(directory)
+          const activeReloadGroup = beforeOwnerSettlement?.reloadGroup
+          if (
+            activeDisposal &&
+            (!activeReloadGroup ||
+              activeReloadGroup.completed ||
+              activeReloadGroup.current !== beforeOwnerSettlement ||
+              activeDisposal.reloadGroup !== activeReloadGroup)
+          ) {
+            return yield* Effect.die(new Error(`instance disposal is still running for ${directory}`))
+          }
           if (!(yield* restore(settleReadyBootstrapPromises(directory, beforeOwnerSettlement)))) {
             const reason = hasInstancePromises(directory)
               ? `instance bootstrap Promise is still running`
