@@ -14,54 +14,63 @@
         "aarch64-darwin"
         "x86_64-darwin"
       ];
-      forEachSystem = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      forEachSystem = f:
+        nixpkgs.lib.genAttrs systems (
+          system:
+          let
+            pkgs = nixpkgs.legacyPackages.${system};
+            bun = pkgs.callPackage ./nix/bun.nix { };
+          in
+          f pkgs bun
+        );
       rev = self.shortRev or self.dirtyShortRev or "dirty";
     in
     {
-      devShells = forEachSystem (pkgs: {
+      devShells = forEachSystem (pkgs: bun: {
         default = pkgs.mkShell {
-          packages = with pkgs; [
-            bun
-            nodejs_20
-            pkg-config
-            openssl
-            git
-          ];
+          packages = [ bun pkgs.nodejs_20 pkgs.pkg-config pkgs.openssl pkgs.git ];
         };
       });
 
       overlays = {
         default =
-          final: _prev:
+          final: prev:
           let
+            bun = final.callPackage ./nix/bun.nix { bun = prev.bun; };
             node_modules = final.callPackage ./nix/node_modules.nix {
+              # This fixed-output derivation only materializes dependencies; binary builds use the fixed Bun.
+              bun = prev.bun;
               inherit rev;
             };
-          in
-          rec {
             opencode = final.callPackage ./nix/opencode.nix {
-              inherit node_modules;
+              inherit bun node_modules;
             };
+          in
+          {
+            inherit bun opencode;
             opencode-desktop = final.callPackage ./nix/desktop.nix {
-              inherit opencode;
+              inherit bun opencode;
             };
           };
       };
 
       packages = forEachSystem (
-        pkgs:
+        pkgs: bun:
         let
           node_modules = pkgs.callPackage ./nix/node_modules.nix {
+            # This fixed-output derivation only materializes dependencies; binary builds use the fixed Bun.
+            bun = pkgs.bun;
             inherit rev;
           };
-        in
-        rec {
-          default = opencode;
           opencode = pkgs.callPackage ./nix/opencode.nix {
-            inherit node_modules;
+            inherit bun node_modules;
           };
+        in
+        {
+          default = opencode;
+          inherit opencode;
           opencode-desktop = pkgs.callPackage ./nix/desktop.nix {
-            inherit opencode;
+            inherit bun opencode;
           };
           # Updater derivation with fakeHash - build fails and reveals correct hash
           node_modules_updater = node_modules.override {
