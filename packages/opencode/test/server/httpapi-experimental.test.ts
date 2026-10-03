@@ -16,6 +16,7 @@ import { Worktree } from "../../src/worktree"
 import { registerDisposer } from "../../src/effect/instance-registry"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
+import { Project } from "../../src/project/project"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -66,6 +67,7 @@ const failedWorktreeIt = testEffect(
 const failedWorktreeMutation = process.platform === "win32" ? failedWorktreeIt.instance.skip : failedWorktreeIt.instance
 let admissionDirectory: string | undefined
 let admissionSignal: Deferred.Deferred<void> | undefined
+let admissionReloadSignal: Deferred.Deferred<void> | undefined
 const observingInstanceStore = Layer.effect(
   InstanceStore.Service,
   Effect.gen(function* () {
@@ -81,6 +83,15 @@ const observingInstanceStore = Layer.effect(
           return yield* store.load(input)
         })
       },
+      reload: (input) => {
+        if (input.directory !== admissionDirectory || !admissionReloadSignal) return store.reload(input)
+        const signal = admissionReloadSignal
+        admissionReloadSignal = undefined
+        return Effect.gen(function* () {
+          yield* Deferred.succeed(signal, undefined)
+          return yield* store.reload(input)
+        })
+      },
     })
   }),
 ).pipe(
@@ -88,10 +99,47 @@ const observingInstanceStore = Layer.effect(
     LayerNode.compile(InstanceStore.node, [[InstanceStore.bootstrapNode, InstanceBootstrap.node]]),
   ),
 )
+type ProjectInitGate = {
+  directory: string
+  firstStarted: Deferred.Deferred<void>
+  releaseFirst: Deferred.Deferred<void>
+  secondStarted: Deferred.Deferred<void>
+  releaseSecond: Deferred.Deferred<void>
+  calls: number
+}
+let projectInitGate: ProjectInitGate | undefined
+const overlappingProject = Layer.effect(
+  Project.Service,
+  Effect.gen(function* () {
+    const project = yield* Project.Service
+    return Project.Service.of({
+      ...project,
+      initGit: (input) => {
+        const gate = projectInitGate
+        if (!gate || input.directory !== gate.directory) return project.initGit(input)
+        const call = gate.calls++
+        return Effect.gen(function* () {
+          if (call === 0) {
+            yield* Deferred.succeed(gate.firstStarted, undefined)
+            yield* Deferred.await(gate.releaseFirst)
+          }
+          if (call === 1) {
+            yield* Deferred.succeed(gate.secondStarted, undefined)
+            yield* Deferred.await(gate.releaseSecond)
+          }
+          return yield* project.initGit(input)
+        })
+      },
+    })
+  }),
+).pipe(Layer.provide(LayerNode.compile(Project.node)))
 const admissionIt = testEffect(
   Layer.mergeAll(
     LayerNode.compile(LayerNode.group([Session.node, Database.node])),
-    httpApiLayerWithAppReplacements([[InstanceStore.node, observingInstanceStore]]),
+    httpApiLayerWithAppReplacements([
+      [InstanceStore.node, observingInstanceStore],
+      [Project.node, overlappingProject],
+    ]),
   ),
 )
 
@@ -246,30 +294,48 @@ afterEach(async () => {
 
 describe("experimental HttpApi", () => {
   admissionIt.live(
-    "admits a concurrent project request while initGit owns a pending reload disposer",
+    "admits overlapping initGit reloads and project reads while a reload disposer is pending",
     () =>
       Effect.gen(function* () {
         const directory = yield* tmpdirScoped()
+        const firstInitStarted = yield* Deferred.make<void>()
+        const releaseFirstInit = yield* Deferred.make<void>()
+        const secondInitStarted = yield* Deferred.make<void>()
+        const releaseSecondInit = yield* Deferred.make<void>()
         const disposerStarted = yield* Deferred.make<void>()
         const disposerFinished = yield* Deferred.make<void>()
         let releaseDisposer: (() => void) | undefined
         let unregister: (() => void) | undefined
+        let disposeCalls = 0
         admissionDirectory = directory
         admissionSignal = undefined
+        admissionReloadSignal = undefined
+        projectInitGate = {
+          directory,
+          firstStarted: firstInitStarted,
+          releaseFirst: releaseFirstInit,
+          secondStarted: secondInitStarted,
+          releaseSecond: releaseSecondInit,
+          calls: 0,
+        }
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
             if (releaseDisposer) yield* Effect.sync(releaseDisposer)
+            yield* Deferred.succeed(releaseFirstInit, undefined)
+            yield* Deferred.succeed(releaseSecondInit, undefined)
             if (unregister) yield* Effect.sync(unregister)
             yield* Effect.sync(() => {
               admissionDirectory = undefined
               admissionSignal = undefined
+              admissionReloadSignal = undefined
+              projectInitGate = undefined
             })
           }),
         )
 
         unregister = yield* Effect.sync(() =>
           registerDisposer((target) => {
-            if (target !== directory) return Promise.resolve()
+            if (target !== directory || ++disposeCalls > 1) return Promise.resolve()
             return new Promise<void>((resolve) => {
               releaseDisposer = resolve
               Deferred.doneUnsafe(disposerStarted, Effect.void)
@@ -278,15 +344,37 @@ describe("experimental HttpApi", () => {
             })
           }),
         )
-        const initializing = yield* request("/project/git/init", directory, { method: "POST" }).pipe(
+        const first = yield* request("/project/git/init", directory, { method: "POST" }).pipe(
           Effect.forkScoped({ startImmediately: true }),
         )
-        yield* awaitWithTimeout(Deferred.await(disposerStarted), "project.initGit did not reach reload disposal", "10 seconds")
+        const second = yield* request("/project/git/init", directory, { method: "POST" }).pipe(
+          Effect.forkScoped({ startImmediately: true }),
+        )
+        yield* awaitWithTimeout(
+          Effect.all([Deferred.await(firstInitStarted), Deferred.await(secondInitStarted)], { concurrency: "unbounded" }),
+          "both project init requests did not enter the production handler",
+          "15 seconds",
+        )
+        yield* Deferred.succeed(releaseFirstInit, undefined)
+        yield* awaitWithTimeout(Deferred.await(disposerStarted), "first initGit did not reach reload disposal", "15 seconds")
+        const successorReloadStarted = yield* Deferred.make<void>()
+        admissionReloadSignal = successorReloadStarted
+        yield* Deferred.succeed(releaseSecondInit, undefined)
+        yield* awaitWithTimeout(
+          Deferred.await(successorReloadStarted),
+          "second initGit did not request its overlapping reload",
+          "15 seconds",
+        )
+        expect(second.pollUnsafe()).toBeUndefined()
 
         const requestLoadStarted = yield* Deferred.make<void>()
         admissionSignal = requestLoadStarted
         const current = yield* request("/project/current", directory).pipe(Effect.forkScoped({ startImmediately: true }))
-        yield* awaitWithTimeout(Deferred.await(requestLoadStarted), "concurrent project request did not enter InstanceStore.load")
+        yield* awaitWithTimeout(
+          Deferred.await(requestLoadStarted),
+          "concurrent project request did not enter InstanceStore.load",
+          "15 seconds",
+        )
         expect(current.pollUnsafe()).toBeUndefined()
 
         if (releaseDisposer) yield* Effect.sync(releaseDisposer)
@@ -296,19 +384,22 @@ describe("experimental HttpApi", () => {
           yield* Effect.sync(unregister)
           unregister = undefined
         }
-        const [initialized, admitted] = yield* Effect.all(
+        const [initialized, successor, admitted] = yield* Effect.all(
           [
-            awaitWithTimeout(Fiber.await(initializing), "project.initGit request did not finish", "20 seconds"),
-            awaitWithTimeout(Fiber.await(current), "concurrent project request did not finish", "20 seconds"),
+            awaitWithTimeout(Fiber.await(first), "first project.initGit request did not finish", "25 seconds"),
+            awaitWithTimeout(Fiber.await(second), "second project.initGit request did not finish", "25 seconds"),
+            awaitWithTimeout(Fiber.await(current), "concurrent project request did not finish", "25 seconds"),
           ],
           { concurrency: "unbounded" },
         )
         expect(Exit.isSuccess(initialized)).toBe(true)
+        expect(Exit.isSuccess(successor)).toBe(true)
         expect(Exit.isSuccess(admitted)).toBe(true)
         if (Exit.isSuccess(initialized)) expect(initialized.value.status).toBe(200)
+        if (Exit.isSuccess(successor)) expect(successor.value.status).toBe(200)
         if (Exit.isSuccess(admitted)) expect(admitted.value.status).toBe(200)
       }),
-    { timeout: 35_000 },
+    { timeout: 120_000 },
   )
 
   it.instance(

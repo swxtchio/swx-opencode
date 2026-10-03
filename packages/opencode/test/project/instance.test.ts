@@ -570,7 +570,7 @@ describe("InstanceStore", () => {
     }),
   )
 
-  it.live("refuses reload disposal until its non-cancellable disposer Promise settles", () =>
+  it.live("keeps overlapping reloads healthy while refusing disposal until the disposer settles", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped({ git: true })
       const store = yield* InstanceStore.Service
@@ -609,6 +609,8 @@ describe("InstanceStore", () => {
       yield* setBootstrap(Effect.void)
       const reload = yield* store.reload({ directory: dir }).pipe(Effect.forkScoped({ startImmediately: true }))
       yield* awaitWithTimeout(Deferred.await(disposing), "reload did not reach its held disposer")
+      const successor = yield* store.reload({ directory: dir }).pipe(Effect.forkScoped({ startImmediately: true }))
+      expect(successor.pollUnsafe()).toBeUndefined()
 
       const removing = yield* store.disposeDirectory(dir).pipe(Effect.forkScoped({ startImmediately: true }))
       const removal = yield* awaitWithTimeout(
@@ -620,6 +622,7 @@ describe("InstanceStore", () => {
       if (Exit.isFailure(removal))
         expect(Cause.pretty(removal.cause)).toContain("instance disposer did not settle")
       expect(reload.pollUnsafe()).toBeUndefined()
+      expect(successor.pollUnsafe()).toBeUndefined()
       const joined = yield* store.load({ directory: dir }).pipe(Effect.forkScoped({ startImmediately: true }))
       expect(joined.pollUnsafe()).toBeUndefined()
 
@@ -627,23 +630,28 @@ describe("InstanceStore", () => {
       yield* setBootstrap(Effect.void)
       yield* Effect.sync(release)
       yield* awaitWithTimeout(Deferred.await(disposeFinished), "held disposer did not finish")
-      if (unregister) {
-        yield* Effect.sync(unregister)
-        unregister = undefined
-      }
-      const [reloaded, loaded] = yield* Effect.all(
+      const [reloaded, next, loaded] = yield* Effect.all(
         [
           awaitWithTimeout(Fiber.await(reload), "reload owner did not finish after its disposer completed"),
+          awaitWithTimeout(Fiber.await(successor), "successor reload did not finish after its predecessor"),
           awaitWithTimeout(Fiber.await(joined), "concurrent load did not join the healthy reload"),
         ],
         { concurrency: "unbounded" },
       )
       expect(Exit.isSuccess(reloaded)).toBe(true)
+      expect(Exit.isSuccess(next)).toBe(true)
       expect(Exit.isSuccess(loaded)).toBe(true)
-      if (Exit.isSuccess(reloaded) && Exit.isSuccess(loaded)) expect(loaded.value).toBe(reloaded.value)
+      if (Exit.isSuccess(reloaded) && Exit.isSuccess(next) && Exit.isSuccess(loaded)) {
+        expect(next.value).not.toBe(reloaded.value)
+        expect(loaded.value).toBe(next.value)
+      }
+      if (unregister) {
+        yield* Effect.sync(unregister)
+        unregister = undefined
+      }
       yield* store.disposeDirectory(dir)
       expect(first.directory).toBe(dir)
-      expect(disposed).toEqual([dir])
+      expect(disposed).toEqual([dir, dir])
     }),
     { timeout: 25_000 },
   )

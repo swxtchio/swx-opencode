@@ -17,6 +17,7 @@ import { Account } from "@/account/account"
 import { isRecord } from "@/util/record"
 import type { ConsoleState } from "@opencode-ai/core/v1/config/console-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { InstancePromise } from "@/effect/instance-promise"
 import { InstanceState } from "@/effect/instance-state"
 import { Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
@@ -230,7 +231,7 @@ const layer = Layer.effect(
       env?: Record<string, string>,
     ) {
       const source = "path" in options ? options.path : options.source
-      const expanded = yield* Effect.promise(() =>
+      const expanded = yield* InstancePromise.from(() =>
         ConfigVariable.substitute(
           "path" in options
             ? { text, type: "path", path: options.path, env }
@@ -241,7 +242,7 @@ const layer = Layer.effect(
       const data = yield* decodeConfig(parsed, source)
       if (!("path" in options)) return data
 
-      yield* Effect.promise(() => resolveLoadedPlugins(data, options.path))
+      yield* InstancePromise.from(() => resolveLoadedPlugins(data, options.path))
       if (!data.$schema) {
         data.$schema = "https://opencode.ai/config.json"
         const updated = text.replace(/^\s*\{/, '{\n  "$schema": "https://opencode.ai/config.json",')
@@ -275,7 +276,7 @@ const layer = Layer.effect(
 
       const legacy = path.join(Global.Path.config, "config")
       if (existsSync(legacy)) {
-        yield* Effect.promise(() =>
+        yield* InstancePromise.from(() =>
           import(pathToFileURL(legacy).href, { with: { type: "toml" } })
             .then(async (mod) => {
               const { provider, model, ...rest } = mod.default
@@ -374,7 +375,7 @@ const layer = Layer.effect(
             const wellknownURL = `${url}/.well-known/opencode`
             yield* Effect.logDebug("fetching remote config", { url: wellknownURL })
             const wellknown = yield* fetchRemoteJson(wellknownURL, undefined, ConfigV1.WellKnown, url)
-            const remote = yield* Effect.promise(() =>
+            const remote = yield* InstancePromise.from(() =>
               substituteWellKnownRemoteConfig({
                 value: wellknown.remote_config,
                 dir: url,
@@ -456,12 +457,12 @@ const layer = Layer.effect(
           }).pipe(Effect.forkDetach)
           deps.push(dep)
 
-          result.command = mergeDeep(result.command ?? {}, yield* Effect.promise(() => ConfigCommand.load(dir)))
-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.loadMode(dir)))
+          result.command = mergeDeep(result.command ?? {}, yield* InstancePromise.from(() => ConfigCommand.load(dir)))
+          result.agent = mergeDeep(result.agent ?? {}, yield* InstancePromise.from(() => ConfigAgent.load(dir)))
+          result.agent = mergeDeep(result.agent ?? {}, yield* InstancePromise.from(() => ConfigAgent.loadMode(dir)))
           // Auto-discovered plugins under `.opencode/plugin(s)` are already local files, so ConfigPlugin.load
           // returns normalized Specs and we only need to attach origin metadata here.
-          const list = yield* Effect.promise(() => ConfigPlugin.load(dir))
+          const list = yield* InstancePromise.from(() => ConfigPlugin.load(dir))
           yield* mergePluginOrigins(dir, list)
         }
 
@@ -522,7 +523,7 @@ const layer = Layer.effect(
         }
 
         // macOS managed preferences (.mobileconfig deployed via MDM) override everything
-        const managed = yield* Effect.promise(() => ConfigManaged.readManagedPreferences())
+        const managed = yield* InstancePromise.from(() => ConfigManaged.readManagedPreferences())
         if (managed) {
           result = mergeConfigConcatArrays(
             result,

@@ -4,7 +4,11 @@ import { GlobalBus } from "@/bus/global"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { WorkspaceContext } from "@/control-plane/workspace-context"
 import { InstanceRef } from "@/effect/instance-ref"
-import { disposeInstance as runDisposers } from "@/effect/instance-registry"
+import {
+  awaitInstancePromises,
+  disposeInstance as runDisposers,
+  hasInstancePromises,
+} from "@/effect/instance-registry"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Cause, Context, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
 import { type InstanceContext } from "./instance-context"
@@ -33,11 +37,19 @@ export const use = serviceUse(Service)
 interface Entry {
   readonly deferred: Deferred.Deferred<InstanceContext>
   readonly loadFiber: Deferred.Deferred<Fiber.Fiber<void>>
+  reloadGroup?: ReloadGroup
   context?: InstanceContext
   disposersDone?: boolean
   disposedEventEmitted?: boolean
   previous?: Entry
 }
+
+interface ReloadGroup {
+  current: Entry
+  completed: boolean
+}
+
+type PendingLoad = { entry: Entry; fiber: Fiber.Fiber<void> }
 
 type DisposerResult = { success: true } | { success: false; error: unknown }
 
@@ -46,7 +58,7 @@ interface DisposerRun {
   readonly entries: Set<Entry>
   readonly observers: Set<() => void>
   readonly autoFinalize: Set<Entry>
-  reloadOwner?: Entry
+  reloadGroup?: ReloadGroup
 }
 
 const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Service> = Layer.effect(
@@ -138,7 +150,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         autoFinalize: new Set<Entry>(),
       }
       if (entry) run.entries.add(entry)
-      if (reloadOwner) run.reloadOwner = reloadOwner
+      if (reloadOwner?.reloadGroup) run.reloadGroup = reloadOwner.reloadGroup
       if (!current) {
         disposerRuns.set(directory, run)
         // The JS Promise is the cleanup owner; interrupting an Effect waiter does not stop it.
@@ -191,6 +203,32 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       yield* awaitDisposerRun(directory, run, "8 seconds")
     })
 
+    const settleTrackedPromises = (
+      directory: string,
+      pending: PendingLoad[],
+    ): Effect.Effect<PendingLoad[]> =>
+      Effect.gen(function* () {
+        if (!hasInstancePromises(directory)) return pending
+        yield* Effect.promise(() => awaitInstancePromises(directory)).pipe(
+          Effect.timeoutOrElse({
+            duration: "8 seconds",
+            orElse: () => Effect.die(new Error(`instance bootstrap Promise did not settle: ${directory}`)),
+          }),
+        )
+        if (pending.length === 0) return pending
+        const settled = yield* Effect.forEach(
+          pending,
+          (item) =>
+            Fiber.await(item.fiber).pipe(
+              Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.succeed(undefined) }),
+            ),
+          { concurrency: "unbounded" },
+        )
+        const remaining = pending.filter((_, index) => settled[index] === undefined)
+        if (hasInstancePromises(directory)) return yield* settleTrackedPromises(directory, remaining)
+        return remaining
+      })
+
     const completeEntry = (directory: string, entry: Entry, work: Effect.Effect<InstanceContext>) =>
       Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
@@ -199,12 +237,14 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             if (Exit.isSuccess(exit)) entry.context = exit.value
             const run = yield* Effect.sync(() => startDisposerRun(directory, entry))
             if (run) yield* Effect.sync(() => run.autoFinalize.add(entry)).pipe(Effect.asVoid)
+            if (entry.reloadGroup?.current === entry) entry.reloadGroup.completed = true
             return
           }
           if (Exit.isFailure(exit)) yield* removeEntry(directory, entry)
           else entry.context = exit.value
           yield* Deferred.done(entry.deferred, exit).pipe(Effect.asVoid)
           if (Exit.isSuccess(exit)) entry.previous = undefined
+          if (entry.reloadGroup?.current === entry) entry.reloadGroup.completed = true
         }),
       )
 
@@ -297,20 +337,21 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         { concurrency: "unbounded" },
       )
       const pending = registered.filter((_, index) => settled[index] === undefined)
-      if (pending.length > 0) {
+      const pendingAfterPromises = yield* settleTrackedPromises(directory, pending)
+      if (pendingAfterPromises.length > 0) {
         yield* Effect.sync(() => {
           const interruptor = Fiber.getCurrent()?.id
-          pending.forEach((item) => item.fiber.interruptUnsafe(interruptor))
+          pendingAfterPromises.forEach((item) => item.fiber.interruptUnsafe(interruptor))
         })
         const stopped = yield* Effect.forEach(
-          pending,
+          pendingAfterPromises,
           (item) =>
             Fiber.await(item.fiber).pipe(
               Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.succeed(undefined) }),
             ),
           { concurrency: "unbounded" },
         )
-        const unconfirmed = pending.filter((_, index) => stopped[index] === undefined)
+        const unconfirmed = pendingAfterPromises.filter((_, index) => stopped[index] === undefined)
         if (unconfirmed.length > 0) return yield* abandonLoads(directory, unconfirmed, "did not stop")
       }
 
@@ -338,7 +379,15 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           }
           const existing = cache.get(directory)
           const disposal = disposerRuns.get(directory)
-          if (disposal && (!existing || disposal.reloadOwner !== existing)) {
+          const reloadGroup = existing?.reloadGroup
+          if (
+            disposal &&
+            (!existing ||
+              !reloadGroup ||
+              reloadGroup.completed ||
+              reloadGroup.current !== existing ||
+              disposal.reloadGroup !== reloadGroup)
+          ) {
             return yield* Effect.die(new Error(`instance disposal is still running for ${directory}`))
           }
           if (existing) return yield* restore(Deferred.await(existing.deferred))
@@ -370,15 +419,25 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           if (orphaned.has(directory)) {
             return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
           }
-          if (disposerRuns.has(directory)) {
+          const previous = cache.get(directory)
+          const continuation =
+            previous?.reloadGroup &&
+            !previous.reloadGroup.completed &&
+            previous.reloadGroup.current === previous
+              ? previous.reloadGroup
+              : undefined
+          const disposal = disposerRuns.get(directory)
+          if (disposal && (!continuation || disposal.reloadGroup !== continuation)) {
             return yield* Effect.die(new Error(`instance disposal is still running for ${directory}`))
           }
-          const previous = cache.get(directory)
           const entry: Entry = {
             deferred: Deferred.makeUnsafe<InstanceContext>(),
             loadFiber: Deferred.makeUnsafe<Fiber.Fiber<void>>(),
             ...(previous ? { previous } : {}),
           }
+          const reloadGroup = continuation ?? { current: entry, completed: false }
+          entry.reloadGroup = reloadGroup
+          reloadGroup.current = entry
           cache.set(directory, entry)
           // Keep reload producers interruptible after the cache handoff, just like load producers.
           const fiber = yield* completeEntry(
