@@ -2,6 +2,7 @@ import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { InstancePromise } from "../../src/effect/instance-promise"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { registerDisposer } from "../../src/effect/instance-registry"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
@@ -403,6 +404,106 @@ describe("InstanceStore", () => {
         yield* store.disposeDirectory(directory)
       }),
     { timeout: 30_000 },
+  )
+
+  it.live(
+    "bounds new loads until an owned bootstrap Promise and its continuation settle",
+    () =>
+      Effect.gen(function* () {
+        const directory = yield* tmpdirScoped({ git: true })
+        const store = yield* InstanceStore.Service
+        const promiseStarted = yield* Deferred.make<void>()
+        const promiseFinished = yield* Deferred.make<void>()
+        const continuationStarted = yield* Deferred.make<void>()
+        const releaseContinuation = yield* Deferred.make<void>()
+        const continuationFinished = yield* Deferred.make<void>()
+        let releasePromise: (() => void) | undefined
+
+        yield* setBootstrap(
+          Effect.gen(function* () {
+            if ((yield* InstanceRef)?.directory !== directory) return
+            yield* InstancePromise.from(
+              () =>
+                new Promise<void>((resolve) => {
+                  releasePromise = resolve
+                  Deferred.doneUnsafe(promiseStarted, Effect.void)
+                }).then(() => {
+                  Deferred.doneUnsafe(promiseFinished, Effect.void)
+                }),
+            )
+            yield* Deferred.succeed(continuationStarted, undefined)
+            yield* Deferred.await(releaseContinuation)
+            yield* Deferred.succeed(continuationFinished, undefined)
+          }),
+        )
+        yield* Effect.addFinalizer(() =>
+          Effect.gen(function* () {
+            if (releasePromise) yield* Effect.sync(releasePromise)
+            yield* Deferred.succeed(releaseContinuation, undefined)
+          }),
+        )
+
+        const loading = yield* store.load({ directory }).pipe(Effect.forkScoped)
+        yield* awaitWithTimeout(Deferred.await(promiseStarted), "tracked config Promise did not start")
+        const removing = yield* store.disposeDirectory(directory).pipe(Effect.forkScoped({ startImmediately: true }))
+        const removal = yield* awaitWithTimeout(
+          Fiber.await(removing),
+          "disposal did not refuse while the owned Promise remained active",
+          "20 seconds",
+        )
+        expect(Exit.isFailure(removal)).toBe(true)
+        if (Exit.isFailure(removal))
+          expect(Cause.pretty(removal.cause)).toContain("instance bootstrap Promise did not settle")
+
+        const blocked = yield* Effect.exit(
+          awaitWithTimeout(
+            Effect.exit(store.load({ directory })),
+            "new load did not reject the still-active owner Promise",
+            "3 seconds",
+          ),
+        )
+        expect(Exit.isSuccess(blocked)).toBe(true)
+        if (Exit.isSuccess(blocked)) {
+          expect(Exit.isFailure(blocked.value)).toBe(true)
+          if (Exit.isFailure(blocked.value))
+            expect(Cause.pretty(blocked.value.cause)).toContain("instance bootstrap Promise is still running")
+        }
+
+        if (!releasePromise) return yield* Effect.die(new Error("tracked Promise did not publish its release handle"))
+        yield* Effect.sync(releasePromise)
+        releasePromise = undefined
+        yield* awaitWithTimeout(Deferred.await(promiseFinished), "tracked Promise did not settle")
+        yield* awaitWithTimeout(Deferred.await(continuationStarted), "bootstrap did not resume after Promise settlement")
+        const recovering = yield* Effect.exit(
+          awaitWithTimeout(
+            Effect.exit(store.load({ directory })),
+            "new load joined an indefinitely pending cached deferred",
+            "10 seconds",
+          ),
+        )
+        expect(Exit.isSuccess(recovering)).toBe(true)
+        if (Exit.isSuccess(recovering)) {
+          expect(Exit.isFailure(recovering.value)).toBe(true)
+          if (Exit.isFailure(recovering.value))
+            expect(Cause.pretty(recovering.value.cause)).toContain("instance load is still recovering")
+        }
+
+        yield* Deferred.succeed(releaseContinuation, undefined)
+        yield* awaitWithTimeout(Deferred.await(continuationFinished), "bootstrap continuation did not finish")
+        const recovered = yield* pollWithTimeout(
+          store.load({ directory }).pipe(
+            Effect.as(true),
+            Effect.catchCause(() => Effect.succeed(undefined)),
+          ),
+          "new load did not recover after the continuation settled",
+          "10 seconds",
+        )
+        expect(recovered).toBe(true)
+        const loaded = yield* Fiber.await(loading)
+        expect(Exit.isSuccess(loaded)).toBe(true)
+        yield* store.disposeDirectory(directory)
+      }),
+    { timeout: 40_000 },
   )
 
   it.live("removes failed loads from the cache", () =>

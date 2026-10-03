@@ -12,4 +12,18 @@ export function from<A>(make: () => Promise<A>) {
   })
 }
 
+export function tryPromise<A, E>(options: { try: () => Promise<A>; catch: (error: unknown) => E }) {
+  return Effect.gen(function* () {
+    const instance = yield* InstanceRef
+    return yield* Effect.tryPromise({
+      try: () => {
+        const promise = options.try()
+        if (instance) trackInstancePromise(instance.directory, promise)
+        return promise
+      },
+      catch: options.catch,
+    })
+  })
+}
+
 export * as InstancePromise from "./instance-promise"

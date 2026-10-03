@@ -41,6 +41,7 @@ interface Entry {
   context?: InstanceContext
   disposersDone?: boolean
   disposedEventEmitted?: boolean
+  promiseQuarantined?: boolean
   previous?: Entry
 }
 
@@ -50,6 +51,7 @@ interface ReloadGroup {
 }
 
 type PendingLoad = { entry: Entry; fiber: Fiber.Fiber<void> }
+type PromiseSettlement = { pending: PendingLoad[]; settled: boolean }
 
 type DisposerResult = { success: true } | { success: false; error: unknown }
 
@@ -206,17 +208,18 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     const settleTrackedPromises = (
       directory: string,
       pending: PendingLoad[],
-    ): Effect.Effect<PendingLoad[]> =>
+    ): Effect.Effect<PromiseSettlement> =>
       Effect.gen(function* () {
-        if (!hasInstancePromises(directory)) return pending
-        yield* Effect.promise(() => awaitInstancePromises(directory)).pipe(
+        if (!hasInstancePromises(directory)) return { pending, settled: true }
+        const settled = yield* Effect.promise(() => awaitInstancePromises(directory)).pipe(
           Effect.timeoutOrElse({
             duration: "8 seconds",
-            orElse: () => Effect.die(new Error(`instance bootstrap Promise did not settle: ${directory}`)),
+            orElse: () => Effect.succeed(false),
           }),
         )
-        if (pending.length === 0) return pending
-        const settled = yield* Effect.forEach(
+        if (!settled) return { pending, settled: false }
+        if (pending.length === 0) return { pending, settled: true }
+        const finished = yield* Effect.forEach(
           pending,
           (item) =>
             Fiber.await(item.fiber).pipe(
@@ -224,9 +227,9 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             ),
           { concurrency: "unbounded" },
         )
-        const remaining = pending.filter((_, index) => settled[index] === undefined)
+        const remaining = pending.filter((_, index) => finished[index] === undefined)
         if (hasInstancePromises(directory)) return yield* settleTrackedPromises(directory, remaining)
-        return remaining
+        return { pending: remaining, settled: true }
       })
 
     const completeEntry = (directory: string, entry: Entry, work: Effect.Effect<InstanceContext>) =>
@@ -234,14 +237,20 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         Effect.gen(function* () {
           const exit = yield* Effect.exit(restore(work))
           if (yield* Deferred.isDone(entry.deferred)) {
-            if (Exit.isSuccess(exit)) entry.context = exit.value
+            if (Exit.isSuccess(exit)) {
+              entry.context = exit.value
+              entry.promiseQuarantined = undefined
+            }
             const run = yield* Effect.sync(() => startDisposerRun(directory, entry))
             if (run) yield* Effect.sync(() => run.autoFinalize.add(entry)).pipe(Effect.asVoid)
             if (entry.reloadGroup?.current === entry) entry.reloadGroup.completed = true
             return
           }
           if (Exit.isFailure(exit)) yield* removeEntry(directory, entry)
-          else entry.context = exit.value
+          else {
+            entry.context = exit.value
+            entry.promiseQuarantined = undefined
+          }
           yield* Deferred.done(entry.deferred, exit).pipe(Effect.asVoid)
           if (Exit.isSuccess(exit)) entry.previous = undefined
           if (entry.reloadGroup?.current === entry) entry.reloadGroup.completed = true
@@ -337,7 +346,12 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         { concurrency: "unbounded" },
       )
       const pending = registered.filter((_, index) => settled[index] === undefined)
-      const pendingAfterPromises = yield* settleTrackedPromises(directory, pending)
+      const promiseSettlement = yield* settleTrackedPromises(directory, pending)
+      if (!promiseSettlement.settled) {
+        yield* Effect.sync(() => entries.forEach((item) => (item.promiseQuarantined = true)))
+        return yield* Effect.die(new Error(`instance bootstrap Promise did not settle: ${directory}`))
+      }
+      const pendingAfterPromises = promiseSettlement.pending
       if (pendingAfterPromises.length > 0) {
         yield* Effect.sync(() => {
           const interruptor = Fiber.getCurrent()?.id
@@ -378,6 +392,21 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             return yield* Effect.die(new Error(`instance load is still running for ${directory}`))
           }
           const existing = cache.get(directory)
+          if (existing?.promiseQuarantined) {
+            if (hasInstancePromises(directory)) {
+              return yield* Effect.die(new Error(`instance bootstrap Promise is still running for ${directory}`))
+            }
+            const context = yield* restore(
+              Deferred.await(existing.deferred).pipe(
+                Effect.timeoutOrElse({
+                  duration: "8 seconds",
+                  orElse: () => Effect.die(new Error(`instance load is still recovering for ${directory}`)),
+                }),
+              ),
+            )
+            existing.promiseQuarantined = undefined
+            return context
+          }
           const disposal = disposerRuns.get(directory)
           const reloadGroup = existing?.reloadGroup
           if (
