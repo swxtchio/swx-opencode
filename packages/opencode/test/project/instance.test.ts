@@ -1125,6 +1125,62 @@ describe("InstanceStore", () => {
     { timeout: 20_000 },
   )
 
+  it.live("evicts a context after an interrupted disposal's registered Promise settles", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const disposing = yield* Deferred.make<void>()
+      const disposeFinished = yield* Deferred.make<void>()
+      const disposedEvent = yield* Deferred.make<void>()
+      let releaseDisposer = () => {}
+      let disposeCalls = 0
+      let disposedEvents = 0
+      const on = (event: GlobalEvent) => {
+        if (event.directory !== dir || event.payload.type !== "server.instance.disposed") return
+        disposedEvents++
+        Deferred.doneUnsafe(disposedEvent, Effect.void)
+      }
+      GlobalBus.on("event", on)
+      yield* registerDisposerScoped((directory) => {
+        if (directory !== dir || disposeCalls++ > 0) return Promise.resolve()
+        return new Promise<void>((resolve) => {
+          releaseDisposer = resolve
+          Deferred.doneUnsafe(disposing, Effect.void)
+        }).then(() => {
+          Deferred.doneUnsafe(disposeFinished, Effect.void)
+        })
+      })
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function* () {
+          yield* Effect.sync(releaseDisposer)
+          yield* Effect.sync(() => GlobalBus.off("event", on))
+        }),
+      )
+
+      const first = yield* store.load({ directory: dir })
+      const disposingContext = yield* store.disposeDirectory(dir).pipe(Effect.forkScoped({ startImmediately: true }))
+      yield* awaitWithTimeout(Deferred.await(disposing), "registered disposer did not start")
+      yield* awaitWithTimeout(Fiber.interrupt(disposingContext), "disposeDirectory waiter did not interrupt", "2 seconds")
+      const interruption = yield* Fiber.await(disposingContext)
+      expect(Exit.isFailure(interruption)).toBe(true)
+      if (Exit.isFailure(interruption)) expect(Cause.hasInterruptsOnly(interruption.cause)).toBe(true)
+
+      yield* Effect.sync(releaseDisposer)
+      yield* awaitWithTimeout(Deferred.await(disposeFinished), "late disposer completion was not observed")
+      yield* awaitWithTimeout(
+        Deferred.await(disposedEvent),
+        "interrupted disposer completion did not publish server.instance.disposed",
+        "5 seconds",
+      )
+      expect(disposedEvents).toBe(1)
+      const recovered = yield* store.load({ directory: dir })
+      expect(recovered).not.toBe(first)
+      expect(recovered.directory).toBe(dir)
+      yield* store.disposeDirectory(dir)
+    }),
+    { timeout: 20_000 },
+  )
+
   it.live("refuses load and reload while a ready context is being disposed", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped({ git: true })
