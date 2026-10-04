@@ -8,7 +8,6 @@ import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
 if (process.env.OPENCODE_INTERNAL_PLUGIN_OWNER_CHILD === "1") {
   let internalPluginGate:
     | {
-        directory: string
         start: () => void
         wait: Promise<void>
         release: () => void
@@ -50,7 +49,7 @@ if (process.env.OPENCODE_INTERNAL_PLUGIN_OWNER_CHILD === "1") {
       "refuses worktree removal while an internal plugin initializer Promise is active",
       () =>
         Effect.gen(function* () {
-          const test = yield* TestInstance
+          yield* TestInstance
           const fs = yield* FSUtil.Service
           const svc = yield* Worktree.Service
           const store = yield* InstanceStore.Service
@@ -61,7 +60,6 @@ if (process.env.OPENCODE_INTERNAL_PLUGIN_OWNER_CHILD === "1") {
           let directory: string | undefined
           let removing: Fiber.Fiber<boolean, unknown> | undefined
           internalPluginGate = {
-            directory: expected.directory,
             start: () => Deferred.doneUnsafe(started, Effect.void),
             wait: new Promise<void>((resolve) => {
               release = resolve

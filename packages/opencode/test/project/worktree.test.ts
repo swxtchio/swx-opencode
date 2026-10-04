@@ -1357,6 +1357,116 @@ describe("Worktree", () => {
       { git: true },
     )
 
+    wintest(
+      "terminates the configured start command before removing its worktree",
+      () =>
+        Effect.gen(function* () {
+          yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const control = yield* tmpdirScoped()
+          const started = path.join(control, "started")
+          const pidFile = path.join(control, "pid")
+          const release = path.join(control, "release")
+          const exited = path.join(control, "exited")
+          const signaledBeforeRemoval = path.join(control, "signaled-before-removal")
+          const signaledAfterRemoval = path.join(control, "signaled-after-removal")
+          const expected = yield* svc.makeWorktreeInfo({ name: "start-command-remove" })
+          let createdDirectory: string | undefined
+          const processIsRunning = (pid: number) => {
+            try {
+              process.kill(pid, 0)
+              return true
+            } catch {
+              return false
+            }
+          }
+          const startCommand = [
+            `trap 'if [ -d ${JSON.stringify(expected.directory)} ]; then printf before > ${JSON.stringify(signaledBeforeRemoval)}; else printf after > ${JSON.stringify(signaledAfterRemoval)}; fi; exit 0' TERM`,
+            `trap 'printf exited > ${JSON.stringify(exited)}' EXIT`,
+            `printf '%s\\n' "$$" > ${JSON.stringify(pidFile)}`,
+            `: > ${JSON.stringify(started)}`,
+            `while [ ! -e ${JSON.stringify(release)} ]; do sleep 0.05; done`,
+          ].join("; ")
+
+          yield* Effect.addFinalizer(() =>
+            Effect.gen(function* () {
+              yield* Effect.promise(() => Bun.write(release, "release\n"))
+              if (!createdDirectory) return
+              const commandExited = yield* pollWithTimeout(
+                Effect.promise(() =>
+                  Bun.file(exited)
+                    .exists()
+                    .then((exists) => (exists ? true : undefined)),
+                ),
+                "configured start command did not exit during test cleanup",
+                "10 seconds",
+              ).pipe(
+                Effect.map(() => true),
+                Effect.catch(() => Effect.succeed(false)),
+              )
+              const pidText = yield* Effect.promise(() =>
+                Bun.file(pidFile)
+                  .text()
+                  .catch(() => ""),
+              )
+              const pid = Number(pidText.trim())
+              if (Number.isSafeInteger(pid) && pid > 0 && (!commandExited || processIsRunning(pid))) {
+                yield* Effect.sync(() => {
+                  try {
+                    process.kill(-pid, "SIGKILL")
+                  } catch {}
+                })
+                yield* pollWithTimeout(
+                  Effect.sync(() => (processIsRunning(pid) ? undefined : true)),
+                  "configured start command survived test cleanup",
+                  "5 seconds",
+                ).pipe(Effect.ignore)
+              }
+              yield* removeCreatedWorktree(createdDirectory).pipe(Effect.ignore)
+            }),
+          )
+
+          const ready = yield* waitReady().pipe(Effect.forkScoped)
+          const info = yield* svc.create({ name: expected.name, startCommand })
+          createdDirectory = info.directory
+          expect(info.directory).toBe(expected.directory)
+          const readyEvent = yield* awaitWithTimeout(
+            Fiber.join(ready),
+            "worktree.ready was not published",
+            "15 seconds",
+          )
+          expect(readyEvent.name).toBe(info.name)
+
+          const pid = yield* pollWithTimeout(
+            Effect.promise(async () => {
+              if (!(await Bun.file(started).exists())) return undefined
+              const value = Number((await Bun.file(pidFile).text()).trim())
+              return Number.isSafeInteger(value) && value > 0 ? value : undefined
+            }),
+            "configured start command did not start after worktree.ready",
+            "15 seconds",
+          )
+          expect(processIsRunning(pid)).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(true)
+
+          expect(
+            yield* awaitWithTimeout(
+              svc.remove({ directory: info.directory }),
+              "Worktree.remove did not stop the configured start command",
+              "15 seconds",
+            ),
+          ).toBe(true)
+          expect(yield* Effect.promise(() => Bun.file(signaledBeforeRemoval).exists())).toBe(true)
+          expect(yield* Effect.promise(() => Bun.file(signaledAfterRemoval).exists())).toBe(false)
+          expect(processIsRunning(pid)).toBe(false)
+          expect(yield* fs.exists(info.directory)).toBe(false)
+          createdDirectory = undefined
+        }),
+      { git: true },
+      { timeout: 45_000 },
+    )
+
     it.instance(
       "lists the active linked worktree but not the project checkout",
       () =>
