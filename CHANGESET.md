@@ -62,13 +62,15 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
-- **#128** Healthy overlapping `project.initGit` reloads carry disposer ownership through successor entries. Promise
+- **#135** Healthy overlapping `project.initGit` reloads carry disposer ownership through successor entries. Promise
   owners are tracked only for work awaited by `InstanceBootstrap.run`, including `Config.get` and plugin
   initialization/loading/config callbacks; concurrent loads join a positively live bootstrap and reload waits for
   that boot before handoff. Unconfirmed producers are refused without poisoning a still-live entry; ordinary runtime
-  plugin hooks do not create boot owners. Worktree removal refuses unresolved
-  boot/disposer work with positive-settlement recovery; `disposeAll` continues across cached directories and reports
-  combined cleanup failures. _Fork-only._
+  plugin hooks do not create boot owners. When a worktree boot has not reached `InstanceStore.load`, removal interrupts
+  it and waits for its fiber to terminate before disposing the instance. It removes the checkout only after boot
+  termination and instance disposal are confirmed; if either cannot settle or disposal is interrupted, removal
+  refuses and leaves the checkout in place. `disposeAll` continues across cached directories and reports combined
+  cleanup failures. _Fork-only._
 - **#126** A removed Session stays removed: a write that was already in flight when `Session.remove` ran is now refused instead of quietly recreating that Session's event history, and the HTTP routes that already promise a missing-Session 404 give it in that race (swxtchio/swx-opencode#97). Prompt-like routes and `sync.steal` still need a separate decision (swxtchio/swx-opencode#125). _Fork-only._
 - **#123** `SessionRunState.cancel` no longer emits idle without a local runner or retained status, preventing a false completion signal for another process’s active turn (swxtchio/swx-opencode#118). Genuine local cancellation still emits idle. _Fork-only._
 - **#122** A failed turn is persisted as failed once SQLite is writable again, even when the lock outlasts every write that would end it (swxtchio/swx-opencode#96). The processor hands a terminal assistant write that loses the lock to a background retry with capped backoff (`terminalRecoverySchedule` and `recoverTerminalMessage` in `packages/opencode/src/session/processor.ts`), which runs until the write commits or fails for another reason, so the row gets its completion and error without a new prompt. The retry is update-only: `Session.updateExistingMessage` checks the row inside the event's own write transaction through a new `EventV2.publish` `precondition`, so an assistant removed while the lock was held is not recreated. While the lock keeps refusing it, the retry logs a rate-limited warning naming the session, message and attempt count, so a stuck recovery stays visible. Only the process that ran the turn writes it, and driver busy waits are unchanged. _Fork-only._

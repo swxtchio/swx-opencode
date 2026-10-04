@@ -455,7 +455,8 @@ const layer: Layer.Layer<
 
       // Preserve the loaded path casing for the store cache; `directory` is lowercased on Windows.
       if (directory !== (yield* canonical(ctx.worktree))) {
-        // InstanceStore has no entry until boot reaches load, so stop the producer first.
+        // Before InstanceStore.load creates an entry, interrupt the boot and confirm its fiber
+        // terminates before disposal.
         yield* stopBoot(directory)
         yield* disposeWorktreeInstance(input.directory)
       }

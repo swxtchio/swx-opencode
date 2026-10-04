@@ -507,7 +507,7 @@ describe("Worktree", () => {
     )
 
     raceIt.instance(
-      "stops an unregistered worktree boot before removal deletes its directory",
+      "waits for an interrupted pre-load worktree boot to terminate before removing its directory",
       () =>
         Effect.gen(function* () {
           const test = yield* TestInstance
@@ -820,7 +820,6 @@ describe("Worktree", () => {
             expect(Exit.isSuccess(joined)).toBe(true)
             const loaded = yield* pollWithTimeout(
               store.load({ directory: info.directory }).pipe(
-                Effect.map((context) => context),
                 Effect.catchCause(() => Effect.succeed(undefined)),
               ),
               `load did not recover after ${producer.loader} settled`,
