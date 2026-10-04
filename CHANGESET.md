@@ -62,7 +62,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Database maintenance
 
-- **#124** Add dormant guarded Session-retention inventory and fixture-only redaction tooling, with fail-closed reads for altered aggregates and an isolated backup, compaction, integrity-check, and restore rehearsal. Real apply and production cutover remain disabled pending captain-approved policy and evidence. _Fork-only._
+- **#137** Add dormant guarded Session-retention inventory and fixture-only redaction tooling, with fail-closed reads for altered aggregates and an isolated backup, compaction, integrity-check, and restore rehearsal. Real apply and production cutover remain disabled pending captain-approved policy and evidence. _Fork-only._
 
 ### Runtime fixes
 
