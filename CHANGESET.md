@@ -62,7 +62,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Database maintenance
 
-- **#130** The fixture-only retention compactor finalizes cached SQLite statements under its exclusive writer fence before replacing the fixture inode, so the fixture owner releases the old file before liveness is checked. _Fork-only._
+- **#130** On pinned Linux Bun 1.3.14, the fixture-only compactor clears its source query cache under the exclusive writer fence and reports success only after the replaced inode has no open owner. The held-query fixture pins this release; independent live owners still refuse. `close(true)` also checks SQLite close errors. _Fork-only._
 - **#137** Add dormant guarded Session-retention inventory and fixture-only redaction tooling, with fail-closed reads for altered aggregates and an isolated backup, compaction, integrity-check, and restore rehearsal. Real apply and production cutover remain disabled pending captain-approved policy and evidence. _Fork-only._
 
 ### Runtime fixes

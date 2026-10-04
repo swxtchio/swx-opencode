@@ -1307,12 +1307,12 @@ test(
       seq: 599,
     })
 
-    // Keep a cached source statement live across the swap; compaction must finalize it before checking the old inode.
-    using preparedSourceStatement = sourceFixture.db.query<{ seq: number }, [string]>(
+    // Keep a half-iterated source query cached; pinned Bun 1.3.14 must clear it before the old-inode check.
+    using cachedSourceStatement = sourceFixture.db.query<{ seq: number }, [string]>(
       "SELECT seq FROM event_sequence WHERE aggregate_id = ?",
     )
-    const preparedSourceRows = preparedSourceStatement.iterate("ses_physical")
-    expect(preparedSourceRows.next()).toEqual({ value: { seq: 599 }, done: false })
+    const cachedSourceRows = cachedSourceStatement.iterate("ses_physical")
+    expect(cachedSourceRows.next()).toEqual({ value: { seq: 599 }, done: false })
 
     const compacted = await compactRestoreFixture({
       sourcePath,
@@ -1325,7 +1325,7 @@ test(
       retainedSessionID: "ses_physical",
     })
     expect(compacted.state, compacted.reasons.join(", ")).toBe("complete")
-    expect(() => preparedSourceRows.next()).toThrow()
+    expect(() => cachedSourceRows.next()).toThrow()
     expect(compacted.changedFiles).toBe(3)
     expect(compacted.reasons).toEqual([])
     expect(compacted.sourceDeviceID).not.toBe(compacted.stagingDeviceID)
