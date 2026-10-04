@@ -1,7 +1,7 @@
-import { createHash, randomUUID } from "node:crypto"
+import { createHash } from "node:crypto"
 import { spawnSync } from "node:child_process"
 import { lstatSync, realpathSync, statSync } from "node:fs"
-import { copyFile, lstat, mkdtemp, open, realpath, rename, rm, stat, statfs, unlink, writeFile } from "node:fs/promises"
+import { lstat, mkdtemp, realpath, rm, stat, statfs, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { Database } from "@opencode-ai/core/database/database"
@@ -118,6 +118,8 @@ export type RetentionInventory = {
   readonly refusals: readonly string[]
 }
 
+type InventoryOptions = { readonly transactional?: boolean }
+
 export type RetentionApplyResult = {
   readonly state: "complete" | "in-progress" | "refused"
   readonly changedRows: number
@@ -126,34 +128,18 @@ export type RetentionApplyResult = {
   readonly reasons: readonly string[]
 }
 
-export type PhysicalMetrics = {
-  readonly size: number
-  readonly blocks: number
-  readonly allocatedBytes: number
-  readonly pageCount: number
-  readonly freelistCount: number
-  readonly autoVacuum: number
-  readonly integrityCheck: string
-  readonly retainedSession: Record<string, unknown>
-}
-
 export type CompactFixtureResult = {
-  readonly state: "complete" | "refused" | "failed"
+  readonly state: "refused"
   readonly changedFiles: number
   readonly reasons: readonly string[]
   readonly sourceDeviceID?: string
   readonly backupDeviceID?: string
   readonly stagingDeviceID?: string
-  readonly measurements?: {
-    readonly before: PhysicalMetrics
-    readonly backup?: PhysicalMetrics
-    readonly staging?: PhysicalMetrics
-    readonly restored?: PhysicalMetrics
-  }
 }
 
 type CompactFixtureInput = {
   readonly sourcePath: string
+  readonly sourceFixture?: FixtureDirectory
   readonly backupPath: string
   readonly stagingPath: string
   readonly expectedSourceDeviceID: string
@@ -161,6 +147,7 @@ type CompactFixtureInput = {
   readonly expectedStagingDeviceID: string
   readonly retainedSessionID: string
   readonly capacityFloorBytes?: number
+  readonly afterInitialLivenessCheck?: () => Promise<void>
 }
 
 type ApplyInput = {
@@ -198,42 +185,32 @@ const redactionPlan = [
 
 const metricScalarKeys = new Set([
   "agent",
-  "cacheRead",
-  "cacheWrite",
   "cost",
   "createdAt",
-  "duration",
-  "durationMs",
   "finish",
   "id",
-  "input",
   "messageID",
   "modelID",
-  "output",
   "partID",
   "providerID",
-  "read",
-  "reasoning",
   "responseModelID",
   "responseModelIDs",
   "role",
-  "routeID",
-  "routeName",
   "seq",
   "sessionID",
-  "startedAt",
   "status",
-  "time",
   "time_created",
   "time_updated",
   "timestamp",
   "type",
   "updatedAt",
   "variant",
-  "wallTime",
-  "wallTimeMs",
-  "write",
 ])
+
+const tokenMetricKeys = new Set(["input", "output", "reasoning", "total"])
+const cacheMetricKeys = new Set(["read", "write"])
+const timeMetricKeys = new Set(["created", "completed", "ran"])
+const timingMetricKeys = new Set(["duration", "durationMs", "startedAt", "endedAt", "wallTime", "wallTimeMs"])
 
 const metricObjectKeys = new Set([
   "cache",
@@ -246,7 +223,6 @@ const metricObjectKeys = new Set([
   "payload",
   "performance",
   "quality",
-  "route",
   "tokens",
   "timing",
   "usage",
@@ -262,11 +238,12 @@ function oneRow<Row>(db: SqliteAccess, statement: string, ...bindings: Array<str
 
 const retainedMetricFields = [
   "providerID",
-  "modelID",
+  "modelID (requested model or route)",
+  "model.id (requested route)",
   "responseModelID",
-  "responseModelIDs",
-  "route",
-  "routeID",
+  "responseModelIDs (serving models)",
+  "time.created",
+  "time.completed",
   "tokens.input",
   "tokens.output",
   "tokens.reasoning",
@@ -313,6 +290,15 @@ const copyTables = [
   { copy: "session_share.secret", table: "session_share", scope: "session_id", value: "secret" },
 ] as const
 
+const requiredRetentionTables = new Set([
+  ...copyTables.map((item) => item.table),
+  ...redactionPlan.map((item) => item.table),
+  "event_sequence",
+  "event_retention",
+  "session_prompt_queue_sequence",
+])
+const classifiedSessionTables = new Set([...requiredRetentionTables])
+
 const jsonCopies = [
   { table: "message", scope: "session_id", value: "data" },
   { table: "part", scope: "session_id", value: "data" },
@@ -320,8 +306,84 @@ const jsonCopies = [
   { table: "session_input", scope: "session_id", value: "prompt" },
   { table: "session_context_epoch", scope: "session_id", value: "snapshot" },
   { table: "session_prompt_queue", scope: "session_id", value: "input" },
-  { table: "event", scope: "aggregate_id", value: "data" },
 ] as const
+
+function retentionSchema(db: SqliteAccess) {
+  const tables = new Set(
+    allRows<TableRow>(db, "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").map(
+      (row) => row.name,
+    ),
+  )
+  const missingTables = Array.from(requiredRetentionTables).filter((table) => !tables.has(table))
+  const unclassifiedSessionTables = Array.from(tables).flatMap((table) => {
+    if (classifiedSessionTables.has(table)) return []
+    const columns = allRows<ColumnRow>(db, `PRAGMA table_info(${quote(table)})`)
+    return columns.some((column) => column.name === "session_id" || column.name === "aggregate_id") ? [table] : []
+  })
+  return { tables, missingTables, unclassifiedSessionTables }
+}
+
+function requiredTableReason(table: string) {
+  return table === "event_retention"
+    ? "unreplayable-marker-store-unavailable"
+    : `${table.replaceAll("_", "-")}-table-unreadable`
+}
+
+function copyOwnershipFailures(db: SqliteAccess) {
+  return copyTables.flatMap(({ table, scope }) => {
+    const columns = allRows<ColumnRow>(db, `PRAGMA table_info(${quote(table)})`)
+    if (columns.length === 0) return []
+    return columns.some((column) => column.name === scope) ? [] : [`source-ownership-unreadable:${table}`]
+  })
+}
+
+function eventAggregateFailures(
+  db: SqliteAccess,
+  sessionID: string,
+  aggregate: AggregateRow | undefined,
+  eventTypes: readonly string[],
+  verifyPayloadOwnership = true,
+) {
+  const reasons = new Set<string>()
+  const rowCount =
+    oneRow<{ rows: number }>(db, "SELECT count(*) AS rows FROM event WHERE aggregate_id = ?", sessionID)?.rows ?? 0
+  if (rowCount > 0 && !aggregate) reasons.add(`event-aggregate-sequence-missing:${sessionID}`)
+  if (!verifyPayloadOwnership && rowCount > 0) {
+    reasons.add(`event-payload-ownership-proof-unavailable:${sessionID}`)
+  }
+  const invalidJSON = verifyPayloadOwnership
+    ? (oneRow<{ rows: number }>(
+        db,
+        "SELECT count(*) AS rows FROM event WHERE aggregate_id = ? AND json_valid(data) = 0",
+        sessionID,
+      )?.rows ?? 0)
+    : 0
+  if (verifyPayloadOwnership && invalidJSON > 0) reasons.add(`event-data-unreadable:${sessionID}`)
+  for (const type of eventTypes) {
+    const definition = Durable.get(type)
+    if (!definition?.durable || definition.durable.aggregate !== "sessionID") {
+      reasons.add(`event-aggregate-owner-unknown:${sessionID}:${type}`)
+      continue
+    }
+    if (verifyPayloadOwnership && invalidJSON === 0) {
+      const invalidOwner = oneRow<{ rows: number }>(
+        db,
+        "SELECT count(*) AS rows FROM event WHERE aggregate_id = ? AND type = ? AND json_extract(data, ?) IS NOT aggregate_id",
+        sessionID,
+        type,
+        `$.${definition.durable.aggregate}`,
+      )?.rows
+      if (invalidOwner) reasons.add(`event-aggregate-owner-conflict:${sessionID}:${type}`)
+    }
+  }
+  const duplicateSequence = oneRow<{ rows: number }>(
+    db,
+    "SELECT count(*) AS rows FROM (SELECT seq FROM event WHERE aggregate_id = ? GROUP BY seq HAVING count(*) > 1)",
+    sessionID,
+  )?.rows
+  if (duplicateSequence) reasons.add(`event-sequence-conflict:${sessionID}`)
+  return Array.from(reasons).toSorted()
+}
 
 export async function createFixtureDatabase(snapshot?: Uint8Array): Promise<FixtureDirectory> {
   const directory = await mkdtemp(path.join(tmpdir(), "opencode-retention-fixture-"))
@@ -413,21 +475,20 @@ function customerBindingFailures(evidence: RetentionEvidence, sessionIDs: readon
   return Array.from(reasons).toSorted()
 }
 
-export function inventory(db: SqliteAccess, evidence: RetentionEvidence = {}, now = Date.now()): RetentionInventory {
-  if (db.inTransaction) return inventorySnapshot(db, evidence, now)
+export function inventory(
+  db: SqliteAccess,
+  evidence: RetentionEvidence = {},
+  now = Date.now(),
+  options?: InventoryOptions,
+): RetentionInventory {
+  if (db.inTransaction || options?.transactional === false) return inventorySnapshot(db, evidence, now)
   return db.transaction(() => inventorySnapshot(db, evidence, now)).deferred()
 }
 
 function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: number): RetentionInventory {
-  const tables = new Set(
-    allRows<TableRow>(db, "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").map(
-      (row) => row.name,
-    ),
-  )
-  const requiredTables = ["session", "event_sequence", "event"]
-  const requiredRefusals = requiredTables
-    .filter((table) => !tables.has(table))
-    .map((table) => `${table.replaceAll("_", "-")}-table-unreadable`)
+  const schema = retentionSchema(db)
+  const tables = schema.tables
+  const requiredRefusals = schema.missingTables.map(requiredTableReason)
   if (requiredRefusals.length > 0) {
     return {
       generatedAt: now,
@@ -472,32 +533,16 @@ function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: n
     if (visited.has(row.id)) continue
     visit(row.id, row.parent_id !== null && !sessionsByID.has(row.parent_id))
   }
-  const classifiedSessionTables = new Set([
-    "message",
-    "part",
-    "session_message",
-    "session_input",
-    "session_context_epoch",
-    "session_prompt_queue",
-    "session_prompt_queue_sequence",
-    "todo",
-    "session_share",
-  ])
-  const unclassifiedSessionTables = Array.from(tables).flatMap((table) => {
-    if (classifiedSessionTables.has(table) || table === "session") return []
-    const columns = allRows<ColumnRow>(db, `PRAGMA table_info(${quote(table)})`)
-    return columns.some((column) => column.name === "session_id") ? [table] : []
-  })
   const globalRefusals = new Set<string>()
-  if (!tables.has("session")) globalRefusals.add("session-table-unreadable")
-  if (!tables.has("event_sequence")) globalRefusals.add("event-sequence-table-unreadable")
-  if (!tables.has("event")) globalRefusals.add("event-table-unreadable")
-  for (const table of unclassifiedSessionTables) globalRefusals.add(`unclassified-session-owned-table:${table}`)
+  for (const table of schema.unclassifiedSessionTables) globalRefusals.add(`unclassified-session-owned-table:${table}`)
 
   const trees = components.map((component) => {
     const sessionIDs = component.sessionIDs
     const reasons = new Set<string>()
-    for (const reason of customerBindingFailures(evidence, sessionIDs)) reasons.add(reason)
+    const verifyEventPayloadOwnership =
+      evidence.liveness !== undefined &&
+      Boolean(evidence.liveness.proofID) &&
+      sameIDs(evidence.liveness.sessionIDs, sessionIDs)
     if (evidence.evidenceError) reasons.add(`evidence-unreadable:${evidence.evidenceError}`)
     if (
       !evidence.policy?.reviewed ||
@@ -509,6 +554,7 @@ function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: n
     } else if (!evidence.policy.readerContractReviewed || !evidence.policy.readerContractID) {
       reasons.add("reader-contract-unreviewed")
     }
+    for (const reason of customerBindingFailures(evidence, sessionIDs)) reasons.add(reason)
     if (!evidence.liveness) reasons.add("cross-process-liveness-proof-unavailable")
     if (!evidence.handoff) reasons.add("measurement-handoff-receipt-unavailable")
     if (component.unresolvedParent) reasons.add("session-tree-parent-unreadable")
@@ -521,7 +567,6 @@ function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: n
       reasons.add("session-tree-parent-unreadable")
     if (sessionIDs.some((sessionID) => parentCycle(sessionID, sessionsByID))) reasons.add("session-tree-cycle")
     for (const refusal of globalRefusals) reasons.add(refusal)
-    if (!tables.has("event_retention")) reasons.add("unreplayable-marker-store-unavailable")
 
     const liveness = evidence.liveness
     if (liveness) {
@@ -587,31 +632,14 @@ function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: n
             sessionID,
           )
         : []
-      const rowCount = eventTypes.reduce((total, row) => total + row.rows, 0)
-      if (rowCount > 0 && !aggregate) reasons.add(`event-aggregate-sequence-missing:${sessionID}`)
-      if (aggregate && eventTypes.length > 0) {
-        const invalidJSON = oneRow<{ rows: number }>(
-          db,
-          "SELECT count(*) AS rows FROM event WHERE aggregate_id = ? AND json_valid(data) = 0",
-          sessionID,
-        )?.rows
-        if (invalidJSON) reasons.add(`event-data-unreadable:${sessionID}`)
-        for (const eventType of eventTypes) {
-          const definition = Durable.get(eventType.type)
-          if (!definition?.durable || definition.durable.aggregate !== "sessionID") {
-            reasons.add(`event-aggregate-owner-unknown:${sessionID}:${eventType.type}`)
-            continue
-          }
-          if (!invalidJSON) {
-            const invalidOwner = oneRow<{ rows: number }>(
-              db,
-              "SELECT count(*) AS rows FROM event WHERE aggregate_id = ? AND json_extract(data, ?) IS NOT aggregate_id",
-              sessionID,
-              `$.${definition.durable.aggregate}`,
-            )?.rows
-            if (invalidOwner) reasons.add(`event-aggregate-owner-conflict:${sessionID}:${eventType.type}`)
-          }
-        }
+      for (const reason of eventAggregateFailures(
+        db,
+        sessionID,
+        aggregate,
+        eventTypes.map((row) => row.type),
+        verifyEventPayloadOwnership,
+      )) {
+        reasons.add(reason)
       }
       for (const { table, scope, value } of jsonCopies) {
         if (!tables.has(table)) continue
@@ -627,19 +655,7 @@ function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: n
       }
     }
 
-    for (const { table, scope } of copyTables) {
-      if (!tables.has(table)) {
-        reasons.add(`source-table-unreadable:${table}`)
-        continue
-      }
-      if (scope === "session_id") {
-        const columns = allRows<ColumnRow>(db, `PRAGMA table_info(${quote(table)})`)
-        if (!columns.some((column) => column.name === "session_id")) {
-          reasons.add(`source-ownership-unreadable:${table}`)
-          continue
-        }
-      }
-    }
+    for (const reason of copyOwnershipFailures(db)) reasons.add(reason)
 
     if (tables.has("session_prompt_queue")) {
       const queueRows = oneRow<{ rows: number }>(
@@ -650,12 +666,18 @@ function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: n
       if (queueRows) reasons.add("v1-prompt-queue-row-present")
     }
     if (tables.has("session_input")) {
+      const inputRows = oneRow<{ rows: number }>(
+        db,
+        `SELECT count(*) AS rows FROM session_input WHERE session_id IN (${placeholders(sessionIDs.length)})`,
+        ...sessionIDs,
+      )?.rows
       const pending = oneRow<{ rows: number }>(
         db,
         `SELECT count(*) AS rows FROM session_input WHERE session_id IN (${placeholders(sessionIDs.length)}) AND promoted_seq IS NULL`,
         ...sessionIDs,
       )?.rows
       if (pending) reasons.add("v2-input-pending")
+      else if (inputRows) reasons.add("v2-input-promoted-row-present")
     }
 
     const aggregates = sessionIDs.map((sessionID) => {
@@ -733,6 +755,10 @@ function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: n
 
 function revalidateCandidate(db: SqliteAccess, expected: RetentionTree, evidence: RetentionEvidence, now: number) {
   const reasons = new Set<string>()
+  const schema = retentionSchema(db)
+  for (const table of schema.missingTables) reasons.add(requiredTableReason(table))
+  for (const table of schema.unclassifiedSessionTables) reasons.add(`unclassified-session-owned-table:${table}`)
+  for (const reason of copyOwnershipFailures(db)) reasons.add(reason)
   for (const reason of customerBindingFailures(evidence, expected.sessionIDs)) reasons.add(reason)
   if (evidence.evidenceError) reasons.add(`evidence-unreadable:${evidence.evidenceError}`)
   if (
@@ -749,6 +775,7 @@ function revalidateCandidate(db: SqliteAccess, expected: RetentionTree, evidence
   if (!evidence.liveness) reasons.add("cross-process-liveness-proof-unavailable")
   if (!evidence.handoff) reasons.add("measurement-handoff-receipt-unavailable")
   if (expected.rootSessionID === "" || expected.sessionIDs.length === 0) reasons.add("session-tree-unreadable")
+  if (reasons.size > 0) return Array.from(reasons).toSorted()
 
   const liveness = evidence.liveness
   if (liveness) {
@@ -829,6 +856,15 @@ function revalidateCandidate(db: SqliteAccess, expected: RetentionTree, evidence
       sessionID,
     ).map((row) => row.type)
     aggregates.push({ aggregateID: sessionID, eventTypes })
+    for (const reason of eventAggregateFailures(db, sessionID, aggregate, eventTypes)) reasons.add(reason)
+    for (const { table, scope, value } of jsonCopies) {
+      const invalidJSON = oneRow<{ rows: number }>(
+        db,
+        `SELECT count(*) AS rows FROM ${quote(table)} WHERE ${quote(scope)} = ? AND json_valid(${quote(value)}) = 0`,
+        sessionID,
+      )?.rows
+      if (invalidJSON) reasons.add(`session-copy-unreadable:${table}:${sessionID}`)
+    }
     if (liveness && liveness.aggregateOwners[sessionID] !== (aggregate?.owner_id ?? null)) {
       reasons.add(`cross-process-aggregate-owner-snapshot-mismatch:${sessionID}`)
     }
@@ -841,26 +877,24 @@ function revalidateCandidate(db: SqliteAccess, expected: RetentionTree, evidence
     if (handoff && handoff.finalSequence[sessionID] !== (aggregate?.seq ?? -1)) {
       reasons.add(`measurement-handoff-does-not-cover-final-write:${sessionID}`)
     }
-    if (
-      eventTypes.some((type) => {
-        const definition = Durable.get(type)
-        return !definition?.durable || definition.durable.aggregate !== "sessionID"
-      })
-    ) {
-      reasons.add(`event-aggregate-owner-unknown:${sessionID}`)
-    }
     const queueRows = oneRow<{ rows: number }>(
       db,
       "SELECT count(*) AS rows FROM session_prompt_queue WHERE session_id = ?",
       sessionID,
     )?.rows
     if (queueRows) reasons.add("v1-prompt-queue-row-present")
+    const inputRows = oneRow<{ rows: number }>(
+      db,
+      "SELECT count(*) AS rows FROM session_input WHERE session_id = ?",
+      sessionID,
+    )?.rows
     const pendingInput = oneRow<{ rows: number }>(
       db,
       "SELECT count(*) AS rows FROM session_input WHERE session_id = ? AND promoted_seq IS NULL",
       sessionID,
     )?.rows
     if (pendingInput) reasons.add("v2-input-pending")
+    else if (inputRows) reasons.add("v2-input-promoted-row-present")
     const marker = oneRow<MarkerRow>(
       db,
       "SELECT state, evidence FROM event_retention WHERE aggregate_id = ?",
@@ -919,7 +953,7 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
       readonly sessionID?: string
       readonly changedRows: number
       readonly changedBytes: number
-      readonly reason?: string
+      readonly refusals?: readonly string[]
     }
     try {
       batch = db
@@ -932,7 +966,7 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
               state: "refused" as const,
               changedRows: 0,
               changedBytes: 0,
-              reason: `evidence-unreadable:${error instanceof Error ? error.message : "unknown"}`,
+              refusals: [`evidence-unreadable:${error instanceof Error ? error.message : "unknown"}`],
             }
           }
           const proofFailures = revalidateCandidate(db, input.tree, evidence, now())
@@ -941,7 +975,7 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
               state: "refused" as const,
               changedRows: 0,
               changedBytes: 0,
-              reason: proofFailures.join(",") || "candidate-proof-changed",
+              refusals: proofFailures.length > 0 ? proofFailures : ["candidate-proof-changed"],
             }
           }
           const tree = input.tree
@@ -1034,7 +1068,7 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
       }
     }
     if (batch.state === "refused") {
-      reasons.add(batch.reason ?? "candidate-proof-changed")
+      for (const reason of batch.refusals ?? ["candidate-proof-changed"]) reasons.add(reason)
       return {
         state: batches > 0 ? "in-progress" : "refused",
         changedRows,
@@ -1108,7 +1142,7 @@ function redactRow(db: SqliteAccess, plan: (typeof redactionPlan)[number], sessi
       sessionID,
     )
     if (!before) return { changedRows: 0, changedBytes: 0 }
-    const snapshot = JSON.stringify(retainMetrics(JSON.parse(before.snapshot))) ?? "{}"
+    const snapshot = retainedJSON(before.snapshot)
     if (snapshot === before.snapshot && before.baseline === "") return { changedRows: 0, changedBytes: 0 }
     db.query("UPDATE session_context_epoch SET snapshot = ?, baseline = '' WHERE session_id = ?").run(
       snapshot,
@@ -1119,7 +1153,7 @@ function redactRow(db: SqliteAccess, plan: (typeof redactionPlan)[number], sessi
       changedBytes: byteLength(before.snapshot) - byteLength(snapshot) + byteLength(before.baseline),
     }
   }
-  const next = plan.kind === "text" ? "" : (JSON.stringify(retainMetrics(JSON.parse(String(row.value)))) ?? "{}")
+  const next = retainedValue(plan.kind, row.value)
   if (next === row.value) return { changedRows: 0, changedBytes: 0 }
   db.query(
     `UPDATE ${quote(plan.table)} SET ${quote(plan.value)} = ? WHERE ${quote(plan.scope)} = ? AND ${quote(plan.cursor)} = ?`,
@@ -1127,8 +1161,32 @@ function redactRow(db: SqliteAccess, plan: (typeof redactionPlan)[number], sessi
   return { changedRows: 1, changedBytes: byteLength(row.value) - byteLength(next) }
 }
 
+function retainedJSON(value: string) {
+  return JSON.stringify(retainMetrics(JSON.parse(value))) ?? "{}"
+}
+
+function retainedValue(kind: "json" | "text", value: string | number | null) {
+  return kind === "text" ? "" : retainedJSON(String(value))
+}
+
 function retainMetrics(value: unknown, key?: string): unknown {
   if (key === "responseModelIDs" && Array.isArray(value)) return value.filter((item) => typeof item === "string")
+  if (key === "tokens") {
+    const retained = retainNamedMetrics(value, tokenMetricKeys, (item) => typeof item === "number")
+    if (retained && value !== null && typeof value === "object" && !Array.isArray(value)) {
+      const cache = retainNamedMetrics(
+        (value as Record<string, unknown>).cache,
+        cacheMetricKeys,
+        (item) => typeof item === "number",
+      )
+      if (cache) retained.cache = cache
+    }
+    return retained
+  }
+  if (key === "time") return retainNamedMetrics(value, timeMetricKeys, isMetricScalar)
+  if (key === "timing" || key === "performance") {
+    return retainNamedMetrics(value, timingMetricKeys, (item) => typeof item === "number")
+  }
   if (Array.isArray(value)) return value.map((item) => retainMetrics(item)).filter((item) => item !== undefined)
   if (value !== null && typeof value === "object") {
     return Object.fromEntries(
@@ -1143,24 +1201,51 @@ function retainMetrics(value: unknown, key?: string): unknown {
   return value
 }
 
+function retainNamedMetrics(
+  value: unknown,
+  keys: ReadonlySet<string>,
+  keep: (value: unknown) => boolean,
+): Record<string, unknown> | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined
+  return Object.fromEntries(Object.entries(value).filter(([key, child]) => keys.has(key) && keep(child)))
+}
+
+function isMetricScalar(value: unknown) {
+  return typeof value === "string" || typeof value === "number" || typeof value === "boolean"
+}
+
 function byteLength(value: unknown) {
   return Buffer.byteLength(typeof value === "string" ? value : value === null ? "" : String(value))
 }
 
 export async function compactRestoreFixture(input: CompactFixtureInput): Promise<CompactFixtureResult> {
-  let changedFiles = 0
-  const reasons = new Set<string>()
   let sourceDeviceID: string | undefined
   let backupDeviceID: string | undefined
   let stagingDeviceID: string | undefined
-  let restoreTemp: string | undefined
+  const refused = (reasons: Iterable<string>): CompactFixtureResult => ({
+    state: "refused",
+    changedFiles: 0,
+    reasons: Array.from(reasons).toSorted(),
+    sourceDeviceID,
+    backupDeviceID,
+    stagingDeviceID,
+  })
   try {
+    const sourceIdentity = input.sourceFixture ? fixtureHandles.get(input.sourceFixture.db) : undefined
+    if (
+      !sourceIdentity ||
+      sourceIdentity.filename !== input.sourceFixture?.filename ||
+      path.resolve(input.sourcePath) !== sourceIdentity.filename ||
+      !fixturePathMatches(sourceIdentity)
+    ) {
+      return refused(["source-fixture-identity-unverified"])
+    }
     if (![input.expectedSourceDeviceID, input.expectedBackupDeviceID, input.expectedStagingDeviceID].every(Boolean)) {
-      return { state: "refused", changedFiles, reasons: ["filesystem-identity-unverified"] }
+      return refused(["filesystem-identity-unverified"])
     }
     const sourcePath = await realpath(input.sourcePath)
-    if (!isTemporaryFixturePath(sourcePath)) {
-      return { state: "refused", changedFiles, reasons: ["compaction-only-supported-for-isolated-fixtures"] }
+    if (sourcePath !== sourceIdentity.filename || !isTemporaryFixturePath(sourcePath)) {
+      return refused(["compaction-only-supported-for-isolated-fixtures"])
     }
     const sourceDirectory = await realpath(path.dirname(sourcePath))
     const backupDirectory = await realpath(path.dirname(input.backupPath))
@@ -1187,6 +1272,7 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
       [backupDeviceID, backupFilesystem.bavail * backupFilesystem.bsize],
       [stagingDeviceID, stagingFilesystem.bavail * stagingFilesystem.bsize],
     ])
+    const reasons = new Set<string>()
 
     if (sourceDeviceID !== input.expectedSourceDeviceID) reasons.add("source-filesystem-identity-mismatch")
     if (backupDeviceID !== input.expectedBackupDeviceID) reasons.add("backup-filesystem-identity-mismatch")
@@ -1232,206 +1318,20 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
       if (!openSource.readable) reasons.add("source-inode-liveness-unavailable")
       if (openSource.pids.length > 0) reasons.add("source-inode-still-open")
     }
-    if (reasons.size > 0) {
-      return {
-        state: "refused",
-        changedFiles,
-        reasons: Array.from(reasons).toSorted(),
-        sourceDeviceID,
-        backupDeviceID,
-        stagingDeviceID,
-      }
-    }
+    if (reasons.size > 0) return refused(reasons)
 
-    const sqlite = await import("bun:sqlite")
-    const checkpointDB = new sqlite.Database(sourcePath) as unknown as SqliteAccess
-    const checkpoint = oneRow<{ busy: number; log: number; checkpointed: number }>(
-      checkpointDB,
-      "PRAGMA wal_checkpoint(TRUNCATE)",
-    )
-    checkpointDB.close()
-    if (!checkpoint || checkpoint.busy !== 0 || checkpoint.log !== checkpoint.checkpointed) {
-      reasons.add("fixture-checkpoint-incomplete")
-      return {
-        state: "refused",
-        changedFiles,
-        reasons: Array.from(reasons),
-        sourceDeviceID,
-        backupDeviceID,
-        stagingDeviceID,
-      }
+    if (input.afterInitialLivenessCheck) await input.afterInitialLivenessCheck()
+    for (const filename of [sourcePath, `${sourcePath}-wal`, `${sourcePath}-shm`]) {
+      if (filename !== sourcePath && !(await fileSize(filename))) continue
+      const openSource = openPath(filename)
+      if (!openSource.readable) reasons.add("source-inode-liveness-unavailable")
+      if (openSource.pids.length > 0) reasons.add("source-inode-still-open")
     }
-    const before = await physicalMetrics(sourcePath, input.retainedSessionID)
-    const readinessDB = new sqlite.Database(sourcePath, { readonly: true }) as unknown as SqliteAccess
-    const markers = allRows<{ state: string }>(readinessDB, "SELECT state FROM event_retention")
-    readinessDB.close()
-    if (markers.length === 0) reasons.add("redacted-session-marker-unavailable")
-    if (markers.some((marker) => marker.state !== "complete")) reasons.add("redaction-progress-incomplete")
-    if (before.integrityCheck !== "ok") reasons.add("source-integrity-check-failed")
-    if (reasons.size > 0) {
-      return {
-        state: "refused",
-        changedFiles,
-        reasons: Array.from(reasons),
-        sourceDeviceID,
-        backupDeviceID,
-        stagingDeviceID,
-        measurements: { before },
-      }
-    }
-    await copyFile(sourcePath, backupPath, 1)
-    changedFiles += 1
-    const backup = await physicalMetrics(backupPath, input.retainedSessionID)
-    if (backup.integrityCheck !== "ok" || !sameRetainedMetrics(before.retainedSession, backup.retainedSession)) {
-      reasons.add("backup-integrity-or-retained-read-failed")
-      return {
-        state: "failed",
-        changedFiles,
-        reasons: Array.from(reasons),
-        sourceDeviceID,
-        backupDeviceID,
-        stagingDeviceID,
-        measurements: { before, backup },
-      }
-    }
-
-    const compactDB = new sqlite.Database(sourcePath) as unknown as SqliteAccess
-    compactDB.query("PRAGMA auto_vacuum = INCREMENTAL").run()
-    compactDB.query(`VACUUM INTO ${sqlLiteral(stagingPath)}`).run()
-    compactDB.close()
-    changedFiles += 1
-    const staging = await physicalMetrics(stagingPath, input.retainedSessionID)
-    if (staging.integrityCheck !== "ok") reasons.add("staging-integrity-check-failed")
-    if (staging.autoVacuum !== 2) reasons.add("staging-auto-vacuum-not-incremental")
-    if (staging.size >= before.size) reasons.add("compacted-file-not-smaller")
-    if (!sameRetainedMetrics(before.retainedSession, backup.retainedSession, staging.retainedSession)) {
-      reasons.add("retained-read-diverged-before-restore")
-    }
-    if (reasons.size > 0) {
-      return {
-        state: "failed",
-        changedFiles,
-        reasons: Array.from(reasons).toSorted(),
-        sourceDeviceID,
-        backupDeviceID,
-        stagingDeviceID,
-        measurements: { before, backup, staging },
-      }
-    }
-
-    restoreTemp = path.join(path.dirname(sourcePath), `.${path.basename(sourcePath)}.${randomUUID()}.restore`)
-    const restoreFree = await statfs(path.dirname(sourcePath))
-    if (restoreFree.bavail * restoreFree.bsize < staging.size) {
-      reasons.add("source-restore-capacity-insufficient")
-      return {
-        state: "refused",
-        changedFiles,
-        reasons: Array.from(reasons),
-        sourceDeviceID,
-        backupDeviceID,
-        stagingDeviceID,
-        measurements: { before, backup, staging },
-      }
-    }
-    await copyFile(stagingPath, restoreTemp, 1)
-    changedFiles += 1
-    const stagedRestore = await physicalMetrics(restoreTemp, input.retainedSessionID)
-    if (!sameRetainedMetrics(before.retainedSession, stagedRestore.retainedSession)) {
-      reasons.add("restored-read-diverged-before-replacement")
-      return {
-        state: "failed",
-        changedFiles,
-        reasons: Array.from(reasons),
-        sourceDeviceID,
-        backupDeviceID,
-        stagingDeviceID,
-        measurements: { before, backup, staging, restored: stagedRestore },
-      }
-    }
-    const openBeforeReplace = openPath(sourcePath)
-    if (!openBeforeReplace.readable || openBeforeReplace.pids.length > 0) {
-      reasons.add(
-        openBeforeReplace.readable ? "source-inode-still-open-before-replacement" : "source-inode-liveness-unavailable",
-      )
-      return {
-        state: "refused",
-        changedFiles,
-        reasons: Array.from(reasons).toSorted(),
-        sourceDeviceID,
-        backupDeviceID,
-        stagingDeviceID,
-        measurements: { before, backup, staging, restored: stagedRestore },
-      }
-    }
-    await rename(restoreTemp, sourcePath)
-    restoreTemp = undefined
-    changedFiles += 1
-    const deleted = deletedPathOpen(sourcePath)
-    if (!deleted.readable || deleted.paths.length > 0) {
-      reasons.add(deleted.readable ? "deleted-source-inode-still-open" : "deleted-inode-scan-unavailable")
-    }
-    const restored = await physicalMetrics(sourcePath, input.retainedSessionID)
-    if (restored.size >= before.size) reasons.add("restored-file-not-smaller")
-    if (restored.allocatedBytes >= before.allocatedBytes) reasons.add("restored-allocation-not-smaller")
-    if (!sameRetainedMetrics(before.retainedSession, restored.retainedSession))
-      reasons.add("retained-read-diverged-after-restore")
-    if (restored.integrityCheck !== "ok") reasons.add("restored-integrity-check-failed")
-    return {
-      state: reasons.size === 0 ? "complete" : "failed",
-      changedFiles,
-      reasons: Array.from(reasons).toSorted(),
-      sourceDeviceID,
-      backupDeviceID,
-      stagingDeviceID,
-      measurements: { before, backup, staging, restored },
-    }
+    reasons.add("fixture-writer-quiescence-proof-unavailable")
+    return refused(reasons)
   } catch (error) {
-    if (restoreTemp) await unlink(restoreTemp).catch(() => undefined)
-    reasons.add(`fixture-compaction-failed:${error instanceof Error ? error.message : "unknown"}`)
-    return {
-      state: changedFiles === 0 ? "refused" : "failed",
-      changedFiles,
-      reasons: Array.from(reasons).toSorted(),
-      sourceDeviceID,
-      backupDeviceID,
-      stagingDeviceID,
-    }
+    return refused([`fixture-compaction-preflight-failed:${error instanceof Error ? error.message : "unknown"}`])
   }
-}
-
-async function physicalMetrics(filename: string, sessionID: string): Promise<PhysicalMetrics> {
-  const sqlite = await import("bun:sqlite")
-  const db = new sqlite.Database(filename, { readonly: true }) as unknown as SqliteAccess
-  try {
-    const integrityCheck =
-      oneRow<{ integrity_check: string }>(db, "PRAGMA integrity_check")?.integrity_check ?? "unreadable"
-    const pageCount = oneRow<{ page_count: number }>(db, "PRAGMA page_count")?.page_count ?? -1
-    const freelistCount = oneRow<{ freelist_count: number }>(db, "PRAGMA freelist_count")?.freelist_count ?? -1
-    const autoVacuum = oneRow<{ auto_vacuum: number }>(db, "PRAGMA auto_vacuum")?.auto_vacuum ?? -1
-    const retainedSession = oneRow<Record<string, unknown>>(
-      db,
-      "SELECT id, parent_id, project_id, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, agent, model, time_created, time_updated FROM session WHERE id = ?",
-      sessionID,
-    )
-    if (!retainedSession) throw new Error(`retained session missing: ${sessionID}`)
-    const file = await stat(filename)
-    return {
-      size: file.size,
-      blocks: file.blocks,
-      allocatedBytes: file.blocks * 512,
-      pageCount,
-      freelistCount,
-      autoVacuum,
-      integrityCheck,
-      retainedSession,
-    }
-  } finally {
-    db.close()
-  }
-}
-
-function sameRetainedMetrics(...values: Record<string, unknown>[]) {
-  return values.every((value) => JSON.stringify(value) === JSON.stringify(values[0]))
 }
 
 function isFixtureDatabase(db: SqliteAccess) {
@@ -1494,27 +1394,10 @@ async function fileSize(filename: string) {
   }
 }
 
-function sqlLiteral(value: string) {
-  return `'${value.replaceAll("'", "''")}'`
-}
-
 function openPath(filename: string) {
   const result = spawnSync("lsof", ["-t", filename], { encoding: "utf8", timeout: 15_000 })
   if (result.error || result.status === null || ![0, 1].includes(result.status)) return { readable: false, pids: [] }
   return { readable: true, pids: result.stdout.trim() ? result.stdout.trim().split(/\s+/) : [] }
-}
-
-function deletedPathOpen(filename: string) {
-  const result = spawnSync("lsof", ["+L1", "-Fn"], { encoding: "utf8", timeout: 15_000 })
-  if (result.error || result.status === null || ![0, 1].includes(result.status)) return { readable: false, paths: [] }
-  return {
-    readable: true,
-    paths: result.stdout
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith("n"))
-      .map((line) => line.slice(1))
-      .filter((name) => name === `${filename} (deleted)` || name === filename),
-  }
 }
 
 function parentCycle(sessionID: string, sessions: ReadonlyMap<string, SessionRow>) {
@@ -1584,7 +1467,7 @@ export const RetentionCommand = cmd<{}, RetentionArgs>({
     try {
       const db = new sqlite.Database(Database.path(), { readonly: true }) as unknown as SqliteAccess
       try {
-        console.log(JSON.stringify(inventory(db), null, 2))
+        console.log(JSON.stringify(inventory(db, {}, Date.now(), { transactional: false }), null, 2))
       } finally {
         db.close()
       }

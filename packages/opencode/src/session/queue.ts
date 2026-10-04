@@ -12,6 +12,10 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { MessageV2 } from "./message-v2"
 import { MessageID, SessionID } from "./schema"
 
+type DatabaseService = Database.Interface["db"]
+type DatabaseTransaction = Parameters<Parameters<DatabaseService["transaction"]>[0]>[0]
+type DatabaseAccess = DatabaseService | DatabaseTransaction
+
 // Durable V1 prompt queue (swxtchio/swx-opencode#68). Every prompt except noReply
 // is admitted here before it becomes a V1 user message, so the loop decides when
 // it reaches the model: a steer at the next safe step, a queued item only when
@@ -160,8 +164,15 @@ const layer = Layer.effect(
       return next
     }
 
-    const exclusive: Interface["exclusive"] = (sessionID, effect) =>
-      semaphore(locks, sessionID).withPermit(events.assertWritable(sessionID).pipe(Effect.andThen(effect)))
+    const writable = <A, E>(sessionID: SessionID, effect: (tx: DatabaseTransaction) => Effect.Effect<A, E>) =>
+      db.transaction((tx) =>
+        Effect.gen(function* () {
+          yield* EventV2.assertWritableIn(tx, sessionID)
+          return yield* effect(tx)
+        }),
+      )
+
+    const exclusive: Interface["exclusive"] = (sessionID, effect) => semaphore(locks, sessionID).withPermit(effect)
 
     // Admission, restore and send-now wake the session; called under its lock.
     const wake = (sessionID: SessionID) => {
@@ -207,35 +218,32 @@ const layer = Layer.effect(
     })
 
     const admitLocked = Effect.fnUntraced(function* (input: AdmitInput) {
-      const row = yield* db
-        .transaction((tx) =>
-          Effect.gen(function* () {
-            yield* events.assertWritable(input.sessionID)
-            const allocated = yield* tx
-              .insert(SessionPromptQueueSequenceTable)
-              .values({ session_id: input.sessionID, seq: 1 })
-              .onConflictDoUpdate({
-                target: SessionPromptQueueSequenceTable.session_id,
-                set: { seq: sql`${SessionPromptQueueSequenceTable.seq} + 1` },
-              })
-              .returning({ seq: SessionPromptQueueSequenceTable.seq })
-              .get()
-            if (!allocated) return yield* Effect.die(new Error(`No queue seq allocated for ${input.sessionID}`))
-            return yield* tx
-              .insert(SessionPromptQueueTable)
-              .values({
-                id: ItemID.create(),
-                session_id: input.sessionID,
-                seq: allocated.seq,
-                delivery: input.delivery ?? "steer",
-                input: encodeInput(Struct.omit(input, ["sessionID", "noReply", "delivery"])),
-                time_created: Date.now(),
-              })
-              .returning()
-              .get()
-          }),
-        )
-        .pipe(Effect.orDie)
+      const row = yield* writable(input.sessionID, (tx) =>
+        Effect.gen(function* () {
+          const allocated = yield* tx
+            .insert(SessionPromptQueueSequenceTable)
+            .values({ session_id: input.sessionID, seq: 1 })
+            .onConflictDoUpdate({
+              target: SessionPromptQueueSequenceTable.session_id,
+              set: { seq: sql`${SessionPromptQueueSequenceTable.seq} + 1` },
+            })
+            .returning({ seq: SessionPromptQueueSequenceTable.seq })
+            .get()
+          if (!allocated) return yield* Effect.die(new Error(`No queue seq allocated for ${input.sessionID}`))
+          return yield* tx
+            .insert(SessionPromptQueueTable)
+            .values({
+              id: ItemID.create(),
+              session_id: input.sessionID,
+              seq: allocated.seq,
+              delivery: input.delivery ?? "steer",
+              input: encodeInput(Struct.omit(input, ["sessionID", "noReply", "delivery"])),
+              time_created: Date.now(),
+            })
+            .returning()
+            .get()
+        }),
+      ).pipe(Effect.orDie)
       if (!row) return yield* Effect.die(new Error(`Queue admission for ${input.sessionID} stored nothing`))
       channels.set(row.id, { sessionID: input.sessionID })
       wake(input.sessionID)
@@ -324,13 +332,15 @@ const layer = Layer.effect(
       return yield* exclusive(
         sessionID,
         Effect.gen(function* () {
-          const row = yield* db
-            .update(SessionPromptQueueTable)
-            .set({ time_withdrawn: Date.now(), message_id: null })
-            .where(and(eq(SessionPromptQueueTable.id, itemID), pending(sessionID)))
-            .returning()
-            .get()
-            .pipe(Effect.orDie)
+          const row = yield* writable(sessionID, (tx) =>
+            tx
+              .update(SessionPromptQueueTable)
+              .set({ time_withdrawn: Date.now(), message_id: null })
+              .where(and(eq(SessionPromptQueueTable.id, itemID), pending(sessionID)))
+              .returning()
+              .get()
+              .pipe(Effect.orDie),
+          ).pipe(Effect.orDie)
           if (!row) return Option.none()
           yield* publish(sessionID)
           return Option.some(fromRow(row))
@@ -343,19 +353,21 @@ const layer = Layer.effect(
     })
 
     const restoreLocked = Effect.fnUntraced(function* (sessionID: SessionID, itemID: ItemID) {
-      const row = yield* db
-        .update(SessionPromptQueueTable)
-        .set({ time_withdrawn: null })
-        .where(
-          and(
-            eq(SessionPromptQueueTable.id, itemID),
-            eq(SessionPromptQueueTable.session_id, sessionID),
-            isNotNull(SessionPromptQueueTable.time_withdrawn),
-          ),
-        )
-        .returning()
-        .get()
-        .pipe(Effect.orDie)
+      const row = yield* writable(sessionID, (tx) =>
+        tx
+          .update(SessionPromptQueueTable)
+          .set({ time_withdrawn: null })
+          .where(
+            and(
+              eq(SessionPromptQueueTable.id, itemID),
+              eq(SessionPromptQueueTable.session_id, sessionID),
+              isNotNull(SessionPromptQueueTable.time_withdrawn),
+            ),
+          )
+          .returning()
+          .get()
+          .pipe(Effect.orDie),
+      ).pipe(Effect.orDie)
       if (!row) return Option.none()
       wake(sessionID)
       yield* publish(sessionID)
@@ -375,13 +387,15 @@ const layer = Layer.effect(
       readonly itemID: ItemID
       readonly delivery: Delivery
     }) {
-      const row = yield* db
-        .update(SessionPromptQueueTable)
-        .set({ delivery: input.delivery })
-        .where(and(eq(SessionPromptQueueTable.id, input.itemID), pending(input.sessionID)))
-        .returning()
-        .get()
-        .pipe(Effect.orDie)
+      const row = yield* writable(input.sessionID, (tx) =>
+        tx
+          .update(SessionPromptQueueTable)
+          .set({ delivery: input.delivery })
+          .where(and(eq(SessionPromptQueueTable.id, input.itemID), pending(input.sessionID)))
+          .returning()
+          .get()
+          .pipe(Effect.orDie),
+      ).pipe(Effect.orDie)
       if (!row) return Option.none()
       wake(input.sessionID)
       yield* publish(input.sessionID)
@@ -413,8 +427,8 @@ const layer = Layer.effect(
         ),
       )
 
-    const oldest = (sessionID: SessionID, delivery: Delivery) =>
-      db
+    const oldest = (query: DatabaseAccess, sessionID: SessionID, delivery: Delivery) =>
+      query
         .select()
         .from(SessionPromptQueueTable)
         .where(and(pending(sessionID), eq(SessionPromptQueueTable.delivery, delivery)))
@@ -425,9 +439,13 @@ const layer = Layer.effect(
 
     // A promoted message sorts after the session's history: V1 clients order
     // messages by id, so a supplied id is kept only while it is still the newest.
-    const messageID = Effect.fnUntraced(function* (sessionID: SessionID, supplied: MessageID | undefined) {
+    const messageID = Effect.fnUntraced(function* (
+      query: DatabaseAccess,
+      sessionID: SessionID,
+      supplied: MessageID | undefined,
+    ) {
       if (!supplied) return MessageID.ascending()
-      const newest = yield* db
+      const newest = yield* query
         .select({ id: MessageTable.id })
         .from(MessageTable)
         .where(eq(MessageTable.session_id, sessionID))
@@ -438,8 +456,8 @@ const layer = Layer.effect(
       return !newest || supplied > newest.id ? supplied : MessageID.ascending()
     })
 
-    const landed = (id: MessageID) =>
-      db
+    const landed = (query: DatabaseAccess, id: MessageID) =>
+      query
         .select({ id: MessageTable.id })
         .from(MessageTable)
         .where(eq(MessageTable.id, id))
@@ -449,32 +467,37 @@ const layer = Layer.effect(
           Effect.map((row) => row !== undefined),
         )
 
-    const markPromoted = (itemID: ItemID, id: MessageID) =>
-      db
-        .update(SessionPromptQueueTable)
-        .set({ time_promoted: Date.now() })
-        .where(eq(SessionPromptQueueTable.id, itemID))
-        .run()
-        .pipe(
-          Effect.orDie,
-          Effect.tap(() =>
-            Effect.sync(() => {
-              const channel = channels.get(itemID)
-              if (channel) channel.message = id
-            }),
-          ),
-        )
+    const markPromoted = (sessionID: SessionID, itemID: ItemID, id: MessageID) =>
+      writable(sessionID, (tx) =>
+        tx
+          .update(SessionPromptQueueTable)
+          .set({ time_promoted: Date.now() })
+          .where(eq(SessionPromptQueueTable.id, itemID))
+          .run()
+          .pipe(Effect.orDie),
+      ).pipe(
+        Effect.orDie,
+        Effect.tap(() =>
+          Effect.sync(() => {
+            const channel = channels.get(itemID)
+            if (channel) channel.message = id
+          }),
+        ),
+      )
 
-    const drop = (itemID: ItemID) =>
-      db.delete(SessionPromptQueueTable).where(eq(SessionPromptQueueTable.id, itemID)).run().pipe(Effect.orDie)
+    const drop = (sessionID: SessionID, itemID: ItemID) =>
+      writable(sessionID, (tx) =>
+        tx.delete(SessionPromptQueueTable).where(eq(SessionPromptQueueTable.id, itemID)).run(),
+      ).pipe(Effect.orDie)
 
-    const unreserve = (itemID: ItemID) =>
-      db
-        .update(SessionPromptQueueTable)
-        .set({ message_id: null })
-        .where(eq(SessionPromptQueueTable.id, itemID))
-        .run()
-        .pipe(Effect.orDie)
+    const unreserve = (sessionID: SessionID, itemID: ItemID) =>
+      writable(sessionID, (tx) =>
+        tx
+          .update(SessionPromptQueueTable)
+          .set({ message_id: null })
+          .where(eq(SessionPromptQueueTable.id, itemID))
+          .run(),
+      ).pipe(Effect.orDie)
 
     // Picks the oldest eligible row and reserves its message id, under the lock.
     // A reservation whose message already landed (a process stopped between the
@@ -483,29 +506,66 @@ const layer = Layer.effect(
       exclusive(
         sessionID,
         Effect.gen(function* () {
-          if (delivery === "steer" && !(yield* oldest(sessionID, "steer"))) return undefined
-          if (delivery === "steer" && (yield* compacting(sessionID))) return undefined
-          const row = yield* oldest(sessionID, delivery)
-          if (!row) return undefined
-          if (row.message_id && (yield* landed(row.message_id))) {
-            yield* markPromoted(row.id, row.message_id)
-            yield* publish(sessionID)
-            return { kind: "finished" as const, row }
+          if (delivery === "steer") {
+            const hasPendingSteer = yield* db
+              .transaction((tx) =>
+                Effect.gen(function* () {
+                  return yield* tx
+                    .select({ id: SessionPromptQueueTable.id })
+                    .from(SessionPromptQueueTable)
+                    .where(pending(sessionID))
+                    .orderBy(asc(SessionPromptQueueTable.seq))
+                    .limit(1)
+                    .get()
+                    .pipe(
+                      Effect.map((row) => row !== undefined),
+                      Effect.orDie,
+                    )
+                }),
+              )
+              .pipe(Effect.orDie)
+            if (!hasPendingSteer || (yield* compacting(sessionID))) return undefined
           }
-          const decoded = Schema.decodeUnknownExit(SessionPromptQueue.QueuedInput)(row.input)
-          if (Exit.isFailure(decoded)) {
-            yield* drop(row.id)
+          const result = yield* writable(sessionID, (tx) =>
+            Effect.gen(function* () {
+              const row = yield* oldest(tx, sessionID, delivery)
+              if (!row) return undefined
+              if (row.message_id && (yield* landed(tx, row.message_id))) {
+                yield* tx
+                  .update(SessionPromptQueueTable)
+                  .set({ time_promoted: Date.now() })
+                  .where(eq(SessionPromptQueueTable.id, row.id))
+                  .run()
+                  .pipe(Effect.orDie)
+                return { kind: "finished" as const, row }
+              }
+              const decoded = Schema.decodeUnknownExit(SessionPromptQueue.QueuedInput)(row.input)
+              if (Exit.isFailure(decoded)) {
+                yield* tx.delete(SessionPromptQueueTable).where(eq(SessionPromptQueueTable.id, row.id)).run()
+                return { kind: "invalid" as const, row, cause: decoded.cause }
+              }
+              const id = yield* messageID(tx, sessionID, decoded.value.messageID)
+              yield* tx
+                .update(SessionPromptQueueTable)
+                .set({ message_id: id })
+                .where(eq(SessionPromptQueueTable.id, row.id))
+                .run()
+                .pipe(Effect.orDie)
+              return { kind: "reserved" as const, row, input: decoded.value, id }
+            }),
+          ).pipe(Effect.orDie)
+          if (!result) return undefined
+          if (result.kind === "finished") {
+            const channel = channels.get(result.row.id)
+            if (channel) channel.message = result.row.message_id!
             yield* publish(sessionID)
-            return { kind: "invalid" as const, row, cause: decoded.cause }
+            return result
           }
-          const id = yield* messageID(sessionID, decoded.value.messageID)
-          yield* db
-            .update(SessionPromptQueueTable)
-            .set({ message_id: id })
-            .where(eq(SessionPromptQueueTable.id, row.id))
-            .run()
-            .pipe(Effect.orDie)
-          return { kind: "reserved" as const, row, input: decoded.value, id }
+          if (result.kind === "invalid") {
+            yield* publish(sessionID)
+            return result
+          }
+          return result
         }),
       )
 
@@ -536,14 +596,18 @@ const layer = Layer.effect(
             .pipe(Effect.orDie)
           if (!current) return false
           if (delivery === "steer" && (yield* compacting(sessionID))) {
-            yield* unreserve(itemID)
+            yield* unreserve(sessionID, itemID)
             return false
           }
           yield* write(prepared).pipe(
             Effect.onExit((exit) =>
               Exit.isSuccess(exit)
-                ? markPromoted(itemID, id)
-                : landed(id).pipe(Effect.flatMap((exists) => (exists ? markPromoted(itemID, id) : unreserve(itemID)))),
+                ? markPromoted(sessionID, itemID, id)
+                : landed(db, id).pipe(
+                    Effect.flatMap((exists) =>
+                      exists ? markPromoted(sessionID, itemID, id) : unreserve(sessionID, itemID),
+                    ),
+                  ),
             ),
             Effect.ensuring(publish(sessionID)),
           )
@@ -585,9 +649,10 @@ const layer = Layer.effect(
                 // A prompt that cannot become a message is consumed, as a failed prompt was before the queue.
                 yield* exclusive(
                   input.sessionID,
-                  (Cause.hasInterruptsOnly(prepared.cause) ? unreserve(next.row.id) : drop(next.row.id)).pipe(
-                    Effect.andThen(publish(input.sessionID)),
-                  ),
+                  (Cause.hasInterruptsOnly(prepared.cause)
+                    ? unreserve(input.sessionID, next.row.id)
+                    : drop(input.sessionID, next.row.id)
+                  ).pipe(Effect.andThen(publish(input.sessionID))),
                 )
                 if (Cause.hasInterruptsOnly(prepared.cause) || next.row.id === input.own)
                   return yield* Effect.failCause(prepared.cause)
@@ -613,16 +678,15 @@ const layer = Layer.effect(
     const consume = Effect.fn("SessionQueue.consume")(function* (sessionID: SessionID) {
       return yield* exclusive(
         sessionID,
-        db
-          .delete(SessionPromptQueueTable)
-          .where(
-            and(eq(SessionPromptQueueTable.session_id, sessionID), isNotNull(SessionPromptQueueTable.time_promoted)),
-          )
-          .run()
-          .pipe(
-            Effect.orDie,
-            Effect.map(() => wakes.get(sessionID) ?? 0),
-          ),
+        writable(sessionID, (tx) =>
+          tx
+            .delete(SessionPromptQueueTable)
+            .where(
+              and(eq(SessionPromptQueueTable.session_id, sessionID), isNotNull(SessionPromptQueueTable.time_promoted)),
+            )
+            .run()
+            .pipe(Effect.map(() => wakes.get(sessionID) ?? 0)),
+        ).pipe(Effect.orDie),
       )
     })
 

@@ -16,6 +16,33 @@ import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import { HistoryPayload, ReplayPayload, SessionPayload } from "../groups/sync"
 
+export function readSyncHistory(db: Database.Interface["db"], payload: typeof HistoryPayload.Type) {
+  const exclude = Object.entries(payload)
+  const where =
+    exclude.length > 0
+      ? not(or(...exclude.map(([id, seq]) => and(eq(EventTable.aggregate_id, id), lte(EventTable.seq, seq))))!)
+      : undefined
+  return db
+    .transaction((tx) =>
+      Effect.gen(function* () {
+        const aggregates = yield* tx
+          .select({ aggregateID: EventTable.aggregate_id })
+          .from(EventTable)
+          .where(where)
+          .groupBy(EventTable.aggregate_id)
+          .all()
+          .pipe(Effect.orDie)
+        yield* Effect.forEach(
+          new Set([...Object.keys(payload), ...aggregates.map((event) => event.aggregateID)]),
+          (aggregateID) => EventV2.assertReplayableIn(tx, aggregateID),
+          { discard: true },
+        )
+        return yield* tx.select().from(EventTable).where(where).orderBy(asc(EventTable.seq)).all().pipe(Effect.orDie)
+      }),
+    )
+    .pipe(Effect.orDie)
+}
+
 export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handlers) =>
   Effect.gen(function* () {
     const workspace = yield* Workspace.Service
@@ -70,34 +97,7 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
     })
 
     const history = Effect.fn("SyncHttpApi.history")(function* (ctx: { payload: typeof HistoryPayload.Type }) {
-      const exclude = Object.entries(ctx.payload)
-      return yield* db
-        .transaction(() =>
-          Effect.gen(function* () {
-            const rows = yield* db
-              .select()
-              .from(EventTable)
-              .where(
-                exclude.length > 0
-                  ? not(
-                      or(
-                        ...exclude.map(([id, seq]) => and(eq(EventTable.aggregate_id, id), lte(EventTable.seq, seq))),
-                      )!,
-                    )
-                  : undefined,
-              )
-              .orderBy(asc(EventTable.seq))
-              .all()
-              .pipe(Effect.orDie)
-            yield* Effect.forEach(
-              new Set([...Object.keys(ctx.payload), ...rows.map((event) => event.aggregate_id)]),
-              (aggregateID) => events.assertReplayable(aggregateID),
-              { discard: true },
-            )
-            return rows
-          }),
-        )
-        .pipe(Effect.orDie)
+      return yield* readSyncHistory(db, ctx.payload)
     })
 
     return handlers.handle("start", start).handle("replay", replay).handle("steal", steal).handle("history", history)

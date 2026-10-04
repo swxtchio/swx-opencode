@@ -1,12 +1,21 @@
-import { expect, test } from "bun:test"
+import { expect, spyOn, test } from "bun:test"
 import { Database } from "bun:sqlite"
+import { Context, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Flag } from "@opencode-ai/core/flag/flag"
 import { mkdtemp, rm, stat, statfs, symlink } from "node:fs/promises"
 import path from "node:path"
+import { eq } from "drizzle-orm"
+import { Service, layerFromPath } from "@opencode-ai/core/database/database"
+import { EventRetentionTable } from "@opencode-ai/core/event/sql"
+import { SessionContextEpoch } from "@opencode-ai/core/session/context-epoch"
+import { SessionV2 } from "@opencode-ai/core/session"
+import { SystemContext } from "@opencode-ai/core/system-context/index"
 import {
   apply,
   compactRestoreFixture,
   createFixtureDatabase,
   inventory,
+  RetentionCommand,
   type RetentionEvidence,
   type SqliteAccess,
 } from "@/cli/cmd/db-retention"
@@ -177,11 +186,6 @@ function addCopies(db: Database, sessionID: string) {
       text: "v2 message sentinel",
     }),
   )
-  db.query("INSERT INTO session_input (id, session_id, promoted_seq, prompt) VALUES (?, ?, 1, ?)").run(
-    `input_${sessionID}`,
-    sessionID,
-    JSON.stringify({ text: "input sentinel" }),
-  )
   db.query("INSERT INTO session_context_epoch (session_id, baseline, snapshot) VALUES (?, ?, ?)").run(
     sessionID,
     "baseline",
@@ -192,6 +196,86 @@ function addCopies(db: Database, sessionID: string) {
     "INSERT INTO session_share (session_id, id, secret, url) VALUES (?, 'share', 'secret sentinel', 'share sentinel')",
   ).run(sessionID)
 }
+
+test("best-effort inventory does not open a read transaction", () => {
+  const db = fixture()
+  try {
+    session(db, "ses_unproven", 10)
+    event(db, "ses_unproven")
+    let transactions = 0
+    const observed = new Proxy(access(db), {
+      get(target, property) {
+        if (property === "transaction")
+          return () => {
+            transactions += 1
+            throw new Error("best-effort inventory opened a transaction")
+          }
+        const value = Reflect.get(target, property, target)
+        return typeof value === "function" ? value.bind(target) : value
+      },
+    })
+
+    const result = inventory(observed, {}, 1_000, { transactional: false })
+
+    expect(transactions).toBe(0)
+    expect(result.trees[0]?.eligible).toBe(false)
+    expect(result.trees[0]?.reasons).toContain("customer-session-classification-unavailable")
+  } finally {
+    db.close()
+  }
+})
+
+test("retention CLI keeps inventory read-only and refuses apply before opening the database", async () => {
+  await using fixtureDB = await createFixtureDatabase()
+  createSchema(fixtureDB.db)
+  session(fixtureDB.db, "ses_cli", 10)
+  event(fixtureDB.db, "ses_cli")
+  fixtureDB.db.query("UPDATE event SET data = 'not-json' WHERE aggregate_id = 'ses_cli'").run()
+  fixtureDB.db.close()
+  const previousDB = Flag.OPENCODE_DB
+  const previousExitCode = process.exitCode
+  Flag.OPENCODE_DB = fixtureDB.filename
+  const output = spyOn(console, "log").mockImplementation(() => {})
+  const transaction = spyOn(Database.prototype, "transaction")
+  try {
+    process.exitCode = 0
+    await RetentionCommand.handler({ _: [], $0: "test", apply: false })
+    const dryRun = JSON.parse(String(output.mock.calls[0]?.[0])) as ReturnType<typeof inventory>
+    expect(dryRun.trees[0]?.eligible).toBe(false)
+    expect(dryRun.trees[0]?.reasons).toContain("reviewed-age-boundary-unavailable")
+    expect(dryRun.trees[0]?.reasons).toContain("cross-process-liveness-proof-unavailable")
+    expect(dryRun.trees[0]?.reasons).toContain("event-payload-ownership-proof-unavailable:ses_cli")
+    expect(transaction).not.toHaveBeenCalled()
+
+    const before = new Database(fixtureDB.filename, { readonly: true })
+    const beforeEvent = before
+      .query<{ data: string }, [string]>("SELECT data FROM event WHERE aggregate_id = ?")
+      .get("ses_cli")?.data
+    before.close()
+    await RetentionCommand.handler({ _: [], $0: "test", apply: true })
+    const applyResult = JSON.parse(String(output.mock.calls[1]?.[0])) as {
+      action: string
+      changedRows: number
+      reasons: string[]
+    }
+    expect(applyResult.action).toBe("refused")
+    expect(applyResult.changedRows).toBe(0)
+    expect(applyResult.reasons).toContain("production-apply-disabled")
+    expect(transaction).not.toHaveBeenCalled()
+    const after = new Database(fixtureDB.filename, { readonly: true })
+    expect(
+      after.query<{ data: string }, [string]>("SELECT data FROM event WHERE aggregate_id = ?").get("ses_cli")?.data,
+    ).toBe(beforeEvent)
+    expect(after.query("SELECT state FROM event_retention").get()).toBeNull()
+    after.close()
+    expect(process.exitCode).toBe(1)
+  } finally {
+    transaction.mockRestore()
+    output.mockRestore()
+    Flag.OPENCODE_DB = previousDB
+    process.exitCode = previousExitCode ?? 0
+  }
+})
 
 test("dry run reports exact trees and refusals without changing SQLite", () => {
   const db = fixture()
@@ -373,8 +457,13 @@ test("unknown event ownership, malformed event data, and new Session tables rema
 
     db.exec("CREATE TABLE future_session_copy (session_id TEXT NOT NULL, content TEXT NOT NULL)")
     db.query("INSERT INTO future_session_copy (session_id, content) VALUES ('ses_old', 'unclassified sentinel')").run()
+    db.exec("CREATE TABLE future_event_copy (aggregate_id TEXT NOT NULL, content TEXT NOT NULL)")
+    db.query(
+      "INSERT INTO future_event_copy (aggregate_id, content) VALUES ('ses_old', 'unclassified event sentinel')",
+    ).run()
     const unknownCopy = inventory(access(db), proof, 1_000)
     expect(unknownCopy.refusals).toContain("unclassified-session-owned-table:future_session_copy")
+    expect(unknownCopy.refusals).toContain("unclassified-session-owned-table:future_event_copy")
     expect(unknownCopy.trees[0]?.eligible).toBe(false)
   } finally {
     db.close()
@@ -481,7 +570,7 @@ test("apply redacts every copy in restartable batches and preserves metric value
     })
     expect(resumed.query("SELECT count(*) AS rows FROM session_share").get()).toEqual({ rows: 0 })
     expect(resumed.query("SELECT content FROM todo WHERE session_id = 'ses_old'").get()).toEqual({ content: "" })
-    expect(resumed.query("SELECT prompt FROM session_input WHERE id = 'input_ses_old'").get()).toEqual({ prompt: "{}" })
+    expect(resumed.query("SELECT prompt FROM session_input WHERE session_id = 'ses_old'").get()).toBeNull()
     expect(resumed.query("SELECT snapshot FROM session_context_epoch WHERE session_id = 'ses_old'").get()).toEqual({
       snapshot: "{}",
     })
@@ -658,6 +747,39 @@ test(
   { timeout: 10_000 },
 )
 
+test(
+  "compaction refuses a temporary database not issued by the fixture factory",
+  async () => {
+    await using tmp = await tmpdir()
+    const sourcePath = path.join(tmp.path, "unissued-compaction.sqlite")
+    const backupPath = path.join(tmp.path, "unissued-backup.sqlite")
+    const stagingPath = path.join(tmp.path, "unissued-staging.sqlite")
+    const db = new Database(sourcePath)
+    createSchema(db)
+    session(db, "ses_unissued", 10)
+    event(db, "ses_unissued")
+    const before = db.serialize()
+    const result = await compactRestoreFixture({
+      sourcePath,
+      backupPath,
+      stagingPath,
+      expectedSourceDeviceID: "fixture-source",
+      expectedBackupDeviceID: "fixture-backup",
+      expectedStagingDeviceID: "fixture-staging",
+      retainedSessionID: "ses_unissued",
+    })
+
+    expect(result.state).toBe("refused")
+    expect(result.changedFiles).toBe(0)
+    expect(result.reasons).toContain("source-fixture-identity-unverified")
+    expect(db.serialize().equals(before)).toBe(true)
+    expect(await Bun.file(backupPath).exists()).toBe(false)
+    expect(await Bun.file(stagingPath).exists()).toBe(false)
+    db.close()
+  },
+  { timeout: 10_000 },
+)
+
 test("apply revalidates evidence inside every batch and keeps partial history unreplayable", () => {
   const db = fixture()
   try {
@@ -689,8 +811,155 @@ test("apply revalidates evidence inside every batch and keeps partial history un
   }
 })
 
+test("apply refuses aggregate-owner changes after inventory before changing rows", () => {
+  const db = fixture()
+  try {
+    session(db, "ses_owner", 10)
+    event(db, "ses_owner")
+    const proof = evidence(["ses_owner"], { ses_owner: 0 })
+    const tree = inventory(access(db), proof, 1_000).trees[0]!
+    expect(tree.eligible).toBe(true)
+    db.query("UPDATE event_sequence SET owner_id = 'new-owner' WHERE aggregate_id = 'ses_owner'").run()
+    const before = db.serialize()
+
+    const result = apply(access(db), { tree, evidence: () => proof, now: () => 1_000 })
+
+    expect(result.state).toBe("refused")
+    expect(result.changedRows).toBe(0)
+    expect(result.reasons).toContain("cross-process-aggregate-owner-snapshot-mismatch:ses_owner")
+    expect(db.serialize().equals(before)).toBe(true)
+  } finally {
+    db.close()
+  }
+})
+
+test("apply refuses a newly added session-owned raw table before changing rows", () => {
+  const db = fixture()
+  try {
+    session(db, "ses_schema", 10)
+    event(db, "ses_schema")
+    const proof = evidence(["ses_schema"], { ses_schema: 0 })
+    const tree = inventory(access(db), proof, 1_000).trees[0]!
+    expect(tree.eligible).toBe(true)
+    db.exec("CREATE TABLE future_session_copy (session_id TEXT NOT NULL, body TEXT NOT NULL)")
+    db.query("INSERT INTO future_session_copy VALUES ('ses_schema', 'new raw sentinel')").run()
+    const before = db.serialize()
+
+    const result = apply(access(db), { tree, evidence: () => proof, now: () => 1_000 })
+
+    expect(result.state).toBe("refused")
+    expect(result.changedRows).toBe(0)
+    expect(result.reasons).toContain("unclassified-session-owned-table:future_session_copy")
+    expect(db.serialize().equals(before)).toBe(true)
+  } finally {
+    db.close()
+  }
+})
+
+test("apply refuses event data corruption after inventory before changing rows", () => {
+  const db = fixture()
+  try {
+    session(db, "ses_event", 10)
+    event(db, "ses_event")
+    const proof = evidence(["ses_event"], { ses_event: 0 })
+    const tree = inventory(access(db), proof, 1_000).trees[0]!
+    expect(tree.eligible).toBe(true)
+    db.query("UPDATE event SET data = 'not-json' WHERE aggregate_id = 'ses_event'").run()
+    const before = db.serialize()
+
+    const result = apply(access(db), { tree, evidence: () => proof, now: () => 1_000 })
+
+    expect(result.state).toBe("refused")
+    expect(result.changedRows).toBe(0)
+    expect(result.reasons).toContain("event-data-unreadable:ses_event")
+    expect(db.serialize().equals(before)).toBe(true)
+  } finally {
+    db.close()
+  }
+})
+
 test(
-  "fixture compaction backs up, restores, and returns allocated bytes on a distinct filesystem",
+  "retention marker fences a real Context Epoch producer paused across the first batch",
+  async () => {
+    await using fixture = await createFixtureDatabase()
+    const sessionID = "ses_context_race"
+    const now = 1_000
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const services = yield* Layer.build(layerFromPath(fixture.filename))
+            const writer = Context.get(services, Service).db
+            session(fixture.db, sessionID, 10)
+            event(fixture.db, sessionID)
+            const proof = evidence([sessionID], { [sessionID]: 0 }, now)
+            const tree = inventory(access(fixture.db), proof, now).trees.find(
+              (candidate) => candidate.rootSessionID === sessionID,
+            )
+            if (!tree?.eligible)
+              return yield* Effect.die(new Error(`Retention fixture refused: ${tree?.reasons.join(",")}`))
+
+            const entered = yield* Deferred.make<void>()
+            const release = yield* Deferred.make<SystemContext.SystemContext>()
+            const producerContext = Effect.gen(function* () {
+              yield* Deferred.succeed(entered, undefined)
+              return yield* Deferred.await(release)
+            })
+            const producer = SessionContextEpoch.initialize(writer, producerContext, SessionV2.ID.make(sessionID))
+            const fiber = yield* producer.pipe(Effect.forkChild({ startImmediately: true }))
+            yield* Effect.addFinalizer(() =>
+              Deferred.succeed(release, SystemContext.empty).pipe(
+                Effect.andThen(Fiber.interrupt(fiber)),
+                Effect.asVoid,
+              ),
+            )
+            yield* Effect.race(
+              Deferred.await(entered),
+              Effect.sleep("2 seconds").pipe(
+                Effect.andThen(Effect.fail(new Error("Context Epoch producer did not start"))),
+              ),
+            )
+
+            const firstBatch = apply(access(fixture.db), {
+              tree,
+              evidence: () => proof,
+              now: () => now,
+              batchSize: 1,
+              maxBatches: 1,
+            })
+            expect(firstBatch.state).toBe("in-progress")
+            expect(firstBatch.changedRows).toBe(1)
+            expect(
+              yield* writer
+                .select({ state: EventRetentionTable.state })
+                .from(EventRetentionTable)
+                .where(eq(EventRetentionTable.aggregate_id, sessionID))
+                .get(),
+            ).toEqual({ state: "redacting" })
+            yield* Deferred.succeed(release, SystemContext.empty)
+
+            const result = yield* Fiber.join(fiber).pipe(Effect.exit)
+            expect(Exit.isFailure(result)).toBe(true)
+            expect(
+              fixture.db
+                .query<
+                  { session_id: string },
+                  [string]
+                >("SELECT session_id FROM session_context_epoch WHERE session_id = ?")
+                .get(sessionID),
+            ).toBeNull()
+          }),
+        ),
+      )
+    } finally {
+      fixture.db.close()
+    }
+  },
+  { timeout: 10_000 },
+)
+
+test(
+  "fixture compaction refuses replacement without continuous writer quiescence proof",
   async () => {
     await using sourceFixture = await createFixtureDatabase()
     const sourcePath = sourceFixture.filename
@@ -741,6 +1010,11 @@ test(
       pageCount: afterRedactionDB.query<{ page_count: number }, []>("PRAGMA page_count").get()!.page_count,
       freelistCount: afterRedactionDB.query<{ freelist_count: number }, []>("PRAGMA freelist_count").get()!
         .freelist_count,
+      integrityCheck: afterRedactionDB.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get()!
+        .integrity_check,
+      retainedSession: afterRedactionDB
+        .query<{ id: string; tokens_input: number }, [string]>("SELECT id, tokens_input FROM session WHERE id = ?")
+        .get("ses_physical"),
     }
     afterRedactionDB.close()
     expect(beforeRedaction.freelistCount).toBe(0)
@@ -755,6 +1029,7 @@ test(
     const stagingPath = path.join(stagingDirectory, "compacted.sqlite")
     const insufficient = await compactRestoreFixture({
       sourcePath,
+      sourceFixture,
       backupPath: path.join(stagingDirectory, "capacity-backup.sqlite"),
       stagingPath: path.join(stagingDirectory, "capacity-stage.sqlite"),
       expectedSourceDeviceID: sourceDeviceID,
@@ -769,6 +1044,7 @@ test(
 
     const unverifiedIdentity = await compactRestoreFixture({
       sourcePath,
+      sourceFixture,
       backupPath: path.join(stagingDirectory, "identity-backup.sqlite"),
       stagingPath: path.join(stagingDirectory, "identity-stage.sqlite"),
       expectedSourceDeviceID: sourceDeviceID,
@@ -783,6 +1059,7 @@ test(
     const holder = new Database(sourcePath, { readonly: true })
     const held = await compactRestoreFixture({
       sourcePath,
+      sourceFixture,
       backupPath,
       stagingPath,
       expectedSourceDeviceID: sourceDeviceID,
@@ -798,6 +1075,7 @@ test(
     const rootDeviceID = String((await stat("/")).dev)
     const rootDestination = await compactRestoreFixture({
       sourcePath,
+      sourceFixture,
       backupPath: path.join(path.dirname(sourcePath), "root-backup.sqlite"),
       stagingPath: path.join(path.dirname(sourcePath), "root-stage.sqlite"),
       expectedSourceDeviceID: sourceDeviceID,
@@ -809,8 +1087,29 @@ test(
     expect(rootDestination.changedFiles).toBe(0)
     expect(rootDestination.reasons).toContain("staging-destination-is-root")
 
-    const compacted = await compactRestoreFixture({
+    const beforeReplaceStat = await stat(sourcePath)
+    let arrivingWriter: Database | undefined
+    const writerArrival = await compactRestoreFixture({
       sourcePath,
+      sourceFixture,
+      backupPath,
+      stagingPath,
+      expectedSourceDeviceID: sourceDeviceID,
+      expectedBackupDeviceID: destinationDeviceID,
+      expectedStagingDeviceID: destinationDeviceID,
+      retainedSessionID: "ses_physical",
+      afterInitialLivenessCheck: async () => {
+        arrivingWriter = new Database(sourcePath)
+      },
+    })
+    arrivingWriter?.close()
+    expect(writerArrival.state).toBe("refused")
+    expect(writerArrival.changedFiles).toBe(0)
+    expect(writerArrival.reasons).toContain("source-inode-still-open")
+
+    const refused = await compactRestoreFixture({
+      sourcePath,
+      sourceFixture,
       backupPath,
       stagingPath,
       expectedSourceDeviceID: sourceDeviceID,
@@ -818,18 +1117,25 @@ test(
       expectedStagingDeviceID: destinationDeviceID,
       retainedSessionID: "ses_physical",
     })
-    expect(compacted.reasons).toEqual([])
-    expect(compacted.state).toBe("complete")
-    expect(compacted.changedFiles).toBe(4)
-    expect(compacted.measurements?.backup?.integrityCheck).toBe("ok")
-    expect(compacted.measurements?.staging?.integrityCheck).toBe("ok")
-    expect(compacted.measurements?.restored?.integrityCheck).toBe("ok")
-    expect(compacted.measurements?.staging?.autoVacuum).toBe(2)
-    expect(compacted.measurements?.restored?.size).toBeLessThan(beforeRedactionStat.size)
-    expect(compacted.measurements?.restored?.allocatedBytes).toBeLessThan(beforeRedactionStat.blocks * 512)
-    expect(compacted.measurements?.restored?.pageCount).toBeLessThan(beforeRedaction.pageCount)
-    expect(compacted.measurements?.restored?.freelistCount).toBe(0)
-    expect(compacted.measurements?.restored?.retainedSession).toEqual(compacted.measurements?.backup?.retainedSession)
+    expect(refused.state).toBe("refused")
+    expect(refused.changedFiles).toBe(0)
+    expect(refused.reasons).toContain("fixture-writer-quiescence-proof-unavailable")
+    expect({
+      device: (await stat(sourcePath)).dev,
+      inode: (await stat(sourcePath)).ino,
+      size: (await stat(sourcePath)).size,
+    }).toEqual({
+      device: beforeReplaceStat.dev,
+      inode: beforeReplaceStat.ino,
+      size: beforeReplaceStat.size,
+    })
+    expect(afterRedaction.integrityCheck).toBe("ok")
+    expect(afterRedaction.freelistCount).toBeGreaterThan(beforeRedaction.freelistCount)
+    expect(afterRedactionStat.size).toBe(beforeRedactionStat.size)
+    expect(afterRedaction.pageCount).toBeGreaterThan(0)
+    expect(afterRedaction.retainedSession).toEqual({ id: "ses_physical", tokens_input: 13 })
+    expect(await Bun.file(backupPath).exists()).toBe(false)
+    expect(await Bun.file(stagingPath).exists()).toBe(false)
   },
   { timeout: 60_000 },
 )

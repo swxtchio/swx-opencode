@@ -31,7 +31,7 @@ const layer = Layer.effect(
       yield* db
         .transaction((tx) =>
           Effect.gen(function* () {
-            yield* events.assertWritable(input.sessionID)
+            yield* EventV2.assertWritableIn(tx, input.sessionID)
             yield* tx.delete(TodoTable).where(eq(TodoTable.session_id, input.sessionID)).run()
             if (input.todos.length === 0) return
             yield* tx

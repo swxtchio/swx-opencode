@@ -5,6 +5,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionStore } from "@opencode-ai/core/session/store"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { SessionInput } from "@opencode-ai/core/session/input"
 import { Prompt } from "@opencode-ai/core/session/prompt"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionMessage } from "@opencode-ai/core/session/message"
@@ -17,7 +18,13 @@ import { desc, eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventRetentionTable, EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
-import { PartTable, SessionInputTable, SessionTable, TodoTable } from "@opencode-ai/core/session/sql"
+import {
+  PartTable,
+  SessionInputTable,
+  SessionMessageTable,
+  SessionTable,
+  TodoTable,
+} from "@opencode-ai/core/session/sql"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
@@ -595,11 +602,185 @@ describe("Session retention producer path", () => {
     }),
   )
 
+  retentionIt.instance(
+    "redacts producer-emitted tool arguments and shell output while retaining route and usage metrics",
+    () =>
+      Effect.gen(function* () {
+        const session = yield* SessionNs.Service
+        const events = yield* EventV2Bridge.Service
+        const { db } = yield* Database.Service
+        const info = yield* session.create({ title: "producer retention source" })
+        const sessionID = SessionV2.ID.make(info.id)
+        const timestamp = yield* DateTime.now
+        const assistantMessageID = SessionMessage.ID.create()
+
+        yield* events.publish(SessionEvent.Step.Started, {
+          sessionID,
+          timestamp,
+          assistantMessageID,
+          agent: "build",
+          model: { id: ModelV2.ID.make("configured-route"), providerID: ProviderV2.ID.make("route-provider") },
+        })
+        yield* events.publish(SessionEvent.Tool.Input.Started, {
+          sessionID,
+          timestamp,
+          assistantMessageID,
+          callID: "call-retention-tool",
+          name: "read",
+        })
+        yield* events.publish(SessionEvent.Tool.Input.Ended, {
+          sessionID,
+          timestamp,
+          assistantMessageID,
+          callID: "call-retention-tool",
+          text: "tool input ended raw sentinel",
+        })
+        yield* events.publish(SessionEvent.Tool.Called, {
+          sessionID,
+          timestamp,
+          assistantMessageID,
+          callID: "call-retention-tool",
+          tool: "read",
+          input: { path: "tool called raw sentinel" },
+          provider: { executed: false },
+        })
+        yield* events.publish(SessionEvent.Shell.Started, {
+          sessionID,
+          timestamp,
+          messageID: SessionMessage.ID.create(),
+          callID: "call-retention-shell",
+          command: "shell command raw sentinel",
+        })
+        yield* events.publish(SessionEvent.Shell.Ended, {
+          sessionID,
+          timestamp,
+          callID: "call-retention-shell",
+          output: "shell output raw sentinel",
+        })
+        yield* events.publish(SessionEvent.Step.Ended, {
+          sessionID,
+          timestamp,
+          assistantMessageID,
+          finish: "stop",
+          cost: 0.75,
+          tokens: { input: 21, output: 8, reasoning: 3, cache: { read: 5, write: 2 } },
+        })
+
+        const before = yield* Effect.all(
+          [
+            db.select({ data: EventTable.data }).from(EventTable).where(eq(EventTable.aggregate_id, info.id)).all(),
+            db
+              .select({ data: SessionMessageTable.data })
+              .from(SessionMessageTable)
+              .where(eq(SessionMessageTable.session_id, info.id))
+              .all(),
+          ],
+          { concurrency: "unbounded" },
+        )
+        const beforeJSON = JSON.stringify(before)
+        for (const sentinel of [
+          "tool input ended raw sentinel",
+          "tool called raw sentinel",
+          "shell command raw sentinel",
+          "shell output raw sentinel",
+        ]) {
+          expect(beforeJSON).toContain(sentinel)
+        }
+
+        const applied = yield* applyRetentionFixture(info.id)
+        const redacted = applied.database
+        const copies = [
+          ...redacted
+            .query<{ data: string }, [string]>("SELECT data FROM event WHERE aggregate_id = ?")
+            .all(info.id)
+            .map((row) => row.data),
+          ...redacted
+            .query<{ data: string }, [string]>("SELECT data FROM session_message WHERE session_id = ?")
+            .all(info.id)
+            .map((row) => row.data),
+        ]
+        const copyJSON = JSON.stringify(copies)
+        for (const sentinel of [
+          "tool input ended raw sentinel",
+          "tool called raw sentinel",
+          "shell command raw sentinel",
+          "shell output raw sentinel",
+        ]) {
+          expect(copyJSON).not.toContain(sentinel)
+        }
+        const assistant = redacted
+          .query<
+            { data: string },
+            [string]
+          >("SELECT data FROM session_message WHERE session_id = ? AND type = 'assistant'")
+          .get(info.id)
+        expect(JSON.parse(assistant!.data).model).toEqual({
+          id: "configured-route",
+          providerID: "route-provider",
+        })
+        expect(JSON.parse(assistant!.data)).toMatchObject({
+          cost: 0.75,
+          tokens: { input: 21, output: 8, reasoning: 3, cache: { read: 5, write: 2 } },
+        })
+        expect(applied.tree.retainedMetricFields).toContain("model.id (requested route)")
+        expect(applied.tree.retainedMetricFields).toContain("tokens.cache.read")
+      }),
+    { timeout: 10_000 },
+  )
+
+  retentionIt.instance("fences V1 queue reads and mutations during retention", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const queue = yield* SessionQueue.Service
+      const { db } = yield* Database.Service
+      const info = yield* session.create({})
+      const item = yield* queue.admit({
+        sessionID: info.id,
+        delivery: "queue",
+        parts: [{ type: "text", text: "queue retention sentinel" }],
+      })
+      yield* db.insert(EventRetentionTable).values({
+        aggregate_id: info.id,
+        state: "redacting",
+        progress_table: "event",
+        progress_id: "evt_retention",
+        evidence: {},
+        time_started: 1,
+        time_updated: 1,
+      })
+
+      const prepared = { called: false }
+      const promoted = yield* queue
+        .promote({
+          sessionID: info.id,
+          delivery: "queue",
+          prepare: () => Effect.sync(() => void (prepared.called = true)),
+          write: () => Effect.void,
+          rejected: () => Effect.void,
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(promoted)).toBe(true)
+      expect(prepared.called).toBe(false)
+
+      const withdrawn = yield* queue.withdraw(info.id, item.id).pipe(Effect.exit)
+      expect(Exit.isFailure(withdrawn)).toBe(true)
+      expect(String(withdrawn)).toContain(`Aggregate ${info.id} is unreplayable`)
+      expect(
+        yield* db
+          .select({ withdrawn: SessionPromptQueueTable.time_withdrawn })
+          .from(SessionPromptQueueTable)
+          .where(eq(SessionPromptQueueTable.id, item.id))
+          .get(),
+      ).toEqual({ withdrawn: null })
+    }),
+  )
+
   retentionIt.instance("marks V1 queue and V2 admitted input producers ineligible", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service
       const queue = yield* SessionQueue.Service
       const v2 = yield* SessionV2.Service
+      const events = yield* EventV2Bridge.Service
       const { db } = yield* Database.Service
       const directory = yield* tmpdirScoped()
       const databasePath = path.join(directory, "retention-inputs.sqlite")
@@ -611,6 +792,13 @@ describe("Session retention producer path", () => {
         prompt: Prompt.make({ text: "v2 input sentinel" }),
         resume: false,
       })
+      const promoted = yield* session.create({})
+      yield* v2.prompt({
+        sessionID: SessionV2.ID.make(promoted.id),
+        prompt: Prompt.make({ text: "promoted V2 input sentinel" }),
+        resume: false,
+      })
+      yield* SessionInput.promoteSteers(db, events, SessionV2.ID.make(promoted.id), Number.MAX_SAFE_INTEGER)
       const native = yield* exportFixtureDatabase(db, databasePath)
       yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
       const now = Date.now()
@@ -645,6 +833,22 @@ describe("Session retention producer path", () => {
       )
       expect(admittedTree?.reasons).toContain("v2-input-pending")
       expect(admittedTree?.eligible).toBe(false)
+
+      const promotedProof = retentionEvidence(
+        promoted.id,
+        yield* EventV2.latestSequence(db, promoted.id),
+        (yield* db
+          .select({ ownerID: EventSequenceTable.owner_id })
+          .from(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, promoted.id))
+          .get())?.ownerID ?? null,
+        now,
+      )
+      const promotedTree = DbRetention.inventory(native as unknown as SqliteAccess, promotedProof, now).trees.find(
+        (item) => item.rootSessionID === promoted.id,
+      )
+      expect(promotedTree?.reasons).toContain("v2-input-promoted-row-present")
+      expect(promotedTree?.eligible).toBe(false)
     }),
   )
 })
