@@ -1,8 +1,9 @@
 import { expect, spyOn, test } from "bun:test"
+import { spawnSync } from "node:child_process"
 import { Database } from "bun:sqlite"
 import { Context, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { mkdtemp, rm, stat, statfs, symlink } from "node:fs/promises"
+import { mkdtemp, readFile, rm, stat, statfs, symlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { eq } from "drizzle-orm"
 import { Service, layerFromPath } from "@opencode-ai/core/database/database"
@@ -85,6 +86,19 @@ function createSchema(db: Database) {
 }
 
 const access = (db: Database) => db as unknown as SqliteAccess
+
+async function retentionCompactionFixture(sessionID: string) {
+  const fixture = await createFixtureDatabase()
+  createSchema(fixture.db)
+  session(fixture.db, sessionID, 10)
+  event(fixture.db, sessionID)
+  return fixture
+}
+
+async function fileSnapshot(filename: string) {
+  const [bytes, file] = await Promise.all([readFile(filename), stat(filename)])
+  return { bytes, device: file.dev, inode: file.ino, size: file.size }
+}
 
 const evidence = (sessionIDs: string[], finalSequence: Record<string, number>, now = 1_000): RetentionEvidence => ({
   customerBinding: {
@@ -780,6 +794,120 @@ test(
   { timeout: 10_000 },
 )
 
+test(
+  "fixture compaction preserves a caller-owned destination on refusal",
+  async () => {
+    await using sourceFixture = await retentionCompactionFixture("ses_existing_destination")
+    const sourcePath = sourceFixture.filename
+    const sourceBefore = await fileSnapshot(sourcePath)
+    const sourceDeviceID = String(sourceBefore.device)
+    const backupPath = path.join(path.dirname(sourcePath), "caller-owned-backup.sqlite")
+    const stagingPath = path.join(path.dirname(sourcePath), "unused-stage.sqlite")
+    await writeFile(backupPath, "caller-owned backup bytes", { flag: "wx" })
+    const backupBefore = await fileSnapshot(backupPath)
+
+    const result = await compactRestoreFixture({
+      sourcePath,
+      sourceFixture,
+      backupPath,
+      stagingPath,
+      expectedSourceDeviceID: sourceDeviceID,
+      expectedBackupDeviceID: sourceDeviceID,
+      expectedStagingDeviceID: sourceDeviceID,
+      retainedSessionID: "ses_existing_destination",
+    })
+
+    expect(result.state).toBe("refused")
+    expect(result.changedFiles).toBe(0)
+    expect(result.reasons).toContain(`destination-already-exists:${backupPath}`)
+    expect(await fileSnapshot(backupPath)).toEqual(backupBefore)
+    expect(await fileSnapshot(sourcePath)).toEqual(sourceBefore)
+    expect(await Bun.file(stagingPath).exists()).toBe(false)
+  },
+  { timeout: 10_000 },
+)
+
+test(
+  "fixture compaction preserves the source when a destination aliases it",
+  async () => {
+    await using sourceFixture = await retentionCompactionFixture("ses_source_alias")
+    const sourcePath = sourceFixture.filename
+    const sourceBefore = await fileSnapshot(sourcePath)
+    const sourceDeviceID = String(sourceBefore.device)
+    const stagingPath = path.join(path.dirname(sourcePath), "alias-stage.sqlite")
+
+    const result = await compactRestoreFixture({
+      sourcePath,
+      sourceFixture,
+      backupPath: sourcePath,
+      stagingPath,
+      expectedSourceDeviceID: sourceDeviceID,
+      expectedBackupDeviceID: sourceDeviceID,
+      expectedStagingDeviceID: sourceDeviceID,
+      retainedSessionID: "ses_source_alias",
+    })
+
+    expect(result.state).toBe("refused")
+    expect(result.changedFiles).toBe(0)
+    expect(result.reasons).toContain("compaction-paths-conflict")
+    expect(await fileSnapshot(sourcePath)).toEqual(sourceBefore)
+    expect(await Bun.file(stagingPath).exists()).toBe(false)
+  },
+  { timeout: 10_000 },
+)
+
+test(
+  "fixture compaction preserves a backup path created by a separate process after preflight",
+  async () => {
+    await using sourceFixture = await retentionCompactionFixture("ses_destination_arrival")
+    const sourcePath = sourceFixture.filename
+    const sourceBefore = await fileSnapshot(sourcePath)
+    const sourceDeviceID = String(sourceBefore.device)
+    const stagingDirectory = await mkdtemp("/dev/shm/opencode-retention-arrival-")
+    await using cleanupStaging = { [Symbol.asyncDispose]: () => rm(stagingDirectory, { recursive: true, force: true }) }
+    const backupPath = path.join(stagingDirectory, "racing-backup.sqlite")
+    const stagingPath = path.join(stagingDirectory, "stage.sqlite")
+    const destinationDeviceID = String((await stat(stagingDirectory)).dev)
+    const racingBytes = "separate-process destination sentinel"
+    let creatorStatus: number | null | undefined
+    let racingFileBefore: Awaited<ReturnType<typeof fileSnapshot>> | undefined
+
+    const result = await compactRestoreFixture({
+      sourcePath,
+      sourceFixture,
+      backupPath,
+      stagingPath,
+      expectedSourceDeviceID: sourceDeviceID,
+      expectedBackupDeviceID: destinationDeviceID,
+      expectedStagingDeviceID: destinationDeviceID,
+      retainedSessionID: "ses_destination_arrival",
+      afterDestinationPreflight: async () => {
+        const creator = spawnSync(
+          process.execPath,
+          [
+            "-e",
+            `require("node:fs").writeFileSync(${JSON.stringify(backupPath)}, ${JSON.stringify(racingBytes)}, { flag: "wx" })`,
+          ],
+          { encoding: "utf8", timeout: 5_000 },
+        )
+        creatorStatus = creator.status
+        if (creator.status === 0) racingFileBefore = await fileSnapshot(backupPath)
+      },
+    })
+
+    expect(creatorStatus).toBe(0)
+    expect(result.state).toBe("refused")
+    expect(result.changedFiles).toBe(0)
+    expect(result.reasons.some((reason) => reason.includes("EEXIST"))).toBe(true)
+    if (!racingFileBefore) throw new Error("separate process did not create the competing backup")
+    expect(racingFileBefore.bytes.toString()).toBe(racingBytes)
+    expect(await fileSnapshot(backupPath)).toEqual(racingFileBefore)
+    expect(await fileSnapshot(sourcePath)).toEqual(sourceBefore)
+    expect(await Bun.file(stagingPath).exists()).toBe(false)
+  },
+  { timeout: 10_000 },
+)
+
 test("apply revalidates evidence inside every batch and keeps partial history unreplayable", () => {
   const db = fixture()
   try {
@@ -1121,6 +1249,7 @@ test(
     const beforeReplaceStat = await stat(sourcePath)
     let fixtureWriterBlocked = false
     let sqliteWriterBlocked = false
+    let separateProcessWriterBlocked = false
     const writerArrival = await compactRestoreFixture({
       sourcePath,
       sourceFixture,
@@ -1145,11 +1274,22 @@ test(
         } finally {
           arrivingWriter?.close()
         }
+        const separateProcessWriter = spawnSync(
+          process.execPath,
+          [
+            "-e",
+            `try { const { Database } = require("bun:sqlite"); const db = new Database(${JSON.stringify(sourcePath)}); db.query("UPDATE event_sequence SET seq = seq + 1 WHERE aggregate_id = ?").run("ses_physical"); db.close(); process.exit(0) } catch (error) { console.error(error); process.exit(1) }`,
+          ],
+          { encoding: "utf8", timeout: 5_000 },
+        )
+        separateProcessWriterBlocked =
+          separateProcessWriter.status === 1 && /database is locked/i.test(`${separateProcessWriter.stdout}\n${separateProcessWriter.stderr}`)
       },
     })
     expect(writerArrival.state).toBe("refused")
     expect(writerArrival.changedFiles).toBe(0)
     expect(writerArrival.reasons).toContain("writer-arrival-blocked-under-exclusive-fence")
+    expect(separateProcessWriterBlocked).toBe(true)
     expect(fixtureWriterBlocked).toBe(true)
     expect(sqliteWriterBlocked).toBe(true)
     expect(await Bun.file(path.join(path.dirname(sourcePath), ".retention-compaction.lock")).exists()).toBe(false)

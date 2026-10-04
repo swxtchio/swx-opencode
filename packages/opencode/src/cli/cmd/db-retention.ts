@@ -173,6 +173,7 @@ type CompactFixtureInput = {
   readonly retainedSessionID: string
   readonly capacityFloorBytes?: number
   readonly afterExclusiveLock?: () => Promise<void>
+  readonly afterDestinationPreflight?: () => Promise<void>
 }
 
 type ApplyInput = {
@@ -1311,6 +1312,8 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
   let sourceDirectory: string | undefined
   let backupPath: string | undefined
   let stagingPath: string | undefined
+  let backupCreated = false
+  let stagingCreated = false
   let restorePath: string | undefined
   let stageDB: NativeSqliteDatabase | undefined
   const refused = (reasons: Iterable<string>, measurements?: CompactFixtureResult["measurements"]): CompactFixtureResult => ({
@@ -1475,6 +1478,7 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
       await input.afterExclusiveLock()
       return refused(["writer-arrival-blocked-under-exclusive-fence"])
     }
+    if (input.afterDestinationPreflight) await input.afterDestinationPreflight()
 
     originalMode = sourceStat.mode & 0o777
     const before = await physicalMetrics(sourceAccess, sourcePath, input.retainedSessionID)
@@ -1482,6 +1486,7 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
       return refused(["source-integrity-or-retained-read-failed"], { before, backup: before, staging: before, restored: before })
     }
     await copyFile(sourcePath, backupPath, constants.COPYFILE_EXCL)
+    backupCreated = true
     const sqlite = await import("bun:sqlite")
     const backupDB = new sqlite.Database(backupPath, { readonly: true }) as unknown as SqliteAccess
     let backup: PhysicalMetrics
@@ -1495,6 +1500,7 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
     }
 
     await copyFile(backupPath, stagingPath, constants.COPYFILE_EXCL)
+    stagingCreated = true
     stageDB = new sqlite.Database(stagingPath)
     stageDB.exec("VACUUM")
     const staging = await physicalMetrics(stageDB as unknown as SqliteAccess, stagingPath, input.retainedSessionID)
@@ -1671,8 +1677,8 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
     if (lockCreated && control) await rm(control.lockPath, { force: true }).catch(() => undefined)
     if (restoreDirectory) await rm(restoreDirectory, { recursive: true, force: true }).catch(() => undefined)
     if (!completed && !replaced) {
-      if (backupPath) await rm(backupPath, { force: true }).catch(() => undefined)
-      if (stagingPath) await rm(stagingPath, { force: true }).catch(() => undefined)
+      if (backupCreated && backupPath && backupPath !== sourcePath) await rm(backupPath, { force: true }).catch(() => undefined)
+      if (stagingCreated && stagingPath && stagingPath !== sourcePath) await rm(stagingPath, { force: true }).catch(() => undefined)
     }
     if (control) control.compacting = false
   }
