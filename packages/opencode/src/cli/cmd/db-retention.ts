@@ -1552,11 +1552,15 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
       return refused(["restore-integrity-or-physical-measurement-failed"], { before, backup, staging, restored })
     }
 
+    // Finalize cached statements without dropping the exclusive SQLite writer fence before the inode swap.
+    const sourceWithQueryCache = sourceDB as NativeSqliteDatabase & { clearQueryCache: () => void }
+    sourceWithQueryCache.clearQueryCache()
     await chmod(restorePath, 0)
     await chmod(sourcePath, 0)
     await rename(restorePath, sourcePath)
     replaced = true
-    sourceDB.close()
+    // A deferred SQLite close can leave a statement-backed descriptor on the replaced inode.
+    sourceDB.close(true)
     sourceClosed = true
     const oldInode = deletedFixtureInodeOpen(sourceIdentity)
     if (!oldInode.readable) {
