@@ -734,6 +734,108 @@ describe("Worktree", () => {
       { timeout: 120_000 },
     )
 
+    for (const producer of [
+      { directory: "agent", loader: "ConfigAgent.load" },
+      { directory: "mode", loader: "ConfigAgent.loadMode" },
+    ] as const) {
+      wintest(
+        `refuses worktree deletion until real ${producer.loader} settles its FIFO Promise`,
+        () =>
+          Effect.gen(function* () {
+            const test = yield* TestInstance
+            const fs = yield* FSUtil.Service
+            const svc = yield* Worktree.Service
+            const store = yield* InstanceStore.Service
+            const fifoDirectory = yield* tmpdirScoped()
+            const fifo = path.join(fifoDirectory, `held-${producer.directory}.md`)
+            const configDirectory = path.join(test.directory, ".opencode", producer.directory)
+            yield* Effect.promise(() => mkdir(configDirectory, { recursive: true }))
+            const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+            const fifoMaker = yield* spawner.spawn(ChildProcess.make("mkfifo", [fifo]))
+            expect(yield* fifoMaker.exitCode).toBe(ChildProcessSpawner.ExitCode(0))
+            yield* Effect.promise(() => symlink(fifo, path.join(configDirectory, "held.md")))
+            yield* git(test.directory, ["add", "--force", `.opencode/${producer.directory}/held.md`])
+            yield* git(test.directory, ["commit", "-m", `add a held ${producer.loader} fixture`])
+            const expected = yield* svc.makeWorktreeInfo({ name: `held-config-${producer.directory}` })
+            const info = yield* svc.create({ name: expected.name })
+            expect(info.directory).toBe(expected.directory)
+            yield* Effect.addFinalizer(() => removeCreatedWorktree(info.directory).pipe(Effect.ignore))
+
+            const writer = createWriteStream(fifo)
+            writer.on("error", () => {})
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                if (!writer.destroyed) writer.destroy()
+              }),
+            )
+            const readerOpened = new Promise<void>((resolve, reject) => {
+              writer.once("open", () => resolve())
+              writer.once("error", reject)
+            })
+            yield* awaitWithTimeout(
+              Effect.promise(() => readerOpened),
+              `${producer.loader} did not open its held FIFO`,
+              "20 seconds",
+            )
+            const joiner = yield* store
+              .load({ directory: info.directory })
+              .pipe(Effect.forkScoped({ startImmediately: true }))
+            expect(joiner.pollUnsafe()).toBeUndefined()
+
+            const removalFiber = yield* svc
+              .remove({ directory: info.directory })
+              .pipe(Effect.forkDetach({ startImmediately: true }))
+            const removalResult = yield* Effect.exit(
+              awaitWithTimeout(
+                Fiber.await(removalFiber),
+                "worktree removal did not refuse its unsettled config Promise",
+                "30 seconds",
+              ),
+            )
+            expect(Exit.isSuccess(removalResult)).toBe(true)
+            if (Exit.isFailure(removalResult)) return
+            const removal = removalResult.value
+            expect(Exit.isFailure(removal)).toBe(true)
+            if (Exit.isFailure(removal)) {
+              expect(Cause.squash(removal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
+              expect(Cause.pretty(removal.cause)).toContain("instance bootstrap Promise did not settle")
+            }
+            expect(hasInstancePromises(info.directory)).toBe(true)
+            expect(yield* fs.exists(info.directory)).toBe(true)
+            expect(normalize(yield* git(test.directory, ["worktree", "list", "--porcelain"]))).toContain(
+              normalize(info.directory),
+            )
+
+            writer.end(`---\ndescription: held config ${producer.directory}\n---\nheld config prompt\n`)
+            yield* awaitWithTimeout(
+              Effect.promise(() => finished(writer)),
+              `held ${producer.loader} reader did not finish`,
+              "15 seconds",
+            )
+            const joined = yield* awaitWithTimeout(
+              Fiber.await(joiner),
+              `concurrent load did not join the live ${producer.loader} bootstrap`,
+              "15 seconds",
+            )
+            expect(Exit.isSuccess(joined)).toBe(true)
+            const loaded = yield* pollWithTimeout(
+              store.load({ directory: info.directory }).pipe(
+                Effect.map((context) => context),
+                Effect.catchCause(() => Effect.succeed(undefined)),
+              ),
+              `load did not recover after ${producer.loader} settled`,
+              "25 seconds",
+            )
+            if (Exit.isSuccess(joined)) expect(loaded).toBe(joined.value)
+
+            expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+            expect(yield* fs.exists(info.directory)).toBe(false)
+          }),
+        { git: true },
+        { timeout: 120_000 },
+      )
+    }
+
     pluginBootstrapIt.instance(
       "serves ready loads and reloads with synchronous and async plugin hook controls",
       () =>
