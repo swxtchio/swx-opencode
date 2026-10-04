@@ -3,6 +3,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
+import { EventRetentionTable } from "@opencode-ai/core/event/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Global } from "@opencode-ai/core/global"
 import { eq } from "drizzle-orm"
@@ -32,7 +33,7 @@ import { Image } from "../../src/image/image"
 import { Question } from "../../src/question"
 import { Todo } from "../../src/session/todo"
 import { Session } from "@/session/session"
-import { MessageTable, SessionMessageTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, PartTable, SessionMessageTable } from "@opencode-ai/core/session/sql"
 import { SessionPromptQueueSequenceTable, SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -1118,6 +1119,57 @@ it.instance("imports successive message batches with one persisted session admis
       .pipe(Effect.orDie)
     expect(imported.map((message) => message.id)).toEqual([firstID, secondID])
     expect(imported[1]?.admission_seq).toBeGreaterThan(imported[0]?.admission_seq ?? 0)
+
+    yield* db.insert(EventRetentionTable).values({
+      aggregate_id: session.id,
+      state: "redacting",
+      progress_table: "event",
+      progress_id: "evt_import_retention",
+      evidence: {},
+      time_started: 1,
+      time_updated: 1,
+    })
+    const blockedID = MessageID.make("msg_import_blocked")
+    yield* fs.writeJson(file, {
+      info: session,
+      messages: [
+        {
+          info: {
+            id: blockedID,
+            sessionID: session.id,
+            role: "user" as const,
+            time: { created: 300 },
+            agent: "build",
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          },
+          parts: [
+            {
+              id: PartID.make("prt_import_blocked"),
+              sessionID: session.id,
+              messageID: blockedID,
+              type: "text" as const,
+              text: "blocked import sentinel",
+            },
+          ],
+        },
+      ],
+    })
+    const blockedImport = yield* runImport(file, ctx).pipe(Effect.provide(localImportShare), Effect.exit)
+    expect(Exit.isFailure(blockedImport)).toBe(true)
+    expect(
+      yield* db
+        .select({ id: MessageTable.id })
+        .from(MessageTable)
+        .where(eq(MessageTable.session_id, session.id))
+        .all(),
+    ).toHaveLength(2)
+    expect(
+      yield* db
+        .select({ id: PartTable.id })
+        .from(PartTable)
+        .where(eq(PartTable.session_id, session.id))
+        .all(),
+    ).toHaveLength(0)
   }),
 )
 

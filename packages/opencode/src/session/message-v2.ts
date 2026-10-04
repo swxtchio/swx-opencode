@@ -19,6 +19,7 @@ import {
 import { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError, convertToModelMessages, LoadAPIKeyError, type ModelMessage, type UIMessage } from "ai"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { NotFoundError } from "@/storage/storage"
 import { and } from "drizzle-orm"
@@ -436,77 +437,84 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
   before?: string
 }) {
   const { db } = yield* Database.Service
-  const before = input.before ? cursor.decode(input.before) : undefined
-  const legacyTime = before?.seq === undefined ? before?.time : undefined
-  const beforeSeq =
-    before?.seq !== undefined
-      ? before.seq
-      : before && legacyTime === undefined
-        ? (yield* db
-            .select({ seq: MessageTable.admission_seq })
-            .from(MessageTable)
-            .where(and(eq(MessageTable.session_id, input.sessionID), eq(MessageTable.id, before.id)))
+  return yield* db
+    .transaction((tx) =>
+      Effect.gen(function* () {
+        yield* EventV2.assertReplayableIn(tx, input.sessionID)
+        const before = input.before ? cursor.decode(input.before) : undefined
+        const legacyTime = before?.seq === undefined ? before?.time : undefined
+        const beforeSeq =
+          before?.seq !== undefined
+            ? before.seq
+            : before && legacyTime === undefined
+              ? (yield* tx
+                  .select({ seq: MessageTable.admission_seq })
+                  .from(MessageTable)
+                  .where(and(eq(MessageTable.session_id, input.sessionID), eq(MessageTable.id, before.id)))
+                  .get()
+                  .pipe(Effect.orDie))?.seq
+              : undefined
+        if (before && beforeSeq === undefined && legacyTime === undefined)
+          throw new Error(`Message cursor anchor not found and has no legacy time: ${before.id}`)
+        const session = eq(MessageTable.session_id, input.sessionID)
+        const where =
+          beforeSeq !== undefined
+            ? and(session, older(beforeSeq))
+            : legacyTime !== undefined && before
+              ? and(
+                  session,
+                  or(
+                    lt(MessageTable.time_created, legacyTime),
+                    and(eq(MessageTable.time_created, legacyTime), lt(MessageTable.id, before.id)),
+                  ),
+                )
+              : session
+        const order =
+          legacyTime === undefined
+            ? [desc(MessageTable.admission_seq)]
+            : [desc(MessageTable.time_created), desc(MessageTable.id)]
+        const rows = yield* tx
+          .select()
+          .from(MessageTable)
+          .where(where)
+          .orderBy(...order)
+          .limit(input.limit + 1)
+          .all()
+          .pipe(Effect.orDie)
+        if (rows.length === 0) {
+          const row = yield* tx
+            .select({ id: SessionTable.id })
+            .from(SessionTable)
+            .where(eq(SessionTable.id, input.sessionID))
             .get()
-            .pipe(Effect.orDie))?.seq
-        : undefined
-  if (before && beforeSeq === undefined && legacyTime === undefined)
-    throw new Error(`Message cursor anchor not found and has no legacy time: ${before.id}`)
-  const session = eq(MessageTable.session_id, input.sessionID)
-  const where =
-    beforeSeq !== undefined
-      ? and(session, older(beforeSeq))
-      : legacyTime !== undefined && before
-        ? and(
-            session,
-            or(
-              lt(MessageTable.time_created, legacyTime),
-              and(eq(MessageTable.time_created, legacyTime), lt(MessageTable.id, before.id)),
-            ),
-          )
-        : session
-  const order =
-    legacyTime === undefined
-      ? [desc(MessageTable.admission_seq)]
-      : [desc(MessageTable.time_created), desc(MessageTable.id)]
-  const rows = yield* db
-    .select()
-    .from(MessageTable)
-    .where(where)
-    .orderBy(...order)
-    .limit(input.limit + 1)
-    .all()
-    .pipe(Effect.orDie)
-  if (rows.length === 0) {
-    const row = yield* db
-      .select({ id: SessionTable.id })
-      .from(SessionTable)
-      .where(eq(SessionTable.id, input.sessionID))
-      .get()
-      .pipe(Effect.orDie)
-    if (!row) return yield* new NotFoundError({ message: `Session not found: ${input.sessionID}` })
-    return {
-      items: [] as WithParts[],
-      more: false,
-    }
-  }
+            .pipe(Effect.orDie)
+          if (!row) return yield* new NotFoundError({ message: `Session not found: ${input.sessionID}` })
+          return {
+            items: [] as WithParts[],
+            more: false,
+          }
+        }
 
-  const more = rows.length > input.limit
-  const slice = more ? rows.slice(0, input.limit) : rows
-  const items = yield* hydrate(db, slice)
-  items.reverse()
-  const tail = slice.at(-1)
-  return {
-    items,
-    more,
-    cursor:
-      more && tail
-        ? cursor.encode(
-            legacyTime === undefined
-              ? { id: tail.id, seq: tail.admission_seq }
-              : { id: tail.id, time: tail.time_created },
-          )
-        : undefined,
-  }
+        const more = rows.length > input.limit
+        const slice = more ? rows.slice(0, input.limit) : rows
+        const items = yield* hydrate(tx, slice)
+        items.reverse()
+        const tail = slice.at(-1)
+        return {
+          items,
+          more,
+          cursor:
+            more && tail
+              ? cursor.encode(
+                  legacyTime === undefined
+                    ? { id: tail.id, seq: tail.admission_seq }
+                    : { id: tail.id, time: tail.time_created },
+                )
+              : undefined,
+        }
+      }),
+    )
+    .pipe(Effect.catchTag("SqlError", (error) => Effect.die(error)))
 })
 
 export const admission = Effect.fn("MessageV2.admission")(function* (sessionID: SessionID) {
@@ -548,30 +556,58 @@ export function stream(sessionID: SessionID) {
 export function parts(messageID: MessageID) {
   return Effect.gen(function* () {
     const { db } = yield* Database.Service
-    const rows = yield* db
-      .select()
-      .from(PartTable)
-      .where(eq(PartTable.message_id, messageID))
-      .orderBy(PartTable.id)
-      .all()
+    return yield* db
+      .transaction((tx) =>
+        Effect.gen(function* () {
+          const message = yield* tx
+            .select({ sessionID: MessageTable.session_id })
+            .from(MessageTable)
+            .where(eq(MessageTable.id, messageID))
+            .get()
+            .pipe(Effect.orDie)
+          if (!message) return []
+          yield* EventV2.assertReplayableIn(tx, message.sessionID)
+          const rows = yield* tx
+            .select()
+            .from(PartTable)
+            .where(eq(PartTable.message_id, messageID))
+            .orderBy(PartTable.id)
+            .all()
+            .pipe(Effect.orDie)
+          return rows.map(part)
+        }),
+      )
       .pipe(Effect.orDie)
-    return rows.map(part)
   })
 }
 
 export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: SessionID; messageID: MessageID }) {
   const { db } = yield* Database.Service
-  const row = yield* db
-    .select()
-    .from(MessageTable)
-    .where(and(eq(MessageTable.id, input.messageID), eq(MessageTable.session_id, input.sessionID)))
-    .get()
-    .pipe(Effect.orDie)
-  if (!row) return yield* new NotFoundError({ message: `Message not found: ${input.messageID}` })
-  return {
-    info: info(row),
-    parts: yield* parts(input.messageID),
-  }
+  return yield* db
+    .transaction((tx) =>
+      Effect.gen(function* () {
+        yield* EventV2.assertReplayableIn(tx, input.sessionID)
+        const row = yield* tx
+          .select()
+          .from(MessageTable)
+          .where(and(eq(MessageTable.id, input.messageID), eq(MessageTable.session_id, input.sessionID)))
+          .get()
+          .pipe(Effect.orDie)
+        if (!row) return yield* new NotFoundError({ message: `Message not found: ${input.messageID}` })
+        const rows = yield* tx
+          .select()
+          .from(PartTable)
+          .where(eq(PartTable.message_id, input.messageID))
+          .orderBy(PartTable.id)
+          .all()
+          .pipe(Effect.orDie)
+        return {
+          info: info(row),
+          parts: rows.map(part),
+        }
+      }),
+    )
+    .pipe(Effect.catchTag("SqlError", (error) => Effect.die(error)))
 })
 
 export function filterCompacted(msgs: Iterable<WithParts>) {
@@ -631,49 +667,49 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
   return filterCompacted(yield* stream(sessionID))
 })
 
-export const snapshot = Effect.fnUntraced(function* (
-  sessionID: SessionID,
-  afterMessages?: () => Effect.Effect<void>,
-) {
+export const snapshot = Effect.fnUntraced(function* (sessionID: SessionID, afterMessages?: () => Effect.Effect<void>) {
   const { db } = yield* Database.Service
-  return yield* db.transaction((tx) =>
-    Effect.gen(function* () {
-      const rows = [] as (typeof MessageTable.$inferSelect)[]
-      const pageSize = 50
-      let before: number | undefined
-      while (true) {
-        const where =
-          before === undefined
-            ? eq(MessageTable.session_id, sessionID)
-            : and(eq(MessageTable.session_id, sessionID), lt(MessageTable.admission_seq, before))
-        const page = yield* tx
-          .select()
-          .from(MessageTable)
-          .where(where)
-          .orderBy(desc(MessageTable.admission_seq))
-          .limit(pageSize)
-          .all()
-          .pipe(Effect.orDie)
-        if (page.length === 0) break
-        rows.push(...page)
-        if (page.length < pageSize) break
-        const last = page.at(-1)
-        if (!last) break
-        before = last.admission_seq
-      }
+  return yield* db
+    .transaction((tx) =>
+      Effect.gen(function* () {
+        yield* EventV2.assertReplayableIn(tx, sessionID)
+        const rows = [] as (typeof MessageTable.$inferSelect)[]
+        const pageSize = 50
+        let before: number | undefined
+        while (true) {
+          const where =
+            before === undefined
+              ? eq(MessageTable.session_id, sessionID)
+              : and(eq(MessageTable.session_id, sessionID), lt(MessageTable.admission_seq, before))
+          const page = yield* tx
+            .select()
+            .from(MessageTable)
+            .where(where)
+            .orderBy(desc(MessageTable.admission_seq))
+            .limit(pageSize)
+            .all()
+            .pipe(Effect.orDie)
+          if (page.length === 0) break
+          rows.push(...page)
+          if (page.length < pageSize) break
+          const last = page.at(-1)
+          if (!last) break
+          before = last.admission_seq
+        }
 
-      const messages: WithParts[] = []
-      for (let index = 0; index < rows.length; index += pageSize) {
-        messages.push(...(yield* hydrate(tx, rows.slice(index, index + pageSize))))
-      }
-      const filtered = filterCompacted(messages)
-      if (afterMessages) yield* afterMessages()
-      return {
-        messages: filtered,
-        admissionOrder: new Map(rows.map((row) => [row.id, row.admission_seq])),
-      }
-    }),
-  ).pipe(Effect.orDie)
+        const messages: WithParts[] = []
+        for (let index = 0; index < rows.length; index += pageSize) {
+          messages.push(...(yield* hydrate(tx, rows.slice(index, index + pageSize))))
+        }
+        const filtered = filterCompacted(messages)
+        if (afterMessages) yield* afterMessages()
+        return {
+          messages: filtered,
+          admissionOrder: new Map(rows.map((row) => [row.id, row.admission_seq])),
+        }
+      }),
+    )
+    .pipe(Effect.orDie)
 })
 
 export function latest(

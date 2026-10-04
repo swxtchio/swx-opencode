@@ -60,6 +60,10 @@ Newest first. Each entry names the upstream range brought in.
 - **#7** Point `test` and `typecheck` at this fork, on GitHub-hosted Linux runners. _Fork-only._
 - **#1** Dependabot: `astro` 5.7.13 to 7.1.1 in `packages/web`. _Fork-only._
 
+### Database maintenance
+
+- **#137** Add dormant guarded Session-retention inventory and fixture-only redaction tooling, with fail-closed reads for altered aggregates and an isolated backup, compaction, integrity-check, and restore rehearsal. Real apply and production cutover remain disabled pending captain-approved policy and evidence. _Fork-only._
+
 ### Runtime fixes
 
 - **#126** A removed Session stays removed: a write that was already in flight when `Session.remove` ran is now refused instead of quietly recreating that Session's event history, and the HTTP routes that already promise a missing-Session 404 give it in that race (swxtchio/swx-opencode#97). Prompt-like routes and `sync.steal` still need a separate decision (swxtchio/swx-opencode#125). _Fork-only._

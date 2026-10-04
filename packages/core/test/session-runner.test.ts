@@ -66,6 +66,7 @@ let responses: LLMEvent[][] | undefined
 let responseStream: Stream.Stream<LLMEvent, LLMError> | undefined
 let streamGate: Deferred.Deferred<void> | undefined
 let streamStarted: Deferred.Deferred<void> | undefined
+const streamStartAcks: Deferred.Deferred<void>[] = []
 let streamFailure: LLMError | undefined
 let toolExecutionGate: Deferred.Deferred<void> | undefined
 let toolExecutionsStarted: Deferred.Deferred<void> | undefined
@@ -78,17 +79,20 @@ const client = Layer.succeed(
     prepare: () => Effect.die("unused"),
     stream: ((request: LLMRequest) => {
       requests.push(request)
+      const requestStarted = streamStartAcks.shift()
+      const signalRequestStart = requestStarted ? Deferred.succeed(requestStarted, undefined) : Effect.void
       if (responseStream) {
         const stream = responseStream
         responseStream = undefined
-        return stream
+        return requestStarted ? Stream.unwrap(signalRequestStart.pipe(Effect.as(stream))) : stream
       }
       const events = streamFailure
         ? Stream.fail(streamFailure)
         : Stream.fromIterable(responses === undefined ? response : (responses.shift() ?? []))
-      if (!streamGate) return events
+      if (!streamGate) return requestStarted ? Stream.unwrap(signalRequestStart.pipe(Effect.as(events))) : events
       return Stream.unwrap(
         (streamStarted ? Deferred.succeed(streamStarted, undefined) : Effect.void).pipe(
+          Effect.andThen(signalRequestStart),
           Effect.andThen(Deferred.await(streamGate)),
           Effect.as(events),
         ),
@@ -310,6 +314,16 @@ const insertSession = (id: SessionV2.ID) =>
       .pipe(Effect.orDie)
   })
 
+const awaitStreamStart = (started: Deferred.Deferred<void>) =>
+  Effect.gen(function* () {
+    let done = false
+    for (let attempt = 0; attempt < 1_000 && !done; attempt++) {
+      done = yield* Deferred.isDone(started)
+      if (!done) yield* Effect.yieldNow
+    }
+    expect(done).toBe(true)
+  })
+
 const setup = Effect.gen(function* () {
   const { db } = yield* Database.Service
   response = []
@@ -325,6 +339,7 @@ const setup = Effect.gen(function* () {
   responseStream = undefined
   streamGate = undefined
   streamStarted = undefined
+  streamStartAcks.length = 0
   toolExecutionGate = undefined
   toolExecutionsStarted = undefined
   toolExecutionsReady = 5
@@ -612,23 +627,29 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
-  it.effect("starts a real runner turn after default prompt recording", () =>
-    Effect.gen(function* () {
-      yield* setup
-      const session = yield* SessionV2.Service
-      requests.length = 0
-      responses = undefined
-      streamGate = undefined
-      streamStarted = undefined
-      response = []
+  it.effect(
+    "starts a real runner turn after default prompt recording",
+    () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        requests.length = 0
+        responses = undefined
+        streamGate = undefined
+        streamStarted = undefined
+        response = []
+        const started = yield* Deferred.make<void>()
+        streamStartAcks.push(started)
 
-      const message = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run automatically" }) })
+        const message = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run automatically" }) })
+        yield* awaitStreamStart(started)
 
-      expect(requests).toHaveLength(1)
-      expect(yield* session.messages({ sessionID })).toMatchObject([
-        { id: message.id, type: "user", text: "Run automatically" },
-      ])
-    }),
+        expect(requests).toHaveLength(1)
+        expect(yield* session.messages({ sessionID })).toMatchObject([
+          { id: message.id, type: "user", text: "Run automatically" },
+        ])
+      }),
+    { timeout: 10_000 },
   )
 
   it.effect("streams one request with registry definitions from chronological V2 user history", () =>
@@ -681,11 +702,15 @@ describe("SessionRunnerLLM", () => {
       ).toBeUndefined()
 
       systemUnavailable = false
+      const started = yield* Deferred.make<void>()
+      streamStartAcks.push(started)
       yield* session.prompt({ id: messageID, sessionID, prompt: Prompt.make({ text: "First" }) })
+      yield* awaitStreamStart(started)
 
       expect(requests).toHaveLength(1)
       expect(requests[0]?.messages.map((message) => message.role)).toEqual(["user"])
     }),
+    { timeout: 10_000 },
   )
 
   it.effect("interrupts a source Location runner after a Session moves", () =>
@@ -2487,36 +2512,42 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
-  it.effect("runs different sessions concurrently", () =>
-    Effect.gen(function* () {
-      yield* setup
-      yield* insertSession(otherSessionID)
-      const session = yield* SessionV2.Service
-      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run first" }), resume: false })
-      yield* session.prompt({ sessionID: otherSessionID, prompt: Prompt.make({ text: "Run second" }), resume: false })
+  it.effect(
+    "runs different sessions concurrently",
+    () =>
+      Effect.gen(function* () {
+        yield* setup
+        yield* insertSession(otherSessionID)
+        const session = yield* SessionV2.Service
+        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run first" }), resume: false })
+        yield* session.prompt({ sessionID: otherSessionID, prompt: Prompt.make({ text: "Run second" }), resume: false })
 
-      requests.length = 0
-      responses = undefined
-      response = []
-      streamGate = yield* Deferred.make<void>()
-      streamStarted = yield* Deferred.make<void>()
+        requests.length = 0
+        responses = undefined
+        response = []
+        streamGate = yield* Deferred.make<void>()
+        streamStarted = undefined
+        const firstStarted = yield* Deferred.make<void>()
+        const secondStarted = yield* Deferred.make<void>()
+        streamStartAcks.push(firstStarted, secondStarted)
 
-      const first = yield* session.resume(sessionID).pipe(Effect.forkChild)
-      yield* Deferred.await(streamStarted)
-      const second = yield* session.resume(otherSessionID).pipe(Effect.forkChild)
-      yield* Effect.yieldNow
+        const first = yield* session.resume(sessionID).pipe(Effect.forkChild)
+        yield* awaitStreamStart(firstStarted)
+        const second = yield* session.resume(otherSessionID).pipe(Effect.forkChild)
+        yield* awaitStreamStart(secondStarted)
 
-      expect(requests).toHaveLength(2)
-      expect(requests.map((request) => request.providerOptions?.openai?.promptCacheKey)).toEqual([
-        sessionID,
-        otherSessionID,
-      ])
-      yield* Deferred.succeed(streamGate, undefined)
-      yield* Fiber.join(first)
-      yield* Fiber.join(second)
-      streamGate = undefined
-      streamStarted = undefined
-    }),
+        expect(requests).toHaveLength(2)
+        expect(requests.map((request) => request.providerOptions?.openai?.promptCacheKey)).toEqual([
+          sessionID,
+          otherSessionID,
+        ])
+        yield* Deferred.succeed(streamGate, undefined)
+        yield* Fiber.join(first)
+        yield* Fiber.join(second)
+        streamGate = undefined
+        streamStarted = undefined
+      }),
+    { timeout: 10_000 },
   )
 
   it.effect("adds session correlation headers to model requests", () =>

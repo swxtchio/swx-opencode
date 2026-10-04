@@ -8,8 +8,9 @@ import { SessionV1 } from "@opencode-ai/schema/session-v1"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { EventRetentionTable, EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { Location } from "@opencode-ai/core/location"
+import { SessionDurable } from "@opencode-ai/schema/durable-event-manifest"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { eq } from "drizzle-orm"
@@ -1154,6 +1155,58 @@ describe("EventV2", () => {
       })
 
       expect(received[0]?.data).toEqual(durableData(aggregateID, "replayed"))
+    }),
+  )
+
+  it.effect("refuses redacted aggregate reads and writes before decoding or committing", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const eventID = EventV2.ID.create()
+      const type = EventV2.versionedType(SessionEvent.ContextUpdated.type, 1)
+      yield* db.insert(EventSequenceTable).values({ aggregate_id: aggregateID, seq: 0 })
+      yield* db.insert(EventTable).values({
+        id: eventID,
+        aggregate_id: aggregateID,
+        seq: 0,
+        type,
+        data: { sessionID: aggregateID, text: 42 },
+      })
+      yield* db.insert(EventRetentionTable).values({
+        aggregate_id: aggregateID,
+        state: "redacting",
+        progress_table: "event",
+        progress_id: eventID,
+        evidence: {},
+        time_started: 1,
+        time_updated: 1,
+      })
+
+      const history = yield* EventV2.readAggregate(db, {
+        aggregateID,
+        manifest: SessionDurable,
+        limit: 10,
+      }).pipe(Effect.exit)
+      const stream = yield* events.durable({ aggregateID }).pipe(Stream.runCollect, Effect.exit)
+      const replay = yield* events
+        .replayAll([{ id: eventID, aggregateID, seq: 0, type: "unknown.event.1", data: {} }])
+        .pipe(Effect.exit)
+      const publish = yield* events.publish(DurableMessage, durableData(aggregateID, "late write")).pipe(Effect.exit)
+
+      for (const result of [history, stream, replay, publish]) {
+        expect(String(result)).toContain(`Aggregate ${aggregateID} is unreplayable`)
+      }
+      expect(String(history)).not.toContain("Expected string")
+      expect(String(replay)).not.toContain("Unknown durable event type")
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toHaveLength(1)
+      expect(
+        yield* db.select().from(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).get(),
+      ).toEqual({
+        aggregate_id: aggregateID,
+        seq: 0,
+        owner_id: null,
+      })
     }),
   )
 })
