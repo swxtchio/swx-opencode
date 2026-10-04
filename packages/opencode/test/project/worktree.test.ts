@@ -735,7 +735,7 @@ describe("Worktree", () => {
     )
 
     pluginBootstrapIt.instance(
-      "serves ready loads and reloads while a runtime plugin hook is active",
+      "serves ready loads and reloads with synchronous and async plugin hook controls",
       () =>
         Effect.gen(function* () {
           const test = yield* TestInstance
