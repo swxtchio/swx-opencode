@@ -414,6 +414,95 @@ describe("InstanceStore", () => {
     { timeout: 90_000 },
   )
 
+  it.live("aggregates both failures from independent held bootstrap owners", () =>
+    Effect.gen(function* () {
+      const dir1 = yield* tmpdirScoped({ git: true })
+      const dir2 = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const started1 = yield* Deferred.make<void>()
+      const started2 = yield* Deferred.make<void>()
+      const makeOwner = (directory: string, started: Deferred.Deferred<void>) => {
+        let release = () => {}
+        return {
+          directory,
+          started,
+          promise: new Promise<void>((resolve) => (release = resolve)),
+          release: () => release(),
+        }
+      }
+      const owners = new Map<string, ReturnType<typeof makeOwner>>([
+        [dir1, makeOwner(dir1, started1)],
+        [dir2, makeOwner(dir2, started2)],
+      ])
+      const disposed: string[] = []
+      let firstLoading: Fiber.Fiber<InstanceContext, never> | undefined
+      let secondLoading: Fiber.Fiber<InstanceContext, never> | undefined
+      let cleanup: Fiber.Fiber<void, never> | undefined
+      yield* setBootstrap(
+        Effect.gen(function* () {
+          const context = yield* InstanceRef
+          const owner = context ? owners.get(context.directory) : undefined
+          if (!owner) return
+          yield* InstancePromise.from(() => {
+            Deferred.doneUnsafe(owner.started, Effect.void)
+            return owner.promise
+          })
+        }),
+      )
+      yield* registerDisposerScoped(async (directory) => {
+        if (owners.has(directory)) disposed.push(directory)
+      })
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => owners.forEach((owner) => owner.release())),
+      )
+
+      firstLoading = yield* store.load({ directory: dir1 }).pipe(Effect.forkScoped({ startImmediately: true }))
+      yield* awaitWithTimeout(Deferred.await(started1), "first bootstrap owner did not start")
+      secondLoading = yield* store.load({ directory: dir2 }).pipe(Effect.forkScoped({ startImmediately: true }))
+      yield* awaitWithTimeout(Deferred.await(started2), "second bootstrap owner did not start")
+      const tracked = yield* pollWithTimeout(
+        Effect.sync(() => (hasInstancePromises(dir1) && hasInstancePromises(dir2) ? true : undefined)),
+        "both independent bootstrap Promise owners were not tracked",
+      )
+      expect(tracked).toBe(true)
+
+      cleanup = yield* store.disposeAll().pipe(Effect.forkScoped({ startImmediately: true }))
+      const refusal = yield* awaitWithTimeout(
+        Fiber.await(cleanup),
+        "disposeAll did not finish both bounded owner checks",
+        "35 seconds",
+      )
+      expect(Exit.isFailure(refusal)).toBe(true)
+      if (Exit.isFailure(refusal)) {
+        const failure = Cause.squash(refusal.cause)
+        expect(failure).toBeInstanceOf(AggregateError)
+        if (failure instanceof AggregateError) {
+          expect(failure.message).toBe("failed to dispose 2 instance(s)")
+          expect(failure.errors).toHaveLength(2)
+          expect(failure.errors.map(String)).toEqual(
+            expect.arrayContaining([expect.stringContaining(dir1), expect.stringContaining(dir2)]),
+          )
+        }
+      }
+      expect(disposed).toEqual([])
+
+      owners.get(dir1)?.release()
+      owners.get(dir2)?.release()
+      const [firstExit, secondExit] = yield* Effect.all([Fiber.await(firstLoading), Fiber.await(secondLoading)])
+      expect(Exit.isSuccess(firstExit)).toBe(true)
+      expect(Exit.isSuccess(secondExit)).toBe(true)
+      firstLoading = undefined
+      secondLoading = undefined
+      const recovered = yield* Effect.exit(
+        awaitWithTimeout(store.disposeAll(), "disposeAll did not recover after both owners settled", "20 seconds"),
+      )
+      expect(Exit.isSuccess(recovered)).toBe(true)
+      expect(disposed).toEqual([dir1, dir2])
+      cleanup = undefined
+    }),
+    { timeout: 60_000 },
+  )
+
   it.live(
     "lets a healthy load finish inside the disposal grace before cleaning it",
     () =>
