@@ -3,11 +3,12 @@ import { createWriteStream } from "node:fs"
 import path from "path"
 import { pathToFileURL } from "url"
 import { finished } from "node:stream/promises"
-import { mkdir, symlink } from "node:fs/promises"
+import { mkdir, rm, symlink } from "node:fs/promises"
 import { AppProcess } from "@opencode-ai/core/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Global } from "@opencode-ai/core/global"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
@@ -934,6 +935,148 @@ describe("Worktree", () => {
         { timeout: 120_000 },
       )
     }
+
+    wintest(
+      "refuses worktree deletion until real well-known remote config substitution settles its FIFO Promise",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const store = yield* InstanceStore.Service
+          const fifoDirectory = yield* tmpdirScoped()
+          const fifo = path.join(fifoDirectory, "held-well-known-url.txt")
+          const authFile = path.join(Global.Path.data, "auth.json")
+          const tokenKey = "ROUND17_WELLKNOWN_TOKEN"
+          const token = "round17-test-token"
+          expect(Global.Path.data).toContain("opencode-test-data-")
+          const savedAuth = yield* Effect.promise(async () =>
+            (await Bun.file(authFile).exists()) ? await Bun.file(authFile).text() : undefined,
+          )
+          let discoveryRequests = 0
+          let remoteConfigRequests = 0
+          let remoteAuthorization: string | undefined
+          const server = Bun.serve({
+            hostname: "127.0.0.1",
+            port: 0,
+            fetch: (request) => {
+              const url = new URL(request.url)
+              if (url.pathname === "/.well-known/opencode") {
+                discoveryRequests++
+                return Response.json({
+                  remote_config: {
+                    url: `{file:${fifo}}`,
+                    headers: { Authorization: `Bearer {env:${tokenKey}}` },
+                  },
+                })
+              }
+              if (url.pathname === "/remote-config") {
+                remoteConfigRequests++
+                remoteAuthorization = request.headers.get("authorization") ?? undefined
+                return Response.json({ config: { username: "well-known-test-user" } })
+              }
+              return new Response("not found", { status: 404 })
+            },
+          })
+          yield* Effect.addFinalizer(() => Effect.promise(() => server.stop(true)))
+          yield* Effect.addFinalizer(() =>
+            Effect.promise(async () => {
+              if (savedAuth === undefined) {
+                await rm(authFile, { force: true })
+                return
+              }
+              await Bun.write(authFile, savedAuth)
+            }),
+          )
+          yield* Effect.promise(() =>
+            Bun.write(
+              authFile,
+              JSON.stringify({ [server.url.origin]: { type: "wellknown", key: tokenKey, token } }),
+            ),
+          )
+
+          const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+          const fifoMaker = yield* spawner.spawn(ChildProcess.make("mkfifo", [fifo]))
+          expect(yield* fifoMaker.exitCode).toBe(ChildProcessSpawner.ExitCode(0))
+          const expected = yield* svc.makeWorktreeInfo({ name: "held-well-known-config" })
+          const info = yield* svc.create({ name: expected.name })
+          expect(info.directory).toBe(expected.directory)
+          yield* Effect.addFinalizer(() => removeCreatedWorktree(info.directory).pipe(Effect.ignore))
+
+          const writer = createWriteStream(fifo)
+          writer.on("error", () => {})
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              if (!writer.destroyed) writer.destroy()
+            }),
+          )
+          const readerOpened = new Promise<void>((resolve, reject) => {
+            writer.once("open", () => resolve())
+            writer.once("error", reject)
+          })
+          yield* awaitWithTimeout(
+            Effect.promise(() => readerOpened),
+            "well-known remote config did not open its held file FIFO",
+            "20 seconds",
+          )
+          expect(discoveryRequests).toBe(1)
+          expect(remoteConfigRequests).toBe(0)
+          const joiner = yield* store
+            .load({ directory: info.directory })
+            .pipe(Effect.forkScoped({ startImmediately: true }))
+          expect(joiner.pollUnsafe()).toBeUndefined()
+
+          const removalFiber = yield* svc
+            .remove({ directory: info.directory })
+            .pipe(Effect.forkDetach({ startImmediately: true }))
+          const removalResult = yield* Effect.exit(
+            awaitWithTimeout(
+              Fiber.await(removalFiber),
+              "worktree removal did not refuse its unsettled well-known config Promise",
+              "30 seconds",
+            ),
+          )
+          expect(Exit.isSuccess(removalResult)).toBe(true)
+          if (Exit.isFailure(removalResult)) return
+          const removal = removalResult.value
+          expect(Exit.isFailure(removal)).toBe(true)
+          if (Exit.isFailure(removal)) {
+            expect(Cause.squash(removal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
+            expect(Cause.pretty(removal.cause)).toContain("instance bootstrap Promise did not settle")
+          }
+          expect(hasInstancePromises(info.directory)).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(true)
+          expect(normalize(yield* git(test.directory, ["worktree", "list", "--porcelain"]))).toContain(
+            normalize(info.directory),
+          )
+
+          writer.end(`${server.url.origin}/remote-config`)
+          yield* awaitWithTimeout(
+            Effect.promise(() => finished(writer)),
+            "held well-known URL reader did not finish",
+            "15 seconds",
+          )
+          const joined = yield* awaitWithTimeout(
+            Fiber.await(joiner),
+            "concurrent load did not join the live well-known config bootstrap",
+            "15 seconds",
+          )
+          expect(Exit.isSuccess(joined)).toBe(true)
+          const loaded = yield* pollWithTimeout(
+            store.load({ directory: info.directory }).pipe(Effect.catchCause(() => Effect.succeed(undefined))),
+            "load did not recover after well-known config substitution settled",
+            "25 seconds",
+          )
+          if (Exit.isSuccess(joined)) expect(loaded).toBe(joined.value)
+          expect(remoteConfigRequests).toBe(1)
+          expect(remoteAuthorization).toBe(`Bearer ${token}`)
+
+          expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(false)
+        }),
+      { git: true },
+      { timeout: 120_000 },
+    )
 
     pluginBootstrapIt.instance(
       "serves ready loads and reloads with synchronous and async plugin hook controls",
