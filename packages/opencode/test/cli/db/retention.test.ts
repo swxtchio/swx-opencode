@@ -1317,7 +1317,7 @@ test(
       expectedStagingDeviceID: destinationDeviceID,
       retainedSessionID: "ses_physical",
     })
-    expect(compacted.state).toBe("complete")
+    expect(compacted.state, compacted.reasons.join(", ")).toBe("complete")
     expect(compacted.changedFiles).toBe(3)
     expect(compacted.reasons).toEqual([])
     expect(compacted.sourceDeviceID).not.toBe(compacted.stagingDeviceID)
