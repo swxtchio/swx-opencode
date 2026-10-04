@@ -959,7 +959,7 @@ test(
 )
 
 test(
-  "fixture compaction refuses replacement without continuous writer quiescence proof",
+  "fixture compaction rehearses backup, VACUUM, and restore under an exclusive writer fence",
   async () => {
     await using sourceFixture = await createFixtureDatabase()
     const sourcePath = sourceFixture.filename
@@ -985,8 +985,27 @@ test(
     addEvents()
     const beforeRedactionStat = await stat(sourcePath)
     const beforeRedaction = {
+      size: beforeRedactionStat.size,
+      blocks: beforeRedactionStat.blocks,
       pageCount: beforeDB.query<{ page_count: number }, []>("PRAGMA page_count").get()!.page_count,
       freelistCount: beforeDB.query<{ freelist_count: number }, []>("PRAGMA freelist_count").get()!.freelist_count,
+      integrityCheck: beforeDB.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get()!.integrity_check,
+      retainedSession: beforeDB
+        .query<
+          {
+            id: string
+            cost: number
+            tokens_input: number
+            tokens_output: number
+            tokens_reasoning: number
+            tokens_cache_read: number
+            tokens_cache_write: number
+          },
+          [string]
+        >(
+          "SELECT id, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write FROM session WHERE id = ?",
+        )
+        .get("ses_physical"),
     }
     beforeDB.close()
 
@@ -1002,7 +1021,6 @@ test(
       batchSize: 32,
     })
     expect(redaction.state).toBe("complete")
-    redactionDB.close()
 
     const afterRedactionStat = await stat(sourcePath)
     const afterRedactionDB = new Database(sourcePath, { readonly: true })
@@ -1013,7 +1031,20 @@ test(
       integrityCheck: afterRedactionDB.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get()!
         .integrity_check,
       retainedSession: afterRedactionDB
-        .query<{ id: string; tokens_input: number }, [string]>("SELECT id, tokens_input FROM session WHERE id = ?")
+        .query<
+          {
+            id: string
+            cost: number
+            tokens_input: number
+            tokens_output: number
+            tokens_reasoning: number
+            tokens_cache_read: number
+            tokens_cache_write: number
+          },
+          [string]
+        >(
+          "SELECT id, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write FROM session WHERE id = ?",
+        )
         .get("ses_physical"),
     }
     afterRedactionDB.close()
@@ -1088,7 +1119,8 @@ test(
     expect(rootDestination.reasons).toContain("staging-destination-is-root")
 
     const beforeReplaceStat = await stat(sourcePath)
-    let arrivingWriter: Database | undefined
+    let fixtureWriterBlocked = false
+    let sqliteWriterBlocked = false
     const writerArrival = await compactRestoreFixture({
       sourcePath,
       sourceFixture,
@@ -1098,16 +1130,44 @@ test(
       expectedBackupDeviceID: destinationDeviceID,
       expectedStagingDeviceID: destinationDeviceID,
       retainedSessionID: "ses_physical",
-      afterInitialLivenessCheck: async () => {
-        arrivingWriter = new Database(sourcePath)
+      afterExclusiveLock: async () => {
+        try {
+          await sourceFixture.reopen()
+        } catch {
+          fixtureWriterBlocked = true
+        }
+        let arrivingWriter: Database | undefined
+        try {
+          arrivingWriter = new Database(sourcePath)
+          arrivingWriter.query("SELECT seq FROM event_sequence WHERE aggregate_id = 'ses_physical'").get()
+        } catch {
+          sqliteWriterBlocked = true
+        } finally {
+          arrivingWriter?.close()
+        }
       },
     })
-    arrivingWriter?.close()
     expect(writerArrival.state).toBe("refused")
     expect(writerArrival.changedFiles).toBe(0)
-    expect(writerArrival.reasons).toContain("source-inode-still-open")
+    expect(writerArrival.reasons).toContain("writer-arrival-blocked-under-exclusive-fence")
+    expect(fixtureWriterBlocked).toBe(true)
+    expect(sqliteWriterBlocked).toBe(true)
+    expect(await Bun.file(path.join(path.dirname(sourcePath), ".retention-compaction.lock")).exists()).toBe(false)
+    expect({
+      device: (await stat(sourcePath)).dev,
+      inode: (await stat(sourcePath)).ino,
+      size: (await stat(sourcePath)).size,
+      seq: sourceFixture.db
+        .query<{ seq: number }, []>("SELECT seq FROM event_sequence WHERE aggregate_id = 'ses_physical'")
+        .get()!.seq,
+    }).toEqual({
+      device: beforeReplaceStat.dev,
+      inode: beforeReplaceStat.ino,
+      size: beforeReplaceStat.size,
+      seq: 599,
+    })
 
-    const refused = await compactRestoreFixture({
+    const compacted = await compactRestoreFixture({
       sourcePath,
       sourceFixture,
       backupPath,
@@ -1117,25 +1177,46 @@ test(
       expectedStagingDeviceID: destinationDeviceID,
       retainedSessionID: "ses_physical",
     })
-    expect(refused.state).toBe("refused")
-    expect(refused.changedFiles).toBe(0)
-    expect(refused.reasons).toContain("fixture-writer-quiescence-proof-unavailable")
-    expect({
-      device: (await stat(sourcePath)).dev,
-      inode: (await stat(sourcePath)).ino,
-      size: (await stat(sourcePath)).size,
-    }).toEqual({
-      device: beforeReplaceStat.dev,
-      inode: beforeReplaceStat.ino,
-      size: beforeReplaceStat.size,
-    })
+    expect(compacted.state).toBe("complete")
+    expect(compacted.changedFiles).toBe(3)
+    expect(compacted.reasons).toEqual([])
+    expect(compacted.sourceDeviceID).not.toBe(compacted.stagingDeviceID)
+    expect(compacted.measurements).toBeDefined()
+    expect(compacted.measurements!.before.retainedSession).toEqual(beforeRedaction.retainedSession ?? undefined)
+    expect(compacted.measurements!.backup.retainedSession).toEqual(beforeRedaction.retainedSession ?? undefined)
+    expect(compacted.measurements!.staging.retainedSession).toEqual(beforeRedaction.retainedSession ?? undefined)
+    expect(compacted.measurements!.restored.retainedSession).toEqual(beforeRedaction.retainedSession ?? undefined)
+    expect(compacted.measurements!.backup.integrityCheck).toBe("ok")
+    expect(compacted.measurements!.staging.integrityCheck).toBe("ok")
+    expect(compacted.measurements!.restored.integrityCheck).toBe("ok")
+    expect(compacted.measurements!.staging.freelistCount).toBe(0)
+    expect(compacted.measurements!.restored.freelistCount).toBe(0)
+    expect(compacted.measurements!.restored.size).toBeLessThan(beforeRedaction.size)
+    expect(compacted.measurements!.restored.blocks).toBeLessThan(beforeRedaction.blocks)
+    expect(compacted.measurements!.restored.pageCount).toBeLessThan(afterRedaction.pageCount)
+    expect(await Bun.file(backupPath).exists()).toBe(true)
+    expect(await Bun.file(stagingPath).exists()).toBe(true)
+    expect(await Bun.file(path.join(path.dirname(sourcePath), ".retention-compaction.lock")).exists()).toBe(false)
+    const restoredStat = await stat(sourcePath)
+    expect(restoredStat.size).toBeLessThan(beforeRedaction.size)
+    expect(restoredStat.blocks).toBeLessThan(beforeRedaction.blocks)
+    expect(sourceFixture.db.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get()!.integrity_check).toBe(
+      "ok",
+    )
+    expect(
+      sourceFixture.db
+        .query<{ id: string; tokens_input: number }, [string]>("SELECT id, tokens_input FROM session WHERE id = ?")
+        .get("ses_physical"),
+    ).toEqual({ id: "ses_physical", tokens_input: 13 })
+
+    expect(beforeRedaction.integrityCheck).toBe("ok")
+    expect(beforeRedaction.freelistCount).toBe(0)
     expect(afterRedaction.integrityCheck).toBe("ok")
     expect(afterRedaction.freelistCount).toBeGreaterThan(beforeRedaction.freelistCount)
     expect(afterRedactionStat.size).toBe(beforeRedactionStat.size)
+    expect(afterRedactionStat.blocks).toBe(beforeRedactionStat.blocks)
     expect(afterRedaction.pageCount).toBeGreaterThan(0)
-    expect(afterRedaction.retainedSession).toEqual({ id: "ses_physical", tokens_input: 13 })
-    expect(await Bun.file(backupPath).exists()).toBe(false)
-    expect(await Bun.file(stagingPath).exists()).toBe(false)
+    expect(afterRedaction.retainedSession).toEqual(beforeRedaction.retainedSession ?? null)
   },
   { timeout: 60_000 },
 )

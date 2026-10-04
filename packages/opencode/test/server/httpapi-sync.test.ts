@@ -162,6 +162,12 @@ describe("sync HttpApi", () => {
         })
         const events = yield* EventV2Bridge.Service
         yield* events.publish(SessionEvent.Synthetic, {
+          sessionID: redacted.id,
+          messageID: SessionMessage.ID.create(),
+          timestamp: yield* DateTime.now,
+          text: "producer-emitted event before retention",
+        })
+        yield* events.publish(SessionEvent.Synthetic, {
           sessionID: safe.id,
           messageID: SessionMessage.ID.create(),
           timestamp: yield* DateTime.now,
@@ -197,6 +203,7 @@ describe("sync HttpApi", () => {
         expect(safeHistory.events.length).toBeGreaterThan(0)
       }),
     { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 10_000 },
   )
 
   it.instance(

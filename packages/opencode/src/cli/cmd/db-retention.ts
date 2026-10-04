@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 import { spawnSync } from "node:child_process"
-import { lstatSync, realpathSync, statSync } from "node:fs"
-import { lstat, mkdtemp, realpath, rm, stat, statfs, writeFile } from "node:fs/promises"
+import { chmodSync, constants, lstatSync, realpathSync, statSync } from "node:fs"
+import { chmod, copyFile, lstat, mkdtemp, open, realpath, rename, rm, stat, statfs, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { Database } from "@opencode-ai/core/database/database"
@@ -129,12 +129,37 @@ export type RetentionApplyResult = {
 }
 
 export type CompactFixtureResult = {
-  readonly state: "refused"
+  readonly state: "complete" | "refused"
   readonly changedFiles: number
   readonly reasons: readonly string[]
   readonly sourceDeviceID?: string
   readonly backupDeviceID?: string
   readonly stagingDeviceID?: string
+  readonly measurements?: {
+    readonly before: PhysicalMetrics
+    readonly backup: PhysicalMetrics
+    readonly staging: PhysicalMetrics
+    readonly restored: PhysicalMetrics
+  }
+}
+
+export type PhysicalMetrics = {
+  readonly size: number
+  readonly blocks: number
+  readonly pageCount: number
+  readonly freelistCount: number
+  readonly integrityCheck: string
+  readonly retainedSession:
+    | {
+        readonly id: string
+        readonly cost: number
+        readonly tokens_input: number
+        readonly tokens_output: number
+        readonly tokens_reasoning: number
+        readonly tokens_cache_read: number
+        readonly tokens_cache_write: number
+      }
+    | undefined
 }
 
 type CompactFixtureInput = {
@@ -147,7 +172,7 @@ type CompactFixtureInput = {
   readonly expectedStagingDeviceID: string
   readonly retainedSessionID: string
   readonly capacityFloorBytes?: number
-  readonly afterInitialLivenessCheck?: () => Promise<void>
+  readonly afterExclusiveLock?: () => Promise<void>
 }
 
 type ApplyInput = {
@@ -161,6 +186,13 @@ type ApplyInput = {
 type RedactionRow = { cursor: string | number; value: string | number | null }
 type FixtureIdentity = { readonly filename: string; readonly device: string; readonly inode: string }
 type NativeSqliteDatabase = InstanceType<typeof import("bun:sqlite").Database>
+type FixtureControl = {
+  identity: FixtureIdentity
+  database: NativeSqliteDatabase
+  compacting: boolean
+  removed: boolean
+  lockPath: string
+}
 type FixtureDirectory = {
   readonly filename: string
   readonly db: NativeSqliteDatabase
@@ -170,6 +202,7 @@ type FixtureDirectory = {
 }
 
 const fixtureHandles = new WeakMap<object, FixtureIdentity>()
+const fixtureControls = new WeakMap<object, FixtureControl>()
 
 const redactionPlan = [
   { table: "event", scope: "aggregate_id", cursor: "seq", value: "data", kind: "json" },
@@ -209,7 +242,7 @@ const metricScalarKeys = new Set([
 
 const tokenMetricKeys = new Set(["input", "output", "reasoning", "total"])
 const cacheMetricKeys = new Set(["read", "write"])
-const timeMetricKeys = new Set(["created", "completed", "ran"])
+const timeMetricKeys = new Set(["created", "completed"])
 const timingMetricKeys = new Set(["duration", "durationMs", "startedAt", "endedAt", "wallTime", "wallTimeMs"])
 
 const metricObjectKeys = new Set([
@@ -225,6 +258,7 @@ const metricObjectKeys = new Set([
   "quality",
   "tokens",
   "timing",
+  "time",
   "usage",
 ])
 
@@ -392,25 +426,47 @@ export async function createFixtureDatabase(snapshot?: Uint8Array): Promise<Fixt
   const sqlite = await import("bun:sqlite")
   const db = new sqlite.Database(filename)
   const identity = await readFixtureIdentity(db as unknown as SqliteAccess, filename)
+  const control: FixtureControl = {
+    identity,
+    database: db,
+    compacting: false,
+    removed: false,
+    lockPath: path.join(directory, ".retention-compaction.lock"),
+  }
   fixtureHandles.set(db, identity)
 
-  const remove = () => rm(directory, { recursive: true, force: true })
-  return {
+  const remove = async () => {
+    if (control.compacting) throw new Error("retention fixture cannot be removed during compaction")
+    if (control.removed) return
+    control.removed = true
+    try {
+      control.database.close()
+    } catch {}
+    await rm(directory, { recursive: true, force: true })
+  }
+  const fixture: FixtureDirectory = {
     filename,
-    db,
+    get db() {
+      return control.database
+    },
     reopen: async () => {
-      if (!fixturePathMatches(identity)) throw new Error("retention fixture identity changed before reopen")
+      if (control.compacting) throw new Error("retention fixture writer admission is closed during compaction")
+      if (control.removed) throw new Error("retention fixture was already removed")
+      if (!fixturePathMatches(control.identity)) throw new Error("retention fixture identity changed before reopen")
       const reopened = new sqlite.Database(filename) as unknown as SqliteAccess
-      if (!(await fixtureHandleMatches(reopened, identity))) {
+      if (!(await fixtureHandleMatches(reopened, control.identity))) {
         reopened.close()
         throw new Error("retention fixture identity changed while reopening")
       }
-      fixtureHandles.set(reopened, identity)
-      return reopened as unknown as NativeSqliteDatabase
+      fixtureHandles.set(reopened, control.identity)
+      control.database = reopened as unknown as NativeSqliteDatabase
+      return control.database
     },
     remove,
     [Symbol.asyncDispose]: remove,
   }
+  fixtureControls.set(fixture, control)
+  return fixture
 }
 
 function makeProgressScope(
@@ -1183,7 +1239,8 @@ function retainMetrics(value: unknown, key?: string): unknown {
     }
     return retained
   }
-  if (key === "time") return retainNamedMetrics(value, timeMetricKeys, isMetricScalar)
+  if (key === "time")
+    return retainNamedMetrics(value, timeMetricKeys, (item) => typeof item === "number" && Number.isFinite(item))
   if (key === "timing" || key === "performance") {
     return retainNamedMetrics(value, timingMetricKeys, (item) => typeof item === "number")
   }
@@ -1210,46 +1267,90 @@ function retainNamedMetrics(
   return Object.fromEntries(Object.entries(value).filter(([key, child]) => keys.has(key) && keep(child)))
 }
 
-function isMetricScalar(value: unknown) {
-  return typeof value === "string" || typeof value === "number" || typeof value === "boolean"
+function sameRetainedRead(left: PhysicalMetrics, right: PhysicalMetrics) {
+  return JSON.stringify(left.retainedSession) === JSON.stringify(right.retainedSession)
 }
 
 function byteLength(value: unknown) {
   return Buffer.byteLength(typeof value === "string" ? value : value === null ? "" : String(value))
 }
 
+async function physicalMetrics(db: SqliteAccess, filename: string, sessionID: string): Promise<PhysicalMetrics> {
+  const file = await stat(filename)
+  return {
+    size: file.size,
+    blocks: file.blocks,
+    pageCount: oneRow<{ page_count: number }>(db, "PRAGMA page_count")?.page_count ?? 0,
+    freelistCount: oneRow<{ freelist_count: number }>(db, "PRAGMA freelist_count")?.freelist_count ?? 0,
+    integrityCheck: oneRow<{ integrity_check: string }>(db, "PRAGMA integrity_check")?.integrity_check ?? "unreadable",
+    retainedSession: oneRow<PhysicalMetrics["retainedSession"]>(
+      db,
+      "SELECT id, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write FROM session WHERE id = ?",
+      sessionID,
+    ),
+  }
+}
+
 export async function compactRestoreFixture(input: CompactFixtureInput): Promise<CompactFixtureResult> {
   let sourceDeviceID: string | undefined
   let backupDeviceID: string | undefined
   let stagingDeviceID: string | undefined
-  const refused = (reasons: Iterable<string>): CompactFixtureResult => ({
+  let sourcePath: string | undefined
+  let databaseReopened = false
+  let control: FixtureControl | undefined
+  let lockFile: Awaited<ReturnType<typeof open>> | undefined
+  let lockCreated = false
+  let sourceLocked = false
+  let sourceClosed = false
+  let oldSourceDB: NativeSqliteDatabase | undefined
+  let restoredLocked = false
+  let replaced = false
+  let completed = false
+  let originalMode: number | undefined
+  let restoreDirectory: string | undefined
+  let sourceDirectory: string | undefined
+  let backupPath: string | undefined
+  let stagingPath: string | undefined
+  let restorePath: string | undefined
+  let stageDB: NativeSqliteDatabase | undefined
+  const refused = (reasons: Iterable<string>, measurements?: CompactFixtureResult["measurements"]): CompactFixtureResult => ({
     state: "refused",
-    changedFiles: 0,
+    changedFiles: replaced ? 3 : 0,
     reasons: Array.from(reasons).toSorted(),
     sourceDeviceID,
     backupDeviceID,
     stagingDeviceID,
+    measurements,
   })
   try {
-    const sourceIdentity = input.sourceFixture ? fixtureHandles.get(input.sourceFixture.db) : undefined
+    control = input.sourceFixture ? fixtureControls.get(input.sourceFixture) : undefined
+    const sourceIdentity = control?.identity
     if (
+      !control ||
       !sourceIdentity ||
       sourceIdentity.filename !== input.sourceFixture?.filename ||
       path.resolve(input.sourcePath) !== sourceIdentity.filename ||
-      !fixturePathMatches(sourceIdentity)
+      !fixturePathMatches(sourceIdentity) ||
+      fixtureHandles.get(control.database) !== sourceIdentity
     ) {
       return refused(["source-fixture-identity-unverified"])
     }
     if (![input.expectedSourceDeviceID, input.expectedBackupDeviceID, input.expectedStagingDeviceID].every(Boolean)) {
       return refused(["filesystem-identity-unverified"])
     }
-    const sourcePath = await realpath(input.sourcePath)
+    sourcePath = await realpath(input.sourcePath)
     if (sourcePath !== sourceIdentity.filename || !isTemporaryFixturePath(sourcePath)) {
       return refused(["compaction-only-supported-for-isolated-fixtures"])
     }
-    const sourceDirectory = await realpath(path.dirname(sourcePath))
+    sourceDirectory = await realpath(path.dirname(sourcePath))
     const backupDirectory = await realpath(path.dirname(input.backupPath))
     const stagingDirectory = await realpath(path.dirname(input.stagingPath))
+    if (
+      path.resolve(path.dirname(input.backupPath)) !== backupDirectory ||
+      path.resolve(path.dirname(input.stagingPath)) !== stagingDirectory
+    ) {
+      return refused(["destination-directory-identity-unverified"])
+    }
     const sourceStat = await stat(sourcePath)
     const sourceDirectoryStat = await stat(sourceDirectory)
     const sourceFilesystem = await statfs(sourceDirectory)
@@ -1262,8 +1363,8 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
     stagingDeviceID = String(stagingStat.dev)
     const rootDeviceID = String((await stat("/")).dev)
     const currentUserID = process.getuid?.()
-    const backupPath = path.join(backupDirectory, path.basename(input.backupPath))
-    const stagingPath = path.join(stagingDirectory, path.basename(input.stagingPath))
+    backupPath = path.join(backupDirectory, path.basename(input.backupPath))
+    stagingPath = path.join(stagingDirectory, path.basename(input.stagingPath))
     const sourceSize = sourceStat.size + (await fileSize(`${sourcePath}-wal`)) + (await fileSize(`${sourcePath}-shm`))
     const destinationUse = new Map<string, number>()
     destinationUse.set(backupDeviceID, sourceSize)
@@ -1281,8 +1382,11 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
     if (stagingDeviceID === rootDeviceID) reasons.add("staging-destination-is-root")
     if (backupDeviceID === sourceDeviceID) reasons.add("backup-filesystem-not-distinct")
     if (stagingDeviceID === sourceDeviceID) reasons.add("staging-filesystem-not-distinct")
+    if (currentUserID === 0) reasons.add("fixture-compaction-requires-non-root-owner")
     if (currentUserID !== undefined) {
-      if (sourceDirectoryStat.uid !== currentUserID) reasons.add("source-fixture-owner-unverified")
+      if (sourceDirectoryStat.uid !== currentUserID || (sourceDirectoryStat.mode & 0o077) !== 0) {
+        reasons.add("source-fixture-owner-or-mode-unverified")
+      }
       if (
         [backupStat, stagingStat].some(
           (directoryStat) => directoryStat.uid !== currentUserID || (directoryStat.mode & 0o077) !== 0,
@@ -1316,21 +1420,261 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
       if (filename !== sourcePath && !(await fileSize(filename))) continue
       const openSource = openPath(filename)
       if (!openSource.readable) reasons.add("source-inode-liveness-unavailable")
-      if (openSource.pids.length > 0) reasons.add("source-inode-still-open")
+      if (!fixtureOwnerIsOnlyOpen(openSource)) reasons.add("source-inode-still-open")
     }
     if (reasons.size > 0) return refused(reasons)
 
-    if (input.afterInitialLivenessCheck) await input.afterInitialLivenessCheck()
+    const identityBeforeFence = await stat(sourcePath)
+    if (
+      String(identityBeforeFence.dev) !== sourceIdentity.device ||
+      String(identityBeforeFence.ino) !== sourceIdentity.inode
+    ) {
+      return refused(["source-fixture-identity-changed-before-fence"])
+    }
+    control.compacting = true
+    lockFile = await open(control.lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR, 0o600)
+    lockCreated = true
+    await lockFile.writeFile(JSON.stringify({ pid: process.pid, fixture: sourceIdentity.inode }))
+    await lockFile.sync()
+
+    const sourceDB = control.database
+    oldSourceDB = sourceDB
+    const sourceAccess = sourceDB as unknown as SqliteAccess
+    sourceDB.exec("PRAGMA busy_timeout=0")
+    if (oneRow<{ journal_mode: string }>(sourceAccess, "PRAGMA journal_mode")?.journal_mode !== "delete") {
+      return refused(["source-journal-mode-not-delete"])
+    }
+    if ((await fileSize(`${sourcePath}-wal`)) || (await fileSize(`${sourcePath}-shm`))) {
+      return refused(["source-wal-sidecar-present"])
+    }
+    sourceDB.exec("PRAGMA locking_mode=EXCLUSIVE")
+    if (oneRow<{ locking_mode: string }>(sourceAccess, "PRAGMA locking_mode")?.locking_mode !== "exclusive") {
+      return refused(["sqlite-exclusive-lock-unavailable"])
+    }
+    sourceLocked = true
+    sourceDB.exec("BEGIN EXCLUSIVE")
+    try {
+      const acquired = sourceDB
+        .query("UPDATE event_sequence SET seq = seq + 1 WHERE aggregate_id = ?")
+        .run(input.retainedSessionID)
+      sourceDB.exec("ROLLBACK")
+      if (acquired.changes !== 1) return refused(["retained-session-aggregate-lock-unavailable"])
+    } catch (error) {
+      try {
+        sourceDB.exec("ROLLBACK")
+      } catch {}
+      return refused([`sqlite-exclusive-lock-unavailable:${error instanceof Error ? error.message : "unknown"}`])
+    }
     for (const filename of [sourcePath, `${sourcePath}-wal`, `${sourcePath}-shm`]) {
       if (filename !== sourcePath && !(await fileSize(filename))) continue
       const openSource = openPath(filename)
-      if (!openSource.readable) reasons.add("source-inode-liveness-unavailable")
-      if (openSource.pids.length > 0) reasons.add("source-inode-still-open")
+      if (!openSource.readable) return refused(["source-inode-liveness-unavailable-under-fence"])
+      if (!fixtureOwnerIsOnlyOpen(openSource)) return refused(["source-inode-still-open-under-fence"])
     }
-    reasons.add("fixture-writer-quiescence-proof-unavailable")
-    return refused(reasons)
+    if (input.afterExclusiveLock) {
+      await input.afterExclusiveLock()
+      return refused(["writer-arrival-blocked-under-exclusive-fence"])
+    }
+
+    originalMode = sourceStat.mode & 0o777
+    const before = await physicalMetrics(sourceAccess, sourcePath, input.retainedSessionID)
+    if (before.integrityCheck !== "ok" || !before.retainedSession) {
+      return refused(["source-integrity-or-retained-read-failed"], { before, backup: before, staging: before, restored: before })
+    }
+    await copyFile(sourcePath, backupPath, constants.COPYFILE_EXCL)
+    const sqlite = await import("bun:sqlite")
+    const backupDB = new sqlite.Database(backupPath, { readonly: true }) as unknown as SqliteAccess
+    let backup: PhysicalMetrics
+    try {
+      backup = await physicalMetrics(backupDB, backupPath, input.retainedSessionID)
+    } finally {
+      backupDB.close()
+    }
+    if (!sameRetainedRead(before, backup) || backup.integrityCheck !== "ok") {
+      return refused(["backup-integrity-or-retained-read-mismatch"], { before, backup, staging: backup, restored: backup })
+    }
+
+    await copyFile(backupPath, stagingPath, constants.COPYFILE_EXCL)
+    stageDB = new sqlite.Database(stagingPath)
+    stageDB.exec("VACUUM")
+    const staging = await physicalMetrics(stageDB as unknown as SqliteAccess, stagingPath, input.retainedSessionID)
+    if (
+      staging.integrityCheck !== "ok" ||
+      staging.freelistCount !== 0 ||
+      !sameRetainedRead(before, staging) ||
+      staging.size >= before.size ||
+      staging.blocks >= before.blocks
+    ) {
+      return refused(["compaction-did-not-preserve-metrics-and-reduce-physical-file"], {
+        before,
+        backup,
+        staging,
+        restored: staging,
+      })
+    }
+    stageDB.close()
+    stageDB = undefined
+
+    restoreDirectory = await mkdtemp(path.join(sourceDirectory, ".retention-restore-"))
+    const restoreDirectoryStat = await stat(restoreDirectory)
+    if (String(restoreDirectoryStat.dev) !== sourceDeviceID || (restoreDirectoryStat.mode & 0o077) !== 0) {
+      return refused(["restore-filesystem-or-directory-identity-unverified"], {
+        before,
+        backup,
+        staging,
+        restored: staging,
+      })
+    }
+    restorePath = path.join(restoreDirectory, "retention.sqlite")
+    await copyFile(stagingPath, restorePath, constants.COPYFILE_EXCL)
+    await chmod(restorePath, originalMode)
+    const restoreDB = new sqlite.Database(restorePath, { readonly: true }) as unknown as SqliteAccess
+    let restored: PhysicalMetrics
+    try {
+      restored = await physicalMetrics(restoreDB, restorePath, input.retainedSessionID)
+    } finally {
+      restoreDB.close()
+    }
+    if (
+      restored.integrityCheck !== "ok" ||
+      restored.size >= before.size ||
+      restored.blocks >= before.blocks ||
+      !sameRetainedRead(before, restored) ||
+      restored.size !== staging.size ||
+      restored.blocks !== staging.blocks
+    ) {
+      return refused(["restore-integrity-or-physical-measurement-failed"], { before, backup, staging, restored })
+    }
+
+    await chmod(restorePath, 0)
+    await chmod(sourcePath, 0)
+    await rename(restorePath, sourcePath)
+    replaced = true
+    sourceDB.close()
+    sourceClosed = true
+    const oldInode = deletedFixtureInodeOpen(sourceIdentity)
+    if (!oldInode.readable) {
+      return refused(["old-source-inode-liveness-unavailable-after-replacement"], { before, backup, staging, restored })
+    }
+    if (oldInode.pids.length > 0) {
+      return refused(["old-source-inode-still-open-after-replacement"], { before, backup, staging, restored })
+    }
+    chmodSync(sourcePath, originalMode)
+    const restoredDB = new sqlite.Database(sourcePath)
+    const restoredIdentity = await readFixtureIdentity(restoredDB as unknown as SqliteAccess, sourcePath)
+    control.identity = restoredIdentity
+    control.database = restoredDB
+    databaseReopened = true
+    fixtureHandles.set(restoredDB, restoredIdentity)
+    restoredDB.exec("PRAGMA busy_timeout=0")
+    restoredDB.exec("PRAGMA locking_mode=EXCLUSIVE")
+    const restoredAccess = restoredDB as unknown as SqliteAccess
+    if (oneRow<{ locking_mode: string }>(restoredAccess, "PRAGMA locking_mode")?.locking_mode !== "exclusive") {
+      return refused(["restored-sqlite-exclusive-lock-unavailable"], { before, backup, staging, restored })
+    }
+    restoredLocked = true
+    restoredDB.exec("BEGIN EXCLUSIVE")
+    try {
+      const acquired = restoredDB
+        .query("UPDATE event_sequence SET seq = seq + 1 WHERE aggregate_id = ?")
+        .run(input.retainedSessionID)
+      restoredDB.exec("ROLLBACK")
+      if (acquired.changes !== 1) {
+        return refused(["restored-session-aggregate-lock-unavailable"], { before, backup, staging, restored })
+      }
+    } catch (error) {
+      try {
+        restoredDB.exec("ROLLBACK")
+      } catch {}
+      return refused([`restored-sqlite-exclusive-lock-unavailable:${error instanceof Error ? error.message : "unknown"}`], {
+        before,
+        backup,
+        staging,
+        restored,
+      })
+    }
+    const replacementOpen = openPath(sourcePath)
+    if (!replacementOpen.readable) {
+      return refused(["restored-source-inode-liveness-unavailable-under-fence"], { before, backup, staging, restored })
+    }
+    if (!fixtureOwnerIsOnlyOpen(replacementOpen)) {
+      return refused(["restored-source-inode-still-open-under-fence"], { before, backup, staging, restored })
+    }
+    const finalMetrics = await physicalMetrics(restoredAccess, sourcePath, input.retainedSessionID)
+    if (
+      finalMetrics.integrityCheck !== "ok" ||
+      !sameRetainedRead(before, finalMetrics) ||
+      finalMetrics.size >= before.size ||
+      finalMetrics.blocks >= before.blocks
+    ) {
+      return refused(["restored-source-integrity-or-retained-read-failed"], {
+        before,
+        backup,
+        staging,
+        restored: finalMetrics,
+      })
+    }
+    restoredDB.exec("PRAGMA locking_mode=NORMAL")
+    restoredDB.query("SELECT 1").get()
+    restoredLocked = false
+    originalMode = undefined
+    completed = true
+    return {
+      state: "complete",
+      changedFiles: 3,
+      reasons: [],
+      sourceDeviceID,
+      backupDeviceID,
+      stagingDeviceID,
+      measurements: { before, backup, staging, restored: finalMetrics },
+    }
   } catch (error) {
-    return refused([`fixture-compaction-preflight-failed:${error instanceof Error ? error.message : "unknown"}`])
+    return refused([`fixture-compaction-failed:${error instanceof Error ? error.message : "unknown"}`])
+  } finally {
+    if (stageDB) {
+      try {
+        stageDB.close()
+      } catch {}
+    }
+    if (replaced && oldSourceDB && !sourceClosed) {
+      try {
+        oldSourceDB.close()
+        sourceClosed = true
+      } catch {}
+    }
+    if (control && sourceLocked && !sourceClosed) {
+      try {
+        control.database.exec("PRAGMA locking_mode=NORMAL")
+        control.database.query("SELECT 1").get()
+      } catch {}
+    }
+    if (control && restoredLocked && databaseReopened) {
+      try {
+        control.database.exec("PRAGMA locking_mode=NORMAL")
+        control.database.query("SELECT 1").get()
+        restoredLocked = false
+      } catch {}
+    }
+    if (control && sourceClosed && !databaseReopened && !control.removed && sourcePath) {
+      try {
+        if (originalMode !== undefined && (await Bun.file(sourcePath).exists())) chmodSync(sourcePath, originalMode)
+        const sqlite = await import("bun:sqlite")
+        const reopened = new sqlite.Database(sourcePath) as unknown as NativeSqliteDatabase
+        const identity = await readFixtureIdentity(reopened as unknown as SqliteAccess, sourcePath)
+        control.database = reopened
+        control.identity = identity
+        fixtureHandles.set(reopened, identity)
+        databaseReopened = true
+      } catch {}
+    }
+    if (lockFile) await lockFile.close().catch(() => undefined)
+    if (lockCreated && control) await rm(control.lockPath, { force: true }).catch(() => undefined)
+    if (restoreDirectory) await rm(restoreDirectory, { recursive: true, force: true }).catch(() => undefined)
+    if (!completed && !replaced) {
+      if (backupPath) await rm(backupPath, { force: true }).catch(() => undefined)
+      if (stagingPath) await rm(stagingPath, { force: true }).catch(() => undefined)
+    }
+    if (control) control.compacting = false
   }
 }
 
@@ -1395,9 +1739,43 @@ async function fileSize(filename: string) {
 }
 
 function openPath(filename: string) {
-  const result = spawnSync("lsof", ["-t", filename], { encoding: "utf8", timeout: 15_000 })
+  const result = spawnSync("lsof", ["-F0pfn", filename], { encoding: "utf8", timeout: 15_000 })
+  if (result.error || result.status === null || ![0, 1].includes(result.status))
+    return { readable: false, pids: [], handles: 0 }
+  const fields = result.stdout.split(/[\0\n]+/).filter(Boolean)
+  return {
+    readable: true,
+    pids: Array.from(new Set(fields.filter((field) => field.startsWith("p")).map((field) => field.slice(1)))),
+    handles: fields.filter((field) => field.startsWith("f")).length,
+  }
+}
+
+function deletedFixtureInodeOpen(identity: FixtureIdentity) {
+  const result = spawnSync("lsof", ["+L1", "-F0pfnDi"], { encoding: "utf8", timeout: 15_000, maxBuffer: 5_000_000 })
   if (result.error || result.status === null || ![0, 1].includes(result.status)) return { readable: false, pids: [] }
-  return { readable: true, pids: result.stdout.trim() ? result.stdout.trim().split(/\s+/) : [] }
+  let processID: string | undefined
+  let inode: string | undefined
+  let name: string | undefined
+  const fields = result.stdout.split(/[\0\n]+/).filter(Boolean)
+  for (const field of fields) {
+    if (field.startsWith("p")) processID = field.slice(1)
+    if (field.startsWith("f")) {
+      inode = undefined
+      name = undefined
+    }
+    if (field.startsWith("i")) inode = field.slice(1)
+    if (field.startsWith("n")) {
+      name = field.slice(1)
+      if (name === `${identity.filename} (deleted)` && inode === identity.inode) {
+        return { readable: true, pids: processID ? [processID] : [] }
+      }
+    }
+  }
+  return { readable: true, pids: [] }
+}
+
+function fixtureOwnerIsOnlyOpen(opened: ReturnType<typeof openPath>) {
+  return opened.readable && opened.pids.length === 1 && opened.pids[0] === String(process.pid) && opened.handles === 1
 }
 
 function parentCycle(sessionID: string, sessions: ReadonlyMap<string, SessionRow>) {

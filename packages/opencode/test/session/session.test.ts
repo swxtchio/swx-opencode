@@ -14,12 +14,13 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionDurable } from "@opencode-ai/schema/durable-event-manifest"
 import path from "node:path"
 import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect"
-import { desc, eq } from "drizzle-orm"
+import { and, desc, eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventRetentionTable, EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
 import {
   PartTable,
+  MessageTable,
   SessionInputTable,
   SessionMessageTable,
   SessionTable,
@@ -339,6 +340,7 @@ describe("Session retention producer path", () => {
       const { db } = yield* Database.Service
       const info = yield* session.create({ title: "retention title sentinel" })
       const messageID = MessageID.ascending()
+      const assistantTime = { created: Date.now(), completed: Date.now() }
       yield* session.updateMessage({
         id: messageID,
         sessionID: info.id,
@@ -352,7 +354,7 @@ describe("Session retention producer path", () => {
         id: assistantMessageID,
         sessionID: info.id,
         role: "assistant",
-        time: { created: Date.now(), completed: Date.now() },
+        time: assistantTime,
         parentID: messageID,
         modelID: ModelV2.ID.make("requested-model"),
         providerID: ProviderV2.ID.make("firerouter"),
@@ -388,6 +390,14 @@ describe("Session retention producer path", () => {
       })
 
       const exportDirectory = yield* tmpdirScoped()
+      const originalMessageData = yield* db
+        .select({ data: MessageTable.data })
+        .from(MessageTable)
+        .where(eq(MessageTable.id, assistantMessageID))
+        .get()
+      if (!originalMessageData) throw new Error("Session.updateMessage did not project its assistant")
+      const originalMessageTime = JSON.parse(JSON.stringify(originalMessageData.data)).time
+      expect(originalMessageTime).toEqual(assistantTime)
       const beforeExportDB = yield* exportFixtureDatabase(db, path.join(exportDirectory, "usage-before.sqlite"))
       yield* Effect.addFinalizer(() => Effect.sync(() => beforeExportDB.close()))
       const exportBefore = readExport(beforeExportDB)
@@ -413,6 +423,10 @@ describe("Session retention producer path", () => {
         cost: 0.25,
         tokens: { input: 12, output: 17, reasoning: 3, cache: { read: 5, write: 7 } },
       })
+      const retainedMessage = native
+        .query<{ data: string }, [string]>("SELECT data FROM message WHERE id = ?")
+        .get(assistantMessageID)
+      expect(JSON.parse(retainedMessage!.data).time).toEqual(originalMessageTime)
       const exportAfter = readExport(native)
       const usageAxes = (archive: ReturnType<typeof readExport>) =>
         archive.records.map((record) => ({
@@ -600,6 +614,7 @@ describe("Session retention producer path", () => {
           .get(),
       ).toEqual({ state: "complete" })
     }),
+    { timeout: 10_000 },
   )
 
   retentionIt.instance(
@@ -666,6 +681,18 @@ describe("Session retention producer path", () => {
           tokens: { input: 21, output: 8, reasoning: 3, cache: { read: 5, write: 2 } },
         })
 
+        const beforeV2Assistant = yield* db
+          .select({ data: SessionMessageTable.data })
+          .from(SessionMessageTable)
+          .where(and(eq(SessionMessageTable.session_id, info.id), eq(SessionMessageTable.type, "assistant")))
+          .get()
+        if (!beforeV2Assistant) throw new Error("SessionEvent producers did not project an assistant")
+        const beforeV2Time = JSON.parse(JSON.stringify(beforeV2Assistant.data)).time
+        expect(beforeV2Time).toEqual({
+          created: DateTime.toEpochMillis(timestamp),
+          completed: DateTime.toEpochMillis(timestamp),
+        })
+
         const before = yield* Effect.all(
           [
             db.select({ data: EventTable.data }).from(EventTable).where(eq(EventTable.aggregate_id, info.id)).all(),
@@ -718,6 +745,7 @@ describe("Session retention producer path", () => {
           id: "configured-route",
           providerID: "route-provider",
         })
+        expect(JSON.parse(assistant!.data).time).toEqual(beforeV2Time)
         expect(JSON.parse(assistant!.data)).toMatchObject({
           cost: 0.75,
           tokens: { input: 21, output: 8, reasoning: 3, cache: { read: 5, write: 2 } },
