@@ -91,6 +91,17 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`event_retention\` (
+          \`aggregate_id\` text PRIMARY KEY,
+          \`state\` text NOT NULL,
+          \`progress_table\` text,
+          \`progress_id\` text,
+          \`evidence\` text NOT NULL,
+          \`time_started\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`event_sequence\` (
           \`aggregate_id\` text PRIMARY KEY,
           \`seq\` integer NOT NULL,

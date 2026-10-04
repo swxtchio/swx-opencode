@@ -60,6 +60,10 @@ Newest first. Each entry names the upstream range brought in.
 - **#7** Point `test` and `typecheck` at this fork, on GitHub-hosted Linux runners. _Fork-only._
 - **#1** Dependabot: `astro` 5.7.13 to 7.1.1 in `packages/web`. _Fork-only._
 
+### Database maintenance
+
+- **#137** Add dormant guarded Session-retention inventory and fixture-only redaction tooling, with fail-closed reads for altered aggregates and an isolated backup, compaction, integrity-check, and restore rehearsal. Real apply and production cutover remain disabled pending captain-approved policy and evidence. _Fork-only._
+
 ### Runtime fixes
 
 - **#130** Carry `activeAssistantMessageID` through legacy busy/retry status events and status-map responses, publish the owner from processor, shell, and direct-subtask producers, and have the TUI keep explicit `null` neutral while falling back to history only when older servers omit the field; historical activity stays inert. _Fork-only._

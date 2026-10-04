@@ -130,6 +130,7 @@ export interface Interface {
   readonly context: (
     sessionID: SessionSchema.ID,
   ) => Effect.Effect<SessionMessage.Message[], NotFoundError | MessageDecodeError>
+  readonly assertReplayable: (sessionID: SessionSchema.ID) => Effect.Effect<void, NotFoundError>
   readonly events: (input: {
     sessionID: SessionSchema.ID
     after?: number
@@ -306,48 +307,63 @@ const layer = Layer.effect(
         const direction = input.cursor?.direction ?? "next"
         const requestedOrder = input.order ?? "desc"
         const order = direction === "previous" ? (requestedOrder === "asc" ? "desc" : "asc") : requestedOrder
-        const anchor = input.cursor
-          ? yield* db
-              .select({ seq: SessionMessageTable.seq })
-              .from(SessionMessageTable)
-              .where(
-                and(eq(SessionMessageTable.session_id, input.sessionID), eq(SessionMessageTable.id, input.cursor.id)),
+        const rows = yield* db
+          .transaction((tx) =>
+            Effect.gen(function* () {
+              yield* EventV2.assertReplayableIn(tx, input.sessionID)
+              const anchor = input.cursor
+                ? yield* tx
+                    .select({ seq: SessionMessageTable.seq })
+                    .from(SessionMessageTable)
+                    .where(
+                      and(
+                        eq(SessionMessageTable.session_id, input.sessionID),
+                        eq(SessionMessageTable.id, input.cursor.id),
+                      ),
+                    )
+                    .get()
+                    .pipe(Effect.orDie)
+                : undefined
+              if (input.cursor && !anchor) return []
+              const boundary = anchor
+                ? order === "asc"
+                  ? gt(SessionMessageTable.seq, anchor.seq)
+                  : lt(SessionMessageTable.seq, anchor.seq)
+                : undefined
+              const where = boundary
+                ? and(eq(SessionMessageTable.session_id, input.sessionID), boundary)
+                : eq(SessionMessageTable.session_id, input.sessionID)
+              const query = tx
+                .select()
+                .from(SessionMessageTable)
+                .where(where)
+                .orderBy(order === "asc" ? asc(SessionMessageTable.seq) : desc(SessionMessageTable.seq))
+              return yield* (input.limit === undefined ? query.all() : query.limit(input.limit).all()).pipe(
+                Effect.orDie,
               )
-              .get()
-              .pipe(Effect.orDie)
-          : undefined
-        if (input.cursor && !anchor) return []
-        const boundary = anchor
-          ? order === "asc"
-            ? gt(SessionMessageTable.seq, anchor.seq)
-            : lt(SessionMessageTable.seq, anchor.seq)
-          : undefined
-        const where = boundary
-          ? and(eq(SessionMessageTable.session_id, input.sessionID), boundary)
-          : eq(SessionMessageTable.session_id, input.sessionID)
-        const query = db
-          .select()
-          .from(SessionMessageTable)
-          .where(where)
-          .orderBy(order === "asc" ? asc(SessionMessageTable.seq) : desc(SessionMessageTable.seq))
-        const rows = yield* (input.limit === undefined ? query.all() : query.limit(input.limit).all()).pipe(
-          Effect.orDie,
-        )
+            }),
+          )
+          .pipe(Effect.orDie)
         return yield* Effect.forEach(direction === "previous" ? rows.toReversed() : rows, decode)
       }),
       message: Effect.fn("V2Session.message")(function* (input) {
-        const stored = yield* store.message(input.messageID)
+        const stored = yield* store.message(input)
         return stored?.sessionID === input.sessionID ? stored.message : undefined
       }),
       context: Effect.fn("V2Session.context")(function* (sessionID) {
         yield* result.get(sessionID)
         return yield* store.context(sessionID)
       }),
+      assertReplayable: Effect.fn("V2Session.assertReplayable")(function* (sessionID) {
+        yield* result.get(sessionID)
+        yield* events.assertReplayable(sessionID)
+      }),
       events: (input) =>
         Stream.unwrap(
-          result
-            .get(input.sessionID)
-            .pipe(Effect.as(events.durable({ aggregateID: input.sessionID, after: input.after }))),
+          Effect.gen(function* () {
+            yield* result.get(input.sessionID)
+            return events.durable({ aggregateID: input.sessionID, after: input.after })
+          }),
         ).pipe(Stream.filter((event): event is SessionEvent.DurableEvent => isDurableSessionEvent(event))),
       history: Effect.fn("V2Session.history")(function* (input) {
         yield* result.get(input.sessionID)
@@ -360,6 +376,7 @@ const layer = Layer.effect(
       prompt: Effect.fn("V2Session.prompt")((input) =>
         Effect.uninterruptible(
           Effect.gen(function* () {
+            yield* events.assertWritable(input.sessionID)
             yield* result.get(input.sessionID)
             const prompt = resolvePrompt(input.prompt)
             const messageID = input.id ?? SessionMessage.ID.create()
@@ -424,6 +441,7 @@ const layer = Layer.effect(
       }),
       active: execution.active,
       resume: Effect.fn("V2Session.resume")(function* (sessionID) {
+        yield* events.assertWritable(sessionID)
         yield* result.get(sessionID)
         yield* execution.resume(sessionID)
       }),
@@ -432,6 +450,7 @@ const layer = Layer.effect(
       ),
       revert: {
         stage: Effect.fn("V2Session.revert.stage")(function* (input) {
+          yield* events.assertWritable(input.sessionID)
           const session = yield* result.get(input.sessionID)
           return yield* SessionRevert.stage({ session, messageID: input.messageID, files: input.files }).pipe(
             Effect.provideService(Database.Service, database),
@@ -440,6 +459,7 @@ const layer = Layer.effect(
           )
         }),
         clear: Effect.fn("V2Session.revert.clear")(function* (sessionID) {
+          yield* events.assertWritable(sessionID)
           const session = yield* result.get(sessionID)
           yield* SessionRevert.clear(session).pipe(
             Effect.provideService(EventV2.Service, events),
@@ -447,6 +467,7 @@ const layer = Layer.effect(
           )
         }),
         commit: Effect.fn("V2Session.revert.commit")(function* (sessionID) {
+          yield* events.assertWritable(sessionID)
           const session = yield* result.get(sessionID)
           yield* SessionRevert.commit(session).pipe(Effect.provideService(EventV2.Service, events))
         }),

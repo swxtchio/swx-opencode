@@ -20,6 +20,9 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { EventV2 } from "@opencode-ai/core/event"
 
+type DatabaseService = Database.Interface["db"]
+type DatabaseTransaction = Parameters<Parameters<DatabaseService["transaction"]>[0]>[0]
+
 const disabled = process.env["OPENCODE_DISABLE_SHARE"] === "true" || process.env["OPENCODE_DISABLE_SHARE"] === "1"
 
 export type Api = {
@@ -116,6 +119,15 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const cfg = yield* Config.Service
     const { db } = yield* Database.Service
+    const writable = <A, E>(sessionID: SessionID, effect: (tx: DatabaseTransaction) => Effect.Effect<A, E>) =>
+      db
+        .transaction((tx) =>
+          Effect.gen(function* () {
+            yield* EventV2.assertWritableIn(tx, sessionID)
+            return yield* effect(tx)
+          }),
+        )
+        .pipe(Effect.orDie)
     const http = yield* HttpClient.HttpClient
     const httpOk = HttpClient.filterStatusOk(http)
     const provider = yield* Provider.Service
@@ -317,15 +329,16 @@ const layer = Layer.effect(
         Effect.flatMap((r) => httpOk.execute(r)),
         Effect.flatMap(HttpClientResponse.schemaBodyJson(ShareSchema)),
       )
-      yield* db
-        .insert(SessionShareTable)
-        .values({ session_id: sessionID, id: result.id, secret: result.secret, url: result.url })
-        .onConflictDoUpdate({
-          target: SessionShareTable.session_id,
-          set: { id: result.id, secret: result.secret, url: result.url },
-        })
-        .run()
-        .pipe(Effect.orDie)
+      yield* writable(sessionID, (tx) =>
+        tx
+          .insert(SessionShareTable)
+          .values({ session_id: sessionID, id: result.id, secret: result.secret, url: result.url })
+          .onConflictDoUpdate({
+            target: SessionShareTable.session_id,
+            set: { id: result.id, secret: result.secret, url: result.url },
+          })
+          .run(),
+      )
       const s = yield* InstanceState.get(state)
       s.shared.set(sessionID, result)
       yield* full(sessionID).pipe(
@@ -353,7 +366,9 @@ const layer = Layer.effect(
         Effect.flatMap((r) => httpOk.execute(r)),
       )
 
-      yield* db.delete(SessionShareTable).where(eq(SessionShareTable.session_id, sessionID)).run().pipe(Effect.orDie)
+      yield* writable(sessionID, (tx) =>
+        tx.delete(SessionShareTable).where(eq(SessionShareTable.session_id, sessionID)).run(),
+      )
       s.shared.delete(sessionID)
       s.queue.delete(sessionID)
     })

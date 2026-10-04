@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "1b57e6eb-f423-4b30-a122-08148e532a83",
+  "id": "f28ff033-4d20-49ab-adb6-fbf1a96a3a7d",
   "prevIds": [
-    "cd7fa1fc-32aa-4d19-bf5c-96318df972bb"
+    "1b57e6eb-f423-4b30-a122-08148e532a83"
   ],
   "ddl": [
     {
@@ -36,6 +36,10 @@
     },
     {
       "name": "credential",
+      "entityType": "tables"
+    },
+    {
+      "name": "event_retention",
       "entityType": "tables"
     },
     {
@@ -579,6 +583,76 @@
       "name": "time_updated",
       "entityType": "columns",
       "table": "credential"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "aggregate_id",
+      "entityType": "columns",
+      "table": "event_retention"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "state",
+      "entityType": "columns",
+      "table": "event_retention"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "progress_table",
+      "entityType": "columns",
+      "table": "event_retention"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "progress_id",
+      "entityType": "columns",
+      "table": "event_retention"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "evidence",
+      "entityType": "columns",
+      "table": "event_retention"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_started",
+      "entityType": "columns",
+      "table": "event_retention"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "event_retention"
     },
     {
       "type": "text",
@@ -1933,6 +2007,15 @@
         "aggregate_id"
       ],
       "nameExplicit": false,
+      "name": "event_retention_pk",
+      "table": "event_retention",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "aggregate_id"
+      ],
+      "nameExplicit": false,
       "name": "event_sequence_pk",
       "table": "event_sequence",
       "entityType": "pks"
@@ -2141,7 +2224,7 @@
         }
       ],
       "isUnique": true,
-      "where": null,
+      "where": "\"message\".\"admission_seq\" > 0",
       "origin": "manual",
       "name": "message_session_admission_seq_idx",
       "entityType": "indexes",

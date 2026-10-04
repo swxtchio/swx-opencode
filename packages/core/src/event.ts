@@ -5,11 +5,15 @@ import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 import { and, asc, eq, gt, inArray } from "drizzle-orm"
 import { Database } from "./database/database"
-import { EventSequenceTable, EventTable } from "./event/sql"
+import { EventRetentionTable, EventSequenceTable, EventTable } from "./event/sql"
 import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
 import { isDeepStrictEqual } from "node:util"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
+import { SessionV1 } from "@opencode-ai/schema/session-v1"
+
+type DatabaseTransaction = Parameters<Parameters<Database.Interface["db"]["transaction"]>[0]>[0]
+type DatabaseAccess = Database.Interface["db"] | DatabaseTransaction
 
 export const ID = Event.ID
 export type ID = import("@opencode-ai/schema/event").ID
@@ -47,6 +51,45 @@ export class InvalidDurableEventError extends Schema.TaggedErrorClass<InvalidDur
   },
 ) {}
 
+export class UnreplayableAggregateError extends Schema.TaggedErrorClass<UnreplayableAggregateError>()(
+  "EventV2.UnreplayableAggregate",
+  {
+    aggregateID: Schema.String,
+    message: Schema.String,
+  },
+) {}
+
+export class RetentionWriteRefusedError extends Schema.TaggedErrorClass<RetentionWriteRefusedError>()(
+  "EventV2.RetentionWriteRefused",
+  {
+    aggregateID: Schema.String,
+    message: Schema.String,
+  },
+) {}
+
+function requireReplayable(db: DatabaseAccess, aggregateID: string) {
+  return db
+    .select({ aggregateID: EventRetentionTable.aggregate_id })
+    .from(EventRetentionTable)
+    .where(
+      and(
+        eq(EventRetentionTable.aggregate_id, aggregateID),
+        inArray(EventRetentionTable.state, ["redacting", "complete"]),
+      ),
+    )
+    .get()
+    .pipe(
+      Effect.orDie,
+      Effect.flatMap((row) =>
+        row
+          ? Effect.die(
+              new UnreplayableAggregateError({ aggregateID, message: `Aggregate ${aggregateID} is unreplayable` }),
+            )
+          : Effect.void,
+      ),
+    )
+}
+
 const decodeSerializedEvent = (event: SerializedEvent): Payload => {
   const definition = Durable.get(event.type)
   if (!definition?.durable) {
@@ -58,6 +101,60 @@ const decodeSerializedEvent = (event: SerializedEvent): Payload => {
     durable: { aggregateID: event.aggregateID, seq: event.seq, version: definition.durable.version },
     data: Schema.decodeUnknownSync(definition.data)(event.data),
   }
+}
+
+function requireWritable(db: DatabaseAccess, aggregateID: string) {
+  return db
+    .select({ state: EventRetentionTable.state })
+    .from(EventRetentionTable)
+    .where(eq(EventRetentionTable.aggregate_id, aggregateID))
+    .get()
+    .pipe(
+      Effect.orDie,
+      Effect.flatMap((row) =>
+        row
+          ? row.state === "scanning"
+            ? Effect.die(
+                new RetentionWriteRefusedError({
+                  aggregateID,
+                  message: `Aggregate ${aggregateID} is fenced for retention`,
+                }),
+              )
+            : Effect.die(
+                new UnreplayableAggregateError({ aggregateID, message: `Aggregate ${aggregateID} is unreplayable` }),
+              )
+          : Effect.void,
+      ),
+    )
+}
+
+function requireDeleteAllowed(db: DatabaseAccess, aggregateID: string) {
+  return db
+    .select({ state: EventRetentionTable.state })
+    .from(EventRetentionTable)
+    .where(eq(EventRetentionTable.aggregate_id, aggregateID))
+    .get()
+    .pipe(
+      Effect.orDie,
+      Effect.flatMap((row) =>
+        row && row.state !== "complete"
+          ? Effect.die(
+              new RetentionWriteRefusedError({
+                aggregateID,
+                message: `Aggregate ${aggregateID} must finish retention before deletion`,
+              }),
+            )
+          : Effect.void,
+      ),
+    )
+}
+
+export function assertReplayableIn(db: DatabaseAccess, aggregateID: string) {
+  return requireReplayable(db, aggregateID)
+}
+
+export function assertWritableIn(db: DatabaseAccess, aggregateID: string) {
+  return requireWritable(db, aggregateID)
 }
 
 export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
@@ -74,18 +171,25 @@ export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
 ) {
   const after = input.after ?? -1
   const rows = yield* db
-    .select()
-    .from(EventTable)
-    .where(
-      and(
-        eq(EventTable.aggregate_id, input.aggregateID),
-        gt(EventTable.seq, after),
-        inArray(EventTable.type, Array.from(input.manifest.definitions.keys())),
-      ),
+    .transaction(() =>
+      Effect.gen(function* () {
+        yield* requireReplayable(db, input.aggregateID)
+        return yield* db
+          .select()
+          .from(EventTable)
+          .where(
+            and(
+              eq(EventTable.aggregate_id, input.aggregateID),
+              gt(EventTable.seq, after),
+              inArray(EventTable.type, Array.from(input.manifest.definitions.keys())),
+            ),
+          )
+          .orderBy(asc(EventTable.seq))
+          .limit(input.limit + 1)
+          .all()
+          .pipe(Effect.orDie)
+      }),
     )
-    .orderBy(asc(EventTable.seq))
-    .limit(input.limit + 1)
-    .all()
     .pipe(Effect.orDie)
   const page = rows.slice(0, input.limit)
   const decode = Schema.decodeUnknownSync(input.manifest.schema)
@@ -145,6 +249,8 @@ export interface Interface {
     events: SerializedEvent[],
     options?: { readonly publish?: boolean; readonly ownerID?: string; readonly strictOwner?: boolean },
   ) => Effect.Effect<string | undefined>
+  readonly assertReplayable: (aggregateID: string) => Effect.Effect<void>
+  readonly assertWritable: (aggregateID: string) => Effect.Effect<void>
   readonly remove: (aggregateID: string) => Effect.Effect<void>
   readonly claim: (aggregateID: string, ownerID: string) => Effect.Effect<void>
 }
@@ -182,6 +288,9 @@ export const layerWith = (options?: LayerOptions) =>
       // TODO: Bind durable projectors to exact type+version before supporting incompatible historical payloads.
       const listeners = new Array<Subscriber>()
       const { db } = yield* Database.Service
+
+      const assertReplayable = (aggregateID: string) => requireReplayable(db, aggregateID)
+      const assertWritable = (aggregateID: string) => requireWritable(db, aggregateID)
 
       const getOrCreate = (definition: Definition) =>
         Effect.gen(function* () {
@@ -244,6 +353,9 @@ export const layerWith = (options?: LayerOptions) =>
                       () =>
                         Effect.gen(function* () {
                           if (precondition && !(yield* precondition)) return
+                          yield* definition.type === SessionV1.Event.Deleted.type
+                            ? requireDeleteAllowed(db, aggregateID)
+                            : requireWritable(db, aggregateID)
                           const row = yield* db
                             .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
                             .from(EventSequenceTable)
@@ -461,6 +573,7 @@ export const layerWith = (options?: LayerOptions) =>
         options?: { readonly publish?: boolean; readonly ownerID?: string; readonly strictOwner?: boolean },
       ) {
         return Effect.gen(function* () {
+          yield* requireReplayable(db, event.aggregateID)
           const definition = Durable.get(event.type)
           if (!definition?.durable) {
             yield* Effect.die(
@@ -510,6 +623,7 @@ export const layerWith = (options?: LayerOptions) =>
               }),
             )
           }
+          yield* requireReplayable(db, source)
           const start = events[0]?.seq ?? 0
           for (const [index, event] of events.entries()) {
             const seq = start + index
@@ -542,10 +656,17 @@ export const layerWith = (options?: LayerOptions) =>
 
       function claim(aggregateID: string, ownerID: string) {
         return db
-          .update(EventSequenceTable)
-          .set({ owner_id: ownerID })
-          .where(eq(EventSequenceTable.aggregate_id, aggregateID))
-          .run()
+          .transaction(() =>
+            Effect.gen(function* () {
+              yield* requireWritable(db, aggregateID)
+              yield* db
+                .update(EventSequenceTable)
+                .set({ owner_id: ownerID })
+                .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+                .run()
+                .pipe(Effect.orDie)
+            }),
+          )
           .pipe(Effect.orDie)
       }
 
@@ -559,12 +680,17 @@ export const layerWith = (options?: LayerOptions) =>
       const readAfter = (aggregateID: string, after: number) =>
         (options?.beforeAggregateRead?.(aggregateID) ?? Effect.void).pipe(
           Effect.andThen(
-            db
-              .select()
-              .from(EventTable)
-              .where(and(eq(EventTable.aggregate_id, aggregateID), gt(EventTable.seq, after)))
-              .orderBy(asc(EventTable.seq))
-              .all(),
+            db.transaction(() =>
+              Effect.gen(function* () {
+                yield* requireReplayable(db, aggregateID)
+                return yield* db
+                  .select()
+                  .from(EventTable)
+                  .where(and(eq(EventTable.aggregate_id, aggregateID), gt(EventTable.seq, after)))
+                  .orderBy(asc(EventTable.seq))
+                  .all()
+              }),
+            ),
           ),
           Effect.orDie,
           Effect.map((rows) =>
@@ -646,6 +772,8 @@ export const layerWith = (options?: LayerOptions) =>
         project,
         replay,
         replayAll,
+        assertReplayable,
+        assertWritable,
         remove,
         claim,
       })

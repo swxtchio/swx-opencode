@@ -397,6 +397,7 @@ Commands:
   opencode db path          print the database path
   opencode db export-usage  export per-session usage as JSONL for archiving; step-finish totals take
                             precedence, with message totals for legacy rows
+  opencode db retention     inventory Session retention candidates without writing the database
 
 Positionals:
   query  SQL query to execute                                                               [string]

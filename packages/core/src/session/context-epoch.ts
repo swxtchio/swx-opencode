@@ -4,6 +4,7 @@ import { eq } from "drizzle-orm"
 import { DateTime, Effect, Schema } from "effect"
 import type { Database } from "../database/database"
 import { EventV2 } from "../event"
+import { EventSequenceTable } from "../event/sql"
 import { SystemContext } from "../system-context/index"
 import { ContextSnapshotDecodeError } from "./error"
 import { SessionEvent } from "./event"
@@ -14,6 +15,8 @@ import { SessionSchema } from "./schema"
 import { SessionContextEpochTable } from "./sql"
 
 type DatabaseService = Database.Interface["db"]
+type DatabaseTransaction = Parameters<Parameters<DatabaseService["transaction"]>[0]>[0]
+type DatabaseAccess = DatabaseService | DatabaseTransaction
 
 interface Prepared {
   readonly baseline: string
@@ -43,8 +46,20 @@ const prepareOnce = Effect.fnUntraced(function* (
   context: Effect.Effect<SystemContext.SystemContext>,
   sessionID: SessionSchema.ID,
 ) {
-  const [value, stored, compaction] = yield* Effect.all(
-    [context, find(db, sessionID), SessionHistory.latestCompaction(db, sessionID)],
+  const [value, [stored, compaction]] = yield* Effect.all(
+    [
+      context,
+      db
+        .transaction((tx) =>
+          Effect.gen(function* () {
+            yield* EventV2.assertWritableIn(tx, sessionID)
+            return yield* Effect.all([find(tx, sessionID), SessionHistory.latestCompaction(tx, sessionID)], {
+              concurrency: "unbounded",
+            })
+          }),
+        )
+        .pipe(Effect.orDie),
+    ],
     { concurrency: "unbounded" },
   )
   if (!stored) {
@@ -88,7 +103,7 @@ const initializeOnce = Effect.fnUntraced(function* (
   return { baseline: generation.baseline, baselineSeq }
 })
 
-const exists = Effect.fn("SessionContextEpoch.exists")(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
+const exists = Effect.fn("SessionContextEpoch.exists")(function* (db: DatabaseAccess, sessionID: SessionSchema.ID) {
   return (
     (yield* db
       .select({ sessionID: SessionContextEpochTable.session_id })
@@ -99,7 +114,7 @@ const exists = Effect.fn("SessionContextEpoch.exists")(function* (db: DatabaseSe
   )
 })
 
-const find = Effect.fn("SessionContextEpoch.find")(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
+const find = Effect.fn("SessionContextEpoch.find")(function* (db: DatabaseAccess, sessionID: SessionSchema.ID) {
   return yield* db
     .select()
     .from(SessionContextEpochTable)
@@ -113,9 +128,16 @@ export const reset = Effect.fn("SessionContextEpoch.reset")(function* (
   sessionID: SessionSchema.ID,
 ) {
   yield* db
-    .delete(SessionContextEpochTable)
-    .where(eq(SessionContextEpochTable.session_id, sessionID))
-    .run()
+    .transaction((tx) =>
+      Effect.gen(function* () {
+        yield* EventV2.assertWritableIn(tx, sessionID)
+        yield* tx
+          .delete(SessionContextEpochTable)
+          .where(eq(SessionContextEpochTable.session_id, sessionID))
+          .run()
+          .pipe(Effect.orDie)
+      }),
+    )
     .pipe(Effect.orDie)
 })
 
@@ -124,18 +146,31 @@ const insert = Effect.fnUntraced(function* (
   sessionID: SessionSchema.ID,
   generation: SystemContext.Generation,
 ) {
-  const baselineSeq = yield* EventV2.latestSequence(db, sessionID)
-  yield* db
-    .insert(SessionContextEpochTable)
-    .values({
-      session_id: sessionID,
-      baseline: generation.baseline,
-      snapshot: generation.snapshot,
-      baseline_seq: baselineSeq,
-    })
-    .run()
+  return yield* db
+    .transaction((tx) =>
+      Effect.gen(function* () {
+        yield* EventV2.assertWritableIn(tx, sessionID)
+        const sequence = yield* tx
+          .select({ seq: EventSequenceTable.seq })
+          .from(EventSequenceTable)
+          .where(eq(EventSequenceTable.aggregate_id, sessionID))
+          .get()
+          .pipe(Effect.orDie)
+        const baselineSeq = sequence?.seq ?? -1
+        yield* tx
+          .insert(SessionContextEpochTable)
+          .values({
+            session_id: sessionID,
+            baseline: generation.baseline,
+            snapshot: generation.snapshot,
+            baseline_seq: baselineSeq,
+          })
+          .run()
+          .pipe(Effect.orDie)
+        return baselineSeq
+      }),
+    )
     .pipe(Effect.orDie)
-  return baselineSeq
 })
 
 const replace = Effect.fnUntraced(function* (
@@ -144,18 +179,25 @@ const replace = Effect.fnUntraced(function* (
   baselineSeq: number,
   generation: SystemContext.Generation,
 ) {
-  const updated = yield* db
-    .update(SessionContextEpochTable)
-    .set({
-      baseline: generation.baseline,
-      snapshot: generation.snapshot,
-      baseline_seq: baselineSeq,
-    })
-    .where(eq(SessionContextEpochTable.session_id, sessionID))
-    .returning({ sessionID: SessionContextEpochTable.session_id })
-    .get()
+  yield* db
+    .transaction((tx) =>
+      Effect.gen(function* () {
+        yield* EventV2.assertWritableIn(tx, sessionID)
+        const updated = yield* tx
+          .update(SessionContextEpochTable)
+          .set({
+            baseline: generation.baseline,
+            snapshot: generation.snapshot,
+            baseline_seq: baselineSeq,
+          })
+          .where(eq(SessionContextEpochTable.session_id, sessionID))
+          .returning({ sessionID: SessionContextEpochTable.session_id })
+          .get()
+          .pipe(Effect.orDie)
+        if (!updated) return yield* Effect.die("Context Epoch not found")
+      }),
+    )
     .pipe(Effect.orDie)
-  if (!updated) return yield* Effect.die("Context Epoch not found")
 })
 
 const advance = Effect.fnUntraced(function* (
