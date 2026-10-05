@@ -129,32 +129,9 @@ jobs:
 
       - name: Run unit tests
         timeout-minutes: 20
-        run: |
-          GITHUB_ACTIONS=false bun turbo test
+        run: GITHUB_ACTIONS=false bun turbo test
         env:
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
-          OPENCODE_SQLITE_PROBE: "1"
-          OPENCODE_SQLITE_PROBE_LOG: ${{ runner.temp }}/opencode-sqlite-probe-${{ github.run_id }}-${{ github.run_attempt }}.jsonl
-
-      - name: Report SQLite probe trace
-        if: always() && runner.os == 'Linux'
-        env:
-          OPENCODE_SQLITE_PROBE_LOG: ${{ runner.temp }}/opencode-sqlite-probe-${{ github.run_id }}-${{ github.run_attempt }}.jsonl
-        run: |
-          if [[ ! -s "$OPENCODE_SQLITE_PROBE_LOG" ]]; then
-            echo "::error::SQLite probe produced no trace; positive coverage was not established"
-            exit 1
-          fi
-          bytes=$(wc -c < "$OPENCODE_SQLITE_PROBE_LOG")
-          if (( bytes > 2097152 )); then
-            echo "::error::SQLite probe trace exceeded the 2 MiB output bound"
-            exit 1
-          fi
-          echo "::group::SQLite probe trace ($bytes bytes)"
-          while IFS= read -r line; do
-            printf '%s\n' "$line"
-          done < "$OPENCODE_SQLITE_PROBE_LOG"
-          echo "::endgroup::"
 
       - name: Run the native watcher regressions
         # The watcher tests above skip under CI. This runs the real-native refusal

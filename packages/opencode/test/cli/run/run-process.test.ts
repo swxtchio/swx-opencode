@@ -3,381 +3,10 @@
 // same process. See `test/lib/cli-process.ts` for the harness — each test uses
 // `opencode.run(message, opts?)` to spawn `bun src/index.ts run ...` with
 // `OPENCODE_CONFIG_CONTENT` providing the test provider config inline.
-import { describe, expect, test } from "bun:test"
-import { Database } from "bun:sqlite"
-import { mkdtemp, rm } from "node:fs/promises"
-import os from "node:os"
-import path from "node:path"
+import { describe, expect } from "bun:test"
 import { Effect } from "effect"
-import { awaitWithTimeout } from "../../lib/effect"
-import { SqliteProbe } from "@opencode-ai/core/database/sqlite-probe"
 import { reply } from "../../lib/llm-server"
 import { cliIt, deadline } from "../../lib/cli-process"
-
-const sqliteLockHolderScript = `
-import { Context, Effect, Layer } from "effect"
-import { SqlClient } from "effect/unstable/sql/SqlClient"
-import { layer } from "@opencode-ai/core/database/sqlite.bun"
-
-const filename = process.env["OPENCODE_DB"]
-if (!filename) throw new Error("SQLite lock holder has no database path")
-await Effect.runPromise(
-  Effect.scoped(
-    Effect.gen(function* () {
-      const context = yield* Layer.build(layer({ filename, disableWAL: true }))
-      const client = Context.get(context, SqlClient)
-      yield* client.withTransaction(
-        Effect.gen(function* () {
-          yield* client.unsafe("INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?)", [1, "probe-private-holder-value"]).raw
-          // Exercise runValues success events while the production transaction holds the write lock.
-          yield* client.unsafe("SAVEPOINT opencode_probe_savepoint").values
-          yield* client.unsafe("RELEASE opencode_probe_savepoint").values
-          console.log("SQLITE_PROBE_LOCK_HELD")
-          yield* Effect.promise(() => new Promise((resolve) => process.stdin.once("data", resolve)))
-        }),
-      )
-    }),
-  ),
-)
-`
-
-const sqliteLockClientScript = `
-import { Context, Effect, Exit, Layer } from "effect"
-import { SqlClient } from "effect/unstable/sql/SqlClient"
-import { layer } from "@opencode-ai/core/database/sqlite.bun"
-
-const filename = process.env["OPENCODE_DB"]
-if (!filename) throw new Error("SQLite lock client has no database path")
-const outcomes = await Effect.runPromise(
-  Effect.scoped(
-    Effect.gen(function* () {
-      const context = yield* Layer.build(layer({ filename, disableWAL: true }))
-      const client = Context.get(context, SqlClient)
-      const runResult = yield* client
-        .unsafe("INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?)", [2, "probe-private-run-value"])
-        .raw.pipe(Effect.exit)
-      const valuesResult = yield* client
-        .unsafe("INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?) RETURNING id", [
-          3,
-          "probe-private-values-value",
-        ])
-        .values.pipe(Effect.exit)
-      return { runResult, valuesResult }
-    }),
-  ),
-)
-if (Exit.isSuccess(outcomes.runResult) || Exit.isSuccess(outcomes.valuesResult))
-  throw new Error("SQLite lock client unexpectedly wrote while the holder transaction was open")
-process.exitCode = 1
-`
-
-describe("SQLite CI probe redaction", () => {
-  test("only accepts the targeted run-process probe IDs", () => {
-    expect(SqliteProbe.isAllowedProbeID("run-process-success")).toBe(true)
-    expect(SqliteProbe.isAllowedProbeID("run-process-sqlite-holder")).toBe(true)
-    expect(SqliteProbe.isAllowedProbeID("run-process-sqlite-client")).toBe(true)
-    expect(SqliteProbe.isAllowedProbeID("free-form-input")).toBe(false)
-  })
-
-  test("redacts SQL values and comments while retaining safe identifiers", () => {
-    expect(
-      SqliteProbe.sanitizeStatement(
-        `INSERT INTO "session" ("id", "value") VALUES (?1, 'secret_parameter') -- private comment`,
-      ),
-    ).toBe('INSERT INTO "session" ("id", "value") VALUES (?1, ?)')
-    expect(SqliteProbe.sanitizeStatement('SELECT "private@example.test" AS "value"')).toBe('SELECT ? AS "value"')
-    expect(SqliteProbe.sanitizeStatement("SELECT 0xdeadbeef, 42")).toBe("SELECT ?, ?")
-  })
-
-  test("bounds the normalized statement", () => {
-    expect(SqliteProbe.sanitizeStatement(`SELECT ${"x".repeat(500)}`)).toHaveLength(192)
-  })
-
-  test("normalizes SQLite lock codes without returning error messages", () => {
-    expect(SqliteProbe.sqliteErrorCode({ code: "SQLITE_BUSY" })).toBe("SQLITE_BUSY")
-    expect(SqliteProbe.sqliteErrorCode({ errcode: 5 })).toBe("SQLITE_BUSY")
-    expect(SqliteProbe.sqliteErrorCode({ errcode: 6 })).toBe("SQLITE_LOCKED")
-    expect(SqliteProbe.sqliteErrorCode({ code: "EIO", message: "private path" })).toBeUndefined()
-  })
-})
-
-const sqliteProbeEnabled = process.env["OPENCODE_SQLITE_PROBE"] === "1"
-
-function sqliteProbeOptions(probeID: string) {
-  const env: Record<string, string> = sqliteProbeEnabled ? { OPENCODE_SQLITE_PROBE_ID: probeID } : {}
-  return { env }
-}
-
-async function readSqliteProbeLog() {
-  const logPath = process.env["OPENCODE_SQLITE_PROBE_LOG"]
-  if (!logPath) throw new Error("OPENCODE_SQLITE_PROBE_LOG is required when the SQLite probe is enabled")
-  const text = await Bun.file(logPath).text()
-  return {
-    text,
-    records: text
-      .split("\n")
-      .filter((line) => line.startsWith("{") && line.endsWith("}"))
-      .map((line) => JSON.parse(line) as Record<string, unknown>),
-  }
-}
-
-function expectSqliteProbe(probeID: string) {
-  return Effect.promise(async () => {
-    if (!sqliteProbeEnabled) return
-    const log = await readSqliteProbeLog()
-    expect(
-      log.records.some(
-        (record) =>
-          record.event === "database_open" &&
-          record.probe_id === probeID &&
-          record.driver === "bun:sqlite" &&
-          record.database_path === ":memory:" &&
-          typeof record.pid === "number" &&
-          typeof record.connection_id === "number",
-      ),
-    ).toBe(true)
-  })
-}
-
-async function readProbeReadyLine(stream: ReadableStream<Uint8Array>) {
-  const reader = stream.getReader()
-  const decoder = new TextDecoder()
-  let buffered = ""
-  try {
-    while (true) {
-      const result = await reader.read()
-      if (result.done) throw new Error("SQLite lock holder exited before its readiness signal")
-      buffered += decoder.decode(result.value, { stream: true })
-      const newline = buffered.indexOf("\n")
-      if (newline >= 0) return buffered.slice(0, newline).trim()
-    }
-  } finally {
-    reader.releaseLock()
-  }
-}
-
-if (sqliteProbeEnabled) {
-  test(
-    "reports the real SQLite busy statement and lock-holder transaction",
-    async () => {
-      const probeID = "run-process-sqlite-client"
-      const holderProbeID = "run-process-sqlite-holder"
-      const directory = await mkdtemp(path.join(os.tmpdir(), "opencode-sqlite-probe-"))
-      const databasePath = path.join(directory, "locked.sqlite")
-      try {
-        const setup = new Database(databasePath)
-        try {
-          setup.run("PRAGMA journal_mode = WAL")
-          setup.run("CREATE TABLE opencode_probe_lock (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
-        } finally {
-          setup.close()
-        }
-
-        const lockHolder = Bun.spawn(["bun", "-e", sqliteLockHolderScript], {
-          cwd: process.cwd(),
-          env: {
-            ...process.env,
-            OPENCODE_DB: databasePath,
-            OPENCODE_SQLITE_PROBE: "1",
-            OPENCODE_SQLITE_PROBE_ID: holderProbeID,
-          },
-          stdin: "pipe",
-          stdout: "pipe",
-          stderr: "ignore",
-        })
-        try {
-          const ready = await Effect.runPromise(
-            awaitWithTimeout(
-              Effect.promise(() => readProbeReadyLine(lockHolder.stdout)),
-              "SQLite lock holder did not confirm its production transaction",
-              "5 seconds",
-            ),
-          )
-          expect(ready).toBe("SQLITE_PROBE_LOCK_HELD")
-
-          const busyClient = Bun.spawn(["bun", "-e", sqliteLockClientScript], {
-            cwd: process.cwd(),
-            env: {
-              ...process.env,
-              OPENCODE_DB: databasePath,
-              OPENCODE_SQLITE_PROBE: "1",
-              OPENCODE_SQLITE_PROBE_ID: probeID,
-            },
-            stdin: "ignore",
-            stdout: "ignore",
-            stderr: "ignore",
-          })
-          try {
-            const exitCode = await Effect.runPromise(
-              awaitWithTimeout(
-                Effect.promise(() => busyClient.exited),
-                "SQLite lock client did not exit",
-                "10 seconds",
-              ),
-            )
-            expect(exitCode).not.toBe(0)
-
-            await lockHolder.stdin.write("release\n")
-            lockHolder.stdin.end()
-            await Effect.runPromise(
-              awaitWithTimeout(
-                Effect.promise(() => lockHolder.exited),
-                "SQLite lock holder did not exit after release",
-                "5 seconds",
-              ),
-            )
-
-            const log = await readSqliteProbeLog()
-            const records = log.records
-            expect(Buffer.byteLength(log.text)).toBeLessThan(2 * 1024 * 1024)
-            expect(
-              log.text
-                .split("\n")
-                .filter(Boolean)
-                .every((line) => line.length <= 768),
-            ).toBe(true)
-            const holderOpen = records.find(
-              (record) => record.event === "database_open" && record.probe_id === holderProbeID,
-            )
-            const holderClient = records.find(
-              (record) => record.event === "client_open" && record.probe_id === holderProbeID,
-            )
-            const holderBegin = records.find(
-              (record) =>
-                record.event === "transaction_begin" &&
-                record.probe_id === holderProbeID &&
-                record.operation === "BEGIN",
-            )
-            const holderSavepoint = records.find(
-              (record) =>
-                record.event === "transaction_begin" &&
-                record.probe_id === holderProbeID &&
-                record.operation === "SAVEPOINT",
-            )
-            const holderRelease = records.find(
-              (record) =>
-                record.event === "transaction_end" &&
-                record.probe_id === holderProbeID &&
-                record.operation === "RELEASE",
-            )
-            const holderCommit = records.find(
-              (record) =>
-                record.event === "transaction_end" &&
-                record.probe_id === holderProbeID &&
-                record.operation === "COMMIT",
-            )
-            const clientDatabase = records.find(
-              (record) => record.event === "database_open" && record.probe_id === probeID,
-            )
-            const clientOpen = records.find((record) => record.event === "client_open" && record.probe_id === probeID)
-            const busyRun = records.find(
-              (record) =>
-                record.event === "statement_error" &&
-                record.probe_id === probeID &&
-                record.statement === "INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?)" &&
-                typeof record.error_code === "string" &&
-                record.error_code.startsWith("SQLITE_BUSY"),
-            )
-            const busyValues = records.find(
-              (record) =>
-                record.event === "statement_error" &&
-                record.probe_id === probeID &&
-                record.statement === "INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?) RETURNING id" &&
-                typeof record.error_code === "string" &&
-                record.error_code.startsWith("SQLITE_BUSY"),
-            )
-            expect(holderOpen).toBeDefined()
-            expect(holderClient).toBeDefined()
-            expect(holderBegin).toBeDefined()
-            expect(holderSavepoint).toBeDefined()
-            expect(holderRelease).toBeDefined()
-            expect(holderCommit).toBeDefined()
-            expect(clientDatabase).toBeDefined()
-            expect(clientOpen).toBeDefined()
-            expect(busyRun).toBeDefined()
-            expect(busyValues).toBeDefined()
-            if (
-              !holderOpen ||
-              !holderClient ||
-              !holderBegin ||
-              !holderSavepoint ||
-              !holderRelease ||
-              !holderCommit ||
-              !clientDatabase ||
-              !clientOpen ||
-              !busyRun ||
-              !busyValues
-            )
-              return
-
-            expect(holderOpen.pid).toBe(lockHolder.pid)
-            expect(holderClient.pid).toBe(lockHolder.pid)
-            expect(holderBegin.client_id).toBe(holderClient.client_id)
-            expect(holderSavepoint.client_id).toBe(holderClient.client_id)
-            expect(holderRelease.client_id).toBe(holderClient.client_id)
-            expect(holderCommit.client_id).toBe(holderClient.client_id)
-            expect(holderRelease.transaction_ids).toContain(holderSavepoint.transaction_id)
-            expect(holderCommit.transaction_ids).toContain(holderBegin.transaction_id)
-            expect(clientDatabase.pid).toBe(busyClient.pid)
-            expect(clientOpen.pid).toBe(busyClient.pid)
-            expect(busyRun.pid).toBe(busyClient.pid)
-            expect(busyValues.pid).toBe(busyClient.pid)
-            expect(busyRun.error_code).toBe("SQLITE_BUSY")
-            expect(busyValues.error_code).toBe("SQLITE_BUSY")
-            expect(busyRun.database_key).toBe(clientDatabase.database_key)
-            expect(busyRun.database_key).toBe(holderOpen.database_key)
-            expect(busyRun.database_path).toBe(`<file:${clientDatabase.database_key}>`)
-            expect(busyRun.database_kind).toBe("file")
-            expect(busyRun.client_id).toBe(clientOpen.client_id)
-            expect(busyRun.operation).toBe("INSERT")
-            expect(busyRun.statement).toBe("INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?)")
-            expect(busyValues.client_id).toBe(clientOpen.client_id)
-            expect(busyValues.database_key).toBe(clientDatabase.database_key)
-            expect(busyValues.operation).toBe("INSERT")
-            expect(busyValues.statement).toBe("INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?) RETURNING id")
-            expect(log.text).not.toContain(databasePath)
-            expect(log.text).not.toContain("probe-private-holder-value")
-            expect(log.text).not.toContain("probe-private-run-value")
-            expect(log.text).not.toContain("probe-private-values-value")
-            const holderCandidate = expect.objectContaining({
-              pid: holderOpen.pid,
-              connection_id: holderOpen.connection_id,
-              client_id: holderBegin.client_id,
-              transaction_id: holderBegin.transaction_id,
-            })
-            expect(busyRun.lock_candidates).toEqual(expect.arrayContaining([holderCandidate]))
-            expect(busyValues.lock_candidates).toEqual(expect.arrayContaining([holderCandidate]))
-          } finally {
-            if (busyClient.exitCode === null) {
-              busyClient.kill()
-              await busyClient.exited
-            }
-          }
-        } finally {
-          if (lockHolder.exitCode === null) {
-            await lockHolder.stdin.write("release\n")
-            lockHolder.stdin.end()
-            try {
-              await Effect.runPromise(
-                awaitWithTimeout(
-                  Effect.promise(() => lockHolder.exited),
-                  "SQLite lock holder did not exit",
-                  "5 seconds",
-                ),
-              )
-            } catch {
-              lockHolder.kill()
-              await lockHolder.exited
-            }
-          }
-        }
-      } finally {
-        await rm(directory, { recursive: true, force: true })
-      }
-    },
-    { timeout: 30_000 },
-  )
-}
 
 describe("opencode run (non-interactive subprocess)", () => {
   // Happy path: prompt completes, output reaches stdout, process exits 0.
@@ -387,9 +16,7 @@ describe("opencode run (non-interactive subprocess)", () => {
     ({ llm, opencode }) =>
       Effect.gen(function* () {
         yield* llm.text("hello from the test llm")
-        const probeID = "run-process-success"
-        const result = yield* opencode.run("say hi", sqliteProbeOptions(probeID))
-        yield* expectSqliteProbe(probeID)
+        const result = yield* opencode.run("say hi")
         opencode.expectExit(result, 0)
         expect(result.stdout).toBe("hello from the test llm\n")
       }),
@@ -423,19 +50,12 @@ describe("opencode run (non-interactive subprocess)", () => {
     ({ llm, opencode }) =>
       Effect.gen(function* () {
         yield* llm.reason("  considering  ", { text: "  answer  " })
-        const thinkingProbeID = "run-process-thinking"
-        const thinking = yield* opencode.run("think", {
-          extraArgs: ["--thinking"],
-          ...sqliteProbeOptions(thinkingProbeID),
-        })
-        yield* expectSqliteProbe(thinkingProbeID)
+        const thinking = yield* opencode.run("think", { extraArgs: ["--thinking"] })
         opencode.expectExit(thinking, 0)
         expect(thinking.stdout).toBe("Thinking: considering\nanswer\n")
 
         yield* llm.reason("hidden", { text: "visible" })
-        const plainProbeID = "run-process-thinking-plain"
-        const plain = yield* opencode.run("think again", sqliteProbeOptions(plainProbeID))
-        yield* expectSqliteProbe(plainProbeID)
+        const plain = yield* opencode.run("think again")
         opencode.expectExit(plain, 0)
         expect(plain.stdout).toBe("visible\n")
       }),
@@ -534,12 +154,7 @@ describe("opencode run (non-interactive subprocess)", () => {
     "prints the real error for an unknown effort on a --command run",
     ({ opencode }) =>
       Effect.gen(function* () {
-        const probeID = "run-process-command-effort"
-        const result = yield* opencode.run("x", {
-          extraArgs: ["--command", "init", "--effort", "no-such-effort"],
-          ...sqliteProbeOptions(probeID),
-        })
-        yield* expectSqliteProbe(probeID)
+        const result = yield* opencode.run("x", { extraArgs: ["--command", "init", "--effort", "no-such-effort"] })
         expect(result.exitCode).toBeGreaterThan(0)
         expect(result.stderr).toContain('Unknown effort "no-such-effort"')
         expect(result.stderr).not.toContain("Unexpected server error")
@@ -562,12 +177,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         )
         yield* llm.fail("upstream provider exploded mid-stream")
         yield* llm.text("recovered")
-        const probeID = "run-process-unknown-finish"
-        const result = yield* opencode.run("trigger midstream error", {
-          timeoutMs: deadline(30_000),
-          ...sqliteProbeOptions(probeID),
-        })
-        yield* expectSqliteProbe(probeID)
+        const result = yield* opencode.run("trigger midstream error", { timeoutMs: deadline(30_000) })
         opencode.expectExit(result, 0)
         expect(result.stdout).toBe("partial response\nrecovered\n")
         expect(result.stderr).not.toContain("upstream provider exploded mid-stream")
@@ -583,9 +193,7 @@ describe("opencode run (non-interactive subprocess)", () => {
     ({ llm, opencode }) =>
       Effect.gen(function* () {
         yield* llm.text("structured output")
-        const probeID = "run-process-json-output"
-        const result = yield* opencode.run("say hi", { format: "json", ...sqliteProbeOptions(probeID) })
-        yield* expectSqliteProbe(probeID)
+        const result = yield* opencode.run("say hi", { format: "json" })
         opencode.expectExit(result, 0)
 
         const events = opencode.parseJsonEvents(result.stdout)
@@ -727,12 +335,7 @@ describe("opencode run (non-interactive subprocess)", () => {
       Effect.gen(function* () {
         yield* llm.tool("bash", { command: "rm -f denied-file", description: "Remove a test file" })
         yield* llm.text("continued after rejection")
-        const deniedProbeID = "run-process-permission-ask"
-        const denied = yield* opencode.run("request permission", {
-          permission: { bash: "ask" },
-          ...sqliteProbeOptions(deniedProbeID),
-        })
-        yield* expectSqliteProbe(deniedProbeID)
+        const denied = yield* opencode.run("request permission", { permission: { bash: "ask" } })
         opencode.expectExit(denied, 0)
         expect(denied.stderr).toContain("permission requested: bash")
         expect(denied.stdout).toBe("")
@@ -740,13 +343,10 @@ describe("opencode run (non-interactive subprocess)", () => {
         yield* llm.reset
         yield* llm.tool("bash", { command: "rm -f allowed-file", description: "Remove a test file" })
         yield* llm.text("continued after approval")
-        const allowedProbeID = "run-process-permission-allow"
         const allowed = yield* opencode.run("request permission", {
           permission: { bash: "ask" },
           extraArgs: ["--dangerously-skip-permissions"],
-          ...sqliteProbeOptions(allowedProbeID),
         })
-        yield* expectSqliteProbe(allowedProbeID)
         opencode.expectExit(allowed, 0)
         expect(allowed.stderr).not.toContain("permission requested: bash")
         expect(allowed.stdout).toContain("continued after approval")
@@ -754,13 +354,10 @@ describe("opencode run (non-interactive subprocess)", () => {
         yield* llm.reset
         yield* llm.tool("bash", { command: "touch explicitly-denied", description: "Create a denied marker" })
         yield* llm.text("continued after explicit denial")
-        const explicitlyDeniedProbeID = "run-process-permission-deny"
         const explicitlyDenied = yield* opencode.run("request denied permission", {
           permission: { bash: "deny" },
           extraArgs: ["--dangerously-skip-permissions"],
-          ...sqliteProbeOptions(explicitlyDeniedProbeID),
         })
-        yield* expectSqliteProbe(explicitlyDeniedProbeID)
         opencode.expectExit(explicitlyDenied, 0)
         expect(explicitlyDenied.stdout).toContain("continued after explicit denial")
         expect(yield* Effect.promise(() => Bun.file(`${home}/explicitly-denied`).exists())).toBe(false)

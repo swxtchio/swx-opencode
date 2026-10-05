@@ -61,6 +61,7 @@ function forkStderrDrain(stream: ReadableStream<Uint8Array>, into: string[]) {
 }
 
 function isolatedEnv(home: string, configJson: string): Record<string, string> {
+  // Pin each child independently of test files that mutate the worker's environment.
   return {
     OPENCODE_TEST_HOME: home,
     HOME: home,
@@ -68,6 +69,7 @@ function isolatedEnv(home: string, configJson: string): Record<string, string> {
     XDG_DATA_HOME: path.join(home, ".local/share"),
     XDG_STATE_HOME: path.join(home, ".local/state"),
     XDG_CACHE_HOME: path.join(home, ".cache"),
+    OPENCODE_DB: ":memory:",
     OPENCODE_CONFIG_CONTENT: configJson,
     OPENCODE_DISABLE_PROJECT_CONFIG: "1",
     OPENCODE_PURE: "1",

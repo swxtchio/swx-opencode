@@ -6,9 +6,10 @@
  * requests, uses the right instance context, mutates storage when expected, and
  * returns the expected response shape.
  *
- * The script intentionally isolates `OPENCODE_DB` before importing modules that touch
- * storage. Scenarios may create/delete sessions and reset the database after each run,
- * so this must never point at a developer's real session database.
+ * The CLI configures isolated paths before importing runtime modules. Keep the
+ * environment helper import-pure because unit tests load it into a shared worker.
+ * Scenarios may create/delete sessions and reset the database after each run, so
+ * this must never point at a developer's real session database.
  *
  * DSL shape:
  * - `http.protected.get/post/...` starts a scenario for one OpenAPI route key.
@@ -29,10 +30,10 @@ import {
   exerciseDataDirectory,
   exerciseDatabasePath,
   exerciseGlobalRoot,
+  configureExerciseEnvironment,
 } from "./environment"
 import { color, printHeader, printResults } from "./report"
 import { coverageResult, parseOptions, routeKey, routeKeys, selectedScenarios } from "./routing"
-import { runScenario } from "./runner"
 import { disposeApps } from "./backend"
 import { runtime } from "./runtime"
 import { type Scenario } from "./types"
@@ -1828,7 +1829,9 @@ const llmScenarios = new Set([
 ])
 
 const main = Effect.gen(function* () {
+  configureExerciseEnvironment()
   yield* Effect.addFinalizer(() => Effect.promise(() => disposeApps()).pipe(Effect.andThen(cleanupExercisePaths)))
+  const { runScenario } = yield* Effect.promise(() => import("./runner"))
   const options = parseOptions(Bun.argv.slice(2))
   const modules = yield* Effect.promise(() => runtime())
   const effectRoutes = routeKeys(OpenApi.fromApi(modules.PublicApi))
