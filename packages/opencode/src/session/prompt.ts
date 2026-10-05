@@ -308,6 +308,7 @@ const layer = Layer.effect(
           time: { start: Date.now() },
         },
       })
+      yield* status.set(sessionID, { type: "busy", activeAssistantMessageID: assistantMessage.id })
       const taskArgs = {
         prompt: task.prompt,
         description: task.description,
@@ -526,6 +527,7 @@ const layer = Layer.effect(
               },
             }
             yield* sessions.updatePart(part)
+            yield* status.set(input.sessionID, { type: "busy", activeAssistantMessageID: msg.id })
             return { msg, part, cwd: ctx.directory }
           }).pipe(Effect.ensuring(markReady))
 
@@ -1234,7 +1236,7 @@ const layer = Layer.effect(
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
-          yield* status.set(sessionID, { type: "busy" })
+          yield* status.set(sessionID, { type: "busy", activeAssistantMessageID: null })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
           seen = yield* queue.consume(sessionID)

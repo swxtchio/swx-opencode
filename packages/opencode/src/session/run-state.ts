@@ -61,7 +61,7 @@ const layer = Layer.effect(
           data.runners.delete(sessionID)
           yield* status.set(sessionID, { type: "idle" })
         }),
-        onBusy: status.set(sessionID, { type: "busy" }),
+        onBusy: status.set(sessionID, { type: "busy", activeAssistantMessageID: null }),
         onInterrupt,
       })
       data.runners.set(sessionID, next)

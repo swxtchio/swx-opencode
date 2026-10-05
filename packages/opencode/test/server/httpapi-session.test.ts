@@ -45,6 +45,7 @@ import { reply, TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { spanHold } from "../fixture/span-hold"
+import { applyRetentionFixture } from "../fixture/session-retention"
 
 const originalWorkspaces = Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
 const noopBootstrapLayer = Layer.succeed(
@@ -800,6 +801,60 @@ describe("session HttpApi", () => {
           message: "Session wait is not available yet",
           service: "session.wait",
         })
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "refuses V2 history and event readers for a redacted aggregate before returning content",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const session = yield* createSession({ title: "v2 retention sentinel" })
+        const producerMessage = yield* createTextMessage(session.id, "v2 body sentinel")
+        const { db } = yield* Database.Service
+        const currentSequence = yield* EventV2.latestSequence(db, session.id)
+        yield* applyRetentionFixture(session.id)
+        const headers = { "x-opencode-directory": test.directory }
+
+        const history = yield* request(`/api/session/${session.id}/history?after=0&limit=10`, { headers })
+        expect(history.status).not.toBe(200)
+        expect(yield* history.text).not.toContain("v2 body sentinel")
+
+        const currentHistory = yield* request(`/api/session/${session.id}/history?after=${currentSequence}&limit=10`, {
+          headers,
+        })
+        expect(currentHistory.status).not.toBe(200)
+        expect(yield* currentHistory.text).not.toContain("v2 body sentinel")
+
+        const eventsV2 = yield* request(`/api/session/${session.id}/event?after=${currentSequence}`, { headers })
+        expect(eventsV2.status).not.toBe(200)
+        expect(yield* eventsV2.text).not.toContain("v2 body sentinel")
+
+        const messagesV2 = yield* request(`/api/session/${session.id}/message`, { headers })
+        expect(messagesV2.status).not.toBe(200)
+        expect(yield* messagesV2.text).not.toContain("v2 body sentinel")
+
+        const context = yield* request(`/api/session/${session.id}/context`, { headers })
+        expect(context.status).not.toBe(200)
+        expect(yield* context.text).not.toContain("v2 body sentinel")
+
+        const messagesV1 = yield* request(pathFor(SessionPaths.messages, { sessionID: session.id }), { headers })
+        expect(messagesV1.status).not.toBe(200)
+        expect(yield* messagesV1.text).not.toContain("v2 body sentinel")
+
+        const messageV1 = yield* request(
+          pathFor(SessionPaths.message, { sessionID: session.id, messageID: producerMessage.info.id }),
+          { headers },
+        )
+        expect(messageV1.status).not.toBe(200)
+        expect(yield* messageV1.text).not.toContain("v2 body sentinel")
+
+        const todo = yield* request(pathFor(SessionPaths.todo, { sessionID: session.id }), { headers })
+        expect(todo.status).not.toBe(200)
+
+        const queue = yield* request(pathFor(SessionQueuePaths.list, { sessionID: session.id }), { headers })
+        expect(queue.status).not.toBe(200)
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )

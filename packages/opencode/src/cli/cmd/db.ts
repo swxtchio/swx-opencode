@@ -5,6 +5,7 @@ import { Effect } from "effect"
 import { sql } from "drizzle-orm"
 import { effectCmd } from "../effect-cmd"
 import { ExportUsageCommand } from "./db-export-usage"
+import { RetentionCommand } from "./db-retention"
 
 const QueryCommand = effectCmd({
   command: "$0 [query]",
@@ -57,7 +58,12 @@ export const DbCommand = effectCmd({
   describe: "database tools",
   instance: false,
   builder: (yargs: Argv) => {
-    return yargs.command(QueryCommand).command(PathCommand).command(ExportUsageCommand).demandCommand()
+    return yargs
+      .command(QueryCommand)
+      .command(PathCommand)
+      .command(ExportUsageCommand)
+      .command(RetentionCommand)
+      .demandCommand()
   },
   handler: Effect.fn("Cli.db")(function* () {}),
 })

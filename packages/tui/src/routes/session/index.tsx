@@ -29,6 +29,7 @@ import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, 
 import { Prompt, type PromptRef } from "../../component/prompt"
 import type {
   AssistantMessage,
+  Message,
   Part,
   Provider,
   ToolPart,
@@ -105,8 +106,50 @@ export function isSessionToolActive(input: {
   message?: { time: { created: number; completed?: number }; error?: unknown }
 }) {
   if (input.state !== "pending" && input.state !== "running") return false
+  return isAssistantTurnActive(input)
+}
+
+export function isAssistantTurnActive(input: {
+  status: SessionTurnStatus
+  message?: { time: { created: number; completed?: number }; error?: unknown }
+}) {
   if (!input.message || input.message.time.completed !== undefined || input.message.error !== undefined) return false
   return input.status === "working" || input.status === "compacting"
+}
+
+function assistantRowSuperseded(sync: ReturnType<typeof useSync>, message: AssistantMessage) {
+  const latest = sync.data.message[message.sessionID]?.findLast((item) => item.role === "assistant")
+  return latest !== undefined && latest.id !== message.id
+}
+
+export function assistantStatus(sync: ReturnType<typeof useSync>, message: AssistantMessage) {
+  const status = sync.data.session_status[message.sessionID]
+  if (!status) return "unknown" as const
+  if (status.type !== "busy" && status.type !== "retry") return "unknown" as const
+  if (status.activeAssistantMessageID !== undefined)
+    return status.activeAssistantMessageID === message.id ? sync.session.status(message.sessionID) : "unknown"
+  if (assistantRowSuperseded(sync, message)) return "unknown" as const
+  return sync.session.status(message.sessionID)
+}
+
+export function activeForegroundTasks(sync: ReturnType<typeof useSync>, messages: Message[]) {
+  return messages.flatMap((message) => {
+    if (message.role !== "assistant") return []
+    const status = assistantStatus(sync, message)
+    if (!isAssistantTurnActive({ status, message })) return []
+    return (sync.data.part[message.id] ?? []).filter(
+      (part): part is ToolPart =>
+        part.type === "tool" &&
+        part.tool === "task" &&
+        part.state.status === "running" &&
+        part.state.metadata?.background !== true,
+    )
+  })
+}
+
+export function activeTaskRetry(status: SessionStatus | undefined, active: boolean) {
+  if (!active || status?.type !== "retry") return
+  return status
 }
 
 function goUpsellKeys(action: RetryAction) {
@@ -167,7 +210,7 @@ const sessionGlobalBindingCommands = [
 
 const sessionGlobalUnfocusedBindingCommands = ["session.first", "session.last"] as const
 
-const context = createContext<{
+export const SessionContext = createContext<{
   width: number
   sessionID: string
   conceal: () => boolean
@@ -183,7 +226,7 @@ const context = createContext<{
 }>()
 
 function use() {
-  const ctx = useContext(context)
+  const ctx = useContext(SessionContext)
   if (!ctx) throw new Error("useContext must be used within a Session component")
   return ctx
 }
@@ -231,17 +274,7 @@ export function Session() {
     return index === -1 ? messages() : messages().slice(0, index)
   }
   const foregroundTasks = createMemo(() =>
-    sync.data.capabilities.experimentalBackgroundSubagents
-      ? messages().flatMap((message) =>
-          (sync.data.part[message.id] ?? []).filter(
-            (part): part is ToolPart =>
-              part.type === "tool" &&
-              part.tool === "task" &&
-              part.state.status === "running" &&
-              part.state.metadata?.background !== true,
-          ),
-        )
-      : [],
+    sync.data.capabilities.experimentalBackgroundSubagents ? activeForegroundTasks(sync, messages()) : [],
   )
   const permissions = createMemo(() => {
     if (session()?.parentID) return []
@@ -1226,7 +1259,7 @@ export function Session() {
 
   return (
     <LocationProvider location={location()}>
-      <context.Provider
+      <SessionContext.Provider
         value={{
           get width() {
             return contentWidth()
@@ -1427,7 +1460,7 @@ export function Session() {
             </Switch>
           </Show>
         </box>
-      </context.Provider>
+      </SessionContext.Provider>
     </LocationProvider>
   )
 }
@@ -1592,13 +1625,7 @@ function AssistantMessage(props: {
             <Show
               when={
                 sync.data.capabilities.experimentalBackgroundSubagents &&
-                props.parts.some(
-                  (x) =>
-                    x.type === "tool" &&
-                    x.tool === "task" &&
-                    x.state.status === "running" &&
-                    x.state.metadata?.background !== true,
-                )
+                activeForegroundTasks(sync, [props.message]).length > 0
               }
             >
               <span style={{ fg: theme.textMuted }}> · </span>
@@ -1673,13 +1700,13 @@ function AssistantMessage(props: {
 
 const PART_MAPPING = {
   text: TextPart,
-  tool: ToolPart,
-  reasoning: ReasoningPart,
+  tool: ToolPartView,
+  reasoning: ReasoningPartView,
 }
 
 const INLINE_TOOL_ICON_WIDTH = 2
 
-function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: AssistantMessage }) {
+export function ReasoningPartView(props: { last: boolean; part: ReasoningPart; message: AssistantMessage }) {
   const { theme } = useTheme()
   const ctx = use()
   const sync = useSync()
@@ -1692,7 +1719,7 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
     return props.part.text.replace("[REDACTED]", "").trim()
   })
   const opaque = createMemo(() => !content() && Boolean(props.part.metadata))
-  const status = createMemo(() => sync.session.status(props.message.sessionID))
+  const status = createMemo(() => assistantStatus(sync, props.message))
   const unresolved = createMemo(
     () =>
       props.part.time.end === undefined &&
@@ -1823,7 +1850,7 @@ function TextPart(props: { last: boolean; part: TextPart; message: AssistantMess
 
 // Pending messages moved to individual tool pending functions
 
-function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMessage }) {
+export function ToolPartView(props: { last: boolean; part: ToolPart; message: AssistantMessage }) {
   const ctx = use()
   const display = createMemo(() => toolDisplay(props.part.tool))
 
@@ -1835,6 +1862,9 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
   })
 
   const toolprops = {
+    get message() {
+      return props.message
+    },
     get metadata() {
       return props.part.state.status === "pending" ? {} : (props.part.state.metadata ?? {})
     },
@@ -1906,6 +1936,7 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
 }
 
 type ToolProps = {
+  message: AssistantMessage
   input: Record<string, unknown>
   metadata: Record<string, unknown>
   tool: string
@@ -1980,7 +2011,11 @@ function InlineTool(props: {
   const message = createMemo(() =>
     sync.data.message[props.part.sessionID]?.find((item) => item.id === props.part.messageID),
   )
-  const status = createMemo(() => sync.session.status(props.part.sessionID))
+  const status = createMemo(() => {
+    const current = message()
+    if (current?.role !== "assistant") return "unknown" as const
+    return assistantStatus(sync, current)
+  })
   const unresolved = createMemo(() => {
     if (props.part.state.status !== "pending" && props.part.state.status !== "running") return false
     const current = message()
@@ -2003,12 +2038,7 @@ function InlineTool(props: {
     if (props.part.state.status !== "pending" && props.part.state.status !== "running") return false
     const current = message()
     if (current?.role !== "assistant") return false
-    return (
-      current.time.completed !== undefined ||
-      current.error !== undefined ||
-      status() === "failed" ||
-      unresolved()
-    )
+    return current.time.completed !== undefined || current.error !== undefined || status() === "failed" || unresolved()
   })
 
   const denied = createMemo(
@@ -2159,7 +2189,12 @@ function BlockTool(props: {
       ? sync.data.message[props.part.sessionID]?.find((item) => item.id === props.part?.messageID)
       : undefined,
   )
-  const status = createMemo(() => (props.part ? sync.session.status(props.part.sessionID) : "idle"))
+  const status = createMemo(() => {
+    if (!props.part) return "idle" as const
+    const current = message()
+    if (current?.role !== "assistant") return "unknown" as const
+    return assistantStatus(sync, current)
+  })
   const unresolved = createMemo(() => {
     if (!props.part || (props.part.state.status !== "pending" && props.part.state.status !== "running")) return false
     const current = message()
@@ -2226,7 +2261,11 @@ function Shell(props: ToolProps) {
   const message = createMemo(() =>
     sync.data.message[props.part.sessionID]?.find((item) => item.id === props.part.messageID),
   )
-  const status = createMemo(() => sync.session.status(props.part.sessionID))
+  const status = createMemo(() => {
+    const current = message()
+    if (current?.role !== "assistant") return "unknown" as const
+    return assistantStatus(sync, current)
+  })
   const isRunning = createMemo(() => {
     if (props.part.state.status !== "running") return false
     const current = message()
@@ -2413,6 +2452,10 @@ function Task(props: ToolProps) {
 
   const sessionID = createMemo(() => stringValue(props.metadata.sessionId))
   const messages = createMemo(() => sync.data.message[sessionID() ?? ""] ?? [])
+  const turnActive = createMemo(() => {
+    const message = props.message
+    return isAssistantTurnActive({ status: assistantStatus(sync, message), message })
+  })
 
   const tools = createMemo(() => {
     return messages().flatMap((msg) =>
@@ -2428,6 +2471,7 @@ function Task(props: ToolProps) {
 
   const status = createMemo(() => sync.data.session_status[sessionID() ?? ""])
   const isRunning = createMemo(() => {
+    if (!turnActive()) return false
     const value = status()
     return (
       props.part.state.status === "running" ||
@@ -2435,9 +2479,7 @@ function Task(props: ToolProps) {
     )
   })
   const retry = createMemo(() => {
-    const value = status()
-    if (value?.type !== "retry") return
-    return value
+    return activeTaskRetry(status(), turnActive())
   })
 
   const duration = createMemo(() => {

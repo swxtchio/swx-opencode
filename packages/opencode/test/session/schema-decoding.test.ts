@@ -229,6 +229,18 @@ describe("SessionStatus.Info", () => {
     expect(decode({ type: "busy" })).toEqual({ type: "busy" })
   })
 
+  test("distinguishes legacy omission from an explicit owner or no-owner value", () => {
+    const busyWithoutOwner = { type: "busy" as const }
+    const busyWithoutAssistant = { type: "busy" as const, activeAssistantMessageID: null }
+    const busyWithAssistant = { type: "busy" as const, activeAssistantMessageID: messageID }
+
+    expect(decode(busyWithoutOwner)).toEqual(busyWithoutOwner)
+    expect(decode(busyWithoutAssistant)).toEqual(busyWithoutAssistant)
+    expect(decode(busyWithAssistant)).toEqual(busyWithAssistant)
+    expect(Schema.encodeUnknownSync(SessionStatus.Info)(busyWithoutAssistant)).toEqual(busyWithoutAssistant)
+    expect(Schema.encodeUnknownSync(SessionStatus.Info)(busyWithAssistant)).toEqual(busyWithAssistant)
+  })
+
   test("retry carries attempt/message/action/next", () => {
     const input = {
       type: "retry" as const,
