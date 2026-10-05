@@ -67,6 +67,10 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#141** Reconcile `.git/HEAD` after an early or missed native callback through a shared read/change/publish path; keep a
+  closed native watch `unavailable` while polling still delivers changed branch values. Cover root-off switches, native
+  error/close, unreadable HEAD recovery and real EventV2 delivery; extend the root-event test bound beyond readiness and
+  serial waits. _Upstreamable._
 - **#130** Carry `activeAssistantMessageID` through legacy busy/retry status events and status-map responses, publish the owner from processor, shell, and direct-subtask producers, and have the TUI keep explicit `null` neutral while falling back to history only when older servers omit the field; historical activity stays inert. _Fork-only._
 - **#126** A removed Session stays removed: a write that was already in flight when `Session.remove` ran is now refused instead of quietly recreating that Session's event history, and the HTTP routes that already promise a missing-Session 404 give it in that race (swxtchio/swx-opencode#97). Prompt-like routes and `sync.steal` still need a separate decision (swxtchio/swx-opencode#125). _Fork-only._
 - **#123** `SessionRunState.cancel` no longer emits idle without a local runner or retained status, preventing a false completion signal for another process’s active turn (swxtchio/swx-opencode#118). Genuine local cancellation still emits idle. _Fork-only._
