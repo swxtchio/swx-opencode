@@ -1,22 +1,145 @@
 import { afterEach, describe, expect } from "bun:test"
+import { createWriteStream } from "node:fs"
 import path from "path"
+import { pathToFileURL } from "url"
+import { finished } from "node:stream/promises"
+import { mkdir, rm, symlink } from "node:fs/promises"
+import { AppProcess } from "@opencode-ai/core/process"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
+import { Global } from "@opencode-ai/core/global"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
+import { hasInstancePromises, registerDisposer } from "../../src/effect/instance-registry"
+import { InstanceRef } from "../../src/effect/instance-ref"
 import { Git } from "../../src/git"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
+import type { InstanceContext } from "../../src/project/instance-context"
 import { InstanceStore } from "../../src/project/instance-store"
+import { Config } from "@/config/config"
+import { RuntimeFlags } from "@/effect/runtime-flags"
+import { Plugin } from "../../src/plugin"
 import { Worktree } from "../../src/worktree"
-import { disposeAllInstances, provideInstance, TestInstance } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { TestConfig } from "../fixture/config"
+import { disposeAllInstances, provideInstance, TestInstance, tmpdirScoped } from "../fixture/fixture"
+import { PluginGate } from "../fixture/plugin-gate"
+import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 
 const it = testEffect(
-  LayerNode.compile(LayerNode.group([Worktree.node, FSUtil.node, Git.node]), [
+  LayerNode.compile(LayerNode.group([Worktree.node, FSUtil.node, Git.node, CrossSpawnSpawner.node]), [
     [InstanceStore.bootstrapNode, InstanceBootstrap.node],
   ]),
 )
 const wintest = process.platform !== "win32" ? it.instance : it.instance.skip
+
+type BootControl =
+  | {
+      mode: "hold"
+      directory: string
+      started: Deferred.Deferred<void>
+      release: Deferred.Deferred<void>
+      interrupted: Deferred.Deferred<void>
+      finished: Deferred.Deferred<void>
+      ignoreInterruption?: boolean
+    }
+  | { mode: "fail"; directory: string }
+
+let bootControl: BootControl | undefined
+
+const gatedAppProcess = Layer.effect(
+  AppProcess.Service,
+  Effect.gen(function* () {
+    const appProcess = yield* AppProcess.Service
+    return AppProcess.Service.of({
+      ...appProcess,
+      run: (command, options) => {
+        const control = bootControl
+        if (
+          !control ||
+          command._tag !== "StandardCommand" ||
+          command.command !== "git" ||
+          command.args[0] !== "reset" ||
+          command.args[1] !== "--hard" ||
+          command.options.cwd !== control.directory
+        ) {
+          return appProcess.run(command, options)
+        }
+        if (control.mode === "fail") {
+          return Effect.succeed({
+            command: "git reset --hard",
+            exitCode: 1,
+            stdout: Buffer.alloc(0),
+            stderr: Buffer.from("simulated worktree checkout failure"),
+            stdoutTruncated: false,
+            stderrTruncated: false,
+          } satisfies AppProcess.RunResult)
+        }
+        return Effect.gen(function* () {
+          yield* Deferred.succeed(control.started, undefined)
+          const waiting = Deferred.await(control.release).pipe(
+            Effect.tap(() => Deferred.succeed(control.finished, undefined)),
+            Effect.onInterrupt(() => Deferred.succeed(control.interrupted, undefined).pipe(Effect.asVoid)),
+          )
+          yield* (control.ignoreInterruption ? Effect.uninterruptible(waiting) : waiting)
+          return yield* appProcess.run(command, options)
+        })
+      },
+    })
+  }),
+).pipe(Layer.provide(LayerNode.compile(AppProcess.node)))
+
+const raceIt = testEffect(
+  LayerNode.compile(LayerNode.group([Worktree.node, FSUtil.node, Git.node]), [
+    [InstanceStore.bootstrapNode, InstanceBootstrap.node],
+    [AppProcess.node, gatedAppProcess],
+  ]),
+)
+let failedBootstrapDirectory: string | undefined
+const failedBootstrap = Layer.succeed(
+  InstanceBootstrap.Service,
+  InstanceBootstrap.Service.of({
+    run: Effect.gen(function* () {
+      if ((yield* InstanceRef)?.directory === failedBootstrapDirectory) {
+        return yield* Effect.die(new Error("simulated instance bootstrap failure"))
+      }
+    }),
+  }),
+)
+const failedBootstrapIt = testEffect(
+  LayerNode.compile(LayerNode.group([Worktree.node, FSUtil.node, Git.node]), [
+    [InstanceStore.bootstrapNode, failedBootstrap],
+  ]),
+)
+let controlledBootstrapRun: Effect.Effect<void> = Effect.void
+const controlledBootstrap = Layer.succeed(
+  InstanceBootstrap.Service,
+  InstanceBootstrap.Service.of({ run: Effect.suspend(() => controlledBootstrapRun) }),
+)
+const nonCooperativeBootstrapIt = testEffect(
+  LayerNode.compile(LayerNode.group([Worktree.node, FSUtil.node, Git.node]), [
+    [InstanceStore.bootstrapNode, controlledBootstrap],
+  ]),
+)
+let pluginSpec: string | undefined
+let pluginSource: string | undefined
+const pluginTestConfig = TestConfig.layer({
+  get: () =>
+    Effect.succeed({
+      plugin: pluginSpec ? [pluginSpec] : [],
+      plugin_origins:
+        pluginSpec && pluginSource ? [{ spec: pluginSpec, source: pluginSource, scope: "local" as const }] : [],
+    }),
+  directories: () => Effect.succeed([]),
+})
+const pluginBootstrapIt = testEffect(
+  LayerNode.compile(LayerNode.group([Worktree.node, FSUtil.node, Git.node, Plugin.node]), [
+    [Config.node, pluginTestConfig],
+    [RuntimeFlags.node, RuntimeFlags.layer({ disableDefaultPlugins: false, pure: false })],
+    [InstanceStore.bootstrapNode, InstanceBootstrap.node],
+  ]),
+)
 
 function normalize(input: string) {
   return input.replace(/\\/g, "/").toLowerCase()
@@ -39,6 +162,20 @@ const waitReady = Effect.fn("WorktreeTest.waitReady")(function* () {
     }),
   )
 })
+
+const subscribeTerminal = (directory: string) =>
+  Effect.gen(function* () {
+    const terminal = yield* Deferred.make<GlobalEvent>()
+    const on = (evt: GlobalEvent) => {
+      if (evt.directory !== directory) return
+      if (evt.payload.type !== Worktree.Event.Ready.type && evt.payload.type !== Worktree.Event.Failed.type) return
+      Deferred.doneUnsafe(terminal, Effect.succeed(evt))
+    }
+
+    GlobalBus.on("event", on)
+    yield* Effect.addFinalizer(() => Effect.sync(() => GlobalBus.off("event", on)))
+    return terminal
+  })
 
 const removeCreatedWorktree = (directory: string) =>
   Effect.gen(function* () {
@@ -183,12 +320,1021 @@ describe("Worktree", () => {
       () =>
         withCreatedWorktree(undefined, ({ info }) =>
           Effect.gen(function* () {
+            const test = yield* TestInstance
+            const fs = yield* FSUtil.Service
+            const svc = yield* Worktree.Service
             expect(info.name).toBeDefined()
             expect(info.branch ?? "").toStartWith("opencode/")
             expect(info.directory).toBeDefined()
+
+            expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+            expect(yield* fs.exists(info.directory)).toBe(false)
+            const branch = yield* gitResult(test.directory, [
+              "show-ref",
+              "--verify",
+              "--quiet",
+              `refs/heads/${info.branch}`,
+            ])
+            expect(branch.exitCode).not.toBe(0)
           }),
         ),
       { git: true },
+    )
+
+    nonCooperativeBootstrapIt.instance(
+      "refuses Worktree.remove while a reload disposer Promise is still running",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const store = yield* InstanceStore.Service
+          const ready = yield* waitReady().pipe(Effect.forkScoped)
+          controlledBootstrapRun = Effect.void
+          const info = yield* svc.create({ name: "held-disposer-remove" })
+          yield* Fiber.join(ready)
+          const disposing = yield* Deferred.make<void>()
+          const releaseDispose = yield* Deferred.make<() => void>()
+          const disposeFinished = yield* Deferred.make<void>()
+          let disposeCalls = 0
+          let releasePromise: (() => void) | undefined
+          let unregister: (() => void) | undefined
+          let reload: Fiber.Fiber<InstanceContext, never> | undefined
+          let removing: Fiber.Fiber<boolean, Worktree.Error> | undefined
+
+          yield* Effect.addFinalizer(() =>
+            Effect.gen(function* () {
+              controlledBootstrapRun = Effect.void
+              if (releasePromise) yield* Effect.sync(releasePromise)
+              if (reload) {
+                yield* Fiber.await(reload).pipe(
+                  Effect.timeoutOrElse({ duration: "15 seconds", orElse: () => Effect.succeed(undefined) }),
+                  Effect.asVoid,
+                )
+              }
+              if (removing) {
+                yield* Fiber.await(removing).pipe(
+                  Effect.timeoutOrElse({ duration: "15 seconds", orElse: () => Effect.succeed(undefined) }),
+                  Effect.asVoid,
+                )
+              }
+              if (unregister) yield* Effect.sync(unregister)
+              yield* removeCreatedWorktree(info.directory).pipe(Effect.ignore)
+            }),
+          )
+
+          unregister = yield* Effect.sync(() =>
+            registerDisposer((directory) => {
+              if (directory !== info.directory) return Promise.resolve()
+              disposeCalls++
+              if (disposeCalls > 1) return Promise.resolve()
+              return new Promise<void>((resolve) => {
+                releasePromise = resolve
+                Deferred.doneUnsafe(disposing, Effect.void)
+                Deferred.doneUnsafe(releaseDispose, Effect.succeed(resolve))
+              }).then(() => {
+                Deferred.doneUnsafe(disposeFinished, Effect.void)
+              })
+            }),
+          )
+
+          reload = yield* store.reload({ directory: info.directory }).pipe(Effect.forkScoped)
+          yield* awaitWithTimeout(Deferred.await(disposing), "reload did not reach the held disposer")
+          removing = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkScoped)
+          const removal = yield* awaitWithTimeout(
+            Fiber.await(removing),
+            "Worktree.remove did not report its bounded disposer refusal",
+            "12 seconds",
+          )
+          expect(Exit.isFailure(removal)).toBe(true)
+          if (Exit.isFailure(removal)) {
+            expect(Cause.squash(removal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
+            expect(Cause.pretty(removal.cause)).toContain("instance disposer did not settle")
+          }
+          expect(reload.pollUnsafe()).toBeUndefined()
+          expect(yield* fs.exists(info.directory)).toBe(true)
+          expect(normalize(yield* git(test.directory, ["worktree", "list", "--porcelain"]))).toContain(
+            normalize(info.directory),
+          )
+          const joined = yield* store.load({ directory: info.directory }).pipe(Effect.forkScoped({ startImmediately: true }))
+          expect(joined.pollUnsafe()).toBeUndefined()
+
+          const release = yield* Deferred.await(releaseDispose)
+          yield* Effect.sync(release)
+          releasePromise = undefined
+          yield* awaitWithTimeout(Deferred.await(disposeFinished), "held disposer did not finish")
+          const reloaded = yield* awaitWithTimeout(Fiber.await(reload), "reload did not finish after disposer completion")
+          const loaded = yield* awaitWithTimeout(Fiber.await(joined), "concurrent load did not join the reload owner")
+          expect(Exit.isSuccess(reloaded)).toBe(true)
+          expect(Exit.isSuccess(loaded)).toBe(true)
+          if (Exit.isSuccess(reloaded) && Exit.isSuccess(loaded)) expect(loaded.value).toBe(reloaded.value)
+          const recovered = yield* pollWithTimeout(
+            store.load({ directory: info.directory }).pipe(
+              Effect.as(true),
+              Effect.catchCause(() => Effect.succeed(undefined)),
+            ),
+            "completed disposer did not release the worktree cache quarantine",
+          )
+          expect(recovered).toBe(true)
+          if (unregister) {
+            yield* Effect.sync(unregister)
+            unregister = undefined
+          }
+          expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(false)
+          removing = undefined
+        }),
+      { git: true },
+      { timeout: 60_000 },
+    )
+
+    raceIt.instance(
+      "refuses removal while a registered worktree boot ignores interruption",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const expected = yield* svc.makeWorktreeInfo({ name: "registered-boot-refusal" })
+          const control: BootControl = {
+            mode: "hold",
+            directory: expected.directory,
+            started: yield* Deferred.make<void>(),
+            release: yield* Deferred.make<void>(),
+            interrupted: yield* Deferred.make<void>(),
+            finished: yield* Deferred.make<void>(),
+            ignoreInterruption: true,
+          }
+          let createdDirectory: string | undefined
+          bootControl = control
+          yield* Effect.addFinalizer(() =>
+            Effect.gen(function* () {
+              bootControl = undefined
+              yield* Deferred.succeed(control.release, undefined).pipe(Effect.asVoid)
+              if (createdDirectory) yield* removeCreatedWorktree(createdDirectory).pipe(Effect.ignore)
+            }),
+          )
+
+          const info = yield* svc.create({ name: expected.name })
+          createdDirectory = info.directory
+          expect(info.directory).toBe(expected.directory)
+          yield* awaitWithTimeout(Deferred.await(control.started), "registered worktree boot did not reach checkout", "5 seconds")
+          const removing = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkScoped({ startImmediately: true }))
+          const refusal = yield* awaitWithTimeout(
+            Fiber.await(removing),
+            "Worktree.remove did not bound its refusal for a registered boot ignoring interruption",
+            "8 seconds",
+          )
+          expect(Exit.isFailure(refusal)).toBe(true)
+          if (Exit.isFailure(refusal)) {
+            expect(Cause.squash(refusal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
+            expect(Cause.pretty(refusal.cause)).toContain("Worktree boot did not stop")
+          }
+          expect(yield* fs.exists(info.directory)).toBe(true)
+          expect(normalize(yield* git(test.directory, ["worktree", "list", "--porcelain"]))).toContain(
+            normalize(info.directory),
+          )
+
+          yield* Deferred.succeed(control.release, undefined)
+          yield* awaitWithTimeout(Deferred.await(control.finished), "registered boot did not finish its held checkout", "10 seconds")
+          expect(yield* awaitWithTimeout(svc.remove({ directory: info.directory }), "worktree removal did not recover after boot release", "15 seconds")).toBe(
+            true,
+          )
+          expect(yield* fs.exists(info.directory)).toBe(false)
+          createdDirectory = undefined
+        }),
+      { git: true },
+      { timeout: 30_000 },
+    )
+
+    raceIt.instance(
+      "waits for an interrupted pre-load worktree boot to terminate before removing its directory",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const expected = yield* svc.makeWorktreeInfo({ name: "boot-before-registration" })
+          const control: BootControl = {
+            mode: "hold",
+            directory: expected.directory,
+            started: yield* Deferred.make<void>(),
+            release: yield* Deferred.make<void>(),
+            interrupted: yield* Deferred.make<void>(),
+            finished: yield* Deferred.make<void>(),
+          }
+          bootControl = control
+          yield* Effect.addFinalizer(() =>
+            Effect.gen(function* () {
+              bootControl = undefined
+              yield* Deferred.succeed(control.release, undefined).pipe(Effect.asVoid)
+            }),
+          )
+
+          const info = yield* svc.create({ name: expected.name })
+          expect(info.directory).toBe(expected.directory)
+          yield* awaitWithTimeout(Deferred.await(control.started), "worktree boot did not reach checkout", "5 seconds")
+          yield* Effect.addFinalizer(() => removeCreatedWorktree(info.directory).pipe(Effect.ignore))
+
+          const removing = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkScoped)
+          const stopped = yield* Deferred.await(control.interrupted).pipe(
+            Effect.as(true),
+            Effect.timeoutOrElse({ duration: "2 seconds", orElse: () => Effect.succeed(false) }),
+          )
+          expect(stopped).toBe(true)
+
+          expect(yield* awaitWithTimeout(Fiber.join(removing), "worktree removal did not finish", "5 seconds")).toBe(
+            true,
+          )
+          expect(yield* fs.exists(info.directory)).toBe(false)
+          const branch = yield* gitResult(test.directory, [
+            "show-ref",
+            "--verify",
+            "--quiet",
+            `refs/heads/${info.branch ?? ""}`,
+          ])
+          expect(branch.exitCode).not.toBe(0)
+        }),
+      { git: true },
+      { timeout: 25_000 },
+    )
+
+    raceIt.instance(
+      "publishes a failed checkout before removing the failed worktree",
+      () =>
+        Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const expected = yield* svc.makeWorktreeInfo({ name: "failed-worktree-checkout" })
+          const terminal = yield* subscribeTerminal(expected.directory)
+          bootControl = { mode: "fail", directory: expected.directory }
+          yield* Effect.addFinalizer(() => Effect.sync(() => (bootControl = undefined)).pipe(Effect.asVoid))
+
+          const info = yield* svc.create({ name: expected.name })
+          yield* Effect.addFinalizer(() => removeCreatedWorktree(info.directory).pipe(Effect.ignore))
+          expect(info.directory).toBe(expected.directory)
+          const event = yield* awaitWithTimeout(
+            Deferred.await(terminal),
+            "worktree checkout did not publish its failure",
+            "5 seconds",
+          )
+          expect(event.payload.type).toBe(Worktree.Event.Failed.type)
+          expect(event.payload.properties.message).toContain("simulated worktree checkout failure")
+
+          expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(false)
+        }),
+      { git: true },
+    )
+
+    failedBootstrapIt.instance(
+      "publishes bootstrap defects as failed worktree events before removal",
+      () =>
+        Effect.gen(function* () {
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const expected = yield* svc.makeWorktreeInfo({ name: "failed-instance-bootstrap" })
+          const terminal = yield* subscribeTerminal(expected.directory)
+          failedBootstrapDirectory = expected.directory
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => (failedBootstrapDirectory = undefined)).pipe(Effect.asVoid),
+          )
+
+          const info = yield* svc.create({ name: expected.name })
+          yield* Effect.addFinalizer(() => removeCreatedWorktree(info.directory).pipe(Effect.ignore))
+          const event = yield* awaitWithTimeout(
+            Deferred.await(terminal),
+            "worktree bootstrap defect did not publish a terminal event",
+            "5 seconds",
+          )
+          expect(event.payload.type).toBe(Worktree.Event.Failed.type)
+          expect(event.payload.properties.message).toContain("simulated instance bootstrap failure")
+
+          expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(false)
+        }),
+      { git: true },
+    )
+
+    wintest(
+      "refuses worktree deletion until real ConfigCommand.load settles its FIFO Promise",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const store = yield* InstanceStore.Service
+          const fifoDirectory = yield* tmpdirScoped()
+          const fifo = path.join(fifoDirectory, "held-command.md")
+          const commandDirectory = path.join(test.directory, ".opencode", "command")
+          yield* Effect.promise(() => mkdir(commandDirectory, { recursive: true }))
+          const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+          const fifoMaker = yield* spawner.spawn(ChildProcess.make("mkfifo", [fifo]))
+          expect(yield* fifoMaker.exitCode).toBe(ChildProcessSpawner.ExitCode(0))
+          yield* Effect.promise(() => symlink(fifo, path.join(commandDirectory, "held.md")))
+          yield* git(test.directory, ["add", "--force", ".opencode/command/held.md"])
+          yield* git(test.directory, ["commit", "-m", "add a held ConfigCommand fixture"])
+          const expected = yield* svc.makeWorktreeInfo({ name: "held-config-command" })
+          let createdDirectory: string | undefined
+          let removalFiber: Fiber.Fiber<boolean, Worktree.Error> | undefined
+
+          const info = yield* svc.create({ name: expected.name })
+          createdDirectory = info.directory
+          expect(info.directory).toBe(expected.directory)
+          yield* Effect.addFinalizer(() => removeCreatedWorktree(info.directory).pipe(Effect.ignore))
+
+          const writer = createWriteStream(fifo)
+          writer.on("error", () => {})
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              if (!writer.destroyed) writer.destroy()
+            }),
+          )
+          const readerOpened = new Promise<void>((resolve, reject) => {
+            writer.once("open", () => resolve())
+            writer.once("error", reject)
+          })
+          yield* awaitWithTimeout(
+            Effect.promise(() => readerOpened),
+            "ConfigCommand.load did not open its held FIFO",
+            "20 seconds",
+          )
+          expect(hasInstancePromises(info.directory)).toBe(true)
+          const joiner = yield* store.load({ directory: info.directory }).pipe(Effect.forkScoped({ startImmediately: true }))
+          expect(joiner.pollUnsafe()).toBeUndefined()
+
+          removalFiber = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkDetach({ startImmediately: true }))
+          const removalResult = yield* Effect.exit(
+            awaitWithTimeout(
+              Fiber.await(removalFiber),
+              "worktree removal did not refuse its unsettled config Promise",
+              "30 seconds",
+            ),
+          )
+          expect(Exit.isSuccess(removalResult)).toBe(true)
+          if (Exit.isFailure(removalResult)) return
+          const removal = removalResult.value
+          expect(Exit.isFailure(removal)).toBe(true)
+          if (Exit.isFailure(removal)) {
+            expect(Cause.squash(removal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
+            expect(Cause.pretty(removal.cause)).toContain("instance bootstrap Promise did not settle")
+          }
+          expect(yield* fs.exists(info.directory)).toBe(true)
+          expect(normalize(yield* git(test.directory, ["worktree", "list", "--porcelain"]))).toContain(
+            normalize(info.directory),
+          )
+          const reloadBlocked = yield* Effect.exit(
+            awaitWithTimeout(
+              Effect.exit(store.reload({ directory: info.directory })),
+              "reload did not refuse the quarantined ConfigCommand owner",
+              "5 seconds",
+            ),
+          )
+          expect(Exit.isSuccess(reloadBlocked)).toBe(true)
+          if (Exit.isSuccess(reloadBlocked)) {
+            expect(Exit.isFailure(reloadBlocked.value)).toBe(true)
+            if (Exit.isFailure(reloadBlocked.value))
+              expect(Cause.pretty(reloadBlocked.value.cause)).toContain("instance bootstrap Promise is still running")
+          }
+          const blocked = yield* Effect.exit(
+            awaitWithTimeout(
+              Effect.exit(store.load({ directory: info.directory })),
+              "new load did not report the pending config Promise owner",
+              "5 seconds",
+            ),
+          )
+          expect(Exit.isSuccess(blocked)).toBe(true)
+          if (Exit.isSuccess(blocked)) {
+            expect(Exit.isFailure(blocked.value)).toBe(true)
+            if (Exit.isFailure(blocked.value))
+              expect(Cause.pretty(blocked.value.cause)).toContain("instance bootstrap Promise is still running")
+          }
+          writer.end("---\ndescription: held config command\n---\necho ready\n")
+          yield* awaitWithTimeout(Effect.promise(() => finished(writer)), "held ConfigCommand reader did not finish", "15 seconds")
+          const joined = yield* awaitWithTimeout(
+            Fiber.await(joiner),
+            "concurrent load did not join the live ConfigCommand bootstrap",
+            "15 seconds",
+          )
+          expect(Exit.isSuccess(joined)).toBe(true)
+          const loaded = yield* pollWithTimeout(
+            store.load({ directory: info.directory }).pipe(
+              Effect.map((context) => context),
+              Effect.catchCause(() => Effect.succeed(undefined)),
+            ),
+            "load did not recover after ConfigCommand.load settled",
+            "25 seconds",
+          )
+          if (Exit.isSuccess(joined)) expect(loaded).toBe(joined.value)
+
+          expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(false)
+          removalFiber = undefined
+        }),
+      { git: true },
+      { timeout: 120_000 },
+    )
+
+    wintest(
+      "refuses worktree deletion until real ConfigVariable file substitution settles its FIFO Promise",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const store = yield* InstanceStore.Service
+          const fifoDirectory = yield* tmpdirScoped()
+          const fifo = path.join(fifoDirectory, "held-config-file.txt")
+          const configFile = path.join(test.directory, "opencode.json")
+          const includedFile = path.join(test.directory, "held.txt")
+          const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+          const fifoMaker = yield* spawner.spawn(ChildProcess.make("mkfifo", [fifo]))
+          expect(yield* fifoMaker.exitCode).toBe(ChildProcessSpawner.ExitCode(0))
+          yield* Effect.promise(() => symlink(fifo, includedFile))
+          yield* Effect.promise(() =>
+            Bun.write(
+              configFile,
+              JSON.stringify({ $schema: "https://opencode.ai/config.json", username: "{file:held.txt}" }),
+            ),
+          )
+          yield* git(test.directory, ["add", "--force", "opencode.json", "held.txt"])
+          yield* git(test.directory, ["commit", "-m", "add a held config file substitution fixture"])
+          const expected = yield* svc.makeWorktreeInfo({ name: "held-config-file-substitution" })
+          const info = yield* svc.create({ name: expected.name })
+          expect(info.directory).toBe(expected.directory)
+          yield* Effect.addFinalizer(() => removeCreatedWorktree(info.directory).pipe(Effect.ignore))
+
+          const writer = createWriteStream(fifo)
+          writer.on("error", () => {})
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              if (!writer.destroyed) writer.destroy()
+            }),
+          )
+          const readerOpened = new Promise<void>((resolve, reject) => {
+            writer.once("open", () => resolve())
+            writer.once("error", reject)
+          })
+          yield* awaitWithTimeout(
+            Effect.promise(() => readerOpened),
+            "ConfigVariable.substitute did not open its held file FIFO",
+            "20 seconds",
+          )
+          const joiner = yield* store
+            .load({ directory: info.directory })
+            .pipe(Effect.forkScoped({ startImmediately: true }))
+          expect(joiner.pollUnsafe()).toBeUndefined()
+
+          const removalFiber = yield* svc
+            .remove({ directory: info.directory })
+            .pipe(Effect.forkDetach({ startImmediately: true }))
+          const removalResult = yield* Effect.exit(
+            awaitWithTimeout(
+              Fiber.await(removalFiber),
+              "worktree removal did not refuse its unsettled file substitution",
+              "30 seconds",
+            ),
+          )
+          expect(Exit.isSuccess(removalResult)).toBe(true)
+          if (Exit.isFailure(removalResult)) return
+          const removal = removalResult.value
+          expect(Exit.isFailure(removal)).toBe(true)
+          if (Exit.isFailure(removal)) {
+            expect(Cause.squash(removal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
+            expect(Cause.pretty(removal.cause)).toContain("instance bootstrap Promise did not settle")
+          }
+          expect(hasInstancePromises(info.directory)).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(true)
+          expect(normalize(yield* git(test.directory, ["worktree", "list", "--porcelain"]))).toContain(
+            normalize(info.directory),
+          )
+
+          writer.end("held config username\n")
+          yield* awaitWithTimeout(
+            Effect.promise(() => finished(writer)),
+            "held ConfigVariable file reader did not finish",
+            "15 seconds",
+          )
+          const joined = yield* awaitWithTimeout(
+            Fiber.await(joiner),
+            "concurrent load did not join the live config file bootstrap",
+            "15 seconds",
+          )
+          expect(Exit.isSuccess(joined)).toBe(true)
+          const loaded = yield* pollWithTimeout(
+            store.load({ directory: info.directory }).pipe(Effect.catchCause(() => Effect.succeed(undefined))),
+            "load did not recover after ConfigVariable file substitution settled",
+            "25 seconds",
+          )
+          if (Exit.isSuccess(joined)) expect(loaded).toBe(joined.value)
+
+          expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(false)
+        }),
+      { git: true },
+      { timeout: 120_000 },
+    )
+
+    for (const producer of [
+      { directory: "agent", loader: "ConfigAgent.load" },
+      { directory: "mode", loader: "ConfigAgent.loadMode" },
+    ] as const) {
+      wintest(
+        `refuses worktree deletion until real ${producer.loader} settles its FIFO Promise`,
+        () =>
+          Effect.gen(function* () {
+            const test = yield* TestInstance
+            const fs = yield* FSUtil.Service
+            const svc = yield* Worktree.Service
+            const store = yield* InstanceStore.Service
+            const fifoDirectory = yield* tmpdirScoped()
+            const fifo = path.join(fifoDirectory, `held-${producer.directory}.md`)
+            const configDirectory = path.join(test.directory, ".opencode", producer.directory)
+            yield* Effect.promise(() => mkdir(configDirectory, { recursive: true }))
+            const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+            const fifoMaker = yield* spawner.spawn(ChildProcess.make("mkfifo", [fifo]))
+            expect(yield* fifoMaker.exitCode).toBe(ChildProcessSpawner.ExitCode(0))
+            yield* Effect.promise(() => symlink(fifo, path.join(configDirectory, "held.md")))
+            yield* git(test.directory, ["add", "--force", `.opencode/${producer.directory}/held.md`])
+            yield* git(test.directory, ["commit", "-m", `add a held ${producer.loader} fixture`])
+            const expected = yield* svc.makeWorktreeInfo({ name: `held-config-${producer.directory}` })
+            const info = yield* svc.create({ name: expected.name })
+            expect(info.directory).toBe(expected.directory)
+            yield* Effect.addFinalizer(() => removeCreatedWorktree(info.directory).pipe(Effect.ignore))
+
+            const writer = createWriteStream(fifo)
+            writer.on("error", () => {})
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                if (!writer.destroyed) writer.destroy()
+              }),
+            )
+            const readerOpened = new Promise<void>((resolve, reject) => {
+              writer.once("open", () => resolve())
+              writer.once("error", reject)
+            })
+            yield* awaitWithTimeout(
+              Effect.promise(() => readerOpened),
+              `${producer.loader} did not open its held FIFO`,
+              "20 seconds",
+            )
+            const joiner = yield* store
+              .load({ directory: info.directory })
+              .pipe(Effect.forkScoped({ startImmediately: true }))
+            expect(joiner.pollUnsafe()).toBeUndefined()
+
+            const removalFiber = yield* svc
+              .remove({ directory: info.directory })
+              .pipe(Effect.forkDetach({ startImmediately: true }))
+            const removalResult = yield* Effect.exit(
+              awaitWithTimeout(
+                Fiber.await(removalFiber),
+                "worktree removal did not refuse its unsettled config Promise",
+                "30 seconds",
+              ),
+            )
+            expect(Exit.isSuccess(removalResult)).toBe(true)
+            if (Exit.isFailure(removalResult)) return
+            const removal = removalResult.value
+            expect(Exit.isFailure(removal)).toBe(true)
+            if (Exit.isFailure(removal)) {
+              expect(Cause.squash(removal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
+              expect(Cause.pretty(removal.cause)).toContain("instance bootstrap Promise did not settle")
+            }
+            expect(hasInstancePromises(info.directory)).toBe(true)
+            expect(yield* fs.exists(info.directory)).toBe(true)
+            expect(normalize(yield* git(test.directory, ["worktree", "list", "--porcelain"]))).toContain(
+              normalize(info.directory),
+            )
+
+            writer.end(`---\ndescription: held config ${producer.directory}\n---\nheld config prompt\n`)
+            yield* awaitWithTimeout(
+              Effect.promise(() => finished(writer)),
+              `held ${producer.loader} reader did not finish`,
+              "15 seconds",
+            )
+            const joined = yield* awaitWithTimeout(
+              Fiber.await(joiner),
+              `concurrent load did not join the live ${producer.loader} bootstrap`,
+              "15 seconds",
+            )
+            expect(Exit.isSuccess(joined)).toBe(true)
+            const loaded = yield* pollWithTimeout(
+              store.load({ directory: info.directory }).pipe(
+                Effect.catchCause(() => Effect.succeed(undefined)),
+              ),
+              `load did not recover after ${producer.loader} settled`,
+              "25 seconds",
+            )
+            if (Exit.isSuccess(joined)) expect(loaded).toBe(joined.value)
+
+            expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+            expect(yield* fs.exists(info.directory)).toBe(false)
+          }),
+        { git: true },
+        { timeout: 120_000 },
+      )
+    }
+
+    wintest(
+      "refuses worktree deletion until real well-known remote config substitution settles its FIFO Promise",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const store = yield* InstanceStore.Service
+          const fifoDirectory = yield* tmpdirScoped()
+          const fifo = path.join(fifoDirectory, "held-well-known-url.txt")
+          const authFile = path.join(Global.Path.data, "auth.json")
+          const tokenKey = "ROUND17_WELLKNOWN_TOKEN"
+          const token = "round17-test-token"
+          expect(Global.Path.data).toContain("opencode-test-data-")
+          const savedAuth = yield* Effect.promise(async () =>
+            (await Bun.file(authFile).exists()) ? await Bun.file(authFile).text() : undefined,
+          )
+          let discoveryRequests = 0
+          let remoteConfigRequests = 0
+          let remoteAuthorization: string | undefined
+          const server = Bun.serve({
+            hostname: "127.0.0.1",
+            port: 0,
+            fetch: (request) => {
+              const url = new URL(request.url)
+              if (url.pathname === "/.well-known/opencode") {
+                discoveryRequests++
+                return Response.json({
+                  remote_config: {
+                    url: `{file:${fifo}}`,
+                    headers: { Authorization: `Bearer {env:${tokenKey}}` },
+                  },
+                })
+              }
+              if (url.pathname === "/remote-config") {
+                remoteConfigRequests++
+                remoteAuthorization = request.headers.get("authorization") ?? undefined
+                return Response.json({ config: { username: "well-known-test-user" } })
+              }
+              return new Response("not found", { status: 404 })
+            },
+          })
+          yield* Effect.addFinalizer(() => Effect.promise(() => server.stop(true)))
+          yield* Effect.addFinalizer(() =>
+            Effect.promise(async () => {
+              if (savedAuth === undefined) {
+                await rm(authFile, { force: true })
+                return
+              }
+              await Bun.write(authFile, savedAuth)
+            }),
+          )
+          yield* Effect.promise(() =>
+            Bun.write(
+              authFile,
+              JSON.stringify({ [server.url.origin]: { type: "wellknown", key: tokenKey, token } }),
+            ),
+          )
+
+          const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+          const fifoMaker = yield* spawner.spawn(ChildProcess.make("mkfifo", [fifo]))
+          expect(yield* fifoMaker.exitCode).toBe(ChildProcessSpawner.ExitCode(0))
+          const expected = yield* svc.makeWorktreeInfo({ name: "held-well-known-config" })
+          const info = yield* svc.create({ name: expected.name })
+          expect(info.directory).toBe(expected.directory)
+          yield* Effect.addFinalizer(() => removeCreatedWorktree(info.directory).pipe(Effect.ignore))
+
+          const writer = createWriteStream(fifo)
+          writer.on("error", () => {})
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              if (!writer.destroyed) writer.destroy()
+            }),
+          )
+          const readerOpened = new Promise<void>((resolve, reject) => {
+            writer.once("open", () => resolve())
+            writer.once("error", reject)
+          })
+          yield* awaitWithTimeout(
+            Effect.promise(() => readerOpened),
+            "well-known remote config did not open its held file FIFO",
+            "20 seconds",
+          )
+          expect(discoveryRequests).toBe(1)
+          expect(remoteConfigRequests).toBe(0)
+          const joiner = yield* store
+            .load({ directory: info.directory })
+            .pipe(Effect.forkScoped({ startImmediately: true }))
+          expect(joiner.pollUnsafe()).toBeUndefined()
+
+          const removalFiber = yield* svc
+            .remove({ directory: info.directory })
+            .pipe(Effect.forkDetach({ startImmediately: true }))
+          const removalResult = yield* Effect.exit(
+            awaitWithTimeout(
+              Fiber.await(removalFiber),
+              "worktree removal did not refuse its unsettled well-known config Promise",
+              "30 seconds",
+            ),
+          )
+          expect(Exit.isSuccess(removalResult)).toBe(true)
+          if (Exit.isFailure(removalResult)) return
+          const removal = removalResult.value
+          expect(Exit.isFailure(removal)).toBe(true)
+          if (Exit.isFailure(removal)) {
+            expect(Cause.squash(removal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
+            expect(Cause.pretty(removal.cause)).toContain("instance bootstrap Promise did not settle")
+          }
+          expect(hasInstancePromises(info.directory)).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(true)
+          expect(normalize(yield* git(test.directory, ["worktree", "list", "--porcelain"]))).toContain(
+            normalize(info.directory),
+          )
+
+          writer.end(`${server.url.origin}/remote-config`)
+          yield* awaitWithTimeout(
+            Effect.promise(() => finished(writer)),
+            "held well-known URL reader did not finish",
+            "15 seconds",
+          )
+          const joined = yield* awaitWithTimeout(
+            Fiber.await(joiner),
+            "concurrent load did not join the live well-known config bootstrap",
+            "15 seconds",
+          )
+          expect(Exit.isSuccess(joined)).toBe(true)
+          const loaded = yield* pollWithTimeout(
+            store.load({ directory: info.directory }).pipe(Effect.catchCause(() => Effect.succeed(undefined))),
+            "load did not recover after well-known config substitution settled",
+            "25 seconds",
+          )
+          if (Exit.isSuccess(joined)) expect(loaded).toBe(joined.value)
+          expect(remoteConfigRequests).toBe(1)
+          expect(remoteAuthorization).toBe(`Bearer ${token}`)
+
+          expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(false)
+        }),
+      { git: true },
+      { timeout: 120_000 },
+    )
+
+    pluginBootstrapIt.instance(
+      "serves ready loads and reloads with synchronous and async plugin hook controls",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const store = yield* InstanceStore.Service
+          const plugin = yield* Plugin.Service
+          const gate = PluginGate.install()
+          let createdDirectory: string | undefined
+          let triggering: Fiber.Fiber<{ env: Record<string, string> }, never> | undefined
+          let reloading: Fiber.Fiber<InstanceContext, never> | undefined
+          yield* Effect.addFinalizer(() =>
+            Effect.gen(function* () {
+              gate.reset()
+              pluginSpec = undefined
+              pluginSource = undefined
+              if (triggering) {
+                yield* Fiber.await(triggering).pipe(
+                  Effect.timeoutOrElse({ duration: "30 seconds", orElse: () => Effect.succeed(undefined) }),
+                  Effect.asVoid,
+                )
+              }
+              if (reloading) {
+                yield* Fiber.await(reloading).pipe(
+                  Effect.timeoutOrElse({ duration: "30 seconds", orElse: () => Effect.succeed(undefined) }),
+                  Effect.asVoid,
+                )
+              }
+              if (createdDirectory) yield* svc.remove({ directory: createdDirectory }).pipe(Effect.ignore)
+            }),
+          )
+
+          const pluginPath = path.join(test.directory, "round8-runtime-plugin.ts")
+          const gateModule = pathToFileURL(path.join(import.meta.dir, "../fixture/plugin-gate.ts")).href
+          yield* fs.writeFileString(
+            pluginPath,
+            [
+              `import { PluginGate } from ${JSON.stringify(gateModule)}`,
+              "export default {",
+              '  id: "test.round-eight-runtime-hook",',
+              "  server: async () => ({",
+              '    "shell.env": (input) => input.cwd === "sync" ? undefined : PluginGate.waitForTrigger(),',
+              "  }),",
+              "}",
+            ].join("\n"),
+          )
+          yield* Effect.sync(() => {
+            pluginSpec = pathToFileURL(pluginPath).href
+            pluginSource = pluginPath
+          })
+
+          const readySignal = yield* waitReady().pipe(Effect.forkScoped)
+          const info = yield* svc.create({ name: "round8-runtime-hook" })
+          createdDirectory = info.directory
+          yield* Fiber.join(readySignal)
+          const ready = yield* store.load({ directory: info.directory })
+          const syncOutput = { env: {} as Record<string, string> }
+          expect(
+            yield* store.provide(
+              { directory: info.directory },
+              plugin.trigger("shell.env", { cwd: "sync" }, syncOutput),
+            ),
+          ).toBe(syncOutput)
+          triggering = yield* store
+            .provide(
+              { directory: info.directory },
+              plugin.trigger("shell.env", { cwd: info.directory }, { env: {} as Record<string, string> }),
+            )
+            .pipe(Effect.forkScoped({ startImmediately: true }))
+          yield* awaitWithTimeout(Effect.promise(() => gate.triggerStarted), "runtime plugin hook did not start", "10 seconds")
+          expect(hasInstancePromises(info.directory)).toBe(false)
+          expect(yield* store.load({ directory: info.directory })).toBe(ready)
+
+          reloading = yield* store.reload({ directory: info.directory }).pipe(Effect.forkScoped({ startImmediately: true }))
+          const reloadExit = yield* awaitWithTimeout(
+            Fiber.await(reloading),
+            "ordinary reload was blocked by a post-boot plugin hook",
+            "15 seconds",
+          )
+          expect(Exit.isSuccess(reloadExit)).toBe(true)
+          if (Exit.isSuccess(reloadExit)) expect(yield* store.load({ directory: info.directory })).toBe(reloadExit.value)
+          expect(hasInstancePromises(info.directory)).toBe(false)
+          reloading = undefined
+
+          gate.releaseTrigger()
+          expect(Exit.isSuccess(yield* Fiber.await(triggering))).toBe(true)
+          triggering = undefined
+          expect(yield* svc.remove({ directory: info.directory })).toBe(true)
+          createdDirectory = undefined
+        }),
+      { git: true },
+      { timeout: 90_000 },
+    )
+
+    pluginBootstrapIt.instance(
+      "refuses worktree deletion during external plugin loading and initialization",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const store = yield* InstanceStore.Service
+          const gate = PluginGate.install()
+          let createdDirectory: string | undefined
+          let loadingRemoval: Fiber.Fiber<boolean, Worktree.Error> | undefined
+          let initializingRemoval: Fiber.Fiber<boolean, Worktree.Error> | undefined
+          let configuringRemoval: Fiber.Fiber<boolean, Worktree.Error> | undefined
+          let disposingRemoval: Fiber.Fiber<boolean, Worktree.Error> | undefined
+          yield* Effect.addFinalizer(() =>
+            Effect.gen(function* () {
+              gate.reset()
+              pluginSpec = undefined
+              pluginSource = undefined
+              for (const fiber of [
+                loadingRemoval,
+                initializingRemoval,
+                configuringRemoval,
+                disposingRemoval,
+              ]) {
+                if (!fiber) continue
+                yield* Fiber.await(fiber).pipe(
+                  Effect.timeoutOrElse({ duration: "45 seconds", orElse: () => Effect.succeed(undefined) }),
+                  Effect.asVoid,
+                )
+              }
+              if (createdDirectory) yield* removeCreatedWorktree(createdDirectory).pipe(Effect.ignore)
+            }),
+          )
+
+          const pluginPath = path.join(test.directory, "round5-worktree-plugin.ts")
+          const gateModule = pathToFileURL(path.join(import.meta.dir, "../fixture/plugin-gate.ts")).href
+          yield* fs.writeFileString(
+            pluginPath,
+            [
+              `import { PluginGate } from ${JSON.stringify(gateModule)}`,
+              "await PluginGate.waitForLoad()",
+              "export default {",
+              '  id: "test.round-five-worktree",',
+              "  server: async () => {",
+              "    await PluginGate.waitForInit()",
+              "    return {",
+              "      config: async () => PluginGate.waitForConfig(),",
+              "      dispose: async () => PluginGate.waitForDispose(),",
+              "    }",
+              "  },",
+              "}",
+            ].join("\n"),
+          )
+          yield* Effect.sync(() => {
+            pluginSpec = pathToFileURL(pluginPath).href
+            pluginSource = pluginPath
+          })
+
+          const expected = yield* svc.makeWorktreeInfo({ name: "plugin-promise-owner" })
+          const info = yield* svc.create({ name: expected.name })
+          createdDirectory = info.directory
+          expect(info.directory).toBe(expected.directory)
+          yield* awaitWithTimeout(Effect.promise(() => gate.loadStarted), "external plugin load did not start", "20 seconds")
+          expect(hasInstancePromises(info.directory)).toBe(true)
+
+          loadingRemoval = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkDetach({ startImmediately: true }))
+          const loadRefusal = yield* awaitWithTimeout(
+            Fiber.await(loadingRemoval),
+            "removal did not refuse a pending external plugin load",
+            "35 seconds",
+          )
+          expect(Exit.isFailure(loadRefusal)).toBe(true)
+          if (Exit.isFailure(loadRefusal)) {
+            expect(Cause.squash(loadRefusal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
+            expect(Cause.pretty(loadRefusal.cause)).toContain("instance bootstrap Promise did not settle")
+          }
+          expect(yield* fs.exists(info.directory)).toBe(true)
+
+          gate.releaseLoad()
+          yield* awaitWithTimeout(Effect.promise(() => gate.initStarted), "external plugin initialization did not start", "20 seconds")
+          expect(hasInstancePromises(info.directory)).toBe(true)
+          initializingRemoval = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkDetach({ startImmediately: true }))
+          const initRefusal = yield* awaitWithTimeout(
+            Fiber.await(initializingRemoval),
+            "removal did not refuse a pending plugin initializer",
+            "35 seconds",
+          )
+          expect(Exit.isFailure(initRefusal)).toBe(true)
+          if (Exit.isFailure(initRefusal)) {
+            expect(Cause.squash(initRefusal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
+            expect(Cause.pretty(initRefusal.cause)).toContain("instance bootstrap Promise did not settle")
+          }
+          expect(yield* fs.exists(info.directory)).toBe(true)
+          gate.releaseInit()
+          yield* awaitWithTimeout(Effect.promise(() => gate.configStarted), "plugin config callback did not start", "20 seconds")
+          expect(hasInstancePromises(info.directory)).toBe(true)
+          configuringRemoval = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkDetach({ startImmediately: true }))
+          const configRefusal = yield* awaitWithTimeout(
+            Fiber.await(configuringRemoval),
+            "removal did not refuse a pending plugin config callback",
+            "35 seconds",
+          )
+          expect(Exit.isFailure(configRefusal)).toBe(true)
+          if (Exit.isFailure(configRefusal)) {
+            expect(Cause.squash(configRefusal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
+            expect(Cause.pretty(configRefusal.cause)).toContain("instance bootstrap Promise did not settle")
+          }
+          expect(yield* fs.exists(info.directory)).toBe(true)
+          const blocked = yield* Effect.exit(
+            awaitWithTimeout(
+              Effect.exit(store.load({ directory: info.directory })),
+              "load did not report the active plugin initializer",
+              "5 seconds",
+            ),
+          )
+          expect(Exit.isSuccess(blocked)).toBe(true)
+          if (Exit.isSuccess(blocked)) {
+            expect(Exit.isFailure(blocked.value)).toBe(true)
+            if (Exit.isFailure(blocked.value))
+              expect(Cause.pretty(blocked.value.cause)).toContain("instance bootstrap Promise is still running")
+          }
+
+          gate.releaseConfig()
+          const recovered = yield* pollWithTimeout(
+            store.load({ directory: info.directory }).pipe(
+              Effect.as(true),
+              Effect.catchCause(() => Effect.succeed(undefined)),
+            ),
+            "plugin bootstrap did not recover after its awaited Promises settled",
+            "30 seconds",
+          )
+          expect(recovered).toBe(true)
+
+          gate.holdDispose()
+          disposingRemoval = yield* svc.remove({ directory: info.directory }).pipe(Effect.forkDetach({ startImmediately: true }))
+          yield* awaitWithTimeout(Effect.promise(() => gate.disposeStarted), "plugin dispose hook did not start", "20 seconds")
+          expect(hasInstancePromises(info.directory)).toBe(false)
+          const disposeRefusal = yield* awaitWithTimeout(
+            Fiber.await(disposingRemoval),
+            "worktree removal did not refuse a pending plugin dispose hook",
+            "15 seconds",
+          )
+          expect(Exit.isFailure(disposeRefusal)).toBe(true)
+          if (Exit.isFailure(disposeRefusal)) {
+            expect(Cause.squash(disposeRefusal.cause)).toBeInstanceOf(Worktree.RemoveFailedError)
+            expect(Cause.pretty(disposeRefusal.cause)).toContain("instance disposer did not settle")
+          }
+          expect(yield* fs.exists(info.directory)).toBe(true)
+          gate.releaseDispose()
+          expect(yield* awaitWithTimeout(svc.remove({ directory: info.directory }), "worktree cleanup did not resume after plugin disposal", "20 seconds")).toBe(
+            true,
+          )
+          expect(yield* fs.exists(info.directory)).toBe(false)
+          loadingRemoval = undefined
+          initializingRemoval = undefined
+          configuringRemoval = undefined
+          disposingRemoval = undefined
+        }),
+      { git: true },
+      { timeout: 240_000 },
     )
 
     it.instance(
@@ -209,6 +1355,116 @@ describe("Worktree", () => {
           }),
         ),
       { git: true },
+    )
+
+    wintest(
+      "terminates the configured start command before removing its worktree",
+      () =>
+        Effect.gen(function* () {
+          yield* TestInstance
+          const fs = yield* FSUtil.Service
+          const svc = yield* Worktree.Service
+          const control = yield* tmpdirScoped()
+          const started = path.join(control, "started")
+          const pidFile = path.join(control, "pid")
+          const release = path.join(control, "release")
+          const exited = path.join(control, "exited")
+          const signaledBeforeRemoval = path.join(control, "signaled-before-removal")
+          const signaledAfterRemoval = path.join(control, "signaled-after-removal")
+          const expected = yield* svc.makeWorktreeInfo({ name: "start-command-remove" })
+          let createdDirectory: string | undefined
+          const processIsRunning = (pid: number) => {
+            try {
+              process.kill(pid, 0)
+              return true
+            } catch {
+              return false
+            }
+          }
+          const startCommand = [
+            `trap 'if [ -d ${JSON.stringify(expected.directory)} ]; then printf before > ${JSON.stringify(signaledBeforeRemoval)}; else printf after > ${JSON.stringify(signaledAfterRemoval)}; fi; exit 0' TERM`,
+            `trap 'printf exited > ${JSON.stringify(exited)}' EXIT`,
+            `printf '%s\\n' "$$" > ${JSON.stringify(pidFile)}`,
+            `: > ${JSON.stringify(started)}`,
+            `while [ ! -e ${JSON.stringify(release)} ]; do sleep 0.05; done`,
+          ].join("; ")
+
+          yield* Effect.addFinalizer(() =>
+            Effect.gen(function* () {
+              yield* Effect.promise(() => Bun.write(release, "release\n"))
+              if (!createdDirectory) return
+              const commandExited = yield* pollWithTimeout(
+                Effect.promise(() =>
+                  Bun.file(exited)
+                    .exists()
+                    .then((exists) => (exists ? true : undefined)),
+                ),
+                "configured start command did not exit during test cleanup",
+                "10 seconds",
+              ).pipe(
+                Effect.map(() => true),
+                Effect.catch(() => Effect.succeed(false)),
+              )
+              const pidText = yield* Effect.promise(() =>
+                Bun.file(pidFile)
+                  .text()
+                  .catch(() => ""),
+              )
+              const pid = Number(pidText.trim())
+              if (Number.isSafeInteger(pid) && pid > 0 && (!commandExited || processIsRunning(pid))) {
+                yield* Effect.sync(() => {
+                  try {
+                    process.kill(-pid, "SIGKILL")
+                  } catch {}
+                })
+                yield* pollWithTimeout(
+                  Effect.sync(() => (processIsRunning(pid) ? undefined : true)),
+                  "configured start command survived test cleanup",
+                  "5 seconds",
+                ).pipe(Effect.ignore)
+              }
+              yield* removeCreatedWorktree(createdDirectory).pipe(Effect.ignore)
+            }),
+          )
+
+          const ready = yield* waitReady().pipe(Effect.forkScoped)
+          const info = yield* svc.create({ name: expected.name, startCommand })
+          createdDirectory = info.directory
+          expect(info.directory).toBe(expected.directory)
+          const readyEvent = yield* awaitWithTimeout(
+            Fiber.join(ready),
+            "worktree.ready was not published",
+            "15 seconds",
+          )
+          expect(readyEvent.name).toBe(info.name)
+
+          const pid = yield* pollWithTimeout(
+            Effect.promise(async () => {
+              if (!(await Bun.file(started).exists())) return undefined
+              const value = Number((await Bun.file(pidFile).text()).trim())
+              return Number.isSafeInteger(value) && value > 0 ? value : undefined
+            }),
+            "configured start command did not start after worktree.ready",
+            "15 seconds",
+          )
+          expect(processIsRunning(pid)).toBe(true)
+          expect(yield* fs.exists(info.directory)).toBe(true)
+
+          expect(
+            yield* awaitWithTimeout(
+              svc.remove({ directory: info.directory }),
+              "Worktree.remove did not stop the configured start command",
+              "15 seconds",
+            ),
+          ).toBe(true)
+          expect(yield* Effect.promise(() => Bun.file(signaledBeforeRemoval).exists())).toBe(true)
+          expect(yield* Effect.promise(() => Bun.file(signaledAfterRemoval).exists())).toBe(false)
+          expect(processIsRunning(pid)).toBe(false)
+          expect(yield* fs.exists(info.directory)).toBe(false)
+          createdDirectory = undefined
+        }),
+      { git: true },
+      { timeout: 45_000 },
     )
 
     it.instance(

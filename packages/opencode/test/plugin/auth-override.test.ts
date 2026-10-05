@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect } from "bun:test"
 import path from "path"
 import { pathToFileURL } from "url"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -85,17 +85,57 @@ describe("plugin.auth-override", () => {
   )
 })
 
-const file = path.join(import.meta.dir, "../../src/plugin/index.ts")
-
 describe("plugin.config-hook-error-isolation", () => {
-  test("config hooks are individually error-isolated in the layer factory", async () => {
-    const src = await Bun.file(file).text()
+  it.instance(
+    "continues to the next plugin config hook when one hook rejects",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const fs = yield* FSUtil.Service
+        const pluginDir = path.join(tmp.directory, ".opencode", "plugin")
+        const failedHookMarker = path.join(tmp.directory, "failed-hook-ran")
+        const nextHookMarker = path.join(tmp.directory, "next-hook-ran")
+        const failedPlugin = pathToFileURL(path.join(pluginDir, "failed-config-hook.ts")).href
+        const nextPlugin = pathToFileURL(path.join(pluginDir, "next-config-hook.ts")).href
 
-    // Each hook's config call is wrapped in Effect.tryPromise with error logging + Effect.ignore
-    expect(src).toContain("plugin config hook failed")
+        yield* fs.writeWithDirs(
+          path.join(pluginDir, "failed-config-hook.ts"),
+          [
+            "export default {",
+            '  id: "demo.failed-config-hook",',
+            "  server: async () => ({",
+            "    config: async () => {",
+            `      await Bun.write(${JSON.stringify(failedHookMarker)}, "called")`,
+            '      throw new Error("expected config hook failure")',
+            "    },",
+            "  }),",
+            "}",
+            "",
+          ].join("\n"),
+        )
+        yield* fs.writeWithDirs(
+          path.join(pluginDir, "next-config-hook.ts"),
+          [
+            "export default {",
+            '  id: "demo.next-config-hook",',
+            "  server: async () => ({",
+            "    config: async () => {",
+            `      await Bun.write(${JSON.stringify(nextHookMarker)}, "called")`,
+            "    },",
+            "  }),",
+            "}",
+            "",
+          ].join("\n"),
+        )
 
-    const pattern =
-      /for\s*\(const hook of hooks\)\s*\{[\s\S]*?Effect\.tryPromise[\s\S]*?\.config\?\.\([\s\S]*?plugin config hook failed[\s\S]*?Effect\.ignore/
-    expect(pattern.test(src)).toBe(true)
-  })
+        yield* ProviderAuth.use
+          .methods()
+          .pipe(Effect.provide(providerAuthLayer(tmp.directory, [failedPlugin, nextPlugin])))
+
+        expect(yield* fs.exists(failedHookMarker)).toBe(true)
+        expect(yield* fs.exists(nextHookMarker)).toBe(true)
+      }),
+    { git: true },
+    30000,
+  )
 })
