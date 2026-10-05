@@ -16,6 +16,7 @@ import type { Connection } from "effect/unstable/sql/SqlConnection"
 import { classifySqliteError, LockTimeoutError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
 import { Sqlite } from "./sqlite"
+import { SqliteProbe } from "./sqlite-probe"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 const nativeBusyTimeoutMs = 5
@@ -24,6 +25,8 @@ const retrySchedule = Schedule.exponential("25 millis").pipe(
   Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 75)))),
   Schedule.take(4),
 )
+const sqliteProbe = SqliteProbe.create()
+const nativeConnections = new WeakMap<object, SqliteProbe.DatabaseInfo>()
 
 const statementError = (cause: unknown) => {
   const reason = classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" })
@@ -74,6 +77,8 @@ interface SqliteConnection extends Connection {
 const make = (options: Config) =>
   Effect.gen(function* () {
     const native = (yield* Sqlite.Native) as Database
+    const database = sqliteProbe ? nativeConnections.get(native) : undefined
+    const probeClient = database ? sqliteProbe?.client(database) : undefined
 
     const compiler = Statement.makeCompilerSqlite(options.transformQueryNames)
     const transformRows = options.transformResultNames
@@ -86,8 +91,15 @@ const make = (options: Config) =>
         // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
         statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
         return Effect.try({
-          try: () => (statement.all(...(params as any)) ?? []) as Array<Record<string, unknown>>,
-          catch: statementError,
+          try: () => {
+            const result = (statement.all(...(params as any)) ?? []) as Array<Record<string, unknown>>
+            probeClient?.succeeded(query)
+            return result
+          },
+          catch: (cause) => {
+            probeClient?.failed(query, cause)
+            return statementError(cause)
+          },
         }).pipe(Effect.retry({ schedule: retrySchedule, while: (error) => error.reason.isRetryable }))
       })
 
@@ -97,8 +109,15 @@ const make = (options: Config) =>
         // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
         statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
         return Effect.try({
-          try: () => (statement.values(...(params as any)) ?? []) as Array<unknown[]>,
-          catch: statementError,
+          try: () => {
+            const result = (statement.values(...(params as any)) ?? []) as Array<unknown[]>
+            probeClient?.succeeded(query)
+            return result
+          },
+          catch: (cause) => {
+            probeClient?.failed(query, cause)
+            return statementError(cause)
+          },
         }).pipe(Effect.retry({ schedule: retrySchedule, while: (error) => error.reason.isRetryable }))
       })
 
@@ -178,9 +197,20 @@ const nativeLayer = (config: Config) =>
         readwrite: config.readwrite ?? true,
         create: config.create ?? true,
       })
+      const database = sqliteProbe?.open(config.filename)
+      if (database) nativeConnections.set(native, database)
       yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
-      native.run(`PRAGMA busy_timeout = ${nativeBusyTimeoutMs};`)
-      if (config.disableWAL !== true) native.run("PRAGMA journal_mode = WAL;")
+      const runSetup = (query: string) => {
+        if (!sqliteProbe || !database) return native.run(query)
+        try {
+          return native.run(query)
+        } catch (cause) {
+          sqliteProbe.failed(database, query, cause)
+          throw cause
+        }
+      }
+      runSetup(`PRAGMA busy_timeout = ${nativeBusyTimeoutMs};`)
+      if (config.disableWAL !== true) runSetup("PRAGMA journal_mode = WAL;")
       return native
     }),
   )

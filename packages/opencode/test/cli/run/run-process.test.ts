@@ -3,10 +3,69 @@
 // same process. See `test/lib/cli-process.ts` for the harness — each test uses
 // `opencode.run(message, opts?)` to spawn `bun src/index.ts run ...` with
 // `OPENCODE_CONFIG_CONTENT` providing the test provider config inline.
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
+import { SqliteProbe } from "@opencode-ai/core/database/sqlite-probe"
 import { reply } from "../../lib/llm-server"
 import { cliIt, deadline } from "../../lib/cli-process"
+
+describe("SQLite CI probe redaction", () => {
+  test("only accepts the targeted run-process probe IDs", () => {
+    expect(SqliteProbe.isAllowedProbeID("run-process-success")).toBe(true)
+    expect(SqliteProbe.isAllowedProbeID("free-form-input")).toBe(false)
+  })
+
+  test("redacts SQL values and comments while retaining safe identifiers", () => {
+    expect(
+      SqliteProbe.sanitizeStatement(
+        `INSERT INTO "session" ("id", "value") VALUES (?1, 'secret_parameter') -- private comment`,
+      ),
+    ).toBe('INSERT INTO "session" ("id", "value") VALUES (?1, ?)')
+    expect(SqliteProbe.sanitizeStatement('SELECT "private@example.test" AS "value"')).toBe('SELECT ? AS "value"')
+    expect(SqliteProbe.sanitizeStatement("SELECT 0xdeadbeef, 42")).toBe("SELECT ?, ?")
+  })
+
+  test("bounds the normalized statement", () => {
+    expect(SqliteProbe.sanitizeStatement(`SELECT ${"x".repeat(500)}`)).toHaveLength(192)
+  })
+
+  test("normalizes SQLite lock codes without returning error messages", () => {
+    expect(SqliteProbe.sqliteErrorCode({ code: "SQLITE_BUSY" })).toBe("SQLITE_BUSY")
+    expect(SqliteProbe.sqliteErrorCode({ errcode: 5 })).toBe("SQLITE_BUSY")
+    expect(SqliteProbe.sqliteErrorCode({ errcode: 6 })).toBe("SQLITE_LOCKED")
+    expect(SqliteProbe.sqliteErrorCode({ code: "EIO", message: "private path" })).toBeUndefined()
+  })
+})
+
+const sqliteProbeEnabled = process.env["OPENCODE_SQLITE_PROBE"] === "1"
+
+function sqliteProbeOptions(probeID: string) {
+  const env: Record<string, string> = sqliteProbeEnabled ? { OPENCODE_SQLITE_PROBE_ID: probeID } : {}
+  return { env }
+}
+
+function expectSqliteProbe(probeID: string) {
+  return Effect.promise(async () => {
+    if (!sqliteProbeEnabled) return
+    const logPath = process.env["OPENCODE_SQLITE_PROBE_LOG"]
+    if (!logPath) throw new Error("OPENCODE_SQLITE_PROBE_LOG is required when the SQLite probe is enabled")
+    const records = (await Bun.file(logPath).text())
+      .split("\n")
+      .filter((line) => line.startsWith("{") && line.endsWith("}"))
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+    expect(
+      records.some(
+        (record) =>
+          record.event === "database_open" &&
+          record.probe_id === probeID &&
+          record.driver === "bun:sqlite" &&
+          record.database_path === ":memory:" &&
+          typeof record.pid === "number" &&
+          typeof record.connection_id === "number",
+      ),
+    ).toBe(true)
+  })
+}
 
 describe("opencode run (non-interactive subprocess)", () => {
   // Happy path: prompt completes, output reaches stdout, process exits 0.
@@ -16,7 +75,9 @@ describe("opencode run (non-interactive subprocess)", () => {
     ({ llm, opencode }) =>
       Effect.gen(function* () {
         yield* llm.text("hello from the test llm")
-        const result = yield* opencode.run("say hi")
+        const probeID = "run-process-success"
+        const result = yield* opencode.run("say hi", sqliteProbeOptions(probeID))
+        yield* expectSqliteProbe(probeID)
         opencode.expectExit(result, 0)
         expect(result.stdout).toBe("hello from the test llm\n")
       }),
@@ -50,12 +111,19 @@ describe("opencode run (non-interactive subprocess)", () => {
     ({ llm, opencode }) =>
       Effect.gen(function* () {
         yield* llm.reason("  considering  ", { text: "  answer  " })
-        const thinking = yield* opencode.run("think", { extraArgs: ["--thinking"] })
+        const thinkingProbeID = "run-process-thinking"
+        const thinking = yield* opencode.run("think", {
+          extraArgs: ["--thinking"],
+          ...sqliteProbeOptions(thinkingProbeID),
+        })
+        yield* expectSqliteProbe(thinkingProbeID)
         opencode.expectExit(thinking, 0)
         expect(thinking.stdout).toBe("Thinking: considering\nanswer\n")
 
         yield* llm.reason("hidden", { text: "visible" })
-        const plain = yield* opencode.run("think again")
+        const plainProbeID = "run-process-thinking-plain"
+        const plain = yield* opencode.run("think again", sqliteProbeOptions(plainProbeID))
+        yield* expectSqliteProbe(plainProbeID)
         opencode.expectExit(plain, 0)
         expect(plain.stdout).toBe("visible\n")
       }),
@@ -154,7 +222,12 @@ describe("opencode run (non-interactive subprocess)", () => {
     "prints the real error for an unknown effort on a --command run",
     ({ opencode }) =>
       Effect.gen(function* () {
-        const result = yield* opencode.run("x", { extraArgs: ["--command", "init", "--effort", "no-such-effort"] })
+        const probeID = "run-process-command-effort"
+        const result = yield* opencode.run("x", {
+          extraArgs: ["--command", "init", "--effort", "no-such-effort"],
+          ...sqliteProbeOptions(probeID),
+        })
+        yield* expectSqliteProbe(probeID)
         expect(result.exitCode).toBeGreaterThan(0)
         expect(result.stderr).toContain('Unknown effort "no-such-effort"')
         expect(result.stderr).not.toContain("Unexpected server error")
@@ -177,7 +250,12 @@ describe("opencode run (non-interactive subprocess)", () => {
         )
         yield* llm.fail("upstream provider exploded mid-stream")
         yield* llm.text("recovered")
-        const result = yield* opencode.run("trigger midstream error", { timeoutMs: deadline(30_000) })
+        const probeID = "run-process-unknown-finish"
+        const result = yield* opencode.run("trigger midstream error", {
+          timeoutMs: deadline(30_000),
+          ...sqliteProbeOptions(probeID),
+        })
+        yield* expectSqliteProbe(probeID)
         opencode.expectExit(result, 0)
         expect(result.stdout).toBe("partial response\nrecovered\n")
         expect(result.stderr).not.toContain("upstream provider exploded mid-stream")
@@ -193,7 +271,9 @@ describe("opencode run (non-interactive subprocess)", () => {
     ({ llm, opencode }) =>
       Effect.gen(function* () {
         yield* llm.text("structured output")
-        const result = yield* opencode.run("say hi", { format: "json" })
+        const probeID = "run-process-json-output"
+        const result = yield* opencode.run("say hi", { format: "json", ...sqliteProbeOptions(probeID) })
+        yield* expectSqliteProbe(probeID)
         opencode.expectExit(result, 0)
 
         const events = opencode.parseJsonEvents(result.stdout)
@@ -335,7 +415,12 @@ describe("opencode run (non-interactive subprocess)", () => {
       Effect.gen(function* () {
         yield* llm.tool("bash", { command: "rm -f denied-file", description: "Remove a test file" })
         yield* llm.text("continued after rejection")
-        const denied = yield* opencode.run("request permission", { permission: { bash: "ask" } })
+        const deniedProbeID = "run-process-permission-ask"
+        const denied = yield* opencode.run("request permission", {
+          permission: { bash: "ask" },
+          ...sqliteProbeOptions(deniedProbeID),
+        })
+        yield* expectSqliteProbe(deniedProbeID)
         opencode.expectExit(denied, 0)
         expect(denied.stderr).toContain("permission requested: bash")
         expect(denied.stdout).toBe("")
@@ -343,10 +428,13 @@ describe("opencode run (non-interactive subprocess)", () => {
         yield* llm.reset
         yield* llm.tool("bash", { command: "rm -f allowed-file", description: "Remove a test file" })
         yield* llm.text("continued after approval")
+        const allowedProbeID = "run-process-permission-allow"
         const allowed = yield* opencode.run("request permission", {
           permission: { bash: "ask" },
           extraArgs: ["--dangerously-skip-permissions"],
+          ...sqliteProbeOptions(allowedProbeID),
         })
+        yield* expectSqliteProbe(allowedProbeID)
         opencode.expectExit(allowed, 0)
         expect(allowed.stderr).not.toContain("permission requested: bash")
         expect(allowed.stdout).toContain("continued after approval")
@@ -354,10 +442,13 @@ describe("opencode run (non-interactive subprocess)", () => {
         yield* llm.reset
         yield* llm.tool("bash", { command: "touch explicitly-denied", description: "Create a denied marker" })
         yield* llm.text("continued after explicit denial")
+        const explicitlyDeniedProbeID = "run-process-permission-deny"
         const explicitlyDenied = yield* opencode.run("request denied permission", {
           permission: { bash: "deny" },
           extraArgs: ["--dangerously-skip-permissions"],
+          ...sqliteProbeOptions(explicitlyDeniedProbeID),
         })
+        yield* expectSqliteProbe(explicitlyDeniedProbeID)
         opencode.expectExit(explicitlyDenied, 0)
         expect(explicitlyDenied.stdout).toContain("continued after explicit denial")
         expect(yield* Effect.promise(() => Bun.file(`${home}/explicitly-denied`).exists())).toBe(false)
