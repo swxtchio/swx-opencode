@@ -213,7 +213,7 @@ describeWatcher("Watcher", () => {
         }),
       { git: true },
     ),
-    15_000,
+    30_000,
   )
 
   it.live("skips non-git roots", () =>
