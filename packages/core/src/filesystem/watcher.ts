@@ -55,7 +55,12 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 
 // workerTarget replaces the parcel worker script. The process has one parcel host,
 // so it only takes effect when this layer starts that host.
-export const layerWith = (options: { workerTarget?: string | URL } = {}) =>
+export const layerWith = (
+  options: {
+    workerTarget?: string | URL
+    onHeadWatcher?: (watcher: ReturnType<typeof watch>) => void
+  } = {},
+) =>
   Layer.effect(
     Service,
     Effect.gen(function* () {
@@ -114,15 +119,17 @@ export const layerWith = (options: { workerTarget?: string | URL } = {}) =>
           const head = path.join(vcs, "HEAD")
           const initial = readHead(head)
           const last = { value: "error" in initial ? undefined : initial.value }
+          const nativeWatch = { failed: false }
           function reconcileHead() {
             const read = readHead(head)
             if ("error" in read) {
+              if (nativeWatch.failed) return
               const failed = failure("git", vcs, read.error)
               const current = statuses.get("git")
               if (current?.state === "unconfirmed" && current.reason === failed.reason) return
               return report({ ...failed, state: "unconfirmed" })
             }
-            if (statuses.get("git")?.state === "unconfirmed" || statuses.get("git")?.state === "unavailable")
+            if (!nativeWatch.failed && statuses.get("git")?.state === "unconfirmed")
               report({ watch: "git", directory: vcs, state: "active" })
             if (read.value === last.value) return
             const event = read.value === undefined ? "unlink" : last.value === undefined ? "add" : "change"
@@ -146,6 +153,7 @@ export const layerWith = (options: { workerTarget?: string | URL } = {}) =>
           const interval = setInterval(reconcileHead, 250)
           interval.unref()
           watcher.on("error", (error) => {
+            nativeWatch.failed = true
             watcher.close()
             report(failure("git", vcs, error))
           })
@@ -156,6 +164,7 @@ export const layerWith = (options: { workerTarget?: string | URL } = {}) =>
                 watcher.close()
               }),
           )
+          options.onHeadWatcher?.(watcher)
           if ("error" in initial) return report({ ...failure("git", vcs, initial.error), state: "unconfirmed" })
           report({ watch: "git", directory: vcs, state: "active" })
         })
