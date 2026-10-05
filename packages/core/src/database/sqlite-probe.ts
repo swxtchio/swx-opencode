@@ -12,9 +12,11 @@ const PROBE_IDS = new Set([
   "run-process-permission-deny",
   "run-process-json-output",
   "run-process-command-effort",
+  "run-process-sqlite-holder",
+  "run-process-sqlite-client",
 ])
-// Nine fixed child IDs × (256 records + 8 error records + two truncation markers) × 768 chars stays below 2 MiB.
-const MAX_EVENTS = 256
+// Eleven fixed child IDs × (224 records + 8 error records + two truncation markers) × 768 ASCII chars stays below 2 MiB.
+const MAX_EVENTS = 224
 const MAX_ERROR_EVENTS = 8
 const MAX_RECORD_CHARS = 768
 const MAX_STATEMENT_CHARS = 192

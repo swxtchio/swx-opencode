@@ -4,14 +4,64 @@
 // `opencode.run(message, opts?)` to spawn `bun src/index.ts run ...` with
 // `OPENCODE_CONFIG_CONTENT` providing the test provider config inline.
 import { describe, expect, test } from "bun:test"
+import { Database } from "bun:sqlite"
+import { mkdtemp, rm } from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
 import { Effect } from "effect"
+import { awaitWithTimeout } from "../../lib/effect"
 import { SqliteProbe } from "@opencode-ai/core/database/sqlite-probe"
 import { reply } from "../../lib/llm-server"
 import { cliIt, deadline } from "../../lib/cli-process"
 
+const sqliteLockHolderScript = `
+import { Database } from "bun:sqlite"
+import { SqliteProbe } from "@opencode-ai/core/database/sqlite-probe"
+
+const filename = process.env["OPENCODE_DB"]
+if (!filename) throw new Error("SQLite lock holder has no database path")
+const probe = SqliteProbe.create()
+if (!probe) throw new Error("SQLite lock-holder probe is not enabled")
+const native = new Database(filename)
+const database = probe.open(filename)
+const client = probe.client(database)
+native.run("PRAGMA busy_timeout = 0")
+native.run("BEGIN IMMEDIATE")
+client.succeeded("BEGIN IMMEDIATE")
+console.log("SQLITE_PROBE_LOCK_HELD")
+await new Promise((resolve) => process.stdin.once("data", resolve))
+native.run("ROLLBACK")
+client.succeeded("ROLLBACK")
+native.close()
+`
+
+const sqliteLockClientScript = `
+import { Context, Effect, Layer } from "effect"
+import { SqlClient } from "effect/unstable/sql/SqlClient"
+import { layer } from "@opencode-ai/core/database/sqlite.bun"
+
+const filename = process.env["OPENCODE_DB"]
+if (!filename) throw new Error("SQLite lock client has no database path")
+try {
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const context = yield* Layer.build(layer({ filename, disableWAL: true }))
+        const client = Context.get(context, SqlClient)
+        yield* client.unsafe("INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?)", [1, "probe-private-value"]).raw
+      }),
+    ),
+  )
+} catch {
+  process.exitCode = 1
+}
+`
+
 describe("SQLite CI probe redaction", () => {
   test("only accepts the targeted run-process probe IDs", () => {
     expect(SqliteProbe.isAllowedProbeID("run-process-success")).toBe(true)
+    expect(SqliteProbe.isAllowedProbeID("run-process-sqlite-holder")).toBe(true)
+    expect(SqliteProbe.isAllowedProbeID("run-process-sqlite-client")).toBe(true)
     expect(SqliteProbe.isAllowedProbeID("free-form-input")).toBe(false)
   })
 
@@ -44,15 +94,19 @@ function sqliteProbeOptions(probeID: string) {
   return { env }
 }
 
+async function readSqliteProbeRecords() {
+  const logPath = process.env["OPENCODE_SQLITE_PROBE_LOG"]
+  if (!logPath) throw new Error("OPENCODE_SQLITE_PROBE_LOG is required when the SQLite probe is enabled")
+  return (await Bun.file(logPath).text())
+    .split("\n")
+    .filter((line) => line.startsWith("{") && line.endsWith("}"))
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+}
+
 function expectSqliteProbe(probeID: string) {
   return Effect.promise(async () => {
     if (!sqliteProbeEnabled) return
-    const logPath = process.env["OPENCODE_SQLITE_PROBE_LOG"]
-    if (!logPath) throw new Error("OPENCODE_SQLITE_PROBE_LOG is required when the SQLite probe is enabled")
-    const records = (await Bun.file(logPath).text())
-      .split("\n")
-      .filter((line) => line.startsWith("{") && line.endsWith("}"))
-      .map((line) => JSON.parse(line) as Record<string, unknown>)
+    const records = await readSqliteProbeRecords()
     expect(
       records.some(
         (record) =>
@@ -65,6 +119,167 @@ function expectSqliteProbe(probeID: string) {
       ),
     ).toBe(true)
   })
+}
+
+async function readProbeReadyLine(stream: ReadableStream<Uint8Array>) {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let buffered = ""
+  try {
+    while (true) {
+      const result = await reader.read()
+      if (result.done) throw new Error("SQLite lock holder exited before its readiness signal")
+      buffered += decoder.decode(result.value, { stream: true })
+      const newline = buffered.indexOf("\n")
+      if (newline >= 0) return buffered.slice(0, newline).trim()
+    }
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+if (sqliteProbeEnabled) {
+  test(
+    "reports the real SQLite busy statement and lock-holder transaction",
+    async () => {
+      const probeID = "run-process-sqlite-client"
+      const holderProbeID = "run-process-sqlite-holder"
+      const directory = await mkdtemp(path.join(os.tmpdir(), "opencode-sqlite-probe-"))
+      const databasePath = path.join(directory, "locked.sqlite")
+      try {
+        const setup = new Database(databasePath)
+        try {
+          setup.run("PRAGMA journal_mode = WAL")
+          setup.run("CREATE TABLE opencode_probe_lock (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+        } finally {
+          setup.close()
+        }
+
+        const lockHolder = Bun.spawn(["bun", "-e", sqliteLockHolderScript], {
+          cwd: process.cwd(),
+          env: {
+            ...process.env,
+            OPENCODE_DB: databasePath,
+            OPENCODE_SQLITE_PROBE: "1",
+            OPENCODE_SQLITE_PROBE_ID: holderProbeID,
+          },
+          stdin: "pipe",
+          stdout: "pipe",
+          stderr: "ignore",
+        })
+        try {
+          const ready = await Effect.runPromise(
+            awaitWithTimeout(
+              Effect.promise(() => readProbeReadyLine(lockHolder.stdout)),
+              "SQLite lock holder did not confirm BEGIN IMMEDIATE",
+              "5 seconds",
+            ),
+          )
+          expect(ready).toBe("SQLITE_PROBE_LOCK_HELD")
+
+          const busyClient = Bun.spawn(["bun", "-e", sqliteLockClientScript], {
+            cwd: process.cwd(),
+            env: {
+              ...process.env,
+              OPENCODE_DB: databasePath,
+              OPENCODE_SQLITE_PROBE: "1",
+              OPENCODE_SQLITE_PROBE_ID: probeID,
+            },
+            stdin: "ignore",
+            stdout: "ignore",
+            stderr: "ignore",
+          })
+          try {
+            const exitCode = await Effect.runPromise(
+              awaitWithTimeout(
+                Effect.promise(() => busyClient.exited),
+                "SQLite lock client did not exit",
+                "10 seconds",
+              ),
+            )
+            expect(exitCode).not.toBe(0)
+
+            const records = await readSqliteProbeRecords()
+            const holderOpen = records.find(
+              (record) => record.event === "database_open" && record.probe_id === holderProbeID,
+            )
+            const holderBegin = records.find(
+              (record) => record.event === "transaction_begin" && record.probe_id === holderProbeID,
+            )
+            const clientDatabase = records.find(
+              (record) => record.event === "database_open" && record.probe_id === probeID,
+            )
+            const clientOpen = records.find((record) => record.event === "client_open" && record.probe_id === probeID)
+            const busy = records.find(
+              (record) =>
+                record.event === "statement_error" &&
+                record.probe_id === probeID &&
+                typeof record.error_code === "string" &&
+                record.error_code.startsWith("SQLITE_BUSY"),
+            )
+            expect(holderOpen).toBeDefined()
+            expect(holderBegin).toBeDefined()
+            expect(clientDatabase).toBeDefined()
+            expect(clientOpen).toBeDefined()
+            expect(busy).toBeDefined()
+            if (!holderOpen || !holderBegin || !clientDatabase || !clientOpen || !busy) return
+
+            expect(holderOpen.pid).toBe(lockHolder.pid)
+            expect(holderBegin.statement).toBe("BEGIN IMMEDIATE")
+            expect(clientDatabase.pid).toBe(busyClient.pid)
+            expect(clientOpen.pid).toBe(busyClient.pid)
+            expect(busy.pid).toBe(busyClient.pid)
+            expect(busy.error_code).toBe("SQLITE_BUSY")
+            expect(busy.database_key).toBe(clientDatabase.database_key)
+            expect(busy.database_key).toBe(holderOpen.database_key)
+            expect(busy.database_path).toBe(`<file:${clientDatabase.database_key}>`)
+            expect(busy.database_kind).toBe("file")
+            expect(busy.client_id).toBe(clientOpen.client_id)
+            expect(busy.operation).toBe("INSERT")
+            expect(busy.statement).toBe("INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?)")
+            expect(JSON.stringify(busy)).not.toContain(databasePath)
+            expect(JSON.stringify(busy)).not.toContain("probe-private-value")
+            const candidates = Array.isArray(busy.lock_candidates)
+              ? (busy.lock_candidates as Array<Record<string, unknown>>)
+              : []
+            expect(candidates).toContainEqual(
+              expect.objectContaining({
+                pid: holderOpen.pid,
+                connection_id: holderOpen.connection_id,
+                client_id: holderBegin.client_id,
+                transaction_id: holderBegin.transaction_id,
+              }),
+            )
+          } finally {
+            if (busyClient.exitCode === null) {
+              busyClient.kill()
+              await busyClient.exited
+            }
+          }
+        } finally {
+          if (lockHolder.exitCode === null) {
+            await lockHolder.stdin.write("release\n")
+            lockHolder.stdin.end()
+            try {
+              await Effect.runPromise(
+                awaitWithTimeout(
+                  Effect.promise(() => lockHolder.exited),
+                  "SQLite lock holder did not exit",
+                  "5 seconds",
+                ),
+              )
+            } catch {
+              lockHolder.kill()
+              await lockHolder.exited
+            }
+          }
+        }
+      } finally {
+        await rm(directory, { recursive: true, force: true })
+      }
+    },
+    { timeout: 30_000 },
+  )
 }
 
 describe("opencode run (non-interactive subprocess)", () => {
