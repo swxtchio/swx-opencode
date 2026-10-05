@@ -67,6 +67,10 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#141** Reconcile `.git/HEAD` after an early or missed native callback through a shared read/change/publish path; keep a
+  closed native watch `unavailable` while polling still delivers changed branch values. Cover root-off switches, native
+  error/close, unreadable HEAD recovery and real EventV2 delivery; extend the root-event test bound beyond readiness and
+  serial waits. _Upstreamable._
 - **#135** Healthy overlapping `project.initGit` reloads carry disposer ownership through successor entries. Promise
   owners are tracked only for work awaited by `InstanceBootstrap.run`, including `Config.get` and plugin
   initialization/loading/config callbacks; concurrent loads join a positively live bootstrap and reload waits for
