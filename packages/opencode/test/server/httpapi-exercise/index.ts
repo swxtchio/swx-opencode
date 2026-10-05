@@ -6,9 +6,10 @@
  * requests, uses the right instance context, mutates storage when expected, and
  * returns the expected response shape.
  *
- * The script intentionally isolates `OPENCODE_DB` before importing modules that touch
- * storage. Scenarios may create/delete sessions and reset the database after each run,
- * so this must never point at a developer's real session database.
+ * The CLI configures isolated paths before importing runtime modules. Keep the
+ * environment helper import-pure because unit tests load it into a shared worker.
+ * Scenarios may create/delete sessions and reset the database after each run, so
+ * this must never point at a developer's real session database.
  *
  * DSL shape:
  * - `http.protected.get/post/...` starts a scenario for one OpenAPI route key.
@@ -29,13 +30,14 @@ import {
   exerciseDataDirectory,
   exerciseDatabasePath,
   exerciseGlobalRoot,
+  configureExerciseEnvironment,
 } from "./environment"
 import { color, printHeader, printResults } from "./report"
 import { coverageResult, parseOptions, routeKey, routeKeys, selectedScenarios } from "./routing"
-import { runScenario } from "./runner"
 import { disposeApps } from "./backend"
 import { runtime } from "./runtime"
 import { type Scenario } from "./types"
+import { worktreeCreateScenario } from "./worktree-create"
 
 function cursor(input: Record<string, unknown>) {
   return Buffer.from(JSON.stringify(input)).toString("base64url")
@@ -533,20 +535,7 @@ const scenarios: Scenario[] = [
     .json(200, array, "status"),
   http.protected.get("/experimental/tool/ids", "tool.ids").json(200, array),
   http.protected.get("/experimental/worktree", "worktree.list").json(200, array),
-  http.protected
-    .post("/experimental/worktree", "worktree.create")
-    .mutating()
-    .at((ctx) => ({ path: "/experimental/worktree", headers: ctx.headers(), body: { name: "api-dsl" } }))
-    .jsonEffect(
-      200,
-      (body, ctx) =>
-        Effect.gen(function* () {
-          object(body)
-          check(typeof body.directory === "string", "created worktree should include directory")
-          yield* ctx.worktreeRemove(body.directory)
-        }),
-      "status",
-    ),
+  worktreeCreateScenario,
   http.protected
     .post("/experimental/worktree", "worktree.create.invalid")
     .at((ctx) => ({ path: "/experimental/worktree", headers: ctx.headers(), body: { name: 1 } }))
@@ -1840,7 +1829,9 @@ const llmScenarios = new Set([
 ])
 
 const main = Effect.gen(function* () {
+  configureExerciseEnvironment()
   yield* Effect.addFinalizer(() => Effect.promise(() => disposeApps()).pipe(Effect.andThen(cleanupExercisePaths)))
+  const { runScenario } = yield* Effect.promise(() => import("./runner"))
   const options = parseOptions(Bun.argv.slice(2))
   const modules = yield* Effect.promise(() => runtime())
   const effectRoutes = routeKeys(OpenApi.fromApi(modules.PublicApi))
@@ -1866,7 +1857,9 @@ const main = Effect.gen(function* () {
           selected,
           (scenario) =>
             Effect.gen(function* () {
-              if (options.progress) console.log(`${color.dim}RUN ${routeKey(scenario)} ${scenario.name}${color.reset}`)
+              if (options.progress || options.mode === "effect") {
+                console.log(`${color.dim}RUN ${routeKey(scenario)} ${scenario.name}${color.reset}`)
+              }
               return yield* runScenario(options)(scenario)
             }),
           { concurrency: 1 },

@@ -3,6 +3,7 @@ export type Runtime = {
   HttpApiApp: (typeof import("../../../src/server/routes/instance/httpapi/server"))["HttpApiApp"]
   AppLayer: (typeof import("../../../src/effect/app-runtime"))["AppLayer"]
   memoMap: import("effect").Layer.MemoMap
+  routeMemoMap?: import("effect").Layer.MemoMap
   InstanceRef: (typeof import("../../../src/effect/instance-ref"))["InstanceRef"]
   InstanceStore: (typeof import("../../../src/project/instance-store"))["InstanceStore"]
   Session: (typeof import("../../../src/session/session"))["Session"]

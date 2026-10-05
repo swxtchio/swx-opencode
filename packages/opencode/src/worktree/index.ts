@@ -11,7 +11,7 @@ import { Slug } from "@opencode-ai/core/util/slug"
 import { errorMessage } from "../util/error"
 import { GlobalBus } from "@/bus/global"
 import { Git } from "@/git"
-import { Effect, Layer, Path, Schema, Scope, Context } from "effect"
+import { Cause, Deferred, Effect, Fiber, Layer, Path, Schema, Scope, Context } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { AppProcess } from "@opencode-ai/core/process"
@@ -150,6 +150,7 @@ const layer: Layer.Layer<
     const gitSvc = yield* Git.Service
     const project = yield* Project.Service
     const store = yield* InstanceStore.Service
+    const boots = new Map<string, { fiber?: Fiber.Fiber<void>; registered: Deferred.Deferred<void> }>()
 
     const git = Effect.fnUntraced(
       function* (args: string[], opts?: { cwd?: string }) {
@@ -249,9 +250,10 @@ const layer: Layer.Layer<
 
       const booted = yield* store.load({ directory: info.directory }).pipe(
         Effect.as(true),
-        Effect.catch((error) =>
+        Effect.catchCause((cause) =>
           Effect.gen(function* () {
-            const message = errorMessage(error)
+            if (Cause.hasInterruptsOnly(cause)) return yield* Effect.failCause(cause)
+            const message = errorMessage(Cause.squash(cause))
             yield* Effect.logError("worktree bootstrap failed", { directory: info.directory, message })
             GlobalBus.emit("event", {
               directory: info.directory,
@@ -280,9 +282,67 @@ const layer: Layer.Layer<
 
     const createFromInfo = Effect.fn("Worktree.createFromInfo")(function* (info: Info, startCommand?: string) {
       yield* setup(info)
-      yield* boot(info, startCommand).pipe(
-        Effect.catchCause((cause) => Effect.logError("worktree bootstrap failed", { cause })),
-        Effect.forkIn(scope),
+      const directory = yield* canonical(info.directory)
+      const entry: { fiber?: Fiber.Fiber<void>; registered: Deferred.Deferred<void> } = {
+        registered: Deferred.makeUnsafe<void>(),
+      }
+      yield* Effect.uninterruptibleMask(() =>
+        Effect.gen(function* () {
+          // Publish the entry and its fiber handle as one uninterrupted handoff.
+          boots.set(directory, entry)
+          const fiber = yield* boot(info, startCommand).pipe(
+            Effect.catchCause((cause) => Effect.logError("worktree bootstrap failed", { cause })),
+            Effect.ensuring(
+              Effect.sync(() => {
+                if (boots.get(directory) === entry) boots.delete(directory)
+              }),
+            ),
+            Effect.interruptible,
+            Effect.forkIn(scope),
+          )
+          entry.fiber = fiber
+          yield* Deferred.succeed(entry.registered, undefined)
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (Deferred.isDoneUnsafe(entry.registered)) return
+              if (!entry.fiber && boots.get(directory) === entry) boots.delete(directory)
+              Deferred.doneUnsafe(entry.registered, Effect.void)
+            }).pipe(Effect.asVoid),
+          ),
+        ),
+      )
+    })
+
+    const stopBoot = Effect.fnUntraced(function* (directory: string) {
+      const entry = boots.get(directory)
+      if (!entry) return
+      const registered = yield* Deferred.await(entry.registered).pipe(
+        Effect.as(true),
+        Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.succeed(false) }),
+      )
+      if (!registered) return yield* new RemoveFailedError({ message: `Worktree boot did not register: ${directory}` })
+      const fiber = entry.fiber
+      if (!fiber) return
+      // Fiber.interrupt joins its target; observe the exit separately after requesting cancellation.
+      yield* Effect.sync(() => fiber.interruptUnsafe(Fiber.getCurrent()?.id))
+      const stopped = yield* Fiber.await(fiber).pipe(
+        Effect.as(true),
+        Effect.timeoutOrElse({
+          duration: "5 seconds",
+          orElse: () => Effect.succeed(false),
+        }),
+      )
+      if (!stopped) return yield* new RemoveFailedError({ message: `Worktree boot did not stop: ${directory}` })
+    })
+
+    const disposeWorktreeInstance = Effect.fnUntraced(function* (directory: string) {
+      yield* store.disposeDirectory(directory).pipe(
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
+          const message = errorMessage(Cause.squash(cause)) || "Failed to dispose worktree instance"
+          return Effect.fail(new RemoveFailedError({ message }))
+        }),
       )
     })
 
@@ -394,7 +454,12 @@ const layer: Layer.Layer<
       const directory = yield* canonical(input.directory)
 
       // Preserve the loaded path casing for the store cache; `directory` is lowercased on Windows.
-      if (directory !== (yield* canonical(ctx.worktree))) yield* store.disposeDirectory(input.directory)
+      if (directory !== (yield* canonical(ctx.worktree))) {
+        // Before InstanceStore.load creates an entry, interrupt the boot and confirm its fiber
+        // terminates before disposal.
+        yield* stopBoot(directory)
+        yield* disposeWorktreeInstance(input.directory)
+      }
 
       const list = yield* git(["worktree", "list", "--porcelain"], { cwd: ctx.worktree })
       if (list.code !== 0) {
@@ -414,7 +479,7 @@ const layer: Layer.Layer<
       }
 
       // Git may return the original casing when a caller supplied a normalized Windows path.
-      yield* store.disposeDirectory(entry.path)
+      yield* disposeWorktreeInstance(entry.path)
       yield* stopFsmonitor(entry.path)
       const removed = yield* git(["worktree", "remove", "--force", entry.path], { cwd: ctx.worktree })
       if (removed.code !== 0) {

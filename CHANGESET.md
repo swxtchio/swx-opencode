@@ -71,6 +71,15 @@ Newest first. Each entry names the upstream range brought in.
   closed native watch `unavailable` while polling still delivers changed branch values. Cover root-off switches, native
   error/close, unreadable HEAD recovery and real EventV2 delivery; extend the root-event test bound beyond readiness and
   serial waits. _Upstreamable._
+- **#135** Healthy overlapping `project.initGit` reloads carry disposer ownership through successor entries. Promise
+  owners are tracked only for work awaited by `InstanceBootstrap.run`, including `Config.get` and plugin
+  initialization/loading/config callbacks; concurrent loads join a positively live bootstrap and reload waits for
+  that boot before handoff. Unconfirmed producers are refused without poisoning a still-live entry; ordinary runtime
+  plugin hooks do not create boot owners. When a worktree boot has not reached `InstanceStore.load`, removal interrupts
+  it and waits for its fiber to terminate before disposing the instance. It removes the checkout only after boot
+  termination and instance disposal are confirmed; if either cannot settle or disposal is interrupted, removal
+  refuses and leaves the checkout in place. `disposeAll` continues across cached directories and reports combined
+  cleanup failures. _Fork-only._
 - **#130** Carry `activeAssistantMessageID` through legacy busy/retry status events and status-map responses, publish the owner from processor, shell, and direct-subtask producers, and have the TUI keep explicit `null` neutral while falling back to history only when older servers omit the field; historical activity stays inert. _Fork-only._
 - **#126** A removed Session stays removed: a write that was already in flight when `Session.remove` ran is now refused instead of quietly recreating that Session's event history, and the HTTP routes that already promise a missing-Session 404 give it in that race (swxtchio/swx-opencode#97). Prompt-like routes and `sync.steal` still need a separate decision (swxtchio/swx-opencode#125). _Fork-only._
 - **#123** `SessionRunState.cancel` no longer emits idle without a local runner or retained status, preventing a false completion signal for another process’s active turn (swxtchio/swx-opencode#118). Genuine local cancellation still emits idle. _Fork-only._

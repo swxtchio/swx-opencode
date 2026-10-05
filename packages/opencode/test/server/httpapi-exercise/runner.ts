@@ -1,46 +1,48 @@
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Duration, Effect, Layer, Scope } from "effect"
+import { Cause, Deferred, Duration, Effect, Layer, Scope } from "effect"
 import { TestLLMServer } from "../../lib/llm-server"
 import type { Config } from "../../../src/config/config"
+import { GlobalBus, type GlobalEvent } from "../../../src/bus/global"
 
 import type { MessageV2 } from "../../../src/session/message-v2"
 import { MessageID, PartID } from "../../../src/session/schema"
 import { call, callAuthProbe, disposeApps } from "./backend"
 import { original } from "./environment"
-import { runtime } from "./runtime"
+import { runtime, type Runtime } from "./runtime"
 import type { ActiveScenario, Options, ProjectOptions, Result, Scenario, ScenarioContext, SeededContext } from "./types"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { WorktreeEvent } from "@opencode-ai/schema/worktree-event"
 
-export function runScenario(options: Options) {
+export function runScenario(options: Options, runtimeOverride?: Runtime) {
   return (scenario: Scenario) => {
     if (scenario.kind === "todo") return Effect.succeed({ status: "skip", scenario } as Result)
-    return runActive(options, scenario).pipe(
+    return Effect.scoped(runActive(options, scenario, runtimeOverride)).pipe(
       Effect.timeoutOrElse({
         duration: options.scenarioTimeout,
         orElse: () => Effect.die(new Error(`scenario timed out after ${Duration.format(options.scenarioTimeout)}`)),
       }),
       Effect.as({ status: "pass", scenario } as Result),
       Effect.catchCause((cause) => Effect.succeed({ status: "fail" as const, scenario, message: Cause.pretty(cause) })),
-      Effect.scoped,
     )
   }
 }
 
-function runActive(options: Options, scenario: ActiveScenario) {
+function runActive(options: Options, scenario: ActiveScenario, runtimeOverride?: Runtime) {
   if (options.mode === "auth") return runAuth(scenario)
 
-  return withContext(options, scenario, "shared", (ctx) =>
+  return withContext(options, scenario, "shared", (ctx, modules) =>
     Effect.gen(function* () {
       yield* trace(options, scenario, "request start")
-      const result = yield* call(scenario, ctx)
+      const result = yield* call(scenario, ctx, {}, modules)
       yield* trace(options, scenario, `response ${result.status}`)
       yield* trace(options, scenario, "expect start")
       yield* scenario.expect(ctx, ctx.state, result)
       yield* trace(options, scenario, "expect done")
     }),
+    runtimeOverride,
   )
 }
 
@@ -63,18 +65,20 @@ function withContext<A, E>(
   options: Options,
   scenario: ActiveScenario,
   label: string,
-  use: (ctx: SeededContext<unknown>) => Effect.Effect<A, E>,
+  use: (ctx: SeededContext<unknown>, modules: Runtime) => Effect.Effect<A, E>,
+  runtimeOverride?: Runtime,
 ) {
   return Effect.acquireRelease(
     Effect.gen(function* () {
       yield* trace(options, scenario, `${label} context acquire start`)
+      const modules = runtimeOverride ?? (yield* Effect.promise(() => runtime()))
       const llm = scenario.project?.llm ? yield* TestLLMServer : undefined
       const project = scenario.project
       const dir = project
-        ? yield* Effect.promise(async () => (await runtime()).tmpdir(projectOptions(project, llm?.url)))
+        ? yield* Effect.promise(async () => modules.tmpdir(projectOptions(project, llm?.url)))
         : undefined
       yield* trace(options, scenario, `${label} context acquire done`)
-      return { dir, llm }
+      return { dir, llm, modules }
     }),
     (ctx) =>
       Effect.gen(function* () {
@@ -88,7 +92,7 @@ function withContext<A, E>(
     Effect.flatMap((context) =>
       Effect.gen(function* () {
         yield* trace(options, scenario, `${label} runtime start`)
-        const modules = yield* Effect.promise(() => runtime())
+        const modules = context.modules
         const scope = yield* Scope.Scope
         const app = yield* Layer.buildWithMemoMap(modules.AppLayer, modules.memoMap, scope)
         yield* trace(options, scenario, `${label} runtime done`)
@@ -122,6 +126,21 @@ function withContext<A, E>(
         const llm = () => {
           if (!context.llm) throw new Error("scenario needs fake LLM")
           return context.llm
+        }
+        const worktreeEvents =
+          scenario.name === "worktree.create"
+            ? { events: [] as GlobalEvent[], waiters: new Map<string, Deferred.Deferred<GlobalEvent>>() }
+            : undefined
+        if (worktreeEvents) {
+          const on = (event: GlobalEvent) => {
+            if (event.payload.type !== WorktreeEvent.Ready.type && event.payload.type !== WorktreeEvent.Failed.type)
+              return
+            worktreeEvents.events.push(event)
+            const waiting = event.directory ? worktreeEvents.waiters.get(event.directory) : undefined
+            if (waiting) Deferred.doneUnsafe(waiting, Effect.succeed(event))
+          }
+          GlobalBus.on("event", on)
+          yield* Effect.addFinalizer(() => Effect.sync(() => GlobalBus.off("event", on)))
         }
         const base: ScenarioContext = {
           directory: context.dir?.path,
@@ -196,7 +215,27 @@ function withContext<A, E>(
           todos: (sessionID, todos) => run(modules.Todo.Service.use((svc) => svc.update({ sessionID, todos }))),
           worktree: (input) => run(modules.Worktree.Service.use((svc) => svc.create(input).pipe(Effect.orDie))),
           worktreeRemove: (directory) =>
-            run(modules.Worktree.Service.use((svc) => svc.remove({ directory })).pipe(Effect.ignore)),
+            run(modules.Worktree.Service.use((svc) => svc.remove({ directory })).pipe(Effect.orDie)),
+          worktreeTerminal: (directory) => {
+            const events = worktreeEvents
+            if (!events) return Effect.die(new Error("scenario did not subscribe to worktree boot events"))
+            return Effect.gen(function* () {
+              const waiting = yield* Deferred.make<GlobalEvent>()
+              const existing = yield* Effect.sync(() => {
+                const event = events.events.find((item) => item.directory === directory)
+                if (event) return event
+                events.waiters.set(directory, waiting)
+                return undefined
+              })
+              if (existing) return existing
+              return yield* Deferred.await(waiting).pipe(
+                Effect.timeoutOrElse({
+                  duration: "20 seconds",
+                  orElse: () => Effect.die(new Error(`worktree boot did not reach a terminal state: ${directory}`)),
+                }),
+              )
+            }).pipe(Effect.ensuring(Effect.sync(() => events.waiters.delete(directory)).pipe(Effect.asVoid)))
+          },
           llmText: (value) => Effect.suspend(() => llm().text(value)),
           llmWait: (count) => Effect.suspend(() => llm().wait(count)),
           tuiRequest: (request) => Effect.sync(() => modules.Tui.submitTuiRequest(request)),
@@ -205,7 +244,7 @@ function withContext<A, E>(
         const state = yield* scenario.seed(base)
         yield* trace(options, scenario, `${label} seed done`)
         yield* trace(options, scenario, `${label} use start`)
-        const result = yield* use({ ...base, state })
+        const result = yield* use({ ...base, state }, modules)
         yield* trace(options, scenario, `${label} use done`)
         return result
       }).pipe(Effect.ensuring(context.llm ? context.llm.reset : Effect.void)),
