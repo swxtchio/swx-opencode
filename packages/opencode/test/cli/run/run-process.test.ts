@@ -15,46 +15,60 @@ import { reply } from "../../lib/llm-server"
 import { cliIt, deadline } from "../../lib/cli-process"
 
 const sqliteLockHolderScript = `
-import { Database } from "bun:sqlite"
-import { SqliteProbe } from "@opencode-ai/core/database/sqlite-probe"
-
-const filename = process.env["OPENCODE_DB"]
-if (!filename) throw new Error("SQLite lock holder has no database path")
-const probe = SqliteProbe.create()
-if (!probe) throw new Error("SQLite lock-holder probe is not enabled")
-const native = new Database(filename)
-const database = probe.open(filename)
-const client = probe.client(database)
-native.run("PRAGMA busy_timeout = 0")
-native.run("BEGIN IMMEDIATE")
-client.succeeded("BEGIN IMMEDIATE")
-console.log("SQLITE_PROBE_LOCK_HELD")
-await new Promise((resolve) => process.stdin.once("data", resolve))
-native.run("ROLLBACK")
-client.succeeded("ROLLBACK")
-native.close()
-`
-
-const sqliteLockClientScript = `
 import { Context, Effect, Layer } from "effect"
 import { SqlClient } from "effect/unstable/sql/SqlClient"
 import { layer } from "@opencode-ai/core/database/sqlite.bun"
 
 const filename = process.env["OPENCODE_DB"]
+if (!filename) throw new Error("SQLite lock holder has no database path")
+await Effect.runPromise(
+  Effect.scoped(
+    Effect.gen(function* () {
+      const context = yield* Layer.build(layer({ filename, disableWAL: true }))
+      const client = Context.get(context, SqlClient)
+      yield* client.withTransaction(
+        Effect.gen(function* () {
+          yield* client.unsafe("INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?)", [1, "probe-private-holder-value"]).raw
+          // Exercise runValues success events while the production transaction holds the write lock.
+          yield* client.unsafe("SAVEPOINT opencode_probe_savepoint").values
+          yield* client.unsafe("RELEASE opencode_probe_savepoint").values
+          console.log("SQLITE_PROBE_LOCK_HELD")
+          yield* Effect.promise(() => new Promise((resolve) => process.stdin.once("data", resolve)))
+        }),
+      )
+    }),
+  ),
+)
+`
+
+const sqliteLockClientScript = `
+import { Context, Effect, Exit, Layer } from "effect"
+import { SqlClient } from "effect/unstable/sql/SqlClient"
+import { layer } from "@opencode-ai/core/database/sqlite.bun"
+
+const filename = process.env["OPENCODE_DB"]
 if (!filename) throw new Error("SQLite lock client has no database path")
-try {
-  await Effect.runPromise(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const context = yield* Layer.build(layer({ filename, disableWAL: true }))
-        const client = Context.get(context, SqlClient)
-        yield* client.unsafe("INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?)", [1, "probe-private-value"]).raw
-      }),
-    ),
-  )
-} catch {
-  process.exitCode = 1
-}
+const outcomes = await Effect.runPromise(
+  Effect.scoped(
+    Effect.gen(function* () {
+      const context = yield* Layer.build(layer({ filename, disableWAL: true }))
+      const client = Context.get(context, SqlClient)
+      const runResult = yield* client
+        .unsafe("INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?)", [2, "probe-private-run-value"])
+        .raw.pipe(Effect.exit)
+      const valuesResult = yield* client
+        .unsafe("INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?) RETURNING id", [
+          3,
+          "probe-private-values-value",
+        ])
+        .values.pipe(Effect.exit)
+      return { runResult, valuesResult }
+    }),
+  ),
+)
+if (Exit.isSuccess(outcomes.runResult) || Exit.isSuccess(outcomes.valuesResult))
+  throw new Error("SQLite lock client unexpectedly wrote while the holder transaction was open")
+process.exitCode = 1
 `
 
 describe("SQLite CI probe redaction", () => {
@@ -94,21 +108,25 @@ function sqliteProbeOptions(probeID: string) {
   return { env }
 }
 
-async function readSqliteProbeRecords() {
+async function readSqliteProbeLog() {
   const logPath = process.env["OPENCODE_SQLITE_PROBE_LOG"]
   if (!logPath) throw new Error("OPENCODE_SQLITE_PROBE_LOG is required when the SQLite probe is enabled")
-  return (await Bun.file(logPath).text())
-    .split("\n")
-    .filter((line) => line.startsWith("{") && line.endsWith("}"))
-    .map((line) => JSON.parse(line) as Record<string, unknown>)
+  const text = await Bun.file(logPath).text()
+  return {
+    text,
+    records: text
+      .split("\n")
+      .filter((line) => line.startsWith("{") && line.endsWith("}"))
+      .map((line) => JSON.parse(line) as Record<string, unknown>),
+  }
 }
 
 function expectSqliteProbe(probeID: string) {
   return Effect.promise(async () => {
     if (!sqliteProbeEnabled) return
-    const records = await readSqliteProbeRecords()
+    const log = await readSqliteProbeLog()
     expect(
-      records.some(
+      log.records.some(
         (record) =>
           record.event === "database_open" &&
           record.probe_id === probeID &&
@@ -171,7 +189,7 @@ if (sqliteProbeEnabled) {
           const ready = await Effect.runPromise(
             awaitWithTimeout(
               Effect.promise(() => readProbeReadyLine(lockHolder.stdout)),
-              "SQLite lock holder did not confirm BEGIN IMMEDIATE",
+              "SQLite lock holder did not confirm its production transaction",
               "5 seconds",
             ),
           )
@@ -199,57 +217,136 @@ if (sqliteProbeEnabled) {
             )
             expect(exitCode).not.toBe(0)
 
-            const records = await readSqliteProbeRecords()
+            await lockHolder.stdin.write("release\n")
+            lockHolder.stdin.end()
+            await Effect.runPromise(
+              awaitWithTimeout(
+                Effect.promise(() => lockHolder.exited),
+                "SQLite lock holder did not exit after release",
+                "5 seconds",
+              ),
+            )
+
+            const log = await readSqliteProbeLog()
+            const records = log.records
+            expect(Buffer.byteLength(log.text)).toBeLessThan(2 * 1024 * 1024)
+            expect(
+              log.text
+                .split("\n")
+                .filter(Boolean)
+                .every((line) => line.length <= 768),
+            ).toBe(true)
             const holderOpen = records.find(
               (record) => record.event === "database_open" && record.probe_id === holderProbeID,
             )
+            const holderClient = records.find(
+              (record) => record.event === "client_open" && record.probe_id === holderProbeID,
+            )
             const holderBegin = records.find(
-              (record) => record.event === "transaction_begin" && record.probe_id === holderProbeID,
+              (record) =>
+                record.event === "transaction_begin" &&
+                record.probe_id === holderProbeID &&
+                record.operation === "BEGIN",
+            )
+            const holderSavepoint = records.find(
+              (record) =>
+                record.event === "transaction_begin" &&
+                record.probe_id === holderProbeID &&
+                record.operation === "SAVEPOINT",
+            )
+            const holderRelease = records.find(
+              (record) =>
+                record.event === "transaction_end" &&
+                record.probe_id === holderProbeID &&
+                record.operation === "RELEASE",
+            )
+            const holderCommit = records.find(
+              (record) =>
+                record.event === "transaction_end" &&
+                record.probe_id === holderProbeID &&
+                record.operation === "COMMIT",
             )
             const clientDatabase = records.find(
               (record) => record.event === "database_open" && record.probe_id === probeID,
             )
             const clientOpen = records.find((record) => record.event === "client_open" && record.probe_id === probeID)
-            const busy = records.find(
+            const busyRun = records.find(
               (record) =>
                 record.event === "statement_error" &&
                 record.probe_id === probeID &&
+                record.statement === "INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?)" &&
+                typeof record.error_code === "string" &&
+                record.error_code.startsWith("SQLITE_BUSY"),
+            )
+            const busyValues = records.find(
+              (record) =>
+                record.event === "statement_error" &&
+                record.probe_id === probeID &&
+                record.statement === "INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?) RETURNING id" &&
                 typeof record.error_code === "string" &&
                 record.error_code.startsWith("SQLITE_BUSY"),
             )
             expect(holderOpen).toBeDefined()
+            expect(holderClient).toBeDefined()
             expect(holderBegin).toBeDefined()
+            expect(holderSavepoint).toBeDefined()
+            expect(holderRelease).toBeDefined()
+            expect(holderCommit).toBeDefined()
             expect(clientDatabase).toBeDefined()
             expect(clientOpen).toBeDefined()
-            expect(busy).toBeDefined()
-            if (!holderOpen || !holderBegin || !clientDatabase || !clientOpen || !busy) return
+            expect(busyRun).toBeDefined()
+            expect(busyValues).toBeDefined()
+            if (
+              !holderOpen ||
+              !holderClient ||
+              !holderBegin ||
+              !holderSavepoint ||
+              !holderRelease ||
+              !holderCommit ||
+              !clientDatabase ||
+              !clientOpen ||
+              !busyRun ||
+              !busyValues
+            )
+              return
 
             expect(holderOpen.pid).toBe(lockHolder.pid)
-            expect(holderBegin.statement).toBe("BEGIN IMMEDIATE")
+            expect(holderClient.pid).toBe(lockHolder.pid)
+            expect(holderBegin.client_id).toBe(holderClient.client_id)
+            expect(holderSavepoint.client_id).toBe(holderClient.client_id)
+            expect(holderRelease.client_id).toBe(holderClient.client_id)
+            expect(holderCommit.client_id).toBe(holderClient.client_id)
+            expect(holderRelease.transaction_ids).toContain(holderSavepoint.transaction_id)
+            expect(holderCommit.transaction_ids).toContain(holderBegin.transaction_id)
             expect(clientDatabase.pid).toBe(busyClient.pid)
             expect(clientOpen.pid).toBe(busyClient.pid)
-            expect(busy.pid).toBe(busyClient.pid)
-            expect(busy.error_code).toBe("SQLITE_BUSY")
-            expect(busy.database_key).toBe(clientDatabase.database_key)
-            expect(busy.database_key).toBe(holderOpen.database_key)
-            expect(busy.database_path).toBe(`<file:${clientDatabase.database_key}>`)
-            expect(busy.database_kind).toBe("file")
-            expect(busy.client_id).toBe(clientOpen.client_id)
-            expect(busy.operation).toBe("INSERT")
-            expect(busy.statement).toBe("INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?)")
-            expect(JSON.stringify(busy)).not.toContain(databasePath)
-            expect(JSON.stringify(busy)).not.toContain("probe-private-value")
-            const candidates = Array.isArray(busy.lock_candidates)
-              ? (busy.lock_candidates as Array<Record<string, unknown>>)
-              : []
-            expect(candidates).toContainEqual(
-              expect.objectContaining({
-                pid: holderOpen.pid,
-                connection_id: holderOpen.connection_id,
-                client_id: holderBegin.client_id,
-                transaction_id: holderBegin.transaction_id,
-              }),
-            )
+            expect(busyRun.pid).toBe(busyClient.pid)
+            expect(busyValues.pid).toBe(busyClient.pid)
+            expect(busyRun.error_code).toBe("SQLITE_BUSY")
+            expect(busyValues.error_code).toBe("SQLITE_BUSY")
+            expect(busyRun.database_key).toBe(clientDatabase.database_key)
+            expect(busyRun.database_key).toBe(holderOpen.database_key)
+            expect(busyRun.database_path).toBe(`<file:${clientDatabase.database_key}>`)
+            expect(busyRun.database_kind).toBe("file")
+            expect(busyRun.client_id).toBe(clientOpen.client_id)
+            expect(busyRun.operation).toBe("INSERT")
+            expect(busyRun.statement).toBe("INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?)")
+            expect(busyValues.client_id).toBe(clientOpen.client_id)
+            expect(busyValues.database_key).toBe(clientDatabase.database_key)
+            expect(busyValues.operation).toBe("INSERT")
+            expect(busyValues.statement).toBe("INSERT INTO opencode_probe_lock (id, value) VALUES (?, ?) RETURNING id")
+            expect(log.text).not.toContain(databasePath)
+            expect(log.text).not.toContain("probe-private-holder-value")
+            expect(log.text).not.toContain("probe-private-run-value")
+            expect(log.text).not.toContain("probe-private-values-value")
+            const holderCandidate = expect.objectContaining({
+              pid: holderOpen.pid,
+              connection_id: holderOpen.connection_id,
+              client_id: holderBegin.client_id,
+              transaction_id: holderBegin.transaction_id,
+            })
+            expect(busyRun.lock_candidates).toEqual(expect.arrayContaining([holderCandidate]))
+            expect(busyValues.lock_candidates).toEqual(expect.arrayContaining([holderCandidate]))
           } finally {
             if (busyClient.exitCode === null) {
               busyClient.kill()

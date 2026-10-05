@@ -194,7 +194,7 @@ async function runHeldResetScenario(scenarioTimeout: string) {
         const result = yield* awaitWithTimeout(
           Fiber.join(fiber),
           "worktree scenario did not settle after its configured bound",
-          scenarioTimeout === "4 seconds" ? "15 seconds" : "35 seconds",
+          scenarioTimeout === "15 seconds" ? "25 seconds" : "35 seconds",
         )
         yield* awaitWithTimeout(
           Deferred.await(gate.interrupted),
@@ -262,9 +262,10 @@ test(
 test(
   "worktree.create scenario deadline interrupts boot and removes checkout and branch",
   async () => {
-    const outcome = await runHeldResetScenario("4 seconds")
+    // Keep the deadline beyond the 10-second positive-entry bound but below the 20-second terminal bound.
+    const outcome = await runHeldResetScenario("15 seconds")
     expect(outcome.result.status).toBe("fail")
-    if (outcome.result.status === "fail") expect(outcome.result.message).toContain("scenario timed out after 4s")
+    if (outcome.result.status === "fail") expect(outcome.result.message).toContain("scenario timed out after 15s")
     expect(outcome.started.branch).toBe("opencode/api-dsl")
     expect(
       outcome.removals.some(
@@ -277,7 +278,7 @@ test(
       ),
     ).toBe(true)
   },
-  { timeout: 25_000 },
+  { timeout: 40_000 },
 )
 
 test(
