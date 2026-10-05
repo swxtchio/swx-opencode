@@ -4,6 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import { Effect } from "effect"
 import { awaitWithTimeout } from "../../lib/effect"
+import { deadline } from "../../lib/deadline"
 
 const isolationScript = `
 const databasePath = process.env["OPENCODE_DB"]
@@ -71,7 +72,7 @@ test(
         awaitWithTimeout(
           Effect.promise(() => child.exited),
           "database isolation child did not exit",
-          "60 seconds",
+          deadline(60_000),
         ),
       )
       const stdout = await new Response(child.stdout).text()
@@ -87,5 +88,6 @@ test(
       await rm(directory, { recursive: true, force: true })
     }
   },
-  { timeout: 90_000 },
+  // Leave 30 scaled seconds between the child backstop and test cleanup.
+  { timeout: deadline(90_000) },
 )
