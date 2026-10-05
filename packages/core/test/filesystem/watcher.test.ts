@@ -23,7 +23,7 @@ type WatcherEvent = { file: string; event: "add" | "change" | "unlink" }
 
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([FSUtil.node, EventV2.node])))
 
-type Options = { root?: boolean; ignore?: string[]; events?: EventV2.Interface; subscribeTimeout?: number }
+type Options = { root?: boolean; disable?: boolean; ignore?: string[]; events?: EventV2.Interface; subscribeTimeout?: number }
 
 function provide(directory: string, vcs?: Location.Interface["vcs"], options?: Options) {
   return Effect.provide(watcherLayer(directory, vcs, options))
@@ -49,7 +49,7 @@ function watcherLayer(directory: string, vcs?: Location.Interface["vcs"], option
   const flagsLayer = ConfigProvider.layer(
     ConfigProvider.fromUnknown({
       OPENCODE_EXPERIMENTAL_FILEWATCHER: options?.root === false ? "false" : "true",
-      OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: "false",
+      OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: options?.disable ? "true" : "false",
       ...(options?.subscribeTimeout === undefined
         ? {}
         : { OPENCODE_EXPERIMENTAL_WATCHER_SUBSCRIBE_TIMEOUT_MS: String(options.subscribeTimeout) }),
@@ -209,6 +209,7 @@ describeWatcher("Watcher", () => {
         Effect.promise(() => tmpdir()),
         (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
       )
+      yield* Effect.promise(() => gitInit(tmp.path))
       yield* ready(tmp.path).pipe(
         provide(tmp.path, { type: "git", store: AbsolutePath.make(path.join(tmp.path, ".git")) }),
         Effect.scoped,
@@ -217,6 +218,12 @@ describeWatcher("Watcher", () => {
       yield* noUpdate((event) => event.file === file, fs.writeFileString(file, "gone")).pipe(
         Effect.provideService(EventV2.Service, events),
       )
+      const head = path.join(tmp.path, ".git", "HEAD")
+      const branch = `after-dispose-${Math.random().toString(36).slice(2)}`
+      yield* noUpdate(
+        (event) => event.file === head,
+        Effect.promise(() => $`git switch -q -c ${branch}`.cwd(tmp.path).quiet()),
+      ).pipe(Effect.provideService(EventV2.Service, events))
     }).pipe(Effect.provide(AppNodeBuilder.build(LayerNode.group([FSUtil.node, EventV2.node])))),
   )
 
@@ -368,14 +375,36 @@ describeWatcher("Watcher", () => {
           const file = path.join(directory, "root-off.txt")
           yield* noUpdate((event) => event.file === file, afs.writeFileString(file, "off"))
           const branch = `switch-${Math.random().toString(36).slice(2)}`
+          const head = path.join(git, "HEAD")
           expect(
             yield* nextUpdate(
-              (event) => event.file === path.join(git, "HEAD"),
+              (event) => event.file === head && event.event === "change",
               Effect.promise(() => $`git switch -q -c ${branch}`.cwd(directory).quiet()),
             ),
-          ).toMatchObject({ file: path.join(git, "HEAD") })
+          ).toEqual({ file: head, event: "change" })
+          expect(yield* Effect.promise(() => fs.readFile(head, "utf8"))).toBe(`ref: refs/heads/${branch}\n`)
         }),
       { git: true, root: false },
+    ),
+  )
+
+  it.live("does not start either watch when the file watcher is disabled", () =>
+    withTmp(
+      (directory) =>
+        Effect.gen(function* () {
+          const afs = yield* FSUtil.Service
+          const watcher = yield* Watcher.Service
+          expect(yield* watcher.status).toEqual([])
+          const file = path.join(directory, "disabled.txt")
+          yield* noUpdate((event) => event.file === file, afs.writeFileString(file, "off"))
+          const head = path.join(directory, ".git", "HEAD")
+          const branch = `disabled-${Math.random().toString(36).slice(2)}`
+          yield* noUpdate(
+            (event) => event.file === head,
+            Effect.promise(() => $`git switch -q -c ${branch}`.cwd(directory).quiet()),
+          )
+        }),
+      { git: true, disable: true },
     ),
   )
 
