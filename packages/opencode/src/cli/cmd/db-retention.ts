@@ -1441,6 +1441,7 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
     await lockFile.sync()
 
     const sourceDB = control.database
+    const sourceWithQueryCache = sourceDB as NativeSqliteDatabase & { clearQueryCache: () => void }
     oldSourceDB = sourceDB
     const sourceAccess = sourceDB as unknown as SqliteAccess
     sourceDB.exec("PRAGMA busy_timeout=0")
@@ -1468,6 +1469,8 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
       } catch {}
       return refused([`sqlite-exclusive-lock-unavailable:${error instanceof Error ? error.message : "unknown"}`])
     }
+    // Release pre-existing cached statements before later compactor queries can evict them from Bun's LRU cache.
+    sourceWithQueryCache.clearQueryCache()
     for (const filename of [sourcePath, `${sourcePath}-wal`, `${sourcePath}-shm`]) {
       if (filename !== sourcePath && !(await fileSize(filename))) continue
       const openSource = openPath(filename)
@@ -1552,11 +1555,14 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
       return refused(["restore-integrity-or-physical-measurement-failed"], { before, backup, staging, restored })
     }
 
+    // Finalize compactor-created statements while the exclusive writer fence is still held.
+    sourceWithQueryCache.clearQueryCache()
     await chmod(restorePath, 0)
     await chmod(sourcePath, 0)
     await rename(restorePath, sourcePath)
     replaced = true
-    sourceDB.close()
+    // A deferred SQLite close can leave a statement-backed descriptor on the replaced inode.
+    sourceDB.close(true)
     sourceClosed = true
     const oldInode = deletedFixtureInodeOpen(sourceIdentity)
     if (!oldInode.readable) {

@@ -267,6 +267,14 @@ function applyLegacySchemaOverrides(spec: OpenApiSpec) {
     schemas.Workspace.properties.directory = nullable(schemas.Workspace.properties.directory)
     schemas.Workspace.properties.extra = nullable(schemas.Workspace.properties.extra)
   }
+  // Null means the current process owns no assistant; do not collapse it into the older omitted-member shape.
+  for (const status of schemas.SessionStatus?.anyOf ?? []) {
+    const properties = status.properties
+    const kind = properties?.type?.enum?.[0]
+    const activeAssistantMessageID = properties?.activeAssistantMessageID
+    if ((kind === "busy" || kind === "retry") && activeAssistantMessageID)
+      properties.activeAssistantMessageID = nullable(activeAssistantMessageID)
+  }
   if (schemas.GlobalSession?.properties?.project)
     schemas.GlobalSession.properties.project = nullable(schemas.GlobalSession.properties.project)
   const providerOptions = schemas.ProviderConfig?.properties?.options

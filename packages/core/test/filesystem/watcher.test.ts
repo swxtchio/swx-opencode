@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test"
 import { mkdirSync, rmSync } from "fs"
 import fs from "fs/promises"
 import path from "path"
-import { ConfigProvider, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Scope, Stream } from "effect"
+import { ConfigProvider, Deferred, Duration, Effect, Exit, Layer, Option, Schema, Scope } from "effect"
 import { Config } from "@opencode-ai/core/config"
 import { ConfigWatcher } from "@opencode-ai/core/config/watcher"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -95,15 +95,14 @@ function wait(check: (event: WatcherEvent) => boolean) {
   return Effect.gen(function* () {
     const events = yield* EventV2.Service
     const deferred = yield* Deferred.make<WatcherEvent>()
-    const fiber = yield* events.subscribe(Watcher.Event.Updated).pipe(
-      Stream.runForEach((event) => {
-        if (!check(event.data)) return Effect.void
-        return Deferred.succeed(deferred, event.data).pipe(Effect.asVoid)
-      }),
-      Effect.forkScoped,
-    )
-    yield* Effect.yieldNow
-    return { deferred, fiber }
+    // Register before triggering; starting the lazy EventV2 stream is not a readiness acknowledgement.
+    const unsubscribe = yield* events.listen((event) => {
+      if (event.type !== Watcher.Event.Updated.type) return Effect.void
+      const data = Schema.decodeUnknownSync(Watcher.Event.Updated.data)(event.data)
+      if (!check(data)) return Effect.void
+      return Deferred.succeed(deferred, data).pipe(Effect.asVoid)
+    })
+    return { deferred, unsubscribe }
   })
 }
 
@@ -115,7 +114,7 @@ function maybeNextUpdate<E>(
   return Effect.acquireUseRelease(
     wait(check),
     ({ deferred }) => trigger.pipe(Effect.andThen(Deferred.await(deferred)), Effect.timeoutOption(timeout)),
-    ({ fiber }) => Fiber.interrupt(fiber),
+    ({ unsubscribe }) => unsubscribe,
   )
 }
 
@@ -123,7 +122,9 @@ function nextUpdate<E>(check: (event: WatcherEvent) => boolean, trigger: Effect.
   return Effect.gen(function* () {
     const result = yield* maybeNextUpdate(check, trigger)
     if (Option.isSome(result)) return result.value
-    return yield* Effect.fail(new Error("timed out waiting for file watcher update"))
+    const watcher = yield* Watcher.Service
+    const status = yield* watcher.status
+    return yield* Effect.fail(new Error(`timed out waiting for file watcher update: ${JSON.stringify(status)}`))
   })
 }
 
@@ -150,7 +151,7 @@ function noUpdate<E>(check: (event: WatcherEvent) => boolean, trigger: Effect.Ef
         Effect.timeoutOption(`${timeout} millis`),
         Effect.tap((result) => Effect.sync(() => expect(result).toEqual(Option.none()))),
       ),
-    ({ fiber }) => Fiber.interrupt(fiber),
+    ({ unsubscribe }) => unsubscribe,
   )
 }
 
@@ -291,6 +292,8 @@ describeWatcher("Watcher", () => {
               }
             })
           yield* gitState("active")
+          const readableBranch = `readable-${Math.random().toString(36).slice(2)}`
+          yield* Effect.promise(() => $`git branch ${readableBranch}`.cwd(directory).quiet())
           // A directory where HEAD was exists but cannot be read as a file, so the
           // watch callback's read fails the way a racing replacement can. Both steps
           // are synchronous, so no callback can run between them.
@@ -301,7 +304,10 @@ describeWatcher("Watcher", () => {
           expect(yield* gitState("unconfirmed")).toMatchObject({ reason: expect.stringContaining("EISDIR") })
           yield* Effect.promise(() => fs.rmdir(head))
           expect(
-            yield* nextUpdate((event) => event.file === head, afs.writeFileString(head, "ref: refs/heads/readable\n")),
+            yield* nextUpdate(
+              (event) => event.file === head,
+              afs.writeFileString(head, `ref: refs/heads/${readableBranch}\n`),
+            ),
           ).toMatchObject({ file: head })
           yield* gitState("active")
         }),

@@ -880,7 +880,10 @@ const layer = Layer.effect(
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             ctx.reasoningMap = {}
-            yield* status.set(ctx.sessionID, { type: "busy" })
+            yield* status.set(ctx.sessionID, {
+              type: "busy",
+              activeAssistantMessageID: ctx.assistantMessage.id,
+            })
             const stream = llm.stream(streamInput)
 
             yield* stream.pipe(
@@ -912,6 +915,7 @@ const layer = Layer.effect(
                     message: info.message,
                     action: info.action,
                     next: info.next,
+                    activeAssistantMessageID: ctx.assistantMessage.id,
                   })
                 },
               }),
