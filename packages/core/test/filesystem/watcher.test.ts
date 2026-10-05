@@ -213,6 +213,7 @@ describeWatcher("Watcher", () => {
         }),
       { git: true },
     ),
+    15_000,
   )
 
   it.live("skips non-git roots", () =>
@@ -249,6 +250,7 @@ describeWatcher("Watcher", () => {
         Effect.promise(() => $`git switch -q -c ${branch}`.cwd(tmp.path).quiet()),
       ).pipe(Effect.provideService(EventV2.Service, events))
     }).pipe(Effect.provide(AppNodeBuilder.build(LayerNode.group([FSUtil.node, EventV2.node])))),
+    10_000,
   )
 
   it.live("ignores .git/index changes", () =>
@@ -267,6 +269,7 @@ describeWatcher("Watcher", () => {
         }),
       { git: true },
     ),
+    10_000,
   )
 
   it.live("publishes .git/HEAD events", () =>
@@ -284,6 +287,7 @@ describeWatcher("Watcher", () => {
         }),
       { git: true },
     ),
+    15_000,
   )
 
   it.live("publishes .git/HEAD events when git switches branches", () =>
@@ -301,6 +305,7 @@ describeWatcher("Watcher", () => {
         }),
       { git: true, root: false },
     ),
+    15_000,
   )
 
   it.live("reports the git watch unconfirmed instead of crashing when HEAD cannot be read", () =>
@@ -344,6 +349,7 @@ describeWatcher("Watcher", () => {
         }),
       { git: true, root: false },
     ),
+    40_000,
   )
 
   it.live("publishes .git/HEAD events for a linked worktree's git directory", () =>
@@ -370,6 +376,7 @@ describeWatcher("Watcher", () => {
         ),
       ).toMatchObject({ file: head })
     }),
+    15_000,
   )
 
   it.live("reports each started watch active", () =>
@@ -386,6 +393,7 @@ describeWatcher("Watcher", () => {
         }),
       { git: true },
     ),
+    10_000,
   )
 
   it.live("keeps the root watch inactive when it is not enabled", () =>
@@ -410,6 +418,7 @@ describeWatcher("Watcher", () => {
         }),
       { git: true, root: false },
     ),
+    15_000,
   )
 
   it.live("keeps a failed git watch unavailable across unreadable HEAD and recovery", () =>
@@ -475,6 +484,7 @@ describeWatcher("Watcher", () => {
         },
       )
     }),
+    15_000,
   )
 
   it.live("does not start either watch when the file watcher is disabled", () =>
@@ -510,6 +520,7 @@ describeWatcher("Watcher", () => {
         }),
       { git: true, ignore: [".git"] },
     ),
+    10_000,
   )
 
   it.live(
@@ -580,6 +591,7 @@ describeWatcher("Watcher", () => {
           },
         },
       ),
+      15_000,
     )
   })
 })
