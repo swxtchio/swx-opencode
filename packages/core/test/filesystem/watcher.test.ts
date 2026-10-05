@@ -1,6 +1,6 @@
 import { $ } from "bun"
 import { describe, expect, test } from "bun:test"
-import { mkdirSync, rmSync } from "fs"
+import { mkdirSync, rmSync, rmdirSync, writeFileSync } from "fs"
 import type { FSWatcher } from "fs"
 import fs from "fs/promises"
 import path from "path"
@@ -32,6 +32,7 @@ type Options = {
   ignore?: string[]
   events?: EventV2.Interface
   onHeadWatcher?: (watcher: FSWatcher) => void
+  onHeadReadError?: (error: unknown) => void
   subscribeTimeout?: number
 }
 
@@ -69,10 +70,13 @@ function watcherLayer(directory: string, vcs?: Location.Interface["vcs"], option
     Location.Service,
     Location.Service.of(location({ directory: AbsolutePath.make(directory) }, { vcs })),
   )
-  const watcherNode = options?.onHeadWatcher
+  const watcherNode = options?.onHeadWatcher || options?.onHeadReadError
     ? makeLocationNode({
         service: Watcher.Service,
-        layer: Watcher.layerWith({ onHeadWatcher: options.onHeadWatcher }),
+        layer: Watcher.layerWith({
+          onHeadWatcher: options?.onHeadWatcher,
+          onHeadReadError: options?.onHeadReadError,
+        }),
         deps: [FSUtil.node, Location.node, Config.node, Git.node, EventV2.node],
       })
     : Watcher.node
@@ -408,15 +412,17 @@ describeWatcher("Watcher", () => {
     ),
   )
 
-  it.live("keeps a failed git watch unavailable while reconciliation publishes HEAD changes", () =>
+  it.live("keeps a failed git watch unavailable across unreadable HEAD and recovery", () =>
     Effect.gen(function* () {
       const headWatcher = { value: undefined as FSWatcher | undefined }
+      const headReadError = yield* Deferred.make<unknown>()
       yield* withTmp(
         (directory) =>
           Effect.gen(function* () {
             const watcher = yield* Watcher.Service
             const git = yield* Effect.promise(() => fs.realpath(path.join(directory, ".git")))
             const head = path.join(git, "HEAD")
+            const initial = yield* Effect.promise(() => fs.readFile(head, "utf8"))
             const branch = `reconcile-${Math.random().toString(36).slice(2)}`
             expect(yield* watcher.status).toEqual([{ watch: "git", directory: git, state: "active" }])
             const headError = new Error("native watch failed")
@@ -428,9 +434,8 @@ describeWatcher("Watcher", () => {
                 const closed = yield* Deferred.make<void>()
                 native.once("close", () => Deferred.doneUnsafe(closed, Effect.void))
                 native.emit("error", headError)
-                expect(
-                  Option.isSome(yield* Deferred.await(closed).pipe(Effect.timeoutOption("1 second"))),
-                ).toBe(true)
+                if (Option.isNone(yield* Deferred.await(closed).pipe(Effect.timeoutOption("1 second"))))
+                  return yield* Effect.fail(new Error("native git HEAD watcher did not close after its error"))
                 const failed = {
                   watch: "git" as const,
                   directory: git,
@@ -438,6 +443,21 @@ describeWatcher("Watcher", () => {
                   reason: headError.message,
                 }
                 expect(yield* watcher.status).toEqual([failed])
+                yield* Effect.sync(() => {
+                  rmSync(head)
+                  mkdirSync(head)
+                })
+                const readError = yield* Deferred.await(headReadError).pipe(Effect.timeoutOption("2 seconds"))
+                if (Option.isNone(readError))
+                  return yield* Effect.fail(new Error("watcher never observed the unreadable HEAD"))
+                expect(
+                  readError.value instanceof Error && "code" in readError.value ? readError.value.code : undefined,
+                ).toBe("EISDIR")
+                expect(yield* watcher.status).toEqual([failed])
+                yield* Effect.sync(() => {
+                  rmdirSync(head)
+                  writeFileSync(head, initial)
+                })
                 yield* Effect.promise(() => $`git switch -q -c ${branch}`.cwd(directory).quiet())
               }),
             )
@@ -447,7 +467,12 @@ describeWatcher("Watcher", () => {
               { watch: "git", directory: git, state: "unavailable", reason: headError.message },
             ])
           }),
-        { git: true, root: false, onHeadWatcher: (watcher) => (headWatcher.value = watcher) },
+        {
+          git: true,
+          root: false,
+          onHeadWatcher: (watcher) => (headWatcher.value = watcher),
+          onHeadReadError: (error) => Deferred.doneUnsafe(headReadError, Effect.succeed(error)),
+        },
       )
     }),
   )

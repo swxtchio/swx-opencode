@@ -58,7 +58,10 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 export const layerWith = (
   options: {
     workerTarget?: string | URL
+    // Test-only injection hook for lifecycle tests to drive the native watch handle.
     onHeadWatcher?: (watcher: ReturnType<typeof watch>) => void
+    // Test-only observer hook for lifecycle tests to see actual HEAD read failures.
+    onHeadReadError?: (error: unknown) => void
   } = {},
 ) =>
   Layer.effect(
@@ -123,11 +126,16 @@ export const layerWith = (
           function reconcileHead() {
             const read = readHead(head)
             if ("error" in read) {
-              if (nativeWatch.failed) return
+              if (nativeWatch.failed) {
+                options.onHeadReadError?.(read.error)
+                return
+              }
               const failed = failure("git", vcs, read.error)
               const current = statuses.get("git")
-              if (current?.state === "unconfirmed" && current.reason === failed.reason) return
-              return report({ ...failed, state: "unconfirmed" })
+              if (current?.state !== "unconfirmed" || current.reason !== failed.reason)
+                report({ ...failed, state: "unconfirmed" })
+              options.onHeadReadError?.(read.error)
+              return
             }
             if (!nativeWatch.failed && statuses.get("git")?.state === "unconfirmed")
               report({ watch: "git", directory: vcs, state: "active" })
