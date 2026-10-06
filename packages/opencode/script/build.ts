@@ -1,13 +1,16 @@
 #!/usr/bin/env bun
 
 import { $ } from "bun"
+import { createRequire } from "node:module"
 import path from "path"
 import { fileURLToPath } from "url"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
+import { fffBuildDefines, fffLibraryForTarget } from "@opencode-ai/script/fff-native"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const dir = path.resolve(__dirname, "..")
+const fffRequire = createRequire(import.meta.resolve("@ff-labs/fff-bun"))
 
 process.chdir(dir)
 
@@ -54,7 +57,7 @@ const embeddedFileMap = skipEmbedWebUi ? null : await createEmbeddedWebUIBundle(
 const treeSitterWorker = await Bun.file(fileURLToPath(import.meta.resolve("@opentui/core/parser.worker"))).text()
 
 const allTargets: {
-  os: string
+  os: "linux" | "darwin" | "win32"
   arch: "arm64" | "x64"
   abi?: "musl"
   avx2?: false
@@ -158,6 +161,7 @@ for (const item of targets) {
     .join("-")
   console.log(`building ${name}`)
   await $`mkdir -p dist/${name}/bin`
+  const nativeLibrary = await fffLibraryForTarget(item, (specifier) => fffRequire.resolve(specifier))
 
   const workerPath = "./src/cli/tui/worker.ts"
   const watcherWorkerPath = "./src/cli/watcher-worker.ts"
@@ -195,6 +199,7 @@ for (const item of targets) {
       ...(embeddedFileMap ? ["opencode-web-ui.gen.ts"] : []),
     ],
     define: {
+      ...fffBuildDefines(nativeLibrary),
       FFF_LIBC: JSON.stringify(item.abi === "musl" ? "musl" : "gnu"),
       OPENCODE_VERSION: `'${Script.version}'`,
       // The plugin SDK version THIS TREE was built against, taken from the
@@ -212,6 +217,8 @@ for (const item of targets) {
       ...(item.os === "linux" ? { "process.env.OPENTUI_LIBC": JSON.stringify(item.abi ?? "glibc") } : {}),
     },
   })
+
+  await Bun.write(`dist/${name}/bin/${nativeLibrary.filename}`, Bun.file(nativeLibrary.sourcePath))
 
   // Smoke test: only run if binary is for current platform
   if (item.os === process.platform && item.arch === process.arch && !item.abi) {

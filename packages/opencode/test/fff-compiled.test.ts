@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { getNpmPackageName } from "@ff-labs/fff-bun"
+import { fffBuildDefines, fffLibraryForTarget } from "@opencode-ai/script/fff-native"
 import fs from "node:fs/promises"
 import { createRequire } from "node:module"
 import path from "node:path"
@@ -10,11 +11,19 @@ const target =
   `bun-${targetPlatform}-${process.arch}${process.platform === "linux" && libc === "musl" ? "-musl" : ""}` as Bun.Build.CompileTarget
 const require = createRequire(import.meta.resolve("@ff-labs/fff-bun"))
 const executablePath = process.env.OPENCODE_FFF_TEST_BUN_EXECUTABLE
-const library = Buffer.from(await Bun.file(require.resolve(getNpmPackageName())).arrayBuffer())
+const nativeLibrary = await fffLibraryForTarget(
+  {
+    os: process.platform === "win32" ? "win32" : process.platform === "darwin" ? "darwin" : "linux",
+    arch: process.arch as "arm64" | "x64",
+    ...(process.platform === "linux" && libc === "musl" ? { abi: "musl" as const } : {}),
+  },
+  (specifier) => require.resolve(specifier),
+)
+const library = Buffer.from(await Bun.file(nativeLibrary.sourcePath).arrayBuffer())
 const extension = process.platform === "darwin" ? ".dylib" : process.platform === "win32" ? ".dll" : ".so"
 
 describe("compiled FFF extraction", () => {
-  test("reuses one matching native allocation across normal and forced exits", async () => {
+  test("keeps native search usable without temp allocations in the sidecar build", async () => {
     const dist = path.join(import.meta.dir, "../dist")
     await fs.mkdir(dist, { recursive: true })
     const root = await fs.mkdtemp(path.join(dist, "fff-compiled-"))
@@ -26,60 +35,58 @@ describe("compiled FFF extraction", () => {
       await fs.mkdir(temporary)
       await fs.writeFile(path.join(workspace, "src", "nested", "needle-target.ts"), "picker-content\n")
 
-      const build = await Bun.build({
-        entrypoints: [path.join(import.meta.dir, "fixture/fff-compiled.ts")],
-        format: "esm",
-        minify: true,
-        splitting: true,
-        define: { FFF_LIBC: JSON.stringify(libc) },
-        compile: {
-          autoloadBunfig: false,
-          autoloadDotenv: false,
-          target,
-          outfile: binary,
-          ...(executablePath ? { executablePath } : {}),
-        },
-      })
-      expect(build.success).toBe(true)
+      const build = async (outfile: string, externalLibrary?: string, executable?: string) =>
+        Bun.build({
+          entrypoints: [path.join(import.meta.dir, "fixture/fff-compiled.ts")],
+          format: "esm",
+          minify: true,
+          splitting: true,
+          define: {
+            ...(externalLibrary ? fffBuildDefines({ filename: externalLibrary }) : {}),
+            FFF_LIBC: JSON.stringify(libc),
+          },
+          compile: {
+            autoloadBunfig: false,
+            autoloadDotenv: false,
+            target,
+            outfile,
+            ...(executable ? { executablePath: executable } : {}),
+          },
+        })
 
-      const allocations = async () => {
-        const entries = await fs.readdir(temporary, { withFileTypes: true })
-        const candidates = (
-          await Promise.all(
-            entries.map(async (entry) => {
-              const directory = path.join(temporary, entry.name)
-              if (entry.isDirectory()) {
-                return (await fs.readdir(directory, { withFileTypes: true }))
-                  .filter((child) => child.isFile() && child.name.endsWith(extension))
-                  .map((child) => path.join(directory, child.name))
-              }
-              return entry.isFile() && entry.name.endsWith(extension) ? [directory] : []
-            }),
-          )
-        ).flat()
+      const allocations = async (temporaryDirectory: string) => {
+        const findLibraries = async (directory: string): Promise<string[]> => {
+          const entries = await fs.readdir(directory, { withFileTypes: true })
+          return (
+            await Promise.all(
+              entries.map(async (entry) => {
+                const file = path.join(directory, entry.name)
+                if (entry.isDirectory()) return findLibraries(file)
+                return entry.isFile() && entry.name.endsWith(extension) ? [file] : []
+              }),
+            )
+          ).flat()
+        }
 
-        return (
-          await Promise.all(
-            candidates.map(async (file) => ({ file, contentMatches: (await fs.readFile(file)).equals(library) })),
-          )
+        const candidates = await findLibraries(temporaryDirectory)
+        return Promise.all(
+          candidates.map(async (file) => {
+            const content = await fs.readFile(file)
+            return { file, byteLength: content.byteLength, contentMatches: content.equals(library) }
+          }),
         )
-          .filter((entry) => entry.contentMatches)
-          .map((entry) => entry.file)
       }
 
-      const launch = (mode: "complete" | "hold") =>
-        Bun.spawn([binary, workspace, mode], {
+      const launch = (executable: string, temporaryDirectory: string, mode: "complete" | "hold") =>
+        Bun.spawn([executable, workspace, mode], {
           cwd: root,
-          env: { ...process.env, BUN_TMPDIR: temporary, TMPDIR: temporary },
+          env: { ...process.env, BUN_TMPDIR: temporaryDirectory, TMPDIR: temporaryDirectory },
           stdout: "pipe",
           stderr: "pipe",
         })
 
-      const before = await allocations()
-      expect(before).toEqual([])
-
-      const complete = async () => {
-        const child = launch("complete")
+      const complete = async (executable: string, temporaryDirectory: string) => {
+        const child = launch(executable, temporaryDirectory, "complete")
         const timeout = setTimeout(() => child.kill("SIGKILL"), 15_000)
         try {
           const [stdout, stderr, status] = await Promise.all([
@@ -94,15 +101,12 @@ describe("compiled FFF extraction", () => {
         }
       }
 
-      await complete()
-      const afterFirstNormalExit = await allocations()
-      expect(afterFirstNormalExit).toHaveLength(1)
-      await complete()
-      const afterNormalExits = await allocations()
-      expect(afterNormalExits).toEqual(afterFirstNormalExit)
-
-      const forceExit = async () => {
-        const child = launch("hold")
+      const forceExit = async (
+        executable: string,
+        temporaryDirectory: string,
+        expected: Awaited<ReturnType<typeof allocations>>,
+      ) => {
+        const child = launch(executable, temporaryDirectory, "hold")
         const reader = child.stdout.getReader()
         const timeout = setTimeout(() => child.kill("SIGKILL"), 15_000)
         try {
@@ -113,18 +117,43 @@ describe("compiled FFF extraction", () => {
             output += new TextDecoder().decode(chunk.value)
           }
           expect(output.split("\n", 1)[0]).toBe("ready")
-          expect(await allocations()).toEqual(afterNormalExits)
+          expect(await allocations(temporaryDirectory)).toEqual(expected)
         } finally {
           clearTimeout(timeout)
           child.kill("SIGKILL")
         }
         expect(await child.exited).not.toBe(0)
-        expect(await allocations()).toEqual(afterNormalExits)
+        expect(await allocations(temporaryDirectory)).toEqual(expected)
       }
 
-      await forceExit()
-      await forceExit()
-      expect(await allocations()).toEqual(afterNormalExits)
+      const before = await allocations(temporary)
+      expect(before).toEqual([])
+
+      const embeddedBuild = await build(binary, undefined, executablePath)
+      expect(embeddedBuild.success).toBe(true)
+      await complete(binary, temporary)
+      const afterFirstNormalExit = await allocations(temporary)
+      expect(afterFirstNormalExit).toHaveLength(1)
+      expect(afterFirstNormalExit[0].contentMatches).toBe(true)
+      await complete(binary, temporary)
+      const afterNormalExits = await allocations(temporary)
+      expect(afterNormalExits).toEqual(afterFirstNormalExit)
+
+      const sidecarTemporary = path.join(root, "sidecar-tmp")
+      const sidecarBinary = path.join(root, "opencode-sidecar")
+      await fs.mkdir(sidecarTemporary)
+      await Bun.write(path.join(root, nativeLibrary.filename), Bun.file(nativeLibrary.sourcePath))
+      const sidecarBuild = await build(sidecarBinary, nativeLibrary.filename)
+      expect(sidecarBuild.success).toBe(true)
+      expect(await allocations(sidecarTemporary)).toEqual([])
+
+      await complete(sidecarBinary, sidecarTemporary)
+      expect(await allocations(sidecarTemporary)).toEqual([])
+      await complete(sidecarBinary, sidecarTemporary)
+      expect(await allocations(sidecarTemporary)).toEqual([])
+      await forceExit(sidecarBinary, sidecarTemporary, [])
+      await forceExit(sidecarBinary, sidecarTemporary, [])
+      expect(await allocations(sidecarTemporary)).toEqual([])
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
