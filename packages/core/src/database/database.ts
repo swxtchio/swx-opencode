@@ -25,20 +25,20 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const db = yield* makeDatabase
 
-    yield* db.run("PRAGMA journal_mode = WAL")
-    yield* db.run("PRAGMA synchronous = NORMAL")
     yield* db.run(`PRAGMA busy_timeout = ${nativeBusyTimeoutMs}`)
     yield* db.run("PRAGMA cache_size = -64000")
     yield* db.run("PRAGMA foreign_keys = ON")
-    yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
     yield* DatabaseMigration.apply(db)
+    yield* db.run("PRAGMA journal_mode = WAL")
+    yield* db.run("PRAGMA synchronous = NORMAL")
+    yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
 
     return { db }
   }).pipe(Effect.orDie),
 )
 
 export function layerFromPath(filename: string) {
-  return layer.pipe(Layer.provide(sqliteLayer({ filename })))
+  return layer.pipe(Layer.provide(sqliteLayer({ filename, disableWAL: true })))
 }
 
 export function path() {

@@ -114,6 +114,78 @@ describe("DatabaseMigration", () => {
       ),
     )
   })
+
+  test("uses incremental auto vacuum for a fresh database and keeps it after reopen", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "fresh.sqlite")
+    const inspect = Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      return {
+        auto_vacuum: yield* db.get<{ auto_vacuum: number }>(sql`PRAGMA auto_vacuum`),
+        session: yield* db.get<{ name: string }>(
+          sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session'`,
+        ),
+      }
+    })
+
+    const open = () =>
+      Effect.runPromise(
+        inspect.pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped),
+      )
+
+    expect(await open()).toEqual({ auto_vacuum: { auto_vacuum: 2 }, session: { name: "session" } })
+    expect(await open()).toEqual({ auto_vacuum: { auto_vacuum: 2 }, session: { name: "session" } })
+  }, 30_000)
+
+  test("preserves auto vacuum and data when opening an existing database", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "existing.sqlite")
+    const before = await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run("PRAGMA auto_vacuum = FULL")
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY, marker text NOT NULL)`)
+        yield* db.run(sql`INSERT INTO session (id, marker) VALUES ('ses_preserved', 'before-open')`)
+        yield* db.run(sql`CREATE TABLE migration (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`)
+        yield* Effect.forEach(migrations, (migration) =>
+          db.run(sql`INSERT INTO migration (id, time_completed) VALUES (${migration.id}, 1)`),
+        )
+
+        return {
+          auto_vacuum: yield* db.get<{ auto_vacuum: number }>(sql`PRAGMA auto_vacuum`),
+          session: yield* db.get<{ id: string; marker: string }>(
+            sql`SELECT id, marker FROM session WHERE id = 'ses_preserved'`,
+          ),
+        }
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, disableWAL: true })), Effect.scoped),
+    )
+    expect(before).toEqual({
+      auto_vacuum: { auto_vacuum: 1 },
+      session: { id: "ses_preserved", marker: "before-open" },
+    })
+
+    const inspect = Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      return {
+        auto_vacuum: yield* db.get<{ auto_vacuum: number }>(sql`PRAGMA auto_vacuum`),
+        session: yield* db.get<{ id: string; marker: string }>(
+          sql`SELECT id, marker FROM session WHERE id = 'ses_preserved'`,
+        ),
+      }
+    })
+    const open = () =>
+      Effect.runPromise(
+        inspect.pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped),
+      )
+    const after = {
+      auto_vacuum: { auto_vacuum: 1 },
+      session: { id: "ses_preserved", marker: "before-open" },
+    }
+
+    expect(await open()).toEqual(after)
+    expect(await open()).toEqual(after)
+  }, 30_000)
+
   if (process.platform === "linux") {
     // Sized from the admitted-load measurements recorded in swxtchio/swx-opencode#117.
     const migrationCheckBackstop = "180s"

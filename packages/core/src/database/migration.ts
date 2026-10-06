@@ -24,6 +24,7 @@ export function apply(db: Database) {
       )
       if (tables.some((table) => table.name === "session")) return yield* applyOnly(db, migrations)
       if (tables.length > 0) return yield* Effect.die("Database is not empty and has no session table")
+      yield* db.run("PRAGMA auto_vacuum = INCREMENTAL")
       yield* db.transaction((tx) =>
         Effect.gen(function* () {
           yield* schema.up(tx)
