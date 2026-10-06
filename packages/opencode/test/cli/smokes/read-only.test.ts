@@ -124,7 +124,7 @@ describe("opencode read-only commands (smoke)", () => {
           [
             { database: "relative.db", disableChannelDb: "", expected: path.join(data, "relative.db") },
             { database: ":memory:", disableChannelDb: "", expected: ":memory:" },
-            { database: "", disableChannelDb: "", expected: path.join(data, "opencode-local.db") },
+            { database: "", disableChannelDb: "1", expected: path.join(data, "opencode.db") },
             { database: "", disableChannelDb: "true", expected: path.join(data, "opencode.db") },
           ],
           (input) =>

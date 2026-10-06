@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test"
 import path from "node:path"
 import { resolvePath } from "../../src/database/resolve-path"
-import { InstallationChannel } from "../../src/installation/version"
 
 const data = path.resolve("opencode-database-path-data")
 const absolute = path.resolve("custom.db")
@@ -9,30 +8,30 @@ const cases = [
   {
     database: absolute,
     data,
-    channel: "local",
+    channel: "fixture",
     disableChannelDb: undefined,
     expected: absolute,
   },
   {
     database: "custom.db",
     data,
-    channel: "local",
+    channel: "fixture",
     disableChannelDb: undefined,
     expected: path.join(data, "custom.db"),
   },
   {
     database: ":memory:",
     data,
-    channel: "local",
+    channel: "fixture",
     disableChannelDb: undefined,
     expected: ":memory:",
   },
   {
     database: undefined,
     data,
-    channel: InstallationChannel,
+    channel: "fixture-channel",
     disableChannelDb: undefined,
-    expected: path.join(data, "opencode-local.db"),
+    expected: path.join(data, "opencode-fixture-channel.db"),
   },
   ...["latest", "beta", "prod"].map((channel) => ({
     database: undefined,
@@ -51,7 +50,7 @@ const cases = [
   ...["1", "true"].map((disableChannelDb) => ({
     database: undefined,
     data,
-    channel: "local",
+    channel: "feature/channel",
     disableChannelDb,
     expected: path.join(data, "opencode.db"),
   })),
