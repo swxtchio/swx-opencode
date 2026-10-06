@@ -67,6 +67,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#144** Make `opencode db path` print the selected path without initializing `AppRuntime` or SQLite, defer global directory creation to runtime initialization, and preserve explicit and channel-specific database path selection. _Upstreamable._
 - **#141** Reconcile `.git/HEAD` after an early or missed native callback through a shared read/change/publish path; keep a
   closed native watch `unavailable` while polling still delivers changed branch values. Cover root-off switches, native
   error/close, unreadable HEAD recovery and real EventV2 delivery; extend the root-event test bound beyond readiness and
