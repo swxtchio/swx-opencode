@@ -3,6 +3,7 @@ import { spawn } from "child_process"
 import { Database } from "@opencode-ai/core/database/database"
 import { Effect } from "effect"
 import { sql } from "drizzle-orm"
+import { cmd } from "./cmd"
 import { effectCmd } from "../effect-cmd"
 import { ExportUsageCommand } from "./db-export-usage"
 import { RetentionCommand } from "./db-retention"
@@ -44,19 +45,17 @@ const QueryCommand = effectCmd({
   }),
 })
 
-const PathCommand = effectCmd({
+const PathCommand = cmd({
   command: "path",
   describe: "print the database path",
-  instance: false,
-  handler: Effect.fn("Cli.db.path")(function* () {
+  handler() {
     console.log(Database.path())
-  }),
+  },
 })
 
-export const DbCommand = effectCmd({
+export const DbCommand = cmd({
   command: "db",
   describe: "database tools",
-  instance: false,
   builder: (yargs: Argv) => {
     return yargs
       .command(QueryCommand)
@@ -65,5 +64,5 @@ export const DbCommand = effectCmd({
       .command(RetentionCommand)
       .demandCommand()
   },
-  handler: Effect.fn("Cli.db")(function* () {}),
+  handler() {},
 })

@@ -7,9 +7,11 @@ import { FetchHttpClient } from "effect/unstable/http"
 import { OtlpSerialization } from "effect/unstable/observability"
 import { Logging } from "./observability/logging"
 import { Otlp } from "./observability/otlp"
+import { initialize } from "./global"
 
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
+    yield* Effect.promise(() => initialize())
     const logs = Logger.layer([...Logging.loggers(), ...Otlp.loggers()], { mergeWithExisting: false }).pipe(
       Layer.provide(NodeFileSystem.layer),
       Layer.provide(OtlpSerialization.layerJson),
