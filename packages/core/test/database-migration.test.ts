@@ -137,7 +137,7 @@ describe("DatabaseMigration", () => {
     expect(await open()).toEqual({ auto_vacuum: { auto_vacuum: 2 }, session: { name: "session" } })
   }, 30_000)
 
-  test("preserves auto vacuum and data when opening an existing database", async () => {
+  test("preserves auto vacuum and data while applying a pending migration to an existing database", async () => {
     await using tmp = await tmpdir()
     const filename = path.join(tmp.path, "existing.sqlite")
     const before = await Effect.runPromise(
@@ -146,13 +146,27 @@ describe("DatabaseMigration", () => {
         yield* db.run("PRAGMA auto_vacuum = FULL")
         yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY, marker text NOT NULL)`)
         yield* db.run(sql`INSERT INTO session (id, marker) VALUES ('ses_preserved', 'before-open')`)
+        yield* db.run(sql`CREATE TABLE message (session_id text NOT NULL, data text NOT NULL)`)
+        yield* db.run(sql`
+          INSERT INTO message (session_id, data)
+          VALUES ('ses_preserved', '{"role":"assistant","cost":1.25,"tokens":{"input":4,"output":3,"reasoning":1,"cache":{"read":2,"write":5}}}')
+        `)
+        yield* db.run(sql`CREATE TABLE journal_mode_seen (mode text NOT NULL)`)
+        yield* db.run(sql`
+          CREATE TRIGGER observe_migration_journal_mode AFTER UPDATE ON session BEGIN
+            INSERT INTO journal_mode_seen (mode)
+            SELECT journal_mode FROM pragma_journal_mode;
+          END
+        `)
         yield* db.run(sql`CREATE TABLE migration (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`)
-        yield* Effect.forEach(migrations, (migration) =>
-          db.run(sql`INSERT INTO migration (id, time_completed) VALUES (${migration.id}, 1)`),
+        yield* Effect.forEach(
+          migrations.filter((migration) => migration.id !== sessionUsageMigration.id),
+          (migration) => db.run(sql`INSERT INTO migration (id, time_completed) VALUES (${migration.id}, 1)`),
         )
 
         return {
           auto_vacuum: yield* db.get<{ auto_vacuum: number }>(sql`PRAGMA auto_vacuum`),
+          journal_mode: yield* db.get<{ journal_mode: string }>(sql`PRAGMA journal_mode`),
           session: yield* db.get<{ id: string; marker: string }>(
             sql`SELECT id, marker FROM session WHERE id = 'ses_preserved'`,
           ),
@@ -161,6 +175,7 @@ describe("DatabaseMigration", () => {
     )
     expect(before).toEqual({
       auto_vacuum: { auto_vacuum: 1 },
+      journal_mode: { journal_mode: "delete" },
       session: { id: "ses_preserved", marker: "before-open" },
     })
 
@@ -168,8 +183,9 @@ describe("DatabaseMigration", () => {
       const { db } = yield* Database.Service
       return {
         auto_vacuum: yield* db.get<{ auto_vacuum: number }>(sql`PRAGMA auto_vacuum`),
+        journal_mode_seen: yield* db.get<{ mode: string }>(sql`SELECT mode FROM journal_mode_seen`),
         session: yield* db.get<{ id: string; marker: string }>(
-          sql`SELECT id, marker FROM session WHERE id = 'ses_preserved'`,
+          sql`SELECT id, marker, cost, tokens_input, tokens_output FROM session WHERE id = 'ses_preserved'`,
         ),
       }
     })
@@ -179,7 +195,14 @@ describe("DatabaseMigration", () => {
       )
     const after = {
       auto_vacuum: { auto_vacuum: 1 },
-      session: { id: "ses_preserved", marker: "before-open" },
+      journal_mode_seen: { mode: "wal" },
+      session: {
+        id: "ses_preserved",
+        marker: "before-open",
+        cost: 1.25,
+        tokens_input: 4,
+        tokens_output: 3,
+      },
     }
 
     expect(await open()).toEqual(after)
