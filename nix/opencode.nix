@@ -56,6 +56,7 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     runHook preInstall
 
     install -Dm755 dist/opencode-*/bin/opencode $out/bin/opencode
+    install -Dm644 dist/opencode-*/bin/libfff_c-* -t $out/bin
     install -Dm644 schema.json $out/share/opencode/schema.json
 
     wrapProgram $out/bin/opencode \

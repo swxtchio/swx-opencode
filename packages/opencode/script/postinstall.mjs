@@ -27,6 +27,8 @@ const arch = archMap[os.arch()] ?? os.arch()
 const base = `opencode-${platform}-${arch}`
 const sourceBinary = platform === "windows" ? "opencode.exe" : "opencode"
 const targetBinary = path.join(__dirname, "bin", "opencode.exe")
+const nativeLibrary =
+  platform === "windows" ? /^fff_c-.+\.dll$/ : platform === "darwin" ? /^libfff_c-.+\.dylib$/ : /^libfff_c-.+\.so$/
 
 function supportsAvx2() {
   if (arch !== "x64") return false
@@ -118,9 +120,16 @@ function packageNames() {
 
 function resolveBinary(name) {
   const packageJsonPath = require.resolve(`${name}/package.json`)
-  const binaryPath = path.join(path.dirname(packageJsonPath), "bin", sourceBinary)
+  const binDirectory = path.join(path.dirname(packageJsonPath), "bin")
+  const binaryPath = path.join(binDirectory, sourceBinary)
   if (!fs.existsSync(binaryPath)) throw new Error(`Binary not found at ${binaryPath}`)
-  return binaryPath
+  return { binaryPath, libraryPath: resolveNativeLibrary(binDirectory) }
+}
+
+function resolveNativeLibrary(directory) {
+  const matches = fs.readdirSync(directory).filter((name) => nativeLibrary.test(name))
+  if (matches.length !== 1) throw new Error(`Expected one FFF native library in ${directory}, found ${matches.length}`)
+  return path.join(directory, matches[0])
 }
 
 function installPackage(name) {
@@ -136,7 +145,10 @@ function installPackage(name) {
     )
     if (result.status !== 0) return
     const packageDir = path.join(temp, "node_modules", name)
-    copyBinary(path.join(packageDir, "bin", sourceBinary), targetBinary)
+    const binDirectory = path.join(packageDir, "bin")
+    const libraryPath = resolveNativeLibrary(binDirectory)
+    copyNativeLibrary(libraryPath, path.join(__dirname, "bin", path.basename(libraryPath)))
+    copyBinary(path.join(binDirectory, sourceBinary), targetBinary)
     return true
   } finally {
     fs.rmSync(temp, { recursive: true, force: true })
@@ -155,6 +167,11 @@ function copyBinary(source, target) {
   fs.chmodSync(target, 0o755)
 }
 
+function copyNativeLibrary(source, target) {
+  if (fs.existsSync(target) && fs.readFileSync(source).equals(fs.readFileSync(target))) return
+  copyBinary(source, target)
+}
+
 function verifyBinary() {
   const result = childProcess.spawnSync(targetBinary, ["--version"], {
     encoding: "utf8",
@@ -167,7 +184,9 @@ function verifyBinary() {
 function main() {
   for (const name of packageNames()) {
     try {
-      copyBinary(resolveBinary(name), targetBinary)
+      const binary = resolveBinary(name)
+      copyNativeLibrary(binary.libraryPath, path.join(__dirname, "bin", path.basename(binary.libraryPath)))
+      copyBinary(binary.binaryPath, targetBinary)
       if (verifyBinary()) return
     } catch {
       if (installPackage(name) && verifyBinary()) return

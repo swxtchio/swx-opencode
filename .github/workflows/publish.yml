@@ -172,6 +172,19 @@ jobs:
           exclude-azure-developer-cli-credential: true
           exclude-interactive-browser-credential: true
 
+      - name: Sign Windows CLI native libraries
+        shell: pwsh
+        run: |
+          $files = @()
+          $files += Get-ChildItem "${{ github.workspace }}\packages\opencode\dist\opencode-windows-arm64\bin\fff_c-*.dll" | Select-Object -ExpandProperty FullName
+          $files += Get-ChildItem "${{ github.workspace }}\packages\opencode\dist\opencode-windows-x64\bin\fff_c-*.dll" | Select-Object -ExpandProperty FullName
+          $files += Get-ChildItem "${{ github.workspace }}\packages\opencode\dist\opencode-windows-x64-baseline\bin\fff_c-*.dll" | Select-Object -ExpandProperty FullName
+          if ($files.Count -ne 3) {
+            throw "Expected one FFF native library for each Windows target, found $($files.Count)"
+          }
+          $signPaths = @($files)
+          & "${{ github.workspace }}\script\sign-windows.ps1" @signPaths
+
       - name: Verify Windows CLI signatures
         shell: pwsh
         run: |
@@ -180,6 +193,14 @@ jobs:
             "${{ github.workspace }}\packages\opencode\dist\opencode-windows-x64\bin\opencode.exe",
             "${{ github.workspace }}\packages\opencode\dist\opencode-windows-x64-baseline\bin\opencode.exe"
           )
+          $native = @()
+          $native += Get-ChildItem "${{ github.workspace }}\packages\opencode\dist\opencode-windows-arm64\bin\fff_c-*.dll" | Select-Object -ExpandProperty FullName
+          $native += Get-ChildItem "${{ github.workspace }}\packages\opencode\dist\opencode-windows-x64\bin\fff_c-*.dll" | Select-Object -ExpandProperty FullName
+          $native += Get-ChildItem "${{ github.workspace }}\packages\opencode\dist\opencode-windows-x64-baseline\bin\fff_c-*.dll" | Select-Object -ExpandProperty FullName
+          if ($native.Count -ne 3) {
+            throw "Expected one FFF native library for each Windows target, found $($native.Count)"
+          }
+          $files += $native
 
           foreach ($file in $files) {
             $sig = Get-AuthenticodeSignature $file
