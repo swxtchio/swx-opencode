@@ -1,20 +1,11 @@
-// Tier-A smoke tests for read-only commands. Each test asserts only that the
-// command exits 0 and produces *some* output in the isolated harness env.
-//
-// These are not behavioral tests — they're the cheapest possible signal that
-// the dependency-layer wiring (config load, DB init, server boot, provider
-// resolution) doesn't crash for the broad class of "no inputs, no side
-// effects" commands. A regression in any shared layer (an Effect.fail that
-// propagates out of a service constructor, a renamed env var, a broken DB
-// migration) will fail one or more of these tests.
-//
-// If a future change should make one of these commands intentionally fail in
-// an empty env, update the assertion + add a note explaining the new contract.
+// Read-only command smoke tests, with a state-preservation regression for `db path`.
 //
 // Speed: each test pays ~1.5s for bun startup. 7 tests serialize within this
 // file. See script/prebuild-test-cli.ts for an opt-in pre-built binary that
 // cuts per-spawn cost when this suite gets bigger.
 import { describe, expect } from "bun:test"
+import fs from "node:fs"
+import path from "node:path"
 import { Effect } from "effect"
 import { cliIt } from "../../lib/cli-process"
 
@@ -98,17 +89,58 @@ describe("opencode read-only commands (smoke)", () => {
     60_000,
   )
 
-  // `db path` prints the DB file location. Under harness isolation the DB
-  // resolves to SQLite's `:memory:` (no on-disk pollution between tests);
-  // in production it'd be a path under OPENCODE_TEST_HOME / XDG_DATA_HOME.
-  // Accept either form — both prove the resolver ran without crashing.
   cliIt.live(
-    "db path: exits 0 and prints a path or :memory:",
-    ({ opencode }) =>
+    "db path: prints the selected path without opening the database or creating defaults",
+    ({ home, opencode }) =>
       Effect.gen(function* () {
-        const r = yield* opencode.spawn(["db", "path"])
+        const data = path.join(home, ".local/share/opencode")
+        const database = path.join(data, "sentinel.db")
+        const defaults = [
+          data,
+          database,
+          `${database}-wal`,
+          `${database}-shm`,
+          path.join(home, ".config/opencode"),
+          path.join(home, ".local/state/opencode"),
+          path.join(home, ".cache/opencode"),
+          path.join(home, ".tmp/opencode"),
+          path.join(home, ".local/share/opencode/log"),
+          path.join(home, ".local/share/opencode/repos"),
+          path.join(home, ".cache/opencode/bin"),
+        ]
+        expect(defaults.filter(fs.existsSync)).toEqual([])
+
+        const r = yield* opencode.spawn(["db", "path"], {
+          env: {
+            OPENCODE_DB: database,
+            TMPDIR: path.join(home, ".tmp"),
+          },
+        })
         opencode.expectExit(r, 0, "db path")
-        expect(r.stdout.trim()).toMatch(/^(:memory:|[/\\].+\.(db|sqlite|sqlite3))$/i)
+        expect(r.stdout.trim()).toBe(database)
+        expect(defaults.filter(fs.existsSync)).toEqual([])
+
+        yield* Effect.forEach(
+          [
+            { database: "relative.db", disableChannelDb: "", expected: path.join(data, "relative.db") },
+            { database: ":memory:", disableChannelDb: "", expected: ":memory:" },
+            { database: "", disableChannelDb: "1", expected: path.join(data, "opencode.db") },
+            { database: "", disableChannelDb: "true", expected: path.join(data, "opencode.db") },
+          ],
+          (input) =>
+            Effect.gen(function* () {
+              const result = yield* opencode.spawn(["db", "path"], {
+                env: {
+                  OPENCODE_DB: input.database,
+                  OPENCODE_DISABLE_CHANNEL_DB: input.disableChannelDb,
+                  TMPDIR: path.join(home, ".tmp"),
+                },
+              })
+              opencode.expectExit(result, 0, "db path")
+              expect(result.stdout.trim()).toBe(input.expected)
+              expect(defaults.filter(fs.existsSync)).toEqual([])
+            }),
+        )
       }),
     60_000,
   )

@@ -1,4 +1,5 @@
 import { NodeHttpServer, NodeServices } from "@effect/platform-node"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Config, Layer } from "effect"
 import { HttpClient, HttpClientRequest, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
@@ -17,6 +18,17 @@ export const httpApiLayer = servedRoutes.pipe(
   Layer.provideMerge(NodeHttpServer.layerTest),
   Layer.provideMerge(NodeServices.layer),
 )
+
+export function httpApiLayerWithAppReplacements(replacements: LayerNode.Replacements): typeof httpApiLayer {
+  return HttpRouter.serve(HttpApiApp.createRoutes(undefined, replacements), {
+    disableListenLog: true,
+    disableLogger: true,
+  }).pipe(
+    Layer.provide(layerWebSocketConstructorGlobal),
+    Layer.provideMerge(NodeHttpServer.layerTest),
+    Layer.provideMerge(NodeServices.layer),
+  ) as typeof httpApiLayer
+}
 
 export function request(path: string, init?: RequestInit) {
   const url = new URL(path, "http://localhost")

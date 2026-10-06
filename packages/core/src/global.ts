@@ -29,18 +29,7 @@ const paths = {
 }
 
 export const Path = paths
-
 Flock.setGlobal({ state })
-
-await Promise.all([
-  fs.mkdir(Path.data, { recursive: true }),
-  fs.mkdir(Path.config, { recursive: true }),
-  fs.mkdir(Path.state, { recursive: true }),
-  fs.mkdir(Path.tmp, { recursive: true }),
-  fs.mkdir(Path.log, { recursive: true }),
-  fs.mkdir(Path.bin, { recursive: true }),
-  fs.mkdir(Path.repos, { recursive: true }),
-])
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Global") {}
 
@@ -71,9 +60,22 @@ export function make(input: Partial<Interface> = {}): Interface {
   }
 }
 
+// Path inspection imports Global to read its paths, so directory creation belongs to runtime initialization.
+export function initialize() {
+  return Promise.all([
+    fs.mkdir(Path.data, { recursive: true }),
+    fs.mkdir(Path.config, { recursive: true }),
+    fs.mkdir(Path.state, { recursive: true }),
+    fs.mkdir(Path.tmp, { recursive: true }),
+    fs.mkdir(Path.log, { recursive: true }),
+    fs.mkdir(Path.bin, { recursive: true }),
+    fs.mkdir(Path.repos, { recursive: true }),
+  ]).then(() => undefined)
+}
+
 const layer = Layer.effect(
   Service,
-  Effect.sync(() => Service.of(make())),
+  Effect.promise(() => initialize().then(() => Service.of(make()))),
 )
 
 export const node = makeGlobalNode({ service: Service, layer: layer, deps: [] })

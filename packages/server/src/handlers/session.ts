@@ -356,11 +356,19 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       )
       .handle(
         "session.events",
-        Effect.fn((ctx) =>
-          Effect.succeed(
-            session.events({ sessionID: ctx.params.sessionID, after: ctx.query.after }).pipe(Stream.orDie),
-          ),
-        ),
+        Effect.fn(function* (ctx) {
+          yield* session.assertReplayable(ctx.params.sessionID).pipe(
+            Effect.catchTag("Session.NotFoundError", (error) =>
+              Effect.fail(
+                new SessionNotFoundError({
+                  sessionID: error.sessionID,
+                  message: `Session not found: ${error.sessionID}`,
+                }),
+              ),
+            ),
+          )
+          return session.events({ sessionID: ctx.params.sessionID, after: ctx.query.after }).pipe(Stream.orDie)
+        }),
       )
       .handle(
         "session.interrupt",

@@ -4,7 +4,7 @@ import fs from "node:fs/promises"
 import Http from "node:http"
 import path from "node:path"
 import { NodeHttpServer } from "@effect/platform-node"
-import { Effect, Exit, Fiber, Layer, Schema } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { eq } from "drizzle-orm"
 import { GlobalBus, type GlobalEvent } from "@/bus/global"
@@ -18,6 +18,7 @@ import { SessionID } from "@/session/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { EventSequenceTable } from "@opencode-ai/core/event/sql"
+import { EventV2 } from "@opencode-ai/core/event"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideTmpdirInstance, requireInstance, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -32,6 +33,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { applyRetentionFixture } from "../fixture/session-retention"
 
 const originalEnv = {
   OPENCODE_AUTH_CONTENT: process.env.OPENCODE_AUTH_CONTENT,
@@ -1713,5 +1715,29 @@ describe("workspace waitForSync", () => {
       }),
     { git: true },
     7000,
+  )
+
+  it.instance(
+    "refuses to warp a redacted Session before sending its event rows",
+    () =>
+      Effect.gen(function* () {
+        const session = yield* SessionNs.Service
+        const workspace = yield* Workspace.Service
+        const info = yield* session.create({ title: "redacted warp" })
+        yield* applyRetentionFixture(info.id)
+
+        const result = yield* workspace
+          .sessionWarp({
+            workspaceID: WorkspaceV2.ID.ascending("wrk_redacted_warp"),
+            sessionID: info.id,
+            copyChanges: true,
+          })
+          .pipe(Effect.exit)
+
+        expect(Exit.isFailure(result)).toBe(true)
+        if (Exit.isFailure(result))
+          expect(Cause.squash(result.cause)).toBeInstanceOf(EventV2.UnreplayableAggregateError)
+      }),
+    { git: true },
   )
 })

@@ -5,6 +5,7 @@ import { PublicApi } from "../../src/server/routes/instance/httpapi/public"
 type Method = "get" | "post" | "put" | "delete" | "patch"
 type OpenApiSchema = {
   readonly $ref?: string
+  readonly additionalProperties?: OpenApiSchema | boolean
   readonly anyOf?: ReadonlyArray<OpenApiSchema>
   readonly type?: string
   readonly enum?: readonly unknown[]
@@ -68,6 +69,30 @@ function componentNames(response: OpenApiResponse | undefined) {
 function isBuiltInEndpointError(name: string) {
   return name.startsWith("EffectHttpApiError") || name.startsWith("effect_HttpApiError_")
 }
+
+describe("PublicApi legacy session status", () => {
+  test("documents nullable active assistant IDs in legacy session status and status-map responses", () => {
+    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const status = spec.components.schemas.SessionStatus
+    const ownerStatuses = (status?.anyOf ?? []).filter((variant) => {
+      const kind = variant.properties?.type?.enum?.[0]
+      return (kind === "busy" || kind === "retry") && variant.properties?.activeAssistantMessageID !== undefined
+    })
+    expect(ownerStatuses).toHaveLength(2)
+    ownerStatuses.forEach((variant) => {
+      expect(variant.properties?.activeAssistantMessageID?.anyOf).toEqual(
+        expect.arrayContaining([expect.objectContaining({ type: "null" })]),
+      )
+    })
+
+    const response = spec.paths["/session/status"]?.get?.responses?.["200"]?.content?.["application/json"]?.schema
+    const statusMap = response?.$ref ? spec.components.schemas[componentName(response.$ref)] : response
+    const values = statusMap?.additionalProperties
+    expect(typeof values === "object" && values !== null ? values.$ref : undefined).toBe(
+      "#/components/schemas/SessionStatus",
+    )
+  })
+})
 
 describe("PublicApi OpenAPI v2 errors", () => {
   test("includes plugin-facing core schemas", () => {

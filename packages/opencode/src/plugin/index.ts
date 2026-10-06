@@ -24,6 +24,7 @@ import { CerebrasPlugin } from "./cerebras"
 import { SnowflakeCortexAuthPlugin } from "./snowflake-cortex"
 import { Effect, Layer, Context } from "effect"
 import { EffectBridge } from "@/effect/bridge"
+import { InstancePromise } from "@/effect/instance-promise"
 import { InstanceState } from "@/effect/instance-state"
 import { errorMessage } from "@/util/error"
 import { PluginLoader } from "./loader"
@@ -140,7 +141,7 @@ const layer = Layer.effect(
           bridge.fork(events.publish(Session.Event.Error, { error: new NamedError.Unknown({ message }).toObject() }))
         }
 
-        const { Server } = yield* Effect.promise(() => import("../server/server"))
+        const { Server } = yield* InstancePromise.from(() => import("../server/server"))
 
         const serverUrl = Server.url
         const client = createOpencodeClient({
@@ -168,7 +169,7 @@ const layer = Layer.effect(
         }
 
         for (const plugin of flags.disableDefaultPlugins ? [] : internalPlugins(flags)) {
-          const init = yield* Effect.tryPromise({
+          const init = yield* InstancePromise.tryPromise({
             try: () => plugin(input),
             catch: errorMessage,
           }).pipe(
@@ -183,7 +184,7 @@ const layer = Layer.effect(
         }
         if (plugins.length) yield* config.waitForDependencies()
 
-        const loaded = yield* Effect.promise(() =>
+        const loaded = yield* InstancePromise.from(() =>
           PluginLoader.loadExternal({
             items: plugins,
             kind: "server",
@@ -221,7 +222,7 @@ const layer = Layer.effect(
 
           // Keep plugin execution sequential so hook registration and execution
           // order remains deterministic across plugin runs.
-          yield* Effect.tryPromise({
+          yield* InstancePromise.tryPromise({
             try: () => applyPlugin(load, input, hooks),
             catch: (err) => {
               const message = errorMessage(err)
@@ -243,7 +244,7 @@ const layer = Layer.effect(
 
         // Notify plugins of current config
         for (const hook of hooks) {
-          yield* Effect.tryPromise({
+          yield* InstancePromise.tryPromise({
             try: () => Promise.resolve((hook as any).config?.(cfg)),
             catch: errorMessage,
           }).pipe(
@@ -291,7 +292,7 @@ const layer = Layer.effect(
       for (const hook of s.hooks) {
         const fn = hook[name] as any
         if (!fn) continue
-        yield* Effect.promise(async () => fn(input, output))
+        yield* Effect.promise(() => Promise.resolve().then(() => fn(input, output)))
       }
       return output
     })

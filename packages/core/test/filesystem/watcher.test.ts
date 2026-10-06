@@ -1,16 +1,19 @@
 import { $ } from "bun"
 import { describe, expect, test } from "bun:test"
-import { mkdirSync, rmSync } from "fs"
+import { mkdirSync, rmSync, rmdirSync, writeFileSync } from "fs"
+import type { FSWatcher } from "fs"
 import fs from "fs/promises"
 import path from "path"
-import { ConfigProvider, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Scope, Stream } from "effect"
+import { ConfigProvider, Deferred, Duration, Effect, Exit, Layer, Option, Schema, Scope } from "effect"
 import { Config } from "@opencode-ai/core/config"
 import { ConfigWatcher } from "@opencode-ai/core/config/watcher"
+import { makeLocationNode } from "@opencode-ai/core/effect/app-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
+import { Git } from "@opencode-ai/core/git"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { location } from "../fixture/location"
@@ -23,7 +26,15 @@ type WatcherEvent = { file: string; event: "add" | "change" | "unlink" }
 
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([FSUtil.node, EventV2.node])))
 
-type Options = { root?: boolean; ignore?: string[]; events?: EventV2.Interface; subscribeTimeout?: number }
+type Options = {
+  root?: boolean
+  disable?: boolean
+  ignore?: string[]
+  events?: EventV2.Interface
+  onHeadWatcher?: (watcher: FSWatcher) => void
+  onHeadReadError?: (error: unknown) => void
+  subscribeTimeout?: number
+}
 
 function provide(directory: string, vcs?: Location.Interface["vcs"], options?: Options) {
   return Effect.provide(watcherLayer(directory, vcs, options))
@@ -49,7 +60,7 @@ function watcherLayer(directory: string, vcs?: Location.Interface["vcs"], option
   const flagsLayer = ConfigProvider.layer(
     ConfigProvider.fromUnknown({
       OPENCODE_EXPERIMENTAL_FILEWATCHER: options?.root === false ? "false" : "true",
-      OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: "false",
+      OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: options?.disable ? "true" : "false",
       ...(options?.subscribeTimeout === undefined
         ? {}
         : { OPENCODE_EXPERIMENTAL_WATCHER_SUBSCRIBE_TIMEOUT_MS: String(options.subscribeTimeout) }),
@@ -59,11 +70,24 @@ function watcherLayer(directory: string, vcs?: Location.Interface["vcs"], option
     Location.Service,
     Location.Service.of(location({ directory: AbsolutePath.make(directory) }, { vcs })),
   )
-  return AppNodeBuilder.build(Watcher.node, [
-    [Config.node, configLayer],
-    [Location.node, locationLayer],
-    ...(options?.events ? [[EventV2.node, Layer.succeed(EventV2.Service, options.events)] as const] : []),
-  ]).pipe(Layer.provide(flagsLayer))
+  const watcherNode = options?.onHeadWatcher || options?.onHeadReadError
+    ? makeLocationNode({
+        service: Watcher.Service,
+        layer: Watcher.layerWith({
+          onHeadWatcher: options?.onHeadWatcher,
+          onHeadReadError: options?.onHeadReadError,
+        }),
+        deps: [FSUtil.node, Location.node, Config.node, Git.node, EventV2.node],
+      })
+    : Watcher.node
+  return AppNodeBuilder.build(
+    watcherNode,
+    [
+      [Config.node, configLayer],
+      [Location.node, locationLayer],
+      ...(options?.events ? [[EventV2.node, Layer.succeed(EventV2.Service, options.events)] as const] : []),
+    ],
+  ).pipe(Layer.provide(flagsLayer))
 }
 
 function withTmp<A, E, R>(
@@ -95,15 +119,14 @@ function wait(check: (event: WatcherEvent) => boolean) {
   return Effect.gen(function* () {
     const events = yield* EventV2.Service
     const deferred = yield* Deferred.make<WatcherEvent>()
-    const fiber = yield* events.subscribe(Watcher.Event.Updated).pipe(
-      Stream.runForEach((event) => {
-        if (!check(event.data)) return Effect.void
-        return Deferred.succeed(deferred, event.data).pipe(Effect.asVoid)
-      }),
-      Effect.forkScoped,
-    )
-    yield* Effect.yieldNow
-    return { deferred, fiber }
+    // Register before triggering; starting the lazy EventV2 stream is not a readiness acknowledgement.
+    const unsubscribe = yield* events.listen((event) => {
+      if (event.type !== Watcher.Event.Updated.type) return Effect.void
+      const data = Schema.decodeUnknownSync(Watcher.Event.Updated.data)(event.data)
+      if (!check(data)) return Effect.void
+      return Deferred.succeed(deferred, data).pipe(Effect.asVoid)
+    })
+    return { deferred, unsubscribe }
   })
 }
 
@@ -115,7 +138,7 @@ function maybeNextUpdate<E>(
   return Effect.acquireUseRelease(
     wait(check),
     ({ deferred }) => trigger.pipe(Effect.andThen(Deferred.await(deferred)), Effect.timeoutOption(timeout)),
-    ({ fiber }) => Fiber.interrupt(fiber),
+    ({ unsubscribe }) => unsubscribe,
   )
 }
 
@@ -123,7 +146,9 @@ function nextUpdate<E>(check: (event: WatcherEvent) => boolean, trigger: Effect.
   return Effect.gen(function* () {
     const result = yield* maybeNextUpdate(check, trigger)
     if (Option.isSome(result)) return result.value
-    return yield* Effect.fail(new Error("timed out waiting for file watcher update"))
+    const watcher = yield* Watcher.Service
+    const status = yield* watcher.status
+    return yield* Effect.fail(new Error(`timed out waiting for file watcher update: ${JSON.stringify(status)}`))
   })
 }
 
@@ -150,7 +175,7 @@ function noUpdate<E>(check: (event: WatcherEvent) => boolean, trigger: Effect.Ef
         Effect.timeoutOption(`${timeout} millis`),
         Effect.tap((result) => Effect.sync(() => expect(result).toEqual(Option.none()))),
       ),
-    ({ fiber }) => Fiber.interrupt(fiber),
+    ({ unsubscribe }) => unsubscribe,
   )
 }
 
@@ -188,6 +213,7 @@ describeWatcher("Watcher", () => {
         }),
       { git: true },
     ),
+    30_000,
   )
 
   it.live("skips non-git roots", () =>
@@ -208,6 +234,7 @@ describeWatcher("Watcher", () => {
         Effect.promise(() => tmpdir()),
         (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
       )
+      yield* Effect.promise(() => gitInit(tmp.path))
       yield* ready(tmp.path).pipe(
         provide(tmp.path, { type: "git", store: AbsolutePath.make(path.join(tmp.path, ".git")) }),
         Effect.scoped,
@@ -216,7 +243,14 @@ describeWatcher("Watcher", () => {
       yield* noUpdate((event) => event.file === file, fs.writeFileString(file, "gone")).pipe(
         Effect.provideService(EventV2.Service, events),
       )
+      const head = path.join(tmp.path, ".git", "HEAD")
+      const branch = `after-dispose-${Math.random().toString(36).slice(2)}`
+      yield* noUpdate(
+        (event) => event.file === head,
+        Effect.promise(() => $`git switch -q -c ${branch}`.cwd(tmp.path).quiet()),
+      ).pipe(Effect.provideService(EventV2.Service, events))
     }).pipe(Effect.provide(AppNodeBuilder.build(LayerNode.group([FSUtil.node, EventV2.node])))),
+    10_000,
   )
 
   it.live("ignores .git/index changes", () =>
@@ -235,6 +269,7 @@ describeWatcher("Watcher", () => {
         }),
       { git: true },
     ),
+    10_000,
   )
 
   it.live("publishes .git/HEAD events", () =>
@@ -252,6 +287,7 @@ describeWatcher("Watcher", () => {
         }),
       { git: true },
     ),
+    15_000,
   )
 
   it.live("publishes .git/HEAD events when git switches branches", () =>
@@ -269,6 +305,7 @@ describeWatcher("Watcher", () => {
         }),
       { git: true, root: false },
     ),
+    15_000,
   )
 
   it.live("reports the git watch unconfirmed instead of crashing when HEAD cannot be read", () =>
@@ -291,6 +328,8 @@ describeWatcher("Watcher", () => {
               }
             })
           yield* gitState("active")
+          const readableBranch = `readable-${Math.random().toString(36).slice(2)}`
+          yield* Effect.promise(() => $`git branch ${readableBranch}`.cwd(directory).quiet())
           // A directory where HEAD was exists but cannot be read as a file, so the
           // watch callback's read fails the way a racing replacement can. Both steps
           // are synchronous, so no callback can run between them.
@@ -301,12 +340,16 @@ describeWatcher("Watcher", () => {
           expect(yield* gitState("unconfirmed")).toMatchObject({ reason: expect.stringContaining("EISDIR") })
           yield* Effect.promise(() => fs.rmdir(head))
           expect(
-            yield* nextUpdate((event) => event.file === head, afs.writeFileString(head, "ref: refs/heads/readable\n")),
+            yield* nextUpdate(
+              (event) => event.file === head,
+              afs.writeFileString(head, `ref: refs/heads/${readableBranch}\n`),
+            ),
           ).toMatchObject({ file: head })
           yield* gitState("active")
         }),
       { git: true, root: false },
     ),
+    40_000,
   )
 
   it.live("publishes .git/HEAD events for a linked worktree's git directory", () =>
@@ -333,6 +376,7 @@ describeWatcher("Watcher", () => {
         ),
       ).toMatchObject({ file: head })
     }),
+    15_000,
   )
 
   it.live("reports each started watch active", () =>
@@ -349,6 +393,7 @@ describeWatcher("Watcher", () => {
         }),
       { git: true },
     ),
+    10_000,
   )
 
   it.live("keeps the root watch inactive when it is not enabled", () =>
@@ -362,14 +407,103 @@ describeWatcher("Watcher", () => {
           const file = path.join(directory, "root-off.txt")
           yield* noUpdate((event) => event.file === file, afs.writeFileString(file, "off"))
           const branch = `switch-${Math.random().toString(36).slice(2)}`
+          const head = path.join(git, "HEAD")
           expect(
             yield* nextUpdate(
-              (event) => event.file === path.join(git, "HEAD"),
+              (event) => event.file === head && event.event === "change",
               Effect.promise(() => $`git switch -q -c ${branch}`.cwd(directory).quiet()),
             ),
-          ).toMatchObject({ file: path.join(git, "HEAD") })
+          ).toEqual({ file: head, event: "change" })
+          expect(yield* Effect.promise(() => fs.readFile(head, "utf8"))).toBe(`ref: refs/heads/${branch}\n`)
         }),
       { git: true, root: false },
+    ),
+    15_000,
+  )
+
+  it.live("keeps a failed git watch unavailable across unreadable HEAD and recovery", () =>
+    Effect.gen(function* () {
+      const headWatcher = { value: undefined as FSWatcher | undefined }
+      const headReadError = yield* Deferred.make<unknown>()
+      yield* withTmp(
+        (directory) =>
+          Effect.gen(function* () {
+            const watcher = yield* Watcher.Service
+            const git = yield* Effect.promise(() => fs.realpath(path.join(directory, ".git")))
+            const head = path.join(git, "HEAD")
+            const initial = yield* Effect.promise(() => fs.readFile(head, "utf8"))
+            const branch = `reconcile-${Math.random().toString(36).slice(2)}`
+            expect(yield* watcher.status).toEqual([{ watch: "git", directory: git, state: "active" }])
+            const headError = new Error("native watch failed")
+            const event = yield* nextUpdate(
+              (item) => item.file === head && item.event === "change",
+              Effect.gen(function* () {
+                const native = headWatcher.value
+                if (!native) return yield* Effect.fail(new Error("git HEAD watch was not captured"))
+                const closed = yield* Deferred.make<void>()
+                native.once("close", () => Deferred.doneUnsafe(closed, Effect.void))
+                native.emit("error", headError)
+                if (Option.isNone(yield* Deferred.await(closed).pipe(Effect.timeoutOption("1 second"))))
+                  return yield* Effect.fail(new Error("native git HEAD watcher did not close after its error"))
+                const failed = {
+                  watch: "git" as const,
+                  directory: git,
+                  state: "unavailable" as const,
+                  reason: headError.message,
+                }
+                expect(yield* watcher.status).toEqual([failed])
+                yield* Effect.sync(() => {
+                  rmSync(head)
+                  mkdirSync(head)
+                })
+                const readError = yield* Deferred.await(headReadError).pipe(Effect.timeoutOption("2 seconds"))
+                if (Option.isNone(readError))
+                  return yield* Effect.fail(new Error("watcher never observed the unreadable HEAD"))
+                expect(
+                  readError.value instanceof Error && "code" in readError.value ? readError.value.code : undefined,
+                ).toBe("EISDIR")
+                expect(yield* watcher.status).toEqual([failed])
+                yield* Effect.sync(() => {
+                  rmdirSync(head)
+                  writeFileSync(head, initial)
+                })
+                yield* Effect.promise(() => $`git switch -q -c ${branch}`.cwd(directory).quiet())
+              }),
+            )
+            expect(event).toEqual({ file: head, event: "change" })
+            expect(yield* Effect.promise(() => fs.readFile(head, "utf8"))).toBe(`ref: refs/heads/${branch}\n`)
+            expect(yield* watcher.status).toEqual([
+              { watch: "git", directory: git, state: "unavailable", reason: headError.message },
+            ])
+          }),
+        {
+          git: true,
+          root: false,
+          onHeadWatcher: (watcher) => (headWatcher.value = watcher),
+          onHeadReadError: (error) => Deferred.doneUnsafe(headReadError, Effect.succeed(error)),
+        },
+      )
+    }),
+    15_000,
+  )
+
+  it.live("does not start either watch when the file watcher is disabled", () =>
+    withTmp(
+      (directory) =>
+        Effect.gen(function* () {
+          const afs = yield* FSUtil.Service
+          const watcher = yield* Watcher.Service
+          expect(yield* watcher.status).toEqual([])
+          const file = path.join(directory, "disabled.txt")
+          yield* noUpdate((event) => event.file === file, afs.writeFileString(file, "off"))
+          const head = path.join(directory, ".git", "HEAD")
+          const branch = `disabled-${Math.random().toString(36).slice(2)}`
+          yield* noUpdate(
+            (event) => event.file === head,
+            Effect.promise(() => $`git switch -q -c ${branch}`.cwd(directory).quiet()),
+          )
+        }),
+      { git: true, disable: true },
     ),
   )
 
@@ -386,6 +520,7 @@ describeWatcher("Watcher", () => {
         }),
       { git: true, ignore: [".git"] },
     ),
+    10_000,
   )
 
   it.live(
@@ -456,6 +591,7 @@ describeWatcher("Watcher", () => {
           },
         },
       ),
+      15_000,
     )
   })
 })

@@ -1,8 +1,9 @@
 export * as SessionStore from "./store"
 
-import { eq } from "drizzle-orm"
+import { and, eq } from "drizzle-orm"
 import { Context, Effect, Layer, Schema } from "effect"
 import { Database } from "../database/database"
+import { EventV2 } from "../event"
 import { makeGlobalNode } from "../effect/app-node"
 import { SessionHistory } from "./history"
 import { MessageDecodeError } from "./error"
@@ -18,9 +19,10 @@ export interface Interface {
     sessionID: SessionSchema.ID,
     baselineSeq: number,
   ) => Effect.Effect<SessionMessage.Message[], MessageDecodeError>
-  readonly message: (
-    messageID: SessionMessage.ID,
-  ) => Effect.Effect<{ readonly sessionID: SessionSchema.ID; readonly message: SessionMessage.Message } | undefined>
+  readonly message: (input: {
+    readonly sessionID: SessionSchema.ID
+    readonly messageID: SessionMessage.ID
+  }) => Effect.Effect<{ readonly sessionID: SessionSchema.ID; readonly message: SessionMessage.Message } | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SessionStore") {}
@@ -42,19 +44,28 @@ const layer = Layer.effect(
       runnerContext: Effect.fn("SessionStore.runnerContext")(function* (sessionID, baselineSeq) {
         return yield* SessionHistory.loadForRunner(db, sessionID, baselineSeq)
       }),
-      message: Effect.fn("SessionStore.message")(function* (messageID) {
-        const row = yield* db
-          .select()
-          .from(SessionMessageTable)
-          .where(eq(SessionMessageTable.id, messageID))
-          .get()
+      message: Effect.fn("SessionStore.message")(function* (input) {
+        return yield* db
+          .transaction((tx) =>
+            Effect.gen(function* () {
+              yield* EventV2.assertReplayableIn(tx, input.sessionID)
+              const row = yield* tx
+                .select()
+                .from(SessionMessageTable)
+                .where(
+                  and(eq(SessionMessageTable.id, input.messageID), eq(SessionMessageTable.session_id, input.sessionID)),
+                )
+                .get()
+                .pipe(Effect.orDie)
+              return row
+                ? {
+                    sessionID: SessionSchema.ID.make(row.session_id),
+                    message: yield* decodeMessage({ ...row.data, id: row.id, type: row.type }).pipe(Effect.orDie),
+                  }
+                : undefined
+            }),
+          )
           .pipe(Effect.orDie)
-        return row
-          ? {
-              sessionID: SessionSchema.ID.make(row.session_id),
-              message: yield* decodeMessage({ ...row.data, id: row.id, type: row.type }).pipe(Effect.orDie),
-            }
-          : undefined
       }),
     })
   }),

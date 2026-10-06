@@ -5,6 +5,7 @@ import { Session } from "@/session/session"
 import { MessageV2 } from "../../session/message-v2"
 import { CliError, effectCmd } from "../effect-cmd"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
 import { SessionTable, MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 import { InstanceRef } from "@/effect/instance-ref"
 import { ShareNext } from "@/share/share-next"
@@ -91,6 +92,8 @@ export function transformShareData(shareData: ShareData[]): {
 }
 
 type ExportData = { info: SDKSession; messages: Array<{ info: Message; parts: Part[] }> }
+type DatabaseService = Database.Interface["db"]
+type DatabaseTransaction = Parameters<Parameters<DatabaseService["transaction"]>[0]>[0]
 
 export const ImportCommand = effectCmd({
   command: "import <file>",
@@ -184,47 +187,62 @@ export const runImport = Effect.fn("Cli.import.body")(function* (file: string, c
     path: path.relative(path.resolve(ctx.worktree), ctx.directory).replaceAll("\\", "/"),
   }) as Session.Info
   const row = Session.toRow(info)
-  yield* db
-    .insert(SessionTable)
-    .values(row)
-    .onConflictDoUpdate({
-      target: SessionTable.id,
-      set: { project_id: row.project_id, directory: row.directory, path: row.path },
-    })
-    .run()
-    .pipe(Effect.orDie)
+  const writeSession = <A, E>(effect: (tx: DatabaseTransaction) => Effect.Effect<A, E>) =>
+    db
+      .transaction((tx) =>
+        Effect.gen(function* () {
+          yield* EventV2.assertWritableIn(tx, row.id)
+          return yield* effect(tx)
+        }),
+      )
+      .pipe(Effect.orDie)
+
+  yield* writeSession((tx) =>
+    tx
+      .insert(SessionTable)
+      .values(row)
+      .onConflictDoUpdate({
+        target: SessionTable.id,
+        set: { project_id: row.project_id, directory: row.directory, path: row.path },
+      })
+      .run(),
+  )
 
   for (const msg of exportData.messages) {
     const msgInfo = decodeMessageInfo(msg.info) as SessionV1.Info
     const { id, sessionID: _, ...msgData } = msgInfo
-    yield* db
-      .insert(MessageTable)
-      .values({
-        id,
-        session_id: row.id,
-        admission_seq: sql<number>`(SELECT COALESCE(MAX(${MessageTable.admission_seq}), 0) + 1 FROM ${MessageTable} WHERE ${MessageTable.session_id} = ${row.id})`,
-        time_created: msgInfo.time?.created ?? Date.now(),
-        data: msgData as never,
-      })
-      .onConflictDoNothing()
-      .run()
-      .pipe(Effect.orDie)
+    yield* writeSession((tx) =>
+      Effect.gen(function* () {
+        yield* tx
+          .insert(MessageTable)
+          .values({
+            id,
+            session_id: row.id,
+            admission_seq: sql<number>`(SELECT COALESCE(MAX(${MessageTable.admission_seq}), 0) + 1 FROM ${MessageTable} WHERE ${MessageTable.session_id} = ${row.id})`,
+            time_created: msgInfo.time?.created ?? Date.now(),
+            data: msgData as never,
+          })
+          .onConflictDoNothing()
+          .run()
+          .pipe(Effect.orDie)
 
-    for (const part of msg.parts) {
-      const partInfo = decodePart(part) as SessionV1.Part
-      const { id: partId, sessionID: _s, messageID, ...partData } = partInfo
-      yield* db
-        .insert(PartTable)
-        .values({
-          id: partId,
-          message_id: messageID,
-          session_id: row.id,
-          data: partData,
-        })
-        .onConflictDoNothing()
-        .run()
-        .pipe(Effect.orDie)
-    }
+        for (const part of msg.parts) {
+          const partInfo = decodePart(part) as SessionV1.Part
+          const { id: partId, sessionID: _s, messageID, ...partData } = partInfo
+          yield* tx
+            .insert(PartTable)
+            .values({
+              id: partId,
+              message_id: messageID,
+              session_id: row.id,
+              data: partData,
+            })
+            .onConflictDoNothing()
+            .run()
+            .pipe(Effect.orDie)
+        }
+      }),
+    )
   }
 
   process.stdout.write(`Imported session: ${exportData.info.id}`)

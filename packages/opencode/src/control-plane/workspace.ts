@@ -557,6 +557,7 @@ const layer = Layer.effect(
     })
 
     const sessionWarp = Effect.fn("Workspace.sessionWarp")(function* (input: SessionWarpInput) {
+      yield* events.assertReplayable(input.sessionID)
       return yield* Effect.gen(function* () {
         const current = yield* db
           .select({ workspaceID: SessionTable.workspace_id })
@@ -643,17 +644,24 @@ const layer = Layer.effect(
         }
 
         const rows = yield* db
-          .select({
-            id: EventTable.id,
-            aggregateID: EventTable.aggregate_id,
-            seq: EventTable.seq,
-            type: EventTable.type,
-            data: EventTable.data,
-          })
-          .from(EventTable)
-          .where(eq(EventTable.aggregate_id, input.sessionID))
-          .orderBy(asc(EventTable.seq))
-          .all()
+          .transaction(() =>
+            Effect.gen(function* () {
+              yield* events.assertReplayable(input.sessionID)
+              return yield* db
+                .select({
+                  id: EventTable.id,
+                  aggregateID: EventTable.aggregate_id,
+                  seq: EventTable.seq,
+                  type: EventTable.type,
+                  data: EventTable.data,
+                })
+                .from(EventTable)
+                .where(eq(EventTable.aggregate_id, input.sessionID))
+                .orderBy(asc(EventTable.seq))
+                .all()
+                .pipe(Effect.orDie)
+            }),
+          )
           .pipe(Effect.orDie)
         if (rows.length === 0)
           return yield* new SessionEventsNotFoundError({

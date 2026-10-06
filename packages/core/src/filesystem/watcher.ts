@@ -55,7 +55,15 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 
 // workerTarget replaces the parcel worker script. The process has one parcel host,
 // so it only takes effect when this layer starts that host.
-export const layerWith = (options: { workerTarget?: string | URL } = {}) =>
+export const layerWith = (
+  options: {
+    workerTarget?: string | URL
+    // Test-only injection hook for lifecycle tests to drive the native watch handle.
+    onHeadWatcher?: (watcher: ReturnType<typeof watch>) => void
+    // Test-only observer hook for lifecycle tests to see actual HEAD read failures.
+    onHeadReadError?: (error: unknown) => void
+  } = {},
+) =>
   Layer.effect(
     Service,
     Effect.gen(function* () {
@@ -114,6 +122,28 @@ export const layerWith = (options: { workerTarget?: string | URL } = {}) =>
           const head = path.join(vcs, "HEAD")
           const initial = readHead(head)
           const last = { value: "error" in initial ? undefined : initial.value }
+          const nativeWatch = { failed: false }
+          function reconcileHead() {
+            const read = readHead(head)
+            if ("error" in read) {
+              if (nativeWatch.failed) {
+                options.onHeadReadError?.(read.error)
+                return
+              }
+              const failed = failure("git", vcs, read.error)
+              const current = statuses.get("git")
+              if (current?.state !== "unconfirmed" || current.reason !== failed.reason)
+                report({ ...failed, state: "unconfirmed" })
+              options.onHeadReadError?.(read.error)
+              return
+            }
+            if (!nativeWatch.failed && statuses.get("git")?.state === "unconfirmed")
+              report({ watch: "git", directory: vcs, state: "active" })
+            if (read.value === last.value) return
+            const event = read.value === undefined ? "unlink" : last.value === undefined ? "add" : "change"
+            last.value = read.value
+            publish(head, event)
+          }
           const watcher = yield* Effect.try({
             try: () =>
               // Git replaces HEAD by renaming HEAD.lock over it, and Bun 1.3 reports that
@@ -121,26 +151,28 @@ export const layerWith = (options: { workerTarget?: string | URL } = {}) =>
               // none) re-reads HEAD, and only an actual change of content is published.
               watch(vcs, (_type, name) => {
                 if (name !== "HEAD" && name !== "HEAD.lock" && name !== null) return
-                const read = readHead(head)
-                // This callback runs outside Effect, so a HEAD that cannot be read must
-                // not throw here: the watch cannot see branch changes until it can.
-                if ("error" in read) return report({ ...failure("git", vcs, read.error), state: "unconfirmed" })
-                if (statuses.get("git")?.state === "unconfirmed")
-                  report({ watch: "git", directory: vcs, state: "active" })
-                if (read.value === last.value) return
-                const event = read.value === undefined ? "unlink" : last.value === undefined ? "add" : "change"
-                last.value = read.value
-                publish(head, event)
+                reconcileHead()
               }),
             catch: (error) => error,
           }).pipe(Effect.catch((error) => Effect.sync(() => void report(failure("git", vcs, error)))))
           if (!watcher) return
           watcher.unref()
+          // HEAD.lock can be reported before the replacement reaches HEAD, with no callback for the final value.
+          const interval = setInterval(reconcileHead, 250)
+          interval.unref()
           watcher.on("error", (error) => {
+            nativeWatch.failed = true
             watcher.close()
             report(failure("git", vcs, error))
           })
-          yield* Effect.addFinalizer(() => Effect.sync(() => watcher.close()))
+          yield* Effect.addFinalizer(
+            () =>
+              Effect.sync(() => {
+                clearInterval(interval)
+                watcher.close()
+              }),
+          )
+          options.onHeadWatcher?.(watcher)
           if ("error" in initial) return report({ ...failure("git", vcs, initial.error), state: "unconfirmed" })
           report({ watch: "git", directory: vcs, state: "active" })
         })

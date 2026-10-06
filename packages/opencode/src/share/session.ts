@@ -4,6 +4,7 @@ import { SessionID } from "@/session/schema"
 import { Effect, Layer, Scope, Context } from "effect"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { ShareNext } from "./share-next"
 
 export interface Interface {
@@ -19,11 +20,13 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const cfg = yield* Config.Service
     const session = yield* Session.Service
+    const events = yield* EventV2Bridge.Service
     const shareNext = yield* ShareNext.Service
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
 
     const share = Effect.fn("SessionShare.share")(function* (sessionID: SessionID) {
+      yield* events.assertWritable(sessionID)
       const conf = yield* cfg.get()
       if (conf.share === "disabled") throw new Error("Sharing is disabled in configuration")
       const result = yield* shareNext.create(sessionID)
@@ -32,6 +35,7 @@ const layer = Layer.effect(
     })
 
     const unshare = Effect.fn("SessionShare.unshare")(function* (sessionID: SessionID) {
+      yield* events.assertWritable(sessionID)
       yield* shareNext.remove(sessionID)
       yield* session.setShare({ sessionID, share: undefined })
     })
@@ -52,7 +56,7 @@ const layer = Layer.effect(
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [Config.node, Session.node, ShareNext.node, RuntimeFlags.node],
+  deps: [Config.node, Session.node, EventV2Bridge.node, ShareNext.node, RuntimeFlags.node],
 })
 
 export * as SessionShare from "./session"

@@ -13,6 +13,7 @@ import { Session } from "@/session/session"
 import type { SessionID } from "../../src/session/schema"
 import { ShareNext } from "@/share/share-next"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
+import { EventRetentionTable } from "@opencode-ai/core/event/sql"
 import { Database } from "@opencode-ai/core/database/database"
 import { eq } from "drizzle-orm"
 import { provideTmpdirInstance } from "../fixture/fixture"
@@ -169,6 +170,90 @@ describe("ShareNext", () => {
           expect(createRequests).toHaveLength(1)
           expect(createRequests[0].method).toBe("POST")
           expect(createRequests[0].url).toBe("https://legacy-share.example.com/api/share")
+        }).pipe(Effect.provide(integrationLayer(client)))
+      },
+      { config: { enterprise: { url: "https://legacy-share.example.com" } } },
+    ),
+  )
+
+  it.live("does not persist a share after Session retention has started", () =>
+    provideTmpdirInstance(
+      () => {
+        const createRequests: HttpClientRequest.HttpClientRequest[] = []
+        const client = HttpClient.make((req) => {
+          if (req.url.endsWith("/api/share")) {
+            createRequests.push(req)
+            return Effect.succeed(
+              json(req, {
+                id: "shr_retention",
+                url: "https://legacy-share.example.com/share/retention",
+                secret: "retention-secret",
+              }),
+            )
+          }
+          return Effect.succeed(json(req, { ok: true }))
+        })
+        return Effect.gen(function* () {
+          const session = yield* (yield* Session.Service).create({ title: "retention share" })
+          const { db } = yield* Database.Service
+          yield* db.insert(EventRetentionTable).values({
+            aggregate_id: session.id,
+            state: "redacting",
+            progress_table: "event",
+            progress_id: "evt_retention",
+            evidence: {},
+            time_started: 1,
+            time_updated: 1,
+          })
+
+          const result = yield* ShareNext.Service.use((service) => Effect.exit(service.create(session.id)))
+
+          expect(Exit.isFailure(result)).toBe(true)
+          expect(yield* share(session.id)).toBeUndefined()
+          expect(createRequests).toHaveLength(1)
+        }).pipe(Effect.provide(integrationLayer(client)))
+      },
+      { config: { enterprise: { url: "https://legacy-share.example.com" } } },
+    ),
+  )
+
+  it.live("does not delete the local share row after Session retention has started", () =>
+    provideTmpdirInstance(
+      () => {
+        const client = HttpClient.make((req) => {
+          if (req.method === "POST")
+            return Effect.succeed(
+              json(req, {
+                id: "shr_retention_remove",
+                url: "https://legacy-share.example.com/share/retention-remove",
+                secret: "retention-remove-secret",
+              }),
+            )
+          return Effect.succeed(HttpClientResponse.fromWeb(req, new Response(null, { status: 200 })))
+        })
+        return Effect.gen(function* () {
+          const session = yield* (yield* Session.Service).create({ title: "retention share removal" })
+          const service = yield* ShareNext.Service
+          const { db } = yield* Database.Service
+          yield* service.create(session.id)
+          yield* db.insert(EventRetentionTable).values({
+            aggregate_id: session.id,
+            state: "redacting",
+            progress_table: "event",
+            progress_id: "evt_retention",
+            evidence: {},
+            time_started: 1,
+            time_updated: 1,
+          })
+
+          const result = yield* Effect.exit(service.remove(session.id))
+
+          expect(Exit.isFailure(result)).toBe(true)
+          expect(yield* share(session.id)).toMatchObject({
+            id: "shr_retention_remove",
+            secret: "retention-remove-secret",
+            url: "https://legacy-share.example.com/share/retention-remove",
+          })
         }).pipe(Effect.provide(integrationLayer(client)))
       },
       { config: { enterprise: { url: "https://legacy-share.example.com" } } },
