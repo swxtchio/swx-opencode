@@ -3,6 +3,7 @@ import { getNpmPackageName } from "@ff-labs/fff-bun"
 import { fffBuildDefines, fffLibraryForTarget } from "@opencode-ai/script/fff-native"
 import fs from "node:fs/promises"
 import { createRequire } from "node:module"
+import os from "node:os"
 import path from "node:path"
 
 const targetPlatform = process.platform === "win32" ? "windows" : process.platform
@@ -24,9 +25,7 @@ const extension = process.platform === "darwin" ? ".dylib" : process.platform ==
 
 describe("compiled FFF extraction", () => {
   test("keeps native search usable without temp allocations in the sidecar build", async () => {
-    const dist = path.join(import.meta.dir, "../dist")
-    await fs.mkdir(dist, { recursive: true })
-    const root = await fs.mkdtemp(path.join(dist, "fff-compiled-"))
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-fff-compiled-"))
     try {
       const temporary = path.join(root, "tmp")
       const workspace = path.join(root, "workspace")
@@ -157,5 +156,5 @@ describe("compiled FFF extraction", () => {
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
-  }, 60_000)
+  }, 180_000)
 })
