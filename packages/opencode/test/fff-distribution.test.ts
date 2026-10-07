@@ -132,9 +132,10 @@ describe("compiled OpenCode FFF distribution", () => {
 
   test("resolves sidecars beside Windows compiled roots", () => {
     const filename = "fff_c-identity.dll"
-    const expected = `B:/~BUN/root/${filename}`
+    const executablePath = path.join("B:/~BUN/root", "opencode.exe")
+    const expected = path.join("B:/~BUN/root", filename)
     const resolved = fffDownload.resolveCompiledLibraryPath(
-      "B:/~BUN/root/opencode.exe",
+      executablePath,
       filename,
       (candidate: string) => candidate === expected,
     )
@@ -234,7 +235,15 @@ async function nativeLibraryIsMapped(pid: number, sidecar: string) {
   }
   const command =
     process.platform === "win32"
-      ? ["tasklist.exe", "/FI", `PID eq ${pid}`, "/M", path.basename(sidecar)]
+      ? [
+          "powershell.exe",
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); (Get-Process -Id ${pid}).Modules | ForEach-Object { $_.FileName }`,
+        ]
       : ["vmmap", String(pid)]
   const result = await run(command, process.cwd(), process.env)
   expect(result.status, result.stderr).toBe(0)
