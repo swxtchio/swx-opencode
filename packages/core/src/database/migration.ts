@@ -22,8 +22,13 @@ export function apply(db: Database) {
       const tables = yield* db.all<{ name: string }>(
         sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`,
       )
-      if (tables.some((table) => table.name === "session")) return yield* applyOnly(db, migrations)
+      if (tables.some((table) => table.name === "session")) {
+        // Existing stores can have pending migrations, so apply them in the production WAL mode.
+        yield* db.run("PRAGMA journal_mode = WAL")
+        return yield* applyOnly(db, migrations)
+      }
       if (tables.length > 0) return yield* Effect.die("Database is not empty and has no session table")
+      yield* db.run("PRAGMA auto_vacuum = INCREMENTAL")
       yield* db.transaction((tx) =>
         Effect.gen(function* () {
           yield* schema.up(tx)
