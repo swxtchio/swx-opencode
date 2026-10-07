@@ -14,7 +14,7 @@ const nativeLibrary = await fffLibraryForTarget({ os: targetOS, arch: targetArch
 )
 const nativeBytes = Buffer.from(await Bun.file(nativeLibrary.sourcePath).arrayBuffer())
 const nativeDigest = new Bun.CryptoHasher("sha256").update(nativeBytes).digest("hex")
-const fffDownload = await import(new URL("./download.ts", import.meta.resolve("@ff-labs/fff-bun")))
+const fffDownload = await import(new URL("./download.ts", import.meta.resolve("@ff-labs/fff-bun")).href)
 
 describe("compiled OpenCode FFF distribution", () => {
   test("loads the packaged native sidecar and leaves no temp addon allocations across exits", async () => {
@@ -136,7 +136,7 @@ describe("compiled OpenCode FFF distribution", () => {
     const resolved = fffDownload.resolveCompiledLibraryPath(
       "B:/~BUN/root/opencode.exe",
       filename,
-      (candidate) => candidate === expected,
+      (candidate: string) => candidate === expected,
     )
     expect(resolved).toBe(expected)
   })
@@ -184,7 +184,9 @@ function childEnvironment(root: string, temporary: string) {
 }
 
 async function waitForServer(server: Bun.Subprocess, stderr: Promise<string>) {
-  const reader = server.stdout.getReader()
+  const stdout = server.stdout
+  if (!stdout || typeof stdout === "number") throw new Error("server stdout is not piped")
+  const reader = stdout.getReader()
   const timeout = setTimeout(() => server.kill("SIGKILL"), 45_000)
   let output = ""
   try {
