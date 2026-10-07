@@ -66,6 +66,7 @@ describe("compiled OpenCode FFF distribution", () => {
       const sidecar = path.join(output, nativeLibrary.filename)
       expect(await fs.readFile(sidecar)).toEqual(nativeBytes)
       expect(nativeLibrary.filename).toContain(nativeDigest)
+      console.log(`FFF sidecar target=${targetOS}-${targetArch} filename=${nativeLibrary.filename} sha256=${nativeDigest}`)
       expect(await addonAllocations(temporaryRoot)).toEqual([])
 
       const normalTemporary = path.join(temporaryRoot, "normal")
@@ -231,7 +232,7 @@ async function nativeLibraryIsMapped(pid: number, sidecar: string) {
   }
   const command =
     process.platform === "win32"
-      ? ["tasklist.exe", "/FI", `PID eq ${pid}`, "/M"]
+      ? ["tasklist.exe", "/FI", `PID eq ${pid}`, "/M", path.basename(sidecar)]
       : ["vmmap", String(pid)]
   const result = await run(command, process.cwd(), process.env)
   expect(result.status, result.stderr).toBe(0)

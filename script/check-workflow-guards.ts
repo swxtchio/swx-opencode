@@ -33,6 +33,8 @@ const GUARD = "github.repository == 'anomalyco/opencode'"
  * guarded on four jobs out of five.
  */
 const ALLOWED = new Map([
+  ["fff-platform-validation.yml::windows-fff", "f04bf8aa6b7a6845"],
+  ["fff-platform-validation.yml::nix-node-modules", "454365e67a9a2ffe"],
   ["test.yml::unit", "fd0a927305590ae6"],
   ["test.yml::e2e", "9f89116be327fa02"],
   ["typecheck.yml::typecheck", "276be38badce0802"],
@@ -59,6 +61,7 @@ const ALLOWED_ACTIONS = new Map([["setup-bun", "761c61a6a87fd34a"]])
  * RUNS is part of what is being trusted.
  */
 const ALLOWED_ENVELOPES = new Map([
+  ["fff-platform-validation.yml", "7c3c7fc7328f12b6"],
   ["test.yml", "0e4560dca190d1b3"],
   ["typecheck.yml", "783bae590157a011"],
 ])
