@@ -38,6 +38,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Fork maintenance and CI
 
+- **#150** The repository-read-only `fff-platform-validation.yml` builds and runs compiled FFF distributions on native Windows x64 and ARM64 runners, computes and checks Nix node_modules hashes on native Linux and macOS runners, retains runner evidence, and builds OpenCode with Nix after each hash matches. _Fork-only._
 - **#98** `tests/run.sh` runs the unit suite from the repository root as CI's "Run unit tests" step does
   (`GITHUB_ACTIONS=false bun turbo test`), returning its exit status, and fails when Bun or the installed workspace
   is missing. The root `npm test` still refuses. _Fork-only._
