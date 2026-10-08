@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { fffLibraryForTarget } from "@opencode-ai/script/fff-native"
+import { packagedFffUnavailableMessage } from "@opencode-ai/core/filesystem/search"
 import { createRequire } from "node:module"
 import fs from "node:fs/promises"
 import os from "node:os"
@@ -15,6 +16,14 @@ const nativeLibrary = await fffLibraryForTarget({ os: targetOS, arch: targetArch
 const nativeBytes = Buffer.from(await Bun.file(nativeLibrary.sourcePath).arrayBuffer())
 const nativeDigest = new Bun.CryptoHasher("sha256").update(nativeBytes).digest("hex")
 const fffDownload = await import(new URL("./download.ts", import.meta.resolve("@ff-labs/fff-bun")).href)
+
+test("names the missing packaged FFF sidecar and its recovery flag", () => {
+  const expectedPath = path.join(path.dirname(process.execPath), nativeLibrary.filename)
+  const message = packagedFffUnavailableMessage(nativeLibrary.filename)
+
+  expect(message).toContain(expectedPath)
+  expect(message).toContain("OPENCODE_DISABLE_FFF=1")
+})
 
 describe("compiled OpenCode FFF distribution", () => {
   test("loads the packaged native sidecar and leaves no temp addon allocations across exits", async () => {

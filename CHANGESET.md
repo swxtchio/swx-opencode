@@ -140,6 +140,17 @@ Newest first. Each entry names the upstream range brought in.
   _Partly upstream:_ upstream #50439 fixed the cycle and its version was taken in the 2026-09-22 sync; the
   layer-node guard is fork-only.
 
+### Native FFF distribution
+
+- **#150** Use the root `packageManager` Bun pin for Nix-built OpenCode and desktop binaries (`package.json`,
+  `nix/bun.nix`, and `flake.nix`). _Fork-only (swxtchio/swx-opencode#97)._
+- **#150** Patch `@ff-labs/fff-bun` (`patches/@ff-labs%2Ffff-bun@0.9.4.patch`) so compiled builds load the
+  content-addressed, target-specific FFF sidecar beside the executable; carry the sidecar through build, install,
+  postinstall, local-release, Docker, and generated release-package paths. _Fork-only (swxtchio/swx-opencode#97)._
+- **#150** Enable native FFF by default in packaged Windows builds (`packages/core/src/flag/flag.ts`), preserve
+  `OPENCODE_DISABLE_FFF=1` as the ripgrep fallback, and report the expected sidecar path when loading is unavailable
+  (`packages/core/src/filesystem/search.ts`). _Fork-only (swxtchio/swx-opencode#97)._
+
 ### Features
 
 - **#73** V1 server prompt queue core (swxtchio/swx-opencode#68): every V1 prompt except `noReply` is admitted to the durable `session_prompt_queue` table before it becomes a user message. `prompt`, `prompt_async` and `command` take `delivery: "steer" | "queue"`; the default steer reaches the next step as before, while `queue` waits until the run would go idle and then runs as its own turn, one per boundary in admission order. Steers wait behind a pending compaction; an abort or error parks pending prompts until the next admission or wake; `/session/:id/queue` lists, withdraws (404 `QueueItemNotPending` once delivered), restores and re-delivers them, with `session.queue.updated` carrying the full list. A sync prompt answers with the final reply of the turn its prompt joined, recorded for it where the loop ends that turn: steers share the reply of the turn they steered, and a queued prompt gets its own turn's; an editor's withdraw that wins answers it with 409 `PromptWithdrawn`. Deliberately, a compaction whose summary turn stopped on an abort or error is not retried, where upstream V1 retried it on the next prompt with that prompt as its parent (summarising it instead of answering it); if the context is still too large, the next overflow check starts a new compaction. Also closes the V1 lost wakeup where a prompt admitted as a run finished joined it and was never answered. Known ordering-only residuals: a `noReply` prompt and the synthetic message a subtask writes to have its output summarised are stored directly rather than through the queue, so they can land out of admission order relative to pending items. _Fork-only; the lost-wakeup fix is upstreamable._

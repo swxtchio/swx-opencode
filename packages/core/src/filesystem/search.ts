@@ -15,6 +15,11 @@ import { Flag } from "../flag/flag"
 
 declare const FFF_BUN_EXTERNAL_LIBRARY: string
 
+export function packagedFffUnavailableMessage(filename: string) {
+  const expectedPath = path.join(path.dirname(process.execPath), filename)
+  return `The packaged FFF native library is unavailable at ${expectedPath}. Set OPENCODE_DISABLE_FFF=1 to use ripgrep instead.`
+}
+
 export interface Interface {
   readonly find: (input: FileSystem.FindInput) => Effect.Effect<FileSystem.Entry[]>
   readonly glob: (input: FileSystem.GlobInput) => Effect.Effect<readonly FileSystem.Entry[]>
@@ -240,7 +245,7 @@ const layer = Layer.unwrap(
     if (Flag.OPENCODE_DISABLE_FFF) return ripgrepLayer
     if (Fff.available()) return fffLayer
     if (typeof FFF_BUN_EXTERNAL_LIBRARY === "string") {
-      throw new Error("The packaged FFF native library is unavailable")
+      throw new Error(packagedFffUnavailableMessage(FFF_BUN_EXTERNAL_LIBRARY))
     }
     return ripgrepLayer
   }),
