@@ -18,18 +18,18 @@ const nodeSqliteDrivers = await import("node:sqlite").then(
   () => undefined,
 )
 const nodeSqliteTest = test.skipIf(!nodeSqliteDrivers)
-// The retry window each statement must give a competing writer: the old 5s native busy_timeout.
+// The retry window each statement must give a competing writer: the tolerance the old native busy_timeout gave.
 const lockWindowMs = 5_000
 // Exhaustion may overrun the window by one capped backoff, one native attempt and scheduling delay.
 const lockWindowSlackMs = 1_500
 // Backstops sit above window plus slack so a statement that never stops fails with its own message.
 const lockBackstop = "10 seconds"
-// Well past the ~250ms the old four-attempt schedule gave up after, and well inside the restored window.
+// Well past the point where the old four-attempt schedule gave up, and well inside the restored window.
 const heldLockMs = 1_500
 // The event loop must keep turning while a statement waits; a long synchronous native wait stalls it for seconds.
 const stallBoundMs = 1_000
 
-// Ticks every 5ms from now on and returns a reader for the longest gap between ticks. The reader includes the gap
+// Ticks continually from now on and returns a reader for the longest gap between ticks. The reader includes the gap
 // still open when it is called, so a synchronous call the ticker has not yet woken from still counts.
 const eventLoopStalls = Effect.gen(function* () {
   let lastTick = performance.now()
