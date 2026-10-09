@@ -26,8 +26,27 @@ const lockWindowSlackMs = 1_500
 const lockBackstop = "10 seconds"
 // Well past the ~250ms the old four-attempt schedule gave up after, and well inside the restored window.
 const heldLockMs = 1_500
-// An unrelated request must finish far sooner than a synchronous wait would let it.
-const probeBoundMs = 1_000
+// The event loop must keep turning while a statement waits; a long synchronous native wait stalls it for seconds.
+const stallBoundMs = 1_000
+
+// Ticks every 5ms from now on and returns a reader for the longest gap between ticks. The reader includes the gap
+// still open when it is called, so a synchronous call the ticker has not yet woken from still counts.
+const eventLoopStalls = Effect.gen(function* () {
+  let lastTick = performance.now()
+  let longestMs = 0
+  yield* Effect.sleep("5 millis").pipe(
+    Effect.andThen(
+      Effect.sync(() => {
+        const now = performance.now()
+        longestMs = Math.max(longestMs, now - lastTick)
+        lastTick = now
+      }),
+    ),
+    Effect.forever,
+    Effect.forkScoped,
+  )
+  return () => Math.max(longestMs, performance.now() - lastTick)
+})
 
 const sqliteError = (error: unknown) => {
   if (isSqlError(error)) return error
@@ -266,6 +285,7 @@ describe("SQLite busy timeout and statement retries", () => {
                 )
                 yield* Effect.addFinalizer(() => Effect.promise(() => holder.release()))
 
+                const longestStallMs = yield* eventLoopStalls
                 let writerFinished = false
                 const startedAt = performance.now()
                 const writer = yield* (
@@ -286,7 +306,6 @@ describe("SQLite busy timeout and statement retries", () => {
                 while (performance.now() - startedAt < heldLockMs) yield* Effect.sleep("10 millis")
                 expect(writerFinished).toBe(false)
 
-                const probeStartedAt = performance.now()
                 yield* Effect.promise(() => holder.probe(server.url.href)).pipe(
                   Effect.timeoutOrElse({
                     duration: "2 seconds",
@@ -294,7 +313,7 @@ describe("SQLite busy timeout and statement retries", () => {
                       Effect.fail(new Error("unrelated request did not progress while SQLite was contended")),
                   }),
                 )
-                expect(performance.now() - probeStartedAt).toBeLessThan(probeBoundMs)
+                expect(longestStallMs()).toBeLessThan(stallBoundMs)
                 expect(writerFinished).toBe(false)
 
                 yield* Effect.promise(() => holder.release())
@@ -436,6 +455,7 @@ describe("SQLite busy timeout and statement retries", () => {
               )
               yield* Effect.addFinalizer(() => Effect.promise(() => holder.release()))
 
+              const longestStallMs = yield* eventLoopStalls
               let writerFinished = false
               let elapsedMs = 0
               const startedAt = performance.now()
@@ -467,6 +487,7 @@ describe("SQLite busy timeout and statement retries", () => {
               expect(Exit.isFailure(result)).toBe(true)
               expect(elapsedMs).toBeGreaterThanOrEqual(lockWindowMs)
               expect(elapsedMs).toBeLessThan(lockWindowMs + lockWindowSlackMs)
+              expect(longestStallMs()).toBeLessThan(stallBoundMs)
               if (!Exit.isFailure(result)) return
               const error = Option.getOrUndefined(Cause.findErrorOption(result.cause))
               expect(isSqlError(error)).toBe(true)
