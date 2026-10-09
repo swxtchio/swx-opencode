@@ -3,6 +3,9 @@ import { sql } from "drizzle-orm"
 import { Context, Effect, Layer } from "effect"
 import { SqlClient } from "effect/unstable/sql/SqlClient"
 
+// The driver gives up after its 5s retry window; this only catches a retry that never stops.
+const retryBackstop = "10 seconds"
+
 const withImmediateSqliteLock = <A, E, R>(
   database: Database.Interface["db"],
   filename: string,
@@ -34,7 +37,7 @@ export const produceSqliteBusyError = (database: Database.Interface["db"], filen
     Effect.flip(
       database.run(sql`INSERT INTO secret_lock_fixture (id, value) VALUES (${1}, ${"secret_parameter"})`).pipe(
         Effect.timeoutOrElse({
-          duration: "5 seconds",
+          duration: retryBackstop,
           orElse: () => Effect.fail(new Error("SQLite busy retries did not stop")),
         }),
       ),
@@ -51,7 +54,7 @@ export const produceSqliteImmediateError = (database: Database.Interface["db"], 
         )
         .pipe(
           Effect.timeoutOrElse({
-            duration: "5 seconds",
+            duration: retryBackstop,
             orElse: () => Effect.fail(new Error("SQLite immediate transaction retries did not stop")),
           }),
         ),
@@ -78,7 +81,7 @@ export const produceSqliteLockedError = (filename: string) =>
       return yield* Effect.flip(
         client.unsafe("DROP TABLE secret_lock_fixture").raw.pipe(
           Effect.timeoutOrElse({
-            duration: "5 seconds",
+            duration: retryBackstop,
             orElse: () => Effect.fail(new Error("SQLite locked retries did not stop")),
           }),
         ),
