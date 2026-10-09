@@ -1,15 +1,20 @@
 #!/usr/bin/env bun
 
 import { $ } from "bun"
+import fs from "node:fs/promises"
+import { createRequire } from "node:module"
 import path from "path"
 import { fileURLToPath } from "url"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
+import { fffBuildDefines, fffLibraryForTarget } from "@opencode-ai/script/fff-native"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const dir = path.resolve(__dirname, "..")
+const fffRequire = createRequire(import.meta.resolve("@ff-labs/fff-bun"))
 
 process.chdir(dir)
+const dist = path.resolve(process.env.OPENCODE_BUILD_DIST ?? "dist")
 
 const generated = await import("./generate.ts")
 
@@ -54,7 +59,7 @@ const embeddedFileMap = skipEmbedWebUi ? null : await createEmbeddedWebUIBundle(
 const treeSitterWorker = await Bun.file(fileURLToPath(import.meta.resolve("@opentui/core/parser.worker"))).text()
 
 const allTargets: {
-  os: string
+  os: "linux" | "darwin" | "win32"
   arch: "arm64" | "x64"
   abi?: "musl"
   avx2?: false
@@ -137,7 +142,7 @@ const targets = singleFlag
     })
   : allTargets
 
-await $`rm -rf dist`
+await fs.rm(dist, { recursive: true, force: true })
 
 const binaries: Record<string, string> = {}
 if (!skipInstall) {
@@ -157,7 +162,8 @@ for (const item of targets) {
     .filter(Boolean)
     .join("-")
   console.log(`building ${name}`)
-  await $`mkdir -p dist/${name}/bin`
+  await fs.mkdir(path.join(dist, name, "bin"), { recursive: true })
+  const nativeLibrary = await fffLibraryForTarget(item, (specifier) => fffRequire.resolve(specifier))
 
   const workerPath = "./src/cli/tui/worker.ts"
   const watcherWorkerPath = "./src/cli/watcher-worker.ts"
@@ -179,7 +185,7 @@ for (const item of targets) {
       autoloadTsconfig: true,
       autoloadPackageJson: true,
       target: name.replace(pkg.name, "bun") as any,
-      outfile: `dist/${name}/bin/opencode`,
+      outfile: path.join(dist, name, "bin", "opencode"),
       execArgv: [`--user-agent=opencode/${Script.version}`, "--use-system-ca", "--"],
       windows: {},
     },
@@ -195,6 +201,7 @@ for (const item of targets) {
       ...(embeddedFileMap ? ["opencode-web-ui.gen.ts"] : []),
     ],
     define: {
+      ...fffBuildDefines(nativeLibrary),
       FFF_LIBC: JSON.stringify(item.abi === "musl" ? "musl" : "gnu"),
       OPENCODE_VERSION: `'${Script.version}'`,
       // The plugin SDK version THIS TREE was built against, taken from the
@@ -213,9 +220,11 @@ for (const item of targets) {
     },
   })
 
+  await Bun.write(path.join(dist, name, "bin", nativeLibrary.filename), Bun.file(nativeLibrary.sourcePath))
+
   // Smoke test: only run if binary is for current platform
   if (item.os === process.platform && item.arch === process.arch && !item.abi) {
-    const binaryPath = `dist/${name}/bin/opencode`
+    const binaryPath = path.join(dist, name, "bin", "opencode")
     console.log(`Running smoke test: ${binaryPath} --version`)
     try {
       const versionOutput = await $`${binaryPath} --version`.text()
@@ -226,8 +235,8 @@ for (const item of targets) {
     }
   }
 
-  await $`rm -rf ./dist/${name}/bin/tui`
-  await Bun.file(`dist/${name}/package.json`).write(
+  await fs.rm(path.join(dist, name, "bin", "tui"), { recursive: true, force: true })
+  await Bun.file(path.join(dist, name, "package.json")).write(
     JSON.stringify(
       {
         name,
@@ -247,9 +256,9 @@ for (const item of targets) {
 if (Script.release) {
   for (const key of Object.keys(binaries)) {
     if (key.includes("linux")) {
-      await $`tar -czf ../../${key}.tar.gz *`.cwd(`dist/${key}/bin`)
+      await $`tar -czf ../../${key}.tar.gz *`.cwd(path.join(dist, key, "bin"))
     } else {
-      await $`zip -r ../../${key}.zip *`.cwd(`dist/${key}/bin`)
+      await $`zip -r ../../${key}.zip *`.cwd(path.join(dist, key, "bin"))
     }
   }
   await $`gh release upload v${Script.version} ./dist/*.zip ./dist/*.tar.gz --clobber --repo ${process.env.GH_REPO}`

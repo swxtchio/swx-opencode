@@ -1,0 +1,39 @@
+diff --git a/src/download.ts b/src/download.ts
+--- a/src/download.ts
++++ b/src/download.ts
+@@ -14,0 +15,2 @@
++declare const FFF_BUN_EXTERNAL_LIBRARY: string;
++
+@@ -103,0 +106,11 @@
++export function resolveCompiledLibraryPath(
++  executablePath = process.execPath,
++  filename = typeof FFF_BUN_EXTERNAL_LIBRARY === "string" ? FFF_BUN_EXTERNAL_LIBRARY : undefined,
++  exists = existsSync,
++) {
++  if (!filename) return null;
++
++  const libraryPath = join(dirname(executablePath), filename);
++  return exists(libraryPath) ? libraryPath : null;
++}
++
+@@ -113,0 +127,4 @@
++  const compiledLibraryPath = resolveCompiledLibraryPath();
++  if (compiledLibraryPath) return compiledLibraryPath;
++  if (typeof FFF_BUN_EXTERNAL_LIBRARY === "string") return null;
++
+diff --git a/src/embedded.ts b/src/embedded.ts
+--- a/src/embedded.ts
++++ b/src/embedded.ts
+@@ -2 +2 @@
+- * Tools for standalone-executable native library embedding.
++ * Default embedded path for standalone-executable native libraries.
+@@ -12,0 +13,2 @@
++ * OpenCode uses a packaged native sidecar so compiled addons stay out of Bun's
++ * scratch-file extraction path.
+@@ -14,0 +17,2 @@
++declare const FFF_BUN_EXTERNAL_LIBRARY: string;
++
+@@ -53 +57,2 @@
+-export const embeddedLibPath: string | null = await resolveEmbeddedLibPath();
++export const embeddedLibPath: string | null =
++  typeof FFF_BUN_EXTERNAL_LIBRARY === "string" ? null : await resolveEmbeddedLibPath();

@@ -340,13 +340,43 @@ download_and_install() {
         unzip -q "$tmp_dir/$filename" -d "$tmp_dir"
     fi
 
+    native_library=$(find "$tmp_dir" -maxdepth 1 -type f -name "$(native_library_pattern "$os")" -print -quit)
+    if [ -n "$native_library" ]; then
+        native_target="$INSTALL_DIR/$(basename "$native_library")"
+        if [ ! -f "$native_target" ] || ! cmp -s "$native_library" "$native_target"; then
+            mv "$native_library" "$native_target"
+        fi
+    fi
     mv "$tmp_dir/opencode" "$INSTALL_DIR"
     chmod 755 "${INSTALL_DIR}/opencode"
     rm -rf "$tmp_dir"
 }
 
+native_library_pattern() {
+    case "$1" in
+        darwin) printf 'libfff_c-*.dylib' ;;
+        linux) printf 'libfff_c-*.so' ;;
+        windows) printf 'fff_c-*.dll' ;;
+        *) return 1 ;;
+    esac
+}
+
 install_from_binary() {
     print_message info "\n${MUTED}Installing ${NC}opencode ${MUTED}from: ${NC}$binary_path"
+    raw_os=$(uname -s)
+    local_os=$(echo "$raw_os" | tr '[:upper:]' '[:lower:]')
+    case "$raw_os" in
+      Darwin*) local_os="darwin" ;;
+      Linux*) local_os="linux" ;;
+      MINGW*|MSYS*|CYGWIN*) local_os="windows" ;;
+    esac
+    native_library=$(find "$(dirname "$binary_path")" -maxdepth 1 -type f -name "$(native_library_pattern "$local_os")" -print -quit)
+    if [ -n "$native_library" ]; then
+        native_target="$INSTALL_DIR/$(basename "$native_library")"
+        if [ ! -f "$native_target" ] || ! cmp -s "$native_library" "$native_target"; then
+            cp "$native_library" "$native_target"
+        fi
+    fi
     cp "$binary_path" "${INSTALL_DIR}/opencode"
     chmod 755 "${INSTALL_DIR}/opencode"
 }

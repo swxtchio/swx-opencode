@@ -1307,7 +1307,7 @@ test(
       seq: 599,
     })
 
-    // Keep a half-iterated source query cached; pinned Bun 1.3.14 must clear it before the old-inode check.
+    // Keep a half-iterated source query cached so compaction must release it before checking and replacing the source inode.
     using cachedSourceStatement = sourceFixture.db.query<{ seq: number }, [string]>(
       "SELECT seq FROM event_sequence WHERE aggregate_id = ?",
     )

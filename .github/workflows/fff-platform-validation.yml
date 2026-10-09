@@ -1,0 +1,214 @@
+name: FFF native platform validation
+
+on:
+  pull_request:
+    branches: [swxtch]
+    paths:
+      - ".github/workflows/fff-platform-validation.yml"
+      - ".github/actions/setup-bun/action.yml"
+      - "bun.lock"
+      - "flake.lock"
+      - "flake.nix"
+      - "nix/**"
+      - "package.json"
+      - "packages/core/src/filesystem/search.ts"
+      - "packages/core/src/flag/flag.ts"
+      - "packages/opencode/script/build.ts"
+      - "packages/opencode/test/fff-compiled.test.ts"
+      - "packages/opencode/test/fff-distribution.test.ts"
+      - "packages/script/src/fff-native.ts"
+      - "patches/@ff-labs%2Ffff-bun@0.9.4.patch"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fff-platform-validation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  TURBO_TELEMETRY_DISABLED: 1
+  DO_NOT_TRACK: 1
+
+jobs:
+  windows-fff:
+    name: Compiled FFF (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64
+            runner: windows-latest
+          - target: windows-arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      PR_HEAD: ${{ github.event.pull_request.head.sha }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Check out pull request merge head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+
+      - name: Resolve native Bun archive
+        id: bun
+        shell: bash
+        run: |
+          VERSION=$(node -p 'require("./package.json").packageManager.split("@")[1]')
+          case "$TARGET" in
+            windows-x64) ARCHIVE="bun-windows-x64-baseline.zip" ;;
+            windows-arm64) ARCHIVE="bun-windows-aarch64.zip" ;;
+            *) echo "Unsupported validation target: $TARGET" >&2; exit 1 ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "url=https://github.com/oven-sh/bun/releases/download/bun-v${VERSION}/${ARCHIVE}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up native Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ steps.bun.outputs.version }}
+          bun-download-url: ${{ steps.bun.outputs.url }}
+
+      - name: Install dependencies
+        shell: bash
+        run: bun install --frozen-lockfile
+
+      - name: Record runner and build identity
+        shell: bash
+        run: |
+          {
+            echo "## Windows compiled FFF validation"
+            echo "- PR head: $PR_HEAD"
+            echo "- Build head: $(git rev-parse HEAD)"
+            echo "- Target: $TARGET"
+            echo "- Runner: $RUNNER_NAME ($RUNNER_OS/$RUNNER_ARCH)"
+            echo "- Command: bun test --timeout 300000 test/fff-compiled.test.ts test/fff-distribution.test.ts"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run compiled FFF distribution tests
+        working-directory: packages/opencode
+        shell: bash
+        run: bun test --timeout 300000 test/fff-compiled.test.ts test/fff-distribution.test.ts
+
+  nix-node-modules:
+    name: Nix node_modules (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+          - system: x86_64-darwin
+            runner: macos-15-intel
+          - system: aarch64-darwin
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    env:
+      PR_HEAD: ${{ github.event.pull_request.head.sha }}
+      SYSTEM: ${{ matrix.system }}
+    steps:
+      - name: Check out pull request merge head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Initialize validation report
+        shell: bash
+        run: |
+          REPORT="$RUNNER_TEMP/nix-validation.md"
+          {
+            echo "## Nix validation"
+            echo "- PR head: $PR_HEAD"
+            echo "- Build head: $(git rev-parse HEAD)"
+            echo "- Nix system: $SYSTEM"
+            echo "- Runner: $RUNNER_NAME ($RUNNER_OS/$RUNNER_ARCH)"
+          } > "$REPORT"
+          echo "REPORT=$REPORT" >> "$GITHUB_ENV"
+
+      - name: Set up Nix
+        uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035 # v34
+
+      - name: Compute native node_modules hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_LOG="$RUNNER_TEMP/nix-hash-build.log"
+          HASH_FILE="$RUNNER_TEMP/node-modules-hash.txt"
+          echo "- Hash command: nix build .#packages.$SYSTEM.node_modules_updater --no-link" >> "$REPORT"
+          nix build ".#packages.$SYSTEM.node_modules_updater" --no-link 2>&1 | tee "$BUILD_LOG" || true
+          HASH="$(python3 - "$BUILD_LOG" <<'PY'
+          import re
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8", errors="replace") as stream:
+              values = re.findall(r"got:\s*(sha256-[A-Za-z0-9+/=]+)", stream.read())
+          print(values[-1] if values else "")
+          PY
+          )"
+          if [[ -z "$HASH" ]]; then
+            echo "- Computed hash: unavailable" >> "$REPORT"
+            echo "- Result: blocked; the Nix build did not report an output hash." >> "$REPORT"
+            exit 1
+          fi
+          printf '%s\n' "$HASH" > "$HASH_FILE"
+          echo "- Computed hash: $HASH" >> "$REPORT"
+          EXPECTED="$(python3 - "$SYSTEM" <<'PY'
+          import json
+          import sys
+
+          with open("nix/hashes.json", encoding="utf-8") as stream:
+              print(json.load(stream)["nodeModules"].get(sys.argv[1], ""))
+          PY
+          )"
+          echo "- Checked-in hash: ${EXPECTED:-missing}" >> "$REPORT"
+          if [[ "$HASH" != "$EXPECTED" ]]; then
+            echo "- Result: mismatch; update nix/hashes.json only from these native runner outputs, then rerun." >> "$REPORT"
+            exit 1
+          fi
+          echo "- Result: hash matches the checked-in value." >> "$REPORT"
+
+      - name: Build OpenCode with Nix
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_LOG="$RUNNER_TEMP/nix-opencode-build.log"
+          echo "- App build command: nix build .#packages.$SYSTEM.opencode --no-link --print-out-paths -L" >> "$REPORT"
+          nix build ".#packages.$SYSTEM.opencode" --no-link --print-out-paths -L 2>&1 | tee "$BUILD_LOG"
+          STORE_PATH="$(python3 - "$BUILD_LOG" <<'PY'
+          import re
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8", errors="replace") as stream:
+              paths = re.findall(r"/nix/store/[0-9a-z]{32}-[^\s]+", stream.read())
+          print(paths[-1] if paths else "unresolved")
+          PY
+          )"
+          echo "- OpenCode output: $STORE_PATH" >> "$REPORT"
+          echo "- Result: Nix package build passed." >> "$REPORT"
+
+      - name: Publish Nix validation report
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f "$REPORT" ]]; then cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Retain Nix runner evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nix-validation-${{ matrix.system }}
+          path: |
+            ${{ runner.temp }}/nix-validation.md
+            ${{ runner.temp }}/nix-hash-build.log
+            ${{ runner.temp }}/nix-opencode-build.log
+            ${{ runner.temp }}/node-modules-hash.txt
+          if-no-files-found: warn
+          retention-days: 7

@@ -25,7 +25,8 @@ if [[ "$platform" != linux-* && "$platform" != darwin-* ]]; then
   printf 'Local release installs currently support Linux and macOS only.\n' >&2
   exit 1
 fi
-built="$root/packages/opencode/dist/opencode-$platform/bin/opencode"
+build_dir="$root/packages/opencode/dist/opencode-$platform/bin"
+built="$build_dir/opencode"
 target="${OPENCODE_LOCAL_BIN:-$HOME/.local/opencode-swxtch/bin/opencode}"
 database="${OPENCODE_DB_PATH:-$HOME/.local/share/opencode/opencode.db}"
 if [[ "$target" != /* || "$database" != /* ]]; then
@@ -52,6 +53,11 @@ fi
 printf 'Building %s with Bun %s\n' "$release" "$bun_version"
 npx --yes "bun@$bun_version" install --frozen-lockfile
 OPENCODE_VERSION="$release" npx --yes "bun@$bun_version" run packages/opencode/script/build.ts --single --skip-install
+native_library=$(find "$build_dir" -maxdepth 1 -type f \( -name 'libfff_c-*.so' -o -name 'libfff_c-*.dylib' \) -print -quit)
+if [[ -z "$native_library" ]]; then
+  printf 'Built FFF native library was not found beside %s.\n' "$built" >&2
+  exit 1
+fi
 
 if [[ "$("$built" --version)" != "$release" || "$("$built" db path)" != "$database" ]]; then
   printf 'Built binary version or database path did not match; install aborted.\n' >&2
@@ -68,7 +74,13 @@ if [[ -f "$target" ]]; then
 fi
 
 temporary="$target.new.$$"
-trap 'rm -f "$temporary"' EXIT
+native_library_target="$(dirname "$target")/$(basename "$native_library")"
+temporary_library="$native_library_target.new.$$"
+trap 'rm -f "$temporary" "$temporary_library"' EXIT
+if [[ ! -f "$native_library_target" ]] || ! cmp -s "$native_library" "$native_library_target"; then
+  install -m 644 "$native_library" "$temporary_library"
+  mv -f "$temporary_library" "$native_library_target"
+fi
 install -m 755 "$built" "$temporary"
 mv -f "$temporary" "$target"
 

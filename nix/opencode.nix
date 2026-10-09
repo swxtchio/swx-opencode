@@ -27,13 +27,6 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     writableTmpDirAsHomeHook
   ];
 
-  postPatch = ''
-    # NOTE: Relax Bun version check to be a warning instead of an error
-    substituteInPlace packages/script/src/index.ts \
-      --replace-fail 'throw new Error(`This script requires bun@''${expectedBunVersionRange}' \
-                     'console.warn(`Warning: This script requires bun@''${expectedBunVersionRange}'
-  '';
-
   configurePhase = ''
     runHook preConfigure
 
@@ -63,6 +56,7 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     runHook preInstall
 
     install -Dm755 dist/opencode-*/bin/opencode $out/bin/opencode
+    install -Dm644 dist/opencode-*/bin/libfff_c-* -t $out/bin
     install -Dm644 schema.json $out/share/opencode/schema.json
 
     wrapProgram $out/bin/opencode \

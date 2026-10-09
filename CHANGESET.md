@@ -38,6 +38,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Fork maintenance and CI
 
+- **#150** The repository-read-only `fff-platform-validation.yml` builds and runs compiled FFF distributions on native Windows x64 and ARM64 runners, computes and checks Nix node_modules hashes on native Linux and macOS runners, retains runner evidence, and builds OpenCode with Nix after each hash matches. _Fork-only._
 - **#98** `tests/run.sh` runs the unit suite from the repository root as CI's "Run unit tests" step does
   (`GITHUB_ACTIONS=false bun turbo test`), returning its exit status, and fails when Bun or the installed workspace
   is missing. The root `npm test` still refuses. _Fork-only._
@@ -138,6 +139,17 @@ Newest first. Each entry names the upstream range brought in.
 - **#2** Break the filesystem search import cycle that crashed compiled binaries, and guard the layer-node walk.
   _Partly upstream:_ upstream #50439 fixed the cycle and its version was taken in the 2026-09-22 sync; the
   layer-node guard is fork-only.
+
+### Native FFF distribution
+
+- **#150** Use the root `packageManager` Bun pin for Nix-built OpenCode and desktop binaries (`package.json`,
+  `nix/bun.nix`, and `flake.nix`). _Fork-only (swxtchio/swx-opencode#97)._
+- **#150** Patch `@ff-labs/fff-bun` (`patches/@ff-labs%2Ffff-bun@0.9.4.patch`) so compiled builds load the
+  content-addressed, target-specific FFF sidecar beside the executable; carry the sidecar through build, install,
+  postinstall, local-release, Docker, and generated release-package paths. _Fork-only (swxtchio/swx-opencode#97)._
+- **#150** Enable native FFF by default in packaged Windows builds (`packages/core/src/flag/flag.ts`), preserve
+  `OPENCODE_DISABLE_FFF=1` as the ripgrep fallback, and report the expected sidecar path when loading is unavailable
+  (`packages/core/src/filesystem/search.ts`). _Fork-only (swxtchio/swx-opencode#97)._
 
 ### Features
 
