@@ -69,6 +69,12 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#155** Restore the SQLite lock-wait window that #88 cut to about 250ms (swxtchio/swx-opencode#153): every
+  runtime client keeps its short native attempt but retries a busy statement asynchronously for 5s of elapsed
+  contention, the old `busy_timeout` window, so a competing writer on the shared store no longer fails accepted
+  prompts and the event loop keeps turning. A stale-snapshot write (`SQLITE_BUSY_SNAPSHOT`), which no statement retry
+  can recover, now fails at once instead of holding the connection for the window (swxtchio/swx-opencode#154).
+  _Fork-only._
 - **#144** Make `opencode db path` print the selected path without initializing `AppRuntime` or SQLite, defer global directory creation to runtime initialization, and preserve explicit and channel-specific database path selection. _Upstreamable._
 - **#141** Reconcile `.git/HEAD` after an early or missed native callback through a shared read/change/publish path; keep a
   closed native watch `unavailable` while polling still delivers changed branch values. Cover root-off switches, native
