@@ -3,7 +3,7 @@ import { sql } from "drizzle-orm"
 import { Context, Effect, Layer } from "effect"
 import { SqlClient } from "effect/unstable/sql/SqlClient"
 
-// The driver gives up after its 5s retry window; this only catches a retry that never stops.
+// Outlasts the driver's own retry window, so it only catches a retry that never stops.
 const retryBackstop = "10 seconds"
 
 const withImmediateSqliteLock = <A, E, R>(

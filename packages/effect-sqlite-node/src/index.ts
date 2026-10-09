@@ -19,8 +19,9 @@ import * as Statement from "effect/unstable/sql/Statement"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 const nativeBusyTimeoutMs = 5
-// Keep the old 5s busy_timeout window, but wait it out asynchronously between 5ms native attempts.
-// The window runs from the first busy failure; backoff is capped at SQLite's own 100ms busy-handler sleep.
+// Restore the lock tolerance the old busy_timeout gave, but wait asynchronously between short native attempts
+// so a contended statement never blocks the event loop. The window runs from the first busy failure, and the
+// backoff cap matches SQLite's own busy-handler sleep.
 const retrySchedule = Schedule.exponential("10 millis").pipe(
   Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 100)))),
   Schedule.jittered,
