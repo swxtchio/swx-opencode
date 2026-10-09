@@ -28,6 +28,8 @@ const lockBackstop = "10 seconds"
 const heldLockMs = 1_500
 // The event loop must keep turning while a statement waits; a long synchronous native wait stalls it for seconds.
 const stallBoundMs = 1_000
+// A stale snapshot can never succeed on retry, so its write must fail far inside the retry window.
+const snapshotBoundMs = 1_000
 
 // Ticks continually from now on and returns a reader for the longest gap between ticks. The reader includes the gap
 // still open when it is called, so a synchronous call the ticker has not yet woken from still counts.
@@ -178,6 +180,26 @@ const clientWithAttemptCount = (input: {
   attempts: { count: number }
 }) =>
   Effect.gen(function* () {
+    // Clients prepare once and retry the execution, so count each execution of the prepared statement.
+    const counted = new WeakSet<object>()
+    const countExecutions = <S extends object>(statement: S) => {
+      if (counted.has(statement)) return statement
+      counted.add(statement)
+      for (const method of ["all", "values"]) {
+        const execute: unknown = Reflect.get(statement, method)
+        if (typeof execute !== "function") continue
+        Object.defineProperty(statement, method, {
+          configurable: true,
+          writable: true,
+          value: (...params: unknown[]) => {
+            input.attempts.count++
+            return execute.apply(statement, params)
+          },
+        })
+      }
+      return statement
+    }
+
     if (input.clientType === "bun") {
       const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
       const prototype = sqlite.Database.prototype
@@ -187,8 +209,8 @@ const clientWithAttemptCount = (input: {
       Object.defineProperty(prototype, "query", {
         ...queryDescriptor,
         value: function (this: InstanceType<typeof sqlite.Database>, sql: string) {
-          if (sql === input.statement) input.attempts.count++
-          return query.call(this, sql)
+          const statement = query.call(this, sql)
+          return sql === input.statement ? countExecutions(statement) : statement
         },
       })
       yield* Effect.addFinalizer(() => Effect.sync(() => Object.defineProperty(prototype, "query", queryDescriptor)))
@@ -206,8 +228,8 @@ const clientWithAttemptCount = (input: {
         configurable: true,
         writable: true,
         value: function (this: InstanceType<typeof drivers.DatabaseSync>, sql: string) {
-          if (sql === input.statement) input.attempts.count++
-          return prepare.call(this, sql)
+          const statement = prepare.call(this, sql)
+          return sql === input.statement ? countExecutions(statement) : statement
         },
       })
       return Context.get(context, SqlClient)
@@ -221,8 +243,8 @@ const clientWithAttemptCount = (input: {
     Object.defineProperty(prototype, "prepare", {
       ...prepareDescriptor,
       value: function (this: InstanceType<typeof drivers.DatabaseSync>, sql: string) {
-        if (sql === input.statement) input.attempts.count++
-        return prepare.call(this, sql)
+        const statement = prepare.call(this, sql)
+        return sql === input.statement ? countExecutions(statement) : statement
       },
     })
     yield* Effect.addFinalizer(() => Effect.sync(() => Object.defineProperty(prototype, "prepare", prepareDescriptor)))
@@ -379,6 +401,66 @@ describe("SQLite busy timeout and statement retries", () => {
           ),
         )
         expect(Exit.isSuccess(exit)).toBe(true)
+      },
+      20_000,
+    )
+  }
+
+  for (const clientType of ["bun", "core-node", "standalone-node"] as const) {
+    test.skipIf(clientType !== "bun" && !nodeSqliteDrivers)(
+      `${clientType} fails a stale-snapshot transaction write without retrying it`,
+      async () => {
+        await using tmp = await tmpdir()
+        const filename = path.join(tmp.path, `${clientType}-snapshot.sqlite`)
+        const writerSql = "INSERT INTO busy_retry_test (id, value) VALUES (1, 'stale-writer')"
+        const exit = await Effect.runPromiseExit(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const attempts = { count: 0 }
+              const client = yield* clientWithAttemptCount({ clientType, filename, statement: writerSql, attempts })
+              yield* client.unsafe("CREATE TABLE busy_retry_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL)").raw
+              expect(yield* client.unsafe("PRAGMA journal_mode").values).toEqual([["wal"]])
+              const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
+              const other = new sqlite.Database(filename)
+              yield* Effect.addFinalizer(() => Effect.sync(() => other.close()))
+
+              let elapsedMs = 0
+              const failure = yield* client
+                .withTransaction(
+                  Effect.gen(function* () {
+                    expect(yield* client.unsafe("SELECT COUNT(*) FROM busy_retry_test").values).toEqual([[0]])
+                    // Another connection commits after this transaction's read, so its snapshot is stale.
+                    other.run("INSERT INTO busy_retry_test (id, value) VALUES (2, 'other-writer')")
+                    const startedAt = performance.now()
+                    yield* client
+                      .unsafe(writerSql)
+                      .raw.pipe(
+                        Effect.onExit(() => Effect.sync(() => void (elapsedMs = performance.now() - startedAt))),
+                      )
+                  }),
+                )
+                .pipe(
+                  Effect.timeoutOrElse({
+                    duration: lockBackstop,
+                    orElse: () => Effect.fail(new Error("stale-snapshot retries did not stop")),
+                  }),
+                  Effect.flip,
+                )
+              expect(isSqlError(failure)).toBe(true)
+              if (!isSqlError(failure)) return
+              expect(failure.reason._tag).toBe("LockTimeoutError")
+              expect(failure.reason.cause).toMatchObject(
+                clientType === "bun" ? { code: "SQLITE_BUSY_SNAPSHOT" } : { errcode: 517 },
+              )
+              expect(elapsedMs).toBeLessThan(snapshotBoundMs)
+              expect(attempts.count).toBe(1)
+              expect(yield* client.unsafe("SELECT id, value FROM busy_retry_test ORDER BY id").values).toEqual([
+                [2, "other-writer"],
+              ])
+            }),
+          ),
+        )
+        if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
       },
       20_000,
     )

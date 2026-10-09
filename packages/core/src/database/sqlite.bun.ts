@@ -28,6 +28,14 @@ const retrySchedule = Schedule.exponential("10 millis").pipe(
   Schedule.both(Schedule.during("5 seconds")),
 )
 
+// A stale read snapshot fails every retry of the same statement; only restarting its transaction can recover.
+const retryable = (error: SqlError) => {
+  const cause = error.reason.cause
+  const snapshot =
+    typeof cause === "object" && cause !== null && "code" in cause && cause.code === "SQLITE_BUSY_SNAPSHOT"
+  return error.reason.isRetryable && !snapshot
+}
+
 const statementError = (cause: unknown) => {
   const reason = classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" })
   if (reason._tag !== "LockTimeoutError") return new SqlError({ reason })
@@ -91,7 +99,7 @@ const make = (options: Config) =>
         return Effect.try({
           try: () => (statement.all(...(params as any)) ?? []) as Array<Record<string, unknown>>,
           catch: statementError,
-        }).pipe(Effect.retry({ schedule: retrySchedule, while: (error) => error.reason.isRetryable }))
+        }).pipe(Effect.retry({ schedule: retrySchedule, while: retryable }))
       })
 
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
@@ -102,7 +110,7 @@ const make = (options: Config) =>
         return Effect.try({
           try: () => (statement.values(...(params as any)) ?? []) as Array<unknown[]>,
           catch: statementError,
-        }).pipe(Effect.retry({ schedule: retrySchedule, while: (error) => error.reason.isRetryable }))
+        }).pipe(Effect.retry({ schedule: retrySchedule, while: retryable }))
       })
 
     const connection = identity<SqliteConnection>({
