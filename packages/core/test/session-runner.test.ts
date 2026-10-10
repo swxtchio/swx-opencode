@@ -19,7 +19,7 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { PermissionV2 } from "@opencode-ai/core/permission"
 import { EventTable } from "@opencode-ai/core/event/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Project } from "@opencode-ai/core/project"
+import { Project, ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { QuestionV2 } from "@opencode-ai/core/question"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -56,7 +56,7 @@ import { ReferenceGuidance } from "@opencode-ai/core/reference/guidance"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Location } from "@opencode-ai/core/location"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Queue, Schema, Stream } from "effect"
 import { asc, eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 
@@ -99,6 +99,14 @@ const client = Layer.succeed(
       )
     }) as unknown as LLMClientShape["stream"],
     generate: () => Effect.die("unused"),
+  }),
+)
+const projects = Layer.succeed(
+  ProjectV2.Service,
+  ProjectV2.Service.of({
+    resolve: (directory) => Effect.succeed({ id: ProjectV2.ID.global, directory }),
+    directories: () => Effect.succeed([]),
+    commit: () => Effect.void,
   }),
 )
 const model = Model.make({ id: "fake-model", provider: "fake", route: OpenAIChat.route })
@@ -250,6 +258,7 @@ const execution = Layer.effect(
     })
     return SessionExecution.Service.of({
       active: coordinator.active,
+      join: coordinator.join,
       resume: coordinator.run,
       wake: coordinator.wake,
       interrupt: coordinator.interrupt,
@@ -290,6 +299,7 @@ const it = testEffect(
       [Snapshot.node, Snapshot.noopLayer],
       [SessionExecution.node, execution],
       [Config.node, config],
+      [ProjectV2.node, projects],
     ],
   ),
 )
@@ -352,6 +362,18 @@ const setup = Effect.gen(function* () {
     .run()
     .pipe(Effect.orDie)
   yield* insertSession(sessionID)
+})
+
+const setupNative = Effect.gen(function* () {
+  yield* setup
+  requests.length = 0
+  const { db } = yield* Database.Service
+  yield* db.delete(SessionTable).where(eq(SessionTable.id, sessionID)).run().pipe(Effect.orDie)
+  const session = yield* SessionV2.Service
+  return yield* session.create({
+    id: sessionID,
+    location: Location.Ref.make({ directory: AbsolutePath.make("/project") }),
+  })
 })
 
 const providerUnavailable = () =>
@@ -483,6 +505,457 @@ const fragmentFixture = (kind: FragmentKind, id: string, chunks: readonly string
     }
   }
 }
+
+const echoTurn = (id: string, text: string) => [
+  LLMEvent.stepStart({ index: 0 }),
+  LLMEvent.toolCall({ id, name: "echo", input: { text } }),
+  LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+  LLMEvent.finish({ reason: "tool-calls" }),
+]
+
+const textTurn = (id: string, text: string) => fragmentFixture("text", id, [text]).completeEvents
+
+describe("SessionV2.wait", () => {
+  it.effect("reports idle for a native Session with no admitted work", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const result = yield* session.wait(sessionID)
+
+      expect(result).toEqual({ type: "idle" })
+    }),
+  )
+
+  it.effect("returns completion after assistant and terminal tool projections agree", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      responses = [echoTurn("call-wait-completed", "settled"), textTurn("text-wait-completed", "Done")]
+      const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run the tool" }) })
+
+      const result = yield* session.wait(sessionID)
+
+      expect(result).toMatchObject({ type: "completed", admittedSeq: admitted.admittedSeq })
+      if (result.type !== "completed") throw new Error("Expected completed Session wait result")
+      const messages = yield* session.messages({ sessionID, order: "asc" })
+      const assistant = yield* session.message({ sessionID, messageID: result.assistantMessageID })
+      const tool = messages
+        .filter((message): message is SessionMessage.Assistant => message.type === "assistant")
+        .flatMap((message) => message.content)
+        .find((content): content is SessionMessage.AssistantTool => content.type === "tool")
+      const history = yield* session.history({ sessionID, limit: 100 })
+
+      expect(assistant).toMatchObject({
+        id: result.assistantMessageID,
+        type: "assistant",
+        content: [{ type: "text", text: "Done" }],
+      })
+      expect(tool?.state.status).toBe("completed")
+      expect(history.hasMore).toBe(false)
+      expect(history.events.map((event) => event.type)).toContain(SessionEvent.Tool.Success.type)
+      expect(history.events.map((event) => event.type)).toContain(SessionEvent.Step.Ended.type)
+      expect(requests).toHaveLength(2)
+    }),
+  )
+
+  it.effect("does not settle while a local tool remains running", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const gate = yield* Deferred.make<void>()
+      const started = yield* Deferred.make<void>()
+      const outcome = yield* Deferred.make<Exit.Exit<SessionV2.WaitResult, SessionV2.Error>>()
+      toolExecutionGate = gate
+      toolExecutionsStarted = started
+      toolExecutionsReady = 1
+      responses = [echoTurn("call-wait-held", "held"), textTurn("text-wait-held", "Done")]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Wait for the held tool" }) })
+
+      const waiter = yield* session.wait(sessionID).pipe(
+        Effect.exit,
+        Effect.flatMap((exit) => Deferred.succeed(outcome, exit)),
+        Effect.forkChild,
+      )
+      yield* Deferred.await(started)
+      yield* Effect.yieldNow
+      expect(yield* Deferred.isDone(outcome)).toBe(false)
+
+      yield* Deferred.succeed(gate, undefined)
+      const result = yield* Deferred.await(outcome)
+      expect(Exit.isSuccess(result)).toBe(true)
+      if (Exit.isSuccess(result)) expect(result.value.type).toBe("completed")
+      yield* Fiber.join(waiter)
+    }).pipe(Effect.ensuring(toolExecutionGate ? Deferred.succeed(toolExecutionGate, undefined) : Effect.void)),
+  )
+
+  it.effect("covers a prompt admitted while the provider turn is running", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const gate = yield* Deferred.make<void>()
+      const started = yield* Deferred.make<void>()
+      const outcome = yield* Deferred.make<Exit.Exit<SessionV2.WaitResult, SessionV2.Error>>()
+      streamGate = gate
+      streamStarted = started
+      responses = [textTurn("text-wait-first", "First answer"), textTurn("text-wait-second", "Second answer")]
+      const first = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First prompt" }) })
+      const waiter = yield* session.wait(sessionID).pipe(
+        Effect.exit,
+        Effect.flatMap((exit) => Deferred.succeed(outcome, exit)),
+        Effect.forkChild,
+      )
+      yield* Deferred.await(started)
+      const second = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second prompt" }) })
+      yield* Deferred.succeed(gate, undefined)
+
+      const result = yield* Deferred.await(outcome)
+      expect(Exit.isSuccess(result)).toBe(true)
+      if (Exit.isSuccess(result))
+        expect(result.value).toMatchObject({ type: "completed", admittedSeq: second.admittedSeq })
+      expect(second.admittedSeq).toBeGreaterThan(first.admittedSeq)
+      const messages = yield* session.messages({ sessionID })
+      expect(messages.filter((message) => message.type === "user").map((message) => message.text)).toEqual([
+        "Second prompt",
+        "First prompt",
+      ])
+      expect(
+        messages
+          .filter((message): message is SessionMessage.Assistant => message.type === "assistant")
+          .flatMap((message) => message.content)
+          .filter((content): content is SessionMessage.AssistantText => content.type === "text")
+          .map((content) => content.text),
+      ).toEqual(["Second answer", "First answer"])
+      expect(requests).toHaveLength(2)
+      yield* Fiber.join(waiter)
+    }).pipe(Effect.ensuring(streamGate ? Deferred.succeed(streamGate, undefined) : Effect.void)),
+  )
+
+  it.effect("reports provider-error events as failed instead of idle", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      response = [LLMEvent.stepStart({ index: 0 }), LLMEvent.providerError({ message: "Provider unavailable" })]
+      const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Fail through an event" }) })
+
+      const result = yield* session.wait(sessionID)
+
+      expect(result).toMatchObject({ type: "failed", admittedSeq: admitted.admittedSeq })
+      const assistant = (yield* session.messages({ sessionID })).find(
+        (message): message is SessionMessage.Assistant => message.type === "assistant",
+      )
+      expect(assistant).toMatchObject({ finish: "error", error: { type: "unknown", message: "Provider unavailable" } })
+      expect((yield* session.history({ sessionID, limit: 100 })).events.map((event) => event.type)).toContain(
+        SessionEvent.Step.Failed.type,
+      )
+      expect(requests).toHaveLength(1)
+    }),
+  )
+
+  it.effect("reports thrown provider failures as failed instead of idle", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      streamFailure = providerUnavailable()
+      const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Fail through the stream" }) })
+
+      const result = yield* session.wait(sessionID)
+
+      expect(result).toMatchObject({ type: "failed", admittedSeq: admitted.admittedSeq })
+      const assistant = (yield* session.messages({ sessionID })).find(
+        (message): message is SessionMessage.Assistant => message.type === "assistant",
+      )
+      expect(assistant).toMatchObject({ finish: "error", error: { type: "unknown", message: "Provider unavailable" } })
+      expect(requests).toHaveLength(1)
+    }),
+  )
+
+  it.effect("reports a joined runner failure when no assistant turn was published", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const systemStarted = yield* Deferred.make<void>()
+      const systemGate = yield* Deferred.make<void>()
+      const outcome = yield* Deferred.make<Exit.Exit<SessionV2.WaitResult, SessionV2.Error>>()
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(systemGate, undefined)
+          systemUnavailable = false
+          systemLoadHook = Effect.void
+        }),
+      )
+      systemUnavailable = false
+      systemLoadHook = Deferred.succeed(systemStarted, undefined).pipe(Effect.andThen(Deferred.await(systemGate)))
+      const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Fail before provider start" }) })
+      yield* Deferred.await(systemStarted)
+      expect(Array.from(yield* session.active)).toEqual([sessionID])
+      const waiter = yield* session.wait(sessionID).pipe(
+        Effect.exit,
+        Effect.flatMap((exit) => Deferred.succeed(outcome, exit)),
+        Effect.forkChild,
+      )
+      yield* Effect.yieldNow
+      expect(yield* Deferred.isDone(outcome)).toBe(false)
+
+      systemUnavailable = true
+      yield* Deferred.succeed(systemGate, undefined)
+      const result = yield* Deferred.await(outcome)
+      expect(result).toMatchObject({
+        _tag: "Success",
+        value: { type: "failed", admittedSeq: admitted.admittedSeq },
+      })
+      expect(requests).toHaveLength(0)
+      expect((yield* session.messages({ sessionID })).some((message) => message.type === "assistant")).toBe(false)
+      const { db } = yield* Database.Service
+      expect(yield* SessionInput.hasPending(db, sessionID, "steer")).toBe(true)
+      yield* Fiber.join(waiter)
+    }),
+  )
+
+  it.effect("does not report completion when a terminal tool failed", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "call-wait-missing", name: "missing", input: {} }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        textTurn("text-wait-tool-failed", "Handled the tool error"),
+      ]
+      const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Call an unknown tool" }) })
+
+      const result = yield* session.wait(sessionID)
+
+      expect(result).toMatchObject({ type: "failed", admittedSeq: admitted.admittedSeq })
+      const toolMessage = (yield* session.messages({ sessionID })).find(
+        (message): message is SessionMessage.Assistant =>
+          message.type === "assistant" &&
+          message.content.some((content) => content.type === "tool" && content.state.status === "error"),
+      )
+      expect(toolMessage).toBeDefined()
+      expect((yield* session.history({ sessionID, limit: 100 })).events.map((event) => event.type)).toContain(
+        SessionEvent.Tool.Failed.type,
+      )
+      expect(requests).toHaveLength(2)
+    }),
+  )
+
+  it.effect("does not complete a successful tool turn without its required provider continuation", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      let resolutions = 0
+      modelResolveHook = Effect.sync(() => resolutions++).pipe(
+        Effect.andThen(
+          Effect.suspend(() =>
+            resolutions === 2 ? Effect.die(new Error("Continuation model resolution failed")) : Effect.void,
+          ),
+        ),
+      )
+      responses = [echoTurn("call-wait-continuation", "settled tool")]
+      const admitted = yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Tool work still needs a provider continuation" }),
+        resume: false,
+      })
+
+      const exit = yield* session.resume(sessionID).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(requests).toHaveLength(1)
+      expect(Array.from(yield* session.active)).toEqual([])
+      const assistant = (yield* session.messages({ sessionID })).find(
+        (message): message is SessionMessage.Assistant => message.type === "assistant",
+      )
+      if (assistant === undefined) throw new Error("Expected the completed tool turn to remain projected")
+      expect(assistant.finish).toBe("tool-calls")
+      expect(assistant.time.completed).toBeDefined()
+      expect(assistant.content.some((content) => content.type === "tool" && content.state.status === "completed")).toBe(
+        true,
+      )
+      expect(yield* session.wait(sessionID).pipe(Effect.flip)).toMatchObject({
+        _tag: "Session.OperationUnavailableError",
+      })
+      expect(admitted.admittedSeq).toBe(1)
+    }),
+  )
+
+  it.effect("does not carry a prior completion across a later admission", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      response = textTurn("text-wait-before-new-prompt", "First answer")
+      const first = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First prompt" }) })
+      const completed = yield* session.wait(sessionID)
+      expect(completed).toMatchObject({ type: "completed", admittedSeq: first.admittedSeq })
+
+      const second = yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Second prompt" }),
+        resume: false,
+      })
+      const pending = yield* session.wait(sessionID)
+
+      expect(second.admittedSeq).toBeGreaterThan(first.admittedSeq)
+      expect(pending).toEqual({ type: "pending", admittedSeq: second.admittedSeq, messageID: second.id })
+      expect(requests).toHaveLength(1)
+    }),
+  )
+
+  it.effect("reports an interrupted drain and its terminal tool cleanup", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const gate = yield* Deferred.make<void>()
+      const started = yield* Deferred.make<void>()
+      const outcome = yield* Deferred.make<Exit.Exit<SessionV2.WaitResult, SessionV2.Error>>()
+      toolExecutionGate = gate
+      toolExecutionsStarted = started
+      toolExecutionsReady = 1
+      response = echoTurn("call-wait-interrupted", "blocked")
+      const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Interrupt this turn" }) })
+      const waiter = yield* session.wait(sessionID).pipe(
+        Effect.exit,
+        Effect.flatMap((exit) => Deferred.succeed(outcome, exit)),
+        Effect.forkChild,
+      )
+      yield* Deferred.await(started)
+      yield* session.interrupt(sessionID)
+
+      const messages = yield* session.messages({ sessionID })
+      const assistant = messages.find(
+        (message): message is SessionMessage.Assistant =>
+          message.type === "assistant" && message.content.some((content) => content.type === "tool"),
+      )
+      const tool = assistant?.content.find((content) => content.type === "tool")
+      expect(tool).toMatchObject({
+        state: { status: "error", error: { message: "Tool execution interrupted" } },
+      })
+      const result = yield* Deferred.await(outcome)
+      expect(result).toMatchObject({
+        _tag: "Success",
+        value: { type: "interrupted", admittedSeq: admitted.admittedSeq },
+      })
+      expect(assistant).toMatchObject({ finish: "error", error: { message: "Provider turn interrupted" } })
+      expect((yield* session.history({ sessionID, limit: 100 })).events.map((event) => event.type)).toContain(
+        SessionEvent.Tool.Failed.type,
+      )
+      expect(requests).toHaveLength(1)
+      yield* Fiber.join(waiter)
+    }).pipe(Effect.ensuring(toolExecutionGate ? Deferred.succeed(toolExecutionGate, undefined) : Effect.void)),
+  )
+
+  it.effect("keeps admit-only work pending and refuses an unobservable promoted turn", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const admitted = yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Admit without running" }),
+        resume: false,
+      })
+
+      expect(yield* session.wait(sessionID)).toEqual({
+        type: "pending",
+        admittedSeq: admitted.admittedSeq,
+        messageID: admitted.id,
+      })
+      expect(Array.from(yield* session.active)).toEqual([])
+
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER)
+      const unavailable = yield* session.wait(sessionID).pipe(Effect.flip)
+
+      expect(unavailable._tag).toBe("Session.OperationUnavailableError")
+    }),
+  )
+})
+
+describe("SessionV2.events cursor", () => {
+  it.effect("replays terminal events after disconnect without redelivering the consumed tool", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const { db } = yield* Database.Service
+      const cursor = yield* EventV2.latestSequence(db, sessionID)
+      const queue = yield* Queue.unbounded<SessionEvent.DurableEvent>()
+      const subscriber = yield* session.events({ sessionID, after: cursor }).pipe(
+        Stream.runForEach((event) => Queue.offer(queue, event).pipe(Effect.asVoid)),
+        Effect.forkScoped,
+      )
+      const toolGate = yield* Deferred.make<void>()
+      const toolStarted = yield* Deferred.make<void>()
+      const finalProviderGate = yield* Deferred.make<void>()
+      const finalProviderStarted = yield* Deferred.make<void>()
+      toolExecutionGate = toolGate
+      toolExecutionsStarted = toolStarted
+      toolExecutionsReady = 1
+      responses = [echoTurn("call-cursor", "tool result")]
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Produce cursor events" }) })
+      yield* Deferred.await(toolStarted)
+      responseStream = Stream.unwrap(
+        Deferred.succeed(finalProviderStarted, undefined).pipe(
+          Effect.andThen(
+            Deferred.await(finalProviderGate).pipe(Effect.as(Stream.fromIterable(textTurn("text-cursor", "Complete")))),
+          ),
+        ),
+      )
+      yield* Deferred.succeed(toolGate, undefined)
+
+      const consumed: SessionEvent.DurableEvent[] = []
+      let tool: SessionEvent.Tool.Success | undefined
+      while (tool === undefined) {
+        const event = yield* Queue.take(queue).pipe(
+          Effect.timeoutOrElse({
+            duration: "10 seconds",
+            orElse: () => Effect.fail(new Error("timed out waiting for the terminal tool event")),
+          }),
+        )
+        consumed.push(event)
+        if (event.type === SessionEvent.Tool.Success.type) tool = event
+      }
+      yield* Deferred.await(finalProviderStarted)
+      yield* Fiber.interrupt(subscriber)
+      yield* Deferred.succeed(finalProviderGate, undefined)
+      yield* session.resume(sessionID)
+
+      if (tool.durable === undefined) throw new Error("Consumed terminal tool event had no cursor")
+      const toolCursor = tool.durable.seq
+      const allHistory = yield* session.history({ sessionID, limit: 100 })
+      const afterHistory = yield* session.history({ sessionID, after: toolCursor, limit: 100 })
+      const resumed = Array.from(
+        yield* session
+          .events({ sessionID, after: toolCursor })
+          .pipe(Stream.take(afterHistory.events.length), Stream.runCollect),
+      )
+      const ids = resumed.map((event) => event.id)
+      const sequences = resumed.map((event) => event.durable?.seq)
+      const consumedPrefix = allHistory.events.filter(
+        (event) => event.durable !== undefined && event.durable.seq <= toolCursor,
+      )
+      const observed = [...consumed, ...resumed]
+
+      expect(consumed.map((event) => event.id)).toContain(tool.id)
+      expect(consumed.map((event) => [event.id, event.durable?.seq])).toEqual(
+        consumedPrefix.map((event) => [event.id, event.durable?.seq]),
+      )
+      expect(allHistory.events.find((event) => event.id === tool.id)?.durable?.seq).toBe(toolCursor)
+      expect(afterHistory.hasMore).toBe(false)
+      expect(ids).toEqual(afterHistory.events.map((event) => event.id))
+      expect(sequences).toEqual(afterHistory.events.map((event) => event.durable?.seq))
+      expect(new Set(ids).size).toBe(ids.length)
+      expect(ids).not.toContain(tool.id)
+      expect(observed.map((event) => event.id)).toEqual(allHistory.events.map((event) => event.id))
+      expect(new Set(observed.map((event) => event.id)).size).toBe(observed.length)
+      expect(resumed.some((event) => event.type === SessionEvent.Step.Ended.type && event.data.finish === "stop")).toBe(
+        true,
+      )
+    }).pipe(Effect.ensuring(toolExecutionGate ? Deferred.succeed(toolExecutionGate, undefined) : Effect.void)),
+  )
+})
 
 const verifyEphemeralDeltas = (kind: FragmentKind) =>
   Effect.gen(function* () {

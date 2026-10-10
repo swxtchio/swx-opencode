@@ -105,6 +105,7 @@ test("session methods use the public HTTP contract", async () => {
       if (url.includes("/prompt")) return Response.json(admission)
       if (url.includes("/context")) return Response.json({ data: [] })
       if (url.includes("/message/")) return Response.json({ data: modelSwitchedMessage })
+      if (url.endsWith("/wait")) return Response.json({ data: waitResult })
       if (url.endsWith("/api/session/active")) return Response.json({ data: { ses_test: { type: "running" } } })
       if (init?.method === "POST" && url.endsWith("/api/session")) return Response.json(session)
       if (init?.method === "POST") return new Response(null, { status: 204 })
@@ -126,7 +127,7 @@ test("session methods use the public HTTP contract", async () => {
     resume: false,
   })
   await client.sessions.compact({ sessionID: "ses_test" })
-  await client.sessions.wait({ sessionID: "ses_test" })
+  const waited = await client.sessions.wait({ sessionID: "ses_test" })
   const context = await client.sessions.context({ sessionID: "ses_test" })
   const history = await client.sessions.history({ sessionID: "ses_test", after: 0, limit: 1 })
   const historyAfter = history.data.at(-1)?.durable?.seq
@@ -142,6 +143,7 @@ test("session methods use the public HTTP contract", async () => {
   expect(active).toEqual({ ses_test: { type: "running" } })
   expect(created.id).toBe("ses_test")
   expect(admitted.id).toBe("msg_test")
+  expect(waited).toEqual(waitResult)
   expect(context).toEqual([])
   expect(history).toEqual({ data: [modelSwitchedEvent], hasMore: true })
   expect(historyNext).toEqual({ data: [], hasMore: false })
@@ -233,6 +235,12 @@ const admission = {
     delivery: "steer",
     timeCreated: 1_717_171_717_000,
   },
+}
+
+const waitResult = {
+  type: "completed",
+  admittedSeq: 7,
+  assistantMessageID: "msg_wait",
 }
 
 const modelSwitchedMessage = {

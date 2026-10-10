@@ -488,7 +488,14 @@ export type SessionsCompactOutput = void
 
 export type SessionsWaitInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 
-export type SessionsWaitOutput = void
+export type SessionsWaitOutput = {
+  readonly data:
+    | { readonly type: "idle" }
+    | { readonly type: "pending"; readonly admittedSeq: number; readonly messageID: string }
+    | { readonly type: "completed"; readonly admittedSeq: number; readonly assistantMessageID: string }
+    | { readonly type: "failed"; readonly admittedSeq?: number; readonly assistantMessageID?: string }
+    | { readonly type: "interrupted"; readonly admittedSeq?: number; readonly assistantMessageID?: string }
+}["data"]
 
 export type SessionsStageInput = {
   readonly sessionID: { readonly sessionID: string }["sessionID"]

@@ -30,7 +30,19 @@ sessions.active()
   -> snapshots foreground Session drains owned by this process
   -> returns only active Session IDs with { type: "running" }
   -> absence means inactive; activity is not durable across process restarts
+
+sessions.wait(sessionID)
+  -> joins a drain already owned by this process; never starts execution or recovery
+  -> returns `idle`, `pending`, `completed`, `failed`, or `interrupted` from durable admissions and message/tool projections
+  -> includes the highest admitted sequence covered when admitted work exists
+  -> reports unavailable when promoted work has no established terminal projection
 ```
+
+`Session.WaitResult` is the public wire contract for the wait outcome. The observation reads admissions, terminal-step boundaries, and assistant/tool projections from one committed database snapshot; it returns `completed` only when no admission is pending, a terminal assistant follows the last promoted input, and every assistant/tool result in the observed work group is settled successfully. A later admission is beyond the returned watermark and supersedes that observation. Promoted work without a local owner and without a terminal assistant remains unavailable; wait does not recover it after process loss.
+
+A terminal assistant step ending in `tool-calls`, or one carrying a local tool call, is an intermediate turn and cannot establish completion until the required provider continuation publishes its terminal assistant.
+
+The joined drain `Exit` supplies a `failed` or `interrupted` result when execution ends unsuccessfully before the admitted turn is successfully completed, even if the latest assistant projection is absent or is only an intermediate tool-call turn; the result still carries the latest admitted sequence when one exists.
 
 `session_input` is the durable admission inbox. `PromptAdmitted` records and projects accepted input so pending queue state can be replayed, replicated, and observed by clients. Admitted inputs remain outside model-visible Session history until the serialized runner publishes `Prompted`. Its projector atomically writes the visible user message and marks the inbox row promoted in the same event transaction. The V1-to-V2 shadow bridge publishes the same `Prompted` event for already-visible V1 prompts.
 

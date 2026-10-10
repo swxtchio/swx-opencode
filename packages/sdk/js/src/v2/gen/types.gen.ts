@@ -4032,6 +4032,31 @@ export type SessionInputAdmitted = {
   promotedSeq?: number
 }
 
+export type SessionWaitResult =
+  | {
+      type: "idle"
+    }
+  | {
+      type: "pending"
+      admittedSeq: number
+      messageID: string
+    }
+  | {
+      type: "completed"
+      admittedSeq: number
+      assistantMessageID: string
+    }
+  | {
+      type: "failed"
+      admittedSeq?: number
+      assistantMessageID?: string
+    }
+  | {
+      type: "interrupted"
+      admittedSeq?: number
+      assistantMessageID?: string
+    }
+
 export type SessionMessageAgentSwitched = {
   id: string
   metadata?: {
@@ -11933,9 +11958,11 @@ export type V2SessionWaitError = V2SessionWaitErrors[keyof V2SessionWaitErrors]
 
 export type V2SessionWaitResponses = {
   /**
-   * <No Content>
+   * Success
    */
-  204: void
+  200: {
+    data: SessionWaitResult
+  }
 }
 
 export type V2SessionWaitResponse = V2SessionWaitResponses[keyof V2SessionWaitResponses]

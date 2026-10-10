@@ -54,6 +54,74 @@ describe("SessionRunCoordinator", () => {
     ),
   )
 
+  it.effect("joins an active drain without starting execution while idle", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>()
+        const gate = yield* Deferred.make<void>()
+        const waiting = yield* Deferred.make<void>()
+        const finished = yield* Deferred.make<void>()
+        let runs = 0
+        const coordinator = yield* SessionRunCoordinator.make<string, never>({
+          drain: () =>
+            Effect.sync(() => runs++).pipe(
+              Effect.andThen(Deferred.succeed(started, undefined)),
+              Effect.andThen(Deferred.await(gate)),
+            ),
+        })
+
+        yield* coordinator.wake("session")
+        yield* Deferred.await(started)
+        const joiner = yield* Effect.gen(function* () {
+          yield* Deferred.succeed(waiting, undefined)
+          yield* coordinator.join("session")
+          yield* Deferred.succeed(finished, undefined)
+        }).pipe(Effect.forkChild)
+        yield* Deferred.await(waiting)
+        yield* Effect.yieldNow
+
+        expect(yield* Deferred.isDone(finished)).toBe(false)
+        expect(runs).toBe(1)
+
+        yield* Deferred.succeed(gate, undefined)
+        yield* Fiber.join(joiner)
+        expect(runs).toBe(1)
+        expect(yield* coordinator.join("idle")).toBeUndefined()
+        expect(runs).toBe(1)
+      }),
+    ),
+  )
+
+  it.effect("returns a failed active drain as an exit value", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>()
+        const gate = yield* Deferred.make<void>()
+        const failure = new Error("drain failed")
+        const coordinator = yield* SessionRunCoordinator.make<string, Error>({
+          drain: () =>
+            Deferred.succeed(started, undefined).pipe(
+              Effect.andThen(Deferred.await(gate)),
+              Effect.andThen(Effect.fail(failure)),
+            ),
+        })
+
+        yield* coordinator.wake("session")
+        yield* Deferred.await(started)
+        const joining = yield* coordinator.join("session").pipe(Effect.forkChild)
+        yield* Effect.yieldNow
+        yield* Deferred.succeed(gate, undefined)
+
+        const exit = yield* Fiber.join(joining)
+        expect(exit).toBeDefined()
+        if (exit === undefined) throw new Error("Expected an active drain exit")
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.findErrorOption(exit.cause)._tag).toBe("Some")
+        expect(Array.from(yield* coordinator.active)).toEqual([])
+      }),
+    ),
+  )
+
   it.effect("starts execution when woken while idle", () =>
     Effect.scoped(
       Effect.gen(function* () {

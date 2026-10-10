@@ -131,7 +131,10 @@ const Endpoint3_7 = (raw: RawClient["server.session"]) => (input: Endpoint3_7Inp
 type Endpoint3_8Request = Parameters<RawClient["server.session"]["session.wait"]>[0]
 type Endpoint3_8Input = { readonly sessionID: Endpoint3_8Request["params"]["sessionID"] }
 const Endpoint3_8 = (raw: RawClient["server.session"]) => (input: Endpoint3_8Input) =>
-  raw["session.wait"]({ params: { sessionID: input["sessionID"] } }).pipe(Effect.mapError(mapClientError))
+  raw["session.wait"]({ params: { sessionID: input["sessionID"] } }).pipe(
+    Effect.mapError(mapClientError),
+    Effect.map((value) => value.data),
+  )
 
 type Endpoint3_9Request = Parameters<RawClient["server.session"]["session.revert.stage"]>[0]
 type Endpoint3_9Input = {

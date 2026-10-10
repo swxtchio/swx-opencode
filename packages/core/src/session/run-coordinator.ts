@@ -8,6 +8,8 @@ export interface Coordinator<Key, E> {
   readonly active: Effect.Effect<ReadonlySet<Key>>
   /** Starts execution while idle or joins the active execution. */
   readonly run: (key: Key) => Effect.Effect<void, E>
+  /** Joins one active drain without starting execution. */
+  readonly join: (key: Key) => Effect.Effect<Exit.Exit<void, E> | undefined>
   /** Registers one coalesced follow-up after newly recorded work. */
   readonly wake: (key: Key) => Effect.Effect<void>
   /** Stops active execution and waits for its cleanup. */
@@ -16,6 +18,7 @@ export interface Coordinator<Key, E> {
 
 type Entry<E> = {
   readonly done: Deferred.Deferred<void, E>
+  settled?: Deferred.Deferred<Exit.Exit<void, E>>
   owner?: Fiber.Fiber<void, never>
   pendingWake: boolean
   stopping: boolean
@@ -36,10 +39,12 @@ export const make = <Key, E>(options: {
 
     const start = (key: Key, entry: Entry<E>, force: boolean, successor = false) => {
       const ready = Deferred.makeUnsafe<void>()
+      const settled = Deferred.makeUnsafe<Exit.Exit<void, E>>()
+      entry.settled = settled
       const owner = fork(
         (successor ? Effect.yieldNow : Deferred.await(ready)).pipe(
           Effect.andThen(Effect.suspend(() => options.drain(key, force))),
-          Effect.onExit((exit) => Effect.sync(() => settle(key, entry, exit))),
+          Effect.onExit((exit) => Effect.sync(() => settle(key, entry, settled, exit))),
           Effect.exit,
           Effect.asVoid,
         ),
@@ -48,7 +53,13 @@ export const make = <Key, E>(options: {
       if (!successor) Deferred.doneUnsafe(ready, Effect.void)
     }
 
-    const settle = (key: Key, entry: Entry<E>, exit: Exit.Exit<void, E>) => {
+    const settle = (
+      key: Key,
+      entry: Entry<E>,
+      settled: Deferred.Deferred<Exit.Exit<void, E>>,
+      exit: Exit.Exit<void, E>,
+    ) => {
+      Deferred.doneUnsafe(settled, Effect.succeed(exit))
       if (Exit.isSuccess(exit) && !entry.stopping && entry.pendingWake) {
         entry.pendingWake = false
         start(key, entry, false, true)
@@ -78,6 +89,12 @@ export const make = <Key, E>(options: {
         return restore(Deferred.await(next.done))
       })
 
+    const join = (key: Key) =>
+      Effect.suspend(() => {
+        const settled = active.get(key)?.settled
+        return settled === undefined ? Effect.succeed(undefined) : Deferred.await(settled)
+      })
+
     const wake = (key: Key) =>
       Effect.sync(() => {
         const entry = active.get(key)
@@ -100,5 +117,5 @@ export const make = <Key, E>(options: {
         return Fiber.interrupt(entry.owner)
       })
 
-    return { active: Effect.sync(() => new Set(active.keys())), run, wake, interrupt }
+    return { active: Effect.sync(() => new Set(active.keys())), run, join, wake, interrupt }
   })
