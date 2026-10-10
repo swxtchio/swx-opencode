@@ -7,6 +7,7 @@ import { eq } from "drizzle-orm"
 import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
+import { newStatementAttempts, patchBunQuery } from "@opencode-ai/core/database/sqlite-attempts"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
@@ -55,50 +56,6 @@ afterAll(async () => {
 // one of these is the admission meeting the held lock.
 const admissionSQL = /^begin\b|session_prompt_queue/i
 
-// Counts the admission's statement attempts at bun:sqlite's query path, as the core sqlite-busy test does, and the
-// native codes of the attempts that throw SQLITE_BUSY. The patch is removed when the test scope closes.
-const countAdmissionAttempts = Effect.gen(function* () {
-  const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
-  const prototype = sqlite.Database.prototype
-  const queryDescriptor = Object.getOwnPropertyDescriptor(prototype, "query")
-  if (!queryDescriptor) return yield* Effect.die(new Error("bun:sqlite query method was not found"))
-  const query: typeof prototype.query = queryDescriptor.value
-  const counted = new WeakSet<object>()
-  const attempts = { count: 0, busy: [] as string[] }
-  const countStatement = <S extends object>(statement: S) => {
-    if (counted.has(statement)) return statement
-    counted.add(statement)
-    for (const method of ["all", "values"]) {
-      const execute: unknown = Reflect.get(statement, method)
-      if (typeof execute !== "function") continue
-      Object.defineProperty(statement, method, {
-        configurable: true,
-        writable: true,
-        value: (...params: unknown[]) => {
-          attempts.count++
-          try {
-            return execute.apply(statement, params)
-          } catch (error) {
-            const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined
-            if (typeof code === "string" && code.startsWith("SQLITE_BUSY")) attempts.busy.push(code)
-            throw error
-          }
-        },
-      })
-    }
-    return statement
-  }
-  Object.defineProperty(prototype, "query", {
-    ...queryDescriptor,
-    value: function (this: InstanceType<typeof sqlite.Database>, sql: string) {
-      const statement = query.call(this, sql)
-      return admissionSQL.test(sql) ? countStatement(statement) : statement
-    },
-  })
-  yield* Effect.addFinalizer(() => Effect.sync(() => Object.defineProperty(prototype, "query", queryDescriptor)))
-  return attempts
-})
-
 it.instance(
   "admits a prompt whose write waits on another connection's commit instead of failing on a stale read",
   () =>
@@ -107,7 +64,8 @@ it.instance(
       const queue = yield* SessionQueue.Service
       const { db } = yield* Database.Service
       const session = yield* sessions.create({ title: "Admission under a concurrent writer" })
-      const attempts = yield* countAdmissionAttempts
+      const attempts = newStatementAttempts()
+      yield* patchBunQuery((sql) => admissionSQL.test(sql), attempts)
 
       const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
       const holder = new sqlite.Database(databasePath)

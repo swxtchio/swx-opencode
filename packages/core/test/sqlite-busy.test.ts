@@ -6,6 +6,12 @@ import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option } from "ef
 import { isSqlError } from "effect/unstable/sql/SqlError"
 import { SqlClient } from "effect/unstable/sql/SqlClient"
 import { Sqlite } from "../src/database/sqlite"
+import {
+  countStatement,
+  newStatementAttempts,
+  patchBunQuery,
+  type StatementAttempts,
+} from "../src/database/sqlite-attempts"
 import path from "path"
 import { tmpdir } from "./fixture/tmpdir"
 
@@ -177,43 +183,11 @@ const clientWithAttemptCount = (input: {
   clientType: "bun" | "core-node" | "standalone-node"
   filename: string
   statement: string
-  attempts: { count: number }
+  attempts: StatementAttempts
 }) =>
   Effect.gen(function* () {
-    // Clients prepare once and retry the execution, so count each execution of the prepared statement.
-    const counted = new WeakSet<object>()
-    const countExecutions = <S extends object>(statement: S) => {
-      if (counted.has(statement)) return statement
-      counted.add(statement)
-      for (const method of ["all", "values"]) {
-        const execute: unknown = Reflect.get(statement, method)
-        if (typeof execute !== "function") continue
-        Object.defineProperty(statement, method, {
-          configurable: true,
-          writable: true,
-          value: (...params: unknown[]) => {
-            input.attempts.count++
-            return execute.apply(statement, params)
-          },
-        })
-      }
-      return statement
-    }
-
     if (input.clientType === "bun") {
-      const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
-      const prototype = sqlite.Database.prototype
-      const queryDescriptor = Object.getOwnPropertyDescriptor(prototype, "query")
-      if (!queryDescriptor) return yield* Effect.die(new Error("bun:sqlite query method was not found"))
-      const query = prototype.query
-      Object.defineProperty(prototype, "query", {
-        ...queryDescriptor,
-        value: function (this: InstanceType<typeof sqlite.Database>, sql: string) {
-          const statement = query.call(this, sql)
-          return sql === input.statement ? countExecutions(statement) : statement
-        },
-      })
-      yield* Effect.addFinalizer(() => Effect.sync(() => Object.defineProperty(prototype, "query", queryDescriptor)))
+      yield* patchBunQuery((sql) => sql === input.statement, input.attempts)
       const context = yield* Layer.build(Database.layerFromPath(input.filename))
       return Context.get(context, Database.Service).db.$client
     }
@@ -229,7 +203,7 @@ const clientWithAttemptCount = (input: {
         writable: true,
         value: function (this: InstanceType<typeof drivers.DatabaseSync>, sql: string) {
           const statement = prepare.call(this, sql)
-          return sql === input.statement ? countExecutions(statement) : statement
+          return sql === input.statement ? countStatement(statement, input.attempts) : statement
         },
       })
       return Context.get(context, SqlClient)
@@ -244,7 +218,7 @@ const clientWithAttemptCount = (input: {
       ...prepareDescriptor,
       value: function (this: InstanceType<typeof drivers.DatabaseSync>, sql: string) {
         const statement = prepare.call(this, sql)
-        return sql === input.statement ? countExecutions(statement) : statement
+        return sql === input.statement ? countStatement(statement, input.attempts) : statement
       },
     })
     yield* Effect.addFinalizer(() => Effect.sync(() => Object.defineProperty(prototype, "prepare", prepareDescriptor)))
@@ -296,7 +270,7 @@ describe("SQLite busy timeout and statement retries", () => {
           const exit = await Effect.runPromiseExit(
             Effect.scoped(
               Effect.gen(function* () {
-                const attempts = { count: 0 }
+                const attempts = newStatementAttempts()
                 const client = yield* clientWithAttemptCount({ clientType, filename, statement: writerSql, attempts })
                 yield* client.unsafe("CREATE TABLE busy_retry_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL)").raw
                 expect(yield* client.unsafe("PRAGMA busy_timeout").values).toEqual([[5]])
@@ -416,7 +390,7 @@ describe("SQLite busy timeout and statement retries", () => {
         const exit = await Effect.runPromiseExit(
           Effect.scoped(
             Effect.gen(function* () {
-              const attempts = { count: 0 }
+              const attempts = newStatementAttempts()
               const client = yield* clientWithAttemptCount({ clientType, filename, statement: writerSql, attempts })
               yield* client.unsafe("CREATE TABLE busy_retry_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL)").raw
               expect(yield* client.unsafe("PRAGMA journal_mode").values).toEqual([["wal"]])
