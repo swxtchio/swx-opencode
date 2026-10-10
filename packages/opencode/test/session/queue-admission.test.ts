@@ -62,7 +62,7 @@ const countAdmissionAttempts = Effect.gen(function* () {
   const prototype = sqlite.Database.prototype
   const queryDescriptor = Object.getOwnPropertyDescriptor(prototype, "query")
   if (!queryDescriptor) return yield* Effect.die(new Error("bun:sqlite query method was not found"))
-  const query = prototype.query
+  const query: typeof prototype.query = queryDescriptor.value
   const counted = new WeakSet<object>()
   const attempts = { count: 0, busy: [] as string[] }
   const countStatement = <S extends object>(statement: S) => {
