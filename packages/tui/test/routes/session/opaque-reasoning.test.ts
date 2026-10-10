@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test"
 import type { Part, ReasoningPart } from "@opencode-ai/sdk/v2"
 import { groupOpaqueReasoning, isOpaqueReasoning } from "../../../src/routes/session/opaque-reasoning"
 
-// Shapes follow session/processor.ts: encrypted reasoning receives no
-// reasoning-delta text, and its provider metadata is written on reasoning-end.
+// Shapes follow session/processor.ts: reasoning-start creates the part with empty
+// text and the provider metadata, and finishReasoning adds time.end.
 const ids = { sessionID: "ses_test", messageID: "msg_test" }
 
 function encrypted(id: string): ReasoningPart {

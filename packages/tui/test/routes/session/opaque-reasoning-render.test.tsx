@@ -43,7 +43,8 @@ function partID(messageID: string, index: number) {
   return `prt_${messageID}_${String(index).padStart(3, "0")}`
 }
 
-// Shapes follow session/processor.ts: encrypted reasoning has provider metadata and no text.
+// Shapes follow session/processor.ts: reasoning-start creates the part with empty
+// text and the provider metadata, and finishReasoning adds time.end.
 function encrypted(messageID: string, index: number, time: ReasoningPart["time"]): ReasoningPart {
   return {
     id: partID(messageID, index),
@@ -226,7 +227,7 @@ test("live: a run updates in place as parts arrive", async () => {
     await wait(() => sync.data.part[live.id]?.length === 3)
     const pending = thoughtLines(await frameWhen(app, (rendered) => rendered.includes("Thought 3 · 3.0s")))
     expect(pending).toHaveLength(1)
-    expect(SPINNER_FRAMES.some((glyph) => pending[0]!.includes(glyph))).toBe(true)
+    expect(SPINNER_FRAMES.some((glyph) => pending[0].includes(glyph))).toBe(true)
 
     emit(partUpdated(third))
     await wait(() => {
@@ -235,7 +236,7 @@ test("live: a run updates in place as parts arrive", async () => {
     })
     const done = thoughtLines(await frameWhen(app, (rendered) => rendered.includes("Thought 3 · 6.0s")))
     expect(done).toHaveLength(1)
-    expect(SPINNER_FRAMES.some((glyph) => done[0]!.includes(glyph))).toBe(false)
+    expect(SPINNER_FRAMES.some((glyph) => done[0].includes(glyph))).toBe(false)
   } finally {
     app.renderer.destroy()
   }
