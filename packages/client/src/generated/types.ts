@@ -669,7 +669,7 @@ export type SessionsContextOutput = {
           readonly reasoning: number
           readonly cache: { readonly read: number; readonly write: number }
         }
-        readonly error?: { readonly type: "unknown"; readonly message: string }
+        readonly error?: { readonly type: "unknown"; readonly message: string; readonly origin?: "runner-interruption" }
       }
     | {
         readonly type: "compaction"
@@ -884,7 +884,11 @@ export type SessionsHistoryOutput = {
           readonly timestamp: number
           readonly sessionID: string
           readonly assistantMessageID: string
-          readonly error: { readonly type: "unknown"; readonly message: string }
+          readonly error: {
+            readonly type: "unknown"
+            readonly message: string
+            readonly origin?: "runner-interruption"
+          }
         }
       }
     | {
@@ -1342,7 +1346,7 @@ export type SessionsEventsOutput =
         readonly timestamp: number
         readonly sessionID: string
         readonly assistantMessageID: string
-        readonly error: { readonly type: "unknown"; readonly message: string }
+        readonly error: { readonly type: "unknown"; readonly message: string; readonly origin?: "runner-interruption" }
       }
     }
   | {
@@ -1747,7 +1751,7 @@ export type SessionsMessageOutput = {
           readonly reasoning: number
           readonly cache: { readonly read: number; readonly write: number }
         }
-        readonly error?: { readonly type: "unknown"; readonly message: string }
+        readonly error?: { readonly type: "unknown"; readonly message: string; readonly origin?: "runner-interruption" }
       }
     | {
         readonly type: "compaction"
@@ -1919,7 +1923,7 @@ export type MessagesListOutput = {
           readonly reasoning: number
           readonly cache: { readonly read: number; readonly write: number }
         }
-        readonly error?: { readonly type: "unknown"; readonly message: string }
+        readonly error?: { readonly type: "unknown"; readonly message: string; readonly origin?: "runner-interruption" }
       }
     | {
         readonly type: "compaction"

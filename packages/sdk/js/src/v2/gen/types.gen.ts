@@ -1036,7 +1036,7 @@ export type GlobalEvent = {
           timestamp: number
           sessionID: string
           assistantMessageID: string
-          error: SessionErrorUnknown
+          error: SessionMessageAssistantError
         }
       }
     | {
@@ -3151,9 +3151,10 @@ export type PromptAgentAttachment = {
   source?: PromptSource
 }
 
-export type SessionErrorUnknown = {
+export type SessionMessageAssistantError = {
   type: "unknown"
   message: string
+  origin?: "runner-interruption"
 }
 
 export type LlmProviderMetadata = {
@@ -3175,6 +3176,11 @@ export type ToolFileContent = {
 }
 
 export type LlmToolContent = ToolTextContent | ToolFileContent
+
+export type SessionErrorUnknown = {
+  type: "unknown"
+  message: string
+}
 
 export type SessionNextRetryError = {
   message: string
@@ -3600,7 +3606,7 @@ export type SyncEventSessionNextStepFailed = {
       timestamp: number
       sessionID: string
       assistantMessageID: string
-      error: SessionErrorUnknown
+      error: SessionMessageAssistantError
     }
   }
 }
@@ -4246,7 +4252,7 @@ export type SessionMessageAssistant = {
       write: number
     }
   }
-  error?: SessionErrorUnknown
+  error?: SessionMessageAssistantError
 }
 
 export type SessionMessageCompaction = {
@@ -4526,7 +4532,7 @@ export type SessionNextStepFailed = {
     timestamp: number
     sessionID: string
     assistantMessageID: string
-    error: SessionErrorUnknown
+    error: SessionMessageAssistantError
   }
 }
 
@@ -6522,7 +6528,7 @@ export type EventSessionNextStepFailed = {
     timestamp: number
     sessionID: string
     assistantMessageID: string
-    error: SessionErrorUnknown
+    error: SessionMessageAssistantError
   }
 }
 

@@ -25,7 +25,11 @@ import { QuestionV2 } from "@opencode-ai/core/question"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { Snapshot } from "@opencode-ai/core/snapshot"
-import { ContextSnapshotDecodeError, ProviderTurnInterruptedMessage } from "@opencode-ai/core/session/error"
+import {
+  ContextSnapshotDecodeError,
+  ProviderTurnInterruptedMessage,
+  ProviderTurnInterruptedOrigin,
+} from "@opencode-ai/core/session/error"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionInput } from "@opencode-ai/core/session/input"
 import { SessionMessage } from "@opencode-ai/core/session/message"
@@ -72,6 +76,8 @@ let staleActiveSnapshot: (() => Effect.Effect<ReadonlySet<SessionV2.ID>>) | unde
 let activeReadAck: Deferred.Deferred<void> | undefined
 let joinAck: Deferred.Deferred<void> | undefined
 let waitForInactiveAfterJoin = false
+let joinedFailureCount = 0
+let joinedSuccessCount = 0
 let toolExecutionGate: Deferred.Deferred<void> | undefined
 let toolExecutionsStarted: Deferred.Deferred<void> | undefined
 let toolExecutionsReady = 5
@@ -278,12 +284,21 @@ const execution = Layer.effect(
       active,
       join: (sessionID) =>
         Effect.suspend(() => {
+          const joined = coordinator.join(sessionID).pipe(
+            Effect.tap((exit) =>
+              Effect.sync(() => {
+                if (exit === undefined) return
+                if (Exit.isFailure(exit)) joinedFailureCount++
+                else joinedSuccessCount++
+              }),
+            ),
+          )
           const ack = joinAck
-          if (!ack) return coordinator.join(sessionID)
+          if (!ack) return joined
           joinAck = undefined
-          const joined = Deferred.succeed(ack, undefined).pipe(Effect.andThen(coordinator.join(sessionID)))
-          if (!waitForInactiveAfterJoin) return joined
-          return joined.pipe(
+          const acknowledged = Deferred.succeed(ack, undefined).pipe(Effect.andThen(joined))
+          if (!waitForInactiveAfterJoin) return acknowledged
+          return acknowledged.pipe(
             Effect.flatMap((exit) => {
               if (exit === undefined) return Effect.succeed(undefined)
               return Effect.gen(function* () {
@@ -384,6 +399,7 @@ const awaitSignal = (signal: Deferred.Deferred<void>, message: string) =>
 
 const setup = Effect.gen(function* () {
   const { db } = yield* Database.Service
+  requests.length = 0
   response = []
   systemBaseline = "Initial context"
   systemRemoved = false
@@ -402,6 +418,8 @@ const setup = Effect.gen(function* () {
   activeReadAck = undefined
   joinAck = undefined
   waitForInactiveAfterJoin = false
+  joinedFailureCount = 0
+  joinedSuccessCount = 0
   toolExecutionGate = undefined
   toolExecutionsStarted = undefined
   toolExecutionsReady = 5
@@ -418,7 +436,6 @@ const setup = Effect.gen(function* () {
 
 const setupNative = Effect.gen(function* () {
   yield* setup
-  requests.length = 0
   const { db } = yield* Database.Service
   yield* db.delete(SessionTable).where(eq(SessionTable.id, sessionID)).run().pipe(Effect.orDie)
   const session = yield* SessionV2.Service
@@ -567,6 +584,46 @@ const echoTurn = (id: string, text: string) => [
 
 const textTurn = (id: string, text: string) => fragmentFixture("text", id, [text]).completeEvents
 
+const publishHostedToolCall = (input: {
+  events: EventV2.Interface
+  sessionID: SessionV2.ID
+  assistantMessageID: SessionMessage.ID
+  callID: string
+}) =>
+  Effect.gen(function* () {
+    const timestamp = yield* DateTime.now
+    yield* input.events.publish(SessionEvent.Step.Started, {
+      sessionID: input.sessionID,
+      assistantMessageID: input.assistantMessageID,
+      timestamp,
+      agent: "build",
+      model: { id: ModelV2.ID.make("fake-model"), providerID: ProviderV2.ID.make("fake") },
+    })
+    yield* input.events.publish(SessionEvent.Tool.Input.Started, {
+      sessionID: input.sessionID,
+      timestamp,
+      assistantMessageID: input.assistantMessageID,
+      callID: input.callID,
+      name: "web_search",
+    })
+    yield* input.events.publish(SessionEvent.Tool.Input.Ended, {
+      sessionID: input.sessionID,
+      timestamp,
+      assistantMessageID: input.assistantMessageID,
+      callID: input.callID,
+      text: '{"query":"Effect"}',
+    })
+    yield* input.events.publish(SessionEvent.Tool.Called, {
+      sessionID: input.sessionID,
+      timestamp,
+      assistantMessageID: input.assistantMessageID,
+      callID: input.callID,
+      tool: "web_search",
+      input: { query: "Effect" },
+      provider: { executed: true },
+    })
+  })
+
 describe("SessionV2.wait", () => {
   it.effect("rechecks execution after observing an initially inactive snapshot", () =>
     Effect.gen(function* () {
@@ -633,8 +690,7 @@ describe("SessionV2.wait", () => {
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           joinAck = undefined
-        })
-          .pipe(Effect.andThen(Deferred.succeed(toolGate, undefined)), Effect.asVoid),
+        }).pipe(Effect.andThen(Deferred.succeed(toolGate, undefined)), Effect.asVoid),
       )
       yield* registry.register({
         failAfterGate: Tool.make({
@@ -698,7 +754,7 @@ describe("SessionV2.wait", () => {
     }),
   )
 
-  it.effect("reports completion when a retried tool call succeeds across a steer promotion", () =>
+  it.effect("fails when a later assistant reuses a provider-local tool ID", () =>
     Effect.gen(function* () {
       yield* setupNative
       const session = yield* SessionV2.Service
@@ -711,8 +767,7 @@ describe("SessionV2.wait", () => {
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           joinAck = undefined
-        })
-          .pipe(Effect.andThen(Deferred.succeed(toolGate, undefined)), Effect.asVoid),
+        }).pipe(Effect.andThen(Deferred.succeed(toolGate, undefined)), Effect.asVoid),
       )
       yield* registry.register({
         retryOnce: Tool.make({
@@ -759,7 +814,7 @@ describe("SessionV2.wait", () => {
       const result = yield* Deferred.await(outcome)
       expect(result).toMatchObject({
         _tag: "Success",
-        value: { type: "completed", admittedSeq: steered.admittedSeq },
+        value: { type: "failed", admittedSeq: steered.admittedSeq },
       })
       expect(attempts).toBe(2)
       const tools = (yield* session.messages({ sessionID, order: "asc" })).flatMap((message) =>
@@ -773,6 +828,130 @@ describe("SessionV2.wait", () => {
       ])
       expect(requests).toHaveLength(3)
       yield* Fiber.join(waiter)
+    }),
+  )
+
+  it.effect("completes a tool call retried under the same assistant identity", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const admission = yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Retry the same hosted tool call" }),
+        resume: false,
+      })
+      yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER)
+      const assistantMessageID = SessionMessage.ID.create()
+      const callID = "call-same-assistant-retry"
+      yield* publishHostedToolCall({ events, sessionID, assistantMessageID, callID })
+      const failureTime = yield* DateTime.now
+      yield* events.publish(SessionEvent.Tool.Failed, {
+        sessionID,
+        timestamp: failureTime,
+        assistantMessageID,
+        callID,
+        error: { type: "unknown", message: "Transient hosted-tool failure" },
+        provider: { executed: true },
+      })
+      const retryTime = yield* DateTime.now
+      yield* events.publish(SessionEvent.Tool.Called, {
+        sessionID,
+        timestamp: retryTime,
+        assistantMessageID,
+        callID,
+        tool: "web_search",
+        input: { query: "Effect" },
+        provider: { executed: true },
+      })
+      yield* events.publish(SessionEvent.Tool.Success, {
+        sessionID,
+        timestamp: yield* DateTime.now,
+        assistantMessageID,
+        callID,
+        structured: {},
+        content: [],
+        provider: { executed: true },
+      })
+      yield* events.publish(SessionEvent.Step.Ended, {
+        sessionID,
+        timestamp: yield* DateTime.now,
+        assistantMessageID,
+        finish: "stop",
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+
+      expect(yield* session.wait(sessionID)).toMatchObject({
+        type: "completed",
+        admittedSeq: admission.admittedSeq,
+        assistantMessageID,
+      })
+      expect(yield* session.message({ sessionID, messageID: assistantMessageID })).toMatchObject({
+        type: "assistant",
+        finish: "stop",
+        content: [{ type: "tool", id: callID, state: { status: "completed" } }],
+      })
+    }),
+  )
+
+  it.effect("does not let a reused tool ID hide a running call in another assistant", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Keep the earlier hosted call unsettled" }),
+        resume: false,
+      })
+      yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER)
+      const callID = "call-reused-running"
+      const firstAssistantMessageID = SessionMessage.ID.create()
+      yield* publishHostedToolCall({ events, sessionID, assistantMessageID: firstAssistantMessageID, callID })
+      yield* events.publish(SessionEvent.Step.Ended, {
+        sessionID,
+        timestamp: yield* DateTime.now,
+        assistantMessageID: firstAssistantMessageID,
+        finish: "tool-calls",
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      const secondAssistantMessageID = SessionMessage.ID.create()
+      yield* publishHostedToolCall({ events, sessionID, assistantMessageID: secondAssistantMessageID, callID })
+      yield* events.publish(SessionEvent.Tool.Success, {
+        sessionID,
+        timestamp: yield* DateTime.now,
+        assistantMessageID: secondAssistantMessageID,
+        callID,
+        structured: {},
+        content: [],
+        provider: { executed: true },
+      })
+      yield* events.publish(SessionEvent.Step.Ended, {
+        sessionID,
+        timestamp: yield* DateTime.now,
+        assistantMessageID: secondAssistantMessageID,
+        finish: "stop",
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+
+      const messages = yield* session.messages({ sessionID, order: "asc" })
+      const tools = messages.flatMap((message) =>
+        message.type === "assistant"
+          ? message.content.filter((content): content is SessionMessage.AssistantTool => content.type === "tool")
+          : [],
+      )
+      expect(tools.filter((tool) => tool.id === callID).map((tool) => tool.state.status)).toEqual([
+        "running",
+        "completed",
+      ])
+      expect(yield* session.wait(sessionID).pipe(Effect.flip)).toMatchObject({
+        _tag: "Session.OperationUnavailableError",
+      })
     }),
   )
 
@@ -794,7 +973,7 @@ describe("SessionV2.wait", () => {
       responseStream = Stream.concat(
         Stream.make(LLMEvent.stepStart({ index: 0 })),
         Stream.fromEffect(Deferred.await(providerGate)).pipe(
-          Stream.flatMap(() => Stream.make(LLMEvent.providerError({ message: "Provider rejected the turn" }))),
+          Stream.flatMap(() => Stream.make(LLMEvent.providerError({ message: ProviderTurnInterruptedMessage }))),
         ),
       )
       responses = [textTurn("text-wait-after-provider-error", "Recovered text does not erase the failure")]
@@ -817,6 +996,10 @@ describe("SessionV2.wait", () => {
       })
       expect(steered.admittedSeq).toBeGreaterThan(first.admittedSeq)
       expect(requests).toHaveLength(2)
+      const providerAssistant = (yield* session.messages({ sessionID })).find(
+        (message): message is SessionMessage.Assistant => message.type === "assistant",
+      )
+      expect(providerAssistant?.error?.origin).toBeUndefined()
       yield* Fiber.join(waiter)
     }),
   )
@@ -835,11 +1018,7 @@ describe("SessionV2.wait", () => {
           joinAck = undefined
           waitForInactiveAfterJoin = false
           responseStream = undefined
-        })
-          .pipe(
-            Effect.andThen(Deferred.succeed(streamTail, undefined)),
-            Effect.asVoid,
-          ),
+        }).pipe(Effect.andThen(Deferred.succeed(streamTail, undefined)), Effect.asVoid),
       )
       streamStartAcks.push(providerStarted)
       responseStream = Stream.concat(
@@ -863,7 +1042,10 @@ describe("SessionV2.wait", () => {
         Effect.forkChild,
       )
       yield* awaitSignal(joined, "wait did not join the provider-error work group")
-      const steered = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Steer after provider failure" }) })
+      const steered = yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Steer after provider failure" }),
+      })
       yield* Deferred.succeed(streamTail, undefined)
 
       const result = yield* Deferred.await(outcome)
@@ -873,12 +1055,15 @@ describe("SessionV2.wait", () => {
       })
       expect(steered.admittedSeq).toBeGreaterThan(first.admittedSeq)
       expect(requests).toHaveLength(2)
+      if (!Exit.isSuccess(result)) throw new Error("Expected the in-flight provider error result")
+      expect(yield* session.wait(sessionID)).toEqual(result.value)
       const history = yield* session.history({ sessionID, limit: 100 })
       const failedEvent = history.events.find((event) => event.type === SessionEvent.Step.Failed.type)
       const steeredEvent = history.events.find(
         (event) => event.type === SessionEvent.PromptAdmitted.type && event.data.messageID === steered.id,
       )
-      if (!failedEvent?.durable || !steeredEvent?.durable) throw new Error("Expected durable provider failure and steer")
+      if (!failedEvent?.durable || !steeredEvent?.durable)
+        throw new Error("Expected durable provider failure and steer")
       expect(failedEvent.durable.seq).toBeLessThan(steeredEvent.durable.seq)
       yield* Fiber.join(waiter)
     }),
@@ -937,6 +1122,59 @@ describe("SessionV2.wait", () => {
       expect(second.admittedSeq).toBeGreaterThan(first.admittedSeq)
       expect(resolutions).toBe(2)
       expect(requests).toHaveLength(1)
+      yield* Fiber.join(waiter)
+    }),
+  )
+
+  it.effect("retains a failed drain outcome through its coalesced no-op successor", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const gate = yield* Deferred.make<void>()
+      const started = yield* Deferred.make<void>()
+      const joined = yield* Deferred.make<void>()
+      const outcome = yield* Deferred.make<Exit.Exit<SessionV2.WaitResult, SessionV2.Error>>()
+      let resolutions = 0
+      modelResolveHook = Effect.sync(() => resolutions++).pipe(
+        Effect.andThen(
+          Effect.suspend(() =>
+            resolutions === 2 ? Effect.die(new Error("Continuation model resolution failed")) : Effect.void,
+          ),
+        ),
+      )
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          joinAck = undefined
+          streamGate = undefined
+          streamStarted = undefined
+          modelResolveHook = Effect.void
+        }).pipe(Effect.andThen(Deferred.succeed(gate, undefined)), Effect.asVoid),
+      )
+      streamGate = gate
+      streamStarted = started
+      response = textTurn("text-wait-coalesced-failure", "First turn held while a steer is admitted")
+      const first = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Start first turn" }) })
+      yield* awaitStreamStart(started)
+      joinAck = joined
+      const waiter = yield* session.wait(sessionID).pipe(
+        Effect.exit,
+        Effect.flatMap((exit) => Deferred.succeed(outcome, exit)),
+        Effect.forkChild,
+      )
+      yield* awaitSignal(joined, "wait did not join the running drain")
+      const second = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Fail the steered turn" }) })
+      yield* Deferred.succeed(gate, undefined)
+
+      const result = yield* Deferred.await(outcome)
+      expect(result).toMatchObject({
+        _tag: "Success",
+        value: { type: "failed", admittedSeq: second.admittedSeq },
+      })
+      expect(second.admittedSeq).toBeGreaterThan(first.admittedSeq)
+      expect(resolutions).toBe(2)
+      expect(requests).toHaveLength(1)
+      expect(joinedFailureCount).toBeGreaterThan(0)
+      expect(joinedSuccessCount).toBeGreaterThan(0)
       yield* Fiber.join(waiter)
     }),
   )
@@ -1319,7 +1557,10 @@ describe("SessionV2.wait", () => {
         _tag: "Success",
         value: { type: "interrupted", admittedSeq: admitted.admittedSeq },
       })
-      expect(assistant).toMatchObject({ finish: "error", error: { message: "Provider turn interrupted" } })
+      expect(assistant).toMatchObject({
+        finish: "error",
+        error: { message: ProviderTurnInterruptedMessage, origin: ProviderTurnInterruptedOrigin },
+      })
       expect((yield* session.history({ sessionID, limit: 100 })).events.map((event) => event.type)).toContain(
         SessionEvent.Tool.Failed.type,
       )
@@ -1340,8 +1581,7 @@ describe("SessionV2.wait", () => {
         Effect.sync(() => {
           joinAck = undefined
           responseStream = undefined
-        })
-          .pipe(Effect.andThen(Deferred.succeed(tail, undefined)), Effect.asVoid),
+        }).pipe(Effect.andThen(Deferred.succeed(tail, undefined)), Effect.asVoid),
       )
       responseStream = Stream.concat(
         Stream.make(
@@ -1384,12 +1624,16 @@ describe("SessionV2.wait", () => {
       )
       expect(assistant).toMatchObject({
         finish: "error",
-        error: { message: ProviderTurnInterruptedMessage },
+        error: { message: ProviderTurnInterruptedMessage, origin: ProviderTurnInterruptedOrigin },
       })
       const history = yield* session.history({ sessionID, limit: 100 })
       const types = history.events.map((event) => event.type)
       expect(types).toContain(SessionEvent.Step.Failed.type)
       expect(types).not.toContain(SessionEvent.Step.Ended.type)
+      const failedEvent = history.events.find(
+        (event): event is SessionEvent.Step.Failed => event.type === SessionEvent.Step.Failed.type,
+      )
+      expect(failedEvent?.data.error.origin).toBe(ProviderTurnInterruptedOrigin)
       yield* Fiber.join(waiter)
       yield* Fiber.await(runner)
     }),

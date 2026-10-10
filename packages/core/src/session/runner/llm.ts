@@ -27,7 +27,7 @@ import { ToolOutputStore } from "../../tool-output-store"
 import { SessionContextEpoch } from "../context-epoch"
 import { SessionCompaction } from "../compaction"
 import { SessionEvent } from "../event"
-import { ProviderTurnInterruptedMessage } from "../error"
+import { ProviderTurnInterruptedMessage, ProviderTurnInterruptedOrigin } from "../error"
 import { SessionHistory } from "../history"
 import { SessionInput } from "../input"
 import { SessionSchema } from "../schema"
@@ -299,7 +299,7 @@ const layer = Layer.effect(
           const llmFailure = failure instanceof LLMError ? failure : undefined
           if (llmFailure && !publisher.hasProviderError()) {
             yield* withPublication(publisher.failUnsettledTools("Provider did not return a tool result", true))
-            yield* withPublication(publisher.failAssistant(llmFailure.reason.message))
+            yield* withPublication(publisher.failAssistant({ type: "unknown", message: llmFailure.reason.message }))
           }
           if (stream._tag === "Failure" && Cause.hasInterrupts(stream.cause)) yield* FiberSet.clear(toolFibers)
           const settled = yield* restore(awaitToolFibers(toolFibers)).pipe(Effect.exit)
@@ -315,7 +315,13 @@ const layer = Layer.effect(
             yield* FiberSet.clear(toolFibers)
             yield* withPublication(publisher.failUnsettledTools("Tool execution interrupted"))
             if (publisher.hasAssistantStarted())
-              yield* withPublication(publisher.failAssistant(ProviderTurnInterruptedMessage))
+              yield* withPublication(
+                publisher.failAssistant({
+                  type: "unknown",
+                  message: ProviderTurnInterruptedMessage,
+                  origin: ProviderTurnInterruptedOrigin,
+                }),
+              )
           }
           if (settled._tag === "Failure" && !Cause.hasInterrupts(settled.cause)) {
             const failure = Cause.squash(settled.cause)

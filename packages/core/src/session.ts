@@ -30,7 +30,7 @@ import { SessionStore } from "./session/store"
 import { SessionExecution } from "./session/execution"
 import { makeGlobalNode } from "./effect/app-node"
 import { LocationServiceMap } from "./location-service-map"
-import { MessageDecodeError, ProviderTurnInterruptedMessage } from "./session/error"
+import { MessageDecodeError, ProviderTurnInterruptedOrigin } from "./session/error"
 import { SessionEvent } from "./session/event"
 import { SessionInput } from "./session/input"
 import { Snapshot } from "./snapshot"
@@ -46,7 +46,6 @@ type WaitProjection =
       readonly latestInput: typeof SessionInputTable.$inferSelect | undefined
       readonly pending: typeof SessionInputTable.$inferSelect | undefined
       readonly latestPromoted: typeof SessionInputTable.$inferSelect | undefined
-      readonly checkpoint: number | undefined
       readonly assistants: ReadonlyArray<{ readonly seq: number; readonly message: SessionMessage.Assistant }>
     }
 
@@ -225,10 +224,7 @@ const layer = Layer.effect(
       )
 
     const waitUnavailable = () => new OperationUnavailableError({ operation: "wait" })
-    const waitProjection = (
-      sessionID: SessionSchema.ID,
-      checkpointOverride?: { readonly seq: number | undefined },
-    ): Effect.Effect<WaitProjection, OperationUnavailableError> =>
+    const waitProjection = (sessionID: SessionSchema.ID): Effect.Effect<WaitProjection, OperationUnavailableError> =>
       db
         .transaction((tx) =>
           Effect.gen(function* () {
@@ -289,8 +285,8 @@ const layer = Layer.effect(
               terminalSteps.find(
                 (event) =>
                   event.seq < seq &&
-                  (event.type === EventV2.versionedType(SessionEvent.Step.Failed.type, 2) ||
-                    Schema.decodeUnknownSync(SessionEvent.Step.Ended.data)(event.data).finish !== "tool-calls"),
+                  event.type === EventV2.versionedType(SessionEvent.Step.Ended.type, 2) &&
+                  Schema.decodeUnknownSync(SessionEvent.Step.Ended.data)(event.data).finish !== "tool-calls",
               )
             const latestAssistant = latestInput
               ? undefined
@@ -302,13 +298,11 @@ const layer = Layer.effect(
                   .limit(1)
                   .get()
                   .pipe(Effect.orDie)
-            // Tool-call step endings require continuation; only a non-continuation terminal step closes older work.
+            // Failed steps stay in the work group until a successful non-continuation step closes it.
             const checkpoint =
-              checkpointOverride === undefined
-                ? latestInput !== undefined
-                  ? checkpointBefore(latestInput.admitted_seq)?.seq
-                  : latestAssistant && checkpointBefore(latestAssistant.seq)?.seq
-                : checkpointOverride.seq
+              latestInput !== undefined
+                ? checkpointBefore(latestInput.admitted_seq)?.seq
+                : latestAssistant && checkpointBefore(latestAssistant.seq)?.seq
             const rows = yield* tx
               .select()
               .from(SessionMessageTable)
@@ -322,7 +316,7 @@ const layer = Layer.effect(
               .orderBy(asc(SessionMessageTable.seq))
               .all()
               .pipe(Effect.orDie)
-            return { native: true as const, latestInput, pending, latestPromoted, checkpoint, rows }
+            return { native: true as const, latestInput, pending, latestPromoted, rows }
           }),
         )
         .pipe(
@@ -338,7 +332,6 @@ const layer = Layer.effect(
                 latestInput: projection.latestInput,
                 pending: projection.pending,
                 latestPromoted: projection.latestPromoted,
-                checkpoint: projection.checkpoint,
                 assistants: messages.filter(
                   (entry): entry is { readonly seq: number; readonly message: SessionMessage.Assistant } =>
                     entry.message.type === "assistant",
@@ -369,26 +362,24 @@ const layer = Layer.effect(
             }
       }
       const assistants = projection.assistants
-      const latestTools = new Map(
-        assistants.flatMap((entry) =>
-          entry.message.content.flatMap((content) =>
-            content.type === "tool"
-              ? [[content.id, { assistantMessageID: entry.message.id, content }] as const]
-              : [],
-          ),
+      const latestTools = assistants.flatMap((entry) =>
+        Array.from(
+          new Map(
+            entry.message.content.flatMap((content) =>
+              content.type === "tool" ? [[content.id, { assistantMessageID: entry.message.id, content }] as const] : [],
+            ),
+          ).values(),
         ),
       )
       const unsettled =
         assistants.some((entry) => entry.message.time.completed === undefined) ||
-        Array.from(latestTools.values()).some(
-          ({ content }) => content.state.status === "pending" || content.state.status === "running",
-        )
+        latestTools.some(({ content }) => content.state.status === "pending" || content.state.status === "running")
       if (unsettled) return undefined
       const failedAssistant = assistants.find(
         (entry) => entry.message.error !== undefined || entry.message.finish === "error",
       )
       if (failedAssistant) {
-        const interrupted = failedAssistant.message.error?.message === ProviderTurnInterruptedMessage
+        const interrupted = failedAssistant.message.error?.origin === ProviderTurnInterruptedOrigin
         return interrupted
           ? {
               type: "interrupted",
@@ -401,7 +392,7 @@ const layer = Layer.effect(
               assistantMessageID: failedAssistant.message.id,
             }
       }
-      const failedTool = Array.from(latestTools.values()).find(({ content }) => content.state.status === "error")
+      const failedTool = latestTools.find(({ content }) => content.state.status === "error")
       if (failedTool)
         return {
           type: "failed",
@@ -677,20 +668,17 @@ const layer = Layer.effect(
       wait: Effect.fn("V2Session.wait")(function* (sessionID) {
         yield* result.get(sessionID)
         let outcome: WaitOutcome | undefined
-        let activeCheckpoint: { readonly seq: number | undefined } | undefined
         while (true) {
           if (!(yield* execution.active).has(sessionID)) {
-            const projection = yield* waitProjection(sessionID, activeCheckpoint)
+            const projection = yield* waitProjection(sessionID)
             if ((yield* execution.active).has(sessionID)) continue
             const result = waitResult(projection, outcome)
             if (result === undefined) return yield* waitUnavailable()
             return result
           }
-          const beforeJoin = yield* waitProjection(sessionID, activeCheckpoint)
-          if (activeCheckpoint === undefined && beforeJoin.native) activeCheckpoint = { seq: beforeJoin.checkpoint }
           const exit = yield* execution.join(sessionID)
           if (exit === undefined) continue
-          const settled = yield* waitProjection(sessionID, activeCheckpoint)
+          const settled = yield* waitProjection(sessionID)
           const admittedSeq = settled.native
             ? (settled.latestPromoted?.admitted_seq ??
               (settled.pending?.id === settled.latestInput?.id ? settled.latestInput?.admitted_seq : undefined))
