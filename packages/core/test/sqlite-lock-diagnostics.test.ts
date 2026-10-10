@@ -200,15 +200,20 @@ describe("SQLite write-lock hold diagnostics", () => {
           const db = yield* productionDatabase(path.join(tmp.path, "nested.sqlite"))
           yield* db.run("CREATE TABLE hold_test (id INTEGER PRIMARY KEY)")
 
-          // Each step is under the threshold; only the outer hold that spans them all exceeds it.
+          // The savepoint alone outlasts the threshold, so only its exclusion keeps it from logging a hold of its own.
           const stepMs = 150
           yield* db
             .transaction(
               (tx) =>
                 Effect.gen(function* () {
                   yield* Effect.sleep(`${stepMs} millis`)
-                  yield* tx.transaction((inner) =>
-                    inner.run("INSERT INTO hold_test (id) VALUES (1)").pipe(Effect.andThen(Effect.sleep(`${stepMs} millis`))),
+                  // A nested immediate transaction, as a durable-event commit inside an open one makes, is a savepoint.
+                  yield* db.transaction(
+                    (inner) =>
+                      inner
+                        .run("INSERT INTO hold_test (id) VALUES (1)")
+                        .pipe(Effect.andThen(Effect.sleep(`${longHoldMs} millis`))),
+                    { behavior: "immediate" },
                   )
                   yield* Effect.sleep(`${stepMs} millis`)
                 }),
@@ -219,7 +224,7 @@ describe("SQLite write-lock hold diagnostics", () => {
           const logged = holds(lines)
           expect(logged).toHaveLength(1)
           expect(logged[0].fields).toMatchObject({ purpose: "test.nestedCaller", span: "test.nestedCaller", outcome: "commit" })
-          expect(logged[0].fields.durationMs).toBeGreaterThanOrEqual(stepMs * 3)
+          expect(logged[0].fields.durationMs).toBeGreaterThanOrEqual(stepMs * 2 + longHoldMs)
         }),
       ),
     ))

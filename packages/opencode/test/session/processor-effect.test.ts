@@ -419,6 +419,7 @@ const sqliteTerminalDbPaths = ([2, 3] as const).map((failures) => ({
   path: path.join(import.meta.dir, `.opencode-sqlite-terminal-${failures}-${crypto.randomUUID()}.db`),
 }))
 const heldLockDbPath = path.join(import.meta.dir, `.opencode-sqlite-held-lock-${crypto.randomUUID()}.db`)
+const streamLockDbPath = path.join(import.meta.dir, `.opencode-sqlite-stream-lock-${crypto.randomUUID()}.db`)
 const routedEnv = LayerNode.compile(root, [
   ...replacements,
   [LLM.node, routedLLM],
@@ -445,6 +446,9 @@ afterAll(async () => {
       heldLockDbPath,
       `${heldLockDbPath}-wal`,
       `${heldLockDbPath}-shm`,
+      streamLockDbPath,
+      `${streamLockDbPath}-wal`,
+      `${streamLockDbPath}-shm`,
       routerLabelDbPath,
       `${routerLabelDbPath}-wal`,
       `${routerLabelDbPath}-shm`,
@@ -552,6 +556,8 @@ const lockTerminalLLM = Layer.succeed(
 )
 type HeldLock = {
   messageID: MessageID
+  // The write the second connection takes the lock just before: the reasoning-end part or the step-finish message.
+  trigger: "reasoning-end" | "step-finish"
   holder?: Sqlite
   streaming: ReturnType<typeof defer<void>>
   resume: ReturnType<typeof defer<void>>
@@ -588,14 +594,26 @@ const heldLockSession = LayerNode.make({
           Effect.suspend(() => {
             const lock = lockFor(part.sessionID, part.messageID)
             // A second connection takes the write lock just before the turn's reasoning-end write.
-            if (lock && !lock.holder && part.type === "reasoning" && part.time.end !== undefined) {
+            if (
+              lock?.trigger === "reasoning-end" &&
+              !lock.holder &&
+              part.type === "reasoning" &&
+              part.time.end !== undefined
+            ) {
               lock.holder = new Sqlite(heldLockDbPath)
               lock.holder.run("BEGIN IMMEDIATE")
             }
             return heldLockWrite(lock, real.updatePart(part))
           }),
         updateMessage: <T extends SessionV1.Info>(msg: T) =>
-          Effect.suspend(() => heldLockWrite(lockFor(msg.sessionID, msg.id), real.updateMessage(msg))),
+          Effect.suspend(() => {
+            const lock = lockFor(msg.sessionID, msg.id)
+            if (lock?.trigger === "step-finish" && !lock.holder && msg.role === "assistant" && msg.finish) {
+              lock.holder = new Sqlite(heldLockDbPath)
+              lock.holder.run("BEGIN IMMEDIATE")
+            }
+            return heldLockWrite(lock, real.updateMessage(msg))
+          }),
         updateExistingMessage: (msg: SessionV1.Info) =>
           Effect.suspend(() => {
             const lock = lockFor(msg.sessionID, msg.id)
@@ -659,6 +677,31 @@ const sqliteLockEnv = LayerNode.compile(root, [
   [Database.node, Database.layerFromPath(sqliteLockDbPath)],
 ])
 const itSqliteLock = testEffect(sqliteLockEnv)
+// The provider stream dies with the session's lock failure after its handled events all succeed.
+const streamLockFailures = new Map<SessionID, unknown>()
+const itStreamLock = testEffect(
+  LayerNode.compile(root, [
+    ...replacements,
+    [
+      LLM.node,
+      Layer.succeed(
+        LLM.Service,
+        LLM.Service.of({
+          stream: (input) =>
+            Stream.concat(
+              Stream.make(
+                LLMEvent.stepStart({ index: 0 }),
+                LLMEvent.reasoningStart({ id: "reasoning-1" }),
+                LLMEvent.reasoningEnd({ id: "reasoning-1" }),
+              ),
+              Stream.die(streamLockFailures.get(input.sessionID as SessionID)),
+            ),
+        }),
+      ),
+    ],
+    [Database.node, Database.layerFromPath(streamLockDbPath)],
+  ]),
+)
 
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
@@ -1669,7 +1712,10 @@ const itHeldLock = testEffect(
 )
 
 // Runs a turn whose reasoning-end write takes a real write lock that stays held after the processor exits.
-const failTurnUnderHeldLock = Effect.fn("test.failTurnUnderHeldLock")(function* (dir: string) {
+const failTurnUnderHeldLock = Effect.fn("test.failTurnUnderHeldLock")(function* (
+  dir: string,
+  trigger: HeldLock["trigger"] = "reasoning-end",
+) {
   const { processors, session, provider } = yield* boot()
   const events = yield* EventV2Bridge.Service
   const statuses = yield* SessionStatus.Service
@@ -1677,7 +1723,7 @@ const failTurnUnderHeldLock = Effect.fn("test.failTurnUnderHeldLock")(function* 
   const parent = yield* user(chat.id, "hold the write lock")
   const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
   const model = yield* provider.getModel(ref.providerID, ref.modelID)
-  const lock: HeldLock = { messageID: msg.id, streaming: defer<void>(), resume: defer<void>(), replayed: 0 }
+  const lock: HeldLock = { messageID: msg.id, trigger, streaming: defer<void>(), resume: defer<void>(), replayed: 0 }
   heldLocks.set(chat.id, lock)
   yield* Effect.addFinalizer(() =>
     Effect.sync(() => {
@@ -1855,6 +1901,118 @@ itHeldLock.live(
           expect(Exit.isFailure(yield* Effect.exit(MessageV2.get({ sessionID: chat.id, messageID: msg.id })))).toBe(
             true,
           )
+        }),
+      { config: cfg },
+    ),
+  30_000,
+)
+
+// Captures halt's error line, which carries the failed operation's recorded origin.
+const haltLines = () => {
+  const lines: Record<string, unknown>[] = []
+  const logger = Logger.make((options) => {
+    const [text, fields] = Array.isArray(options.message) ? options.message : [options.message]
+    if (options.logLevel === "Error" && text === "process" && typeof fields === "object" && fields !== null)
+      lines.push(fields)
+  })
+  return { lines, logger }
+}
+
+for (const scenario of [
+  {
+    trigger: "reasoning-end",
+    event: SessionV1.Event.PartUpdated.type,
+    callSite: ["Session.updatePart", "SessionProcessor.finishReasoning"],
+  },
+  { trigger: "step-finish", event: SessionV1.Event.MessageUpdated.type, callSite: ["Session.updateMessage"] },
+] as const) {
+  itHeldLock.live(
+    `processor halt names the ${scenario.trigger} write that met the held lock`,
+    () =>
+      provideTmpdirInstance(
+        (dir) =>
+          Effect.gen(function* () {
+            const halt = haltLines()
+            const loggers = yield* Effect.service(Logger.CurrentLoggers)
+            const { lock, exit, terminal } = yield* failTurnUnderHeldLock(dir, scenario.trigger).pipe(
+              Effect.provideService(Logger.CurrentLoggers, new Set([...loggers, halt.logger])),
+            )
+            expect(lock.produced && sqliteLockMessage(lock.produced)).toBe("Database is locked (SQLITE_BUSY)")
+
+            expect(halt.lines).toHaveLength(1)
+            expect(String(halt.lines[0].error).toLowerCase()).toContain("database is locked (sqlite_busy)")
+            const failure = halt.lines[0].failure as Record<string, unknown> | undefined
+            expect(failure).toMatchObject({ event: scenario.event, stage: "handler", case: scenario.trigger })
+            // The span chain runs from the failed commit outward, through the helper the case called.
+            const frames = String(failure?.callSite).split(" < ")
+            const positions = scenario.callSite.map((name) => frames.indexOf(name))
+            expect(positions.every((position) => position >= 0)).toBe(true)
+            expect(positions).toEqual(positions.toSorted((a, b) => a - b))
+
+            // The diagnostics leave the stop, its idle state and the eventual terminal write as they were.
+            expect(Exit.isSuccess(exit) && exit.value).toBe("stop")
+            lock.holder?.run("ROLLBACK")
+            yield* Deferred.await(terminal).pipe(
+              Effect.timeoutOrElse({
+                duration: "10 seconds",
+                orElse: () => Effect.die(new Error("the failed turn was not persisted after the lock was released")),
+              }),
+            )
+          }),
+        { config: cfg },
+      ),
+    40_000,
+  )
+}
+
+itStreamLock.live(
+  "processor halt attributes a provider stream lock failure to the stream, not the last handled case",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+          const database = yield* Database.Service
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "stream lock origin")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const model = yield* provider.getModel(ref.providerID, ref.modelID)
+          const error = yield* produceSqliteBusyError(database.db, streamLockDbPath)
+          streamLockFailures.set(chat.id, error)
+          yield* Effect.addFinalizer(() => Effect.sync(() => streamLockFailures.delete(chat.id)))
+
+          const halt = haltLines()
+          const loggers = yield* Effect.service(Logger.CurrentLoggers)
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+          const result = yield* handle
+            .process({
+              user: {
+                id: parent.id,
+                sessionID: chat.id,
+                role: "user",
+                time: parent.time,
+                agent: parent.agent,
+                model: { providerID: ref.providerID, modelID: ref.modelID },
+              } satisfies SessionV1.User,
+              sessionID: chat.id,
+              model,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "stream lock origin" }],
+              tools: {},
+            })
+            .pipe(Effect.provideService(Logger.CurrentLoggers, new Set([...loggers, halt.logger])))
+
+          expect(result).toBe("stop")
+          expect(halt.lines).toHaveLength(1)
+          expect(String(halt.lines[0].error).toLowerCase()).toContain("database is locked (sqlite_busy)")
+          const failure = halt.lines[0].failure as Record<string, unknown> | undefined
+          expect(failure).toMatchObject({ stage: "stream" })
+          expect(failure).not.toHaveProperty("event")
+          expect(failure).not.toHaveProperty("case")
+          // The handled reasoning case wrote its part before the stream failed.
+          const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+          expect(stored.parts.some((part) => part.type === "reasoning")).toBe(true)
         }),
       { config: cfg },
     ),

@@ -157,12 +157,13 @@ export class EffectSQLiteSession<TRelations extends AnyRelations> extends SQLite
             ).pipe(
               Effect.flatMap(() => {
                 // A top-level immediate or exclusive BEGIN owns the write lock from here until COMMIT or ROLLBACK
-                // succeeds; time spent waiting for the lock is the retry gate's, not this hold's.
+                // succeeds; time spent waiting for the lock is the retry gate's, not this hold's. Only those top-level
+                // statements report a release, so a savepoint neither starts nor ends a hold.
                 const acquiredAt = performance.now()
                 const released = (outcome: "commit" | "rollback") =>
                   Effect.suspend(() => {
                     const heldMs = performance.now() - acquiredAt
-                    if (id !== 0 || behavior === "deferred" || heldMs <= longWriteLockHoldMs) return Effect.void
+                    if (behavior === "deferred" || heldMs <= longWriteLockHoldMs) return Effect.void
                     const parent = Context.getOption(services, Tracer.ParentSpan)
                     const span = parent._tag === "Some" && parent.value._tag === "Span" ? parent.value.name : undefined
                     return Effect.logWarning("sqlite write lock held", {
