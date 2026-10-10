@@ -69,7 +69,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
-- **#PR** Log SQLite write-lock holds and lock-stop call sites, diagnostics only (firstmate task
+- **#201** Log SQLite write-lock holds and lock-stop call sites, diagnostics only (firstmate task
   opencode-stop-instrument-180, follows #194): an immediate transaction holding the write lock over 250 ms logs its
   pid, purpose and duration; a lock failure leaving the retry gate logs one summary with the statement head, attempts,
   elapsed time and native code; and halt's error line names the failed write's event, stream case and call site. No
