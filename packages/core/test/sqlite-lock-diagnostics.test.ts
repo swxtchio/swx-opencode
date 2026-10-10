@@ -187,7 +187,7 @@ describe("SQLite write-lock hold diagnostics", () => {
           expect(yield* db.values("SELECT id FROM hold_test ORDER BY id")).toEqual([[1], [3]])
         }),
       ),
-    ))
+    ), 20_000)
 
   test("names an unlabelled hold by its span and keeps nested savepoints inside the outer hold", () =>
     run(
@@ -382,13 +382,79 @@ describe("SQLite lock retry exhaustion diagnostics", () => {
             expect(counts.every((count) => count > 1)).toBe(true)
             expect(counts[0] + counts[1]).toBe(attempts.count)
             for (const line of summaries) {
-              expect(line.fields.statement).toBe("INSERT INTO hold_test")
+              expect(line.fields.statement).toBe("insert")
               expect(line.fields.elapsedMs).toBeLessThan(10_000)
             }
           }),
         ),
       ),
     30_000,
+  )
+
+  test(
+    "names an exhausted statement by its operation, never its comments, literals, identifiers or parameters",
+    () =>
+      run(
+        captured((lines) =>
+          Effect.gen(function* () {
+            const tmp = yield* Effect.acquireRelease(
+              Effect.promise(() => tmpdir()),
+              (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+            )
+            const filename = path.join(tmp.path, "redaction.sqlite")
+            const setup = yield* productionDatabase(filename)
+            yield* setup.run("CREATE TABLE redact_test (id INTEGER PRIMARY KEY, v TEXT)")
+            yield* setup.run(`CREATE TABLE "secret_identifier" (id INTEGER PRIMARY KEY)`)
+            yield* setup.run("INSERT INTO redact_test (id, v) VALUES (1, NULL)")
+            const statements = [
+              { sql: "/* secret_comment */ INSERT INTO redact_test (id) VALUES (10)", params: [], operation: "insert" },
+              { sql: "-- secret_line_comment\nINSERT INTO redact_test (id) VALUES (11)", params: [], operation: "insert" },
+              {
+                sql: "INSERT INTO redact_test (id, v) VALUES (12, 'secret_literal')",
+                params: [],
+                operation: "insert",
+              },
+              { sql: `INSERT INTO "secret_identifier" (id) VALUES (13)`, params: [], operation: "insert" },
+              { sql: "\n\t  bEgIn\r\n  ImMeDiAtE  ", params: [], operation: "begin immediate" },
+              {
+                sql: "UPDATE redact_test SET v = 'secret_multi' WHERE id = 1; DELETE FROM redact_test",
+                params: [],
+                operation: "update",
+              },
+              {
+                sql: "INSERT INTO redact_test (id, v) VALUES (?, ?)",
+                params: [14, "secret_parameter"],
+                operation: "insert",
+              },
+            ]
+            // One connection per statement, so every statement meets the held lock at once.
+            const clients = yield* Effect.forEach(statements, () =>
+              productionDatabase(filename).pipe(Effect.map((db) => db.$client)),
+            )
+            yield* inProcessHolder(filename)
+
+            const failures = yield* Effect.forEach(
+              statements,
+              (statement, index) => clients[index].unsafe(statement.sql, statement.params).raw.pipe(Effect.flip),
+              { concurrency: "unbounded" },
+            ).pipe(
+              Effect.timeoutOrElse({ duration: lockBackstop, orElse: () => Effect.die(new Error("retries never stopped")) }),
+            )
+
+            // The returned errors keep their existing lock classification and message.
+            for (const failure of failures) {
+              expect(isSqlError(failure) && failure.reason._tag).toBe("LockTimeoutError")
+              expect(failure.message).toBe("Failed to execute statement: database is locked (SQLITE_BUSY)")
+            }
+            const summaries = exhausted(lines)
+            expect(summaries.map((line) => line.fields.statement).toSorted()).toEqual(
+              statements.map((statement) => statement.operation).toSorted(),
+            )
+            expect(JSON.stringify(summaries)).not.toContain("secret")
+          }),
+        ),
+      ),
+    20_000,
   )
 
   for (const clientType of ["core-node", "standalone-node"] as const) {
@@ -417,7 +483,7 @@ describe("SQLite lock retry exhaustion diagnostics", () => {
               const summaries = exhausted(lines)
               expect(summaries).toHaveLength(1)
               expect(summaries[0].fields).toMatchObject({
-                statement: "INSERT INTO hold_test",
+                statement: "insert",
                 attempts: attempts.count,
                 "sqlite.code": "ERR_SQLITE_ERROR",
                 "sqlite.errcode": 5,
@@ -474,7 +540,7 @@ describe("SQLite lock retry exhaustion diagnostics", () => {
 
               const summaries = unretried(lines)
               expect(summaries).toHaveLength(1)
-              expect(summaries[0].fields).toMatchObject({ statement: "INSERT INTO hold_test", attempts: 1 })
+              expect(summaries[0].fields).toMatchObject({ statement: "insert", attempts: 1 })
               expect(attempts.count).toBe(1)
               expect(summaries[0].fields).toMatchObject(
                 clientType === "bun"

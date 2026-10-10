@@ -42,7 +42,7 @@ export const retryLocked = <A>(execute: Effect.Effect<A, SqlError>, sql: string)
           typeof error.reason.cause === "object" && error.reason.cause !== null ? error.reason.cause : {}
         return Effect.logWarning(retryable(error) ? "sqlite lock retries exhausted" : "sqlite lock failed without retry", {
           pid: process.pid,
-          statement: sql.trim().split(/\s+/).slice(0, 3).join(" ").slice(0, 64),
+          statement: statementOperation(sql),
           attempts,
           elapsedMs: Math.round(performance.now() - startedAt),
           // node:sqlite's code is generic, so its full extended result code tells BUSY from BUSY_SNAPSHOT.
@@ -52,3 +52,14 @@ export const retryLocked = <A>(execute: Effect.Effect<A, SqlError>, sql: string)
       }),
     )
   })
+
+// Names a statement by its operation alone: the leading keyword, and a BEGIN's transaction behaviour. Leading comments
+// are skipped and nothing after the operation is read, so comments, literals, identifiers and parameters never reach
+// the log.
+const statementOperation = (sql: string) => {
+  const statement = sql.replace(/^(?:\s|--[^\n]*|\/\*[\s\S]*?\*\/)*/, "")
+  const operation = statement.match(/^[a-z]+\b/i)?.[0].toLowerCase()
+  if (operation !== "begin") return operation ?? "unknown"
+  const behavior = statement.match(/^begin\s+(deferred|immediate|exclusive)\b/i)?.[1]
+  return behavior ? `begin ${behavior.toLowerCase()}` : "begin"
+}
