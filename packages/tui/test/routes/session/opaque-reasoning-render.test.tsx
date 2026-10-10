@@ -3,6 +3,7 @@ import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { expect, test } from "bun:test"
 import { createSignal, For, onCleanup, Show } from "solid-js"
 import { useRenderer } from "@opentui/solid"
+import { TextRenderable, type Renderable } from "@opentui/core"
 import type { AssistantMessage, GlobalEvent, Part, ReasoningPart } from "@opencode-ai/sdk/v2"
 import { resolve, TuiConfigProvider } from "../../../src/config"
 import { LocalProvider } from "../../../src/context/local"
@@ -150,6 +151,16 @@ function Transcript(props: { messages: AssistantMessage[] }) {
 
 function thoughtLines(frame: string) {
   return frame.split("\n").filter((line) => line.includes("Thought"))
+}
+
+// The rendered text node that shows a label. A row that is kept across an update is the same node after it.
+function renderableWith(node: Renderable, label: string): Renderable | undefined {
+  for (const child of node.getChildren()) {
+    if (child instanceof TextRenderable && child.plainText.includes(label)) return child
+    const found = renderableWith(child, label)
+    if (found) return found
+  }
+  return undefined
 }
 
 // Polls the rendered frame until it shows what the test expects, bounded so a wrong frame still fails.
@@ -326,6 +337,40 @@ test("plain reasoning between two runs keeps its own header and body", async () 
     const plainHeader = all.findIndex((line) => line.includes("Thought: 1.0s"))
     const body = all.findIndex((line) => line.includes("Checking the tests first."))
     expect(body).toBeGreaterThan(plainHeader)
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("a live run keeps its row and selection when a third part arrives", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  const live = message("msg_identity")
+  const { app, emit, sync } = await mount(undefined, tmp.path, true, () => <Transcript messages={[live]} />)
+
+  try {
+    emit(global({ id: "evt_identity_message", type: "message.updated", properties: { sessionID, info: live } }))
+    emit(partUpdated(encrypted("msg_identity", 1, { start: 1000, end: 2000 })))
+    emit(partUpdated(encrypted("msg_identity", 2, { start: 3000, end: 5000 })))
+    await wait(() => sync.data.part[live.id]?.length === 2)
+    const label = "Thought 2 · 3.0s"
+    const frame = await frameWhen(app, (rendered) => rendered.includes(label))
+
+    const row = renderableWith(app.renderer.root, label)
+    expect(row).toBeDefined()
+    const y = frame.split("\n").findIndex((line) => line.includes(label))
+    const x = frame.split("\n")[y].indexOf(label)
+    await app.mockMouse.drag(x, y, x + label.length - 1, y)
+    expect(app.renderer.hasSelection).toBe(true)
+    const selection = app.renderer.getSelectionContainer()
+
+    emit(partUpdated(encrypted("msg_identity", 3, { start: 6000, end: 9000 })))
+    await wait(() => sync.data.part[live.id]?.length === 3)
+    await frameWhen(app, (rendered) => rendered.includes("Thought 3 · 6.0s"))
+
+    expect(renderableWith(app.renderer.root, "Thought 3 · 6.0s") === row).toBe(true)
+    expect(app.renderer.hasSelection).toBe(true)
+    expect(app.renderer.getSelectionContainer() === selection).toBe(true)
   } finally {
     app.renderer.destroy()
   }

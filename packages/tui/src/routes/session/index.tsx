@@ -1599,26 +1599,31 @@ export function AssistantMessageView(props: {
   })
 
   // Grouping is per message: an error renders after the parts, so it ends a run by position.
-  const rows = createMemo(() => groupOpaqueReasoning(props.parts))
+  const grouped = createMemo(() => groupOpaqueReasoning(props.parts))
 
   const childShortcut = useCommandShortcut("session.child.first")
   const backgroundShortcut = useCommandShortcut("session.background")
 
   return (
     <>
-      <For each={rows()}>
+      <For each={grouped().rows}>
         {(part, index) => {
-          if (part.type === "opaque-reasoning")
-            return <OpaqueReasoningRunView parts={part.parts} message={props.message} />
           const component = createMemo(() => PART_MAPPING[part.type as keyof typeof PART_MAPPING])
           return (
-            <Show when={component()}>
-              <Dynamic
-                last={index() === rows().length - 1}
-                component={component()}
-                part={part as any}
-                message={props.message}
-              />
+            <Show
+              when={grouped().runs.has(part.id)}
+              fallback={
+                <Show when={component()}>
+                  <Dynamic
+                    last={index() === grouped().rows.length - 1}
+                    component={component()}
+                    part={part as any}
+                    message={props.message}
+                  />
+                </Show>
+              }
+            >
+              <OpaqueReasoningRunView members={() => grouped().runs.get(part.id) ?? []} message={props.message} />
             </Show>
           )
         }}
@@ -1729,12 +1734,15 @@ export function ReasoningPartView(props: { last: boolean; part: ReasoningPart; m
   const syntax = createSyntaxStyleMemo(() => generateSubtleSyntax(theme))
 
   const toggle = () => {
-    if (!inMinimal() || opaque()) return
+    if (!inMinimal()) return
     setExpanded((prev) => !prev)
   }
 
+  // Encrypted parts render through the run view, so one part and a longer run share one component.
+  if (opaque()) return <OpaqueReasoningRunView members={() => [props.part]} message={props.message} />
+
   return (
-    <Show when={content() || opaque()}>
+    <Show when={content()}>
       <box
         ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
         paddingLeft={3}
@@ -1744,16 +1752,15 @@ export function ReasoningPartView(props: { last: boolean; part: ReasoningPart; m
       >
         <box onMouseUp={toggle}>
           <ReasoningHeader
-            toggleable={inMinimal() && !opaque()}
+            toggleable={inMinimal()}
             open={!inMinimal() || expanded()}
             done={state().done}
             unknown={state().unresolved}
             title={summary().title}
             duration={state().done ? Locale.duration(state().duration) : undefined}
-            encrypted={opaque()}
           />
         </box>
-        <Show when={!opaque() && (!inMinimal() || expanded()) && summary().body}>
+        <Show when={(!inMinimal() || expanded()) && summary().body}>
           <box paddingLeft={inMinimal() ? 2 : 0} marginTop={1}>
             <code
               filetype="markdown"
@@ -1771,11 +1778,11 @@ export function ReasoningPartView(props: { last: boolean; part: ReasoningPart; m
   )
 }
 
-function OpaqueReasoningRunView(props: { parts: ReasoningPart[]; message: AssistantMessage }) {
+function OpaqueReasoningRunView(props: { members: () => ReasoningPart[]; message: AssistantMessage }) {
   const ctx = use()
   const sync = useSync()
   const status = createMemo(() => assistantStatus(sync, props.message))
-  const states = createMemo(() => props.parts.map((part) => reasoningState(part, props.message, status())))
+  const states = createMemo(() => props.members().map((part) => reasoningState(part, props.message, status())))
   const duration = createMemo(() => states().reduce((total, state) => total + state.duration, 0))
 
   return (
@@ -1794,7 +1801,7 @@ function OpaqueReasoningRunView(props: { parts: ReasoningPart[]; message: Assist
         title={null}
         duration={Locale.duration(duration())}
         encrypted
-        count={props.parts.length}
+        count={states().length > 1 ? states().length : undefined}
       />
     </box>
   )

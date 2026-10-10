@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import type { Part, ReasoningPart } from "@opencode-ai/sdk/v2"
-import { groupOpaqueReasoning, isOpaqueReasoning } from "../../../src/routes/session/opaque-reasoning"
+import {
+  groupOpaqueReasoning,
+  isOpaqueReasoning,
+  type OpaqueReasoningGroups,
+} from "../../../src/routes/session/opaque-reasoning"
 
 // Shapes follow session/processor.ts: reasoning-start creates the part with empty
 // text and the provider metadata, and finishReasoning adds time.end.
@@ -66,82 +70,116 @@ function stepFinish(id: string): Part {
   }
 }
 
+function file(id: string): Part {
+  return { ...ids, id, type: "file", mime: "text/plain", url: "file:///notes.txt" }
+}
+
+// Each row by its id, or as "run:<member ids>" when the row leads a run.
+function shape(groups: OpaqueReasoningGroups) {
+  return groups.rows.map((row) => {
+    const members = groups.runs.get(row.id)
+    return members ? `run:${members.map((part) => part.id).join(",")}` : row.id
+  })
+}
+
 describe("groupOpaqueReasoning", () => {
   test("collapses a run of consecutive encrypted parts into one row", () => {
     const parts = [encrypted("a"), encrypted("b"), encrypted("c"), encrypted("d")]
 
-    expect(groupOpaqueReasoning(parts)).toEqual([{ type: "opaque-reasoning", parts }])
+    const groups = groupOpaqueReasoning(parts)
+
+    expect(shape(groups)).toEqual(["run:a,b,c,d"])
+    expect(groups.runs.get("a")).toEqual(parts)
   })
 
-  test("keeps a lone encrypted part as the original part object", () => {
+  test("a lone encrypted part is a run of one and keeps its object", () => {
     const part = encrypted("a")
 
-    const rows = groupOpaqueReasoning([part])
+    const groups = groupOpaqueReasoning([part])
 
-    expect(rows).toHaveLength(1)
-    expect(rows[0]).toBe(part)
+    expect(groups.rows).toHaveLength(1)
+    expect(groups.rows[0]).toBe(part)
+    expect(groups.runs.get("a")).toEqual([part])
+  })
+
+  test("a run keeps its first part's object as it grows", () => {
+    const first = encrypted("a")
+
+    const before = groupOpaqueReasoning([first, encrypted("b")])
+    const after = groupOpaqueReasoning([first, encrypted("b"), encrypted("c")])
+
+    expect(before.rows[0]).toBe(first)
+    expect(after.rows[0]).toBe(first)
+    expect(after.runs.get("a")).toHaveLength(3)
   })
 
   test("a tool call ends the run, and the next encrypted part starts a new one", () => {
-    const a = encrypted("a")
-    const b = encrypted("b")
-    const call = tool("call")
-    const c = encrypted("c")
+    const groups = groupOpaqueReasoning([encrypted("a"), encrypted("b"), tool("call"), encrypted("c")])
 
-    expect(groupOpaqueReasoning([a, b, call, c])).toEqual([{ type: "opaque-reasoning", parts: [a, b] }, call, c])
+    expect(shape(groups)).toEqual(["run:a,b", "call", "run:c"])
   })
 
   test("visible text ends the run, and the next encrypted part starts a new one", () => {
-    const a = encrypted("a")
-    const b = encrypted("b")
-    const answer = text("answer", "Here is the result.")
-    const c = encrypted("c")
-    const d = encrypted("d")
-
-    expect(groupOpaqueReasoning([a, b, answer, c, d])).toEqual([
-      { type: "opaque-reasoning", parts: [a, b] },
-      answer,
-      { type: "opaque-reasoning", parts: [c, d] },
+    const groups = groupOpaqueReasoning([
+      encrypted("a"),
+      encrypted("b"),
+      text("answer", "Here is the result."),
+      encrypted("c"),
+      encrypted("d"),
     ])
+
+    expect(shape(groups)).toEqual(["run:a,b", "answer", "run:c,d"])
   })
 
   test("a failed tool call ends the run", () => {
-    const a = encrypted("a")
-    const b = encrypted("b")
-    const failed = failedTool("failed")
-    const c = encrypted("c")
+    const groups = groupOpaqueReasoning([encrypted("a"), failedTool("failed"), encrypted("b"), encrypted("c")])
 
-    expect(groupOpaqueReasoning([a, failed, b, c])).toEqual([a, failed, { type: "opaque-reasoning", parts: [b, c] }])
+    expect(shape(groups)).toEqual(["run:a", "failed", "run:b,c"])
   })
 
-  test("parts that render no line do not end a run", () => {
-    const a = encrypted("a")
-    const b = encrypted("b")
+  test("parts that render no line do not end a run, and stay in order", () => {
+    const groups = groupOpaqueReasoning([
+      encrypted("a"),
+      stepFinish("finish"),
+      stepStart("start"),
+      text("blank", " \n"),
+      emptyReasoning("e"),
+      encrypted("b"),
+    ])
 
-    expect(
-      groupOpaqueReasoning([a, stepFinish("finish"), stepStart("start"), text("blank", " \n"), emptyReasoning("e"), b]),
-    ).toEqual([{ type: "opaque-reasoning", parts: [a, b] }])
+    expect(shape(groups)).toEqual(["run:a,b", "finish", "start", "blank", "e"])
+  })
+
+  test("a part type the view does not render yet keeps its place", () => {
+    const groups = groupOpaqueReasoning([encrypted("a"), file("attachment"), encrypted("b"), tool("call")])
+
+    expect(shape(groups)).toEqual(["run:a,b", "attachment", "call"])
   })
 
   test("summarized reasoning ends the run and renders as its own part", () => {
-    const a = encrypted("a")
-    const b = encrypted("b")
-    const plan = summarized("plan", "Reading the config first")
-    const c = encrypted("c")
+    const groups = groupOpaqueReasoning([
+      encrypted("a"),
+      encrypted("b"),
+      summarized("plan", "Reading the config first"),
+      encrypted("c"),
+    ])
 
-    expect(groupOpaqueReasoning([a, b, plan, c])).toEqual([{ type: "opaque-reasoning", parts: [a, b] }, plan, c])
+    expect(shape(groups)).toEqual(["run:a,b", "plan", "run:c"])
   })
 
   test("a [REDACTED] placeholder with metadata is still encrypted and joins the run", () => {
-    const a = encrypted("a")
     const redacted: ReasoningPart = { ...encrypted("redacted"), text: "[REDACTED]" }
-    const b = encrypted("b")
 
-    expect(groupOpaqueReasoning([a, redacted, b])).toEqual([{ type: "opaque-reasoning", parts: [a, redacted, b] }])
+    const groups = groupOpaqueReasoning([encrypted("a"), redacted, encrypted("b")])
+
+    expect(shape(groups)).toEqual(["run:a,redacted,b"])
   })
 
   test("returns no rows for no parts", () => {
-    expect(groupOpaqueReasoning([])).toEqual([])
+    const groups = groupOpaqueReasoning([])
+
+    expect(groups.rows).toEqual([])
+    expect(groups.runs.size).toBe(0)
   })
 })
 

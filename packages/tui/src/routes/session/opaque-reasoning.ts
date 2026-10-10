@@ -1,6 +1,11 @@
 import type { Part, ReasoningPart } from "@opencode-ai/sdk/v2"
 
-export type OpaqueReasoningRun = { type: "opaque-reasoning"; parts: ReasoningPart[] }
+// A run's row is its first part, the same object on every recompute, so the view keyed on it persists while
+// the run grows. The later members are not rows; they reach the view through `runs`.
+export type OpaqueReasoningGroups = {
+  rows: Part[]
+  runs: Map<string, ReasoningPart[]>
+}
 
 // OpenRouter encrypts some reasoning blocks and marks them with a placeholder.
 export function reasoningText(part: ReasoningPart) {
@@ -13,16 +18,21 @@ export function isOpaqueReasoning(part: ReasoningPart) {
   return !reasoningText(part) && Boolean(part.metadata)
 }
 
-// A run ends at a part that renders a line of its own. Parts that render no
-// line are skipped without ending the run, so a step boundary between two
-// encrypted parts still shows as one line.
-export function groupOpaqueReasoning(parts: readonly Part[]): Array<Part | OpaqueReasoningRun> {
+// A run ends at a part that renders a line of its own. Every other part stays in
+// order, so a part type the view does not render yet still reaches the view.
+export function groupOpaqueReasoning(parts: readonly Part[]): OpaqueReasoningGroups {
   const breakers = parts.flatMap((part, index) => (breaksRun(part) ? [index] : []))
   const starts = [0, ...breakers.map((index) => index + 1)]
-  return starts.flatMap((start, index) => {
+  const runs = new Map<string, ReasoningPart[]>()
+  const rows = starts.flatMap((start, index) => {
     const end = breakers[index] ?? parts.length
-    return [...collapseRun(parts.slice(start, end)), ...parts.slice(end, end + 1)]
+    const segment = parts.slice(start, end)
+    const members = segment.filter(isOpaquePart)
+    const leader = members[0]
+    if (leader) runs.set(leader.id, members)
+    return [...segment.filter((part) => !isOpaquePart(part) || part === leader), ...parts.slice(end, end + 1)]
   })
+  return { rows, runs }
 }
 
 function breaksRun(part: Part) {
@@ -32,8 +42,6 @@ function breaksRun(part: Part) {
   return false
 }
 
-function collapseRun(segment: readonly Part[]): Array<ReasoningPart | OpaqueReasoningRun> {
-  const run = segment.flatMap((part) => (part.type === "reasoning" && isOpaqueReasoning(part) ? [part] : []))
-  if (run.length < 2) return run
-  return [{ type: "opaque-reasoning", parts: run }]
+function isOpaquePart(part: Part): part is ReasoningPart {
+  return part.type === "reasoning" && isOpaqueReasoning(part)
 }
