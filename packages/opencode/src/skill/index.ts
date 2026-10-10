@@ -92,6 +92,8 @@ type DiscoveryState = {
 type ScanState = {
   matches: Set<string>
   dirs: Set<string>
+  // skills.exclude globs, matched relative to the root each scan starts from.
+  exclude: string[]
 }
 
 export interface Interface {
@@ -153,6 +155,7 @@ const scan = Effect.fnUntraced(function* (
         include: "file",
         symlink: true,
         dot: opts?.dot,
+        ignore: state.exclude,
       }),
     catch: (error) => error,
   }).pipe(
@@ -180,7 +183,8 @@ const discoverSkills = Effect.fnUntraced(function* (
   directory: string,
   worktree: string,
 ) {
-  const state: ScanState = { matches: new Set(), dirs: new Set() }
+  const cfg = yield* config.get()
+  const state: ScanState = { matches: new Set(), dirs: new Set(), exclude: cfg.skills?.exclude ?? [] }
 
   const externalDirs: string[] = []
   if (!disableExternalSkills) {
@@ -207,7 +211,6 @@ const discoverSkills = Effect.fnUntraced(function* (
     yield* scan(state, dir, OPENCODE_SKILL_PATTERN)
   }
 
-  const cfg = yield* config.get()
   for (const item of cfg.skills?.paths ?? []) {
     const expanded = item.startsWith("~/") ? path.join(global.home, item.slice(2)) : item
     const dir = path.isAbsolute(expanded) ? expanded : path.join(directory, expanded)

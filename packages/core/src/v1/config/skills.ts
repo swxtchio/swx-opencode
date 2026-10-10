@@ -9,5 +9,9 @@ export const Info = Schema.Struct({
   urls: Schema.optional(Schema.Array(Schema.String)).annotate({
     description: "URLs to fetch skills from (e.g., https://example.com/.well-known/skills/)",
   }),
+  exclude: Schema.optional(Schema.Array(Schema.String)).annotate({
+    description:
+      "Glob patterns of SKILL.md files to skip in every skill root, matched relative to that root (e.g., **/.trash/**)",
+  }),
 })
 export type Info = Schema.Schema.Type<typeof Info>
