@@ -679,6 +679,10 @@ const sqliteLockEnv = LayerNode.compile(root, [
 const itSqliteLock = testEffect(sqliteLockEnv)
 // The provider stream dies with the session's lock failure after its handled events all succeed.
 const streamLockFailures = new Map<SessionID, unknown>()
+// A named callable inside the provider stream, so the halt line must name it rather than the processor around it.
+const failProviderStream = Effect.fn("test.failProviderStream")(function* (sessionID: SessionID) {
+  return yield* Effect.die(streamLockFailures.get(sessionID))
+})
 const itStreamLock = testEffect(
   LayerNode.compile(root, [
     ...replacements,
@@ -694,7 +698,7 @@ const itStreamLock = testEffect(
                 LLMEvent.reasoningStart({ id: "reasoning-1" }),
                 LLMEvent.reasoningEnd({ id: "reasoning-1" }),
               ),
-              Stream.die(streamLockFailures.get(input.sessionID as SessionID)),
+              Stream.unwrap(failProviderStream(input.sessionID as SessionID)),
             ),
         }),
       ),
@@ -1945,6 +1949,7 @@ for (const scenario of [
             expect(failure).toMatchObject({ event: scenario.event, stage: "handler", case: scenario.trigger })
             // The span chain runs from the failed commit outward, through the helper the case called.
             const frames = String(failure?.callSite).split(" < ")
+            expect(frames[0]).toBe(scenario.callSite[0])
             const positions = scenario.callSite.map((name) => frames.indexOf(name))
             expect(positions.every((position) => position >= 0)).toBe(true)
             expect(positions).toEqual(positions.toSorted((a, b) => a - b))
@@ -2008,6 +2013,8 @@ itStreamLock.live(
           expect(String(halt.lines[0].error).toLowerCase()).toContain("database is locked (sqlite_busy)")
           const failure = halt.lines[0].failure as Record<string, unknown> | undefined
           expect(failure).toMatchObject({ stage: "stream" })
+          // The call site is the failing callable inside the stream, not the processor that observed the failure.
+          expect(String(failure?.callSite).split(" < ")[0]).toBe("test.failProviderStream")
           expect(failure).not.toHaveProperty("event")
           expect(failure).not.toHaveProperty("case")
           // The handled reasoning case wrote its part before the stream failed.
