@@ -19,11 +19,23 @@ import { Sqlite } from "./sqlite"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 const nativeBusyTimeoutMs = 5
-// Five 5ms native attempts plus four 25/50/75/75ms backoffs target ~250ms total.
-const retrySchedule = Schedule.exponential("25 millis").pipe(
-  Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 75)))),
-  Schedule.take(4),
+const sqliteBusySnapshot = 517
+// Restore the lock tolerance the old busy_timeout gave, but wait asynchronously between short native attempts
+// so a contended statement never blocks the event loop. The window runs from the first failed retry, and the
+// backoff cap matches SQLite's own busy-handler sleep.
+const retrySchedule = Schedule.exponential("10 millis").pipe(
+  Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 100)))),
+  Schedule.jittered,
+  Schedule.both(Schedule.during("5 seconds")),
 )
+
+// A stale read snapshot fails every retry of the same statement; only restarting its transaction can recover.
+const retryable = (error: SqlError) => {
+  const cause = error.reason.cause
+  const snapshot =
+    typeof cause === "object" && cause !== null && "errcode" in cause && cause.errcode === sqliteBusySnapshot
+  return error.reason.isRetryable && !snapshot
+}
 
 const statementError = (cause: unknown) => {
   const errcode =
@@ -93,10 +105,14 @@ const make = (options: Config) =>
       Effect.withFiber<Array<Record<string, unknown>>, SqlError>((fiber) => {
         const statement = native.prepare(query)
         statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
-        return Effect.try({
+        const execute = Effect.try({
           try: () => statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>,
           catch: statementError,
-        }).pipe(Effect.retry({ schedule: retrySchedule, while: (error) => error.reason.isRetryable }))
+        })
+        // Only a statement that met the lock builds the retry schedule, which re-attempts it at once before backing off.
+        return execute.pipe(
+          Effect.catchIf(retryable, () => Effect.retry(execute, { schedule: retrySchedule, while: retryable })),
+        )
       })
 
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
@@ -104,10 +120,14 @@ const make = (options: Config) =>
         const statement = native.prepare(query)
         statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
         statement.setReturnArrays(true)
-        return Effect.try({
+        const execute = Effect.try({
           try: () => statement.all(...(params as SQLInputValue[])) as unknown as ReadonlyArray<ReadonlyArray<unknown>>,
           catch: statementError,
-        }).pipe(Effect.retry({ schedule: retrySchedule, while: (error) => error.reason.isRetryable }))
+        })
+        // Only a statement that met the lock builds the retry schedule, which re-attempts it at once before backing off.
+        return execute.pipe(
+          Effect.catchIf(retryable, () => Effect.retry(execute, { schedule: retrySchedule, while: retryable })),
+        )
       })
 
     const connection = identity<SqliteConnection>({
