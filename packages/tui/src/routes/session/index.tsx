@@ -70,7 +70,7 @@ import { QuestionPrompt } from "./question"
 import { DialogExportOptions } from "../../ui/dialog-export-options"
 import * as Model from "../../util/model"
 import { AssistantModelLabel } from "./message-model"
-import { groupOpaqueReasoning, isOpaqueReasoning, reasoningText } from "./opaque-reasoning"
+import { groupOpaqueReasoning, reasoningText } from "./opaque-reasoning"
 import type { SessionStepMessage } from "../../util/model"
 import { formatTranscript } from "../../util/transcript"
 import { sessionEpilogue } from "../../util/presentation"
@@ -1726,7 +1726,6 @@ export function ReasoningPartView(props: { last: boolean; part: ReasoningPart; m
   const [expanded, setExpanded] = createSignal(false)
 
   const content = createMemo(() => reasoningText(props.part))
-  const opaque = createMemo(() => isOpaqueReasoning(props.part))
   const status = createMemo(() => assistantStatus(sync, props.message))
   const state = createMemo(() => reasoningState(props.part, props.message, status()))
   const inMinimal = createMemo(() => ctx.thinkingMode() === "hide")
@@ -1737,9 +1736,6 @@ export function ReasoningPartView(props: { last: boolean; part: ReasoningPart; m
     if (!inMinimal()) return
     setExpanded((prev) => !prev)
   }
-
-  // Encrypted parts render through the run view, so one part and a longer run share one component.
-  if (opaque()) return <OpaqueReasoningRunView members={() => [props.part]} message={props.message} />
 
   return (
     <Show when={content()}>
