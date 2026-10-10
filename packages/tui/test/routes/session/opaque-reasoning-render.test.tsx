@@ -342,7 +342,7 @@ test("plain reasoning between two runs keeps its own header and body", async () 
   }
 })
 
-test("a live run keeps its row and selection when a third part arrives", async () => {
+test("a live run keeps its label and selection as a third part goes in flight and completes", async () => {
   await using tmp = await tmpdir()
   await Bun.write(`${tmp.path}/kv.json`, "{}")
   const live = message("msg_identity")
@@ -353,22 +353,41 @@ test("a live run keeps its row and selection when a third part arrives", async (
     emit(partUpdated(encrypted("msg_identity", 1, { start: 1000, end: 2000 })))
     emit(partUpdated(encrypted("msg_identity", 2, { start: 3000, end: 5000 })))
     await wait(() => sync.data.part[live.id]?.length === 2)
-    const label = "Thought 2 · 3.0s"
-    const frame = await frameWhen(app, (rendered) => rendered.includes(label))
+    const before = "Thought 2 · 3.0s"
+    const frame = await frameWhen(app, (rendered) => rendered.includes(before))
 
-    const row = renderableWith(app.renderer.root, label)
-    expect(row).toBeDefined()
-    const y = frame.split("\n").findIndex((line) => line.includes(label))
-    const x = frame.split("\n")[y].indexOf(label)
-    await app.mockMouse.drag(x, y, x + label.length - 1, y)
+    const label = renderableWith(app.renderer.root, before)
+    expect(label).toBeDefined()
+    const y = frame.split("\n").findIndex((line) => line.includes(before))
+    const x = frame.split("\n")[y].indexOf(before)
+    await app.mockMouse.drag(x, y, x + before.length - 1, y)
     expect(app.renderer.hasSelection).toBe(true)
     const selection = app.renderer.getSelectionContainer()
 
-    emit(partUpdated(encrypted("msg_identity", 3, { start: 6000, end: 9000 })))
+    // The third part arrives in flight: the line gains the spinner and keeps its label and selection.
+    emit(
+      global({ id: "evt_identity_busy", type: "session.status", properties: { sessionID, status: { type: "busy" } } }),
+    )
+    const third = encrypted("msg_identity", 3, { start: 6000, end: 9000 })
+    emit(partUpdated({ ...third, time: { start: 6000 } }))
     await wait(() => sync.data.part[live.id]?.length === 3)
-    await frameWhen(app, (rendered) => rendered.includes("Thought 3 · 6.0s"))
+    const inFlight = "Thought 3 · 3.0s"
+    const pending = await frameWhen(app, (rendered) => rendered.includes(inFlight))
+    const pendingLine = pending.split("\n").find((line) => line.includes(inFlight)) ?? ""
+    expect(SPINNER_FRAMES.some((glyph) => pendingLine.includes(glyph))).toBe(true)
+    expect(renderableWith(app.renderer.root, inFlight) === label).toBe(true)
+    expect(app.renderer.hasSelection).toBe(true)
+    expect(app.renderer.getSelectionContainer() === selection).toBe(true)
 
-    expect(renderableWith(app.renderer.root, "Thought 3 · 6.0s") === row).toBe(true)
+    // The part completes: the same label and selection survive the spinner going away.
+    emit(partUpdated(third))
+    await wait(() => {
+      const stored = sync.data.part[live.id]?.find((part) => part.id === third.id)
+      return stored?.type === "reasoning" && stored.time.end === 9000
+    })
+    const completed = "Thought 3 · 6.0s"
+    await frameWhen(app, (rendered) => rendered.includes(completed))
+    expect(renderableWith(app.renderer.root, completed) === label).toBe(true)
     expect(app.renderer.hasSelection).toBe(true)
     expect(app.renderer.getSelectionContainer() === selection).toBe(true)
   } finally {

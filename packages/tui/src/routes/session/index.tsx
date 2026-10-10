@@ -1780,10 +1780,24 @@ export function ReasoningPartView(props: { last: boolean; part: ReasoningPart; m
 
 function OpaqueReasoningRunView(props: { members: () => ReasoningPart[]; message: AssistantMessage }) {
   const ctx = use()
+  const { theme } = useTheme()
   const sync = useSync()
   const status = createMemo(() => assistantStatus(sync, props.message))
   const states = createMemo(() => props.members().map((part) => reasoningState(part, props.message, status())))
+  const done = createMemo(() => states().every((state) => state.done))
+  const unknown = createMemo(() => states().some((state) => state.unresolved))
   const duration = createMemo(() => states().reduce((total, state) => total + state.duration, 0))
+  const fg = () =>
+    ctx.thinkingMode() !== "hide"
+      ? RGBA.fromValues(theme.warning.r, theme.warning.g, theme.warning.b, theme.thinkingOpacity)
+      : theme.warning
+  // The label is one text node for the whole lifecycle; only its content and the spinner beside it change.
+  // A selection on the label therefore survives the in-flight and completed transitions.
+  const label = () => {
+    if (unknown()) return "Thinking status unknown"
+    if (!done() && states().length === 1) return "Thinking"
+    return `Thought${states().length > 1 ? ` ${states().length}` : ""} · ${Locale.duration(duration())}`
+  }
 
   return (
     <box
@@ -1793,16 +1807,14 @@ function OpaqueReasoningRunView(props: { members: () => ReasoningPart[]; message
       flexDirection="column"
       flexShrink={0}
     >
-      <ReasoningHeader
-        toggleable={false}
-        open={ctx.thinkingMode() !== "hide"}
-        done={states().every((state) => state.done)}
-        unknown={states().some((state) => state.unresolved)}
-        title={null}
-        duration={Locale.duration(duration())}
-        encrypted
-        count={states().length > 1 ? states().length : undefined}
-      />
+      <box flexDirection="row" gap={1}>
+        <Show when={!done() && !unknown()}>
+          <Spinner color={fg()} />
+        </Show>
+        <text fg={unknown() ? theme.textMuted : fg()} wrapMode="none">
+          {label()}
+        </text>
+      </box>
     </box>
   )
 }
@@ -1831,19 +1843,14 @@ function ReasoningHeader(props: {
   title: string | null
   duration?: string
   encrypted?: boolean
-  count?: number
 }) {
   const { theme } = useTheme()
   const fg = () =>
     props.open
       ? RGBA.fromValues(theme.warning.r, theme.warning.g, theme.warning.b, theme.thinkingOpacity)
       : theme.warning
-  // A run shows its count and duration while it is still in flight, so the line
-  // updates as each part arrives.
-  const encryptedLabel = () =>
-    `Thought${props.count ? ` ${props.count}` : ""}${props.duration ? ` · ${props.duration}` : ""}`
   const completed = () => {
-    if (props.encrypted) return encryptedLabel()
+    if (props.encrypted) return `Thought${props.duration ? ` · ${props.duration}` : ""}`
     const detail = [props.title, props.duration].filter(Boolean).join(" · ")
     return `${props.toggleable ? (props.open ? "- " : "+ ") : ""}Thought${detail ? `: ${detail}` : ""}`
   }
@@ -1857,9 +1864,7 @@ function ReasoningHeader(props: {
       </Match>
       <Match when={!props.done}>
         <box flexDirection="row">
-          <Spinner color={fg()}>
-            {props.count ? encryptedLabel() : props.title ? "Thinking: " + props.title : "Thinking"}
-          </Spinner>
+          <Spinner color={fg()}>{props.title ? "Thinking: " + props.title : "Thinking"}</Spinner>
         </box>
       </Match>
       <Match when={true}>
