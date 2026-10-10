@@ -69,6 +69,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#163** Revert #155 (swxtchio/swx-opencode#153): under concurrent writers it dropped more accepted prompts than its parent #150, so the busy waits return to the pre-#155 schedule. The fix-forward is tracked in swxtchio/swx-opencode#162. _Fork-only._
 - **#144** Make `opencode db path` print the selected path without initializing `AppRuntime` or SQLite, defer global directory creation to runtime initialization, and preserve explicit and channel-specific database path selection. _Upstreamable._
 - **#141** Reconcile `.git/HEAD` after an early or missed native callback through a shared read/change/publish path; keep a
   closed native watch `unavailable` while polling still delivers changed branch values. Cover root-off switches, native
