@@ -6175,14 +6175,14 @@ consumeLock.instance(
         const exits = yield* awaitWithTimeout(
           Effect.all([Fiber.await(task), Fiber.await(continuation)]),
           "the run never stopped under the held lock",
-          "40 seconds",
+          "60 seconds",
         )
 
         consumeRefusals(exits).forEach((refusal) => {
           expect(refusal).toBeInstanceOf(SessionQueue.ConsumeLockedError)
-          expect(refusal).toMatchObject({ sessionID: chat.id, attempts: 3 })
+          expect(refusal).toMatchObject({ sessionID: chat.id, attempts: 5 })
         })
-        expect(capture.locked).toEqual([1, 2, 3].map((attempts) => ({ "session.id": chat.id, attempts })))
+        expect(capture.locked).toEqual([1, 2, 3, 4, 5].map((attempts) => ({ "session.id": chat.id, attempts })))
         // The refusal kept the continuation pending and the tool result, and left nothing running to retry it.
         expect(records()).toEqual(before)
         expect(yield* llm.calls).toBe(1)
@@ -6193,7 +6193,7 @@ consumeLock.instance(
         yield* wakeDeliversContinuation(started)
       }).pipe(Effect.provideService(Logger.CurrentLoggers, capture.loggers))
     }),
-  60_000,
+  90_000,
 )
 
 consumeLock.instance(
@@ -6222,14 +6222,14 @@ consumeLock.instance(
         const exits = yield* awaitWithTimeout(
           Effect.all([Fiber.await(task), Fiber.await(continuation)]),
           "the run never stopped while the session permit was held",
-          "45 seconds",
+          "80 seconds",
         ).pipe(Effect.onError(() => Deferred.succeed(permitRelease, undefined)))
 
         consumeRefusals(exits).forEach((refusal) => {
           expect(refusal).toBeInstanceOf(SessionQueue.ConsumeLockedError)
-          expect(refusal).toMatchObject({ sessionID: chat.id, attempts: 3 })
+          expect(refusal).toMatchObject({ sessionID: chat.id, attempts: 5 })
         })
-        expect(capture.backstop).toEqual([1, 2, 3].map((attempts) => ({ "session.id": chat.id, attempts })))
+        expect(capture.backstop).toEqual([1, 2, 3, 4, 5].map((attempts) => ({ "session.id": chat.id, attempts })))
         expect(capture.locked).toEqual([])
         expect(records()).toEqual(before)
         expect(yield* llm.calls).toBe(1)
@@ -6240,7 +6240,7 @@ consumeLock.instance(
         yield* wakeDeliversContinuation(started)
       }).pipe(Effect.provideService(Logger.CurrentLoggers, capture.loggers))
     }),
-  70_000,
+  110_000,
 )
 
 // Makes the consume's delete, which runs only after its transaction began, fail with SQLITE_BUSY while armed, so the
@@ -6296,7 +6296,7 @@ consumeLock.instance(
         const exits = yield* awaitWithTimeout(
           Effect.all([Fiber.await(task), Fiber.await(continuation)]),
           "the run never stopped on the failing delete",
-          "30 seconds",
+          "45 seconds",
         )
         busy.on = false
 
@@ -6304,7 +6304,7 @@ consumeLock.instance(
           expect(refusal).not.toBeInstanceOf(SessionQueue.ConsumeLockedError)
           expect(sqliteLockMessage(refusal)).toBe("Database is locked (SQLITE_BUSY)")
         })
-        // One attempt only: the delete's own statement retries ran inside it, and no further attempt was made.
+        // The delete's own statement retries ran inside its attempt, and no further attempt was made.
         expect(busy.executions).toBeGreaterThan(0)
         expect(capture.locked).toEqual([])
         expect(capture.backstop).toEqual([])
@@ -6312,7 +6312,7 @@ consumeLock.instance(
         expect(yield* llm.calls).toBe(1)
       }).pipe(Effect.provideService(Logger.CurrentLoggers, capture.loggers))
     }),
-  45_000,
+  60_000,
 )
 
 const resourcePart = (uri: string) => ({

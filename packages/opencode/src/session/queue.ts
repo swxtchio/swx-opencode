@@ -58,7 +58,7 @@ export class ConsumeLockedError extends Schema.TaggedErrorClass<ConsumeLockedErr
 
 // Each consume attempt waits out the statement lock window, so a lock released
 // within about this many windows lets the run go on.
-const consumeAttempts = 3
+const consumeAttempts = 5
 // Bounds an attempt's wait for the session permit, the shared connection and
 // BEGIN together: its own statement window plus one other statement's window
 // ahead of it on the connection. The body, once begun, is not timed.
@@ -723,8 +723,8 @@ const layer = Layer.effect(
           return yield* Effect.die(
             new ConsumeLockedError({
               sessionID,
-              attempts,
-              message: `SessionQueue.consume could not begin its write in ${attempts} attempts; session ${sessionID} stopped, and its queued prompts stay pending until it is prompted again`,
+              attempts: consumeAttempts,
+              message: `SessionQueue.consume could not begin its write in ${consumeAttempts} attempts; session ${sessionID} stopped, and its queued prompts stay pending until it is prompted again`,
             }),
           )
       }
