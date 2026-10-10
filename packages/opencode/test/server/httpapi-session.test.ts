@@ -1,11 +1,12 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { afterEach, describe, expect } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer, Queue, Schema, Stream, Tracer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
+import { Sse } from "effect/unstable/encoding"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -37,6 +38,7 @@ import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { ProviderTurnInterruptedMessage, ProviderTurnInterruptedOrigin } from "@opencode-ai/core/session/error"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import * as DateTime from "effect/DateTime"
@@ -303,41 +305,18 @@ const awaitNativeModel = (directory: string) =>
     "10 seconds",
   )
 
-const createNativeSessionEventDecoder = () => {
-  const decoder = new TextDecoder()
-  let buffer = ""
-  const frame = (text: string) => {
-    const data = text
-      .split(/\r\n|\r|\n/)
-      .flatMap((line) => (line.startsWith("data:") ? [line.slice("data:".length).replace(/^ /, "")] : []))
-      .join("\n")
-    return data
-      ? [Schema.decodeUnknownSync(SessionEvent.Durable)(Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(data))]
-      : []
-  }
-  const drain = () => {
-    const events: SessionEvent.DurableEvent[] = []
-    while (true) {
-      const boundary = /(?:\r\n|\r|\n)(?:\r\n|\r|\n)/.exec(buffer)
-      if (!boundary) break
-      events.push(...frame(buffer.slice(0, boundary.index)))
-      buffer = buffer.slice(boundary.index + boundary[0].length)
-    }
-    return events
-  }
-  return {
-    write: (chunk: Uint8Array) => {
-      buffer += decoder.decode(chunk, { stream: true })
-      return drain()
-    },
-    finish: () => {
-      buffer += decoder.decode()
-      const final = buffer
-      buffer = ""
-      return frame(final)
-    },
-  }
-}
+const decodeNativeSessionEvents = <E>(bytes: Stream.Stream<Uint8Array, E>) =>
+  bytes.pipe(
+    Stream.decodeText(),
+    Stream.pipeThroughChannel(Sse.decode()),
+    Stream.catchTag("Retry", () => Stream.empty),
+    Stream.filter((event) => event.data.length > 0),
+    Stream.map((event) =>
+      Schema.decodeUnknownSync(SessionEvent.Durable)(
+        Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(event.data),
+      ),
+    ),
+  )
 
 const openNativeSessionEvents = (sessionID: SessionV2.ID, after: number, headers?: RequestInit["headers"]) =>
   Effect.gen(function* () {
@@ -345,60 +324,59 @@ const openNativeSessionEvents = (sessionID: SessionV2.ID, after: number, headers
     if (response.status !== 200)
       return yield* Effect.fail(new Error(`Session event stream returned ${response.status}`))
     const events = yield* Queue.unbounded<SessionEvent.DurableEvent>()
-    const decoder = createNativeSessionEventDecoder()
-    const fiber = yield* Stream.concat(
-      response.stream.pipe(Stream.map(decoder.write), Stream.flattenIterable),
-      Stream.unwrap(Effect.sync(() => Stream.fromIterable(decoder.finish()))),
-    ).pipe(Stream.runForEach((event) => Queue.offer(events, event).pipe(Effect.asVoid)), Effect.forkScoped)
+    const fiber = yield* decodeNativeSessionEvents(response.stream).pipe(
+      Stream.runForEach((event) => Queue.offer(events, event).pipe(Effect.asVoid)),
+      Effect.forkScoped,
+    )
     return { events, fiber, response }
   })
 
-it.effect("decodes native SSE frames independent of transport chunking", () =>
-  Effect.sync(() => {
-    const sessionID = SessionV2.ID.make("ses_sse_decoder")
-    const event = (seq: number) =>
-      SessionEvent.ContextUpdated.make({
-        id: EventV2.ID.create(),
-        type: SessionEvent.ContextUpdated.type,
-        durable: { aggregateID: sessionID, seq, version: 1 },
-        data: {
-          sessionID,
-          timestamp: DateTime.makeUnsafe(seq),
-          messageID: SessionMessage.ID.create(),
-          text: "Résumé 🐈",
-        },
-      })
-    const first = event(1)
-    const second = event(2)
-    const encoder = new TextEncoder()
-    const frame = (value: SessionEvent.DurableEvent) =>
-      `data: ${JSON.stringify(Schema.encodeUnknownSync(SessionEvent.Durable)(value))}\r\n\r\n`
-    const firstFrame = frame(first)
-    const secondFrame = frame(second)
-    const summary = (events: ReadonlyArray<SessionEvent.DurableEvent>) =>
-      events.map((value) => ({ id: value.id, type: value.type, seq: value.durable?.seq }))
-    const firstExpected = summary([first])
+test("decodes native SSE frames independent of transport chunking", async () => {
+  const sessionID = SessionV2.ID.make("ses_sse_decoder")
+  const event = (seq: number) =>
+    SessionEvent.ContextUpdated.make({
+      id: EventV2.ID.create(),
+      type: SessionEvent.ContextUpdated.type,
+      durable: { aggregateID: sessionID, seq, version: 1 },
+      data: {
+        sessionID,
+        timestamp: DateTime.makeUnsafe(seq),
+        messageID: SessionMessage.ID.create(),
+        text: "Résumé 🐈",
+      },
+    })
+  const first = event(1)
+  const second = event(2)
+  const encoder = new TextEncoder()
+  const frame = (value: SessionEvent.DurableEvent) =>
+    `data: ${JSON.stringify(Schema.encodeUnknownSync(SessionEvent.Durable)(value))}\r\n\r\n`
+  const firstFrame = frame(first)
+  const secondFrame = frame(second)
+  const summary = (events: ReadonlyArray<SessionEvent.DurableEvent>) =>
+    events.map((value) => {
+      if (value.type !== SessionEvent.ContextUpdated.type) throw new Error(`Unexpected event type: ${value.type}`)
+      return { id: value.id, type: value.type, seq: value.durable?.seq, text: value.data.text }
+    })
+  const collect = (chunks: ReadonlyArray<Uint8Array>) =>
+    Effect.runPromise(
+      decodeNativeSessionEvents(Stream.fromIterable(chunks)).pipe(
+        Stream.runCollect,
+        Effect.map((events) => Array.from(events)),
+      ),
+    )
+  const firstExpected = summary([first])
 
-    const splitAfterTwoBytes = createNativeSessionEventDecoder()
-    const firstBytes = encoder.encode(firstFrame)
-    const splitAfterTwo = [
-      ...splitAfterTwoBytes.write(firstBytes.slice(0, 2)),
-      ...splitAfterTwoBytes.write(firstBytes.slice(2)),
-      ...splitAfterTwoBytes.finish(),
-    ]
-    expect(summary(splitAfterTwo)).toEqual(firstExpected)
+  const firstBytes = encoder.encode(firstFrame)
+  const splitAfterTwo = await collect([firstBytes.slice(0, 2), firstBytes.slice(2)])
+  expect(summary(splitAfterTwo)).toEqual(firstExpected)
 
-    const bytewise = createNativeSessionEventDecoder()
-    const bytewiseEvents = Array.from({ length: firstBytes.length }, (_, index) =>
-      bytewise.write(firstBytes.slice(index, index + 1)),
-    ).flat()
-    bytewiseEvents.push(...bytewise.finish())
-    expect(summary(bytewiseEvents)).toEqual(firstExpected)
+  const bytewiseEvents = await collect(
+    Array.from({ length: firstBytes.length }, (_, index) => firstBytes.slice(index, index + 1)),
+  )
+  expect(summary(bytewiseEvents)).toEqual(firstExpected)
 
-    const coalesced = createNativeSessionEventDecoder()
-    expect(summary(coalesced.write(encoder.encode(firstFrame + secondFrame)))).toEqual(summary([first, second]))
-  }),
-)
+  expect(summary(await collect([encoder.encode(firstFrame + secondFrame)]))).toEqual(summary([first, second]))
+})
 
 afterEach(async () => {
   Flag.OPENCODE_EXPERIMENTAL_WORKSPACES = originalWorkspaces
@@ -560,43 +538,45 @@ describe("session HttpApi", () => {
     { git: true, config: { formatter: false, lsp: false } },
   )
 
-  it.live("uses the persisted session directory for prompt requests", () =>
-    Effect.gen(function* () {
-      const llm = yield* TestLLMServer
-      yield* llm.text("ok", { usage: { input: 1, output: 1 } })
+  it.live(
+    "uses the persisted session directory for prompt requests",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.text("ok", { usage: { input: 1, output: 1 } })
 
-      const config = testProviderConfig(llm.url)
-      const sessionDirectory = yield* tmpdirScoped({ git: true, config })
-      const requestDirectory = yield* tmpdirScoped({ git: true, config })
-      const session = yield* createSession({ title: "directory regression" }).pipe(
-        provideInstanceEffect(sessionDirectory),
-      )
+        const config = testProviderConfig(llm.url)
+        const sessionDirectory = yield* tmpdirScoped({ git: true, config })
+        const requestDirectory = yield* tmpdirScoped({ git: true, config })
+        const session = yield* createSession({ title: "directory regression" }).pipe(
+          provideInstanceEffect(sessionDirectory),
+        )
 
-      const response = yield* request(
-        `${pathFor(SessionPaths.prompt, { sessionID: session.id })}?directory=${encodeURIComponent(requestDirectory)}`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            agent: "build",
-            model: { providerID: "test", modelID: "test-model" },
-            parts: [{ type: "text", text: "which directory?" }],
-          }),
-        },
-      )
+        const response = yield* request(
+          `${pathFor(SessionPaths.prompt, { sessionID: session.id })}?directory=${encodeURIComponent(requestDirectory)}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "which directory?" }],
+            }),
+          },
+        )
 
-      expect(response.status).toBe(200)
-      yield* responseJson(response)
+        expect(response.status).toBe(200)
+        yield* responseJson(response)
 
-      const messages = yield* Session.use
-        .messages({ sessionID: session.id })
-        .pipe(provideInstanceEffect(sessionDirectory), Effect.orDie)
-      const assistant = messages.find((message) => message.info.role === "assistant")
-      expect(assistant?.info.role === "assistant" ? assistant.info.path : undefined).toEqual({
-        cwd: sessionDirectory,
-        root: sessionDirectory,
-      })
-    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+        const messages = yield* Session.use
+          .messages({ sessionID: session.id })
+          .pipe(provideInstanceEffect(sessionDirectory), Effect.orDie)
+        const assistant = messages.find((message) => message.info.role === "assistant")
+        expect(assistant?.info.role === "assistant" ? assistant.info.path : undefined).toEqual({
+          cwd: sessionDirectory,
+          root: sessionDirectory,
+        })
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
     30_000,
   )
 
@@ -1287,7 +1267,7 @@ describe("session HttpApi", () => {
         expect(interruptedAssistant).toMatchObject({
           type: "assistant",
           finish: "error",
-          error: { message: "Provider turn interrupted" },
+          error: { message: ProviderTurnInterruptedMessage, origin: ProviderTurnInterruptedOrigin },
         })
         const interruptedHistory = yield* requestJson<{ data: SessionEvent.DurableEvent[] }>(
           `/api/session/${interruptedSession.id}/history?limit=100`,
