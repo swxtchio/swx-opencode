@@ -169,7 +169,7 @@ export class EffectSQLiteSession<TRelations extends AnyRelations> extends SQLite
                     return Effect.logWarning("sqlite write lock held", {
                       pid: process.pid,
                       purpose: Context.get(services, TransactionPurpose) ?? span ?? "unknown",
-                      span,
+                      ...(span && { span }),
                       outcome,
                       durationMs: Math.round(heldMs),
                     })

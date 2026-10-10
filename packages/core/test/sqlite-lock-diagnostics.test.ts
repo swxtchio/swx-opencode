@@ -339,6 +339,7 @@ describe("SQLite lock retry exhaustion diagnostics", () => {
               statement: "begin immediate",
               attempts: attempts.count,
               "sqlite.code": "SQLITE_BUSY",
+              "sqlite.errcode": 5,
             })
             expect(attempts.count).toBeGreaterThan(1)
             expect(summaries[0].fields.elapsedMs).toBeGreaterThanOrEqual(5_000)
@@ -477,7 +478,7 @@ describe("SQLite lock retry exhaustion diagnostics", () => {
               expect(attempts.count).toBe(1)
               expect(summaries[0].fields).toMatchObject(
                 clientType === "bun"
-                  ? { "sqlite.code": "SQLITE_BUSY_SNAPSHOT" }
+                  ? { "sqlite.code": "SQLITE_BUSY_SNAPSHOT", "sqlite.errcode": 517 }
                   : { "sqlite.code": "ERR_SQLITE_ERROR", "sqlite.errcode": 517 },
               )
               expect(exhausted(lines)).toEqual([])
