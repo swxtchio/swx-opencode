@@ -303,18 +303,41 @@ const awaitNativeModel = (directory: string) =>
     "10 seconds",
   )
 
-const decodeNativeSessionEvents = (chunk: Uint8Array) =>
-  new TextDecoder()
-    .decode(chunk)
-    .split(/\r?\n\r?\n/)
-    .flatMap((frame) => {
-      const data = frame
-        .split(/\r?\n/)
-        .find((line) => line.startsWith("data:"))
-        ?.slice("data:".length)
-        .trim()
-      return data ? [Schema.decodeUnknownSync(SessionEvent.Durable)(Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(data))] : []
-    })
+const createNativeSessionEventDecoder = () => {
+  const decoder = new TextDecoder()
+  let buffer = ""
+  const frame = (text: string) => {
+    const data = text
+      .split(/\r\n|\r|\n/)
+      .flatMap((line) => (line.startsWith("data:") ? [line.slice("data:".length).replace(/^ /, "")] : []))
+      .join("\n")
+    return data
+      ? [Schema.decodeUnknownSync(SessionEvent.Durable)(Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(data))]
+      : []
+  }
+  const drain = () => {
+    const events: SessionEvent.DurableEvent[] = []
+    while (true) {
+      const boundary = /(?:\r\n|\r|\n)(?:\r\n|\r|\n)/.exec(buffer)
+      if (!boundary) break
+      events.push(...frame(buffer.slice(0, boundary.index)))
+      buffer = buffer.slice(boundary.index + boundary[0].length)
+    }
+    return events
+  }
+  return {
+    write: (chunk: Uint8Array) => {
+      buffer += decoder.decode(chunk, { stream: true })
+      return drain()
+    },
+    finish: () => {
+      buffer += decoder.decode()
+      const final = buffer
+      buffer = ""
+      return frame(final)
+    },
+  }
+}
 
 const openNativeSessionEvents = (sessionID: SessionV2.ID, after: number, headers?: RequestInit["headers"]) =>
   Effect.gen(function* () {
@@ -322,14 +345,60 @@ const openNativeSessionEvents = (sessionID: SessionV2.ID, after: number, headers
     if (response.status !== 200)
       return yield* Effect.fail(new Error(`Session event stream returned ${response.status}`))
     const events = yield* Queue.unbounded<SessionEvent.DurableEvent>()
-    const fiber = yield* response.stream.pipe(
-      Stream.map(decodeNativeSessionEvents),
-      Stream.flattenIterable,
-      Stream.runForEach((event) => Queue.offer(events, event).pipe(Effect.asVoid)),
-      Effect.forkScoped,
-    )
+    const decoder = createNativeSessionEventDecoder()
+    const fiber = yield* Stream.concat(
+      response.stream.pipe(Stream.map(decoder.write), Stream.flattenIterable),
+      Stream.unwrap(Effect.sync(() => Stream.fromIterable(decoder.finish()))),
+    ).pipe(Stream.runForEach((event) => Queue.offer(events, event).pipe(Effect.asVoid)), Effect.forkScoped)
     return { events, fiber, response }
   })
+
+it.effect("decodes native SSE frames independent of transport chunking", () =>
+  Effect.sync(() => {
+    const sessionID = SessionV2.ID.make("ses_sse_decoder")
+    const event = (seq: number) =>
+      SessionEvent.ContextUpdated.make({
+        id: EventV2.ID.create(),
+        type: SessionEvent.ContextUpdated.type,
+        durable: { aggregateID: sessionID, seq, version: 1 },
+        data: {
+          sessionID,
+          timestamp: DateTime.makeUnsafe(seq),
+          messageID: SessionMessage.ID.create(),
+          text: "Résumé 🐈",
+        },
+      })
+    const first = event(1)
+    const second = event(2)
+    const encoder = new TextEncoder()
+    const frame = (value: SessionEvent.DurableEvent) =>
+      `data: ${JSON.stringify(Schema.encodeUnknownSync(SessionEvent.Durable)(value))}\r\n\r\n`
+    const firstFrame = frame(first)
+    const secondFrame = frame(second)
+    const summary = (events: ReadonlyArray<SessionEvent.DurableEvent>) =>
+      events.map((value) => ({ id: value.id, type: value.type, seq: value.durable?.seq }))
+    const firstExpected = summary([first])
+
+    const splitAfterTwoBytes = createNativeSessionEventDecoder()
+    const firstBytes = encoder.encode(firstFrame)
+    const splitAfterTwo = [
+      ...splitAfterTwoBytes.write(firstBytes.slice(0, 2)),
+      ...splitAfterTwoBytes.write(firstBytes.slice(2)),
+      ...splitAfterTwoBytes.finish(),
+    ]
+    expect(summary(splitAfterTwo)).toEqual(firstExpected)
+
+    const bytewise = createNativeSessionEventDecoder()
+    const bytewiseEvents = Array.from({ length: firstBytes.length }, (_, index) =>
+      bytewise.write(firstBytes.slice(index, index + 1)),
+    ).flat()
+    bytewiseEvents.push(...bytewise.finish())
+    expect(summary(bytewiseEvents)).toEqual(firstExpected)
+
+    const coalesced = createNativeSessionEventDecoder()
+    expect(summary(coalesced.write(encoder.encode(firstFrame + secondFrame)))).toEqual(summary([first, second]))
+  }),
+)
 
 afterEach(async () => {
   Flag.OPENCODE_EXPERIMENTAL_WORKSPACES = originalWorkspaces
@@ -528,6 +597,7 @@ describe("session HttpApi", () => {
         root: sessionDirectory,
       })
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
   )
 
   it.live(
