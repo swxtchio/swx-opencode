@@ -9,9 +9,10 @@ import { Global } from "@opencode-ai/core/global"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { afterAll, expect, test } from "bun:test"
+import { Database as Sqlite } from "bun:sqlite"
 import { randomUUID } from "node:crypto"
 import { rm } from "node:fs/promises"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Logger, Option, Schema, Stream } from "effect"
 import { HttpClient } from "effect/unstable/http"
 import os from "os"
 import path from "path"
@@ -683,8 +684,8 @@ const nonOwnerRunState = LayerNode.compile(
 
 afterAll(async () => {
   await Promise.all(
-    [nonOwnerCancelDatabasePath, `${nonOwnerCancelDatabasePath}-wal`, `${nonOwnerCancelDatabasePath}-shm`].map((file) =>
-      rm(file, { force: true }),
+    [nonOwnerCancelDatabasePath, consumeLockDbPath].flatMap((file) =>
+      [file, `${file}-wal`, `${file}-shm`].map((each) => rm(each, { force: true })),
     ),
   )
 })
@@ -5946,6 +5947,235 @@ it.instance(
       expect(JSON.stringify(lastUser(inputs[3]))).toContain("parked by the error")
     }),
   15_000,
+)
+
+// Consume recovery (swxtchio/swx-opencode#167). The run's consume after a tool step meets a write lock taken by a
+// second connection on a file database, as it would meet another writer's long transaction. Expected model inputs
+// and records come from what each test sends and what the bash tool writes, never from the queue under test.
+
+const consumeLockDbPath = path.join(os.tmpdir(), `opencode-consume-lock-${randomUUID()}.db`)
+const consumeLock = testEffect(makeHttpWithDatabase(Database.layerFromPath(consumeLockDbPath)))
+
+// The production consume reports each attempt that met the lock with this log, which the tests capture.
+const consumeLockedLog = "queue consume met a held write lock"
+
+const startConsumeLocked = Effect.fn("test.startConsumeLocked")(function* () {
+  const { dir, llm } = yield* useServerConfig(providerCfg)
+  const prompt = yield* SessionPrompt.Service
+  const sessions = yield* Session.Service
+  const events = yield* EventV2Bridge.Service
+  const chat = yield* sessions.create({
+    title: "Consume under a held lock",
+    permission: [{ permission: "*", pattern: "*", action: "allow" }],
+  })
+  const marker = path.join(dir, "tool-runs.txt")
+  const gate = yield* Deferred.make<void>()
+  yield* llm.push(
+    reply()
+      .wait(deferredAsPromise(gate))
+      .tool("bash", { command: `echo ran >> "${marker}"; echo tool-output-ok`, description: "Mark the tool run" }),
+  )
+
+  // The loop publishes its busy status just before consume, and listeners run inline with the publish, so a lock
+  // taken here once the tool step is persisted is held when that loop's consume begins.
+  const lock: { holder?: Sqlite } = {}
+  const locked = yield* Deferred.make<void>()
+  const off = yield* events.listen((event) =>
+    Effect.gen(function* () {
+      if (lock.holder || event.type !== SessionStatus.Event.Status.type) return
+      const data = Schema.decodeUnknownSync(SessionStatus.Event.Status.data)(event.data)
+      if (data.sessionID !== chat.id || data.status.type !== "busy" || data.status.activeAssistantMessageID !== null)
+        return
+      const history = yield* sessions.messages({ sessionID: chat.id }).pipe(Effect.orDie)
+      if (!history.some((message) => message.info.role === "assistant" && message.info.finish === "tool-calls")) return
+      lock.holder = new Sqlite(consumeLockDbPath)
+      lock.holder.run("BEGIN IMMEDIATE")
+      yield* Deferred.succeed(locked, undefined)
+    }),
+  )
+  yield* Effect.addFinalizer(() =>
+    off.pipe(
+      Effect.andThen(
+        Effect.sync(() => {
+          if (lock.holder?.inTransaction) lock.holder.run("ROLLBACK")
+          lock.holder?.close()
+        }),
+      ),
+    ),
+  )
+
+  const send = (text: string, extra?: Partial<SessionPrompt.PromptInput>) =>
+    prompt
+      .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said(text), ...extra })
+      .pipe(Effect.forkChild)
+  const task = yield* send("run the tool")
+  yield* awaitWithTimeout(llm.wait(1), "the tool step's provider call never started", "10 seconds")
+  const continuation = yield* send("continue after the tool", { delivery: "queue" })
+  yield* admitted(chat.id, "continue after the tool")
+  yield* Deferred.succeed(gate, undefined)
+  yield* awaitWithTimeout(Deferred.await(locked), "the loop never reached consume after the tool step", "10 seconds")
+
+  // Reads the records through the lock holder, since the run's own connection waits on the lock.
+  const records = () => {
+    const holder = lock.holder!
+    const queue = holder
+      .query("select time_promoted, message_id, time_withdrawn from session_prompt_queue where session_id = ?")
+      .all(chat.id)
+    const users = holder
+      .query(
+        "select p.message_id as id from part p join message m on m.id = p.message_id " +
+          "where p.session_id = ? and json_extract(m.data, '$.role') = 'user' and json_extract(p.data, '$.text') = ?",
+      )
+      .all(chat.id, "continue after the tool")
+    const tools = holder
+      .query<{ id: PartID; status: SessionV1.ToolPart["state"]["status"] }, [string]>(
+        "select id, json_extract(data, '$.state.status') as status from part " +
+          "where session_id = ? and json_extract(data, '$.tool') = 'bash'",
+      )
+      .all(chat.id)
+    return { queue, users, tools }
+  }
+  const release = Effect.sync(() => {
+    lock.holder!.run("COMMIT")
+  })
+  const toolRuns = Effect.promise(() => Bun.file(marker).text())
+  return { llm, prompt, sessions, chat, task, continuation, records, release, toolRuns }
+})
+
+const captureConsumeLocked = Effect.fn("test.captureConsumeLocked")(function* () {
+  const attempts: unknown[] = []
+  const capture = Logger.make((options) => {
+    const [text, fields] = Array.isArray(options.message) ? options.message : [options.message]
+    if (text === consumeLockedLog) attempts.push(fields)
+  })
+  const loggers = yield* Effect.service(Logger.CurrentLoggers)
+  return { attempts, loggers: new Set([...loggers, capture]) }
+})
+
+consumeLock.instance(
+  "a consume that meets a held write lock recovers on release, and the turn and its queued continuation run once",
+  () =>
+    Effect.gen(function* () {
+      const capture = yield* captureConsumeLocked()
+      yield* Effect.gen(function* () {
+        const { llm, sessions, chat, task, continuation, records, release, toolRuns } = yield* startConsumeLocked()
+        yield* llm.text("task done")
+        yield* llm.text("continuation done")
+        const before = records()
+        expect(before.queue).toEqual([{ time_promoted: null, message_id: null, time_withdrawn: null }])
+        expect(before.tools).toEqual([{ id: expect.any(String), status: "completed" }])
+
+        // Release on the logged failed attempt, or once the run ended without one, which is the unrecovered outcome.
+        yield* awaitWithTimeout(
+          Effect.race(
+            pollWithTimeout(
+              Effect.sync(() => (capture.attempts.length > 0 ? true : undefined)),
+              "consume never reported the held lock",
+              "15 seconds",
+            ),
+            Fiber.await(task),
+          ),
+          "neither a failed consume nor the run's end was observed",
+          "20 seconds",
+        )
+        const failed = records()
+        yield* release
+        const [taskReply, continuationReply] = yield* finish(task, continuation)
+
+        expect(capture.attempts).toEqual([{ "session.id": chat.id, attempts: 1 }])
+        // The failed attempt changed nothing: the continuation is still pending and the tool result kept.
+        expect(failed).toEqual(before)
+        const inputs = yield* llm.inputs
+        expect(inputs).toHaveLength(3)
+        expect(mentions(inputs[1], "tool-output-ok")).toBe(true)
+        expect(mentions(inputs[1], "continue after the tool")).toBe(false)
+        expect(lastUser(inputs[2])).toEqual({ role: "user", content: "continue after the tool" })
+        expect(yield* toolRuns).toBe("ran\n")
+
+        const history = yield* sessions.messages({ sessionID: chat.id })
+        const users = history.filter((message) =>
+          message.parts.some((part) => part.type === "text" && part.text === "continue after the tool"),
+        )
+        expect(users.map((message) => message.info.role)).toEqual(["user"])
+        const answers = history.filter(
+          (message) => message.info.role === "assistant" && message.info.parentID === users[0]!.info.id,
+        )
+        expect(answers).toHaveLength(1)
+        const answer = answers[0]!
+        if (answer.info.role !== "assistant") throw new Error("the continuation's answer is not an assistant message")
+        expect(answer.info.time.completed).toBeDefined()
+        expect(answer.info.error).toBeUndefined()
+        expect(answer.parts.some((part) => part.type === "text" && part.text === "continuation done")).toBe(true)
+        expect(continuationReply.info.id).toBe(answer.info.id)
+        expect(taskReply.parts.some((part) => part.type === "text" && part.text === "task done")).toBe(true)
+        const tools = history.flatMap((message) =>
+          message.parts.filter((part): part is SessionV1.ToolPart => part.type === "tool"),
+        )
+        expect(tools.map((part) => ({ id: part.id, status: part.state.status }))).toEqual(before.tools)
+        const remaining = yield* Effect.gen(function* () {
+          const { db } = yield* Database.Service
+          return yield* db
+            .select()
+            .from(SessionPromptQueueTable)
+            .where(eq(SessionPromptQueueTable.session_id, chat.id))
+            .all()
+        })
+        expect(remaining).toEqual([])
+      }).pipe(Effect.provideService(Logger.CurrentLoggers, capture.loggers))
+    }),
+  30_000,
+)
+
+consumeLock.instance(
+  "a consume whose lock outlasts its recovery bound stops the run with a named error and keeps the continuation",
+  () =>
+    Effect.gen(function* () {
+      const capture = yield* captureConsumeLocked()
+      yield* Effect.gen(function* () {
+        const { llm, prompt, sessions, chat, task, continuation, records, release, toolRuns } =
+          yield* startConsumeLocked()
+        const before = records()
+        const exits = yield* awaitWithTimeout(
+          Effect.all([Fiber.await(task), Fiber.await(continuation)]),
+          "the run never stopped under the held lock",
+          "40 seconds",
+        )
+
+        const refusals = exits.map((exit) => (Exit.isFailure(exit) ? Cause.squash(exit.cause) : exit.value))
+        refusals.forEach((refusal) => {
+          expect(refusal).toBeInstanceOf(SessionQueue.ConsumeLockedError)
+          expect(refusal).toMatchObject({ sessionID: chat.id, attempts: 3 })
+        })
+        expect(capture.attempts).toEqual([1, 2, 3].map((attempts) => ({ "session.id": chat.id, attempts })))
+        // The refusal kept the continuation pending and the tool result, and left nothing running to retry it.
+        expect(records()).toEqual(before)
+        expect(yield* llm.calls).toBe(1)
+        expect((yield* (yield* SessionStatus.Service).list()).has(chat.id)).toBe(false)
+        expect(Exit.isSuccess(yield* (yield* SessionRunState.Service).assertNotBusy(chat.id).pipe(Effect.exit))).toBe(
+          true,
+        )
+
+        // A later prompt delivers the kept continuation once, without running the tool again.
+        yield* release
+        yield* llm.text("wake done")
+        yield* llm.text("continuation done")
+        yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("wake up") })
+        const inputs = yield* llm.inputs
+        expect(inputs).toHaveLength(3)
+        expect(lastUser(inputs[1])).toEqual({ role: "user", content: "wake up" })
+        expect(lastUser(inputs[2])).toEqual({ role: "user", content: "continue after the tool" })
+        expect(yield* toolRuns).toBe("ran\n")
+        const history = yield* sessions.messages({ sessionID: chat.id })
+        const users = history.filter((message) =>
+          message.parts.some((part) => part.type === "text" && part.text === "continue after the tool"),
+        )
+        expect(users).toHaveLength(1)
+        expect(
+          history.filter((message) => message.info.role === "assistant" && message.info.parentID === users[0]!.info.id),
+        ).toHaveLength(1)
+      }).pipe(Effect.provideService(Logger.CurrentLoggers, capture.loggers))
+    }),
+  60_000,
 )
 
 const resourcePart = (uri: string) => ({
