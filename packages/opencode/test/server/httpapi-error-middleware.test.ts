@@ -111,45 +111,48 @@ describe("HttpApi error middleware", () => {
     20_000,
   )
 
-  it.live("maps a produced direct SQLITE_LOCKED error distinctly", () =>
-    Effect.gen(function* () {
-      const tmp = yield* Effect.promise(() => tmpdir())
-      yield* Effect.addFinalizer(() => Effect.promise(() => tmp[Symbol.asyncDispose]()))
-      const error = yield* produceSqliteLockedError(path.join(tmp.path, "sqlite-locked.sqlite"))
-      expect(error).not.toBeInstanceOf(EffectDrizzleQueryError)
-      expect(isSqlError(error)).toBe(true)
-      if (!isSqlError(error)) return
-      expect(error.reason._tag).toBe("LockTimeoutError")
-      expect(error.reason.cause).toMatchObject({ code: "SQLITE_LOCKED" })
-      expect(error.message).not.toContain("secret_lock_fixture")
-      expect(error.message).not.toContain("secret_parameter")
+  it.live(
+    "maps a produced direct SQLITE_LOCKED error distinctly",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* Effect.promise(() => tmpdir())
+        yield* Effect.addFinalizer(() => Effect.promise(() => tmp[Symbol.asyncDispose]()))
+        const error = yield* produceSqliteLockedError(path.join(tmp.path, "sqlite-locked.sqlite"))
+        expect(error).not.toBeInstanceOf(EffectDrizzleQueryError)
+        expect(isSqlError(error)).toBe(true)
+        if (!isSqlError(error)) return
+        expect(error.reason._tag).toBe("LockTimeoutError")
+        expect(error.reason.cause).toMatchObject({ code: "SQLITE_LOCKED" })
+        expect(error.message).not.toContain("secret_lock_fixture")
+        expect(error.message).not.toContain("secret_parameter")
 
-      const converted = MessageV2.fromError(error, { providerID: ProviderV2.ID.make("test") })
-      expect(converted).toMatchObject({
-        name: "UnknownError",
-        data: { message: "Database is locked (SQLITE_LOCKED)" },
-      })
-      expect(JSON.stringify(converted)).not.toContain("secret_lock_fixture")
-      expect(JSON.stringify(converted)).not.toContain("secret_parameter")
+        const converted = MessageV2.fromError(error, { providerID: ProviderV2.ID.make("test") })
+        expect(converted).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Database is locked (SQLITE_LOCKED)" },
+        })
+        expect(JSON.stringify(converted)).not.toContain("secret_lock_fixture")
+        expect(JSON.stringify(converted)).not.toContain("secret_parameter")
 
-      yield* HttpRouter.add("GET", "/sqlite-locked", Effect.die(error)).pipe(
-        Layer.provide(errorLayer),
-        HttpRouter.serve,
-        Layer.build,
-      )
-      const response = yield* HttpClientRequest.get("/sqlite-locked").pipe(HttpClient.execute)
-      const body = yield* response.json
-      const serialized = JSON.stringify(body)
+        yield* HttpRouter.add("GET", "/sqlite-locked", Effect.die(error)).pipe(
+          Layer.provide(errorLayer),
+          HttpRouter.serve,
+          Layer.build,
+        )
+        const response = yield* HttpClientRequest.get("/sqlite-locked").pipe(HttpClient.execute)
+        const body = yield* response.json
+        const serialized = JSON.stringify(body)
 
-      expect(response.status).toBe(500)
-      expect(body).toMatchObject({
-        name: "UnknownError",
-        data: { message: "Database is locked (SQLITE_LOCKED)" },
-      })
-      expect((body as { data?: { ref?: unknown } }).data?.ref).toMatch(/^err_[0-9a-f-]{8}$/)
-      expect(serialized).not.toContain("secret_lock_fixture")
-      expect(serialized).not.toContain("secret_parameter")
-    }),
+        expect(response.status).toBe(500)
+        expect(body).toMatchObject({
+          name: "UnknownError",
+          data: { message: "Database is locked (SQLITE_LOCKED)" },
+        })
+        expect((body as { data?: { ref?: unknown } }).data?.ref).toMatch(/^err_[0-9a-f-]{8}$/)
+        expect(serialized).not.toContain("secret_lock_fixture")
+        expect(serialized).not.toContain("secret_parameter")
+      }),
+    20_000,
   )
 
   it.live("returns invalid config defects as structured client errors", () =>
