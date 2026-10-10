@@ -30,7 +30,7 @@ import { SessionStore } from "./session/store"
 import { SessionExecution } from "./session/execution"
 import { makeGlobalNode } from "./effect/app-node"
 import { LocationServiceMap } from "./location-service-map"
-import { MessageDecodeError } from "./session/error"
+import { MessageDecodeError, ProviderTurnInterruptedMessage } from "./session/error"
 import { SessionEvent } from "./session/event"
 import { SessionInput } from "./session/input"
 import { Snapshot } from "./snapshot"
@@ -46,6 +46,7 @@ type WaitProjection =
       readonly latestInput: typeof SessionInputTable.$inferSelect | undefined
       readonly pending: typeof SessionInputTable.$inferSelect | undefined
       readonly latestPromoted: typeof SessionInputTable.$inferSelect | undefined
+      readonly checkpoint: number | undefined
       readonly assistants: ReadonlyArray<{ readonly seq: number; readonly message: SessionMessage.Assistant }>
     }
 
@@ -224,7 +225,10 @@ const layer = Layer.effect(
       )
 
     const waitUnavailable = () => new OperationUnavailableError({ operation: "wait" })
-    const waitProjection = (sessionID: SessionSchema.ID): Effect.Effect<WaitProjection, OperationUnavailableError> =>
+    const waitProjection = (
+      sessionID: SessionSchema.ID,
+      checkpointOverride?: { readonly seq: number | undefined },
+    ): Effect.Effect<WaitProjection, OperationUnavailableError> =>
       db
         .transaction((tx) =>
           Effect.gen(function* () {
@@ -266,47 +270,59 @@ const layer = Layer.effect(
               ],
               { concurrency: "unbounded" },
             )
-            // A terminal step before the latest admission closes older work; a step still open at admission remains in this observation.
-            const checkpoint = latestInput
-              ? yield* tx
-                  .select({ seq: EventTable.seq })
-                  .from(EventTable)
-                  .where(
-                    and(
-                      eq(EventTable.aggregate_id, sessionID),
-                      lt(EventTable.seq, latestInput.admitted_seq),
-                      inArray(EventTable.type, [
-                        EventV2.versionedType(SessionEvent.Step.Ended.type, 2),
-                        EventV2.versionedType(SessionEvent.Step.Failed.type, 2),
-                      ]),
-                    ),
-                  )
-                  .orderBy(desc(EventTable.seq))
+            const terminalSteps = yield* tx
+              .select({ seq: EventTable.seq, type: EventTable.type, data: EventTable.data })
+              .from(EventTable)
+              .where(
+                and(
+                  eq(EventTable.aggregate_id, sessionID),
+                  inArray(EventTable.type, [
+                    EventV2.versionedType(SessionEvent.Step.Ended.type, 2),
+                    EventV2.versionedType(SessionEvent.Step.Failed.type, 2),
+                  ]),
+                ),
+              )
+              .orderBy(desc(EventTable.seq))
+              .all()
+              .pipe(Effect.orDie)
+            const checkpointBefore = (seq: number) =>
+              terminalSteps.find(
+                (event) =>
+                  event.seq < seq &&
+                  (event.type === EventV2.versionedType(SessionEvent.Step.Failed.type, 2) ||
+                    Schema.decodeUnknownSync(SessionEvent.Step.Ended.data)(event.data).finish !== "tool-calls"),
+              )
+            const latestAssistant = latestInput
+              ? undefined
+              : yield* tx
+                  .select({ seq: SessionMessageTable.seq })
+                  .from(SessionMessageTable)
+                  .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.type, "assistant")))
+                  .orderBy(desc(SessionMessageTable.seq))
                   .limit(1)
                   .get()
                   .pipe(Effect.orDie)
-              : undefined
-            const query = tx
+            // Tool-call step endings require continuation; only a non-continuation terminal step closes older work.
+            const checkpoint =
+              checkpointOverride === undefined
+                ? latestInput !== undefined
+                  ? checkpointBefore(latestInput.admitted_seq)?.seq
+                  : latestAssistant && checkpointBefore(latestAssistant.seq)?.seq
+                : checkpointOverride.seq
+            const rows = yield* tx
               .select()
               .from(SessionMessageTable)
               .where(
                 and(
                   eq(SessionMessageTable.session_id, sessionID),
                   eq(SessionMessageTable.type, "assistant"),
-                  gt(SessionMessageTable.seq, checkpoint?.seq ?? -1),
+                  gt(SessionMessageTable.seq, checkpoint ?? -1),
                 ),
               )
-            const rows = latestInput
-              ? yield* query.orderBy(asc(SessionMessageTable.seq)).all().pipe(Effect.orDie)
-              : yield* tx
-                  .select()
-                  .from(SessionMessageTable)
-                  .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.type, "assistant")))
-                  .orderBy(desc(SessionMessageTable.seq))
-                  .limit(1)
-                  .all()
-                  .pipe(Effect.orDie)
-            return { native: true as const, latestInput, pending, latestPromoted, rows }
+              .orderBy(asc(SessionMessageTable.seq))
+              .all()
+              .pipe(Effect.orDie)
+            return { native: true as const, latestInput, pending, latestPromoted, checkpoint, rows }
           }),
         )
         .pipe(
@@ -322,6 +338,7 @@ const layer = Layer.effect(
                 latestInput: projection.latestInput,
                 pending: projection.pending,
                 latestPromoted: projection.latestPromoted,
+                checkpoint: projection.checkpoint,
                 assistants: messages.filter(
                   (entry): entry is { readonly seq: number; readonly message: SessionMessage.Assistant } =>
                     entry.message.type === "assistant",
@@ -351,6 +368,46 @@ const layer = Layer.effect(
               ...(assistantMessageID === undefined ? {} : { assistantMessageID }),
             }
       }
+      const assistants = projection.assistants
+      const latestTools = new Map(
+        assistants.flatMap((entry) =>
+          entry.message.content.flatMap((content) =>
+            content.type === "tool"
+              ? [[content.id, { assistantMessageID: entry.message.id, content }] as const]
+              : [],
+          ),
+        ),
+      )
+      const unsettled =
+        assistants.some((entry) => entry.message.time.completed === undefined) ||
+        Array.from(latestTools.values()).some(
+          ({ content }) => content.state.status === "pending" || content.state.status === "running",
+        )
+      if (unsettled) return undefined
+      const failedAssistant = assistants.find(
+        (entry) => entry.message.error !== undefined || entry.message.finish === "error",
+      )
+      if (failedAssistant) {
+        const interrupted = failedAssistant.message.error?.message === ProviderTurnInterruptedMessage
+        return interrupted
+          ? {
+              type: "interrupted",
+              ...(admittedSeq === undefined ? {} : { admittedSeq }),
+              assistantMessageID: failedAssistant.message.id,
+            }
+          : {
+              type: "failed",
+              ...(admittedSeq === undefined ? {} : { admittedSeq }),
+              assistantMessageID: failedAssistant.message.id,
+            }
+      }
+      const failedTool = Array.from(latestTools.values()).find(({ content }) => content.state.status === "error")
+      if (failedTool)
+        return {
+          type: "failed",
+          ...(admittedSeq === undefined ? {} : { admittedSeq }),
+          assistantMessageID: failedTool.assistantMessageID,
+        }
 
       if (projection.pending) {
         if (failedOutcome) return failure()
@@ -359,42 +416,20 @@ const layer = Layer.effect(
       }
       if (projection.latestInput === undefined) {
         if (failedOutcome) return failure()
+        const latest = assistants.at(-1)
+        if (!latest) return { type: "idle" }
+        if (
+          latest.message.finish === "tool-calls" ||
+          latest.message.content.some((content) => content.type === "tool" && content.provider?.executed !== true)
+        )
+          return undefined
         return { type: "idle" }
       }
 
       const promotedSeq = projection.latestPromoted?.promoted_seq
       if (promotedSeq === undefined || promotedSeq === null) return undefined
-      const assistants = projection.assistants.filter((entry) => entry.seq > promotedSeq)
-      const latest = assistants.at(-1)
+      const latest = assistants.filter((entry) => entry.seq > promotedSeq).at(-1)
       if (!latest) return failedOutcome ? failure() : undefined
-      if (
-        assistants.some(
-          (entry) =>
-            entry.message.time.completed === undefined ||
-            entry.message.content.some(
-              (content) =>
-                content.type === "tool" && (content.state.status === "pending" || content.state.status === "running"),
-            ),
-        )
-      )
-        return undefined
-
-      const failedAssistant = assistants.find(
-        (entry) =>
-          entry.message.error !== undefined ||
-          entry.message.finish === "error" ||
-          entry.message.content.some((content) => content.type === "tool" && content.state.status === "error"),
-      )
-      if (failedAssistant) {
-        const interrupted = failedAssistant.message.error?.message === "Provider turn interrupted"
-        return interrupted
-          ? {
-              type: "interrupted",
-              admittedSeq,
-              assistantMessageID: failedAssistant.message.id,
-            }
-          : { type: "failed", admittedSeq, assistantMessageID: failedAssistant.message.id }
-      }
       if (failedOutcome) return failure(latest.message.id)
       // A successful tool result still needs its provider continuation before the admitted turn is complete.
       if (
@@ -642,19 +677,29 @@ const layer = Layer.effect(
       wait: Effect.fn("V2Session.wait")(function* (sessionID) {
         yield* result.get(sessionID)
         let outcome: WaitOutcome | undefined
+        let activeCheckpoint: { readonly seq: number | undefined } | undefined
         while (true) {
-          const projection = yield* waitProjection(sessionID)
           if (!(yield* execution.active).has(sessionID)) {
+            const projection = yield* waitProjection(sessionID, activeCheckpoint)
+            if ((yield* execution.active).has(sessionID)) continue
             const result = waitResult(projection, outcome)
             if (result === undefined) return yield* waitUnavailable()
             return result
           }
+          const beforeJoin = yield* waitProjection(sessionID, activeCheckpoint)
+          if (activeCheckpoint === undefined && beforeJoin.native) activeCheckpoint = { seq: beforeJoin.checkpoint }
           const exit = yield* execution.join(sessionID)
-          if (exit !== undefined)
-            outcome = {
-              admittedSeq: projection.native ? projection.latestInput?.admitted_seq : undefined,
-              exit,
-            }
+          if (exit === undefined) continue
+          const settled = yield* waitProjection(sessionID, activeCheckpoint)
+          const admittedSeq = settled.native
+            ? (settled.latestPromoted?.admitted_seq ??
+              (settled.pending?.id === settled.latestInput?.id ? settled.latestInput?.admitted_seq : undefined))
+            : undefined
+          const previousFailure =
+            outcome !== undefined && outcome.admittedSeq === admittedSeq && Exit.isFailure(outcome.exit)
+          const settledResult = waitResult(settled)
+          const pending = settledResult === undefined || settledResult.type === "pending"
+          outcome = Exit.isSuccess(exit) && previousFailure && pending ? outcome : { admittedSeq, exit }
         }
       }),
       active: execution.active,
