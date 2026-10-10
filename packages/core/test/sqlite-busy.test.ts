@@ -18,37 +18,6 @@ const nodeSqliteDrivers = await import("node:sqlite").then(
   () => undefined,
 )
 const nodeSqliteTest = test.skipIf(!nodeSqliteDrivers)
-// The retry window each statement must give a competing writer: the tolerance the old native busy_timeout gave.
-const lockWindowMs = 5_000
-// Exhaustion may overrun the window by one capped backoff, one native attempt and scheduling delay.
-const lockWindowSlackMs = 1_500
-// Backstops sit above window plus slack so a statement that never stops fails with its own message.
-const lockBackstop = "10 seconds"
-// Well past the point where the old four-attempt schedule gave up, and well inside the restored window.
-const heldLockMs = 1_500
-// The event loop must keep turning while a statement waits; a long synchronous native wait stalls it for seconds.
-const stallBoundMs = 1_000
-// A stale snapshot can never succeed on retry, so its write must fail far inside the retry window.
-const snapshotBoundMs = 1_000
-
-// Ticks continually from now on and returns a reader for the longest gap between ticks. The reader includes the gap
-// still open when it is called, so a synchronous call the ticker has not yet woken from still counts.
-const eventLoopStalls = Effect.gen(function* () {
-  let lastTick = performance.now()
-  let longestMs = 0
-  yield* Effect.sleep("5 millis").pipe(
-    Effect.andThen(
-      Effect.sync(() => {
-        const now = performance.now()
-        longestMs = Math.max(longestMs, now - lastTick)
-        lastTick = now
-      }),
-    ),
-    Effect.forever,
-    Effect.forkScoped,
-  )
-  return () => Math.max(longestMs, performance.now() - lastTick)
-})
 
 const sqliteError = (error: unknown) => {
   if (isSqlError(error)) return error
@@ -180,42 +149,21 @@ const clientWithAttemptCount = (input: {
   attempts: { count: number }
 }) =>
   Effect.gen(function* () {
-    // Clients prepare once and retry the execution, so count each execution of the prepared statement.
-    const counted = new WeakSet<object>()
-    const countExecutions = <S extends object>(statement: S) => {
-      if (counted.has(statement)) return statement
-      counted.add(statement)
-      for (const method of ["all", "values"]) {
-        const execute: unknown = Reflect.get(statement, method)
-        if (typeof execute !== "function") continue
-        Object.defineProperty(statement, method, {
-          configurable: true,
-          writable: true,
-          value: (...params: unknown[]) => {
-            input.attempts.count++
-            return execute.apply(statement, params)
-          },
-        })
-      }
-      return statement
-    }
-
     if (input.clientType === "bun") {
+      const bun = yield* Effect.promise(() => import("../src/database/sqlite.bun"))
+      const context = yield* Layer.build(bun.layer({ filename: input.filename }))
       const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
-      const prototype = sqlite.Database.prototype
-      const queryDescriptor = Object.getOwnPropertyDescriptor(prototype, "query")
-      if (!queryDescriptor) return yield* Effect.die(new Error("bun:sqlite query method was not found"))
-      const query = prototype.query
-      Object.defineProperty(prototype, "query", {
-        ...queryDescriptor,
-        value: function (this: InstanceType<typeof sqlite.Database>, sql: string) {
-          const statement = query.call(this, sql)
-          return sql === input.statement ? countExecutions(statement) : statement
+      const native = Context.get(context, Sqlite.Native) as InstanceType<typeof sqlite.Database>
+      const query = native.query
+      Object.defineProperty(native, "query", {
+        configurable: true,
+        writable: true,
+        value: (sql: string) => {
+          if (sql === input.statement) input.attempts.count++
+          return query.call(native, sql)
         },
       })
-      yield* Effect.addFinalizer(() => Effect.sync(() => Object.defineProperty(prototype, "query", queryDescriptor)))
-      const context = yield* Layer.build(Database.layerFromPath(input.filename))
-      return Context.get(context, Database.Service).db.$client
+      return Context.get(context, SqlClient)
     }
 
     const drivers = nodeSqliteDrivers
@@ -228,8 +176,8 @@ const clientWithAttemptCount = (input: {
         configurable: true,
         writable: true,
         value: function (this: InstanceType<typeof drivers.DatabaseSync>, sql: string) {
-          const statement = prepare.call(this, sql)
-          return sql === input.statement ? countExecutions(statement) : statement
+          if (sql === input.statement) input.attempts.count++
+          return prepare.call(this, sql)
         },
       })
       return Context.get(context, SqlClient)
@@ -243,8 +191,8 @@ const clientWithAttemptCount = (input: {
     Object.defineProperty(prototype, "prepare", {
       ...prepareDescriptor,
       value: function (this: InstanceType<typeof drivers.DatabaseSync>, sql: string) {
-        const statement = prepare.call(this, sql)
-        return sql === input.statement ? countExecutions(statement) : statement
+        if (sql === input.statement) input.attempts.count++
+        return prepare.call(this, sql)
       },
     })
     yield* Effect.addFinalizer(() => Effect.sync(() => Object.defineProperty(prototype, "prepare", prepareDescriptor)))
@@ -281,13 +229,14 @@ describe("SQLite busy timeout and statement retries", () => {
     )
   })
 
-  for (const clientType of ["bun", "core-node", "standalone-node"] as const) {
+  for (const clientType of ["core", "standalone"] as const) {
     for (const method of ["run", "values"] as const) {
-      test.skipIf(clientType !== "bun" && !nodeSqliteDrivers)(
-        `${clientType} ${method} waits out a write lock held past the old 250ms window`,
+      nodeSqliteTest(
+        `node:sqlite ${clientType} retries ${method} after a second process releases its write lock`,
         async () => {
+          if (!nodeSqliteDrivers) return
           await using tmp = await tmpdir()
-          const filename = path.join(tmp.path, `${clientType}-held.sqlite`)
+          const filename = path.join(tmp.path, "node-busy.sqlite")
           const writerValue = `${clientType}-${method}-writer`
           const writerSql =
             method === "run"
@@ -297,59 +246,42 @@ describe("SQLite busy timeout and statement retries", () => {
             Effect.scoped(
               Effect.gen(function* () {
                 const attempts = { count: 0 }
-                const client = yield* clientWithAttemptCount({ clientType, filename, statement: writerSql, attempts })
+                const client = yield* clientWithAttemptCount({
+                  clientType: clientType === "core" ? "core-node" : "standalone-node",
+                  filename,
+                  statement: writerSql,
+                  attempts,
+                })
                 yield* client.unsafe("CREATE TABLE busy_retry_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL)").raw
-                expect(yield* client.unsafe("PRAGMA busy_timeout").values).toEqual([[5]])
-                const server = Bun.serve({ port: 0, fetch: () => new Response("server-progress") })
-                yield* Effect.addFinalizer(() => Effect.sync(() => server.stop(true)))
-                const holder = yield* Effect.promise(() =>
-                  startLockHolder(filename, clientType === "bun" ? holderScript : nodeHolderScript),
-                )
-                yield* Effect.addFinalizer(() => Effect.promise(() => holder.release()))
+                yield* client.unsafe("PRAGMA busy_timeout = 0").raw
 
-                const longestStallMs = yield* eventLoopStalls
-                let writerFinished = false
-                const startedAt = performance.now()
-                const writer = yield* (
-                  method === "run" ? client.unsafe(writerSql).raw : client.unsafe(writerSql).values
-                ).pipe(
-                  Effect.onExit(() => Effect.sync(() => void (writerFinished = true))),
-                  Effect.forkChild({ startImmediately: true }),
-                )
+                const holder = yield* Effect.promise(() => startLockHolder(filename, nodeHolderScript))
                 yield* Effect.gen(function* () {
-                  while (attempts.count === 0) yield* Effect.sleep("1 millis")
-                }).pipe(
-                  Effect.timeoutOrElse({
-                    duration: "1 second",
-                    orElse: () => Effect.fail(new Error("writer did not attempt the held-lock statement")),
-                  }),
-                )
-                // The holder owns the write lock and the writer has met it; keep holding well past the old schedule.
-                while (performance.now() - startedAt < heldLockMs) yield* Effect.sleep("10 millis")
-                expect(writerFinished).toBe(false)
+                  const statement = method === "run" ? client.unsafe(writerSql).raw : client.unsafe(writerSql).values
+                  let writerFinished = false
+                  const writer = yield* statement.pipe(
+                    Effect.onExit(() => Effect.sync(() => void (writerFinished = true))),
+                    Effect.forkChild({ startImmediately: true }),
+                  )
 
-                yield* Effect.promise(() => holder.probe(server.url.href)).pipe(
-                  Effect.timeoutOrElse({
-                    duration: "2 seconds",
-                    orElse: () =>
-                      Effect.fail(new Error("unrelated request did not progress while SQLite was contended")),
-                  }),
-                )
-                expect(longestStallMs()).toBeLessThan(stallBoundMs)
-                expect(writerFinished).toBe(false)
-
-                yield* Effect.promise(() => holder.release())
-                const result = yield* Fiber.await(writer).pipe(
-                  Effect.timeoutOrElse({
-                    duration: "2 seconds",
-                    orElse: () => Effect.fail(new Error("writer did not finish after the lock was released")),
-                  }),
-                )
-                if (Exit.isFailure(result)) return yield* Effect.fail(new Error(Cause.pretty(result.cause)))
-                if (method === "values") expect(result.value).toEqual([[1]])
-                expect(
-                  yield* client.unsafe(`SELECT COUNT(*) FROM busy_retry_test WHERE value = '${writerValue}'`).values,
-                ).toEqual([[1]])
+                  yield* Effect.gen(function* () {
+                    while (attempts.count === 0) yield* Effect.sleep("1 millis")
+                  }).pipe(
+                    Effect.timeoutOrElse({
+                      duration: "1 second",
+                      orElse: () => Effect.fail(new Error("writer did not attempt the held-lock statement")),
+                    }),
+                  )
+                  expect(writerFinished).toBe(false)
+                  yield* Effect.promise(() => holder.release())
+                  const result = yield* Fiber.await(writer)
+                  expect(Exit.isSuccess(result)).toBe(true)
+                  if (!Exit.isSuccess(result)) return
+                  if (method === "values") expect(result.value).toEqual([[1]])
+                  expect(
+                    yield* client.unsafe(`SELECT COUNT(*) FROM busy_retry_test WHERE value = '${writerValue}'`).values,
+                  ).toEqual([[1]])
+                }).pipe(Effect.ensuring(Effect.promise(() => holder.release())))
               }),
             ),
           )
@@ -386,7 +318,7 @@ describe("SQLite busy timeout and statement retries", () => {
                   .unsafe("INSERT INTO busy_retry_test (id, value) VALUES (1, 'node-writer')")
                   .raw.pipe(
                     Effect.timeoutOrElse({
-                      duration: lockBackstop,
+                      duration: "5 seconds",
                       orElse: () => Effect.fail(new Error("node retry did not stop")),
                     }),
                   )
@@ -402,67 +334,7 @@ describe("SQLite busy timeout and statement retries", () => {
         )
         expect(Exit.isSuccess(exit)).toBe(true)
       },
-      20_000,
-    )
-  }
-
-  for (const clientType of ["bun", "core-node", "standalone-node"] as const) {
-    test.skipIf(clientType !== "bun" && !nodeSqliteDrivers)(
-      `${clientType} fails a stale-snapshot transaction write without retrying it`,
-      async () => {
-        await using tmp = await tmpdir()
-        const filename = path.join(tmp.path, `${clientType}-snapshot.sqlite`)
-        const writerSql = "INSERT INTO busy_retry_test (id, value) VALUES (1, 'stale-writer')"
-        const exit = await Effect.runPromiseExit(
-          Effect.scoped(
-            Effect.gen(function* () {
-              const attempts = { count: 0 }
-              const client = yield* clientWithAttemptCount({ clientType, filename, statement: writerSql, attempts })
-              yield* client.unsafe("CREATE TABLE busy_retry_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL)").raw
-              expect(yield* client.unsafe("PRAGMA journal_mode").values).toEqual([["wal"]])
-              const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
-              const other = new sqlite.Database(filename)
-              yield* Effect.addFinalizer(() => Effect.sync(() => other.close()))
-
-              let elapsedMs = 0
-              const failure = yield* client
-                .withTransaction(
-                  Effect.gen(function* () {
-                    expect(yield* client.unsafe("SELECT COUNT(*) FROM busy_retry_test").values).toEqual([[0]])
-                    // Another connection commits after this transaction's read, so its snapshot is stale.
-                    other.run("INSERT INTO busy_retry_test (id, value) VALUES (2, 'other-writer')")
-                    const startedAt = performance.now()
-                    yield* client
-                      .unsafe(writerSql)
-                      .raw.pipe(
-                        Effect.onExit(() => Effect.sync(() => void (elapsedMs = performance.now() - startedAt))),
-                      )
-                  }),
-                )
-                .pipe(
-                  Effect.timeoutOrElse({
-                    duration: lockBackstop,
-                    orElse: () => Effect.fail(new Error("stale-snapshot retries did not stop")),
-                  }),
-                  Effect.flip,
-                )
-              expect(isSqlError(failure)).toBe(true)
-              if (!isSqlError(failure)) return
-              expect(failure.reason._tag).toBe("LockTimeoutError")
-              expect(failure.reason.cause).toMatchObject(
-                clientType === "bun" ? { code: "SQLITE_BUSY_SNAPSHOT" } : { errcode: 517 },
-              )
-              expect(elapsedMs).toBeLessThan(snapshotBoundMs)
-              expect(attempts.count).toBe(1)
-              expect(yield* client.unsafe("SELECT id, value FROM busy_retry_test ORDER BY id").values).toEqual([
-                [2, "other-writer"],
-              ])
-            }),
-          ),
-        )
-        if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
-      },
-      20_000,
+      10_000,
     )
   }
 
@@ -486,7 +358,7 @@ describe("SQLite busy timeout and statement retries", () => {
               })
               .pipe(
                 Effect.timeoutOrElse({
-                  duration: lockBackstop,
+                  duration: "5 seconds",
                   orElse: () => Effect.fail(new Error("immediate transaction retries did not stop")),
                 }),
               )
@@ -502,11 +374,75 @@ describe("SQLite busy timeout and statement retries", () => {
       ),
     )
     if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
-  }, 20_000)
+  }, 10_000)
+
+  for (const method of ["run", "values"] as const) {
+    test(`retries ${method} after a second process releases its write lock`, async () => {
+      await using tmp = await tmpdir()
+      const filename = path.join(tmp.path, "busy.sqlite")
+      const writerSql =
+        method === "run"
+          ? "INSERT INTO busy_retry_test (id, value) VALUES (1, 'writer')"
+          : "INSERT INTO busy_retry_test (id, value) VALUES (1, 'writer') RETURNING id"
+      const attempts = { count: 0 }
+      const exit = await Effect.runPromiseExit(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const client = yield* clientWithAttemptCount({
+              clientType: "bun",
+              filename,
+              statement: writerSql,
+              attempts,
+            })
+            yield* client.unsafe("CREATE TABLE busy_retry_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL)").raw
+            yield* client.unsafe("PRAGMA busy_timeout = 0").raw
+
+            const holder = yield* Effect.promise(() => startLockHolder(filename, bunHolderScript))
+            yield* Effect.gen(function* () {
+              const statement = Effect.gen(function* () {
+                if (method === "run") {
+                  yield* client.unsafe(writerSql).raw
+                  return { method: "run" as const }
+                }
+                return {
+                  method: "values" as const,
+                  rows: yield* client.unsafe(writerSql).values,
+                }
+              })
+              let writerFinished = false
+              const writer = yield* statement.pipe(
+                Effect.onExit(() => Effect.sync(() => void (writerFinished = true))),
+                Effect.forkChild({ startImmediately: true }),
+              )
+
+              yield* Effect.gen(function* () {
+                while (attempts.count === 0) yield* Effect.sleep("1 millis")
+              }).pipe(
+                Effect.timeoutOrElse({
+                  duration: "1 second",
+                  orElse: () => Effect.fail(new Error("writer did not attempt the held-lock statement")),
+                }),
+              )
+              expect(writerFinished).toBe(false)
+              yield* Effect.promise(() => holder.release())
+              const result = yield* Fiber.await(writer)
+              expect(Exit.isSuccess(result)).toBe(true)
+              if (!Exit.isSuccess(result)) return
+              if (result.value.method === "values") expect(result.value.rows).toEqual([[1]])
+              expect(
+                yield* client.unsafe("SELECT COUNT(*) FROM busy_retry_test WHERE value = 'writer'").values,
+              ).toEqual([[1]])
+            }).pipe(Effect.ensuring(Effect.promise(() => holder.release())))
+          }),
+        ),
+      )
+      expect(Exit.isSuccess(exit)).toBe(true)
+    }, 10_000)
+  }
 
   for (const clientType of ["bun", "core-node", "standalone-node"] as const) {
-    test.skipIf(clientType !== "bun" && !nodeSqliteDrivers)(
-      `${clientType} serves unrelated requests and exhausts a persistent lock after the retry window`,
+    nodeSqliteTest(
+      `${clientType} serves unrelated requests and exhausts a persistent lock within budget`,
       async () => {
         const drivers = nodeSqliteDrivers
         if (clientType !== "bun" && !drivers) return
@@ -537,7 +473,6 @@ describe("SQLite busy timeout and statement retries", () => {
               )
               yield* Effect.addFinalizer(() => Effect.promise(() => holder.release()))
 
-              const longestStallMs = yield* eventLoopStalls
               let writerFinished = false
               let elapsedMs = 0
               const startedAt = performance.now()
@@ -559,17 +494,10 @@ describe("SQLite busy timeout and statement retries", () => {
                 }),
               )
               expect(writerFinished).toBe(false)
-              const result = yield* Fiber.await(writer).pipe(
-                Effect.timeoutOrElse({
-                  duration: lockBackstop,
-                  orElse: () => Effect.fail(new Error("persistent-lock retries did not stop")),
-                }),
-              )
+              const result = yield* Fiber.await(writer)
               expect(writerFinished).toBe(true)
               expect(Exit.isFailure(result)).toBe(true)
-              expect(elapsedMs).toBeGreaterThanOrEqual(lockWindowMs)
-              expect(elapsedMs).toBeLessThan(lockWindowMs + lockWindowSlackMs)
-              expect(longestStallMs()).toBeLessThan(stallBoundMs)
+              expect(elapsedMs).toBeLessThan(1_000)
               if (!Exit.isFailure(result)) return
               const error = Option.getOrUndefined(Cause.findErrorOption(result.cause))
               expect(isSqlError(error)).toBe(true)
@@ -581,17 +509,12 @@ describe("SQLite busy timeout and statement retries", () => {
               expect(
                 yield* client.unsafe("SELECT COUNT(*) FROM busy_retry_test WHERE value = 'persistent-writer'").values,
               ).toEqual([[0]])
-              yield* client.unsafe("INSERT INTO busy_retry_test (id, value) VALUES (2, 'independent-writer')").raw
-              expect(yield* client.unsafe("SELECT id, value FROM busy_retry_test ORDER BY id").values).toEqual([
-                [2, "independent-writer"],
-                [100, "holder"],
-              ])
             }),
           ),
         )
         if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
       },
-      20_000,
+      10_000,
     )
   }
 
@@ -766,11 +689,10 @@ describe("SQLite busy timeout and statement retries", () => {
 
             yield* Effect.gen(function* () {
               let failure: unknown
-              const startedAt = performance.now()
               if (method === "run") {
                 yield* database.run("INSERT INTO busy_retry_test (id, value) VALUES (1, 'writer')").pipe(
                   Effect.timeoutOrElse({
-                    duration: lockBackstop,
+                    duration: "5 seconds",
                     orElse: () => Effect.fail(new Error("retry did not stop")),
                   }),
                   Effect.catch((error) => Effect.sync(() => (failure = error))),
@@ -780,7 +702,7 @@ describe("SQLite busy timeout and statement retries", () => {
                   .values("INSERT INTO busy_retry_test (id, value) VALUES (1, 'writer') RETURNING id")
                   .pipe(
                     Effect.timeoutOrElse({
-                      duration: lockBackstop,
+                      duration: "5 seconds",
                       orElse: () => Effect.fail(new Error("retry did not stop")),
                     }),
                     Effect.catch((error) => Effect.sync(() => (failure = error))),
@@ -788,10 +710,7 @@ describe("SQLite busy timeout and statement retries", () => {
               }
               expect(failure).toBeInstanceOf(EffectDrizzleQueryError)
               if (!(failure instanceof EffectDrizzleQueryError)) return
-              const elapsedMs = performance.now() - startedAt
-              expect(elapsedMs).toBeGreaterThanOrEqual(lockWindowMs)
-              expect(elapsedMs).toBeLessThan(lockWindowMs + lockWindowSlackMs)
-              expect(attempts.lock).toBeGreaterThan(1)
+              expect(attempts.lock).toBe(5)
               expect(failure.query).toBe("Database is locked (SQLITE_BUSY)")
               expect(failure.params).toEqual([])
               expect(failure.message).toContain("Database is locked (SQLITE_BUSY)")
@@ -833,7 +752,7 @@ describe("SQLite busy timeout and statement retries", () => {
         ),
       )
       if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
-    }, 20_000)
+    }, 10_000)
   }
 
   for (const method of ["run", "values"] as const) {

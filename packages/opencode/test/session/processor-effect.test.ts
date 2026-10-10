@@ -1790,7 +1790,7 @@ itHeldLock.live(
           yield* waitFor(
             Effect.sync(() => (progress.length >= 2 ? true : undefined)),
             "the refused terminal write reported no progress",
-            120_000,
+            30_000,
           )
           expect(progress.slice(0, 2)).toEqual([
             { "session.id": chat.id, messageID: msg.id, attempts: 4 },
@@ -1813,7 +1813,7 @@ itHeldLock.live(
         }),
       { config: cfg },
     ),
-  180_000,
+  60_000,
 )
 
 itHeldLock.live(
