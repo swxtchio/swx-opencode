@@ -20,7 +20,7 @@ import { Sqlite } from "./sqlite"
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 const nativeBusyTimeoutMs = 5
 // Restore the lock tolerance the old busy_timeout gave, but wait asynchronously between short native attempts
-// so a contended statement never blocks the event loop. The window runs from the first busy failure, and the
+// so a contended statement never blocks the event loop. The window runs from the first failed retry, and the
 // backoff cap matches SQLite's own busy-handler sleep.
 const retrySchedule = Schedule.exponential("10 millis").pipe(
   Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 100)))),
@@ -96,10 +96,14 @@ const make = (options: Config) =>
         const statement = native.query(query)
         // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
         statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
-        return Effect.try({
+        const execute = Effect.try({
           try: () => (statement.all(...(params as any)) ?? []) as Array<Record<string, unknown>>,
           catch: statementError,
-        }).pipe(Effect.retry({ schedule: retrySchedule, while: retryable }))
+        })
+        // Only a statement that met the lock builds the retry schedule, which re-attempts it at once before backing off.
+        return execute.pipe(
+          Effect.catchIf(retryable, () => Effect.retry(execute, { schedule: retrySchedule, while: retryable })),
+        )
       })
 
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
@@ -107,10 +111,14 @@ const make = (options: Config) =>
         const statement = native.query(query)
         // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
         statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
-        return Effect.try({
+        const execute = Effect.try({
           try: () => (statement.values(...(params as any)) ?? []) as Array<unknown[]>,
           catch: statementError,
-        }).pipe(Effect.retry({ schedule: retrySchedule, while: retryable }))
+        })
+        // Only a statement that met the lock builds the retry schedule, which re-attempts it at once before backing off.
+        return execute.pipe(
+          Effect.catchIf(retryable, () => Effect.retry(execute, { schedule: retrySchedule, while: retryable })),
+        )
       })
 
     const connection = identity<SqliteConnection>({
