@@ -285,6 +285,51 @@ test("a tool call and visible text each end the run and start a new line", async
   }
 })
 
+test("plain reasoning between two runs keeps its own header and body", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  const turn = message("msg_plain")
+  const plain: ReasoningPart = {
+    id: partID("msg_plain", 3),
+    sessionID,
+    messageID: "msg_plain",
+    type: "reasoning",
+    text: "Checking the tests first.",
+    time: { start: 5000, end: 6000 },
+  }
+  const parts: Part[] = [
+    encrypted("msg_plain", 1, { start: 1000, end: 2000 }),
+    encrypted("msg_plain", 2, { start: 3000, end: 5000 }),
+    plain,
+    encrypted("msg_plain", 4, { start: 6500, end: 7000 }),
+  ]
+  const { app, emit, sync } = await mount(undefined, tmp.path, true, () => <Transcript messages={[turn]} />)
+
+  try {
+    emit(global({ id: "evt_plain_message", type: "message.updated", properties: { sessionID, info: turn } }))
+    for (const part of parts) {
+      emit(partUpdated(part))
+    }
+    await wait(() => sync.data.part[turn.id]?.length === parts.length)
+
+    const frame = await frameWhen(
+      app,
+      (rendered) => rendered.includes("Checking the tests first.") && rendered.includes("Thought · 500ms"),
+    )
+    const lines = thoughtLines(frame)
+    expect(lines).toHaveLength(3)
+    expect(lines[0]).toContain("Thought 2 · 3.0s")
+    expect(lines[1]).toContain("Thought: 1.0s")
+    expect(lines[2]).toContain("Thought · 500ms")
+    const all = frame.split("\n")
+    const plainHeader = all.findIndex((line) => line.includes("Thought: 1.0s"))
+    const body = all.findIndex((line) => line.includes("Checking the tests first."))
+    expect(body).toBeGreaterThan(plainHeader)
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
 test("a message error ends the run, and the next message starts a new line", async () => {
   await using tmp = await tmpdir()
   await Bun.write(`${tmp.path}/kv.json`, "{}")
