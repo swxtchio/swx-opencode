@@ -49,6 +49,24 @@ This skill is loaded from the global home directory.
   )
 }
 
+const reviewSkill = `---
+name: review
+description: A review skill, also copied into a hidden per-host folder and the trash.
+---
+
+# Review
+`
+
+// The canonical review skill, plus the copies gstack leaves behind: a hidden per-host
+// install and a trash folder. All three share one skill name.
+async function createReviewCopies(skillsRoot: string) {
+  await Promise.all(
+    ["gstack/review", "gstack/.openclaw/review", ".trash/review"].map((dir) =>
+      Bun.write(path.join(skillsRoot, dir, "SKILL.md"), reviewSkill),
+    ),
+  )
+}
+
 const withHome = <A, E, R>(home: string, self: Effect.Effect<A, E, R>) =>
   Effect.acquireUseRelease(
     Effect.sync(() => {
@@ -578,6 +596,42 @@ description: A skill in the .opencode/skills directory.
 
           const skill = yield* Skill.Service
           expect((yield* skill.dirs()).length).toBe(4)
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live("loads only the canonical skill when skills.exclude matches its hidden and trash copies", () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const skillsRoot = path.join(dir, ".claude", "skills")
+          yield* Effect.promise(() => createReviewCopies(skillsRoot))
+
+          const skill = yield* Skill.Service
+          expect(yield* skill.dirs()).toEqual([path.join(skillsRoot, "gstack", "review")])
+          const list = (yield* skill.all()).filter((s) => s.location !== "<built-in>")
+          expect(list.map((s) => s.location)).toEqual([path.join(skillsRoot, "gstack", "review", "SKILL.md")])
+        }),
+      { git: true, config: { skills: { exclude: ["**/.trash/**", "**/gstack/.*/**"] } } },
+    ),
+  )
+
+  it.live("loads hidden and trash copies when skills.exclude is not set", () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const skillsRoot = path.join(dir, ".claude", "skills")
+          yield* Effect.promise(() => createReviewCopies(skillsRoot))
+
+          const skill = yield* Skill.Service
+          expect((yield* skill.dirs()).toSorted()).toEqual(
+            [
+              path.join(skillsRoot, "gstack", "review"),
+              path.join(skillsRoot, "gstack", ".openclaw", "review"),
+              path.join(skillsRoot, ".trash", "review"),
+            ].toSorted(),
+          )
         }),
       { git: true },
     ),

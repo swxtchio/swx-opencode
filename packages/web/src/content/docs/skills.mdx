@@ -29,6 +29,18 @@ It loads any matching `skills/*/SKILL.md` in `.opencode/` and any matching `.cla
 
 Global definitions are also loaded from `~/.config/opencode/skills/*/SKILL.md`, `~/.claude/skills/*/SKILL.md`, and `~/.agents/skills/*/SKILL.md`.
 
+To skip copies you do not want loaded, such as a hidden per-host install or a trash folder, set glob patterns under `skills.exclude`:
+
+```json
+{
+  "skills": {
+    "exclude": ["**/.trash/**", "**/gstack/.*/**"]
+  }
+}
+```
+
+Each pattern is matched against the `SKILL.md` path relative to the folder the scan started from, such as `.claude` or `.opencode`, so one pattern works in every location above. Excluded skills are never loaded, so they cannot shadow a skill with the same name.
+
 ---
 
 ## Write frontmatter
