@@ -164,12 +164,17 @@ const layer = Layer.effect(
       return next
     }
 
+    // The write lock is taken at BEGIN. A deferred transaction would pin a read
+    // snapshot in assertWritableIn, and a commit by another writer while its
+    // write waits on the lock would leave that snapshot stale.
     const writable = <A, E>(sessionID: SessionID, effect: (tx: DatabaseTransaction) => Effect.Effect<A, E>) =>
-      db.transaction((tx) =>
-        Effect.gen(function* () {
-          yield* EventV2.assertWritableIn(tx, sessionID)
-          return yield* effect(tx)
-        }),
+      db.transaction(
+        (tx) =>
+          Effect.gen(function* () {
+            yield* EventV2.assertWritableIn(tx, sessionID)
+            return yield* effect(tx)
+          }),
+        { behavior: "immediate" },
       )
 
     const exclusive: Interface["exclusive"] = (sessionID, effect) => semaphore(locks, sessionID).withPermit(effect)
