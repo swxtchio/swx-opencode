@@ -2012,6 +2012,7 @@ export type Config = {
   skills?: {
     paths?: Array<string>
     urls?: Array<string>
+    exclude?: Array<string>
   }
   references?: {
     [key: string]: string | ConfigV2ReferenceGit | ConfigV2ReferenceLocal
