@@ -70,6 +70,7 @@ import { QuestionPrompt } from "./question"
 import { DialogExportOptions } from "../../ui/dialog-export-options"
 import * as Model from "../../util/model"
 import { AssistantModelLabel } from "./message-model"
+import { groupOpaqueReasoning, isOpaqueReasoning, reasoningText } from "./opaque-reasoning"
 import type { SessionStepMessage } from "../../util/model"
 import { formatTranscript } from "../../util/transcript"
 import { sessionEpilogue } from "../../util/presentation"
@@ -1386,7 +1387,7 @@ export function Session() {
                         />
                       </Match>
                       <Match when={message.role === "assistant"}>
-                        <AssistantMessage
+                        <AssistantMessageView
                           last={lastAssistant()?.id === message.id}
                           message={message as AssistantMessage}
                           parts={sync.data.part[message.id] ?? []}
@@ -1570,7 +1571,7 @@ function UserMessage(props: {
   )
 }
 
-function AssistantMessage(props: {
+export function AssistantMessageView(props: {
   message: AssistantMessage
   parts: Part[]
   last: boolean
@@ -1597,18 +1598,23 @@ function AssistantMessage(props: {
     return props.message.time.completed - user.time.created
   })
 
+  // Grouping is per message: an error renders after the parts, so it ends a run by position.
+  const rows = createMemo(() => groupOpaqueReasoning(props.parts))
+
   const childShortcut = useCommandShortcut("session.child.first")
   const backgroundShortcut = useCommandShortcut("session.background")
 
   return (
     <>
-      <For each={props.parts}>
+      <For each={rows()}>
         {(part, index) => {
+          if (part.type === "opaque-reasoning")
+            return <OpaqueReasoningRunView parts={part.parts} message={props.message} />
           const component = createMemo(() => PART_MAPPING[part.type as keyof typeof PART_MAPPING])
           return (
             <Show when={component()}>
               <Dynamic
-                last={index() === props.parts.length - 1}
+                last={index() === rows().length - 1}
                 component={component()}
                 part={part as any}
                 message={props.message}
@@ -1714,32 +1720,11 @@ export function ReasoningPartView(props: { last: boolean; part: ReasoningPart; m
   // layout never shifts. Click to open the full markdown block, click to close.
   const [expanded, setExpanded] = createSignal(false)
 
-  const content = createMemo(() => {
-    // OpenRouter encrypts some reasoning blocks; drop the placeholder.
-    return props.part.text.replace("[REDACTED]", "").trim()
-  })
-  const opaque = createMemo(() => !content() && Boolean(props.part.metadata))
+  const content = createMemo(() => reasoningText(props.part))
+  const opaque = createMemo(() => isOpaqueReasoning(props.part))
   const status = createMemo(() => assistantStatus(sync, props.message))
-  const unresolved = createMemo(
-    () =>
-      props.part.time.end === undefined &&
-      props.message.time.completed === undefined &&
-      props.message.error === undefined &&
-      status() === "unknown",
-  )
-  const isDone = createMemo(
-    () =>
-      props.part.time.end !== undefined ||
-      props.message.time.completed !== undefined ||
-      props.message.error !== undefined ||
-      status() === "failed" ||
-      unresolved(),
-  )
+  const state = createMemo(() => reasoningState(props.part, props.message, status()))
   const inMinimal = createMemo(() => ctx.thinkingMode() === "hide")
-  const duration = createMemo(() => {
-    const end = props.part.time.end
-    return end === undefined ? 0 : Math.max(0, end - props.part.time.start)
-  })
   const summary = createMemo(() => reasoningSummary(content()))
   const syntax = createSyntaxStyleMemo(() => generateSubtleSyntax(theme))
 
@@ -1761,10 +1746,10 @@ export function ReasoningPartView(props: { last: boolean; part: ReasoningPart; m
           <ReasoningHeader
             toggleable={inMinimal() && !opaque()}
             open={!inMinimal() || expanded()}
-            done={isDone()}
-            unknown={unresolved()}
+            done={state().done}
+            unknown={state().unresolved}
             title={summary().title}
-            duration={isDone() ? Locale.duration(duration()) : undefined}
+            duration={state().done ? Locale.duration(state().duration) : undefined}
             encrypted={opaque()}
           />
         </box>
@@ -1786,6 +1771,51 @@ export function ReasoningPartView(props: { last: boolean; part: ReasoningPart; m
   )
 }
 
+function OpaqueReasoningRunView(props: { parts: ReasoningPart[]; message: AssistantMessage }) {
+  const ctx = use()
+  const sync = useSync()
+  const status = createMemo(() => assistantStatus(sync, props.message))
+  const states = createMemo(() => props.parts.map((part) => reasoningState(part, props.message, status())))
+  const duration = createMemo(() => states().reduce((total, state) => total + state.duration, 0))
+
+  return (
+    <box
+      ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
+      paddingLeft={3}
+      marginTop={1}
+      flexDirection="column"
+      flexShrink={0}
+    >
+      <ReasoningHeader
+        toggleable={false}
+        open={ctx.thinkingMode() !== "hide"}
+        done={states().every((state) => state.done)}
+        unknown={states().some((state) => state.unresolved)}
+        title={null}
+        duration={Locale.duration(duration())}
+        encrypted
+        count={props.parts.length}
+      />
+    </box>
+  )
+}
+
+function reasoningState(part: ReasoningPart, message: AssistantMessage, status: ReturnType<typeof assistantStatus>) {
+  const unresolved =
+    part.time.end === undefined &&
+    message.time.completed === undefined &&
+    message.error === undefined &&
+    status === "unknown"
+  const done =
+    part.time.end !== undefined ||
+    message.time.completed !== undefined ||
+    message.error !== undefined ||
+    status === "failed" ||
+    unresolved
+  const end = part.time.end
+  return { done, unresolved, duration: end === undefined ? 0 : Math.max(0, end - part.time.start) }
+}
+
 function ReasoningHeader(props: {
   toggleable: boolean
   open: boolean
@@ -1794,14 +1824,19 @@ function ReasoningHeader(props: {
   title: string | null
   duration?: string
   encrypted?: boolean
+  count?: number
 }) {
   const { theme } = useTheme()
   const fg = () =>
     props.open
       ? RGBA.fromValues(theme.warning.r, theme.warning.g, theme.warning.b, theme.thinkingOpacity)
       : theme.warning
+  // A run shows its count and duration while it is still in flight, so the line
+  // updates as each part arrives.
+  const encryptedLabel = () =>
+    `Thought${props.count ? ` ${props.count}` : ""}${props.duration ? ` · ${props.duration}` : ""}`
   const completed = () => {
-    if (props.encrypted) return `Thought${props.duration ? ` · ${props.duration}` : ""}`
+    if (props.encrypted) return encryptedLabel()
     const detail = [props.title, props.duration].filter(Boolean).join(" · ")
     return `${props.toggleable ? (props.open ? "- " : "+ ") : ""}Thought${detail ? `: ${detail}` : ""}`
   }
@@ -1815,7 +1850,9 @@ function ReasoningHeader(props: {
       </Match>
       <Match when={!props.done}>
         <box flexDirection="row">
-          <Spinner color={fg()}>{props.title ? "Thinking: " + props.title : "Thinking"}</Spinner>
+          <Spinner color={fg()}>
+            {props.count ? encryptedLabel() : props.title ? "Thinking: " + props.title : "Thinking"}
+          </Spinner>
         </box>
       </Match>
       <Match when={true}>
