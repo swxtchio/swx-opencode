@@ -736,11 +736,13 @@ const layer = Layer.effect(
     // body rolls back without deleting anything.
     const consumeAttempt = Effect.fnUntraced(function* (sessionID: SessionID) {
       const state = { began: false, abandoned: false }
+      // Whether the abandon won: a body that began first is waited for instead,
+      // so a committed consume is never reported as a backstop.
       const abandon = (fiber: Fiber.Fiber<unknown, unknown>) =>
         Effect.suspend(() => {
-          if (state.began) return Effect.void
+          if (state.began) return Effect.succeed(false)
           state.abandoned = true
-          return Fiber.interrupt(fiber).pipe(Effect.forkIn(scope), Effect.asVoid)
+          return Fiber.interrupt(fiber).pipe(Effect.forkIn(scope), Effect.as(true))
         })
       const fiber = yield* exclusive(
         sessionID,
@@ -765,10 +767,7 @@ const layer = Layer.effect(
         Effect.timeoutOption(consumeAcquireBackstop),
         Effect.onInterrupt(() => abandon(fiber)),
       )
-      if (Option.isNone(waited) && !state.began) {
-        yield* abandon(fiber)
-        return { kind: "backstop" as const }
-      }
+      if (Option.isNone(waited) && (yield* abandon(fiber))) return { kind: "backstop" as const }
       const exit = Option.isSome(waited) ? waited.value : yield* Fiber.await(fiber)
       if (Exit.isSuccess(exit)) return { kind: "consumed" as const, seen: exit.value }
       if (!state.began && sqliteLockMessage(Cause.squash(exit.cause)) !== undefined) return { kind: "locked" as const }

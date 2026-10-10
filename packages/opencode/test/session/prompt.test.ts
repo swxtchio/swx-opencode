@@ -67,6 +67,7 @@ import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { sqliteLockMessage } from "@/util/sqlite-error"
+import { newStatementAttempts, patchBunQuery } from "@opencode-ai/core/database/sqlite-attempts"
 import { InstanceRef } from "@/effect/instance-ref"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -6047,12 +6048,16 @@ const writeLockHold = Effect.fn("test.writeLockHold")(function* () {
   return { take, release: Effect.sync(() => lock.holder!.run("COMMIT")) }
 })
 
-const captureConsumeLogs = Effect.fn("test.captureConsumeLogs")(function* () {
+// `onLocked` runs inline with a locked attempt's log, before the consume makes its next attempt.
+const captureConsumeLogs = Effect.fn("test.captureConsumeLogs")(function* (onLocked?: () => void) {
   const locked: unknown[] = []
   const backstop: unknown[] = []
   const capture = Logger.make((options) => {
     const [text, fields] = Array.isArray(options.message) ? options.message : [options.message]
-    if (text === consumeLockedLog) locked.push(fields)
+    if (text === consumeLockedLog) {
+      locked.push(fields)
+      onLocked?.()
+    }
     if (text === consumeBackstopLog) backstop.push(fields)
   })
   const loggers = yield* Effect.service(Logger.CurrentLoggers)
@@ -6241,6 +6246,80 @@ consumeLock.instance(
       }).pipe(Effect.provideService(Logger.CurrentLoggers, capture.loggers))
     }),
   110_000,
+)
+
+consumeLock.instance(
+  "a consume whose later attempts wait on a connection another transaction keeps refuses before it ends, and its abandoned attempts delete nothing",
+  () =>
+    Effect.gen(function* () {
+      const queue = yield* SessionQueue.Service
+      const status = yield* SessionStatus.Service
+      const runState = yield* SessionRunState.Service
+      const { db } = yield* Database.Service
+      const services = yield* Effect.context<never>()
+      // The consume's own BEGIN IMMEDIATE attempts and its deletes, counted at the native statement.
+      const begins = newStatementAttempts()
+      yield* patchBunQuery((sql) => sql === "begin immediate", begins)
+      const deletes = newStatementAttempts()
+      yield* patchBunQuery((sql) => /^delete from "session_prompt_queue" where .*"time_promoted" is not null/.test(sql), deletes)
+
+      // An unrelated deferred transaction that keeps the shared connection until released. It starts inside the
+      // first failed attempt's log, before the next attempt is made, so it takes the connection ahead of it.
+      const owned = yield* Deferred.make<void>()
+      const holderRelease = yield* Deferred.make<void>()
+      const holdConnection = () =>
+        Effect.runForkWith(services)(
+          db.transaction(() => Deferred.succeed(owned, undefined).pipe(Effect.andThen(Deferred.await(holderRelease)))),
+        )
+      const capture = yield* captureConsumeLogs(() => {
+        if (!Deferred.isDoneUnsafe(owned)) holdConnection()
+      })
+      yield* Effect.gen(function* () {
+        const lock = yield* writeLockHold()
+        const started = yield* startConsumeLocked(lock.take)
+        const { llm, chat, task, continuation, records } = started
+        const before = records()
+        const deletesBefore = deletes.count
+
+        // The first attempt meets the native lock; then the transaction owns the connection and the lock is released.
+        yield* awaitWithTimeout(Deferred.await(owned), "the transaction never took the shared connection", "15 seconds")
+        expect(begins.busy.length).toBeGreaterThan(0)
+        expect(capture.locked).toEqual([{ "session.id": chat.id, attempts: 1 }])
+        yield* lock.release
+        const exits = yield* awaitWithTimeout(
+          Effect.all([Fiber.await(task), Fiber.await(continuation)]),
+          "the run never stopped while another transaction kept the connection",
+          "70 seconds",
+        ).pipe(Effect.onError(() => Deferred.succeed(holderRelease, undefined)))
+
+        // Refused, attributably and with the runner stopped, while the transaction still holds the connection.
+        consumeRefusals(exits).forEach((refusal) => {
+          expect(refusal).toBeInstanceOf(SessionQueue.ConsumeLockedError)
+          expect(refusal).toMatchObject({ sessionID: chat.id, attempts: 5 })
+        })
+        expect(capture.backstop).toEqual([2, 3, 4, 5].map((attempts) => ({ "session.id": chat.id, attempts })))
+        expect((yield* status.list()).has(chat.id)).toBe(false)
+        expect(Exit.isSuccess(yield* runState.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
+        expect(Deferred.isDoneUnsafe(holderRelease)).toBe(false)
+        const beginsAtRefusal = begins.count
+
+        // Released, the abandoned attempt that kept the session permit gets the connection and begins its
+        // transaction. Once the permit is free again it has ended, and nothing was deleted.
+        yield* Deferred.succeed(holderRelease, undefined)
+        yield* awaitWithTimeout(
+          queue.exclusive(chat.id, Effect.void),
+          "the abandoned attempt never released the session permit",
+          "15 seconds",
+        )
+        expect(begins.count).toBeGreaterThan(beginsAtRefusal)
+        expect(deletes.count).toBe(deletesBefore)
+        expect(records()).toEqual(before)
+        expect(yield* llm.calls).toBe(1)
+
+        yield* wakeDeliversContinuation(started)
+      }).pipe(Effect.provideService(Logger.CurrentLoggers, capture.loggers))
+    }),
+  120_000,
 )
 
 // Makes the consume's delete, which runs only after its transaction began, fail with SQLITE_BUSY while armed, so the
