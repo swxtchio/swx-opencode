@@ -23,6 +23,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
 import { sqliteLockMessage } from "@/util/sqlite-error"
+import { FailureOrigin } from "@opencode-ai/core/observability/failure-origin"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
@@ -837,11 +838,14 @@ const layer = Layer.effect(
       })
 
       const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
+        // Names the failed operation's event, stream case and call site, so a stop is traceable past its stack.
+        const origin = FailureOrigin.get(e)
         yield* Effect.logError("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
           error: errorMessage(e),
           stack: e instanceof Error ? e.stack : undefined,
+          ...(origin && { failure: origin }),
         })
         if (ctx.assistantMessage.error) {
           yield* status.set(ctx.sessionID, { type: "idle" })
@@ -884,10 +888,16 @@ const layer = Layer.effect(
               type: "busy",
               activeAssistantMessageID: ctx.assistantMessage.id,
             })
-            const stream = llm.stream(streamInput)
+            const stream = llm.stream(streamInput).pipe(
+              Stream.tapCause((cause) => FailureOrigin.record(cause, { stage: "stream" })),
+            )
 
             yield* stream.pipe(
-              Stream.tap((event) => handleEvent(event)),
+              Stream.tap((event) =>
+                handleEvent(event).pipe(
+                  Effect.tapCause((cause) => FailureOrigin.record(cause, { stage: "handler", case: event.type })),
+                ),
+              ),
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
             )
