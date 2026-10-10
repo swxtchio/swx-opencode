@@ -9,6 +9,7 @@ import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm
 import { Cause, Context, Effect, Exit, Layer, Option, Schema, Semaphore, Struct } from "effect"
 import { isDeepStrictEqual } from "node:util"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { sqliteLockMessage } from "@/util/sqlite-error"
 import { MessageV2 } from "./message-v2"
 import { MessageID, SessionID } from "./schema"
 
@@ -40,6 +41,23 @@ export class WithdrawnError extends Schema.TaggedErrorClass<WithdrawnError>()("S
   sessionID: Schema.String,
   itemID: Schema.String,
 }) {}
+
+/**
+ * A consume that could not take the database write lock in any of its attempts.
+ * The run stops with it, and every queued row stays as it was for the next wake.
+ */
+export class ConsumeLockedError extends Schema.TaggedErrorClass<ConsumeLockedError>()(
+  "SessionQueueConsumeLockedError",
+  {
+    sessionID: Schema.String,
+    attempts: Schema.Number,
+    message: Schema.String,
+  },
+) {}
+
+// Each consume attempt waits out the statement lock window, so a lock released
+// within about this many windows lets the run go on.
+const consumeAttempts = 3
 
 export interface Interface {
   readonly admit: (input: AdmitInput) => Effect.Effect<Item>
@@ -97,6 +115,9 @@ export interface Interface {
    * Called by a drain before it reads history; returns the wake count that read
    * reflects, for `park`. A promoted row outlives its promotion until then so
    * that a joiner of a finishing run can see the prompt still needs a drain.
+   * Another connection's write lock can outlast one attempt: an attempt whose
+   * transaction never began is made again, and one that meets the lock on its
+   * last attempt dies with ConsumeLockedError.
    */
   readonly consume: (sessionID: SessionID) => Effect.Effect<number>
   /**
@@ -680,18 +701,49 @@ const layer = Layer.effect(
         )
         .pipe(Effect.withSpan("SessionQueue.promote"))
 
+    // Only an attempt whose delete never ran is made again, so no executed
+    // transaction body is replayed. Success is the attempt's own commit.
     const consume = Effect.fn("SessionQueue.consume")(function* (sessionID: SessionID) {
-      return yield* exclusive(
-        sessionID,
-        writable(sessionID, (tx) =>
-          tx
-            .delete(SessionPromptQueueTable)
-            .where(
-              and(eq(SessionPromptQueueTable.session_id, sessionID), isNotNull(SessionPromptQueueTable.time_promoted)),
-            )
-            .run()
-            .pipe(Effect.map(() => wakes.get(sessionID) ?? 0)),
-        ).pipe(Effect.orDie),
+      let attempts = 0
+      let began = false
+      const lockedBeforeBegin = (error: unknown) => !began && sqliteLockMessage(error) !== undefined
+      return yield* Effect.suspend(() => {
+        attempts++
+        began = false
+        return exclusive(
+          sessionID,
+          writable(sessionID, (tx) => {
+            began = true
+            return tx
+              .delete(SessionPromptQueueTable)
+              .where(
+                and(
+                  eq(SessionPromptQueueTable.session_id, sessionID),
+                  isNotNull(SessionPromptQueueTable.time_promoted),
+                ),
+              )
+              .run()
+              .pipe(Effect.map(() => wakes.get(sessionID) ?? 0))
+          }),
+        )
+      }).pipe(
+        Effect.tapError((error) =>
+          lockedBeforeBegin(error)
+            ? Effect.logWarning("queue consume met a held write lock", { "session.id": sessionID, attempts })
+            : Effect.void,
+        ),
+        Effect.retry({ times: consumeAttempts - 1, while: lockedBeforeBegin }),
+        Effect.catch((error) =>
+          Effect.die(
+            lockedBeforeBegin(error)
+              ? new ConsumeLockedError({
+                  sessionID,
+                  attempts,
+                  message: `SessionQueue.consume could not take the database write lock in ${attempts} attempts; session ${sessionID} stopped, and its queued prompts stay pending until it is prompted again`,
+                })
+              : error,
+          ),
+        ),
       )
     })
 
