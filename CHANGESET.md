@@ -69,6 +69,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#202** Recover a consume that meets a held write lock (swxtchio/swx-opencode#167, #180): `SessionQueue.consume` re-attempts a consume whose write never began, up to 5 attempts, each with a 10 s acquisition backstop, then ends the run with `SessionQueueConsumeLockedError` and keeps the queued prompts for the next one. No transaction body is replayed. _Fork-only._
 - **#201** Log SQLite write-lock holds and lock-stop call sites, diagnostics only (firstmate task
   opencode-stop-instrument-180, follows #194): an immediate transaction holding the write lock over 250 ms logs its
   pid, purpose and duration; a lock failure leaving the retry gate logs one summary with the statement head, attempts,
