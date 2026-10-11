@@ -1082,7 +1082,11 @@ describe("SessionV2.wait", () => {
       const failedAssistant = (yield* session.messages({ sessionID })).find(
         (message): message is SessionMessage.Assistant => message.type === "assistant",
       )
-      expect(failed).toEqual({ type: "failed", admittedSeq: first.admittedSeq, assistantMessageID: failedAssistant?.id })
+      expect(failed).toEqual({
+        type: "failed",
+        admittedSeq: first.admittedSeq,
+        assistantMessageID: failedAssistant?.id,
+      })
       expect(Array.from(yield* session.active)).toEqual([])
 
       const second = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Prompt after the failure" }) })
@@ -1133,7 +1137,10 @@ describe("SessionV2.wait", () => {
         assistantMessageID: interruptedAssistant?.id,
       })
 
-      const second = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Prompt after the interruption" }) })
+      const second = yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Prompt after the interruption" }),
+      })
       const result = yield* session.wait(sessionID)
       const answered = (yield* session.messages({ sessionID })).find(
         (message): message is SessionMessage.Assistant =>
