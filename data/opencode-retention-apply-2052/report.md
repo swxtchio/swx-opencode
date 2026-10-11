@@ -94,10 +94,21 @@ and re-run green.
     names no holder, an unregistered holder then opens the store, and the batch refuses with unchanged bytes.
   - "a holder whose descriptors cannot be read is still found through its SQLite lock in /proc/locks": the holder
     makes itself non-dumpable, so its descriptors cannot be listed, and the scan still names it.
+  - "a holder admitted while the batch waits on a contended BEGIN IMMEDIATE refuses it before any write"
+    (swxtchio/swx-opencode#226). It uses only positive readiness signals:
+    1. A registered contender process that has written no Session holds BEGIN IMMEDIATE and reports `ready`.
+    2. The batch's database handle writes a signal file at the instant it issues BEGIN IMMEDIATE, after every
+       pre-lock step.
+    3. Only then does the contender admit a new unregistered holder. It reports `holder <pid>` once that holder is
+       ready, and only then releases the lock (`released`).
+
+    So the holder arrives after anything a pre-lock step could scan, and before the batch can hold the lock. The
+    batch refuses with `database-holder-appeared-after-scan:<pid>` and unchanged bytes. With the rescan moved to just
+    after `input.evidence`, only this test fails (RP33).
   - "dry run names pending, unfinished, workspace-owned, receipt, and unreadable proofs".
 - Core test: `packages/core/test/event.test.ts` › "records this process as the writer of every committed durable
   append, and nothing for a fenced one".
-- Red proofs: RP1, RP2, RP5, RP6, RP7, RP10, RP12, RP21, RP22, RP23, RP24 and RP25.
+- Red proofs: RP1, RP2, RP5, RP6, RP7, RP10, RP12, RP21, RP22, RP23, RP24, RP25 and RP33.
 
 ### 3. Content removed, metrics retained exactly — verified at the existing boundary
 
@@ -163,9 +174,11 @@ and re-run green.
   `packages/client` regenerates unchanged.
 - `/sync/replay` onto a redacted aggregate stays refused ("refuses sync replay onto a redacted aggregate without
   changing its rows").
-- Tests in `packages/opencode/test/server/httpapi-sync.test.ts`. The first four use one Session pruned by a real
-  retention apply and one kept peer, each across three payloads (the pruned Session omitted, listed past its first
-  event, and listed at its last sequence):
+- Tests in `packages/opencode/test/server/httpapi-sync.test.ts` exercise marker-driven exclusion, not an applied
+  store. `applyRetentionFixtures` runs a real retention apply on an in-memory copy and copies only the markers it
+  wrote back into the served store, whose rows stay unredacted, so the reader must exclude them by marker alone. The
+  first four tests use one such pruned Session and one kept peer, each across three payloads (the pruned Session
+  omitted, listed past its first event, and listed at its last sequence):
   - "a history request touching a pruned Session returns 200 with the other Sessions' events".
   - "a pruned Session contributes no events to sync history, and its rows are never read": the pruned rows are made
     undecodable first, and the request still succeeds without them.
@@ -173,19 +186,39 @@ and re-run green.
     Session, not the kept one, and no held Session inside a range is unpruned.
   - "sync history keeps its bare event array body when a Session is pruned": an array of rows with exactly
     `aggregate_id`, `data`, `id`, `seq`, `type`, equal to the unpruned rows past each cursor.
-  - "a standard HTTP client syncs a high-cardinality pruned history without response-header overflow": 700 Sessions,
-    550 of them pruned through a real retention apply (150 interleaved with kept ones, 400 contiguous). Node's
-    `http` client, with its default 16 KiB header limit, posts over TCP to the real Node HTTP server that serves the
-    app. The response is 200 with exactly the kept Sessions' events in a bare array. The header line fits 2048
-    bytes, its ranges ascend, cover the 400 contiguous Sessions, and cover no kept or other unpruned held Session.
+  - "a standard HTTP client syncs a high-cardinality pruned history without response-header overflow"
+    (swxtchio/swx-opencode#224): 700 Sessions, 550 of them pruned by marker (150 interleaved with kept ones, 400
+    contiguous). Node's `http` client, with its default 16 KiB header limit, posts over TCP to the real Node HTTP
+    server that serves the app. The response is 200 with exactly the kept Sessions' events in a bare array. The
+    header line fits 2048 bytes, and its ranges ascend, cover the 400 contiguous Sessions, and cover no kept or other
+    unpruned held Session. The header is truncated, yet every pruned Session it leaves out is still absent from the
+    body: truncation does not change exclusion (RP36).
+  - "pruned rows stay excluded with more pruned Sessions than SQLite binds parameters": the pruned Session's real
+    marker, sequence and event rows are copied under 250,100 more aggregate IDs, more than the 250,000 bound
+    parameters Bun's SQLite accepts in one statement. Every payload still returns exactly the kept peer's events.
+    Binding the pruned IDs as a list fails with `too many SQL variables` (RP34); the subquery binds none.
+  - "an allowed cross-origin browser client can read the X-Pruned-Sessions header" (swxtchio/swx-opencode#225): with
+    `Origin: http://localhost:3000` the response allows that origin and lists `X-Pruned-Sessions` in
+    `Access-Control-Expose-Headers`, which the history handler sets alongside the header itself, as the session
+    messages handler does for `Link` and `X-Next-Cursor`. Effect's CORS middleware exposes nothing by default (RP35).
 - The retention test fixture (`test/fixture/session-retention.ts`) now prunes many Sessions in one pass, on an
   in-memory copy of the store, so pruning 550 takes seconds rather than paying a procfs holder scan per batch. The
   apply code is unchanged.
-- Red proofs: RP27 to RP29 (decision 1), rerun against the range implementation, and RP30 to RP32.
+- Red proofs: RP27 to RP29 (decision 1), rerun against the range implementation, and RP30 to RP32 and RP34 to RP36.
+- The missing-sequence sentinel (`seq ?? -1` for a marker without a sequence row) left with the per-Session
+  sequence; the range contract carries no sequence.
 - Still refused: `readerContract` evidence is absent in production, so every tree refuses with
   `reader-contract-unreviewed`. Supplying it would change the production refusal, which neither decision allows.
-- Not done, not required: `Workspace.syncHistory`, the in-repo client of this route, ignores the header. A workspace
-  that already holds a pruned Session gets no events for it and is not told it was pruned.
+- Workspace consumer (swxtchio/swx-opencode#223): `Workspace.syncHistory` is compatible with the range contract. It
+  gets 200, replays retained events, deletes nothing and claims nothing about completeness. Before decision 1 the
+  same request failed and its loop retried. Every real use of the header changes cached Session state, so no code
+  change was made. The policy fork is on #223 (comment 6115259788):
+  - A: an advisory durable "source pruned" mark (recommended once enablement nears).
+  - B: redacting the cached copy, which needs authorization because it deletes content.
+  - C: leaving it as is.
+
+  Whether to warp a source-pruned Session belongs to the same fork.
+- Publication: the PR's `CHANGESET.md` entry is added once its number exists.
 
 ### 6. Literal `v2-input-promoted-row-present` — kept
 
@@ -270,6 +303,10 @@ and re-run green.
 | Header bound, `packages/opencode`: `bun test test/server/httpapi-session.test.ts -t redacted` | 1 pass |
 | Header bound, `packages/opencode`: `bun test test/control-plane/workspace.test.ts -t redacted` | 1 pass |
 | Header bound, `packages/opencode`: `bun typecheck` | clean |
+| Round-1 review fixes, `packages/opencode`: `bun test test/server/httpapi-sync.test.ts` | 10 pass, 0 fail, 1 skipped |
+| Round-1 review fixes, `packages/opencode`: `bun test test/cli/db/retention.test.ts` | 31 pass, 0 fail |
+| Round-1 review fixes, `packages/opencode`: session, workspace and session-HTTP redacted-retention tests | 4, 1 and 1 pass |
+| Round-1 review fixes, `packages/opencode`: `bun typecheck` | clean |
 | Decision 1, `packages/opencode`: `bun test test/control-plane/workspace.test.ts -t "redacted"` | 1 pass |
 | Decision 1, `packages/opencode`: `bun test test/server/httpapi-session.test.ts -t "redacted aggregate before returning content"` | 1 pass |
 | Decision 1, `packages/core` and `packages/opencode`: `bun typecheck` | clean |
@@ -316,6 +353,10 @@ restored from a byte copy, with `git status` clean afterwards.
 | RP30 | complete enumeration restored (a JSON object of every pruned Session) | high-cardinality test fails: Node's client reports `HPE_HEADER_OVERFLOW Parse Error: Header overflow` |
 | RP31 | header budget removed | 7 pass, 1 fail: the high-cardinality test, a 4,733-byte header line |
 | RP32 | runs allowed to span unpruned Sessions | 6 pass, 2 fail: the range header test and the high-cardinality test, a kept Session covered |
+| RP33 | holder rescan moved to just after `input.evidence`, before BEGIN IMMEDIATE (#226 mutant) | `retention.test.ts` 30 pass, 1 fail: only the contended BEGIN IMMEDIATE test |
+| RP34 | pruned IDs bound as a list instead of the subquery | `httpapi-sync.test.ts` 9 pass, 1 fail: the parameter-limit test, `SQLiteError: too many SQL variables` |
+| RP35 | `Access-Control-Expose-Headers` not set | the cross-origin test 0 pass, 1 fail |
+| RP36 | exclusion limited to the first 100 pruned Sessions, like a bounded notification | the high-cardinality test 0 pass, 1 fail |
 
 ## Measured selection on the live store (read-only, 2026-10-11T20:23:44Z)
 
