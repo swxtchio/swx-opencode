@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process"
 import { Database } from "bun:sqlite"
 import { Context, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { mkdtemp, readFile, rm, stat, statfs, symlink, writeFile } from "node:fs/promises"
+import { chmod, mkdtemp, readFile, rm, stat, statfs, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { eq } from "drizzle-orm"
 import { Service, layerFromPath } from "@opencode-ai/core/database/database"
@@ -15,8 +15,10 @@ import {
   apply,
   compactRestoreFixture,
   createFixtureDatabase,
+  inactivityPolicy,
   inventory,
   RetentionCommand,
+  scanDatabaseHolders,
   type RetentionEvidence,
   type SqliteAccess,
 } from "@/cli/cmd/db-retention"
@@ -73,15 +75,17 @@ function createSchema(db: Database) {
     CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, owner_id TEXT);
     CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL);
     CREATE TABLE event_retention (aggregate_id TEXT PRIMARY KEY, state TEXT NOT NULL, progress_table TEXT, progress_id TEXT, evidence TEXT NOT NULL, time_started INTEGER NOT NULL, time_updated INTEGER NOT NULL);
-    CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, data TEXT NOT NULL);
-    CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, data TEXT NOT NULL);
-    CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL);
-    CREATE TABLE session_input (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, promoted_seq INTEGER, prompt TEXT NOT NULL);
+    CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL DEFAULT 10, time_updated INTEGER NOT NULL DEFAULT 10, data TEXT NOT NULL);
+    CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER NOT NULL DEFAULT 10, time_updated INTEGER NOT NULL DEFAULT 10, data TEXT NOT NULL);
+    CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'assistant', seq INTEGER NOT NULL, time_created INTEGER NOT NULL DEFAULT 10, time_updated INTEGER NOT NULL DEFAULT 10, data TEXT NOT NULL);
+    CREATE TABLE session_input (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, promoted_seq INTEGER, prompt TEXT NOT NULL, time_created INTEGER NOT NULL DEFAULT 10);
     CREATE TABLE session_context_epoch (session_id TEXT PRIMARY KEY, baseline TEXT NOT NULL, snapshot TEXT NOT NULL);
-    CREATE TABLE session_prompt_queue (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, input TEXT NOT NULL);
+    CREATE TABLE session_prompt_queue (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, input TEXT NOT NULL, time_created INTEGER NOT NULL DEFAULT 10, time_promoted INTEGER, time_withdrawn INTEGER);
     CREATE TABLE session_prompt_queue_sequence (session_id TEXT PRIMARY KEY, seq INTEGER NOT NULL);
-    CREATE TABLE todo (session_id TEXT NOT NULL, position INTEGER NOT NULL, content TEXT NOT NULL);
-    CREATE TABLE session_share (session_id TEXT PRIMARY KEY, id TEXT NOT NULL, secret TEXT NOT NULL, url TEXT NOT NULL);
+    CREATE TABLE todo (session_id TEXT NOT NULL, position INTEGER NOT NULL, content TEXT NOT NULL, time_created INTEGER NOT NULL DEFAULT 10, time_updated INTEGER NOT NULL DEFAULT 10);
+    CREATE TABLE session_share (session_id TEXT PRIMARY KEY, id TEXT NOT NULL, secret TEXT NOT NULL, url TEXT NOT NULL, time_created INTEGER NOT NULL DEFAULT 10, time_updated INTEGER NOT NULL DEFAULT 10);
+    CREATE TABLE event_writer_process (writer_id TEXT PRIMARY KEY, pid INTEGER NOT NULL, boot_id TEXT, start_ticks TEXT, time_registered INTEGER NOT NULL);
+    CREATE TABLE event_aggregate_writer (aggregate_id TEXT NOT NULL, writer_id TEXT NOT NULL, time_last_append INTEGER NOT NULL, PRIMARY KEY (aggregate_id, writer_id));
   `)
 }
 
@@ -100,7 +104,14 @@ async function fileSnapshot(filename: string) {
   return { bytes, device: file.dev, inode: file.ino, size: file.size }
 }
 
-const evidence = (sessionIDs: string[], finalSequence: Record<string, number>, now = 1_000): RetentionEvidence => ({
+// Every fixture row is timestamped 10 ms after the epoch, so NOW is just past the inactivity window.
+const NOW = inactivityPolicy.windowMs + 1_000
+
+const evidence = (
+  sessionIDs: string[],
+  finalSequence: Record<string, number>,
+  filename = ":memory:",
+): RetentionEvidence => ({
   customerBinding: {
     proofID: "fixture-unbound-session-classification",
     durable: true,
@@ -108,24 +119,8 @@ const evidence = (sessionIDs: string[], finalSequence: Record<string, number>, n
     customerBoundSessionIDs: [],
     nonCustomerSessionIDs: sessionIDs,
   },
-  policy: {
-    reviewed: true,
-    cutoffEpochMs: 100,
-    reviewedReference: "swxtchio/swx-opencode#97",
-    policyDigest: "fixture-policy-digest",
-    readerContractReviewed: true,
-    readerContractID: "fixture-reader-contract",
-  },
-  liveness: {
-    proofID: "fixture-live-snapshot",
-    observedAtEpochMs: now - 1,
-    sessionIDs,
-    aggregateOwners: Object.fromEntries(sessionIDs.map((id) => [id, null])),
-    servingProcesses: [],
-    canResume: false,
-    unfinishedOwnedWork: false,
-    validThroughEpochMs: now + 10_000,
-  },
+  readerContract: { reviewed: true, id: "fixture-reader-contract" },
+  holders: scanDatabaseHolders(filename),
   handoff: {
     receiptID: "fixture-firstmate-receipt",
     durable: true,
@@ -165,6 +160,7 @@ function addCopies(db: Database, sessionID: string) {
     sessionID,
     JSON.stringify({
       role: "assistant",
+      time: { created: 10, completed: 11 },
       providerID: "provider-a",
       modelID: "requested-model",
       responseModelIDs: ["served-a", "served-b"],
@@ -192,6 +188,7 @@ function addCopies(db: Database, sessionID: string) {
     sessionID,
     JSON.stringify({
       role: "assistant",
+      time: { created: 10, completed: 11 },
       providerID: "provider-a",
       modelID: "requested-model",
       responseModelIDs: ["served-a"],
@@ -229,7 +226,7 @@ test("best-effort inventory does not open a read transaction", () => {
       },
     })
 
-    const result = inventory(observed, {}, 1_000, { transactional: false })
+    const result = inventory(observed, {}, NOW, { transactional: false })
 
     expect(transactions).toBe(0)
     expect(result.trees[0]?.eligible).toBe(false)
@@ -239,7 +236,7 @@ test("best-effort inventory does not open a read transaction", () => {
   }
 })
 
-test("retention CLI keeps inventory read-only and refuses apply before opening the database", async () => {
+test("retention CLI keeps inventory read-only and refuses apply before any write when no tree passes every gate", async () => {
   await using fixtureDB = await createFixtureDatabase()
   createSchema(fixtureDB.db)
   session(fixtureDB.db, "ses_cli", 10)
@@ -256,9 +253,12 @@ test("retention CLI keeps inventory read-only and refuses apply before opening t
     await RetentionCommand.handler({ _: [], $0: "test", apply: false })
     const dryRun = JSON.parse(String(output.mock.calls[0]?.[0])) as ReturnType<typeof inventory>
     expect(dryRun.trees[0]?.eligible).toBe(false)
-    expect(dryRun.trees[0]?.reasons).toContain("reviewed-age-boundary-unavailable")
-    expect(dryRun.trees[0]?.reasons).toContain("cross-process-liveness-proof-unavailable")
-    expect(dryRun.trees[0]?.reasons).toContain("event-payload-ownership-proof-unavailable:ses_cli")
+    expect(dryRun.trees[0]?.reasons).toEqual([
+      "customer-session-classification-unavailable",
+      "event-payload-ownership-proof-unavailable:ses_cli",
+      "measurement-handoff-receipt-unavailable",
+      "reader-contract-unreviewed",
+    ])
     expect(transaction).not.toHaveBeenCalled()
 
     const before = new Database(fixtureDB.filename, { readonly: true })
@@ -301,7 +301,7 @@ test("dry run reports exact trees and refusals without changing SQLite", () => {
     const before = db.serialize()
 
     const proof = evidence(["ses_child", "ses_parent"], { ses_child: -1, ses_parent: 0 })
-    const dryRun = inventory(access(db), proof, 1_000)
+    const dryRun = inventory(access(db), proof, NOW)
 
     expect(dryRun.unknownAggregates).toEqual(["unknown-aggregate"])
     expect(dryRun.trees[0]).toMatchObject({
@@ -321,77 +321,63 @@ test("dry run reports exact trees and refusals without changing SQLite", () => {
     })
     expect(db.serialize().equals(before)).toBe(true)
 
-    const failedProof = evidence(["ses_child", "ses_parent"], { ses_child: -1, ses_parent: 0 })
-    const refused = inventory(
-      access(db),
-      {
-        ...failedProof,
-        liveness: { ...failedProof.liveness!, servingProcesses: ["opencode:pid-1"] },
-      },
-      1_000,
-    )
-    expect(refused.trees[0]?.reasons).toContain("serving-process-owns-session")
+    const refused = inventory(access(db), { ...proof, holders: { state: "unreadable", reason: "fixture" } }, NOW)
+    expect(refused.trees[0]?.reasons).toContain("database-holder-scan-unreadable:fixture")
     expect(db.serialize().equals(before)).toBe(true)
   } finally {
     db.close()
   }
 })
 
-test("dry run names stale, unfinished, pending, owner-conflict, cutoff, and unreadable proofs", () => {
+test("dry run names pending, unfinished, workspace-owned, receipt, and unreadable proofs", () => {
   const db = fixture()
   try {
     session(db, "ses_old", 10)
-    session(db, "ses_new", 200)
     event(db, "ses_old")
     db.query("INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES ('ses_orphan', 0, 'owner-a')").run()
     const valid = evidence(["ses_old"], { ses_old: 0 })
-    const stale = inventory(access(db), { ...valid, liveness: { ...valid.liveness!, validThroughEpochMs: 999 } }, 1_000)
-    expect(stale.trees.find((item) => item.rootSessionID === "ses_old")?.reasons).toContain(
-      "cross-process-liveness-proof-stale",
-    )
-    expect(stale.unknownAggregates).toContain("ses_orphan")
+    const reasons = () => inventory(access(db), valid, NOW).trees.find((item) => item.rootSessionID === "ses_old")!.reasons
+    expect(reasons()).toEqual([])
+    expect(inventory(access(db), valid, NOW).unknownAggregates).toContain("ses_orphan")
 
-    const unfinished = inventory(
-      access(db),
-      { ...valid, liveness: { ...valid.liveness!, unfinishedOwnedWork: true } },
-      1_000,
+    db.query(
+      "INSERT INTO message (id, session_id, data) VALUES ('msg_running', 'ses_old', ?)",
+    ).run(JSON.stringify({ role: "assistant", time: { created: 10 } }))
+    expect(reasons()).toContain("unfinished-assistant-message:ses_old")
+    db.query("DELETE FROM message").run()
+    db.query("INSERT INTO session_message (id, session_id, type, seq, data) VALUES ('v2_running', 'ses_old', 'assistant', 1, ?)").run(
+      JSON.stringify({ time: { created: 10 } }),
     )
-    expect(unfinished.trees.find((item) => item.rootSessionID === "ses_old")?.reasons).toContain(
-      "unfinished-owned-work",
-    )
+    expect(reasons()).toContain("unfinished-assistant-message:ses_old")
+    db.query("DELETE FROM session_message").run()
 
     db.query(
       "INSERT INTO session_input (id, session_id, promoted_seq, prompt) VALUES ('pending', 'ses_old', NULL, '{}')",
     ).run()
-    const queued = inventory(access(db), valid, 1_000)
-    expect(queued.trees.find((item) => item.rootSessionID === "ses_old")?.reasons).toContain("v2-input-pending")
+    expect(reasons()).toContain("v2-input-pending")
     db.query("DELETE FROM session_input").run()
+    db.query("INSERT INTO session_prompt_queue (id, session_id, input) VALUES ('queued', 'ses_old', '{}')").run()
+    expect(reasons()).toContain("v1-prompt-queue-row-present")
+    db.query("DELETE FROM session_prompt_queue").run()
 
     db.query("UPDATE event_sequence SET owner_id = 'owner-a' WHERE aggregate_id = 'ses_old'").run()
-    const ownerConflict = inventory(access(db), valid, 1_000)
-    expect(ownerConflict.trees.find((item) => item.rootSessionID === "ses_old")?.reasons).toContain(
-      "cross-process-aggregate-owner-snapshot-mismatch:ses_old",
-    )
+    expect(reasons()).toContain("session-owned-by-workspace:ses_old")
     db.query("UPDATE event_sequence SET owner_id = NULL WHERE aggregate_id = 'ses_old'").run()
 
     const staleReceipt = inventory(
       access(db),
       { ...valid, handoff: { ...valid.handoff!, finalSequence: { ses_old: -1 } } },
-      1_000,
+      NOW,
     )
     expect(staleReceipt.trees.find((item) => item.rootSessionID === "ses_old")?.reasons).toContain(
       "measurement-handoff-does-not-cover-final-write:ses_old",
     )
 
-    const newer = inventory(access(db), { ...valid, policy: { ...valid.policy!, cutoffEpochMs: 50 } }, 1_000)
-    expect(newer.trees.find((item) => item.rootSessionID === "ses_new")?.reasons).toContain(
-      "session-after-reviewed-cutoff:ses_new",
-    )
-
-    const unreadable = inventory(access(db), { ...valid, evidenceError: "receipt store unavailable" }, 1_000)
+    const unreadable = inventory(access(db), { ...valid, evidenceError: "receipt store unavailable" }, NOW)
     expect(unreadable.trees.find((item) => item.rootSessionID === "ses_old")?.reasons).toContain(
       "evidence-unreadable:receipt store unavailable",
     )
+    expect(reasons()).toEqual([])
   } finally {
     db.close()
   }
@@ -403,13 +389,13 @@ test("a missing measurement receipt refuses an otherwise proven tree without cha
     session(db, "ses_old", 10)
     event(db, "ses_old")
     const valid = evidence(["ses_old"], { ses_old: 0 })
-    const tree = inventory(access(db), valid, 1_000).trees[0]!
-    const noReceipt = { policy: valid.policy, liveness: valid.liveness }
+    const tree = inventory(access(db), valid, NOW).trees[0]!
+    const noReceipt = { ...valid, handoff: undefined }
     const before = db.serialize()
 
-    const dryRun = inventory(access(db), noReceipt, 1_000)
+    const dryRun = inventory(access(db), noReceipt, NOW)
     expect(dryRun.trees[0]?.reasons).toContain("measurement-handoff-receipt-unavailable")
-    const result = apply(access(db), { tree, evidence: () => noReceipt, now: () => 1_000 })
+    const result = apply(access(db), { tree, evidence: () => noReceipt, now: () => NOW })
 
     expect(result.state).toBe("refused")
     expect(result.changedRows).toBe(0)
@@ -434,14 +420,14 @@ test("customer-bound and unclassified Session trees remain ineligible", () => {
         nonCustomerSessionIDs: [],
       },
     }
-    const boundTree = inventory(access(db), customerBound, 1_000).trees[0]!
+    const boundTree = inventory(access(db), customerBound, NOW).trees[0]!
     expect(boundTree.reasons).toContain("customer-bound-session-retention-workflow-unapproved:ses_customer")
-    const refused = apply(access(db), { tree: boundTree, evidence: () => customerBound, now: () => 1_000 })
+    const refused = apply(access(db), { tree: boundTree, evidence: () => customerBound, now: () => NOW })
     expect(refused.state).toBe("refused")
     expect(refused.changedRows).toBe(0)
     expect(db.serialize().equals(before)).toBe(true)
 
-    const unknown = inventory(access(db), { ...valid, customerBinding: undefined }, 1_000)
+    const unknown = inventory(access(db), { ...valid, customerBinding: undefined }, NOW)
     expect(unknown.trees[0]?.reasons).toContain("customer-session-classification-unavailable")
     expect(db.serialize().equals(before)).toBe(true)
   } finally {
@@ -459,14 +445,14 @@ test("unknown event ownership, malformed event data, and new Session tables rema
       "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES ('evt_unknown', 'ses_old', 1, 'future.event.1', ?)",
     ).run(JSON.stringify({ sessionID: "ses_old", text: "future event sentinel" }))
     const proof = evidence(["ses_old"], { ses_old: 1 })
-    const unknownEvent = inventory(access(db), proof, 1_000)
+    const unknownEvent = inventory(access(db), proof, NOW)
     expect(unknownEvent.trees[0]?.reasons).toContain("event-aggregate-owner-unknown:ses_old:future.event.1")
 
     db.query("DELETE FROM event WHERE id = 'evt_unknown'").run()
     db.query(
       "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES ('evt_invalid_json', 'ses_old', 1, 'session.next.context.updated.1', 'not-json')",
     ).run()
-    const unreadableEvent = inventory(access(db), proof, 1_000)
+    const unreadableEvent = inventory(access(db), proof, NOW)
     expect(unreadableEvent.trees[0]?.reasons).toContain("event-data-unreadable:ses_old")
 
     db.exec("CREATE TABLE future_session_copy (session_id TEXT NOT NULL, content TEXT NOT NULL)")
@@ -475,7 +461,7 @@ test("unknown event ownership, malformed event data, and new Session tables rema
     db.query(
       "INSERT INTO future_event_copy (aggregate_id, content) VALUES ('ses_old', 'unclassified event sentinel')",
     ).run()
-    const unknownCopy = inventory(access(db), proof, 1_000)
+    const unknownCopy = inventory(access(db), proof, NOW)
     expect(unknownCopy.refusals).toContain("unclassified-session-owned-table:future_session_copy")
     expect(unknownCopy.refusals).toContain("unclassified-session-owned-table:future_event_copy")
     expect(unknownCopy.trees[0]?.eligible).toBe(false)
@@ -492,8 +478,8 @@ test("apply redacts every copy in restartable batches and preserves metric value
   event(first, "ses_old")
   addCopies(first, "ses_old")
   const exportBefore = readExport(first)
-  const proof = evidence(["ses_old"], { ses_old: 0 })
-  const initial = inventory(access(first), proof, 1_000)
+  const proof = evidence(["ses_old"], { ses_old: 0 }, fixtureDB.filename)
+  const initial = inventory(access(first), proof, NOW)
   expect(initial.trees[0]?.eligible).toBe(true)
   const metricSnapshot = [
     JSON.parse(
@@ -515,7 +501,7 @@ test("apply redacts every copy in restartable batches and preserves metric value
   const firstBatch = apply(access(first), {
     tree: initial.trees[0]!,
     evidence: () => proof,
-    now: () => 1_000,
+    now: () => NOW,
     batchSize: 1,
     maxBatches: 1,
   })
@@ -531,7 +517,7 @@ test("apply redacts every copy in restartable batches and preserves metric value
     const result = apply(access(resumed), {
       tree: initial.trees[0]!,
       evidence: () => proof,
-      now: () => 1_000,
+      now: () => NOW,
       batchSize: 1,
     })
     expect(result.state).toBe("complete")
@@ -647,119 +633,52 @@ test("failed apply evidence refuses before any row changes", () => {
     event(db, "ses_old")
     addCopies(db, "ses_old")
     const valid = evidence(["ses_old"], { ses_old: 0 })
-    const candidate = inventory(access(db), valid, 1_000).trees[0]!
+    const candidate = inventory(access(db), valid, NOW).trees[0]!
     const before = db.serialize()
 
-    const result = apply(access(db), { tree: candidate, evidence: () => ({}), now: () => 1_000 })
+    const result = apply(access(db), { tree: candidate, evidence: () => ({}), now: () => NOW })
 
     expect(result.state).toBe("refused")
     expect(result.changedRows).toBe(0)
-    expect(result.reasons.join("\n")).toContain("reviewed-age-boundary-unavailable")
+    expect(result.reasons.join("\n")).toContain("measurement-handoff-receipt-unavailable")
     expect(db.serialize().equals(before)).toBe(true)
   } finally {
     db.close()
   }
 })
 
-test("apply is unavailable for database files outside the isolated fixture directory", async () => {
-  const filename = path.join(process.cwd(), `.retention-nonfixture-${process.pid}.sqlite`)
+test("apply on a database outside the fixture factory requires a holder scan of that exact file", async () => {
+  await using tmp = await tmpdir()
+  // The production data directory admits only its owner, which the holder scan requires.
+  await chmod(tmp.path, 0o700)
+  const filename = path.join(tmp.path, "production-shaped.sqlite")
   const db = new Database(filename)
   try {
     createSchema(db)
     session(db, "ses_old", 10)
     event(db, "ses_old")
-    const valid = evidence(["ses_old"], { ses_old: 0 })
-    const tree = inventory(access(db), valid, 1_000).trees[0]!
+    const valid = evidence(["ses_old"], { ses_old: 0 }, filename)
+    const tree = inventory(access(db), valid, NOW).trees[0]!
+    expect(tree.reasons).toEqual([])
+    const before = db.serialize()
 
-    const result = apply(access(db), { tree, evidence: () => valid, now: () => 1_000 })
+    const otherFile = { ...valid, holders: scanDatabaseHolders(":memory:") }
+    const mismatched = apply(access(db), { tree, evidence: () => otherFile, now: () => NOW })
+    expect(mismatched.state).toBe("refused")
+    expect(mismatched.changedRows).toBe(0)
+    expect(mismatched.reasons).toContain("database-holder-scan-target-mismatch")
+    expect(db.serialize().equals(before)).toBe(true)
 
-    expect(result.state).toBe("refused")
-    expect(result.changedRows).toBe(0)
-    expect(result.reasons).toContain("apply-only-supported-for-isolated-fixtures")
-    expect(db.query("SELECT state FROM event_retention").get()).toBeNull()
+    const result = apply(access(db), { tree, evidence: () => valid, now: () => NOW })
+    expect(result.state).toBe("complete")
+    expect(db.query("SELECT state FROM event_retention").get()).toEqual({ state: "complete" })
     expect(
       db.query<{ data: string }, []>("SELECT data FROM event WHERE aggregate_id = 'ses_old'").get()?.data,
-    ).toContain("event sentinel")
+    ).not.toContain("event sentinel")
   } finally {
     db.close()
-    await rm(filename, { force: true })
   }
 })
-
-test(
-  "apply refuses a temporary symlink to a database target without altering it",
-  async () => {
-    await using linkRoot = await tmpdir()
-    const targetDirectory = await mkdtemp(path.join(process.cwd(), ".retention-identity-target-"))
-    const targetFilename = path.join(targetDirectory, "target.sqlite")
-    const aliasFilename = path.join(linkRoot.path, "alias.sqlite")
-    const target = new Database(targetFilename)
-    createSchema(target)
-    session(target, "ses_symlink", 10)
-    event(target, "ses_symlink")
-    const proof = evidence(["ses_symlink"], { ses_symlink: 0 })
-    target.close()
-    try {
-      await symlink(targetFilename, aliasFilename)
-      const alias = new Database(aliasFilename)
-      try {
-        const tree = inventory(access(alias), proof, 1_000).trees[0]!
-        expect(tree.eligible).toBe(true)
-        const before = alias.serialize()
-        const result = apply(access(alias), { tree, evidence: () => proof, now: () => 1_000 })
-        expect(result.state).toBe("refused")
-        expect(result.changedRows).toBe(0)
-        expect(result.reasons).toContain("apply-only-supported-for-isolated-fixtures")
-        expect(alias.serialize().equals(before)).toBe(true)
-      } finally {
-        alias.close()
-      }
-      const reopened = new Database(targetFilename, { readonly: true })
-      try {
-        expect(
-          reopened.query<{ data: string }, [string]>("SELECT data FROM event WHERE aggregate_id = ?").get("ses_symlink")
-            ?.data,
-        ).toContain("event sentinel")
-        expect(reopened.query("SELECT state FROM event_retention").get()).toBeNull()
-      } finally {
-        reopened.close()
-      }
-    } finally {
-      await rm(targetDirectory, { recursive: true, force: true })
-    }
-  },
-  { timeout: 10_000 },
-)
-
-test(
-  "apply refuses an unowned regular temporary database without altering it",
-  async () => {
-    await using tmp = await tmpdir()
-    const filename = path.join(tmp.path, "unowned.sqlite")
-    const db = new Database(filename)
-    createSchema(db)
-    session(db, "ses_unowned", 10)
-    event(db, "ses_unowned")
-    const proof = evidence(["ses_unowned"], { ses_unowned: 0 })
-    try {
-      const tree = inventory(access(db), proof, 1_000).trees[0]!
-      expect(tree.eligible).toBe(true)
-      const before = db.serialize()
-      const result = apply(access(db), { tree, evidence: () => proof, now: () => 1_000 })
-      expect(result.state).toBe("refused")
-      expect(result.changedRows).toBe(0)
-      expect(result.reasons).toContain("apply-only-supported-for-isolated-fixtures")
-      expect(db.serialize().equals(before)).toBe(true)
-      expect(
-        db.query<{ data: string }, [string]>("SELECT data FROM event WHERE aggregate_id = ?").get("ses_unowned")?.data,
-      ).toContain("event sentinel")
-      expect(db.query("SELECT state FROM event_retention").get()).toBeNull()
-    } finally {
-      db.close()
-    }
-  },
-  { timeout: 10_000 },
-)
 
 test(
   "compaction refuses a temporary database not issued by the fixture factory",
@@ -915,13 +834,13 @@ test("apply revalidates evidence inside every batch and keeps partial history un
     event(db, "ses_old")
     addCopies(db, "ses_old")
     const valid = evidence(["ses_old"], { ses_old: 0 })
-    const tree = inventory(access(db), valid, 1_000).trees[0]!
+    const tree = inventory(access(db), valid, NOW).trees[0]!
     const proofs = [valid, { ...valid, evidenceError: "liveness source stopped responding" }]
 
     const result = apply(access(db), {
       tree,
       evidence: () => proofs.shift() ?? {},
-      now: () => 1_000,
+      now: () => NOW,
       batchSize: 1,
     })
 
@@ -945,12 +864,12 @@ test("apply refuses aggregate-owner changes after inventory before changing rows
     session(db, "ses_owner", 10)
     event(db, "ses_owner")
     const proof = evidence(["ses_owner"], { ses_owner: 0 })
-    const tree = inventory(access(db), proof, 1_000).trees[0]!
+    const tree = inventory(access(db), proof, NOW).trees[0]!
     expect(tree.eligible).toBe(true)
     db.query("UPDATE event_sequence SET owner_id = 'new-owner' WHERE aggregate_id = 'ses_owner'").run()
     const before = db.serialize()
 
-    const result = apply(access(db), { tree, evidence: () => proof, now: () => 1_000 })
+    const result = apply(access(db), { tree, evidence: () => proof, now: () => NOW })
 
     expect(result.state).toBe("refused")
     expect(result.changedRows).toBe(0)
@@ -967,13 +886,13 @@ test("apply refuses a newly added session-owned raw table before changing rows",
     session(db, "ses_schema", 10)
     event(db, "ses_schema")
     const proof = evidence(["ses_schema"], { ses_schema: 0 })
-    const tree = inventory(access(db), proof, 1_000).trees[0]!
+    const tree = inventory(access(db), proof, NOW).trees[0]!
     expect(tree.eligible).toBe(true)
     db.exec("CREATE TABLE future_session_copy (session_id TEXT NOT NULL, body TEXT NOT NULL)")
     db.query("INSERT INTO future_session_copy VALUES ('ses_schema', 'new raw sentinel')").run()
     const before = db.serialize()
 
-    const result = apply(access(db), { tree, evidence: () => proof, now: () => 1_000 })
+    const result = apply(access(db), { tree, evidence: () => proof, now: () => NOW })
 
     expect(result.state).toBe("refused")
     expect(result.changedRows).toBe(0)
@@ -990,12 +909,12 @@ test("apply refuses event data corruption after inventory before changing rows",
     session(db, "ses_event", 10)
     event(db, "ses_event")
     const proof = evidence(["ses_event"], { ses_event: 0 })
-    const tree = inventory(access(db), proof, 1_000).trees[0]!
+    const tree = inventory(access(db), proof, NOW).trees[0]!
     expect(tree.eligible).toBe(true)
     db.query("UPDATE event SET data = 'not-json' WHERE aggregate_id = 'ses_event'").run()
     const before = db.serialize()
 
-    const result = apply(access(db), { tree, evidence: () => proof, now: () => 1_000 })
+    const result = apply(access(db), { tree, evidence: () => proof, now: () => NOW })
 
     expect(result.state).toBe("refused")
     expect(result.changedRows).toBe(0)
@@ -1011,7 +930,7 @@ test(
   async () => {
     await using fixture = await createFixtureDatabase()
     const sessionID = "ses_context_race"
-    const now = 1_000
+    const now = NOW
     try {
       await Effect.runPromise(
         Effect.scoped(
@@ -1020,7 +939,7 @@ test(
             const writer = Context.get(services, Service).db
             session(fixture.db, sessionID, 10)
             event(fixture.db, sessionID)
-            const proof = evidence([sessionID], { [sessionID]: 0 }, now)
+            const proof = evidence([sessionID], { [sessionID]: 0 }, fixture.filename)
             const tree = inventory(access(fixture.db), proof, now).trees.find(
               (candidate) => candidate.rootSessionID === sessionID,
             )
@@ -1138,14 +1057,14 @@ test(
     beforeDB.close()
 
     const redactionDB = await sourceFixture.reopen()
-    const proof = evidence(["ses_physical"], { ses_physical: 599 })
-    const beforeApply = inventory(access(redactionDB), proof, 1_000).trees.find(
+    const proof = evidence(["ses_physical"], { ses_physical: 599 }, sourcePath)
+    const beforeApply = inventory(access(redactionDB), proof, NOW).trees.find(
       (item) => item.rootSessionID === "ses_physical",
     )!
     const redaction = apply(access(redactionDB), {
       tree: beforeApply,
       evidence: () => proof,
-      now: () => 1_000,
+      now: () => NOW,
       batchSize: 32,
     })
     expect(redaction.state).toBe("complete")

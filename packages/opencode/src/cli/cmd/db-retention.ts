@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto"
 import { spawnSync } from "node:child_process"
-import { chmodSync, constants, lstatSync, realpathSync, statSync } from "node:fs"
+import { chmodSync, constants, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs"
 import { chmod, copyFile, lstat, mkdtemp, open, realpath, rename, rm, stat, statfs, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventWriter } from "@opencode-ai/core/event/writer"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
 import { cmd } from "./cmd"
 
@@ -40,24 +41,14 @@ export type RetentionEvidence = {
     readonly customerBoundSessionIDs: readonly string[]
     readonly nonCustomerSessionIDs: readonly string[]
   }
-  readonly policy?: {
+  // The mixed /sync/history reader contract (swxtchio/swx-opencode#133 item 1) is a public
+  // decision; until one is recorded, production evidence carries none and every tree refuses.
+  readonly readerContract?: {
     readonly reviewed: boolean
-    readonly cutoffEpochMs: number
-    readonly reviewedReference: string
-    readonly policyDigest: string
-    readonly readerContractReviewed: boolean
-    readonly readerContractID: string
+    readonly id: string
   }
-  readonly liveness?: {
-    readonly proofID: string
-    readonly observedAtEpochMs: number
-    readonly sessionIDs: readonly string[]
-    readonly aggregateOwners: Readonly<Record<string, string | null>>
-    readonly servingProcesses: readonly string[]
-    readonly canResume: boolean
-    readonly unfinishedOwnedWork: boolean
-    readonly validThroughEpochMs: number
-  }
+  // Produced by scanDatabaseHolders for the exact database file being inventoried or changed.
+  readonly holders?: DatabaseHolderScan
   readonly handoff?: {
     readonly receiptID: string
     readonly durable: boolean
@@ -91,6 +82,23 @@ export type RetentionEvidence = {
   }
   readonly evidenceError?: string
 }
+
+export type DatabaseHolderScan =
+  | {
+      readonly state: "complete"
+      // "memory" for an in-memory database, which no other process can open.
+      readonly target: { readonly device: string; readonly inode: string } | "memory"
+      // Other processes with an open handle on the database, WAL, or shared-memory file.
+      readonly pids: readonly number[]
+    }
+  | { readonly state: "unreadable"; readonly reason: string }
+
+// The captain-approved boundary (swxtchio/swx-firstmate#2052, 2026-10-11): a Session tree inactive for
+// more than seven days is eligible; one inactive for seven days or less is never touched.
+export const inactivityPolicy = {
+  windowMs: 7 * 24 * 60 * 60 * 1000,
+  reference: "swxtchio/swx-firstmate#2052",
+} as const
 
 export type RetentionTree = {
   readonly rootSessionID: string
@@ -330,9 +338,30 @@ const requiredRetentionTables = new Set([
   ...redactionPlan.map((item) => item.table),
   "event_sequence",
   "event_retention",
+  "event_writer_process",
+  "event_aggregate_writer",
   "session_prompt_queue_sequence",
 ])
 const classifiedSessionTables = new Set([...requiredRetentionTables])
+
+// Every producer timestamp a Session tree carries. Event rows have no timestamp, so appends are
+// timed by event_aggregate_writer, which the EventV2 commit writes with each append.
+const activityColumns = [
+  { table: "session", scope: "id", required: ["time_created", "time_updated"], optional: ["time_archived"] },
+  { table: "message", scope: "session_id", required: ["time_created", "time_updated"], optional: [] },
+  { table: "part", scope: "session_id", required: ["time_created", "time_updated"], optional: [] },
+  { table: "session_message", scope: "session_id", required: ["time_created", "time_updated"], optional: [] },
+  { table: "session_input", scope: "session_id", required: ["time_created"], optional: [] },
+  {
+    table: "session_prompt_queue",
+    scope: "session_id",
+    required: ["time_created"],
+    optional: ["time_promoted", "time_withdrawn"],
+  },
+  { table: "todo", scope: "session_id", required: ["time_created", "time_updated"], optional: [] },
+  { table: "session_share", scope: "session_id", required: ["time_created", "time_updated"], optional: [] },
+  { table: "event_aggregate_writer", scope: "aggregate_id", required: ["time_last_append"], optional: [] },
+] as const
 
 const jsonCopies = [
   { table: "message", scope: "session_id", value: "data" },
@@ -477,10 +506,9 @@ function makeProgressScope(
   evidence: RetentionEvidence,
 ) {
   const scopeEvidence = {
-    cutoffEpochMs: evidence.policy?.cutoffEpochMs ?? null,
-    reviewedReference: evidence.policy?.reviewedReference ?? null,
-    policyDigest: evidence.policy?.policyDigest ?? null,
-    readerContractID: evidence.policy?.readerContractID ?? null,
+    inactivityWindowMs: inactivityPolicy.windowMs,
+    inactivityReference: inactivityPolicy.reference,
+    readerContractID: evidence.readerContract?.id ?? null,
     customerBinding: evidence.customerBinding
       ? {
           proofID: evidence.customerBinding.proofID,
@@ -592,28 +620,11 @@ function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: n
   }
   const globalRefusals = new Set<string>()
   for (const table of schema.unclassifiedSessionTables) globalRefusals.add(`unclassified-session-owned-table:${table}`)
+  for (const reason of copyOwnershipFailures(db)) globalRefusals.add(reason)
 
   const trees = components.map((component) => {
     const sessionIDs = component.sessionIDs
-    const reasons = new Set<string>()
-    const verifyEventPayloadOwnership =
-      evidence.liveness !== undefined &&
-      Boolean(evidence.liveness.proofID) &&
-      sameIDs(evidence.liveness.sessionIDs, sessionIDs)
-    if (evidence.evidenceError) reasons.add(`evidence-unreadable:${evidence.evidenceError}`)
-    if (
-      !evidence.policy?.reviewed ||
-      !Number.isFinite(evidence.policy.cutoffEpochMs) ||
-      !evidence.policy.reviewedReference ||
-      !evidence.policy.policyDigest
-    ) {
-      reasons.add("reviewed-age-boundary-unavailable")
-    } else if (!evidence.policy.readerContractReviewed || !evidence.policy.readerContractID) {
-      reasons.add("reader-contract-unreviewed")
-    }
-    for (const reason of customerBindingFailures(evidence, sessionIDs)) reasons.add(reason)
-    if (!evidence.liveness) reasons.add("cross-process-liveness-proof-unavailable")
-    if (!evidence.handoff) reasons.add("measurement-handoff-receipt-unavailable")
+    const reasons = new Set<string>(globalRefusals)
     if (component.unresolvedParent) reasons.add("session-tree-parent-unreadable")
     if (
       sessionIDs.some((sessionID) => {
@@ -623,72 +634,25 @@ function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: n
     )
       reasons.add("session-tree-parent-unreadable")
     if (sessionIDs.some((sessionID) => parentCycle(sessionID, sessionsByID))) reasons.add("session-tree-cycle")
-    for (const refusal of globalRefusals) reasons.add(refusal)
-
-    const liveness = evidence.liveness
-    if (liveness) {
-      if (!liveness.proofID) reasons.add("cross-process-liveness-proof-unreadable")
-      if (!Number.isFinite(liveness.observedAtEpochMs) || liveness.observedAtEpochMs > now) {
-        reasons.add("cross-process-liveness-proof-time-unreadable")
-      }
-      if (!Number.isFinite(liveness.validThroughEpochMs)) reasons.add("cross-process-liveness-proof-time-unreadable")
-      if (liveness.validThroughEpochMs <= now) reasons.add("cross-process-liveness-proof-stale")
-      if (liveness.canResume) reasons.add("session-can-resume")
-      if (liveness.unfinishedOwnedWork) reasons.add("unfinished-owned-work")
-      if (liveness.servingProcesses.length > 0) reasons.add("serving-process-owns-session")
-      if (!sameIDs(liveness.sessionIDs, sessionIDs)) reasons.add("liveness-tree-scope-mismatch")
-    }
-    const handoff = evidence.handoff
-    if (handoff) {
-      if (!handoff.receiptID || handoff.durable !== true) reasons.add("measurement-handoff-receipt-unreadable")
-      if (
-        handoff.report.rawHistoryInaccessible !== true ||
-        !handoff.report.resultDigest ||
-        !validUtcWindow(handoff.report.windowStart, handoff.report.windowEnd)
-      )
-        reasons.add("report-not-reproduced-without-raw-history")
-      for (const [axis, state] of Object.entries(handoff.axes)) {
-        if (
-          state.status === "unavailable" &&
-          (!state.cause || handoff.report.unavailableCauses[axis] !== state.cause)
-        ) {
-          reasons.add(`measurement-axis-unavailable-cause-missing:${axis}`)
-        }
-        if (state.status === "retained" && axis in handoff.report.unavailableCauses) {
-          reasons.add(`measurement-axis-retained-but-reported-unavailable:${axis}`)
-        }
-      }
-      if (handoffAxes.some((axis) => !handoff.axes[axis])) reasons.add("measurement-handoff-axes-incomplete")
-      if (Object.values(handoff.report.denominators).some((value) => !Number.isFinite(value) || value < 0)) {
-        reasons.add("report-denominators-unreadable")
-      }
-      if (!sameIDs(handoff.sessionIDs, sessionIDs)) reasons.add("handoff-tree-scope-mismatch")
-    }
-
     for (const sessionID of sessionIDs) {
-      const session = sessionsByID.get(sessionID)
-      if (!session) {
-        reasons.add(`session-row-missing:${sessionID}`)
-        continue
-      }
-      if (evidence.policy?.reviewed && session.time_created > evidence.policy.cutoffEpochMs) {
-        reasons.add(`session-after-reviewed-cutoff:${sessionID}`)
-      }
+      if (!sessionsByID.has(sessionID)) reasons.add(`session-row-missing:${sessionID}`)
+    }
+    for (const reason of candidateFailures(db, sessionIDs, evidence, now)) reasons.add(reason)
+
+    // Payload ownership is proved by a JSON scan of every event row, the dominant cost of a dry run on a
+    // large store. A tree that is already refused for another reason skips it and stays refused.
+    const verifyEventPayloadOwnership = reasons.size === 0
+    for (const sessionID of sessionIDs) {
       const aggregate = oneRow<AggregateRow>(
         db,
         "SELECT aggregate_id, seq, owner_id FROM event_sequence WHERE aggregate_id = ?",
         sessionID,
       )
-      if (liveness && liveness.aggregateOwners[sessionID] !== (aggregate?.owner_id ?? null)) {
-        reasons.add(`cross-process-aggregate-owner-snapshot-mismatch:${sessionID}`)
-      }
-      const eventTypes = tables.has("event")
-        ? allRows<EventTypeRow>(
-            db,
-            "SELECT type, count(*) AS rows FROM event WHERE aggregate_id = ? GROUP BY type ORDER BY type",
-            sessionID,
-          )
-        : []
+      const eventTypes = allRows<EventTypeRow>(
+        db,
+        "SELECT type, count(*) AS rows FROM event WHERE aggregate_id = ? GROUP BY type ORDER BY type",
+        sessionID,
+      )
       for (const reason of eventAggregateFailures(
         db,
         sessionID,
@@ -707,34 +671,6 @@ function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: n
         )?.rows
         if (invalidJSON) reasons.add(`session-copy-unreadable:${table}:${sessionID}`)
       }
-      if (handoff && handoff.finalSequence[sessionID] !== (aggregate?.seq ?? -1)) {
-        reasons.add(`measurement-handoff-does-not-cover-final-write:${sessionID}`)
-      }
-    }
-
-    for (const reason of copyOwnershipFailures(db)) reasons.add(reason)
-
-    if (tables.has("session_prompt_queue")) {
-      const queueRows = oneRow<{ rows: number }>(
-        db,
-        `SELECT count(*) AS rows FROM session_prompt_queue WHERE session_id IN (${placeholders(sessionIDs.length)})`,
-        ...sessionIDs,
-      )?.rows
-      if (queueRows) reasons.add("v1-prompt-queue-row-present")
-    }
-    if (tables.has("session_input")) {
-      const inputRows = oneRow<{ rows: number }>(
-        db,
-        `SELECT count(*) AS rows FROM session_input WHERE session_id IN (${placeholders(sessionIDs.length)})`,
-        ...sessionIDs,
-      )?.rows
-      const pending = oneRow<{ rows: number }>(
-        db,
-        `SELECT count(*) AS rows FROM session_input WHERE session_id IN (${placeholders(sessionIDs.length)}) AND promoted_seq IS NULL`,
-        ...sessionIDs,
-      )?.rows
-      if (pending) reasons.add("v2-input-pending")
-      else if (inputRows) reasons.add("v2-input-promoted-row-present")
     }
 
     const aggregates = sessionIDs.map((sessionID) => {
@@ -743,20 +679,16 @@ function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: n
         "SELECT aggregate_id, seq, owner_id FROM event_sequence WHERE aggregate_id = ?",
         sessionID,
       )
-      const rows = tables.has("event")
-        ? oneRow<{ rows: number; bytes: number }>(
-            db,
-            "SELECT count(*) AS rows, coalesce(sum(length(CAST(data AS BLOB))), 0) AS bytes FROM event WHERE aggregate_id = ?",
-            sessionID,
-          )
-        : undefined
-      const eventTypes = tables.has("event")
-        ? allRows<{ type: string }>(
-            db,
-            "SELECT DISTINCT type FROM event WHERE aggregate_id = ? ORDER BY type",
-            sessionID,
-          ).map((eventType) => eventType.type)
-        : []
+      const rows = oneRow<{ rows: number; bytes: number }>(
+        db,
+        "SELECT count(*) AS rows, coalesce(sum(length(CAST(data AS BLOB))), 0) AS bytes FROM event WHERE aggregate_id = ?",
+        sessionID,
+      )
+      const eventTypes = allRows<{ type: string }>(
+        db,
+        "SELECT DISTINCT type FROM event WHERE aggregate_id = ? ORDER BY type",
+        sessionID,
+      ).map((eventType) => eventType.type)
       return {
         aggregateID: sessionID,
         seq: row?.seq ?? -1,
@@ -777,7 +709,6 @@ function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: n
     })
     const progressScope = makeProgressScope(component.rootSessionID, sessionIDs, aggregates, evidence)
     for (const sessionID of sessionIDs) {
-      if (!tables.has("event_retention")) continue
       const marker = oneRow<MarkerRow>(
         db,
         "SELECT state, evidence FROM event_retention WHERE aggregate_id = ?",
@@ -810,68 +741,298 @@ function inventorySnapshot(db: SqliteAccess, evidence: RetentionEvidence, now: n
   }
 }
 
+/**
+ * The eligibility policy shared by the dry run and by every apply batch, which calls it again inside
+ * its write transaction. Each refusal names what is unproved; an empty result means every gate passed.
+ */
+function candidateFailures(db: SqliteAccess, sessionIDs: readonly string[], evidence: RetentionEvidence, now: number) {
+  const reasons = new Set<string>()
+  if (evidence.evidenceError) reasons.add(`evidence-unreadable:${evidence.evidenceError}`)
+  if (!evidence.readerContract?.reviewed || !evidence.readerContract.id) reasons.add("reader-contract-unreviewed")
+  for (const reason of customerBindingFailures(evidence, sessionIDs)) reasons.add(reason)
+  for (const reason of holderFailures(db, evidence.holders)) reasons.add(reason)
+  for (const reason of handoffFailures(db, evidence, sessionIDs)) reasons.add(reason)
+  for (const reason of inactivityFailures(db, sessionIDs, now)) reasons.add(reason)
+  for (const reason of sessionWorkFailures(db, sessionIDs)) reasons.add(reason)
+  return Array.from(reasons).toSorted()
+}
+
+/**
+ * A tree is inactive only when its newest producer timestamp, across every Session in it, is more than
+ * the policy window before now. A missing or non-numeric timestamp column cannot prove inactivity.
+ */
+function inactivityFailures(db: SqliteAccess, sessionIDs: readonly string[], now: number) {
+  const reasons = new Set<string>()
+  const ids = placeholders(sessionIDs.length)
+  let lastActivity = Number.NEGATIVE_INFINITY
+  for (const source of activityColumns) {
+    const columns = new Set(allRows<ColumnRow>(db, `PRAGMA table_info(${quote(source.table)})`).map((row) => row.name))
+    const missing = [source.scope, ...source.required].filter((column) => !columns.has(column))
+    if (missing.length > 0) {
+      reasons.add(`session-activity-evidence-unavailable:${source.table}.${missing.join(",")}`)
+      continue
+    }
+    const present = [
+      ...source.required.map((column) => ({ column, nullable: false })),
+      ...source.optional.filter((column) => columns.has(column)).map((column) => ({ column, nullable: true })),
+    ]
+    for (const { column, nullable } of present) {
+      const row = oneRow<{ newest: number | null; unreadable: number | null }>(
+        db,
+        `SELECT max(${quote(column)}) AS newest, sum(CASE WHEN typeof(${quote(column)}) = 'integer' THEN 0 WHEN ${quote(column)} IS NULL AND ${nullable ? 1 : 0} THEN 0 ELSE 1 END) AS unreadable FROM ${quote(source.table)} WHERE ${quote(source.scope)} IN (${ids})`,
+        ...sessionIDs,
+      )
+      if (row?.unreadable) reasons.add(`session-activity-unreadable:${source.table}.${column}`)
+      if (typeof row?.newest === "number") lastActivity = Math.max(lastActivity, row.newest)
+    }
+  }
+  if (lastActivity === Number.NEGATIVE_INFINITY) reasons.add("session-activity-unreadable:no-timestamp")
+  if (!Number.isFinite(now)) reasons.add("inactivity-clock-unreadable")
+  if (lastActivity !== Number.NEGATIVE_INFINITY && !(now - lastActivity > inactivityPolicy.windowMs)) {
+    reasons.add("session-tree-active-within-inactivity-window")
+  }
+  return Array.from(reasons).toSorted()
+}
+
+/**
+ * Cross-process liveness. Opening the shared database is not ownership: a registered process holds a
+ * Session only by having appended to it. Every process holding the file must be registered and still be
+ * the same process, otherwise its ownership is unprovable and every tree refuses.
+ */
+function holderFailures(db: SqliteAccess, holders: DatabaseHolderScan | undefined) {
+  if (!holders) return ["cross-process-liveness-proof-unavailable"]
+  if (holders.state === "unreadable") return [`database-holder-scan-unreadable:${holders.reason}`]
+  const reasons = new Set<string>()
+  const target = fileIdentity(db.filename)
+  if (
+    target === undefined ||
+    (holders.target === "memory" ? target !== "memory" : target === "memory" || target.device !== holders.target.device || target.inode !== holders.target.inode)
+  ) {
+    reasons.add("database-holder-scan-target-mismatch")
+  }
+  const self = EventWriter.self()
+  if (!self.bootID || !self.startTicks) reasons.add("process-identity-unavailable")
+  for (const pid of holders.pids) {
+    const current = EventWriter.readIdentity(pid)
+    if (!current) continue
+    const registered = allRows<{ boot_id: string | null; start_ticks: string | null }>(
+      db,
+      "SELECT boot_id, start_ticks FROM event_writer_process WHERE pid = ?",
+      pid,
+    )
+    if (!registered.some((row) => sameProcess(row, current))) reasons.add(`unregistered-database-holder:${pid}`)
+  }
+  return Array.from(reasons).toSorted()
+}
+
+function sessionWorkFailures(db: SqliteAccess, sessionIDs: readonly string[]) {
+  const reasons = new Set<string>()
+  const ids = placeholders(sessionIDs.length)
+  const writers = allRows<{
+    aggregate_id: string
+    pid: number | null
+    boot_id: string | null
+    start_ticks: string | null
+  }>(
+    db,
+    `SELECT writer.aggregate_id, process.pid, process.boot_id, process.start_ticks FROM event_aggregate_writer writer LEFT JOIN event_writer_process process ON process.writer_id = writer.writer_id WHERE writer.aggregate_id IN (${ids}) ORDER BY writer.aggregate_id`,
+    ...sessionIDs,
+  )
+  for (const writer of writers) {
+    if (writer.pid === null) {
+      reasons.add(`session-writer-unregistered:${writer.aggregate_id}`)
+      continue
+    }
+    if (!writer.boot_id || !writer.start_ticks) {
+      reasons.add(`session-writer-liveness-unreadable:${writer.aggregate_id}`)
+      continue
+    }
+    const current = EventWriter.readIdentity(writer.pid)
+    if (!current) continue
+    if (current.bootID === null || current.startTicks === null) {
+      reasons.add(`session-writer-liveness-unreadable:${writer.aggregate_id}`)
+      continue
+    }
+    if (sameProcess(writer, current)) reasons.add(`session-held-by-live-process:${writer.aggregate_id}`)
+  }
+  for (const sessionID of sessionIDs) {
+    const owner = oneRow<{ owner_id: string | null }>(
+      db,
+      "SELECT owner_id FROM event_sequence WHERE aggregate_id = ?",
+      sessionID,
+    )
+    if (owner?.owner_id) reasons.add(`session-owned-by-workspace:${sessionID}`)
+    const unfinished = oneRow<{ v1: number; v2: number }>(
+      db,
+      `SELECT
+        (SELECT count(*) FROM message WHERE session_id = ?1 AND (json_valid(data) = 0 OR (json_extract(data, '$.role') = 'assistant' AND coalesce(json_type(data, '$.time.completed'), 'missing') NOT IN ('integer', 'real')))) AS v1,
+        (SELECT count(*) FROM session_message WHERE session_id = ?1 AND type = 'assistant' AND (json_valid(data) = 0 OR coalesce(json_type(data, '$.time.completed'), 'missing') NOT IN ('integer', 'real'))) AS v2`,
+      sessionID,
+    )
+    if (unfinished?.v1 || unfinished?.v2) reasons.add(`unfinished-assistant-message:${sessionID}`)
+  }
+  const queueRows = oneRow<{ rows: number }>(
+    db,
+    `SELECT count(*) AS rows FROM session_prompt_queue WHERE session_id IN (${ids})`,
+    ...sessionIDs,
+  )?.rows
+  if (queueRows) reasons.add("v1-prompt-queue-row-present")
+  const inputs = oneRow<{ rows: number; pending: number }>(
+    db,
+    `SELECT count(*) AS rows, coalesce(sum(promoted_seq IS NULL), 0) AS pending FROM session_input WHERE session_id IN (${ids})`,
+    ...sessionIDs,
+  )
+  if (inputs?.pending) reasons.add("v2-input-pending")
+  else if (inputs?.rows) reasons.add("v2-input-promoted-row-present")
+  return Array.from(reasons).toSorted()
+}
+
+function handoffFailures(db: SqliteAccess, evidence: RetentionEvidence, sessionIDs: readonly string[]) {
+  const handoff = evidence.handoff
+  if (!handoff) return ["measurement-handoff-receipt-unavailable"]
+  const reasons = new Set<string>()
+  if (!handoff.receiptID || handoff.durable !== true) reasons.add("measurement-handoff-receipt-unreadable")
+  if (
+    handoff.report.rawHistoryInaccessible !== true ||
+    !handoff.report.resultDigest ||
+    !validUtcWindow(handoff.report.windowStart, handoff.report.windowEnd)
+  )
+    reasons.add("report-not-reproduced-without-raw-history")
+  for (const [axis, state] of Object.entries(handoff.axes)) {
+    if (state.status === "unavailable" && (!state.cause || handoff.report.unavailableCauses[axis] !== state.cause)) {
+      reasons.add(`measurement-axis-unavailable-cause-missing:${axis}`)
+    }
+    if (state.status === "retained" && axis in handoff.report.unavailableCauses) {
+      reasons.add(`measurement-axis-retained-but-reported-unavailable:${axis}`)
+    }
+  }
+  if (handoffAxes.some((axis) => !handoff.axes[axis])) reasons.add("measurement-handoff-axes-incomplete")
+  if (Object.values(handoff.report.denominators).some((value) => !Number.isFinite(value) || value < 0)) {
+    reasons.add("report-denominators-unreadable")
+  }
+  if (!sameIDs(handoff.sessionIDs, sessionIDs)) reasons.add("handoff-tree-scope-mismatch")
+  for (const sessionID of sessionIDs) {
+    const seq = oneRow<{ seq: number }>(db, "SELECT seq FROM event_sequence WHERE aggregate_id = ?", sessionID)?.seq
+    if (handoff.finalSequence[sessionID] !== (seq ?? -1)) {
+      reasons.add(`measurement-handoff-does-not-cover-final-write:${sessionID}`)
+    }
+  }
+  return Array.from(reasons).toSorted()
+}
+
+function sameProcess(
+  registered: { readonly boot_id: string | null; readonly start_ticks: string | null },
+  current: EventWriter.ProcessIdentity,
+) {
+  return (
+    registered.boot_id !== null &&
+    registered.start_ticks !== null &&
+    registered.boot_id === current.bootID &&
+    registered.start_ticks === current.startTicks
+  )
+}
+
+function fileIdentity(filename: string) {
+  if (filename === ":memory:" || filename === "") return "memory" as const
+  try {
+    const file = statSync(filename)
+    return { device: String(file.dev), inode: String(file.ino) }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Lists every other process holding the database file, its WAL, or its shared-memory file, matched by
+ * device and inode so a renamed or linked path cannot hide a holder. Two kernel sources are combined:
+ * the open descriptors of this user's processes, and every process holding a POSIX lock on those inodes
+ * in /proc/locks, which covers all users and processes whose descriptors are not inspectable. Every
+ * SQLite connection to a WAL database holds such a lock on the shared-memory file while it is open.
+ * The residual blind spot is a process of another user, or a non-inspectable one, that has the file open
+ * without a SQLite lock.
+ */
+export function scanDatabaseHolders(filename: string): DatabaseHolderScan {
+  const target = fileIdentity(filename)
+  if (target === "memory") return { state: "complete", target, pids: [] }
+  if (!target) return { state: "unreadable", reason: "database-file-unreadable" }
+  const userID = process.getuid?.()
+  if (userID === undefined) return { state: "unreadable", reason: "process-user-unavailable" }
+  try {
+    const directory = statSync(path.dirname(realpathSync(filename)))
+    if (directory.uid !== userID || (directory.mode & 0o077) !== 0) {
+      return { state: "unreadable", reason: "database-directory-admits-other-users" }
+    }
+    const files = [filename, `${filename}-wal`, `${filename}-shm`].flatMap((file) => {
+      try {
+        const stat = statSync(file, { bigint: true })
+        return [{ dev: stat.dev, ino: stat.ino }]
+      } catch {
+        return []
+      }
+    })
+    const inodes = new Set(files.map((file) => `${file.dev}:${file.ino}`))
+    const opened = readdirSync("/proc").flatMap((entry) => {
+      if (!/^\d+$/.test(entry) || Number(entry) === process.pid) return []
+      return processDescriptors(entry, userID).some((descriptor) => {
+        try {
+          const file = statSync(`/proc/${entry}/fd/${descriptor}`, { bigint: true })
+          return inodes.has(`${file.dev}:${file.ino}`)
+        } catch {
+          return false
+        }
+      })
+        ? [Number(entry)]
+        : []
+    })
+    const locked = lockHolders(files)
+    if (locked === "unattributable") return { state: "unreadable", reason: "database-lock-holder-unattributable" }
+    const pids = new Set([...opened, ...locked.filter((pid) => pid !== process.pid)])
+    return { state: "complete", target, pids: Array.from(pids).toSorted((left, right) => left - right) }
+  } catch (error) {
+    return { state: "unreadable", reason: error instanceof Error ? error.message : "unknown" }
+  }
+}
+
+function processDescriptors(pid: string, userID: number) {
+  try {
+    if (statSync(`/proc/${pid}`).uid !== userID) return []
+    return readdirSync(`/proc/${pid}/fd`)
+  } catch {
+    // Exited, or not inspectable (for example a non-dumpable process); lockHolders still covers its
+    // SQLite connections.
+    return []
+  }
+}
+
+function lockHolders(files: readonly { dev: bigint; ino: bigint }[]) {
+  const keys = new Set(
+    files.map((file) => {
+      const major = ((file.dev >> 8n) & 0xfffn) | ((file.dev >> 32n) & ~0xfffn)
+      const minor = (file.dev & 0xffn) | ((file.dev >> 12n) & ~0xffn)
+      return `${major}:${minor}:${file.ino}`
+    }),
+  )
+  const pids = new Array<number>()
+  for (const line of readFileSync("/proc/locks", "utf8").split("\n")) {
+    const match = /\s(-?\d+)\s+([0-9a-f]+):([0-9a-f]+):(\d+)\s/i.exec(line)
+    if (!match) continue
+    if (!keys.has(`${BigInt(`0x${match[2]}`)}:${BigInt(`0x${match[3]}`)}:${match[4]}`)) continue
+    // An open-file-description lock reports pid -1 and cannot be attributed to a process.
+    if (match[1] === "-1") return "unattributable" as const
+    pids.push(Number(match[1]))
+  }
+  return pids
+}
+
 function revalidateCandidate(db: SqliteAccess, expected: RetentionTree, evidence: RetentionEvidence, now: number) {
   const reasons = new Set<string>()
   const schema = retentionSchema(db)
   for (const table of schema.missingTables) reasons.add(requiredTableReason(table))
   for (const table of schema.unclassifiedSessionTables) reasons.add(`unclassified-session-owned-table:${table}`)
   for (const reason of copyOwnershipFailures(db)) reasons.add(reason)
-  for (const reason of customerBindingFailures(evidence, expected.sessionIDs)) reasons.add(reason)
-  if (evidence.evidenceError) reasons.add(`evidence-unreadable:${evidence.evidenceError}`)
-  if (
-    !evidence.policy?.reviewed ||
-    !Number.isFinite(evidence.policy.cutoffEpochMs) ||
-    !evidence.policy.reviewedReference ||
-    !evidence.policy.policyDigest
-  ) {
-    reasons.add("reviewed-age-boundary-unavailable")
-  }
-  if (!evidence.policy?.readerContractReviewed || !evidence.policy.readerContractID) {
-    reasons.add("reader-contract-unreviewed")
-  }
-  if (!evidence.liveness) reasons.add("cross-process-liveness-proof-unavailable")
-  if (!evidence.handoff) reasons.add("measurement-handoff-receipt-unavailable")
   if (expected.rootSessionID === "" || expected.sessionIDs.length === 0) reasons.add("session-tree-unreadable")
   if (reasons.size > 0) return Array.from(reasons).toSorted()
-
-  const liveness = evidence.liveness
-  if (liveness) {
-    if (!liveness.proofID) reasons.add("cross-process-liveness-proof-unreadable")
-    if (!Number.isFinite(liveness.observedAtEpochMs) || liveness.observedAtEpochMs > now) {
-      reasons.add("cross-process-liveness-proof-time-unreadable")
-    }
-    if (!Number.isFinite(liveness.validThroughEpochMs)) reasons.add("cross-process-liveness-proof-time-unreadable")
-    if (liveness.validThroughEpochMs <= now) reasons.add("cross-process-liveness-proof-stale")
-    if (liveness.canResume) reasons.add("session-can-resume")
-    if (liveness.unfinishedOwnedWork) reasons.add("unfinished-owned-work")
-    if (liveness.servingProcesses.length > 0) reasons.add("serving-process-owns-session")
-    if (!sameIDs(liveness.sessionIDs, expected.sessionIDs)) reasons.add("liveness-tree-scope-mismatch")
-  }
-
-  const handoff = evidence.handoff
-  if (handoff) {
-    if (!handoff.receiptID || !handoff.durable) reasons.add("measurement-handoff-receipt-unreadable")
-    if (
-      !handoff.report.rawHistoryInaccessible ||
-      !handoff.report.resultDigest ||
-      !validUtcWindow(handoff.report.windowStart, handoff.report.windowEnd)
-    ) {
-      reasons.add("report-not-reproduced-without-raw-history")
-    }
-    if (!sameIDs(handoff.sessionIDs, expected.sessionIDs)) reasons.add("handoff-tree-scope-mismatch")
-    if (handoffAxes.some((axis) => !handoff.axes[axis])) reasons.add("measurement-handoff-axes-incomplete")
-    for (const [axis, state] of Object.entries(handoff.axes)) {
-      if (state.status === "unavailable" && (!state.cause || handoff.report.unavailableCauses[axis] !== state.cause)) {
-        reasons.add(`measurement-axis-unavailable-cause-missing:${axis}`)
-      }
-      if (state.status === "retained" && axis in handoff.report.unavailableCauses) {
-        reasons.add(`measurement-axis-retained-but-reported-unavailable:${axis}`)
-      }
-    }
-    if (Object.values(handoff.report.denominators).some((value) => !Number.isFinite(value) || value < 0)) {
-      reasons.add("report-denominators-unreadable")
-    }
-  }
+  for (const reason of candidateFailures(db, expected.sessionIDs, evidence, now)) reasons.add(reason)
 
   const rows = allRows<SessionRow>(
     db,
@@ -894,19 +1055,20 @@ function revalidateCandidate(db: SqliteAccess, expected: RetentionTree, evidence
 
   const aggregates = new Array<{ aggregateID: string; eventTypes: string[] }>()
   for (const sessionID of expected.sessionIDs) {
-    const session = rows.find((row) => row.id === sessionID)
-    if (!session) {
+    if (!rows.some((row) => row.id === sessionID)) {
       reasons.add(`session-row-missing:${sessionID}`)
       continue
-    }
-    if (evidence.policy?.reviewed && session.time_created > evidence.policy.cutoffEpochMs) {
-      reasons.add(`session-after-reviewed-cutoff:${sessionID}`)
     }
     const aggregate = oneRow<AggregateRow>(
       db,
       "SELECT aggregate_id, seq, owner_id FROM event_sequence WHERE aggregate_id = ?",
       sessionID,
     )
+    const inventoried = expected.aggregates.find((item) => item.aggregateID === sessionID)
+    if ((aggregate?.seq ?? -1) !== (inventoried?.seq ?? -1)) reasons.add(`event-appended-after-inventory:${sessionID}`)
+    if ((aggregate?.owner_id ?? null) !== (inventoried?.ownerID ?? null)) {
+      reasons.add(`cross-process-aggregate-owner-snapshot-mismatch:${sessionID}`)
+    }
     const eventTypes = allRows<{ type: string }>(
       db,
       "SELECT DISTINCT type FROM event WHERE aggregate_id = ? ORDER BY type",
@@ -922,36 +1084,12 @@ function revalidateCandidate(db: SqliteAccess, expected: RetentionTree, evidence
       )?.rows
       if (invalidJSON) reasons.add(`session-copy-unreadable:${table}:${sessionID}`)
     }
-    if (liveness && liveness.aggregateOwners[sessionID] !== (aggregate?.owner_id ?? null)) {
-      reasons.add(`cross-process-aggregate-owner-snapshot-mismatch:${sessionID}`)
-    }
     const maxEvent = oneRow<{ seq: number | null }>(
       db,
       "SELECT max(seq) AS seq FROM event WHERE aggregate_id = ?",
       sessionID,
     )?.seq
     if ((aggregate?.seq ?? -1) !== (maxEvent ?? -1)) reasons.add(`event-sequence-changed:${sessionID}`)
-    if (handoff && handoff.finalSequence[sessionID] !== (aggregate?.seq ?? -1)) {
-      reasons.add(`measurement-handoff-does-not-cover-final-write:${sessionID}`)
-    }
-    const queueRows = oneRow<{ rows: number }>(
-      db,
-      "SELECT count(*) AS rows FROM session_prompt_queue WHERE session_id = ?",
-      sessionID,
-    )?.rows
-    if (queueRows) reasons.add("v1-prompt-queue-row-present")
-    const inputRows = oneRow<{ rows: number }>(
-      db,
-      "SELECT count(*) AS rows FROM session_input WHERE session_id = ?",
-      sessionID,
-    )?.rows
-    const pendingInput = oneRow<{ rows: number }>(
-      db,
-      "SELECT count(*) AS rows FROM session_input WHERE session_id = ? AND promoted_seq IS NULL",
-      sessionID,
-    )?.rows
-    if (pendingInput) reasons.add("v2-input-pending")
-    else if (inputRows) reasons.add("v2-input-promoted-row-present")
     const marker = oneRow<MarkerRow>(
       db,
       "SELECT state, evidence FROM event_retention WHERE aggregate_id = ?",
@@ -986,15 +1124,6 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
   const completedSessionIDs = new Set<string>()
   const reasons = new Set<string>()
 
-  if (!isFixtureDatabase(db)) {
-    return {
-      state: "refused",
-      changedRows,
-      changedBytes,
-      completedSessionIDs: [],
-      reasons: ["apply-only-supported-for-isolated-fixtures"],
-    }
-  }
   if (!input.tree.eligible) {
     return {
       state: "refused",
@@ -1012,20 +1141,17 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
       readonly changedBytes: number
       readonly refusals?: readonly string[]
     }
+    // Evidence is produced before the write lock (the holder scan reads procfs) and revalidated
+    // against the database inside it.
+    let evidence: RetentionEvidence
+    try {
+      evidence = input.evidence()
+    } catch (error) {
+      evidence = { evidenceError: error instanceof Error ? error.message : "unknown" }
+    }
     try {
       batch = db
         .transaction(() => {
-          let evidence: RetentionEvidence
-          try {
-            evidence = input.evidence()
-          } catch (error) {
-            return {
-              state: "refused" as const,
-              changedRows: 0,
-              changedBytes: 0,
-              refusals: [`evidence-unreadable:${error instanceof Error ? error.message : "unknown"}`],
-            }
-          }
           const proofFailures = revalidateCandidate(db, input.tree, evidence, now())
           if (proofFailures.length > 0) {
             return {
@@ -1690,12 +1816,6 @@ export async function compactRestoreFixture(input: CompactFixtureInput): Promise
   }
 }
 
-function isFixtureDatabase(db: SqliteAccess) {
-  if (db.filename === ":memory:") return true
-  const identity = fixtureHandles.get(db as object)
-  return identity !== undefined && db.filename === identity.filename && fixturePathMatches(identity)
-}
-
 function fixturePathMatches(identity: FixtureIdentity) {
   try {
     const link = lstatSync(identity.filename)
@@ -1833,31 +1953,29 @@ type RetentionArgs = { apply?: boolean }
 
 export const RetentionCommand = cmd<{}, RetentionArgs>({
   command: "retention",
-  describe: "inventory Session retention candidates without writing the database",
-  builder: (yargs) => yargs.option("apply", { type: "boolean", default: false, describe: "apply redaction" }),
+  describe: "inventory Session retention candidates; --apply redacts only trees that pass every gate",
+  builder: (yargs) =>
+    yargs.option("apply", { type: "boolean", default: false, describe: "redact every tree that passes every gate" }),
   async handler(args) {
     const sqlite = await import("bun:sqlite")
-    if (args.apply) {
-      console.log(
-        JSON.stringify({
-          action: "refused",
-          changedRows: 0,
-          reasons: [
-            "reviewed-age-boundary-unavailable",
-            "cross-process-liveness-proof-unavailable",
-            "measurement-handoff-receipt-unavailable",
-            "reader-contract-unreviewed",
-            "production-apply-disabled",
-          ],
-        }),
-      )
-      process.exitCode = 1
-      return
-    }
+    const filename = Database.path()
     try {
-      const db = new sqlite.Database(Database.path(), { readonly: true }) as unknown as SqliteAccess
+      if (!args.apply) {
+        const db = new sqlite.Database(filename, { readonly: true }) as unknown as SqliteAccess
+        try {
+          console.log(
+            JSON.stringify(inventory(db, productionEvidence(filename), Date.now(), { transactional: false }), null, 2),
+          )
+        } finally {
+          db.close()
+        }
+        return
+      }
+      const db = new sqlite.Database(filename, { readwrite: true, create: false }) as unknown as SqliteAccess
       try {
-        console.log(JSON.stringify(inventory(db, {}, Date.now(), { transactional: false }), null, 2))
+        const result = applyGated(db, () => productionEvidence(filename))
+        console.log(JSON.stringify(result, null, 2))
+        if (result.action !== "applied") process.exitCode = 1
       } finally {
         db.close()
       }
@@ -1873,5 +1991,81 @@ export const RetentionCommand = cmd<{}, RetentionArgs>({
     }
   },
 })
+
+/**
+ * The production evidence this build can produce. The measurement receipt, customer classification and
+ * reader contract have no approved producer yet, so their gates refuse every tree.
+ */
+function productionEvidence(filename: string): RetentionEvidence {
+  return { holders: scanDatabaseHolders(filename) }
+}
+
+export type GatedApplyResult = {
+  readonly action: "applied" | "partial" | "refused"
+  readonly changedRows: number
+  readonly changedBytes: number
+  readonly completedSessionIDs: readonly string[]
+  readonly eligibleTrees: number
+  readonly refusedTrees: number
+  readonly reasons: readonly string[]
+}
+
+/**
+ * Redacts every tree whose inventory passes every gate, revalidating inside each batch. A refusal before
+ * the first committed batch writes nothing; a refusal after one stops all further writes and reports the
+ * committed progress.
+ */
+export function applyGated(db: SqliteAccess, evidence: () => RetentionEvidence, now = Date.now): GatedApplyResult {
+  db.exec("PRAGMA busy_timeout = 5000")
+  const dryRun = inventory(db, evidence(), now(), { transactional: false })
+  const eligible = dryRun.trees.filter((tree) => tree.eligible)
+  const refusedTrees = dryRun.trees.length - eligible.length
+  if (eligible.length === 0) {
+    const kinds = new Set([...dryRun.refusals, ...dryRun.trees.flatMap((tree) => tree.reasons.map(reasonKind))])
+    if (dryRun.trees.length === 0) kinds.add("no-retention-candidate")
+    return {
+      action: "refused",
+      changedRows: 0,
+      changedBytes: 0,
+      completedSessionIDs: [],
+      eligibleTrees: 0,
+      refusedTrees,
+      reasons: [...Array.from(kinds).toSorted(), "production-apply-disabled"],
+    }
+  }
+  const completed = new Array<string>()
+  let changedRows = 0
+  let changedBytes = 0
+  for (const tree of eligible) {
+    const result = apply(db, { tree, evidence, now })
+    changedRows += result.changedRows
+    changedBytes += result.changedBytes
+    completed.push(...result.completedSessionIDs)
+    if (result.state === "complete") continue
+    return {
+      action: changedRows > 0 || completed.length > 0 ? "partial" : "refused",
+      changedRows,
+      changedBytes,
+      completedSessionIDs: completed.toSorted(),
+      eligibleTrees: eligible.length,
+      refusedTrees,
+      reasons: [...result.reasons, "production-apply-disabled"],
+    }
+  }
+  return {
+    action: "applied",
+    changedRows,
+    changedBytes,
+    completedSessionIDs: completed.toSorted(),
+    eligibleTrees: eligible.length,
+    refusedTrees,
+    reasons: [],
+  }
+}
+
+function reasonKind(reason: string) {
+  const separator = reason.indexOf(":")
+  return separator === -1 ? reason : reason.slice(0, separator)
+}
 
 export * as DbRetention from "./db-retention"

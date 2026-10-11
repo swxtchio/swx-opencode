@@ -1,8 +1,7 @@
 import { Effect } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
-import { EventRetentionTable, EventSequenceTable } from "@opencode-ai/core/event/sql"
-import { eq } from "drizzle-orm"
+import { EventRetentionTable } from "@opencode-ai/core/event/sql"
 import { DbRetention, type RetentionEvidence, type SqliteAccess } from "@/cli/cmd/db-retention"
 
 const access = (db: unknown) => db as SqliteAccess
@@ -10,14 +9,9 @@ const access = (db: unknown) => db as SqliteAccess
 export function applyRetentionFixture(sessionID: string) {
   return Effect.gen(function* () {
     const { db } = yield* Database.Service
-    const now = Date.now()
-    const ownerID =
-      (yield* db
-        .select({ ownerID: EventSequenceTable.owner_id })
-        .from(EventSequenceTable)
-        .where(eq(EventSequenceTable.aggregate_id, sessionID))
-        .get())?.ownerID ?? null
-    const proof: RetentionEvidence = {
+    // Past the inactivity window for a Session the test just created.
+    const now = Date.now() + DbRetention.inactivityPolicy.windowMs + 60_000
+    const evidence: RetentionEvidence = {
       customerBinding: {
         proofID: "fixture-unbound-session-classification",
         durable: true,
@@ -25,24 +19,7 @@ export function applyRetentionFixture(sessionID: string) {
         customerBoundSessionIDs: [],
         nonCustomerSessionIDs: [sessionID],
       },
-      policy: {
-        reviewed: true,
-        cutoffEpochMs: now + 60_000,
-        reviewedReference: "swxtchio/swx-opencode#97",
-        policyDigest: "fixture-policy-digest",
-        readerContractReviewed: true,
-        readerContractID: "fixture-reader-contract",
-      },
-      liveness: {
-        proofID: "fixture-liveness",
-        observedAtEpochMs: now,
-        sessionIDs: [sessionID],
-        aggregateOwners: { [sessionID]: ownerID },
-        servingProcesses: [],
-        canResume: false,
-        unfinishedOwnedWork: false,
-        validThroughEpochMs: now + 60_000,
-      },
+      readerContract: { reviewed: true, id: "fixture-reader-contract" },
       handoff: {
         receiptID: "fixture-handoff",
         durable: true,
@@ -78,6 +55,10 @@ export function applyRetentionFixture(sessionID: string) {
     const image = yield* (db.$client as unknown as { export: Effect.Effect<Uint8Array> }).export
     const fixture = yield* Effect.promise(() => DbRetention.createFixtureDatabase(image))
     const database = fixture.db
+    // The copy stands for the store after the test process, which wrote this Session through the real
+    // producer, has exited: its registered identity no longer names a live process.
+    database.query("UPDATE event_writer_process SET start_ticks = 'exited-writer'").run()
+    const proof: RetentionEvidence = { ...evidence, holders: DbRetention.scanDatabaseHolders(fixture.filename) }
     yield* Effect.addFinalizer(() =>
       Effect.promise(async () => {
         database.close()
