@@ -766,7 +766,7 @@ export type SessionPromptQueueItem = {
   id: string
   sessionID: string
   /**
-   * Admission order within the session; never reused
+   * Delivery order within the session: admission order until a reorder trades it between pending items; never reused
    */
   seq: number
   delivery: "steer" | "queue"

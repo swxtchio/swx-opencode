@@ -3381,7 +3381,7 @@ export class Queue extends HeyApiClient {
   /**
    * List queued prompts
    *
-   * List the prompts admitted to a session that have not reached the model yet: pending steers first, then queued prompts, each in admission order.
+   * List the prompts admitted to a session that have not reached the model yet: pending steers first, then queued prompts, each in the order it is delivered.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters: {

@@ -42,7 +42,7 @@ export const SessionQueueApi = HttpApi.make("sessionQueue").add(
           identifier: "session.queue.list",
           summary: "List queued prompts",
           description:
-            "List the prompts admitted to a session that have not reached the model yet: pending steers first, then queued prompts, each in admission order.",
+            "List the prompts admitted to a session that have not reached the model yet: pending steers first, then queued prompts, each in the order it is delivered.",
         }),
       ),
       HttpApiEndpoint.delete("withdraw", SessionQueuePaths.withdraw, {

@@ -66,7 +66,10 @@ export type QueuedInputEncoded = typeof QueuedInput.Encoded
 export const Item = Schema.Struct({
   id: ItemID,
   sessionID: SessionID,
-  seq: NonNegativeInt.annotate({ description: "Admission order within the session; never reused" }),
+  seq: NonNegativeInt.annotate({
+    description:
+      "Delivery order within the session: admission order until a reorder trades it between pending items; never reused",
+  }),
   delivery: Delivery,
   input: QueuedInput,
   time: Schema.Struct({

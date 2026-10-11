@@ -5,11 +5,13 @@ import type { MessageID } from "../v1/session"
 import { SessionTable } from "./sql"
 
 // Fork-owned V1 prompt queue (swxtchio/swx-opencode#68). A row is pending until
-// it is promoted into a V1 user message (time_promoted) or withdrawn for editing
-// (time_withdrawn). message_id is reserved before the message is written, so a
-// promotion a stopped process left half done is finished rather than repeated. A
-// promoted row stays until the next drain's history read has seen its message; a
-// withdrawn row stays so it can be restored.
+// it is promoted into a V1 user message (time_promoted), withdrawn for editing
+// (time_withdrawn), or deleted from the review view (#212). seq orders delivery
+// within a category, and a reorder trades it between pending rows. message_id
+// is reserved before the message is written, so a promotion a stopped process
+// left half done is finished rather than repeated. A promoted row stays until
+// the next drain's history read has seen its message; a withdrawn row stays so
+// it can be restored.
 export const SessionPromptQueueTable = sqliteTable(
   "session_prompt_queue",
   {

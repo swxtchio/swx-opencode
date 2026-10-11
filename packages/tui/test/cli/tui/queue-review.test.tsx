@@ -1,0 +1,322 @@
+/** @jsxImportSource @opentui/solid */
+import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
+import { testRender, useRenderer } from "@opentui/solid"
+import { afterEach, expect, jest, test } from "bun:test"
+import type { GlobalEvent, SessionPromptQueueItem } from "@opencode-ai/sdk/v2"
+import { mkdir } from "node:fs/promises"
+import path from "node:path"
+import { onCleanup, onMount } from "solid-js"
+import { tmpdir } from "../../fixture/fixture"
+import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
+import { TestTuiContexts } from "../../fixture/tui-environment"
+import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
+import { ArgsProvider } from "../../../src/context/args"
+import { ExitProvider } from "../../../src/context/exit"
+import { KVProvider } from "../../../src/context/kv"
+import { PermissionProvider } from "../../../src/context/permission"
+import { ProjectProvider } from "../../../src/context/project"
+import { SDKProvider } from "../../../src/context/sdk"
+import { SyncProvider, useSync } from "../../../src/context/sync"
+import { ThemeProvider } from "../../../src/context/theme"
+import { TuiConfigProvider } from "../../../src/config"
+import { OpencodeKeymapProvider, registerOpencodeKeymap } from "../../../src/keymap"
+import { DialogProvider, useDialog } from "../../../src/ui/dialog"
+import { ToastProvider } from "../../../src/ui/toast"
+import { PromptQueueRow } from "../../../src/component/prompt/queue"
+import { DialogQueue, REVIEW_IDLE_MS } from "../../../src/component/dialog-queue"
+
+// The review view of pending prompts (swxtchio/swx-opencode#212), rendered with
+// the production sync, SDK and dialog providers against a scripted server. What
+// the server does with each request is covered in packages/opencode.
+
+const sessionID = "ses_queue_review"
+const session = { id: sessionID, title: "review", time: { created: 0, updated: 0 }, version: "1", directory }
+
+function item(id: string, delivery: "steer" | "queue", text: string, seq: number): SessionPromptQueueItem {
+  return { id, sessionID, seq, delivery, input: { parts: [{ type: "text", text }] }, time: { created: seq } }
+}
+
+const userMessage = {
+  info: {
+    id: "msg_user",
+    sessionID,
+    role: "user",
+    time: { created: 1 },
+    agent: "build",
+    model: { providerID: "test", modelID: "model" },
+  },
+  parts: [{ id: "prt_user", sessionID, messageID: "msg_user", type: "text", text: "already in the transcript" }],
+}
+
+async function wait(fn: () => boolean | Promise<boolean>, timeout = 3000) {
+  const start = Date.now()
+  while (!(await fn())) {
+    if (Date.now() - start > timeout) throw new Error("timed out waiting for condition")
+    await Bun.sleep(10)
+  }
+}
+
+type QueueRequest = { method: string; path: string; body: Record<string, unknown> | undefined }
+
+async function mount(initial: SessionPromptQueueItem[]) {
+  await using tmp = await tmpdir()
+  const state = path.join(tmp.path, "state")
+  await mkdir(state, { recursive: true })
+  await Bun.write(path.join(state, "kv.json"), "{}")
+  const events = createEventSource()
+  const queue = { items: initial }
+  const requests: QueueRequest[] = []
+  const base = createFetch((url) => {
+    if (url.pathname === `/session/${sessionID}`) return json(session)
+    if (url.pathname === `/session/${sessionID}/message`) return json([userMessage])
+    if (url.pathname === `/session/${sessionID}/todo`) return json([])
+    if (url.pathname === `/session/${sessionID}/diff`) return json([])
+    if (url.pathname === `/session/${sessionID}/queue/release`) return new Response(null, { status: 204 })
+    if (url.pathname === `/session/${sessionID}/queue/remove`) return json(queue.items[0])
+    if (url.pathname.startsWith(`/session/${sessionID}/queue`)) return json(queue.items)
+  })
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init)
+    const url = new URL(request.url)
+    if (url.pathname.startsWith(`/session/${sessionID}/queue`)) {
+      const text = request.method === "GET" ? "" : await request.clone().text()
+      requests.push({ method: request.method, path: url.pathname, body: text ? JSON.parse(text) : undefined })
+    }
+    return base.fetch(request)
+  }) as typeof globalThis.fetch
+
+  let sync!: ReturnType<typeof useSync>
+  let dialog!: ReturnType<typeof useDialog>
+  let ready!: () => void
+  const mounted = new Promise<void>((resolve) => (ready = resolve))
+
+  function Probe() {
+    sync = useSync()
+    dialog = useDialog()
+    onMount(ready)
+    return <PromptQueueRow sessionID={sessionID} />
+  }
+
+  function Harness() {
+    const renderer = useRenderer()
+    const keymap = createDefaultOpenTuiKeymap(renderer)
+    const config = createTuiResolvedConfig({ leader_timeout: 1000 })
+    onCleanup(registerOpencodeKeymap(keymap, renderer, config))
+    return (
+      <TestTuiContexts directory={tmp.path} paths={{ home: tmp.path, state, worktree: tmp.path }}>
+        <OpencodeKeymapProvider keymap={keymap}>
+          <TuiConfigProvider config={config}>
+            <ArgsProvider>
+              <KVProvider>
+                <ThemeProvider mode="dark">
+                  <ToastProvider>
+                    <SDKProvider url="http://test" directory={directory} fetch={fetch} events={events.source}>
+                      <PermissionProvider>
+                        <ProjectProvider>
+                          <ExitProvider exit={() => {}}>
+                            <SyncProvider>
+                              <DialogProvider>
+                                <Probe />
+                              </DialogProvider>
+                            </SyncProvider>
+                          </ExitProvider>
+                        </ProjectProvider>
+                      </PermissionProvider>
+                    </SDKProvider>
+                  </ToastProvider>
+                </ThemeProvider>
+              </KVProvider>
+            </ArgsProvider>
+          </TuiConfigProvider>
+        </OpencodeKeymapProvider>
+      </TestTuiContexts>
+    )
+  }
+
+  const app = await testRender(() => <Harness />, { kittyKeyboard: true, width: 100, height: 40 })
+  await mounted
+  await wait(() => sync.status === "complete")
+  await sync.session.sync(sessionID)
+
+  const frame = async () => {
+    await app.renderOnce()
+    return app.captureCharFrame()
+  }
+  const find = async (needle: string) => {
+    const lines = (await frame()).split("\n")
+    const y = lines.findIndex((line) => line.includes(needle))
+    if (y < 0) throw new Error(`"${needle}" is not on screen`)
+    return { x: lines[y]!.indexOf(needle), y }
+  }
+  return {
+    app,
+    sync,
+    dialog,
+    requests,
+    frame,
+    queued: (method: string) => requests.filter((request) => request.path.endsWith(`/queue/${method}`)),
+    // The server publishes every change to the pending list.
+    publish(items: SessionPromptQueueItem[]) {
+      queue.items = items
+      events.emit({
+        directory,
+        project: "proj_test",
+        payload: { id: `evt_${Math.random()}`, type: "session.queue.updated", properties: { sessionID, items } },
+      } as GlobalEvent)
+    },
+    async open() {
+      const holds = requests.filter((request) => request.path.endsWith("/queue/hold")).length
+      const row = await find("pending")
+      await app.mockMouse.click(row.x, row.y)
+      await wait(() => requests.filter((request) => request.path.endsWith("/queue/hold")).length > holds)
+      expect(dialog.stack.length).toBe(1)
+    },
+    async click(needle: string) {
+      const target = await find(needle)
+      await app.mockMouse.click(target.x, target.y)
+    },
+  }
+}
+
+let cleanup: (() => void) | undefined
+afterEach(() => {
+  jest.useRealTimers()
+  cleanup?.()
+  cleanup = undefined
+})
+
+async function setup(initial: SessionPromptQueueItem[]) {
+  const view = await mount(initial)
+  cleanup = () => view.app.renderer.destroy()
+  return view
+}
+
+const steer = item("que_1", "steer", "steer the running turn", 2)
+const queued = item("que_2", "queue", "queued for later", 3)
+
+test("the row under the prompt counts pending prompts by category, not transcript messages", async () => {
+  const view = await setup([steer, queued])
+  expect(view.sync.data.message[sessionID]?.length).toBe(1)
+  expect(await view.frame()).toContain("2 pending · 1 steer · 1 queue")
+
+  view.publish([queued])
+  await wait(() => view.sync.data.session_queue[sessionID]?.length === 1)
+  expect(await view.frame()).toContain("1 pending · 0 steer · 1 queue")
+
+  view.publish([])
+  await wait(() => view.sync.data.session_queue[sessionID]?.length === 0)
+  expect(await view.frame()).not.toContain("pending")
+})
+
+test("activating the row opens the pending prompts in delivery order with their categories, held until closed", async () => {
+  const later = item("que_3", "queue", "queued after that", 4)
+  const view = await setup([steer, queued, later])
+  await view.open()
+
+  const lines = (await view.frame()).split("\n")
+  const listed = [
+    ["steer the running turn", "steer"],
+    ["queued for later", "queue"],
+    ["queued after that", "queue"],
+  ].map(([text, category]) => {
+    const y = lines.findIndex((line) => line.includes(text!))
+    expect(lines[y]).toContain(category!)
+    return y
+  })
+  expect(listed.every((y) => y >= 0)).toBe(true)
+  expect(listed).toEqual(listed.toSorted((a, b) => a - b))
+
+  const [hold] = view.queued("hold")
+  expect(hold?.method).toBe("POST")
+  expect(view.queued("release")).toEqual([])
+
+  view.app.mockInput.pressEscape()
+  await wait(() => view.queued("release").length === 1)
+  expect(view.dialog.stack.length).toBe(0)
+  expect(view.queued("release")[0]?.body).toEqual(hold?.body)
+})
+
+test("every route that closes the view releases its hold", async () => {
+  const view = await setup([steer])
+
+  await view.open()
+  view.dialog.clear()
+  await wait(() => view.queued("release").length === 1)
+
+  await view.open()
+  view.dialog.replace(() => <text>another dialog</text>)
+  await wait(() => view.queued("release").length === 2)
+  view.dialog.clear()
+
+  await view.open()
+  // Opening the view by mouse leaves an empty selection, which the backdrop
+  // takes for the end of a drag; a dialog opened by key starts without one.
+  view.app.renderer.clearSelection()
+  await view.app.mockMouse.click(2, 35)
+  await wait(() => view.queued("release").length === 3)
+  expect(view.queued("hold").map((request) => request.body)).toEqual(
+    view.queued("release").map((request) => request.body),
+  )
+})
+
+test("five minutes without activity close the view and release its hold; activity restarts that interval", async () => {
+  const view = await setup([steer, queued])
+  // Fake timers stop Bun.sleep, so this waits on the event loop's own turns.
+  const settle = async (done: () => boolean) => {
+    for (let turn = 0; turn < 1000 && !done(); turn++) await new Promise<void>((resolve) => queueMicrotask(resolve))
+    expect(done()).toBe(true)
+  }
+  // Opened as the row opens it, since a mouse click waits on timers too.
+  jest.useFakeTimers()
+  DialogQueue.show(view.dialog, sessionID)
+  await settle(() => view.queued("hold").length === 1)
+
+  jest.advanceTimersByTime(REVIEW_IDLE_MS - 60_000)
+  expect(view.dialog.stack.length).toBe(1)
+  // Activity four minutes in renews the server's hold and restarts the interval.
+  view.app.mockInput.pressArrow("down")
+  await settle(() => view.queued("hold").length === 2)
+  jest.advanceTimersByTime(REVIEW_IDLE_MS - 1)
+  expect(view.dialog.stack.length).toBe(1)
+  expect(view.queued("release")).toEqual([])
+
+  jest.advanceTimersByTime(1)
+  await settle(() => view.queued("release").length === 1)
+  expect(view.dialog.stack.length).toBe(0)
+})
+
+test("delete removes the selected pending prompt", async () => {
+  const view = await setup([steer, queued])
+  await view.open()
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("d", { ctrl: true })
+  await wait(() => view.queued("remove").length === 1)
+  expect(view.queued("remove")[0]?.body).toEqual({ id: queued.id })
+
+  view.publish([steer])
+  await wait(async () => !(await view.frame()).includes("queued for later"))
+  expect(await view.frame()).toContain("steer the running turn")
+})
+
+test("reorder moves a pending prompt within its category and never past the other", async () => {
+  const second = item("que_4", "queue", "second queued", 5)
+  const view = await setup([steer, queued, second])
+  await view.open()
+
+  // The first row is a steer, and the next one a queued prompt: nothing to move past.
+  view.app.mockInput.pressArrow("down", { meta: true })
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressArrow("up", { meta: true })
+  await wait(() => view.queued("reorder").length === 1)
+  expect(view.queued("reorder")[0]?.body).toEqual({ items: [second.id, queued.id] })
+})
+
+test("the consolidate button asks the server to consolidate the pending prompts", async () => {
+  const view = await setup([steer, queued])
+  await view.open()
+  await view.click("consolidate")
+  await wait(() => view.queued("consolidate").length === 1)
+  view.app.mockInput.pressKey("o", { ctrl: true })
+  await wait(() => view.queued("consolidate").length === 2)
+})

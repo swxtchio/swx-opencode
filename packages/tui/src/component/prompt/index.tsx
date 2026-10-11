@@ -54,6 +54,7 @@ import { useArgs } from "../../context/args"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useLeaderActive, useOpencodeKeymap } from "../../keymap"
 import { useTuiConfig } from "../../config"
 import { usePromptWorkspace } from "./workspace"
+import { PromptQueueRow } from "./queue"
 import { usePromptMove } from "./move"
 import { readLocalAttachment } from "./local-attachment"
 import { useLocation } from "../../context/location"
@@ -1690,6 +1691,7 @@ export function Prompt(props: PromptProps) {
             </box>
           </Show>
         </box>
+        <PromptQueueRow sessionID={props.sessionID} />
       </box>
       <Autocomplete
         sessionID={props.sessionID}
