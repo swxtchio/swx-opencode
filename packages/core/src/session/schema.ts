@@ -7,3 +7,6 @@ export type ID = typeof ID.Type
 
 export const Info = Session.Info
 export type Info = Session.Info
+
+export const WaitResult = Session.WaitResult
+export type WaitResult = typeof WaitResult.Type

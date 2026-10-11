@@ -5850,7 +5850,7 @@ export class Session3 extends HeyApiClient {
   /**
    * Wait for session
    *
-   * Wait for a session agent loop to become idle.
+   * Wait for current admitted work to settle and return its durable outcome.
    */
   public wait<ThrowOnError extends boolean = false>(
     parameters: {

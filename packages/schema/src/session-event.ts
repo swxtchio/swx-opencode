@@ -50,6 +50,8 @@ const stepSettlementOptions = {
 
 export const UnknownError = SessionMessage.UnknownError
 export type UnknownError = SessionMessage.UnknownError
+export const AssistantError = SessionMessage.AssistantError
+export type AssistantError = SessionMessage.AssistantError
 
 export const AgentSwitched = Event.define({
   type: "session.next.agent.switched",
@@ -87,7 +89,11 @@ export type Moved = typeof Moved.Type
 export const Prompted = Event.define({
   type: "session.next.prompted",
   ...options,
-  schema: PromptFields,
+  schema: {
+    ...PromptFields,
+    // Set when a running drain promotes the input at a provider-turn boundary, so the input joins that drain's work.
+    continuation: Schema.Literal(true).pipe(optional),
+  },
 })
 export type Prompted = typeof Prompted.Type
 
@@ -188,7 +194,7 @@ export namespace Step {
     schema: {
       ...Base,
       assistantMessageID: SessionMessage.ID,
-      error: UnknownError,
+      error: AssistantError,
     },
   })
   export type Failed = typeof Failed.Type

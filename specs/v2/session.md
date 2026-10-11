@@ -30,7 +30,21 @@ sessions.active()
   -> snapshots foreground Session drains owned by this process
   -> returns only active Session IDs with { type: "running" }
   -> absence means inactive; activity is not durable across process restarts
+
+sessions.wait(sessionID)
+  -> joins a drain already owned by this process; never starts execution or recovery
+  -> returns `idle`, `pending`, `completed`, `failed`, or `interrupted` from durable admissions and message/tool projections
+  -> includes the highest admitted sequence covered when admitted work exists
+  -> reports unavailable when promoted work has no established terminal projection
 ```
+
+`Session.WaitResult` is the public wire contract for the wait outcome. The observation reads admissions, terminal-step boundaries, and assistant/tool projections from one committed database snapshot; it returns `completed` only when no admission is pending, a terminal assistant follows the last promoted input, and every assistant/tool result in the observed work group is settled successfully. A later admission is beyond the returned watermark and supersedes that observation. Promoted work without a local owner and without a terminal assistant remains unavailable; wait does not recover it after process loss.
+
+A terminal assistant step ending in `tool-calls`, or one carrying a local tool call, is an intermediate turn and cannot establish completion until the required provider continuation publishes its terminal assistant.
+
+The observed work group starts after the last closing terminal step committed before the latest admission. A successful step that does not end in `tool-calls` always closes the older work. A failed or interrupted step closes it when it was committed before the latest input's work started. That work starts at the latest `Prompted` event without `continuation`, which is a drain start or a would-idle queue promotion. The runner sets `Prompted.continuation` only when a running drain promotes steers at a provider-turn boundary. A steer accepted into a failing drain therefore reports that failure, while a prompt promoted by a later drain, at the would-idle queue boundary, or still pending settles on its own outcome, as do the continuation steers of that later work. An explicit resume that promotes no input starts no new work, so steers it promotes stay with the earlier work.
+
+The joined drain `Exit` supplies a `failed` or `interrupted` result when execution ends unsuccessfully before the admitted turn is successfully completed, even if the latest assistant projection is absent or is only an intermediate tool-call turn; the result still carries the latest admitted sequence when one exists.
 
 `session_input` is the durable admission inbox. `PromptAdmitted` records and projects accepted input so pending queue state can be replayed, replicated, and observed by clients. Admitted inputs remain outside model-visible Session history until the serialized runner publishes `Prompted`. Its projector atomically writes the visible user message and marks the inbox row promoted in the same event transaction. The V1-to-V2 shadow bridge publishes the same `Prompted` event for already-visible V1 prompts.
 

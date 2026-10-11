@@ -95,6 +95,9 @@ test("session methods retain decoded Effect inputs and outputs", async () => {
     if (url.includes("/message/")) {
       return Effect.succeed(HttpClientResponse.fromWeb(request, Response.json({ data: modelSwitchedMessage })))
     }
+    if (url.endsWith("/wait")) {
+      return Effect.succeed(HttpClientResponse.fromWeb(request, Response.json({ data: waitResult })))
+    }
     if (url.endsWith("/api/session/active")) {
       return Effect.succeed(
         HttpClientResponse.fromWeb(request, Response.json({ data: { ses_test: { type: "running" } } })),
@@ -128,7 +131,7 @@ test("session methods retain decoded Effect inputs and outputs", async () => {
       resume: false,
     })
     yield* client.sessions.compact({ sessionID: Session.ID.make("ses_test") })
-    yield* client.sessions.wait({ sessionID: Session.ID.make("ses_test") })
+    const waited = yield* client.sessions.wait({ sessionID: Session.ID.make("ses_test") })
     const context = yield* client.sessions.context({ sessionID: Session.ID.make("ses_test") })
     const history = yield* client.sessions.history({
       sessionID: Session.ID.make("ses_test"),
@@ -150,7 +153,7 @@ test("session methods retain decoded Effect inputs and outputs", async () => {
       sessionID: Session.ID.make("ses_test"),
       messageID: SessionMessage.ID.make("msg_model"),
     })
-    return { page, active, created, admitted, context, history, historyNext, events, message }
+    return { page, active, created, admitted, waited, context, history, historyNext, events, message }
   }).pipe(Effect.provideService(HttpClient.HttpClient, httpClient), Effect.runPromise)
 
   expect(DateTime.toEpochMillis(result.page.data[0].time.created)).toBe(1_717_171_717_000)
@@ -158,6 +161,7 @@ test("session methods retain decoded Effect inputs and outputs", async () => {
   expect(Object.getPrototypeOf(result.page.data[0])).toBe(Object.prototype)
   expect(Object.getPrototypeOf(result.created)).toBe(Object.prototype)
   expect(result.created.id).toBe("ses_test")
+  expect(result.waited).toEqual(waitResult)
   expect(Object.getPrototypeOf(result.admitted)).toBe(Object.prototype)
   expect(Object.getPrototypeOf(result.admitted.prompt)).toBe(Object.prototype)
   expect(DateTime.toEpochMillis(result.admitted.timeCreated)).toBe(1_717_171_717_000)
@@ -224,6 +228,12 @@ const admission = {
     delivery: "steer",
     timeCreated: 1_717_171_717_000,
   },
+}
+
+const waitResult = {
+  type: "completed",
+  admittedSeq: 7,
+  assistantMessageID: "msg_wait",
 }
 
 const modelSwitchedMessage = {

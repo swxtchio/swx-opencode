@@ -2,6 +2,9 @@ import { Schema } from "effect"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
 
+export const ProviderTurnInterruptedMessage = "Provider turn interrupted"
+export const ProviderTurnInterruptedOrigin = "runner-interruption"
+
 export class MessageDecodeError extends Schema.TaggedErrorClass<MessageDecodeError>()("Session.MessageDecodeError", {
   sessionID: SessionSchema.ID,
   messageID: SessionMessage.ID,

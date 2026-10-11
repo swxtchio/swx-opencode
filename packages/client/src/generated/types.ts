@@ -488,7 +488,14 @@ export type SessionsCompactOutput = void
 
 export type SessionsWaitInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 
-export type SessionsWaitOutput = void
+export type SessionsWaitOutput = {
+  readonly data:
+    | { readonly type: "idle" }
+    | { readonly type: "pending"; readonly admittedSeq: number; readonly messageID: string }
+    | { readonly type: "completed"; readonly admittedSeq: number; readonly assistantMessageID: string }
+    | { readonly type: "failed"; readonly admittedSeq?: number; readonly assistantMessageID?: string }
+    | { readonly type: "interrupted"; readonly admittedSeq?: number; readonly assistantMessageID?: string }
+}["data"]
 
 export type SessionsStageInput = {
   readonly sessionID: { readonly sessionID: string }["sessionID"]
@@ -662,7 +669,7 @@ export type SessionsContextOutput = {
           readonly reasoning: number
           readonly cache: { readonly read: number; readonly write: number }
         }
-        readonly error?: { readonly type: "unknown"; readonly message: string }
+        readonly error?: { readonly type: "unknown"; readonly message: string; readonly origin?: "runner-interruption" }
       }
     | {
         readonly type: "compaction"
@@ -748,6 +755,7 @@ export type SessionsHistoryOutput = {
             }>
           }
           readonly delivery: "steer" | "queue"
+          readonly continuation?: true
         }
       }
     | {
@@ -877,7 +885,11 @@ export type SessionsHistoryOutput = {
           readonly timestamp: number
           readonly sessionID: string
           readonly assistantMessageID: string
-          readonly error: { readonly type: "unknown"; readonly message: string }
+          readonly error: {
+            readonly type: "unknown"
+            readonly message: string
+            readonly origin?: "runner-interruption"
+          }
         }
       }
     | {
@@ -1206,6 +1218,7 @@ export type SessionsEventsOutput =
           }>
         }
         readonly delivery: "steer" | "queue"
+        readonly continuation?: true
       }
     }
   | {
@@ -1335,7 +1348,7 @@ export type SessionsEventsOutput =
         readonly timestamp: number
         readonly sessionID: string
         readonly assistantMessageID: string
-        readonly error: { readonly type: "unknown"; readonly message: string }
+        readonly error: { readonly type: "unknown"; readonly message: string; readonly origin?: "runner-interruption" }
       }
     }
   | {
@@ -1740,7 +1753,7 @@ export type SessionsMessageOutput = {
           readonly reasoning: number
           readonly cache: { readonly read: number; readonly write: number }
         }
-        readonly error?: { readonly type: "unknown"; readonly message: string }
+        readonly error?: { readonly type: "unknown"; readonly message: string; readonly origin?: "runner-interruption" }
       }
     | {
         readonly type: "compaction"
@@ -1912,7 +1925,7 @@ export type MessagesListOutput = {
           readonly reasoning: number
           readonly cache: { readonly read: number; readonly write: number }
         }
-        readonly error?: { readonly type: "unknown"; readonly message: string }
+        readonly error?: { readonly type: "unknown"; readonly message: string; readonly origin?: "runner-interruption" }
       }
     | {
         readonly type: "compaction"

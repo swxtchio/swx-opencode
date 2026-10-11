@@ -1,5 +1,15 @@
 # V2 Schema Changelog
 
+## 2026-10-10: Add Native Session Completion Wait
+
+- Change `POST /api/session/:sessionID/wait` to return `200 { data: Session.WaitResult }` for established idle, pending, completed, failed, and interrupted outcomes; retain `503` when the committed native state cannot establish the outcome.
+- Replace the unimplemented wait operation so process-local inactivity alone is not mistaken for successful completion; the response carries the highest admitted sequence it observed when admitted work exists.
+- Describe `503` as an unobservable completion outcome, not an unimplemented wait operation.
+- Derive the outcome from existing durable admissions and projected assistant/tool messages; treat a tool-call step as intermediate until its provider continuation finishes, and add no new durable event, event version, or migration.
+- Add optional `origin: "runner-interruption"` to the assistant error carried by `session.next.step.failed` and the projected assistant message, so an interruption is identified without matching its message text.
+- Add optional `continuation: true` to `session.next.prompted.1` when a running drain promotes steers at a provider-turn boundary, so wait keeps a failure in the work group only for input that joined the failing drain.
+- Regenerate the Promise, Effect, and legacy JavaScript client contracts; keep the durable Session event stream and exclusive history cursor unchanged, with no consumer cutover or V1 migration in this change.
+
 ## 2026-06-26: Add Finite Session History
 
 - Add `GET /api/session/:sessionID/history` and generated Promise, Effect, and legacy JavaScript client methods.

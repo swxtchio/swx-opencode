@@ -240,7 +240,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
     .add(
       HttpApiEndpoint.post("session.wait", "/api/session/:sessionID/wait", {
         params: { sessionID: Session.ID },
-        success: HttpApiSchema.NoContent,
+        success: Schema.Struct({ data: Session.WaitResult }),
         error: [SessionNotFoundError, ServiceUnavailableError],
       })
         .middleware(sessionLocationMiddleware)
@@ -248,7 +248,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
           OpenApi.annotations({
             identifier: "v2.session.wait",
             summary: "Wait for session",
-            description: "Wait for a session agent loop to become idle.",
+            description: "Wait for current admitted work to settle and return its durable outcome.",
           }),
         ),
     )
