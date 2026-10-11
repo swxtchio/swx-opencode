@@ -7,9 +7,11 @@ was only read: the holder scan, a selection census, and a read-only copy of one 
 **Ordinary prompted V2 Sessions remain ineligible.** The literal `v2-input-promoted-row-present` refusal is kept.
 Any tree with a persisted V2 input row (promoted or pending) is never redacted.
 
-**Live apply is still refused by code.** Three gates have no approved contract or producer (D1–D3 below). Each is a
-captain-owned decision, raised as `needs-decision` on the wake channel. Until they are decided, every real
-`opencode db retention --apply` returns `production-apply-disabled`.
+**Live apply is still refused by code.** Three gates had no approved contract or producer (D1–D3 below). Each is a
+captain-owned decision, raised as `needs-decision` on the wake channel. Captain decision 1 has since settled the
+`/sync/history` behaviour (D1), now implemented (invariant 5), but the production refusal is unchanged: production
+evidence still supplies no reader-contract, receipt or classification, so every real `opencode db retention --apply`
+returns `production-apply-disabled`.
 
 - Branch: `fm/opencode-retention-apply-2052`, based on `origin/swxtch` at `4b87478ddf4a14ffb42cdffde4af48712a9b03b6`.
 - Implementation head: `5e0a1d91c9` (`git rev-parse HEAD` before this report commit). The lock measurement ran at
@@ -20,7 +22,7 @@ captain-owned decision, raised as `needs-decision` on the wake channel. Until th
 
 | ID | Gate | Why code alone cannot close it | Options (recommended first) |
 | --- | --- | --- | --- |
-| D1 | Mixed `/sync/history` reader (swxtchio/swx-opencode#133 item 1) | `readSyncHistory` returns a bare event array. The SDK publishes it as `sync.history.list`. A server that redacts one aggregate can serve unaffected aggregates correctly only through a new response shape or new error/resync semantics. #133 reserves that choice to the captain. The brief rules out an unversioned envelope and silent omission. | A: a versioned `POST /sync/history/v2` returning `{events, unreplayable:[{aggregateID, seq}]}`. `Workspace.syncHistory` migrates to it, and the legacy route keeps its whole-request refusal. B: a typed 409 that lists the redacted IDs, plus a request-side exclusion list. C: keep the gate refused. |
+| D1 | Mixed `/sync/history` reader (swxtchio/swx-opencode#133 item 1). **Decided 2026-10-11 (captain decision 1); see invariant 5.** | `readSyncHistory` returns a bare event array. The SDK publishes it as `sync.history.list`. A server that redacts one aggregate can serve unaffected aggregates correctly only through a new response shape or new error/resync semantics. #133 reserves that choice to the captain. The brief rules out an unversioned envelope and silent omission. | A: a versioned `POST /sync/history/v2` returning `{events, unreplayable:[{aggregateID, seq}]}`. `Workspace.syncHistory` migrates to it, and the legacy route keeps its whole-request refusal. B: a typed 409 that lists the redacted IDs, plus a request-side exclusion list. C: keep the gate refused. |
 | D2 | Measurement receipt (swxtchio/swx-firstmate#1815) | The Firstmate producer (`fm_usage_read_opencode_scoped`, `fm_usage_finalize`, `fm_usage_finalize_readback`, `fm_primary_usage_harvest`) retains message-level `source_coverage` per Firstmate task or primary session: message count, digests and message watermark. It has no child-Session tree scope and no final **event** sequence (`bin/fm-usage-lib.sh` lines 1086–1104 and 1420–1425 at fm-llmrouter `2ea3deb7c`). It therefore cannot certify that a candidate tree's final write was measured. This OpenCode task may not change Firstmate's tracked material. | A: a Firstmate task extends the producer to emit a versioned per-tree receipt, holding the tree's session IDs and the final event seq per aggregate, both read in the same read transaction, plus the axes or their unavailable causes, with a readback. This crew then builds the OpenCode consumer for that schema. B: keep the gate refused. |
 | D3 | Customer-Session classification | `apply` has always required a `customerBinding` proof, but no production producer emits one. Every tree refuses with `customer-session-classification-unavailable`. The captain's #2052 list of refusal reasons does not mention this gate. | A: a store-level operator attestation (for example `--attest-no-customer-sessions <reviewed-ref>`), recorded in the progress evidence. B: a new per-Session marker producer. C: keep the gate refused. |
 
@@ -131,13 +133,41 @@ and re-run green.
   final-sequence receipt. The existing "a missing measurement receipt refuses…" test is kept.
 - Unproved: valid producer-derived coverage enabling a candidate, because no producer exists yet.
 
-### 5. Mixed `/sync/history` reader — NOT changed; the gate stays refused (D1)
+### 5. Mixed `/sync/history` reader — implemented per captain decision 1; the production gate stays refused
 
-- `readSyncHistory` still refuses a whole mixed request before decoding when any aggregate is redacted.
-  `packages/opencode/test/server/httpapi-sync.test.ts` still passes unchanged with the updated retention fixture.
-- `readerContract` evidence is absent in production, so every tree refuses with `reader-contract-unreviewed`.
-- Unproved: unaffected-Session sync with redacted peers. This waits for the public response and error/resync
-  decision; I did not regenerate the SDK or client.
+- Decision (2026-10-11): the reader must not fail on pruned data. A request touching a pruned Session returns 200
+  with the other Sessions' events; the pruned Session contributes none; `X-Pruned-Sessions` lists each pruned Session
+  with its last sequence number; the body stays the unchanged bare event array.
+- `readSyncHistory` (`packages/opencode/src/server/routes/instance/httpapi/handlers/sync.ts`) reads, in one
+  transaction, the aggregates the request touches (its payload keys plus every aggregate with events past its cursor)
+  and the retention markers in a state `EventV2.unreplayableRetentionStates` names (`redacting`, `complete`). The
+  touched marked aggregates are excluded in SQL, so their rows are never read or decoded, and are returned as
+  `pruned`, keyed by Session ID with `event_sequence.seq`.
+- The `history` handler returns the same event array. When `pruned` is non-empty, it sets
+  `X-Pruned-Sessions` to a JSON object of Session ID to last sequence, e.g. `{"ses_…":7}`. That is the request
+  payload's own shape and the same JSON-object convention as the existing fence header. With nothing pruned there is
+  no header. The endpoint's OpenAPI description says so; `packages/sdk/openapi.json` and the legacy JS SDK carry
+  the new description (only that line: regenerating `openapi.json` also surfaced unrelated pre-existing drift, which
+  is left out), and `packages/client` regenerates unchanged.
+- `/sync/replay` onto a redacted aggregate stays refused ("refuses sync replay onto a redacted aggregate without
+  changing its rows").
+- Tests in `packages/opencode/test/server/httpapi-sync.test.ts`, on one Session pruned by a real retention apply and
+  one kept peer, each across three payloads (the pruned Session omitted, listed past its first event, and listed at
+  its last sequence):
+  - "a history request touching a pruned Session returns 200 with the other Sessions' events".
+  - "a pruned Session contributes no events to sync history, and its rows are never read": the pruned rows are made
+    undecodable first, and the request still succeeds without them.
+  - "the X-Pruned-Sessions header lists each pruned Session with its last sequence number": the expected sequence
+    is read from the producer before retention.
+  - "sync history keeps its bare event array body when a Session is pruned": an array of rows with exactly
+    `aggregate_id`, `data`, `id`, `seq`, `type`, equal to the unpruned rows past each cursor.
+- Red proofs: RP27 (the no-fail path reverted), RP28 (the header reverted), RP29 (the pruned-row exclusion reverted).
+- Still refused: `readerContract` evidence is absent in production, so every tree refuses with
+  `reader-contract-unreviewed`. Supplying it would change the production refusal, which this scope addition forbids.
+- Not done, not required by the decision: `Workspace.syncHistory`, the in-repo client of this route, ignores the
+  header. A workspace that already holds a pruned Session gets no events for it and is not told it was pruned. A
+  store with many pruned Sessions also grows the header by about 40 bytes per touched pruned Session, and many HTTP
+  clients cap response headers near 16 KB, roughly 400 Sessions.
 
 ### 6. Literal `v2-input-promoted-row-present` — kept
 
@@ -163,7 +193,8 @@ and re-run green.
   write transaction, with every reason kind plus `production-apply-disabled`. Otherwise it applies each tree,
   revalidating every batch inside its lock. A refusal after committed batches returns `partial` with the honest
   `changedRows`, and nothing further is written.
-- `productionEvidence` supplies only the holder scan, so D1–D3 keep `production-apply-disabled` on every real call.
+- `productionEvidence` supplies only the holder scan, so the reader-contract, receipt and classification gates keep
+  `production-apply-disabled` on every real call.
 - Tests:
   - "retention CLI keeps inventory read-only and refuses apply before any write when no tree passes every gate" runs
     the production CLI handler: no transaction, and bytes unchanged.
@@ -173,8 +204,8 @@ and re-run green.
     reader, unreadable evidence, and a clock still inside the inactivity window of the producer's writes.
   - "a gate failing after committed batches reports partial progress and stops every further write".
 - Red proofs: RP9, RP16 (fixture barrier restored), RP17, RP18 and RP19.
-- Unproved: a positive run of the **production CLI handler** itself. It cannot pass until D1–D3 supply producers. The
-  positive test exercises `applyGated`, the function the handler calls, on a store the real producers wrote. Its
+- Unproved: a positive run of the **production CLI handler** itself. It cannot pass until the reader-contract,
+  receipt and classification gates have production producers. The positive test exercises `applyGated`, the function the handler calls, on a store the real producers wrote. Its
   customer, receipt and reader inputs are fixture stand-ins, and only the holder scan comes from the real producer.
 
 ### 8. One-batch write-lock hold — measured: about 330–400 ms per batch
@@ -215,6 +246,10 @@ and re-run green.
 | Round-1 fixes, `packages/opencode`: `bun test test/cli/db/retention.test.ts` | 30 pass, 0 fail |
 | Round-1 fixes, `packages/opencode`: `bun test test/session/session.test.ts -t "retention\|Retention"` | 4 pass, 0 fail |
 | Round-1 fixes, `packages/opencode`: `bun test test/server/httpapi-sync.test.ts` | 4 pass, 0 fail, 1 skipped |
+| Decision 1, `packages/opencode`: `bun test test/server/httpapi-sync.test.ts` | 7 pass, 0 fail, 1 skipped |
+| Decision 1, `packages/opencode`: `bun test test/control-plane/workspace.test.ts -t "redacted"` | 1 pass |
+| Decision 1, `packages/opencode`: `bun test test/server/httpapi-session.test.ts -t "redacted aggregate before returning content"` | 1 pass |
+| Decision 1, `packages/core` and `packages/opencode`: `bun typecheck` | clean |
 | `packages/opencode`: `bun test test/server/httpapi-session.test.ts -t "redacted aggregate before returning content"` | 1 pass |
 | `packages/opencode`: `bun test test/control-plane/workspace.test.ts -t "warp a redacted Session"` | 1 pass |
 | `packages/core` and `packages/opencode`: `bun typecheck` | clean |
@@ -252,6 +287,9 @@ restored from a byte copy, with `git status` clean afterwards.
 | RP24 | in-lock holder rescan (`lockedHolderFailures`) in `revalidateCandidate` | "opens the store after the evidence scan" 0 pass, 1 fail: apply completed 17 rows with the holder present |
 | RP25 | `/proc/locks` holders dropped from the scan result | "found through its SQLite lock" 0 pass, 1 fail: `pids: []` |
 | RP26 | `model` dropped from the retained metric objects | producer-built "restartable batches" 0 pass, 1 fail; the pre-fix reduced-fixture test at `9d5610eb` 1 pass |
+| RP27 | replayability preflight restored in `readSyncHistory` (no-fail path reverted) | `httpapi-sync.test.ts` 3 pass, 4 fail: all four pruned-Session tests |
+| RP28 | `X-Pruned-Sessions` header not set | 6 pass, 1 fail: the header test |
+| RP29 | pruned rows no longer excluded | 5 pass, 2 fail: "contributes no events" and "bare event array body" |
 
 ## Measured selection on the live store (read-only, 2026-10-11T20:23:44Z)
 
@@ -270,9 +308,8 @@ restored from a byte copy, with `git status` clean afterwards.
 
 - Receipt production and readback for the fresh store (D2): the producer cannot emit one, and changes to it are out
   of scope.
-- Unaffected sync alongside a redacted aggregate (D1): blocked on a public-contract decision.
 - A production customer classification (D3): no producer exists.
-- A positive production CLI apply: blocked by D1–D3.
+- A positive production CLI apply: blocked by the reader-contract evidence gate, D2 and D3.
 - Holder-scan blind spot: a process of another user (including root), or a non-inspectable process, that has the file
   open without holding a SQLite lock. Every WAL connection holds one, so this is limited to non-SQLite handles.
 - A holder that opens the store after a batch's in-lock rescan and before its COMMIT is not seen by that batch. It
