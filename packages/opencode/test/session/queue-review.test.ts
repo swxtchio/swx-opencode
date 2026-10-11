@@ -151,6 +151,11 @@ it.instance(
       const written: string[] = []
       const promote = promoter(session.id, written)
       yield* admit(session.id, "queue", "kept by the lease")
+      // A hold nobody watches lapses for promotion all the same.
+      const unwatched = yield* sessions.create({ title: "review lease, unwatched" })
+      const unwatchedWritten: string[] = []
+      yield* admit(unwatched.id, "queue", "freed by its own deadline")
+      yield* queue.hold(unwatched.id, "view")
 
       yield* queue.hold(session.id, "view")
       const ended = yield* queue.released(session.id).pipe(Effect.forkChild)
@@ -161,6 +166,8 @@ it.instance(
       yield* promote("queue")
       expect(written).toEqual([])
       expect(ended.pollUnsafe()).toBeUndefined()
+      yield* promoter(unwatched.id, unwatchedWritten)("queue")
+      expect(unwatchedWritten).toEqual(["freed by its own deadline"])
 
       yield* TestClock.adjust("1 minute")
       // A timeout would run on the test clock too, so a bounded number of turns

@@ -273,8 +273,9 @@ test("five minutes without activity close the view and release its hold; activit
 
   jest.advanceTimersByTime(REVIEW_IDLE_MS - 60_000)
   expect(view.dialog.stack.length).toBe(1)
-  // Activity four minutes in renews the server's hold and restarts the interval.
-  view.app.mockInput.pressArrow("down")
+  // Any key four minutes in, not only one that moves the selection, renews the
+  // server's hold and restarts the interval.
+  view.app.mockInput.pressKey("x")
   await settle(() => view.queued("hold").length === 2)
   jest.advanceTimersByTime(REVIEW_IDLE_MS - 1)
   expect(view.dialog.stack.length).toBe(1)

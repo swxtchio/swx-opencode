@@ -178,3 +178,11 @@ const table = sqliteTable("session", {
 - A `steer` (the default) is promoted at admission so it still reaches the running turn's next step; only an explicit `queue` waits for the would-idle boundary. Holding every steer until the loop top would break senders that expect their message in history mid-run.
 - Never name a fork table, route or event after upstream v2's `session_input`, `session_pending` or `session_inbox`; a sync bringing v2 in would collide with it.
 - Every queue write goes through `writable()` in `queue.ts`, which opens its transaction with `BEGIN IMMEDIATE`. A deferred transaction that reads before it writes pins a read snapshot, and a later commit by another writer then fails the write with `SQLITE_BUSY_SNAPSHOT`, which the driver does not retry (#162). Add new queue writes inside `writable()`; read-only queue transactions may stay deferred.
+- The TUI review view holds a session's promotion (`hold`/`release` in `queue.ts`, #212). Both `reserve` and `commit` check `held()`: without the `reserve` check a promotion loop re-reserves forever against a `commit` that refuses. A new promotion path needs the same checks, and `awaitingDrain` must keep ignoring held pending rows or a drain caller re-drains in a loop.
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project.
+Do not repeat what the codebase already shows; point to the authoritative file or command instead.
+Prefer rewriting or pruning existing entries over appending new ones.
+When updating this file, preserve this bar for all agents and keep entries concise.
