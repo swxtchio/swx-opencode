@@ -2262,7 +2262,9 @@ describe("session HttpApi", () => {
         body: body === undefined ? undefined : JSON.stringify(body),
       })
     const lastUsers = llm.inputs.pipe(
-      Effect.map((inputs) => inputs.map((input) => (Array.isArray(input.messages) ? input.messages.at(-1) : undefined))),
+      Effect.map((inputs) =>
+        inputs.map((input) => (Array.isArray(input.messages) ? input.messages.at(-1) : undefined)),
+      ),
     )
     return {
       headers,
@@ -2325,9 +2327,12 @@ describe("session HttpApi", () => {
         yield* api.idle()
         expect(yield* llm.calls).toBe(1)
         expect(api.texts(yield* api.listed())).toEqual(["steer while held", "queued while held"])
-        const messages = yield* requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, { sessionID: session.id }), {
-          headers: api.headers,
-        })
+        const messages = yield* requestJson<SessionV1.WithParts[]>(
+          pathFor(SessionPaths.messages, { sessionID: session.id }),
+          {
+            headers: api.headers,
+          },
+        )
         expect(JSON.stringify(messages)).not.toContain("while held")
 
         // A sync prompt on a new session waits out the hold rather than failing.
@@ -2444,6 +2449,34 @@ describe("session HttpApi", () => {
         yield* api.idle()
         expect(JSON.stringify(yield* llm.inputs)).not.toContain("drop this one")
         expect(yield* api.listed()).toEqual([])
+
+        // Deleting a new session's first prompt answers its sync caller as withdrawn.
+        const fresh = yield* createSession({ title: "review edits, new session" }).pipe(
+          provideInstanceEffect(directory),
+        )
+        const freshApi = reviewRoutes(directory, fresh.id, llm)
+        expect((yield* freshApi.post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const first = yield* freshApi
+          .post(SessionPaths.prompt, {
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            parts: [{ type: "text", text: "deleted before it started" }],
+          })
+          .pipe(Effect.forkChild)
+        const [firstItem] = yield* pollWithTimeout(
+          freshApi.listed().pipe(Effect.map((items) => (items.length === 1 ? items : undefined))),
+          "first prompt never queued",
+        )
+        expect((yield* freshApi.post(SessionQueuePaths.remove, { id: firstItem!.id })).status).toBe(200)
+        expect((yield* freshApi.post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+        const withdrawn = yield* awaitWithTimeout(
+          Fiber.join(first),
+          "deleted first prompt never answered",
+          "10 seconds",
+        )
+        expect(withdrawn.status).toBe(409)
+        expect(yield* responseJson(withdrawn)).toMatchObject({ _tag: "PromptWithdrawn", itemID: firstItem!.id })
+        expect(yield* llm.calls).toBe(4)
       }).pipe(
         Effect.ensuring(Deferred.succeed(gate, undefined)),
         Effect.provide(TestLLMServer.layer),

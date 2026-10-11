@@ -240,7 +240,7 @@ const layer = Layer.effect(
       { readonly leases: Map<string, number>; readonly ended: Deferred.Deferred<HoldEnd> }
     >()
 
-    const semaphore =(map: Map<SessionID, Semaphore.Semaphore>, sessionID: SessionID) => {
+    const semaphore = (map: Map<SessionID, Semaphore.Semaphore>, sessionID: SessionID) => {
       const hit = map.get(sessionID)
       if (hit) return hit
       const next = Semaphore.makeUnsafe(1)
@@ -517,7 +517,8 @@ const layer = Layer.effect(
           const current = (yield* settle(sessionID, "lapsed")) ? holds.get(sessionID) : undefined
           const until = (yield* Clock.currentTimeMillis) + Duration.toMillis(holdLease)
           if (current) current.leases.set(holder, until)
-          if (!current) holds.set(sessionID, { leases: new Map([[holder, until]]), ended: yield* Deferred.make<HoldEnd>() })
+          if (!current)
+            holds.set(sessionID, { leases: new Map([[holder, until]]), ended: yield* Deferred.make<HoldEnd>() })
           return { started: !current, items: yield* list(sessionID) }
         }),
       ).pipe(Effect.withSpan("SessionQueue.hold"))
@@ -619,9 +620,10 @@ const layer = Layer.effect(
                 .all()
                 .pipe(Effect.orDie)
               const plan = consolidation(
-                [...rows.filter((row) => row.delivery === "steer"), ...rows.filter((row) => row.delivery !== "steer")].map(
-                  fromRow,
-                ),
+                [
+                  ...rows.filter((row) => row.delivery === "steer"),
+                  ...rows.filter((row) => row.delivery !== "steer"),
+                ].map(fromRow),
               )
               if (plan.removed.length > 0)
                 yield* tx
@@ -1202,7 +1204,10 @@ export function consolidation(items: readonly Item[]) {
       ].join("\n")
       return {
         id: first.item.id,
-        input: { ...first.item.input, parts: [{ ...first.item.input.parts[0]!, text }] } as SessionPromptQueue.QueuedInput,
+        input: {
+          ...first.item.input,
+          parts: [{ ...first.item.input.parts[0]!, text }],
+        } as SessionPromptQueue.QueuedInput,
       }
     }),
   }

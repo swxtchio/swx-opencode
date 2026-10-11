@@ -4,7 +4,7 @@ import { rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { eq } from "drizzle-orm"
-import { Deferred, Effect, Fiber, Layer, Option } from "effect"
+import { Deferred, Effect, Exit, Fiber, Layer, Option } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
@@ -163,7 +163,11 @@ it.instance(
       expect(ended.pollUnsafe()).toBeUndefined()
 
       yield* TestClock.adjust("1 minute")
-      expect(yield* awaitWithTimeout(Fiber.join(ended), "lapsed hold never ended")).toBe("lapsed")
+      // A timeout would run on the test clock too, so a bounded number of turns
+      // lets the woken watcher finish instead.
+      for (let turn = 0; turn < 100 && ended.pollUnsafe() === undefined; turn++) yield* Effect.yieldNow
+      const end = ended.pollUnsafe()
+      expect(end && Exit.isSuccess(end) ? end.value : undefined).toBe("lapsed")
       yield* promote("queue")
       expect(written).toEqual(["kept by the lease"])
     }).pipe(Effect.provide(TestClock.layer())),
