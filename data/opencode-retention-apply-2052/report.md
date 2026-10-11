@@ -78,30 +78,45 @@ and re-run green.
 
   Opening the shared file is not ownership; only a process that wrote the Session holds it, until it exits. All of
   these checks run again inside every batch's `BEGIN IMMEDIATE`.
-- Tests in `retention.test.ts`, each using a separate OS process (`test/fixture/retention-holder.ts`):
+- The evidence holder scan runs before the lock, so `apply` also rescans the full holder set inside every batch's
+  `BEGIN IMMEDIATE` (`lockedHolderFailures`). Every current holder must pass the registration check, and a holder
+  missing from the evidence scan refuses the batch (`database-holder-appeared-after-scan:<pid>`).
+- Tests in `retention.test.ts`, each on a store written by the real producers (`test/fixture/retention-producer.ts`)
+  and held by a separate OS process (`test/fixture/retention-holder.ts`):
   - "a Session written by a live process in another OS process is never selected, and is released when it exits": a
     real `Database`+`EventV2` producer in another process holds the Session. Selection and apply refuse with
     unchanged bytes, and the Session becomes eligible after that process exits.
   - "an unregistered process holding the database refuses every tree until it exits".
   - "a holder or pending work arriving between inventory and a batch refuses it before any write".
+  - "a holder that opens the store after the evidence scan refuses the batch before any write": the evidence scan
+    names no holder, an unregistered holder then opens the store, and the batch refuses with unchanged bytes.
+  - "a holder whose descriptors cannot be read is still found through its SQLite lock in /proc/locks": the holder
+    makes itself non-dumpable, so its descriptors cannot be listed, and the scan still names it.
   - "dry run names pending, unfinished, workspace-owned, receipt, and unreadable proofs".
 - Core test: `packages/core/test/event.test.ts` › "records this process as the writer of every committed durable
   append, and nothing for a fenced one".
-- Red proofs: RP1, RP2, RP5, RP6, RP7, RP10, RP12, RP21, RP22 and RP23.
+- Red proofs: RP1, RP2, RP5, RP6, RP7, RP10, RP12, RP21, RP22, RP23, RP24 and RP25.
 
 ### 3. Content removed, metrics retained exactly — verified at the existing boundary
 
-- `redactionPlan`, `redactRow` and `retainMetrics` are unchanged. The existing restart-safe apply test ("apply
-  redacts every copy in restartable batches and preserves metric values") now also compares the per-Session usage
-  record, which the session-usage projection maintains: `cost`, `tokens_input`, `tokens_output`, `tokens_reasoning`,
-  `tokens_cache_read`, `tokens_cache_write`, plus the `model` and `agent` columns. It also compares
-  provider, requested and serving model, tokens, cost and `time.created`/`time.completed` on message, part and V2 rows,
-  and the `db export-usage` records, before and after.
+- `redactionPlan`, `redactRow` and `retainMetrics` are unchanged. The restart-safe apply test ("apply redacts every
+  Session-produced copy in restartable batches and preserves metric values") runs on a store written by the real
+  producers in a separate process (`test/fixture/retention-producer.ts`): the production `Database` layer's schema,
+  and Session, message, part, V2 step, V2 context, todo and Context Epoch rows from the Session, Todo and EventV2
+  producers. It compares the per-Session usage record, which the session-usage projection fills from the producer's
+  step-finish part: `cost`, `tokens_input`, `tokens_output`, `tokens_reasoning`, `tokens_cache_read`,
+  `tokens_cache_write`, and the `model` and `agent` columns, which these producers leave null. It also compares
+  provider, requested model (V1 `modelID` and V2 `model`), serving models, tokens, cost and
+  `time.created`/`time.completed` on every message, part and V2 row, and the `db export-usage` records, before and
+  after.
+- The reduced hand-built schema remains only for refusal cases and the fixture-compaction rehearsals. RP26 shows why
+  it was not enough: dropping `model` from the retained metric objects leaves the old reduced-fixture test green and
+  turns the producer-built test red, because only the real V2 assistant carries `model: { id, providerID }`.
 - Raw sentinels disappear from every inventoried copy. The durable `redacting` marker is written with the first
   changed batch, and the run resumes after a reopen; both are existing behaviour, still asserted.
-- The gated path test ("gated apply redacts a production-shaped store only when every gate passes…") observes the
+- The gated path test ("gated apply redacts a Session-produced store only when every gate passes…") observes the
   redaction through `applyGated`.
-- Red proofs: RP13 (fabricated zero usage), RP14 (tokens dropped) and RP15 (serving models dropped).
+- Red proofs: RP13 (fabricated zero usage), RP14 (tokens dropped), RP15 (serving models dropped) and RP26.
 
 ### 4. Fresh-store measurement receipt — NOT produced; the gate stays refused (D2)
 
@@ -153,14 +168,14 @@ and re-run green.
   - "retention CLI keeps inventory read-only and refuses apply before any write when no tree passes every gate" runs
     the production CLI handler: no transaction, and bytes unchanged.
   - "apply on a database outside the fixture factory requires a holder scan of that exact file".
-  - "gated apply redacts a production-shaped store only when every gate passes, and refuses before any write
+  - "gated apply redacts a Session-produced store only when every gate passes, and refuses before any write
     otherwise". This covers omitted liveness, unreadable scan, omitted receipt, omitted classification, unreviewed
-    reader and unreadable evidence.
+    reader, unreadable evidence, and a clock still inside the inactivity window of the producer's writes.
   - "a gate failing after committed batches reports partial progress and stops every further write".
 - Red proofs: RP9, RP16 (fixture barrier restored), RP17, RP18 and RP19.
 - Unproved: a positive run of the **production CLI handler** itself. It cannot pass until D1–D3 supply producers. The
-  positive test exercises `applyGated`, the function the handler calls. Its customer, receipt and reader inputs are
-  fixture stand-ins, and only the holder scan comes from the real producer.
+  positive test exercises `applyGated`, the function the handler calls, on a store the real producers wrote. Its
+  customer, receipt and reader inputs are fixture stand-ins, and only the holder scan comes from the real producer.
 
 ### 8. One-batch write-lock hold — measured: about 330–400 ms per batch
 
@@ -183,6 +198,10 @@ and re-run green.
 - Exploratory runs at an earlier head with the same apply code: batch size 1 gave 343–393 ms, and batch size 512 gave
   349–408 ms. Hold time is therefore dominated by revalidation, not by the row limit. At 32 rows per batch, this tree
   would hold the lock about 1,700 times. I have set no latency threshold.
+- These figures predate the in-lock holder rescan (invariant 2), which adds one full procfs scan to every batch's
+  hold. On this box, with 695 processes and load average about 13.9, one `scanDatabaseHolders` call took 29–59 ms
+  (median 36 ms over 20 calls). Its cost scales with the process count, not the tree. The tree measurement was not
+  repeated, because it reads the live store.
 
 ## Verification
 
@@ -193,6 +212,9 @@ and re-run green.
 | `packages/core`: `bun script/migration.ts --check` | exit 0 |
 | `packages/opencode`: `bun test test/cli/db/retention.test.ts` | 28 pass, 0 fail |
 | `packages/opencode`: `bun test test/server/httpapi-sync.test.ts test/session/session.test.ts` | 19 pass, 0 fail |
+| Round-1 fixes, `packages/opencode`: `bun test test/cli/db/retention.test.ts` | 30 pass, 0 fail |
+| Round-1 fixes, `packages/opencode`: `bun test test/session/session.test.ts -t "retention\|Retention"` | 4 pass, 0 fail |
+| Round-1 fixes, `packages/opencode`: `bun test test/server/httpapi-sync.test.ts` | 4 pass, 0 fail, 1 skipped |
 | `packages/opencode`: `bun test test/server/httpapi-session.test.ts -t "redacted aggregate before returning content"` | 1 pass |
 | `packages/opencode`: `bun test test/control-plane/workspace.test.ts -t "warp a redacted Session"` | 1 pass |
 | `packages/core` and `packages/opencode`: `bun typecheck` | clean |
@@ -227,6 +249,9 @@ restored from a byte copy, with `git status` clean afterwards.
 | RP21 | `session-writer-unregistered` | "dry run names" 0 pass, 1 fail |
 | RP22 | `session-writer-liveness-unreadable` | same, 0 pass, 1 fail |
 | RP23 | `session-owned-by-workspace` | same, 0 pass, 1 fail |
+| RP24 | in-lock holder rescan (`lockedHolderFailures`) in `revalidateCandidate` | "opens the store after the evidence scan" 0 pass, 1 fail: apply completed 17 rows with the holder present |
+| RP25 | `/proc/locks` holders dropped from the scan result | "found through its SQLite lock" 0 pass, 1 fail: `pids: []` |
+| RP26 | `model` dropped from the retained metric objects | producer-built "restartable batches" 0 pass, 1 fail; the pre-fix reduced-fixture test at `9d5610eb` 1 pass |
 
 ## Measured selection on the live store (read-only, 2026-10-11T20:23:44Z)
 
@@ -250,7 +275,7 @@ restored from a byte copy, with `git status` clean afterwards.
 - A positive production CLI apply: blocked by D1–D3.
 - Holder-scan blind spot: a process of another user (including root), or a non-inspectable process, that has the file
   open without holding a SQLite lock. Every WAL connection holds one, so this is limited to non-SQLite handles.
-- A holder started by an old-build process after the scan and before the batch lock is not seen inside the lock. Its
-  running turn still refuses through the unfinished-row check, and any later write is refused by the retention fence.
+- A holder that opens the store after a batch's in-lock rescan and before its COMMIT is not seen by that batch. It
+  cannot write until the COMMIT releases the lock, and the next batch's rescan refuses it.
 - Writer rows for exited processes are never pruned. They are harmless but grow with process restarts.
 - Lock hold on the live store under its real contention was not measured; this was forbidden.
