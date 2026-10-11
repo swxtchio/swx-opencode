@@ -14,6 +14,7 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { SystemContext } from "@opencode-ai/core/system-context/index"
 import {
   apply,
+  applyGated,
   compactRestoreFixture,
   createFixtureDatabase,
   inactivityPolicy,
@@ -479,6 +480,24 @@ test("apply redacts every copy in restartable batches and preserves metric value
   event(first, "ses_old")
   addCopies(first, "ses_old")
   const exportBefore = readExport(first)
+  // The Session row is the per-session usage record the session-usage projection maintains.
+  const sessionUsage = (db: Database) =>
+    db
+      .query(
+        "SELECT cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, model, agent FROM session WHERE id = 'ses_old'",
+      )
+      .get()
+  const usageBefore = sessionUsage(first)
+  expect(usageBefore).toEqual({
+    cost: 12.5,
+    tokens_input: 13,
+    tokens_output: 17,
+    tokens_reasoning: 2,
+    tokens_cache_read: 3,
+    tokens_cache_write: 4,
+    model: JSON.stringify({ id: "requested-model", providerID: "provider-a" }),
+    agent: "build",
+  })
   const proof = evidence(["ses_old"], { ses_old: 0 }, fixtureDB.filename)
   const initial = inventory(access(first), proof, NOW)
   expect(initial.trees[0]?.eligible).toBe(true)
@@ -497,6 +516,7 @@ test("apply redacts every copy in restartable batches and preserves metric value
     responseModelIDs: data.responseModelIDs,
     cost: data.cost,
     tokens: data.tokens,
+    time: data.time,
   }))
 
   const firstBatch = apply(access(first), {
@@ -546,8 +566,10 @@ test("apply redacts every copy in restartable batches and preserves metric value
       responseModelIDs: data.responseModelIDs,
       cost: data.cost,
       tokens: data.tokens,
+      time: data.time,
     }))
     expect(afterMetricSnapshot).toEqual(metricSnapshot)
+    expect(sessionUsage(resumed)).toEqual(usageBefore)
     const exportAfter = readExport(resumed)
     const usageAxes = (archive: ReturnType<typeof readExport>) =>
       archive.records.map((record) => ({
@@ -1553,6 +1575,87 @@ test("a promoted V2 input row refuses its tree literally, including one promoted
     expect(result).toMatchObject({ state: "refused", changedRows: 0 })
     expect(result.reasons).toEqual(["v2-input-promoted-row-present"])
     expect(db.serialize().equals(before)).toBe(true)
+  } finally {
+    db.close()
+  }
+})
+
+test("gated apply redacts a production-shaped store only when every gate passes, and refuses before any write otherwise", async () => {
+  await using tmp = await tmpdir()
+  await chmod(tmp.path, 0o700)
+  const filename = path.join(tmp.path, "opencode.db")
+  const db = new Database(filename)
+  try {
+    createSchema(db)
+    session(db, "ses_old", 10)
+    event(db, "ses_old")
+    addCopies(db, "ses_old")
+    const valid = evidence(["ses_old"], { ses_old: 0 }, filename)
+    const before = db.serialize()
+    const failures: Array<[string, RetentionEvidence]> = [
+      ["cross-process-liveness-proof-unavailable", { ...valid, holders: undefined }],
+      ["database-holder-scan-unreadable", { ...valid, holders: { state: "unreadable", reason: "procfs gone" } }],
+      ["measurement-handoff-receipt-unavailable", { ...valid, handoff: undefined }],
+      ["customer-session-classification-unavailable", { ...valid, customerBinding: undefined }],
+      ["reader-contract-unreviewed", { ...valid, readerContract: undefined }],
+      ["evidence-unreadable", { ...valid, evidenceError: "receipt unreadable" }],
+    ]
+    for (const [reason, failed] of failures) {
+      const result = applyGated(access(db), () => failed, () => NOW)
+      expect(result).toMatchObject({ action: "refused", changedRows: 0, eligibleTrees: 0 })
+      expect(result.reasons).toContain(reason)
+      expect(result.reasons).toContain("production-apply-disabled")
+      expect(db.serialize().equals(before)).toBe(true)
+    }
+
+    const applied = applyGated(access(db), () => valid, () => NOW)
+    expect(applied).toMatchObject({ action: "applied", eligibleTrees: 1, completedSessionIDs: ["ses_old"], reasons: [] })
+    expect(applied.changedRows).toBeGreaterThan(0)
+    expect(db.query("SELECT state FROM event_retention WHERE aggregate_id = 'ses_old'").get()).toEqual({
+      state: "complete",
+    })
+    expect(eventRows(db, "ses_old").map((row) => row.data).join("\n")).not.toContain("sentinel")
+  } finally {
+    db.close()
+  }
+})
+
+test("a gate failing after committed batches reports partial progress and stops every further write", async () => {
+  await using tmp = await tmpdir()
+  await chmod(tmp.path, 0o700)
+  const filename = path.join(tmp.path, "opencode.db")
+  const db = new Database(filename)
+  try {
+    createSchema(db)
+    for (const id of ["ses_a", "ses_b"]) {
+      session(db, id, 10)
+      event(db, id)
+      addCopies(db, id)
+    }
+    // The customer classification and receipt cover the whole store here, as a store-wide producer
+    // would; the holder scan is the real producer until it stops answering after two batches.
+    let calls = 0
+    const proof = (): RetentionEvidence => {
+      calls += 1
+      const store = evidence(["ses_a", "ses_b"], { ses_a: 0, ses_b: 0 }, filename)
+      return calls <= 3 ? store : { ...store, holders: { state: "unreadable", reason: "scan stopped" } }
+    }
+    const sessionB = () =>
+      [eventRows(db, "ses_b"), db.query("SELECT data FROM part WHERE session_id = 'ses_b'").all()].map((rows) =>
+        JSON.stringify(rows),
+      )
+    const bBefore = sessionB()
+
+    const result = applyGated(access(db), proof, () => NOW)
+
+    expect(result.action).toBe("partial")
+    expect(result.changedRows).toBeGreaterThan(0)
+    expect(result.reasons).toContain("database-holder-scan-unreadable:scan stopped")
+    expect(result.reasons).toContain("production-apply-disabled")
+    expect(db.query("SELECT aggregate_id, state FROM event_retention").all()).toEqual([
+      { aggregate_id: "ses_a", state: "redacting" },
+    ])
+    expect(sessionB()).toEqual(bBefore)
   } finally {
     db.close()
   }

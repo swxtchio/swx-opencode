@@ -509,13 +509,18 @@ function makeProgressScope(
     inactivityWindowMs: inactivityPolicy.windowMs,
     inactivityReference: inactivityPolicy.reference,
     readerContractID: evidence.readerContract?.id ?? null,
+    // Only this tree's projection of a store-wide proof, so classifying other Sessions later does not
+    // invalidate this tree's restart-safe progress.
     customerBinding: evidence.customerBinding
       ? {
           proofID: evidence.customerBinding.proofID,
           durable: evidence.customerBinding.durable,
-          sessionIDs: evidence.customerBinding.sessionIDs,
-          customerBoundSessionIDs: evidence.customerBinding.customerBoundSessionIDs,
-          nonCustomerSessionIDs: evidence.customerBinding.nonCustomerSessionIDs,
+          customerBoundSessionIDs: evidence.customerBinding.customerBoundSessionIDs.filter((id) =>
+            sessionIDs.includes(id),
+          ),
+          nonCustomerSessionIDs: evidence.customerBinding.nonCustomerSessionIDs.filter((id) =>
+            sessionIDs.includes(id),
+          ),
         }
       : null,
     receiptID: evidence.handoff?.receiptID ?? null,
@@ -540,9 +545,10 @@ function customerBindingFailures(evidence: RetentionEvidence, sessionIDs: readon
     return Array.from(reasons)
   }
   if (!binding.proofID || binding.durable !== true) reasons.add("customer-session-classification-proof-unreadable")
-  if (!sameIDs(binding.sessionIDs, sessionIDs)) reasons.add("customer-session-classification-tree-scope-mismatch")
-  if (!sameIDs([...binding.customerBoundSessionIDs, ...binding.nonCustomerSessionIDs], sessionIDs)) {
-    reasons.add("customer-session-classification-incomplete")
+  // A classification may cover a whole store; it must name every Session of this tree.
+  const classified = new Set(binding.sessionIDs)
+  if (sessionIDs.some((sessionID) => !classified.has(sessionID))) {
+    reasons.add("customer-session-classification-tree-scope-mismatch")
   }
   const customerBound = new Set(binding.customerBoundSessionIDs)
   const nonCustomer = new Set(binding.nonCustomerSessionIDs)
@@ -910,7 +916,9 @@ function handoffFailures(db: SqliteAccess, evidence: RetentionEvidence, sessionI
   if (Object.values(handoff.report.denominators).some((value) => !Number.isFinite(value) || value < 0)) {
     reasons.add("report-denominators-unreadable")
   }
-  if (!sameIDs(handoff.sessionIDs, sessionIDs)) reasons.add("handoff-tree-scope-mismatch")
+  // A receipt may cover a whole store; it must cover every Session of this tree at its final write.
+  const covered = new Set(handoff.sessionIDs)
+  if (sessionIDs.some((sessionID) => !covered.has(sessionID))) reasons.add("handoff-tree-scope-mismatch")
   for (const sessionID of sessionIDs) {
     const seq = oneRow<{ seq: number }>(db, "SELECT seq FROM event_sequence WHERE aggregate_id = ?", sessionID)?.seq
     if (handoff.finalSequence[sessionID] !== (seq ?? -1)) {
