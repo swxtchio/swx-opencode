@@ -4581,7 +4581,7 @@ export class History extends HeyApiClient {
   /**
    * List sync events
    *
-   * List sync events for all aggregates. Keys are aggregate IDs the client already knows about, values are the last known sequence ID. Events with seq > value are returned for those aggregates. Aggregates not listed in the input get their full history.
+   * List sync events for all aggregates. Keys are aggregate IDs the client already knows about, values are the last known sequence ID. Events with seq > value are returned for those aggregates. Aggregates not listed in the input get their full history. A Session whose history retention has pruned returns no events; the X-Pruned-Sessions response header lists each such Session the request touched as a JSON object of Session ID to its last sequence ID.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters?: {

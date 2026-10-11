@@ -71,6 +71,9 @@ export class RetentionWriteRefusedError extends Schema.TaggedErrorClass<Retentio
   },
 ) {}
 
+// Retention states in which an aggregate's history has been, or is being, redacted and can no longer be replayed.
+export const unreplayableRetentionStates = ["redacting", "complete"] as const
+
 function requireReplayable(db: DatabaseAccess, aggregateID: string) {
   return db
     .select({ aggregateID: EventRetentionTable.aggregate_id })
@@ -78,7 +81,7 @@ function requireReplayable(db: DatabaseAccess, aggregateID: string) {
     .where(
       and(
         eq(EventRetentionTable.aggregate_id, aggregateID),
-        inArray(EventRetentionTable.state, ["redacting", "complete"]),
+        inArray(EventRetentionTable.state, [...unreplayableRetentionStates]),
       ),
     )
     .get()

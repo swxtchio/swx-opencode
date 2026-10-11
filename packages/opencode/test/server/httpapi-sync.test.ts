@@ -1,17 +1,14 @@
 import { afterEach, describe, expect, mock } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Context, DateTime, Effect, Exit, Layer } from "effect"
+import { Context, DateTime, Effect, Layer } from "effect"
 import { eq, sql } from "drizzle-orm"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
-import { ModelV2 } from "@opencode-ai/core/model"
-import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionMessage } from "@opencode-ai/core/session/message"
-import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { EventTable } from "@opencode-ai/core/event/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { SessionDurable } from "@opencode-ai/schema/durable-event-manifest"
 import { SyncPaths } from "../../src/server/routes/instance/httpapi/groups/sync"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import { Session } from "@/session/session"
@@ -22,6 +19,53 @@ import { testEffect } from "../lib/effect"
 import { httpApiLayer, requestInDirectory } from "./httpapi-layer"
 import { applyRetentionFixture } from "../fixture/session-retention"
 import { readSyncHistory } from "../../src/server/routes/instance/httpapi/handlers/sync"
+
+type HistoryRow = { id: string; aggregate_id: string; seq: number; type: string; data: Record<string, unknown> }
+
+// One Session pruned by a real retention apply and one kept peer, both written by the real producers. The
+// payloads touch the pruned Session three ways: by omission, past its first event, and at its last sequence.
+const prunedStore = Effect.gen(function* () {
+  const tmp = yield* TestInstance
+  const pruned = yield* Session.use.create({ title: "pruned sync sentinel" })
+  const kept = yield* Session.use.create({ title: "kept sync peer" })
+  const events = yield* EventV2Bridge.Service
+  for (const [session, text] of [
+    [pruned, "pruned sync event sentinel"],
+    [kept, "kept sync event"],
+  ] as const) {
+    yield* events.publish(SessionEvent.Synthetic, {
+      sessionID: session.id,
+      messageID: SessionMessage.ID.create(),
+      timestamp: yield* DateTime.now,
+      text,
+    })
+  }
+  const { db } = yield* Database.Service
+  const prunedLast = yield* EventV2.latestSequence(db, pruned.id)
+  yield* applyRetentionFixture(pruned.id)
+  const keptEvents = (yield* db
+    .select()
+    .from(EventTable)
+    .where(eq(EventTable.aggregate_id, kept.id))
+    .orderBy(EventTable.seq)
+    .all()).map((row) => JSON.parse(JSON.stringify(row)) as HistoryRow)
+  expect(keptEvents.length).toBeGreaterThan(0)
+  const history = (payload: Record<string, number>) =>
+    requestInDirectory(SyncPaths.history, tmp.directory, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+  return {
+    db,
+    pruned,
+    kept,
+    prunedLast,
+    keptEvents,
+    history,
+    payloads: [{}, { [pruned.id]: 0, [kept.id]: 0 }, { [pruned.id]: prunedLast }] as Record<string, number>[],
+  }
+})
 
 const originalWorkspaces = Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
 const context = Context.empty() as Context.Context<unknown>
@@ -88,7 +132,7 @@ describe("sync HttpApi", () => {
   )
 
   it.instance(
-    "refuses sync history and replay for a redacted aggregate before returning or decoding rows",
+    "refuses sync replay onto a redacted aggregate without changing its rows",
     () =>
       Effect.gen(function* () {
         const tmp = yield* TestInstance
@@ -98,29 +142,7 @@ describe("sync HttpApi", () => {
         yield* applyRetentionFixture(session.id)
 
         const before = yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, session.id)).all()
-        const sequence = yield* db
-          .select({ seq: EventSequenceTable.seq })
-          .from(EventSequenceTable)
-          .where(eq(EventSequenceTable.aggregate_id, session.id))
-          .get()
-        const history = yield* requestInDirectory(SyncPaths.history, tmp.directory, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({}),
-        })
-        expect(history.status).not.toBe(200)
-        expect(yield* history.text).not.toContain("sync retention sentinel")
-        const latestSequence = before.at(-1)?.seq ?? -1
-        for (const cursor of [-1, latestSequence]) {
-          const currentHistory = yield* requestInDirectory(SyncPaths.history, tmp.directory, {
-            method: "POST",
-            headers,
-            body: JSON.stringify({ [session.id]: cursor }),
-          })
-          expect(currentHistory.status).not.toBe(200)
-          expect(yield* currentHistory.text).not.toContain("sync retention sentinel")
-        }
-
+        const sequence = yield* EventV2.latestSequence(db, session.id)
         const replay = yield* requestInDirectory(SyncPaths.replay, tmp.directory, {
           method: "POST",
           headers,
@@ -130,7 +152,7 @@ describe("sync HttpApi", () => {
               {
                 id: "evt_unreadable_replay",
                 aggregateID: session.id,
-                seq: (sequence?.seq ?? -1) + 1,
+                seq: sequence + 1,
                 type: EventV2.versionedType(SessionV1.Event.MessageRemoved.type, 1),
                 data: { sessionID: session.id, messageID: SessionV1.MessageID.ascending() },
               },
@@ -145,62 +167,87 @@ describe("sync HttpApi", () => {
   )
 
   it.instance(
-    "preflights mixed sync aggregates before decoding a malformed marked event",
+    "a history request touching a pruned Session returns 200 with the other Sessions' events",
     () =>
       Effect.gen(function* () {
-        const tmp = yield* TestInstance
-        const headers = { "x-opencode-directory": tmp.directory, "content-type": "application/json" }
-        const redacted = yield* Session.use.create({ title: "mixed redacted sync" })
-        const safe = yield* Session.use.create({ title: "safe sync peer" })
-        yield* Session.use.updateMessage({
-          id: SessionV1.MessageID.ascending(),
-          role: "user",
-          sessionID: safe.id,
-          agent: "build",
-          model: { providerID: ProviderV2.ID.make("sync-test"), modelID: ModelV2.ID.make("sync-test") },
-          time: { created: Date.now() },
-        })
-        const events = yield* EventV2Bridge.Service
-        yield* events.publish(SessionEvent.Synthetic, {
-          sessionID: redacted.id,
-          messageID: SessionMessage.ID.create(),
-          timestamp: yield* DateTime.now,
-          text: "producer-emitted event before retention",
-        })
-        yield* events.publish(SessionEvent.Synthetic, {
-          sessionID: safe.id,
-          messageID: SessionMessage.ID.create(),
-          timestamp: yield* DateTime.now,
-          text: "safe sync event",
-        })
-        const { db } = yield* Database.Service
-        const currentSequence = yield* EventV2.latestSequence(db, redacted.id)
-        yield* applyRetentionFixture(redacted.id)
-        yield* db.run(sql`UPDATE event SET data = 'not-json' WHERE aggregate_id = ${redacted.id}`)
-
-        for (const cursor of [-1, currentSequence]) {
-          const payload = { [redacted.id]: cursor, [safe.id]: -1 }
-          const result = yield* readSyncHistory(db, payload).pipe(Effect.exit)
-          expect(Exit.isFailure(result)).toBe(true)
-          if (Exit.isFailure(result))
-            expect(Cause.squash(result.cause)).toBeInstanceOf(EventV2.UnreplayableAggregateError)
-
-          const response = yield* requestInDirectory(SyncPaths.history, tmp.directory, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(payload),
-          })
-          expect(response.status).not.toBe(200)
-          expect(yield* response.text).not.toContain("not-json")
+        const store = yield* prunedStore
+        for (const payload of store.payloads) {
+          const response = yield* store.history(payload)
+          expect(response.status).toBe(200)
+          const rows = (yield* response.json) as HistoryRow[]
+          expect(rows.filter((row) => row.aggregate_id === store.kept.id)).toEqual(
+            store.keptEvents.filter((row) => row.seq > (payload[store.kept.id] ?? -1)),
+          )
         }
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 10_000 },
+  )
 
-        const safeHistory = yield* EventV2.readAggregate(db, {
-          aggregateID: safe.id,
-          after: -1,
-          limit: 10,
-          manifest: SessionDurable,
+  it.instance(
+    "a pruned Session contributes no events to sync history, and its rows are never read",
+    () =>
+      Effect.gen(function* () {
+        const store = yield* prunedStore
+        // Rows that can no longer be decoded prove the reader excludes the pruned Session without reading them.
+        yield* store.db.run(sql`UPDATE event SET data = 'not-json' WHERE aggregate_id = ${store.pruned.id}`)
+        for (const payload of store.payloads) {
+          const response = yield* store.history(payload)
+          expect(response.status).toBe(200)
+          const rows = (yield* response.json) as HistoryRow[]
+          expect(rows.filter((row) => row.aggregate_id === store.pruned.id)).toEqual([])
+          const direct = yield* readSyncHistory(store.db, payload)
+          expect(direct.events.filter((row) => row.aggregate_id === store.pruned.id)).toEqual([])
+        }
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 10_000 },
+  )
+
+  it.instance(
+    "the X-Pruned-Sessions header lists each pruned Session with its last sequence number",
+    () =>
+      Effect.gen(function* () {
+        const store = yield* prunedStore
+        for (const payload of store.payloads) {
+          const response = yield* store.history(payload)
+          expect(response.status).toBe(200)
+          expect(JSON.parse(response.headers["x-pruned-sessions"] ?? "null")).toEqual({
+            [store.pruned.id]: store.prunedLast,
+          })
+        }
+        // A cursor past the pruned Session's last sequence still touches it, so it is still reported.
+        const beyond = yield* store.history({ [store.pruned.id]: store.prunedLast + 1, [store.kept.id]: 0 })
+        expect(beyond.status).toBe(200)
+        expect(JSON.parse(beyond.headers["x-pruned-sessions"] ?? "null")).toEqual({
+          [store.pruned.id]: store.prunedLast,
         })
-        expect(safeHistory.events.length).toBeGreaterThan(0)
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 10_000 },
+  )
+
+  it.instance(
+    "sync history keeps its bare event array body when a Session is pruned",
+    () =>
+      Effect.gen(function* () {
+        const store = yield* prunedStore
+        for (const payload of store.payloads) {
+          const response = yield* store.history(payload)
+          expect(response.status).toBe(200)
+          const body = (yield* response.json) as unknown
+          expect(Array.isArray(body)).toBe(true)
+          const rows = body as Record<string, unknown>[]
+          expect(rows.length).toBeGreaterThan(0)
+          for (const row of rows)
+            expect(Object.keys(row).toSorted()).toEqual(["aggregate_id", "data", "id", "seq", "type"])
+          expect(rows).toEqual(
+            (yield* store.db.select().from(EventTable).orderBy(EventTable.seq).all())
+              .filter((row) => row.aggregate_id !== store.pruned.id)
+              .filter((row) => (payload[row.aggregate_id] ?? -1) < row.seq)
+              .map((row) => JSON.parse(JSON.stringify(row))),
+          )
+        }
       }),
     { git: true, config: { formatter: false, lsp: false } },
     { timeout: 10_000 },

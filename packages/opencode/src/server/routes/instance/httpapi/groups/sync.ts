@@ -35,6 +35,9 @@ export const HistoryEvent = Schema.Struct({
   data: Schema.Record(Schema.String, Schema.Unknown),
 })
 
+// Set on a history response that omits pruned Sessions: a JSON object of each pruned Session ID to its last sequence.
+export const PrunedSessionsHeader = "X-Pruned-Sessions"
+
 export const SyncPaths = {
   start: `${root}/start`,
   replay: `${root}/replay`,
@@ -90,7 +93,7 @@ export const SyncApi = HttpApi.make("sync")
             identifier: "sync.history.list",
             summary: "List sync events",
             description:
-              "List sync events for all aggregates. Keys are aggregate IDs the client already knows about, values are the last known sequence ID. Events with seq > value are returned for those aggregates. Aggregates not listed in the input get their full history.",
+              "List sync events for all aggregates. Keys are aggregate IDs the client already knows about, values are the last known sequence ID. Events with seq > value are returned for those aggregates. Aggregates not listed in the input get their full history. A Session whose history retention has pruned returns no events; the X-Pruned-Sessions response header lists each such Session the request touched as a JSON object of Session ID to its last sequence ID.",
           }),
         ),
       )
