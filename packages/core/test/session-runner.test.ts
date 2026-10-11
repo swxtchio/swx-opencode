@@ -588,6 +588,34 @@ const echoTurn = (id: string, text: string) => [
 
 const textTurn = (id: string, text: string) => fragmentFixture("text", id, [text]).completeEvents
 
+// Runs one Gemini SSE response through the real Gemini protocol, so tool call IDs come from its parser, which numbers
+// calls by position and restarts at tool_0 in each stream.
+const geminiTurn = (parts: ReadonlyArray<unknown>) =>
+  LLMClient.generate(LLM.request({ model: Gemini.route.model({ id: "gemini-2.5-flash" }), prompt: "Replay" })).pipe(
+    Effect.map((response) => [...response.events]),
+    Effect.provide(
+      LLMClient.layer.pipe(
+        Layer.provide(RequestExecutor.layer),
+        Layer.provide(
+          Layer.succeed(
+            HttpClient.HttpClient,
+            HttpClient.make((request) =>
+              Effect.succeed(
+                HttpClientResponse.fromWeb(
+                  request,
+                  new Response(
+                    `data: ${JSON.stringify({ candidates: [{ content: { role: "model", parts }, finishReason: "STOP" }] })}\n\n`,
+                    { headers: { "content-type": "text/event-stream" } },
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  )
+
 const publishHostedToolCall = (input: {
   events: EventV2.Interface
   sessionID: SessionV2.ID
@@ -917,35 +945,7 @@ describe("SessionV2.wait", () => {
             ),
         }),
       })
-      // Each turn runs a Gemini SSE response through the real Gemini protocol. Its parser restarts generated call IDs
-      // in each stream, so the unrelated later call reuses tool_0.
-      const geminiTurn = (parts: ReadonlyArray<unknown>) =>
-        LLMClient.generate(
-          LLM.request({ model: Gemini.route.model({ id: "gemini-2.5-flash" }), prompt: "Replay" }),
-        ).pipe(
-          Effect.map((response) => [...response.events]),
-          Effect.provide(
-            LLMClient.layer.pipe(
-              Layer.provide(RequestExecutor.layer),
-              Layer.provide(
-                Layer.succeed(
-                  HttpClient.HttpClient,
-                  HttpClient.make((request) =>
-                    Effect.succeed(
-                      HttpClientResponse.fromWeb(
-                        request,
-                        new Response(
-                          `data: ${JSON.stringify({ candidates: [{ content: { role: "model", parts }, finishReason: "STOP" }] })}\n\n`,
-                          { headers: { "content-type": "text/event-stream" } },
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        )
+      // Gemini restarts generated call IDs in each stream, so the unrelated later call reuses tool_0.
       responses = [
         yield* geminiTurn([{ functionCall: { name: "bash", args: { command: "make test" } } }]),
         yield* geminiTurn([{ functionCall: { name: "bash", args: { command: "ls" } } }]),
@@ -1028,6 +1028,64 @@ describe("SessionV2.wait", () => {
       expect(calls[0]?.assistantMessageID).not.toBe(calls[1]?.assistantMessageID)
       const answered = assistants.at(-1)
       if (!answered) throw new Error("Expected the assistant that answered after the retry")
+      expect(result).toEqual({ type: "completed", admittedSeq: admitted.admittedSeq, assistantMessageID: answered.id })
+      expect(requests).toHaveLength(3)
+    }),
+  )
+
+  it.effect("completes when a later Gemini stream retries a failed call at a new position", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const registry = yield* ToolRegistry.Service
+      const commands: string[] = []
+      yield* registry.register({
+        bash: Tool.make({
+          description: "Run a command",
+          input: Schema.Struct({ command: Schema.String }),
+          output: Schema.Struct({}),
+          execute: ({ command }) =>
+            Effect.suspend(() => {
+              commands.push(command)
+              return command === "make test" && commands.filter((run) => run === "make test").length === 1
+                ? Effect.die("make test failed")
+                : Effect.succeed({})
+            }),
+        }),
+      })
+      // The first stream numbers its two calls tool_0 and tool_1. The retry is the only call in the next stream, so the
+      // parser numbers it tool_0, the ID of the first stream's other call.
+      responses = [
+        yield* geminiTurn([
+          { functionCall: { name: "bash", args: { command: "make build" } } },
+          { functionCall: { name: "bash", args: { command: "make test" } } },
+        ]),
+        yield* geminiTurn([{ functionCall: { name: "bash", args: { command: "make test" } } }]),
+        yield* geminiTurn([{ text: "Tests pass" }]),
+      ]
+      const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Build and test" }) })
+      const result = yield* session.wait(sessionID)
+
+      expect(commands.toSorted()).toEqual(["make build", "make test", "make test"])
+      const assistants = (yield* session.messages({ sessionID, order: "asc" })).filter(
+        (message): message is SessionMessage.Assistant => message.type === "assistant",
+      )
+      const calls = assistants.map((message) =>
+        message.content.flatMap((content) =>
+          content.type === "tool" ? [{ id: content.id, input: content.state.input, status: content.state.status }] : [],
+        ),
+      )
+      expect(calls).toEqual([
+        [
+          { id: "tool_0", input: { command: "make build" }, status: "completed" },
+          { id: "tool_1", input: { command: "make test" }, status: "error" },
+        ],
+        [{ id: "tool_0", input: { command: "make test" }, status: "completed" }],
+        [],
+      ])
+      const answered = assistants.at(-1)
+      if (!answered) throw new Error("Expected the assistant that answered after the retry")
+      expect(answered.content).toContainEqual(expect.objectContaining({ type: "text", text: "Tests pass" }))
       expect(result).toEqual({ type: "completed", admittedSeq: admitted.admittedSeq, assistantMessageID: answered.id })
       expect(requests).toHaveLength(3)
     }),
