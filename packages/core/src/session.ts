@@ -281,13 +281,29 @@ const layer = Layer.effect(
               .orderBy(desc(EventTable.seq))
               .all()
               .pipe(Effect.orDie)
-            const checkpointBefore = (seq: number) =>
+            const checkpointBefore = (seq: number, failureCloses: boolean) =>
               terminalSteps.find(
                 (event) =>
                   event.seq < seq &&
-                  event.type === EventV2.versionedType(SessionEvent.Step.Ended.type, 2) &&
-                  Schema.decodeUnknownSync(SessionEvent.Step.Ended.data)(event.data).finish !== "tool-calls",
+                  (event.type === EventV2.versionedType(SessionEvent.Step.Failed.type, 2)
+                    ? failureCloses
+                    : Schema.decodeUnknownSync(SessionEvent.Step.Ended.data)(event.data).finish !== "tool-calls"),
               )
+            const latestPromotion =
+              latestInput?.promoted_seq === null || latestInput?.promoted_seq === undefined
+                ? undefined
+                : yield* tx
+                    .select({ data: EventTable.data })
+                    .from(EventTable)
+                    .where(
+                      and(
+                        eq(EventTable.aggregate_id, sessionID),
+                        eq(EventTable.seq, latestInput.promoted_seq),
+                        eq(EventTable.type, EventV2.versionedType(SessionEvent.Prompted.type, 1)),
+                      ),
+                    )
+                    .get()
+                    .pipe(Effect.orDie)
             const latestAssistant = latestInput
               ? undefined
               : yield* tx
@@ -298,11 +314,16 @@ const layer = Layer.effect(
                   .limit(1)
                   .get()
                   .pipe(Effect.orDie)
-            // Failed steps stay in the work group until a successful non-continuation step closes it.
+            // A failed step stays in the work group of input its own drain promoted at a provider-turn boundary,
+            // until a successful non-continuation step closes the group. Input promoted any other way starts after it.
             const checkpoint =
               latestInput !== undefined
-                ? checkpointBefore(latestInput.admitted_seq)?.seq
-                : latestAssistant && checkpointBefore(latestAssistant.seq)?.seq
+                ? checkpointBefore(
+                    latestInput.admitted_seq,
+                    latestPromotion === undefined ||
+                      Schema.decodeUnknownSync(SessionEvent.Prompted.data)(latestPromotion.data).continuation !== true,
+                  )?.seq
+                : latestAssistant && checkpointBefore(latestAssistant.seq, false)?.seq
             const rows = yield* tx
               .select()
               .from(SessionMessageTable)

@@ -171,9 +171,12 @@ const layer = Layer.effect(
         concurrency: "unbounded",
       }).pipe(Effect.map(SystemContext.combine))
 
+    // A continuation promotes steers at a provider-turn boundary inside the running drain.
+    type Promotion = SessionInput.Delivery | "continuation"
+
     const runTurnAttempt = Effect.fn("SessionRunner.runTurn")(function* (
       sessionID: SessionSchema.ID,
-      promotion: SessionInput.Delivery | undefined,
+      promotion: Promotion | undefined,
       step: number,
       recoverOverflow?: typeof compaction.compactAfterOverflow,
     ) {
@@ -189,7 +192,8 @@ const layer = Layer.effect(
       if (promotion) {
         const cutoff = yield* EventV2.latestSequence(db, session.id)
         let promoted = 0
-        if (promotion === "steer") promoted = yield* SessionInput.promoteSteers(db, events, session.id, cutoff)
+        if (promotion === "steer" || promotion === "continuation")
+          promoted = yield* SessionInput.promoteSteers(db, events, session.id, cutoff, promotion === "continuation")
         if (promotion === "queue") {
           promoted += Number(yield* SessionInput.promoteNextQueued(db, events, session.id))
           promoted += yield* SessionInput.promoteSteers(db, events, session.id, cutoff)
@@ -363,7 +367,7 @@ const layer = Layer.effect(
     }, Effect.scoped)
     type RunTurn = (
       sessionID: SessionSchema.ID,
-      promotion: SessionInput.Delivery | undefined,
+      promotion: Promotion | undefined,
       step: number,
     ) => Effect.Effect<{ readonly needsContinuation: boolean; readonly step: number }, RunError>
 
@@ -403,7 +407,7 @@ const layer = Layer.effect(
       const hasQueue = hasSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
       if (!input.force && !hasSteer && !hasQueue) return
       yield* failInterruptedTools(input.sessionID)
-      let promotion: SessionInput.Delivery | undefined = hasSteer ? "steer" : hasQueue ? "queue" : undefined
+      let promotion: Promotion | undefined = hasSteer ? "steer" : hasQueue ? "queue" : undefined
       let shouldRun = input.force || hasSteer || hasQueue
       while (shouldRun) {
         let needsContinuation = true
@@ -412,7 +416,7 @@ const layer = Layer.effect(
           const result = yield* runTurn(input.sessionID, promotion, step)
           needsContinuation = result.needsContinuation
           step = result.step + 1
-          promotion = "steer"
+          promotion = "continuation"
           if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
         }
         shouldRun = yield* SessionInput.hasPending(db, input.sessionID, "queue")

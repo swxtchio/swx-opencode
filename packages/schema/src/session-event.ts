@@ -89,7 +89,11 @@ export type Moved = typeof Moved.Type
 export const Prompted = Event.define({
   type: "session.next.prompted",
   ...options,
-  schema: PromptFields,
+  schema: {
+    ...PromptFields,
+    // Set when a running drain promotes the input at a provider-turn boundary, so the input joins that drain's work.
+    continuation: Schema.Literal(true).pipe(optional),
+  },
 })
 export type Prompted = typeof Prompted.Type
 

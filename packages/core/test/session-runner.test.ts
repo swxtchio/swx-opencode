@@ -1069,6 +1069,85 @@ describe("SessionV2.wait", () => {
     }),
   )
 
+  it.effect("settles a prompt admitted after a failed drain on its own outcome", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      responses = [
+        [LLMEvent.stepStart({ index: 0 }), LLMEvent.providerError({ message: "Provider failed the first prompt" })],
+        textTurn("text-wait-after-failed-drain", "Recovered"),
+      ]
+      const first = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Fail this prompt" }) })
+      const failed = yield* session.wait(sessionID)
+      const failedAssistant = (yield* session.messages({ sessionID })).find(
+        (message): message is SessionMessage.Assistant => message.type === "assistant",
+      )
+      expect(failed).toEqual({ type: "failed", admittedSeq: first.admittedSeq, assistantMessageID: failedAssistant?.id })
+      expect(Array.from(yield* session.active)).toEqual([])
+
+      const second = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Prompt after the failure" }) })
+      const result = yield* session.wait(sessionID)
+      const recovered = (yield* session.messages({ sessionID })).find(
+        (message): message is SessionMessage.Assistant =>
+          message.type === "assistant" &&
+          message.content.some((content) => content.type === "text" && content.text === "Recovered"),
+      )
+      expect(recovered?.finish).toBe("stop")
+      expect(result).toEqual({ type: "completed", admittedSeq: second.admittedSeq, assistantMessageID: recovered?.id })
+      expect(second.admittedSeq).toBeGreaterThan(first.admittedSeq)
+      expect(requests).toHaveLength(2)
+    }),
+  )
+
+  it.effect("settles a prompt sent after an interruption on its own outcome", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const providerStarted = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          responseStream = undefined
+        }),
+      )
+      streamStartAcks.push(providerStarted)
+      responseStream = Stream.concat(
+        Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.textStart({ id: "text-wait-interrupted-before-prompt" }),
+          LLMEvent.textDelta({ id: "text-wait-interrupted-before-prompt", text: "Interrupted mid-turn" }),
+        ),
+        Stream.never,
+      )
+      responses = [textTurn("text-wait-after-interruption", "Answered after the interruption")]
+      const first = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Interrupt this prompt" }) })
+      yield* awaitStreamStart(providerStarted)
+      yield* session.interrupt(sessionID)
+      const interrupted = yield* session.wait(sessionID)
+      const interruptedAssistant = (yield* session.messages({ sessionID })).find(
+        (message): message is SessionMessage.Assistant => message.type === "assistant",
+      )
+      expect(interruptedAssistant?.error?.origin).toBe(ProviderTurnInterruptedOrigin)
+      expect(interrupted).toEqual({
+        type: "interrupted",
+        admittedSeq: first.admittedSeq,
+        assistantMessageID: interruptedAssistant?.id,
+      })
+
+      const second = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Prompt after the interruption" }) })
+      const result = yield* session.wait(sessionID)
+      const answered = (yield* session.messages({ sessionID })).find(
+        (message): message is SessionMessage.Assistant =>
+          message.type === "assistant" &&
+          message.content.some(
+            (content) => content.type === "text" && content.text === "Answered after the interruption",
+          ),
+      )
+      expect(answered?.finish).toBe("stop")
+      expect(result).toEqual({ type: "completed", admittedSeq: second.admittedSeq, assistantMessageID: answered?.id })
+      expect(requests).toHaveLength(2)
+    }),
+  )
+
   it.effect("attributes a joined failure to an admission completed during the drain", () =>
     Effect.gen(function* () {
       yield* setupNative
