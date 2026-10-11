@@ -1,15 +1,22 @@
 import { afterEach, describe, expect, mock } from "bun:test"
+import http from "node:http"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Context, DateTime, Effect, Layer } from "effect"
+import { HttpServer } from "effect/unstable/http"
 import { eq, sql } from "drizzle-orm"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionMessage } from "@opencode-ai/core/session/message"
-import { EventTable } from "@opencode-ai/core/event/sql"
+import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { SyncPaths } from "../../src/server/routes/instance/httpapi/groups/sync"
+import {
+  PrunedSessionsHeader,
+  PrunedSessionsHeaderBudget,
+  SyncPaths,
+} from "../../src/server/routes/instance/httpapi/groups/sync"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import { Session } from "@/session/session"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -17,10 +24,61 @@ import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { httpApiLayer, requestInDirectory } from "./httpapi-layer"
-import { applyRetentionFixture } from "../fixture/session-retention"
+import { applyRetentionFixture, applyRetentionFixtures } from "../fixture/session-retention"
 import { readSyncHistory } from "../../src/server/routes/instance/httpapi/handlers/sync"
 
 type HistoryRow = { id: string; aggregate_id: string; seq: number; type: string; data: Record<string, unknown> }
+
+// The documented X-Pruned-Sessions syntax: comma-separated `first..last` ranges or lone IDs.
+const parseRanges = (header: string | undefined) =>
+  (header ?? "")
+    .split(",")
+    .filter((entry) => entry.length > 0)
+    .map((entry) => {
+      const [first, last] = entry.split("..")
+      return { first: first!, last: last ?? first! }
+    })
+
+const covered = (ranges: { first: string; last: string }[], id: string) =>
+  ranges.some((range) => range.first <= id && id <= range.last)
+
+// Every Session ID the store holds, which is what a range speaks for.
+const heldIDs = (db: Database.Interface["db"]) =>
+  Effect.gen(function* () {
+    const sessions = yield* db.select({ id: SessionTable.id }).from(SessionTable).all()
+    const aggregates = yield* db.select({ id: EventSequenceTable.aggregate_id }).from(EventSequenceTable).all()
+    return [...sessions, ...aggregates].map((row) => row.id)
+  })
+
+// Node's own HTTP client with its default 16 KiB response-header limit, as a standard client would send it.
+function postWithNodeHttp(url: URL, directory: string, body: string) {
+  return new Promise<{ status?: number; headers: http.IncomingHttpHeaders; body: string; error?: string }>(
+    (resolve) => {
+      const request = http.request(
+        url,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-opencode-directory": directory },
+        },
+        (response) => {
+          const chunks = new Array<Buffer>()
+          response.on("data", (chunk: Buffer) => chunks.push(chunk))
+          response.on("end", () =>
+            resolve({
+              status: response.statusCode,
+              headers: response.headers,
+              body: Buffer.concat(chunks).toString("utf8"),
+            }),
+          )
+        },
+      )
+      request.on("error", (error: NodeJS.ErrnoException) =>
+        resolve({ headers: {}, body: "", error: `${error.code ?? ""} ${error.message}` }),
+      )
+      request.end(body)
+    },
+  )
+}
 
 // One Session pruned by a real retention apply and one kept peer, both written by the real producers. The
 // payloads touch the pruned Session three ways: by omission, past its first event, and at its last sequence.
@@ -205,26 +263,74 @@ describe("sync HttpApi", () => {
   )
 
   it.instance(
-    "the X-Pruned-Sessions header lists each pruned Session with its last sequence number",
+    "the X-Pruned-Sessions header names the pruned Session as a range and no unpruned Session",
     () =>
       Effect.gen(function* () {
         const store = yield* prunedStore
-        for (const payload of store.payloads) {
+        for (const payload of [...store.payloads, { [store.pruned.id]: store.prunedLast + 1, [store.kept.id]: 0 }]) {
           const response = yield* store.history(payload)
           expect(response.status).toBe(200)
-          expect(JSON.parse(response.headers["x-pruned-sessions"] ?? "null")).toEqual({
-            [store.pruned.id]: store.prunedLast,
-          })
+          const ranges = parseRanges(response.headers["x-pruned-sessions"])
+          expect(covered(ranges, store.pruned.id)).toBe(true)
+          expect(covered(ranges, store.kept.id)).toBe(false)
+          for (const id of yield* heldIDs(store.db)) {
+            if (covered(ranges, id)) expect(id).toBe(store.pruned.id)
+          }
         }
-        // A cursor past the pruned Session's last sequence still touches it, so it is still reported.
-        const beyond = yield* store.history({ [store.pruned.id]: store.prunedLast + 1, [store.kept.id]: 0 })
-        expect(beyond.status).toBe(200)
-        expect(JSON.parse(beyond.headers["x-pruned-sessions"] ?? "null")).toEqual({
-          [store.pruned.id]: store.prunedLast,
-        })
       }),
     { git: true, config: { formatter: false, lsp: false } },
     { timeout: 10_000 },
+  )
+
+  it.instance(
+    "a standard HTTP client syncs a high-cardinality pruned history without response-header overflow",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const { db } = yield* Database.Service
+        // 700 Sessions: across the first 300, every other one is kept, so the pruned ones there cannot be
+        // coalesced; the last 400 are all pruned. 550 pruned Sessions in all, enough that naming each one would
+        // overflow Node's 16 KiB response-header limit.
+        const sessions = new Array<{ id: string; prune: boolean }>()
+        for (let index = 0; index < 700; index++) {
+          const session = yield* Session.use.create({ title: `high-cardinality ${index}` })
+          sessions.push({ id: session.id, prune: index >= 300 || index % 2 === 0 })
+        }
+        const pruned = sessions.filter((session) => session.prune).map((session) => session.id)
+        expect(pruned).toHaveLength(550)
+        yield* applyRetentionFixtures(pruned)
+        const prunedSet = new Set(pruned)
+        const kept = sessions.filter((session) => !session.prune).map((session) => session.id)
+
+        // The suite's app is served by a real Node HTTP server on a loopback port; request it over TCP.
+        const address = (yield* HttpServer.HttpServer).address
+        if (address._tag !== "TcpAddress") throw new Error("sync app is not served over TCP")
+        const response = yield* Effect.promise(() =>
+          postWithNodeHttp(new URL(SyncPaths.history, `http://127.0.0.1:${address.port}`), tmp.directory, "{}"),
+        )
+
+        expect(response.error).toBeUndefined()
+        expect(response.status).toBe(200)
+        const body = JSON.parse(response.body) as HistoryRow[]
+        expect(Array.isArray(body)).toBe(true)
+        expect(body.some((row) => prunedSet.has(row.aggregate_id))).toBe(false)
+        expect(new Set(body.map((row) => row.aggregate_id))).toEqual(new Set(kept))
+        const header = response.headers["x-pruned-sessions"]
+        expect(typeof header).toBe("string")
+        const line = `${PrunedSessionsHeader}: ${header}\r\n`
+        expect(Buffer.byteLength(line)).toBeLessThanOrEqual(PrunedSessionsHeaderBudget)
+        const ranges = parseRanges(header as string)
+        expect(ranges.length).toBeGreaterThan(1)
+        // Ranges, not a list: the budget cannot hold 400 IDs one by one, yet the contiguous block is covered.
+        expect(pruned.filter((id) => covered(ranges, id)).length).toBeGreaterThanOrEqual(400)
+        expect(ranges.map((range) => range.first)).toEqual(ranges.map((range) => range.first).toSorted())
+        for (const id of kept) expect(covered(ranges, id)).toBe(false)
+        for (const id of yield* heldIDs(db)) {
+          if (covered(ranges, id)) expect(prunedSet.has(id)).toBe(true)
+        }
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 60_000 },
   )
 
   it.instance(

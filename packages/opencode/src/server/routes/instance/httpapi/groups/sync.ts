@@ -35,8 +35,15 @@ export const HistoryEvent = Schema.Struct({
   data: Schema.Record(Schema.String, Schema.Unknown),
 })
 
-// Set on a history response that omits pruned Sessions: a JSON object of each pruned Session ID to its last sequence.
+// Set on a history response when Sessions are pruned: comma-separated ascending ranges `first..last`, or a lone ID.
+// Every Session this server holds whose ID sorts, in string order, between first and last inclusive is pruned.
+// Best effort: the ranges are the ascending prefix that fits PrunedSessionsHeaderBudget, so a Session not covered may
+// still be pruned.
 export const PrunedSessionsHeader = "X-Pruned-Sessions"
+// Bytes for the whole header line (name, ": ", value, CRLF). Proxies commonly hold all response headers in one
+// 4 KiB buffer (nginx's default proxy_buffer_size) and Node's client caps them at 16 KiB; 2 KiB leaves the rest of
+// the smaller limit for the response's ordinary headers.
+export const PrunedSessionsHeaderBudget = 2048
 
 export const SyncPaths = {
   start: `${root}/start`,
@@ -93,7 +100,7 @@ export const SyncApi = HttpApi.make("sync")
             identifier: "sync.history.list",
             summary: "List sync events",
             description:
-              "List sync events for all aggregates. Keys are aggregate IDs the client already knows about, values are the last known sequence ID. Events with seq > value are returned for those aggregates. Aggregates not listed in the input get their full history. A Session whose history retention has pruned returns no events; the X-Pruned-Sessions response header lists each such Session the request touched as a JSON object of Session ID to its last sequence ID.",
+              "List sync events for all aggregates. Keys are aggregate IDs the client already knows about, values are the last known sequence ID. Events with seq > value are returned for those aggregates. Aggregates not listed in the input get their full history. A Session whose history retention has pruned returns no events, and the response stays this bare array. Best effort, the X-Pruned-Sessions response header lists pruned Sessions as comma-separated ascending ranges, each `first..last` or a single Session ID, whose endpoints use only letters, digits, `_` and `-`: every Session this server holds whose ID sorts, in string order, between first and last inclusive is pruned. The whole header line is bounded to 2048 bytes, so it may list only an ascending prefix of the pruned Sessions; a Session it does not cover may still be pruned. It is absent when none is listed.",
           }),
         ),
       )

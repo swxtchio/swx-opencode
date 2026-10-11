@@ -5,6 +5,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventRetentionTable, EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { SessionTable } from "@opencode-ai/core/session/sql"
 import { asc } from "drizzle-orm"
 import { and } from "drizzle-orm"
 import { eq } from "drizzle-orm"
@@ -17,12 +18,18 @@ import { Effect, Scope } from "effect"
 import { HttpEffect, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { HistoryPayload, PrunedSessionsHeader, ReplayPayload, SessionPayload } from "../groups/sync"
+import {
+  HistoryPayload,
+  PrunedSessionsHeader,
+  PrunedSessionsHeaderBudget,
+  ReplayPayload,
+  SessionPayload,
+} from "../groups/sync"
 
 /**
  * Reads every event past the caller's cursors. A Session whose history retention has redacted (pruned) contributes
- * no events and is reported in `pruned` with its last sequence number instead, so one pruned Session never fails
- * the read for the others. Its rows are excluded in SQL and never read.
+ * no events, so a pruned Session never fails the read for the others; its rows are excluded in SQL and never read.
+ * `pruned` describes the pruned Sessions as ascending ranges over the IDs this store holds (see prunedRanges).
  */
 export function readSyncHistory(db: Database.Interface["db"], payload: typeof HistoryPayload.Type) {
   const exclude = Object.entries(payload)
@@ -33,46 +40,87 @@ export function readSyncHistory(db: Database.Interface["db"], payload: typeof Hi
   return db
     .transaction((tx) =>
       Effect.gen(function* () {
-        const aggregates = yield* tx
-          .select({ aggregateID: EventTable.aggregate_id })
-          .from(EventTable)
-          .where(past)
-          .groupBy(EventTable.aggregate_id)
-          .all()
-          .pipe(Effect.orDie)
-        const touched = new Set([...Object.keys(payload), ...aggregates.map((event) => event.aggregateID)])
-        const pruned = (yield* tx
-          .select({ aggregateID: EventRetentionTable.aggregate_id, seq: EventSequenceTable.seq })
-          .from(EventRetentionTable)
-          .leftJoin(EventSequenceTable, eq(EventSequenceTable.aggregate_id, EventRetentionTable.aggregate_id))
-          .where(inArray(EventRetentionTable.state, [...EventV2.unreplayableRetentionStates]))
-          .orderBy(asc(EventRetentionTable.aggregate_id))
-          .all()
-          .pipe(Effect.orDie)).filter((row) => touched.has(row.aggregateID))
+        const unreplayable = inArray(EventRetentionTable.state, [...EventV2.unreplayableRetentionStates])
         const events = yield* tx
           .select()
           .from(EventTable)
           .where(
             and(
               past,
-              pruned.length > 0
-                ? notInArray(
-                    EventTable.aggregate_id,
-                    pruned.map((row) => row.aggregateID),
-                  )
-                : undefined,
+              notInArray(
+                EventTable.aggregate_id,
+                tx.select({ id: EventRetentionTable.aggregate_id }).from(EventRetentionTable).where(unreplayable),
+              ),
             ),
           )
           .orderBy(asc(EventTable.seq))
           .all()
           .pipe(Effect.orDie)
+        const pruned = yield* tx
+          .select({ id: EventRetentionTable.aggregate_id })
+          .from(EventRetentionTable)
+          .where(unreplayable)
+          .all()
+          .pipe(Effect.orDie)
+        if (pruned.length === 0) return { events, pruned: [] }
+        const held = yield* Effect.all(
+          [
+            tx.select({ id: SessionTable.id }).from(SessionTable).all(),
+            tx.select({ id: EventSequenceTable.aggregate_id }).from(EventSequenceTable).all(),
+          ],
+          { concurrency: 1 },
+        ).pipe(Effect.orDie)
         return {
           events,
-          pruned: Object.fromEntries(pruned.map((row) => [row.aggregateID, row.seq ?? -1])),
+          pruned: prunedRanges(
+            [...held.flat(), ...pruned].map((row) => row.id),
+            new Set(pruned.map((row) => row.id)),
+          ),
         }
       }),
     )
     .pipe(Effect.orDie)
+}
+
+// Characters a range endpoint may use. Every generated Session ID qualifies; an ID outside this set (callers may
+// supply their own) cannot be written unambiguously in the header, so it is never an endpoint.
+const rangeEndpoint = /^[A-Za-z0-9_-]+$/
+
+/**
+ * Coalesces the pruned IDs into maximal runs over every ID this store holds, in ascending string order. A range
+ * never spans an unpruned ID this store holds, so it never claims that one was pruned. With ASCII endpoints the
+ * IDs between them are the same in UTF-16 and byte order, so any client comparison agrees.
+ */
+function prunedRanges(held: readonly string[], pruned: ReadonlySet<string>) {
+  const ranges = new Array<{ first: string; last: string }>()
+  let open = false
+  for (const id of Array.from(new Set(held)).toSorted()) {
+    if (!pruned.has(id) || !rangeEndpoint.test(id)) {
+      open = false
+      continue
+    }
+    if (open) ranges[ranges.length - 1] = { first: ranges[ranges.length - 1]!.first, last: id }
+    else ranges.push({ first: id, last: id })
+    open = true
+  }
+  return ranges
+}
+
+/**
+ * Writes the ascending prefix of the ranges that fits the header budget, counting the whole header line. Best
+ * effort: what is listed is exact, and nothing is implied about pruned Sessions after the last listed range.
+ */
+function prunedSessionsHeader(ranges: readonly { first: string; last: string }[]) {
+  const entries = new Array<string>()
+  let bytes = PrunedSessionsHeader.length + ": \r\n".length
+  for (const range of ranges) {
+    const entry = range.first === range.last ? range.first : `${range.first}..${range.last}`
+    const size = entry.length + (entries.length > 0 ? 1 : 0)
+    if (bytes + size > PrunedSessionsHeaderBudget) break
+    entries.push(entry)
+    bytes += size
+  }
+  return entries.length > 0 ? entries.join(",") : undefined
 }
 
 export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handlers) =>
@@ -130,10 +178,11 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
 
     const history = Effect.fn("SyncHttpApi.history")(function* (ctx: { payload: typeof HistoryPayload.Type }) {
       const result = yield* readSyncHistory(db, ctx.payload)
-      if (Object.keys(result.pruned).length > 0) {
+      const pruned = prunedSessionsHeader(result.pruned)
+      if (pruned !== undefined) {
         // The body stays the bare event array; the pruned Sessions travel in a header.
         yield* HttpEffect.appendPreResponseHandler((_request, response) =>
-          Effect.succeed(HttpServerResponse.setHeader(response, PrunedSessionsHeader, JSON.stringify(result.pruned))),
+          Effect.succeed(HttpServerResponse.setHeader(response, PrunedSessionsHeader, pruned)),
         )
       }
       return result.events
