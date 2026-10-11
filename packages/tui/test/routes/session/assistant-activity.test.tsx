@@ -7,6 +7,7 @@ import { onCleanup } from "solid-js"
 import type { JSX } from "@opentui/solid"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { AssistantMessage, Message, Part, Session, SessionStatus } from "@opencode-ai/sdk/v2"
+import { LocalProvider } from "../../../src/context/local"
 import { LocationProvider } from "../../../src/context/location"
 import { RouteProvider } from "../../../src/context/route"
 import { useSync } from "../../../src/context/sync"
@@ -18,7 +19,7 @@ import {
   activeTaskRetry,
   assistantStatus,
   SessionContext,
-  ReasoningPartView,
+  AssistantMessageView,
   ToolPartView,
 } from "../../../src/routes/session"
 import { SPINNER_FRAMES } from "../../../src/component/spinner"
@@ -147,17 +148,33 @@ function History(props: {
   return (
     <TuiConfigProvider config={config}>
       <ThemeProvider mode="dark">
-        <LocationProvider>
-          <SessionContext.Provider value={sessionContext}>
-            <box flexDirection="column">
-              <ReasoningPartView last={true} message={props.old.info} part={props.oldReasoning} />
-              <ToolPartView last={true} message={props.old.info} part={props.oldRead} />
-              <ToolPartView last={true} message={props.shell.info} part={props.oldShell} />
-              <ReasoningPartView last={true} message={props.current.info} part={props.currentReasoning} />
-              {props.currentRead && <ToolPartView last={true} message={props.current.info} part={props.currentRead} />}
-            </box>
-          </SessionContext.Provider>
-        </LocationProvider>
+        <TaskInteractionProviders sessionID={props.sessionID}>
+          <LocalProvider>
+            <LocationProvider>
+              <SessionContext.Provider value={sessionContext}>
+                <box flexDirection="column">
+                  <AssistantMessageView
+                    last={true}
+                    message={props.old.info}
+                    parts={[props.oldReasoning]}
+                    modelMessages={undefined}
+                  />
+                  <ToolPartView last={true} message={props.old.info} part={props.oldRead} />
+                  <ToolPartView last={true} message={props.shell.info} part={props.oldShell} />
+                  <AssistantMessageView
+                    last={true}
+                    message={props.current.info}
+                    parts={[props.currentReasoning]}
+                    modelMessages={undefined}
+                  />
+                  {props.currentRead && (
+                    <ToolPartView last={true} message={props.current.info} part={props.currentRead} />
+                  )}
+                </box>
+              </SessionContext.Provider>
+            </LocationProvider>
+          </LocalProvider>
+        </TaskInteractionProviders>
       </ThemeProvider>
     </TuiConfigProvider>
   )
@@ -198,12 +215,19 @@ function PreAssistantHistory(props: {
           <SessionContext.Provider value={sessionContext}>
             <TaskInteractionProviders sessionID={props.sessionID}>
               <TaskSeed prepare={props.prepare}>
-                <box flexDirection="column">
-                  <ReasoningPartView last={true} message={props.old.info} part={props.oldReasoning} />
-                  <ToolPartView last={true} message={props.old.info} part={props.oldRead} />
-                  <ToolPartView last={true} message={props.shell.info} part={props.shellPart} />
-                  <ToolPartView last={true} message={props.task.info} part={props.taskPart} />
-                </box>
+                <LocalProvider>
+                  <box flexDirection="column">
+                    <AssistantMessageView
+                      last={true}
+                      message={props.old.info}
+                      parts={[props.oldReasoning]}
+                      modelMessages={undefined}
+                    />
+                    <ToolPartView last={true} message={props.old.info} part={props.oldRead} />
+                    <ToolPartView last={true} message={props.shell.info} part={props.shellPart} />
+                    <ToolPartView last={true} message={props.task.info} part={props.taskPart} />
+                  </box>
+                </LocalProvider>
               </TaskSeed>
             </TaskInteractionProviders>
           </SessionContext.Provider>

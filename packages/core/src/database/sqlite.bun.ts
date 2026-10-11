@@ -83,7 +83,7 @@ const make = (options: Config) =>
           try: () => (statement.all(...(params as any)) ?? []) as Array<Record<string, unknown>>,
           catch: statementError,
         })
-        return retryLocked(execute)
+        return retryLocked(execute, query)
       })
 
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
@@ -95,7 +95,7 @@ const make = (options: Config) =>
           try: () => (statement.values(...(params as any)) ?? []) as Array<unknown[]>,
           catch: statementError,
         })
-        return retryLocked(execute)
+        return retryLocked(execute, query)
       })
 
     const connection = identity<SqliteConnection>({
