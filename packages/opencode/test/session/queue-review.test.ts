@@ -200,6 +200,24 @@ it.instance(
 )
 
 it.instance(
+  "a command being prepared when it is consolidated delivers every merged step",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "consolidate into a command in preparation" })
+      const written: string[] = []
+      yield* admit(session.id, "queue", "run lint")
+      yield* admit(session.id, "queue", "run lint --fix")
+      const racing = yield* gated(session.id, "queue", written)
+      expect((yield* queue.consolidate(session.id)).map(text)).toEqual(["run lint:\n1. run lint\n2. --fix"])
+      yield* racing.finish
+      expect(written).toEqual(["run lint:\n1. run lint\n2. --fix"])
+    }),
+  30_000,
+)
+
+it.instance(
   "a review hold stops both categories, even a promotion already being prepared, until it is released",
   () =>
     Effect.gen(function* () {

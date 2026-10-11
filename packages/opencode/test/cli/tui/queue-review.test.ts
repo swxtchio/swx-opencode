@@ -54,7 +54,7 @@ const boot = Effect.fnUntraced(function* (input: { directory: string; sessionID?
       const target = new URL(`${url.pathname}${url.search}`, base)
       if (url.pathname !== "/global/event") return globalThis.fetch(new Request(target, source))
       // The SDK's event stream leaves a rejected cancel unhandled when the app
-      // aborts it at exit, so the app reads a stream that just ends instead.
+      // aborts it at exit (#219), so the app reads a stream that just ends instead.
       const upstream = new AbortController()
       const response = await globalThis.fetch(new Request(target, { headers: source.headers, signal: upstream.signal }))
       const reader = response.body!.getReader()
