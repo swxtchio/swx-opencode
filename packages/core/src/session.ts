@@ -417,9 +417,8 @@ const layer = Layer.effect(
               assistantMessageID: failedAssistant.message.id,
             }
       }
-      // A failed call is recovered only by a later repeat that completes, in this assistant or a later one. A repeat has
-      // the same tool name and arguments. The provider call ID is not part of a repeat: a recovery may carry a fresh ID,
-      // and providers such as Gemini reuse generated IDs across streams for unrelated calls.
+      // A failed call recovers when a later call with the same tool name and arguments completes, in this assistant or a
+      // later one. The call ID is ignored: a recovery may carry a fresh ID, and Gemini reuses IDs for unrelated calls.
       const unrecoveredTool = latestTools.find(
         ({ content }, index) =>
           content.state.status === "error" &&

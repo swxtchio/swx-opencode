@@ -831,7 +831,7 @@ describe("SessionV2.wait", () => {
         ],
         textTurn("text-wait-after-recovery", "Recovered"),
       ]
-      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Repeat the tool call" }) })
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Recover the tool call" }) })
       yield* Deferred.await(toolStarted)
       joinAck = joined
       const waiter = yield* session.wait(sessionID).pipe(
@@ -848,15 +848,15 @@ describe("SessionV2.wait", () => {
       const assistants = (yield* session.messages({ sessionID, order: "asc" })).filter(
         (message): message is SessionMessage.Assistant => message.type === "assistant",
       )
-      const repeated = assistants.flatMap((message) =>
+      const calls = assistants.flatMap((message) =>
         message.content.flatMap((content) =>
           content.type === "tool" && content.id === "call-wait-recovery"
             ? [{ assistantMessageID: message.id, status: content.state.status }]
             : [],
         ),
       )
-      expect(repeated.map((tool) => tool.status)).toEqual(["error", "completed"])
-      expect(repeated[0]?.assistantMessageID).not.toBe(repeated[1]?.assistantMessageID)
+      expect(calls.map((tool) => tool.status)).toEqual(["error", "completed"])
+      expect(calls[0]?.assistantMessageID).not.toBe(calls[1]?.assistantMessageID)
       const recovered = assistants.at(-1)
       if (!recovered) throw new Error("Expected the assistant that answered after the recovery")
       expect(recovered.content).toContainEqual(expect.objectContaining({ type: "text", text: "Recovered" }))
@@ -879,7 +879,7 @@ describe("SessionV2.wait", () => {
           description: "Fail with a provider-local call ID",
           input: Schema.Struct({}),
           output: Schema.Struct({}),
-          execute: () => Effect.die("tool failure that is never repeated"),
+          execute: () => Effect.die("tool failure that is never recovered"),
         }),
         succeedsLater: Tool.make({
           description: "Succeed under the same provider-local call ID",
@@ -977,63 +977,7 @@ describe("SessionV2.wait", () => {
     }),
   )
 
-  it.effect("completes when a later assistant recovers a failed call with a repeat under a fresh ID", () =>
-    Effect.gen(function* () {
-      yield* setupNative
-      const session = yield* SessionV2.Service
-      const registry = yield* ToolRegistry.Service
-      const commands: string[] = []
-      yield* registry.register({
-        bash: Tool.make({
-          description: "Run a command",
-          input: Schema.Struct({ command: Schema.String }),
-          output: Schema.Struct({}),
-          execute: ({ command }) =>
-            Effect.suspend(() => (commands.push(command) === 1 ? Effect.die("make test failed") : Effect.succeed({}))),
-        }),
-      })
-      responses = [
-        [
-          LLMEvent.stepStart({ index: 0 }),
-          LLMEvent.toolCall({ id: "call-wait-first-attempt", name: "bash", input: { command: "make test" } }),
-          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
-          LLMEvent.finish({ reason: "tool-calls" }),
-        ],
-        [
-          LLMEvent.stepStart({ index: 0 }),
-          LLMEvent.toolCall({ id: "call-wait-fresh-repeat", name: "bash", input: { command: "make test" } }),
-          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
-          LLMEvent.finish({ reason: "tool-calls" }),
-        ],
-        textTurn("text-wait-after-fresh-repeat", "Tests pass"),
-      ]
-      const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run the tests" }) })
-      const result = yield* session.wait(sessionID)
-
-      expect(commands).toEqual(["make test", "make test"])
-      const assistants = (yield* session.messages({ sessionID, order: "asc" })).filter(
-        (message): message is SessionMessage.Assistant => message.type === "assistant",
-      )
-      const calls = assistants.flatMap((message) =>
-        message.content.flatMap((content) =>
-          content.type === "tool"
-            ? [{ assistantMessageID: message.id, id: content.id, status: content.state.status }]
-            : [],
-        ),
-      )
-      expect(calls.map((call) => [call.id, call.status])).toEqual([
-        ["call-wait-first-attempt", "error"],
-        ["call-wait-fresh-repeat", "completed"],
-      ])
-      expect(calls[0]?.assistantMessageID).not.toBe(calls[1]?.assistantMessageID)
-      const answered = assistants.at(-1)
-      if (!answered) throw new Error("Expected the assistant that answered after the recovery")
-      expect(result).toEqual({ type: "completed", admittedSeq: admitted.admittedSeq, assistantMessageID: answered.id })
-      expect(requests).toHaveLength(3)
-    }),
-  )
-
-  it.effect("completes when a later Gemini stream recovers a failed call with a repeat at a new position", () =>
+  it.effect("completes when a later Gemini stream recovers a failed call under a fresh ID", () =>
     Effect.gen(function* () {
       yield* setupNative
       const session = yield* SessionV2.Service
@@ -1053,7 +997,7 @@ describe("SessionV2.wait", () => {
             }),
         }),
       })
-      // The first stream numbers its two calls tool_0 and tool_1. The repeat is the only call in the next stream, so the
+      // The first stream numbers its two calls tool_0 and tool_1. The recovery is the only call in the next stream, so the
       // parser numbers it tool_0, the ID of the first stream's other call.
       responses = [
         yield* geminiTurn([
@@ -1099,7 +1043,7 @@ describe("SessionV2.wait", () => {
       const { db } = yield* Database.Service
       const admission = yield* session.prompt({
         sessionID,
-        prompt: Prompt.make({ text: "Repeat the same hosted tool call" }),
+        prompt: Prompt.make({ text: "Recover the same hosted tool call" }),
         resume: false,
       })
       yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER)
@@ -1115,10 +1059,10 @@ describe("SessionV2.wait", () => {
         error: { type: "unknown", message: "Transient hosted-tool failure" },
         provider: { executed: true },
       })
-      const repeatTime = yield* DateTime.now
+      const recoveryTime = yield* DateTime.now
       yield* events.publish(SessionEvent.Tool.Called, {
         sessionID,
-        timestamp: repeatTime,
+        timestamp: recoveryTime,
         assistantMessageID,
         callID,
         tool: "web_search",
