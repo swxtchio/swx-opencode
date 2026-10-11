@@ -4,6 +4,7 @@ import { Database } from "bun:sqlite"
 import { Context, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { chmod, mkdtemp, readFile, rm, stat, statfs, writeFile } from "node:fs/promises"
+import os from "node:os"
 import path from "node:path"
 import { eq } from "drizzle-orm"
 import { Service, layerFromPath } from "@opencode-ai/core/database/database"
@@ -1287,3 +1288,272 @@ test(
   },
   { timeout: 60_000 },
 )
+
+const DAY = 24 * 60 * 60 * 1000
+
+// A refused tree skips the event-payload JSON scan and says so; the remaining reasons name the refusing gate.
+const gateReasons = (tree: { reasons: readonly string[] }) =>
+  tree.reasons.filter((reason) => !reason.startsWith("event-payload-ownership-proof-unavailable:"))
+
+test("only a whole tree inactive for strictly more than seven days since its last activity is selected", () => {
+  const db = fixture()
+  try {
+    const idleAt = 50 * DAY
+    const boundary = idleAt + inactivityPolicy.windowMs
+    session(db, "ses_idle", idleAt)
+    event(db, "ses_idle")
+    // Created long before the boundary but used recently: creation age alone would select it.
+    session(db, "ses_reused", 10)
+    event(db, "ses_reused")
+    db.query("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)").run(
+      "msg_recent",
+      "ses_reused",
+      10,
+      boundary,
+      JSON.stringify({ role: "user", time: { created: 10 } }),
+    )
+    // An old parent whose child was active recently is one tree, so the parent is protected too.
+    session(db, "ses_parent", 10)
+    session(db, "ses_child", 10, "ses_parent")
+    db.query("INSERT INTO todo (session_id, position, content, time_created, time_updated) VALUES (?, 1, ?, ?, ?)").run(
+      "ses_child",
+      "child todo",
+      10,
+      boundary,
+    )
+    // Event appends carry no timestamp of their own; the writer record times them.
+    session(db, "ses_appended", 10)
+    event(db, "ses_appended")
+    db.query(
+      "INSERT INTO event_aggregate_writer (aggregate_id, writer_id, time_last_append) VALUES ('ses_appended', 'writer-gone', ?)",
+    ).run(boundary)
+    db.query(
+      "INSERT INTO event_writer_process (writer_id, pid, boot_id, start_ticks, time_registered) VALUES ('writer-gone', 2147483646, 'boot', '1', 10)",
+    ).run()
+    const proof = (ids: string[]) => evidence(ids, Object.fromEntries(ids.map((id) => [id, ids.includes("ses_parent") ? -1 : 0])))
+    const tree = (now: number, root: string, ids: string[]) =>
+      inventory(access(db), proof(ids), now).trees.find((item) => item.rootSessionID === root)!
+
+    expect(gateReasons(tree(boundary + 1, "ses_idle", ["ses_idle"]))).toEqual([])
+    for (const now of [boundary, boundary - 1]) {
+      expect(gateReasons(tree(now, "ses_idle", ["ses_idle"]))).toEqual(["session-tree-active-within-inactivity-window"])
+    }
+    const later = boundary + 1
+    expect(gateReasons(tree(later, "ses_reused", ["ses_reused"]))).toEqual([
+      "session-tree-active-within-inactivity-window",
+    ])
+    expect(gateReasons(tree(later, "ses_parent", ["ses_child", "ses_parent"]))).toEqual([
+      "session-tree-active-within-inactivity-window",
+    ])
+    expect(gateReasons(tree(later, "ses_appended", ["ses_appended"]))).toEqual([
+      "session-tree-active-within-inactivity-window",
+    ])
+    expect(gateReasons(tree(boundary + inactivityPolicy.windowMs + 1, "ses_reused", ["ses_reused"]))).toEqual([])
+
+    const before = db.serialize()
+    const reused = tree(later, "ses_reused", ["ses_reused"])
+    const refused = apply(access(db), { tree: { ...reused, eligible: true, reasons: [] }, evidence: () => proof(["ses_reused"]), now: () => later })
+    expect(refused).toMatchObject({ state: "refused", changedRows: 0 })
+    expect(refused.reasons).toContain("session-tree-active-within-inactivity-window")
+    expect(db.serialize().equals(before)).toBe(true)
+
+    db.query("UPDATE message SET time_updated = 'yesterday' WHERE id = 'msg_recent'").run()
+    expect(gateReasons(tree(boundary + inactivityPolicy.windowMs + 1, "ses_reused", ["ses_reused"]))).toEqual([
+      "session-activity-unreadable:message.time_updated",
+    ])
+  } finally {
+    db.close()
+  }
+})
+
+test("activity arriving after inventory refuses the next batch before it writes", () => {
+  const db = fixture()
+  try {
+    session(db, "ses_old", 10)
+    event(db, "ses_old")
+    addCopies(db, "ses_old")
+    const proof = evidence(["ses_old"], { ses_old: 0 })
+    const tree = inventory(access(db), proof, NOW).trees[0]!
+    expect(tree.eligible).toBe(true)
+    const first = apply(access(db), { tree, evidence: () => proof, now: () => NOW, batchSize: 1, maxBatches: 1 })
+    expect(first).toMatchObject({ state: "in-progress", changedRows: 1 })
+    db.query("UPDATE part SET time_updated = ? WHERE session_id = 'ses_old'").run(NOW - 1)
+    const before = db.serialize()
+
+    const result = apply(access(db), { tree, evidence: () => proof, now: () => NOW, batchSize: 1 })
+
+    expect(result).toMatchObject({ state: "refused", changedRows: 0 })
+    expect(result.reasons).toContain("session-tree-active-within-inactivity-window")
+    expect(db.serialize().equals(before)).toBe(true)
+  } finally {
+    db.close()
+  }
+})
+
+async function productionStore() {
+  // A fresh private directory, like the production data directory, initialized by the production layer.
+  const directory = await mkdtemp(path.join(os.tmpdir(), "opencode-retention-store-"))
+  const filename = path.join(directory, "opencode.db")
+  await Effect.runPromise(Effect.scoped(Layer.build(layerFromPath(filename))))
+  return { filename, [Symbol.asyncDispose]: () => rm(directory, { recursive: true, force: true }) }
+}
+
+function productionSession(db: Database, id: string, time: number) {
+  db.query(
+    "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?, 'proj', 'slug', '/work', 'held session sentinel', 'v1', ?, ?)",
+  ).run(id, time, time)
+}
+
+async function holdSession(filename: string, sessionID: string, mode: "write" | "open") {
+  const holder = Bun.spawn(
+    [process.execPath, path.join(import.meta.dir, "../../fixture/retention-holder.ts"), filename, sessionID, mode],
+    { stdin: "pipe", stdout: "pipe", stderr: "pipe", cwd: path.join(import.meta.dir, "../../..") },
+  )
+  const reader = holder.stdout.getReader()
+  let output = ""
+  while (!output.includes("ready")) {
+    const chunk = await reader.read()
+    if (chunk.done) throw new Error(`holder exited before ready: ${await new Response(holder.stderr).text()}`)
+    output += new TextDecoder().decode(chunk.value)
+  }
+  reader.releaseLock()
+  return {
+    pid: holder.pid,
+    release: async () => {
+      holder.stdin.end()
+      await holder.exited
+    },
+    [Symbol.asyncDispose]: async () => {
+      holder.kill()
+      await holder.exited
+    },
+  }
+}
+
+const eventRows = (db: Database, sessionID: string) =>
+  db.query<{ data: string }, [string]>("SELECT data FROM event WHERE aggregate_id = ? ORDER BY seq").all(sessionID)
+
+test(
+  "a Session written by a live process in another OS process is never selected, and is released when it exits",
+  async () => {
+    await using store = await productionStore()
+    const db = new Database(store.filename)
+    try {
+      productionSession(db, "ses_held", 10)
+      await using holder = await holdSession(store.filename, "ses_held", "write")
+      const proof = () => evidence(["ses_held"], { ses_held: 0 }, store.filename)
+      expect(proof().holders).toEqual(expect.objectContaining({ state: "complete", pids: [holder.pid] }))
+
+      const held = inventory(access(db), proof(), Date.now() + NOW).trees.find((item) => item.rootSessionID === "ses_held")!
+      expect(held.eligible).toBe(false)
+      expect(gateReasons(held)).toEqual(["session-held-by-live-process:ses_held"])
+      const before = db.serialize()
+      const refused = apply(access(db), {
+        tree: { ...held, eligible: true, reasons: [] },
+        evidence: proof,
+        now: () => Date.now() + NOW,
+      })
+      expect(refused).toMatchObject({ state: "refused", changedRows: 0 })
+      expect(refused.reasons).toContain("session-held-by-live-process:ses_held")
+      expect(db.serialize().equals(before)).toBe(true)
+
+      await holder.release()
+      const released = inventory(access(db), proof(), Date.now() + NOW).trees.find(
+        (item) => item.rootSessionID === "ses_held",
+      )!
+      expect(released.reasons).toEqual([])
+    } finally {
+      db.close()
+    }
+  },
+  { timeout: 30_000 },
+)
+
+test(
+  "an unregistered process holding the database refuses every tree until it exits",
+  async () => {
+    await using store = await productionStore()
+    const db = new Database(store.filename)
+    try {
+      productionSession(db, "ses_quiet", 10)
+      await using holder = await holdSession(store.filename, "ses_quiet", "open")
+      const proof = () => evidence(["ses_quiet"], { ses_quiet: -1 }, store.filename)
+      const refused = inventory(access(db), proof(), Date.now() + NOW)
+      expect(gateReasons(refused.trees[0]!)).toEqual([`unregistered-database-holder:${holder.pid}`])
+      await holder.release()
+      expect(inventory(access(db), proof(), Date.now() + NOW).trees[0]?.reasons).toEqual([])
+    } finally {
+      db.close()
+    }
+  },
+  { timeout: 30_000 },
+)
+
+test(
+  "a holder or pending work arriving between inventory and a batch refuses it before any write",
+  async () => {
+    await using store = await productionStore()
+    const db = new Database(store.filename)
+    try {
+      productionSession(db, "ses_late", 10)
+      const proof = () => evidence(["ses_late"], { ses_late: -1 }, store.filename)
+      const now = () => Date.now() + NOW
+      const tree = inventory(access(db), proof(), now()).trees[0]!
+      expect(tree.reasons).toEqual([])
+
+      await using holder = await holdSession(store.filename, "ses_late", "write")
+      const eventsBefore = eventRows(db, "ses_late")
+      const before = db.serialize()
+      const result = apply(access(db), { tree, evidence: proof, now })
+      expect(result).toMatchObject({ state: "refused", changedRows: 0 })
+      expect(result.reasons).toContain("session-held-by-live-process:ses_late")
+      expect(result.reasons).toContain("event-appended-after-inventory:ses_late")
+      expect(db.serialize().equals(before)).toBe(true)
+      expect(eventRows(db, "ses_late")).toEqual(eventsBefore)
+      await holder.release()
+
+      const current = inventory(access(db), { ...proof(), handoff: { ...proof().handoff!, finalSequence: { ses_late: 0 } } }, now()).trees[0]!
+      expect(current.reasons).toEqual([])
+      db.query(
+        "INSERT INTO session_prompt_queue (id, session_id, seq, delivery, input, time_created) VALUES ('queued', 'ses_late', 1, 'queue', '{}', 10)",
+      ).run()
+      const queuedBefore = db.serialize()
+      const queued = apply(access(db), {
+        tree: current,
+        evidence: () => ({ ...proof(), handoff: { ...proof().handoff!, finalSequence: { ses_late: 0 } } }),
+        now,
+      })
+      expect(queued).toMatchObject({ state: "refused", changedRows: 0 })
+      expect(queued.reasons).toContain("v1-prompt-queue-row-present")
+      expect(db.serialize().equals(queuedBefore)).toBe(true)
+    } finally {
+      db.close()
+    }
+  },
+  { timeout: 30_000 },
+)
+
+test("a promoted V2 input row refuses its tree literally, including one promoted after inventory", () => {
+  const db = fixture()
+  try {
+    session(db, "ses_prompted", 10)
+    event(db, "ses_prompted")
+    addCopies(db, "ses_prompted")
+    const proof = evidence(["ses_prompted"], { ses_prompted: 0 })
+    const tree = inventory(access(db), proof, NOW).trees[0]!
+    expect(tree.eligible).toBe(true)
+    db.query(
+      "INSERT INTO session_input (id, session_id, promoted_seq, prompt) VALUES ('input_promoted', 'ses_prompted', 1, ?)",
+    ).run(JSON.stringify({ text: "promoted prompt sentinel" }))
+    expect(gateReasons(inventory(access(db), proof, NOW).trees[0]!)).toEqual(["v2-input-promoted-row-present"])
+    const before = db.serialize()
+
+    const result = apply(access(db), { tree, evidence: () => proof, now: () => NOW })
+
+    expect(result).toMatchObject({ state: "refused", changedRows: 0 })
+    expect(result.reasons).toEqual(["v2-input-promoted-row-present"])
+    expect(db.serialize().equals(before)).toBe(true)
+  } finally {
+    db.close()
+  }
+})
