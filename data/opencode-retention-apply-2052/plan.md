@@ -73,3 +73,22 @@ Source: `data/opencode-retention-fix-r2/scope-addition-decision1.md` in the firs
 - `/sync/replay` onto a redacted aggregate stays refused. The production apply refusal is unchanged.
 - Focused tests in `test/server/httpapi-sync.test.ts`, one per required behaviour, each red with the header or
   the no-fail path reverted.
+
+## Scope addition: bounded pruned-Session notification (captain, 2026-10-11)
+
+Source: `data/opencode-retention-fix-r2/header-bound-decision.md` in the firstmate home. Supersedes complete
+enumeration in `X-Pruned-Sessions`; the 200 response and bare-array body stay.
+
+- Identifier contract: a Session ID is any string starting with `ses` (`packages/schema/src/session-id.ts`); generated
+  ones are time-descending plus random, and callers may supply their own. No ID interval is reserved, so a range can
+  honestly speak only for the Sessions this server holds. A range `first..last` therefore means: every Session this
+  server holds whose ID sorts, in string order, between first and last inclusive is pruned. Ranges are maximal runs of
+  pruned IDs over the server's sorted held IDs, so none spans an unpruned Session it holds. Endpoints use only
+  `[A-Za-z0-9_-]`, which keeps the syntax unambiguous and makes UTF-16 and byte order agree on membership.
+- Bound: the whole header line (name, `: `, value, CRLF) stays within 2048 bytes, leaving the rest of a common 4 KiB
+  proxy response-header buffer for ordinary headers. The header carries the ascending prefix of ranges that fits.
+  Last sequence numbers are no longer carried; a range cannot hold one per Session.
+- Contract text in the endpoint description, the SDK `openapi.json` line and the legacy JS SDK.
+- Regression: a standard Node HTTP client (default 16 KiB header limit) syncs a 550-pruned-Session history over TCP;
+  red with complete enumeration restored (header overflow), with the budget removed, and with runs allowed to span
+  unpruned Sessions.
