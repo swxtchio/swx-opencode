@@ -42,6 +42,8 @@ sessions.wait(sessionID)
 
 A terminal assistant step ending in `tool-calls`, or one carrying a local tool call, is an intermediate turn and cannot establish completion until the required provider continuation publishes its terminal assistant.
 
+The observed work group starts after the last closing terminal step committed before the latest admission. A successful step that does not end in `tool-calls` always closes the older work. A failed or interrupted step closes it unless the latest input was promoted with `Prompted.continuation`, which the runner sets only when a running drain promotes steers at a provider-turn boundary. A steer accepted into a failing drain therefore reports that failure, while a prompt promoted by a later drain, at the would-idle queue boundary, or still pending settles on its own outcome.
+
 The joined drain `Exit` supplies a `failed` or `interrupted` result when execution ends unsuccessfully before the admitted turn is successfully completed, even if the latest assistant projection is absent or is only an intermediate tool-call turn; the result still carries the latest admitted sequence when one exists.
 
 `session_input` is the durable admission inbox. `PromptAdmitted` records and projects accepted input so pending queue state can be replayed, replicated, and observed by clients. Admitted inputs remain outside model-visible Session history until the serialized runner publishes `Prompted`. Its projector atomically writes the visible user message and marks the inbox row promoted in the same event transaction. The V1-to-V2 shadow bridge publishes the same `Prompted` event for already-visible V1 prompts.

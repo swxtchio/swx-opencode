@@ -941,6 +941,7 @@ export type GlobalEvent = {
           messageID: string
           prompt: Prompt
           delivery: "steer" | "queue"
+          continuation?: true
         }
       }
     | {
@@ -3455,6 +3456,7 @@ export type SyncEventSessionNextPrompted = {
       messageID: string
       prompt: Prompt
       delivery: "steer" | "queue"
+      continuation?: true
     }
   }
 }
@@ -4357,6 +4359,7 @@ export type SessionNextPrompted = {
     messageID: string
     prompt: Prompt
     delivery: "steer" | "queue"
+    continuation?: true
   }
 }
 
@@ -6425,6 +6428,7 @@ export type EventSessionNextPrompted = {
     messageID: string
     prompt: Prompt
     delivery: "steer" | "queue"
+    continuation?: true
   }
 }
 
