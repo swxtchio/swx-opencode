@@ -6,9 +6,10 @@ import { MessageTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm"
-import { Cause, Context, Effect, Exit, Layer, Option, Schema, Semaphore, Struct } from "effect"
+import { Cause, Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Scope, Semaphore, Struct } from "effect"
 import { isDeepStrictEqual } from "node:util"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { sqliteLockMessage } from "@/util/sqlite-error"
 import { MessageV2 } from "./message-v2"
 import { MessageID, SessionID } from "./schema"
 
@@ -40,6 +41,28 @@ export class WithdrawnError extends Schema.TaggedErrorClass<WithdrawnError>()("S
   sessionID: Schema.String,
   itemID: Schema.String,
 }) {}
+
+/**
+ * A consume whose write could not begin in any of its attempts, on another
+ * connection's write lock or past the acquisition backstop. The run stops with
+ * it, and every queued row stays as it was for the next wake.
+ */
+export class ConsumeLockedError extends Schema.TaggedErrorClass<ConsumeLockedError>()(
+  "SessionQueueConsumeLockedError",
+  {
+    sessionID: Schema.String,
+    attempts: Schema.Number,
+    message: Schema.String,
+  },
+) {}
+
+// Each consume attempt waits out the statement lock window, so a lock released
+// within about this many windows lets the run go on.
+const consumeAttempts = 5
+// Bounds an attempt's wait for the session permit, the shared connection and
+// BEGIN together: its own statement window plus one other statement's window
+// ahead of it on the connection. The body, once begun, is not timed.
+const consumeAcquireBackstop = Duration.seconds(10)
 
 export interface Interface {
   readonly admit: (input: AdmitInput) => Effect.Effect<Item>
@@ -97,6 +120,9 @@ export interface Interface {
    * Called by a drain before it reads history; returns the wake count that read
    * reflects, for `park`. A promoted row outlives its promotion until then so
    * that a joiner of a finishing run can see the prompt still needs a drain.
+   * Another connection's write lock can outlast one attempt: an attempt whose
+   * transaction never began, on the lock or past its acquisition backstop, is
+   * made again, and the last such attempt dies with ConsumeLockedError.
    */
   readonly consume: (sessionID: SessionID) => Effect.Effect<number>
   /**
@@ -140,6 +166,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const database = yield* Database.Service
     const { db } = database
+    const scope = yield* Scope.Scope
     const events = yield* EventV2Bridge.Service
     // `locks` guard every mutation and its publication and are held only for
     // bounded database work. `order` keeps a session's promotions in seq order
@@ -680,19 +707,71 @@ const layer = Layer.effect(
         )
         .pipe(Effect.withSpan("SessionQueue.promote"))
 
+    // Only an attempt whose delete never ran is made again, so no executed
+    // transaction body is replayed. Success is the attempt's own commit.
     const consume = Effect.fn("SessionQueue.consume")(function* (sessionID: SessionID) {
-      return yield* exclusive(
+      for (let attempts = 1; ; attempts++) {
+        const attempt = yield* consumeAttempt(sessionID)
+        if (attempt.kind === "consumed") return attempt.seen
+        yield* Effect.logWarning(
+          attempt.kind === "locked"
+            ? "queue consume met a held write lock"
+            : "queue consume waited past its acquisition backstop",
+          { "session.id": sessionID, attempts },
+        )
+        if (attempts === consumeAttempts)
+          return yield* Effect.die(
+            new ConsumeLockedError({
+              sessionID,
+              attempts: consumeAttempts,
+              message: `SessionQueue.consume could not begin its write in ${consumeAttempts} attempts; session ${sessionID} stopped, and its queued prompts stay pending until it is prompted again`,
+            }),
+          )
+      }
+    })
+
+    // The driver waits for its connection and retries BEGIN uninterruptibly, so
+    // the attempt runs in its own fiber and the backstop stops waiting for it
+    // rather than interrupting it. An abandoned attempt that later reaches its
+    // body rolls back without deleting anything.
+    const consumeAttempt = Effect.fnUntraced(function* (sessionID: SessionID) {
+      const state = { began: false, abandoned: false }
+      // Whether the abandon won: a body that began first is waited for instead,
+      // so a committed consume is never reported as a backstop.
+      const abandon = (fiber: Fiber.Fiber<unknown, unknown>) =>
+        Effect.suspend(() => {
+          if (state.began) return Effect.succeed(false)
+          state.abandoned = true
+          return Fiber.interrupt(fiber).pipe(Effect.forkIn(scope), Effect.as(true))
+        })
+      const fiber = yield* exclusive(
         sessionID,
         writable(sessionID, (tx) =>
-          tx
-            .delete(SessionPromptQueueTable)
-            .where(
-              and(eq(SessionPromptQueueTable.session_id, sessionID), isNotNull(SessionPromptQueueTable.time_promoted)),
-            )
-            .run()
-            .pipe(Effect.map(() => wakes.get(sessionID) ?? 0)),
-        ).pipe(Effect.orDie),
+          Effect.suspend(() => {
+            if (state.abandoned) return Effect.interrupt
+            state.began = true
+            return tx
+              .delete(SessionPromptQueueTable)
+              .where(
+                and(
+                  eq(SessionPromptQueueTable.session_id, sessionID),
+                  isNotNull(SessionPromptQueueTable.time_promoted),
+                ),
+              )
+              .run()
+              .pipe(Effect.map(() => wakes.get(sessionID) ?? 0))
+          }),
+        ),
+      ).pipe(Effect.forkIn(scope, { startImmediately: true }))
+      const waited = yield* Fiber.await(fiber).pipe(
+        Effect.timeoutOption(consumeAcquireBackstop),
+        Effect.onInterrupt(() => abandon(fiber)),
       )
+      if (Option.isNone(waited) && (yield* abandon(fiber))) return { kind: "backstop" as const }
+      const exit = Option.isSome(waited) ? waited.value : yield* Fiber.await(fiber)
+      if (Exit.isSuccess(exit)) return { kind: "consumed" as const, seen: exit.value }
+      if (!state.began && sqliteLockMessage(Cause.squash(exit.cause)) !== undefined) return { kind: "locked" as const }
+      return yield* Effect.failCause(exit.cause).pipe(Effect.orDie)
     })
 
     const park = (sessionID: SessionID, seen?: number) =>
