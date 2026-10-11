@@ -8,6 +8,8 @@ import { Database } from "./database/database"
 import { TransactionPurpose } from "@opencode-ai/effect-drizzle-sqlite"
 import { FailureOrigin } from "./observability/failure-origin"
 import { EventRetentionTable, EventSequenceTable, EventTable } from "./event/sql"
+import { EventWriter } from "./event/writer"
+import { EventAggregateWriterTable } from "./event/writer.sql"
 import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
 import { isDeepStrictEqual } from "node:util"
@@ -464,6 +466,7 @@ export const layerWith = (options?: LayerOptions) =>
                             ])
                             .run()
                             .pipe(Effect.orDie)
+                          yield* EventWriter.recordAppend(db, aggregateID)
                           return { aggregateID, seq }
                         }),
                       { behavior: "immediate" },
@@ -655,6 +658,10 @@ export const layerWith = (options?: LayerOptions) =>
             Effect.gen(function* () {
               yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).run()
               yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
+              yield* db
+                .delete(EventAggregateWriterTable)
+                .where(eq(EventAggregateWriterTable.aggregate_id, aggregateID))
+                .run()
             }),
           )
           .pipe(Effect.orDie)
