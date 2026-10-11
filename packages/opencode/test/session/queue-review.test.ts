@@ -87,12 +87,16 @@ const gated = (sessionID: SessionID, delivery: SessionQueue.Delivery, written: s
     const queue = yield* SessionQueue.Service
     const preparing = yield* Deferred.make<void>()
     const gate = yield* Deferred.make<void>()
+    const prepared: string[] = []
     const fiber = yield* queue
       .promote({
         sessionID,
         delivery,
         prepare: (input) =>
-          Deferred.isDone(preparing).pipe(
+          Effect.sync(() =>
+            prepared.push(input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")),
+          ).pipe(
+            Effect.andThen(Deferred.isDone(preparing)),
             Effect.flatMap((again) =>
               again ? Effect.void : Deferred.succeed(preparing, undefined).pipe(Effect.andThen(Deferred.await(gate))),
             ),
@@ -107,6 +111,7 @@ const gated = (sessionID: SessionID, delivery: SessionQueue.Delivery, written: s
       .pipe(Effect.forkChild)
     yield* awaitWithTimeout(Deferred.await(preparing), "the gated promotion never began preparing")
     return {
+      prepared,
       // Lets the gated preparation finish, and waits for its promotion to return.
       finish: Deferred.succeed(gate, undefined).pipe(
         Effect.andThen(awaitWithTimeout(Fiber.join(fiber), "the gated promotion never returned")),
@@ -115,7 +120,7 @@ const gated = (sessionID: SessionID, delivery: SessionQueue.Delivery, written: s
   })
 
 it.instance(
-  "a promotion prepared before a reorder never commits out of the new order, held or closed",
+  "a promotion prepared before a hold or a reorder never commits its stale reservation",
   () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
@@ -134,44 +139,56 @@ it.instance(
       yield* promoter(closed.id, closedWritten)("queue")
       expect(closedWritten).toEqual(["admitted second", "admitted first"])
 
-      // Reordered while held, the preparation ending before the release.
-      const held = yield* sessions.create({ title: "reorder, held through the preparation" })
-      const heldWritten: string[] = []
-      const one = yield* admit(held.id, "queue", "admitted first")
-      const two = yield* admit(held.id, "queue", "admitted second")
-      const holding = yield* gated(held.id, "queue", heldWritten)
-      yield* queue.hold(held.id, "view")
-      yield* queue.reorder(held.id, [two.id, one.id])
+      // Reordered with no review open at all.
+      const unheld = yield* sessions.create({ title: "reorder, no review open" })
+      const unheldWritten: string[] = []
+      const one = yield* admit(unheld.id, "queue", "admitted first")
+      const two = yield* admit(unheld.id, "queue", "admitted second")
+      const reordering = yield* gated(unheld.id, "queue", unheldWritten)
+      yield* queue.reorder(unheld.id, [two.id, one.id])
+      yield* reordering.finish
+      yield* promoter(unheld.id, unheldWritten)("queue")
+      expect(unheldWritten).toEqual(["admitted second", "admitted first"])
+
+      // Held and closed with nothing changed: the preparation that began before
+      // the hold is refused all the same, and the item prepared again.
+      const untouched = yield* sessions.create({ title: "held and closed, nothing changed" })
+      const untouchedWritten: string[] = []
+      yield* admit(untouched.id, "queue", "admitted first")
+      const holding = yield* gated(untouched.id, "queue", untouchedWritten)
+      yield* queue.hold(untouched.id, "view")
+      yield* queue.release(untouched.id, "view")
       yield* holding.finish
-      expect(heldWritten).toEqual([])
-      yield* queue.release(held.id, "view")
-      yield* promoter(held.id, heldWritten)("queue")
-      yield* promoter(held.id, heldWritten)("queue")
-      expect(heldWritten).toEqual(["admitted second", "admitted first"])
+      expect(holding.prepared).toEqual(["admitted first", "admitted first"])
+      expect(untouchedWritten).toEqual(["admitted first"])
     }),
   30_000,
 )
 
 it.instance(
-  "a duplicate being prepared when the review consolidates is delivered once, in either category",
+  "a duplicate being prepared when the queue is consolidated is delivered once, in either category, held or not",
   () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const queue = yield* SessionQueue.Service
-      yield* Effect.forEach(["steer", "queue"] as const, (delivery) =>
+      const cases = (["steer", "queue"] as const).flatMap((delivery) => [
+        { delivery, held: true },
+        { delivery, held: false },
+      ])
+      yield* Effect.forEach(cases, ({ delivery, held }) =>
         Effect.gen(function* () {
-          const session = yield* sessions.create({ title: `consolidate a ${delivery} in preparation` })
+          const session = yield* sessions.create({ title: `consolidate a ${delivery} in preparation, held ${held}` })
           const written: string[] = []
           yield* admit(session.id, delivery, "the same instruction")
           yield* admit(session.id, delivery, "the same instruction")
           yield* admit(session.id, delivery, "another instruction")
           const racing = yield* gated(session.id, delivery, written)
-          yield* queue.hold(session.id, "view")
+          if (held) yield* queue.hold(session.id, "view")
           expect((yield* queue.consolidate(session.id)).map(text)).toEqual([
             "the same instruction",
             "another instruction",
           ])
-          yield* queue.release(session.id, "view")
+          if (held) yield* queue.release(session.id, "view")
           yield* racing.finish
           yield* promoter(session.id, written)(delivery)
           yield* promoter(session.id, written)(delivery)
