@@ -21,6 +21,13 @@ export const UnknownError = Schema.Struct({
   message: Schema.String,
 }).annotate({ identifier: "Session.Error.Unknown" })
 
+export interface AssistantError extends Schema.Schema.Type<typeof AssistantError> {}
+export const AssistantError = Schema.Struct({
+  type: Schema.Literal("unknown"),
+  message: Schema.String,
+  origin: Schema.Literal("runner-interruption").pipe(optional),
+}).annotate({ identifier: "Session.Message.AssistantError" })
+
 const Base = {
   id: ID,
   metadata: Schema.Record(Schema.String, Schema.Unknown).pipe(optional),
@@ -181,7 +188,7 @@ export const Assistant = Schema.Struct({
     reasoning: Schema.Finite,
     cache: Schema.Struct({ read: Schema.Finite, write: Schema.Finite }),
   }).pipe(optional),
-  error: UnknownError.pipe(optional),
+  error: AssistantError.pipe(optional),
   time: Schema.Struct({
     created: DateTimeUtcFromMillis,
     completed: DateTimeUtcFromMillis.pipe(optional),

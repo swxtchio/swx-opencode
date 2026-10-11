@@ -1,11 +1,12 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { afterEach, describe, expect } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer, Queue, Stream, Tracer } from "effect"
+import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer, Queue, Schema, Stream, Tracer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
+import { Sse } from "effect/unstable/encoding"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -34,7 +35,10 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { EventTable } from "@opencode-ai/core/event/sql"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionEvent } from "@opencode-ai/core/session/event"
+import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { ProviderTurnInterruptedMessage, ProviderTurnInterruptedOrigin } from "@opencode-ai/core/session/error"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import * as DateTime from "effect/DateTime"
@@ -257,6 +261,123 @@ function requestJson<T>(path: string, init?: RequestInit) {
   return request(path, init).pipe(Effect.flatMap(json<T>))
 }
 
+function createNativeSession(directory: string, id?: SessionV2.ID) {
+  return requestJson<{ data: SessionV2.Info }>("/api/session", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ id, model: { id: "test-model", providerID: "test" }, location: { directory } }),
+  }).pipe(Effect.map(({ data }) => data))
+}
+
+const writeNativeTestProvider = (directory: string, url: string) =>
+  Effect.promise(() =>
+    Bun.write(
+      path.join(directory, "opencode.json"),
+      JSON.stringify({
+        model: "test/test-model",
+        providers: {
+          test: {
+            name: "Test",
+            api: { type: "aisdk", package: "@ai-sdk/openai-compatible", url, settings: {} },
+            request: { body: { apiKey: "test-key" } },
+            models: {
+              "test-model": {
+                name: "Test Model",
+                api: { id: "test-model" },
+                capabilities: { tools: true, input: ["text"], output: ["text"] },
+                limit: { context: 100_000, output: 10_000 },
+                cost: { input: 0, output: 0 },
+              },
+            },
+          },
+        },
+        permissions: [{ action: "read", resource: "*", effect: "allow" }],
+      }),
+    ),
+  ).pipe(Effect.asVoid)
+
+const awaitNativeModel = (directory: string) =>
+  pollWithTimeout(
+    requestJson<{ data: Array<{ id: string; providerID: string }> }>("/api/model", {
+      headers: { "x-opencode-directory": directory },
+    }).pipe(Effect.map(({ data }) => data.find((model) => model.providerID === "test" && model.id === "test-model"))),
+    "the configured V2 model did not become available",
+    "10 seconds",
+  )
+
+const decodeNativeSessionEvents = <E>(bytes: Stream.Stream<Uint8Array, E>) =>
+  bytes.pipe(
+    Stream.decodeText(),
+    Stream.pipeThroughChannel(Sse.decode()),
+    Stream.catchTag("Retry", () => Stream.empty),
+    Stream.filter((event) => event.data.length > 0),
+    Stream.map((event) =>
+      Schema.decodeUnknownSync(SessionEvent.Durable)(
+        Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(event.data),
+      ),
+    ),
+  )
+
+const openNativeSessionEvents = (sessionID: SessionV2.ID, after: number, headers?: RequestInit["headers"]) =>
+  Effect.gen(function* () {
+    const response = yield* request(`/api/session/${sessionID}/event?after=${after}`, { headers })
+    if (response.status !== 200)
+      return yield* Effect.fail(new Error(`Session event stream returned ${response.status}`))
+    const events = yield* Queue.unbounded<SessionEvent.DurableEvent>()
+    const fiber = yield* decodeNativeSessionEvents(response.stream).pipe(
+      Stream.runForEach((event) => Queue.offer(events, event).pipe(Effect.asVoid)),
+      Effect.forkScoped,
+    )
+    return { events, fiber, response }
+  })
+
+test("decodes native SSE frames independent of transport chunking", async () => {
+  const sessionID = SessionV2.ID.make("ses_sse_decoder")
+  const event = (seq: number) =>
+    SessionEvent.ContextUpdated.make({
+      id: EventV2.ID.create(),
+      type: SessionEvent.ContextUpdated.type,
+      durable: { aggregateID: sessionID, seq, version: 1 },
+      data: {
+        sessionID,
+        timestamp: DateTime.makeUnsafe(seq),
+        messageID: SessionMessage.ID.create(),
+        text: "Résumé 🐈",
+      },
+    })
+  const first = event(1)
+  const second = event(2)
+  const encoder = new TextEncoder()
+  const frame = (value: SessionEvent.DurableEvent) =>
+    `data: ${JSON.stringify(Schema.encodeUnknownSync(SessionEvent.Durable)(value))}\r\n\r\n`
+  const firstFrame = frame(first)
+  const secondFrame = frame(second)
+  const summary = (events: ReadonlyArray<SessionEvent.DurableEvent>) =>
+    events.map((value) => {
+      if (value.type !== SessionEvent.ContextUpdated.type) throw new Error(`Unexpected event type: ${value.type}`)
+      return { id: value.id, type: value.type, seq: value.durable?.seq, text: value.data.text }
+    })
+  const collect = (chunks: ReadonlyArray<Uint8Array>) =>
+    Effect.runPromise(
+      decodeNativeSessionEvents(Stream.fromIterable(chunks)).pipe(
+        Stream.runCollect,
+        Effect.map((events) => Array.from(events)),
+      ),
+    )
+  const firstExpected = summary([first])
+
+  const firstBytes = encoder.encode(firstFrame)
+  const splitAfterTwo = await collect([firstBytes.slice(0, 2), firstBytes.slice(2)])
+  expect(summary(splitAfterTwo)).toEqual(firstExpected)
+
+  const bytewiseEvents = await collect(
+    Array.from({ length: firstBytes.length }, (_, index) => firstBytes.slice(index, index + 1)),
+  )
+  expect(summary(bytewiseEvents)).toEqual(firstExpected)
+
+  expect(summary(await collect([encoder.encode(firstFrame + secondFrame)]))).toEqual(summary([first, second]))
+})
+
 afterEach(async () => {
   Flag.OPENCODE_EXPERIMENTAL_WORKSPACES = originalWorkspaces
   await disposeAllInstances()
@@ -417,43 +538,46 @@ describe("session HttpApi", () => {
     { git: true, config: { formatter: false, lsp: false } },
   )
 
-  it.live("uses the persisted session directory for prompt requests", () =>
-    Effect.gen(function* () {
-      const llm = yield* TestLLMServer
-      yield* llm.text("ok", { usage: { input: 1, output: 1 } })
+  it.live(
+    "uses the persisted session directory for prompt requests",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.text("ok", { usage: { input: 1, output: 1 } })
 
-      const config = testProviderConfig(llm.url)
-      const sessionDirectory = yield* tmpdirScoped({ git: true, config })
-      const requestDirectory = yield* tmpdirScoped({ git: true, config })
-      const session = yield* createSession({ title: "directory regression" }).pipe(
-        provideInstanceEffect(sessionDirectory),
-      )
+        const config = testProviderConfig(llm.url)
+        const sessionDirectory = yield* tmpdirScoped({ git: true, config })
+        const requestDirectory = yield* tmpdirScoped({ git: true, config })
+        const session = yield* createSession({ title: "directory regression" }).pipe(
+          provideInstanceEffect(sessionDirectory),
+        )
 
-      const response = yield* request(
-        `${pathFor(SessionPaths.prompt, { sessionID: session.id })}?directory=${encodeURIComponent(requestDirectory)}`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            agent: "build",
-            model: { providerID: "test", modelID: "test-model" },
-            parts: [{ type: "text", text: "which directory?" }],
-          }),
-        },
-      )
+        const response = yield* request(
+          `${pathFor(SessionPaths.prompt, { sessionID: session.id })}?directory=${encodeURIComponent(requestDirectory)}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "which directory?" }],
+            }),
+          },
+        )
 
-      expect(response.status).toBe(200)
-      yield* responseJson(response)
+        expect(response.status).toBe(200)
+        yield* responseJson(response)
 
-      const messages = yield* Session.use
-        .messages({ sessionID: session.id })
-        .pipe(provideInstanceEffect(sessionDirectory), Effect.orDie)
-      const assistant = messages.find((message) => message.info.role === "assistant")
-      expect(assistant?.info.role === "assistant" ? assistant.info.path : undefined).toEqual({
-        cwd: sessionDirectory,
-        root: sessionDirectory,
-      })
-    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+        const messages = yield* Session.use
+          .messages({ sessionID: session.id })
+          .pipe(provideInstanceEffect(sessionDirectory), Effect.orDie)
+        const assistant = messages.find((message) => message.info.role === "assistant")
+        expect(assistant?.info.role === "assistant" ? assistant.info.path : undefined).toEqual({
+          cwd: sessionDirectory,
+          root: sessionDirectory,
+        })
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
   )
 
   it.live(
@@ -779,14 +903,19 @@ describe("session HttpApi", () => {
   )
 
   it.instance(
-    "returns v2 public unavailable errors for unfinished session mutations",
+    "returns completed native wait results with explicit and persisted caller directories",
     () =>
       Effect.gen(function* () {
-        const test = yield* TestInstance
-        const headers = { "x-opencode-directory": test.directory }
-        const session = yield* createSession({ title: "v2 unavailable" })
-
-        const compact = yield* request(`/api/session/${session.id}/compact`, { method: "POST", headers })
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({
+          git: true,
+          init: (directory) => writeNativeTestProvider(directory, llm.url),
+        })
+        const legacy = yield* createSession({ title: "v2 compact unavailable" })
+        const compact = yield* request(`/api/session/${legacy.id}/compact`, {
+          method: "POST",
+          headers: { "x-opencode-directory": directory },
+        })
         expect(compact.status).toBe(503)
         expect(yield* responseJson(compact)).toEqual({
           _tag: "ServiceUnavailableError",
@@ -794,15 +923,363 @@ describe("session HttpApi", () => {
           service: "session.compact",
         })
 
-        const wait = yield* request(`/api/session/${session.id}/wait`, { method: "POST", headers })
-        expect(wait.status).toBe(503)
-        expect(yield* responseJson(wait)).toEqual({
-          _tag: "ServiceUnavailableError",
-          message: "Session wait is not available yet",
-          service: "session.wait",
+        for (const [index, includeDirectory] of [true, false].entries()) {
+          const id = SessionV2.ID.make(includeDirectory ? "ses_wait_explicit" : "ses_wait_persisted")
+          const session = yield* createNativeSession(directory, id)
+          yield* awaitNativeModel(directory)
+          const directoryHeader: Record<string, string> = includeDirectory ? { "x-opencode-directory": directory } : {}
+          const idleResponse = yield* request(`/api/session/${session.id}/wait`, {
+            method: "POST",
+            headers: directoryHeader,
+          })
+          expect(idleResponse.status).toBe(200)
+          expect(yield* json<{ data: SessionV2.WaitResult }>(idleResponse)).toEqual({ data: { type: "idle" } })
+          yield* llm.text(`Answer for ${id}`)
+          const headers = { ...directoryHeader, "content-type": "application/json" }
+          const admission = yield* requestJson<{ data: { id: string; admittedSeq: number } }>(
+            `/api/session/${session.id}/prompt`,
+            {
+              method: "POST",
+              headers,
+              body: JSON.stringify({ prompt: { text: `Prompt for ${id}` } }),
+            },
+          )
+          yield* awaitWithTimeout(llm.wait(index + 1), `provider did not start for ${id}`, "10 seconds")
+
+          const wait = yield* request(`/api/session/${session.id}/wait`, {
+            method: "POST",
+            headers: directoryHeader,
+          })
+          expect(wait.status).toBe(200)
+          const outcome = yield* json<{ data: SessionV2.WaitResult }>(wait)
+          expect(outcome.data).toMatchObject({ type: "completed", admittedSeq: admission.data.admittedSeq })
+          if (outcome.data.type !== "completed") throw new Error(`Expected completed wait for ${id}`)
+          const completed = outcome.data
+
+          const messages = yield* requestJson<{ data: SessionMessage.Message[] }>(
+            `/api/session/${session.id}/message`,
+            { headers: directoryHeader },
+          )
+          const user = messages.data.find((message) => message.id === admission.data.id)
+          const assistant = messages.data.find((message) => message.id === completed.assistantMessageID)
+          if (assistant === undefined) throw new Error(`Wait assistant was not projected for ${id}`)
+          const single = yield* requestJson<{ data: SessionMessage.Message }>(
+            `/api/session/${session.id}/message/${completed.assistantMessageID}`,
+            { headers: directoryHeader },
+          )
+          const history = yield* requestJson<{ data: SessionEvent.DurableEvent[]; hasMore: boolean }>(
+            `/api/session/${session.id}/history?limit=100`,
+            { headers: directoryHeader },
+          )
+
+          expect(user).toMatchObject({ id: admission.data.id, type: "user", text: `Prompt for ${id}` })
+          expect(assistant).toMatchObject({ id: outcome.data.assistantMessageID, type: "assistant" })
+          expect(single.data).toEqual(assistant)
+          expect(history.hasMore).toBe(false)
+          expect(history.data.map((event) => event.type)).toContain(SessionEvent.Step.Ended.type)
+          const providerCalls = yield* llm.calls
+          expect(providerCalls).toBe(index + 1)
+        }
+        expect(yield* llm.calls).toBe(2)
+      }).pipe(Effect.provide(TestLLMServer.layer)),
+    { git: true, config: { formatter: false, lsp: false } },
+    30_000,
+  )
+
+  it.instance(
+    "returns pending for native admit-only work",
+    () =>
+      Effect.gen(function* () {
+        const directory = yield* tmpdirScoped({ git: true })
+        const sessionID = SessionV2.ID.make("ses_wait_pending")
+        const session = yield* createNativeSession(directory, sessionID)
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const admission = yield* requestJson<{ data: { id: string; admittedSeq: number } }>(
+          `/api/session/${session.id}/prompt`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ prompt: { text: "Admit without resuming" }, resume: false }),
+          },
+        )
+
+        const pending = yield* request(`/api/session/${session.id}/wait`, { method: "POST", headers })
+        expect(pending.status).toBe(200)
+        expect(yield* json<{ data: SessionV2.WaitResult }>(pending)).toMatchObject({
+          data: { type: "pending", admittedSeq: admission.data.admittedSeq, messageID: admission.data.id },
         })
       }),
     { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "resumes terminal tool and assistant events after an HTTP disconnect",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({
+          git: true,
+          init: (directory) =>
+            writeNativeTestProvider(directory, llm.url).pipe(
+              Effect.andThen(
+                Effect.promise(() => Bun.write(path.join(directory, "cursor.txt"), "terminal tool payload")).pipe(
+                  Effect.asVoid,
+                ),
+              ),
+            ),
+        })
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        yield* awaitNativeModel(directory)
+        let releaseFinal = () => {}
+        const finalGate = new Promise<void>((resolve) => {
+          releaseFinal = resolve
+        })
+        yield* Effect.addFinalizer(() => Effect.sync(releaseFinal))
+        const session = yield* createNativeSession(directory, SessionV2.ID.make("ses_wait_cursor_http"))
+        const { db } = yield* Database.Service
+        const initialCursor = yield* EventV2.latestSequence(db, session.id)
+        yield* llm.tool("read", { path: "cursor.txt" })
+        yield* llm.hold("Final answer", finalGate)
+        const admission = yield* requestJson<{ data: { id: string; admittedSeq: number } }>(
+          `/api/session/${session.id}/prompt`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ prompt: { text: "Run and reconnect" } }),
+          },
+        )
+        yield* awaitWithTimeout(llm.wait(1), "tool provider request never started", "10 seconds")
+        const live = yield* openNativeSessionEvents(session.id, initialCursor, headers)
+        const waitResponse = yield* Deferred.make<HttpClientResponse.HttpClientResponse>()
+        const waiter = yield* request(`/api/session/${session.id}/wait`, { method: "POST", headers }).pipe(
+          Effect.tap((response) => Deferred.succeed(waitResponse, response)),
+          Effect.forkScoped,
+        )
+        yield* Effect.yieldNow
+        expect(yield* Deferred.isDone(waitResponse)).toBe(false)
+
+        const consumed: SessionEvent.DurableEvent[] = []
+        let consumedTool: SessionEvent.Tool.Success | undefined
+        while (consumedTool === undefined) {
+          const event = yield* Queue.take(live.events).pipe(
+            Effect.timeoutOrElse({
+              duration: "10 seconds",
+              orElse: () => Effect.fail(new Error("timed out waiting for the terminal tool event")),
+            }),
+          )
+          consumed.push(event)
+          if (event.type === SessionEvent.Tool.Success.type) consumedTool = event
+        }
+        if (consumedTool.durable === undefined) throw new Error("Consumed terminal tool event had no cursor")
+        const toolCursor = consumedTool.durable.seq
+        yield* awaitWithTimeout(llm.wait(2), "final provider request never started", "10 seconds")
+        expect(yield* Deferred.isDone(waitResponse)).toBe(false)
+        yield* Fiber.interrupt(live.fiber)
+        yield* Effect.sync(releaseFinal)
+
+        const completedResponse = yield* awaitWithTimeout(
+          Deferred.await(waitResponse),
+          "HTTP wait did not return after assistant publication",
+          "10 seconds",
+        )
+        expect(completedResponse.status).toBe(200)
+        const completed = yield* json<{ data: SessionV2.WaitResult }>(completedResponse)
+        expect(completed.data).toMatchObject({ type: "completed", admittedSeq: admission.data.admittedSeq })
+        if (completed.data.type !== "completed") throw new Error("Expected completed HTTP wait")
+        yield* Fiber.join(waiter)
+
+        const allHistory = yield* requestJson<{ data: SessionEvent.DurableEvent[]; hasMore: boolean }>(
+          `/api/session/${session.id}/history?limit=100`,
+          { headers },
+        )
+        const resumedHistory = yield* requestJson<{ data: SessionEvent.DurableEvent[]; hasMore: boolean }>(
+          `/api/session/${session.id}/history?after=${toolCursor}&limit=100`,
+          { headers },
+        )
+        const resumed = yield* openNativeSessionEvents(session.id, toolCursor, headers)
+        const resumedEvents: SessionEvent.DurableEvent[] = []
+        for (let index = 0; index < resumedHistory.data.length; index++)
+          resumedEvents.push(
+            yield* Queue.take(resumed.events).pipe(
+              Effect.timeoutOrElse({
+                duration: "10 seconds",
+                orElse: () => Effect.fail(new Error("timed out resuming native Session events")),
+              }),
+            ),
+          )
+        yield* Fiber.interrupt(resumed.fiber)
+
+        expect(allHistory.hasMore).toBe(false)
+        expect(allHistory.data.find((event) => event.id === consumedTool.id)?.durable?.seq).toBe(toolCursor)
+        const consumedPrefix = allHistory.data.filter(
+          (event) => event.durable !== undefined && event.durable.seq <= toolCursor,
+        )
+        expect(consumed.map((event) => [event.id, event.durable?.seq])).toEqual(
+          consumedPrefix.map((event) => [event.id, event.durable?.seq]),
+        )
+        expect(resumedHistory.hasMore).toBe(false)
+        expect(resumedEvents.map((event) => [event.id, event.durable?.seq])).toEqual(
+          resumedHistory.data.map((event) => [event.id, event.durable?.seq]),
+        )
+        expect(new Set(resumedEvents.map((event) => event.id)).size).toBe(resumedEvents.length)
+        expect(resumedEvents.map((event) => event.id)).not.toContain(consumedTool.id)
+        expect(
+          resumedEvents.some((event) => event.type === SessionEvent.Step.Ended.type && event.data.finish === "stop"),
+        ).toBe(true)
+        expect(consumed.map((event) => event.id)).toContain(consumedTool.id)
+        const allObserved = [...consumed, ...resumedEvents]
+        expect(allObserved.map((event) => event.id)).toEqual(allHistory.data.map((event) => event.id))
+        expect(new Set(allObserved.map((event) => event.id)).size).toBe(allObserved.length)
+        const providerCalls = yield* llm.calls
+        expect(providerCalls).toBe(2)
+      }).pipe(Effect.provide(TestLLMServer.layer)),
+    { git: true, config: { formatter: false, lsp: false } },
+    60_000,
+  )
+
+  it.instance(
+    "returns a failed terminal-tool outcome through native HTTP wait",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({
+          git: true,
+          init: (directory) => writeNativeTestProvider(directory, llm.url),
+        })
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        yield* awaitNativeModel(directory)
+
+        const failedSession = yield* createNativeSession(directory, SessionV2.ID.make("ses_wait_failed_http"))
+        yield* llm.tool("missing", {})
+        yield* llm.text("Handled the missing tool")
+        const failedAdmission = yield* requestJson<{ data: { admittedSeq: number } }>(
+          `/api/session/${failedSession.id}/prompt`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ prompt: { text: "Fail the provider turn" } }),
+          },
+        )
+        yield* awaitWithTimeout(llm.wait(1), "failed tool provider request never started", "10 seconds")
+        yield* awaitWithTimeout(llm.wait(2), "failure handling continuation never started", "10 seconds")
+        const failedResponse = yield* request(`/api/session/${failedSession.id}/wait`, {
+          method: "POST",
+          headers,
+        })
+        expect(failedResponse.status).toBe(200)
+        const failed = yield* json<{ data: SessionV2.WaitResult }>(failedResponse)
+        expect(failed.data).toMatchObject({ type: "failed", admittedSeq: failedAdmission.data.admittedSeq })
+        const failedMessages = yield* requestJson<{ data: SessionMessage.Message[] }>(
+          `/api/session/${failedSession.id}/message`,
+          { headers },
+        )
+        const failedTool = failedMessages.data
+          .filter((message): message is SessionMessage.Assistant => message.type === "assistant")
+          .flatMap((message) => message.content)
+          .find((content) => content.type === "tool" && content.state.status === "error")
+        expect(failedTool).toBeDefined()
+        const failedHistory = yield* requestJson<{ data: SessionEvent.DurableEvent[] }>(
+          `/api/session/${failedSession.id}/history?limit=100`,
+          { headers },
+        )
+        expect(failedHistory.data.map((event) => event.type)).toContain(SessionEvent.Tool.Failed.type)
+        const providerCalls = yield* llm.calls
+        expect(providerCalls).toBe(2)
+      }).pipe(Effect.provide(TestLLMServer.layer)),
+    { git: true, config: { formatter: false, lsp: false } },
+    30_000,
+  )
+
+  it.instance(
+    "returns an interrupted native wait after publishing terminal tool cleanup",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({
+          git: true,
+          init: (directory) => writeNativeTestProvider(directory, llm.url),
+        })
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        yield* awaitNativeModel(directory)
+        const interruptedSession = yield* createNativeSession(directory, SessionV2.ID.make("ses_wait_interrupted_http"))
+        yield* llm.toolHang("read", { path: "cursor.txt" })
+        const interruptedAdmission = yield* requestJson<{ data: { admittedSeq: number } }>(
+          `/api/session/${interruptedSession.id}/prompt`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ prompt: { text: "Interrupt the provider turn" } }),
+          },
+        )
+        yield* awaitWithTimeout(llm.wait(1), "held provider request never started", "10 seconds")
+        const partial = yield* pollWithTimeout(
+          requestJson<{ data: SessionMessage.Message[] }>(`/api/session/${interruptedSession.id}/message`, {
+            headers,
+          }).pipe(
+            Effect.map(({ data }) =>
+              data.find(
+                (message) => message.type === "assistant" && message.content.some((content) => content.type === "tool"),
+              ),
+            ),
+          ),
+          "held provider turn did not publish its tool projection",
+          "10 seconds",
+        )
+        expect(partial?.type).toBe("assistant")
+        if (partial?.type !== "assistant") throw new Error("Expected a projected assistant while the provider is held")
+        expect(partial.time.completed).toBeUndefined()
+        expect(partial.content.some((content) => content.type === "tool" && content.state.status === "pending")).toBe(
+          true,
+        )
+        const waitResponse = yield* Deferred.make<HttpClientResponse.HttpClientResponse>()
+        const waiting = yield* request(`/api/session/${interruptedSession.id}/wait`, {
+          method: "POST",
+          headers,
+        }).pipe(
+          Effect.tap((response) => Deferred.succeed(waitResponse, response)),
+          Effect.forkChild,
+        )
+        yield* Effect.yieldNow
+        expect(yield* Deferred.isDone(waitResponse)).toBe(false)
+        const interruptExit = yield* request(`/api/session/${interruptedSession.id}/interrupt`, {
+          method: "POST",
+          headers,
+        }).pipe(Effect.exit)
+        if (Exit.isFailure(interruptExit)) return yield* Effect.failCause(interruptExit.cause)
+        const interrupt = interruptExit.value
+        expect(interrupt.status).toBe(204)
+        const interruptedResponse = yield* awaitWithTimeout(
+          Deferred.await(waitResponse),
+          "wait did not settle after interruption",
+          "10 seconds",
+        )
+        expect(interruptedResponse.status).toBe(200)
+        const interrupted = yield* json<{ data: SessionV2.WaitResult }>(interruptedResponse)
+        expect(interrupted.data).toMatchObject({
+          type: "interrupted",
+          admittedSeq: interruptedAdmission.data.admittedSeq,
+        })
+        const interruptedMessages = yield* requestJson<{ data: SessionMessage.Message[] }>(
+          `/api/session/${interruptedSession.id}/message`,
+          { headers },
+        )
+        const interruptedAssistant = interruptedMessages.data.find((message) => message.type === "assistant")
+        expect(interruptedAssistant).toMatchObject({
+          type: "assistant",
+          finish: "error",
+          error: { message: ProviderTurnInterruptedMessage, origin: ProviderTurnInterruptedOrigin },
+        })
+        const interruptedHistory = yield* requestJson<{ data: SessionEvent.DurableEvent[] }>(
+          `/api/session/${interruptedSession.id}/history?limit=100`,
+          { headers },
+        )
+        expect(interruptedHistory.data.map((event) => event.type)).toContain(SessionEvent.Tool.Failed.type)
+        const providerCalls = yield* llm.calls
+        expect(providerCalls).toBe(1)
+        yield* Fiber.join(waiting)
+      }).pipe(Effect.provide(TestLLMServer.layer)),
+    { git: true, config: { formatter: false, lsp: false } },
+    30_000,
   )
 
   it.instance(
@@ -816,6 +1293,14 @@ describe("session HttpApi", () => {
         const currentSequence = yield* EventV2.latestSequence(db, session.id)
         yield* applyRetentionFixture(session.id)
         const headers = { "x-opencode-directory": test.directory }
+
+        const wait = yield* request(`/api/session/${session.id}/wait`, { method: "POST", headers })
+        expect(wait.status).toBe(503)
+        expect(yield* responseJson(wait)).toMatchObject({
+          _tag: "ServiceUnavailableError",
+          message: "Session wait outcome is not observable",
+          service: "session.wait",
+        })
 
         const history = yield* request(`/api/session/${session.id}/history?after=0&limit=10`, { headers })
         expect(history.status).not.toBe(200)

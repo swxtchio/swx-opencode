@@ -219,6 +219,7 @@ const publish = Effect.fn("SessionInput.publish")(function* (
   events: EventV2.Interface,
   sessionID: SessionSchema.ID,
   rows: ReadonlyArray<typeof SessionInputTable.$inferSelect>,
+  continuation = false,
 ) {
   for (const row of rows) {
     const id = SessionMessage.ID.make(row.id)
@@ -229,6 +230,7 @@ const publish = Effect.fn("SessionInput.publish")(function* (
         messageID: id,
         prompt: decodePrompt(row.prompt),
         delivery: row.delivery,
+        ...(continuation ? { continuation: true as const } : {}),
       })
       .pipe(
         Effect.catchDefect((defect) =>
@@ -248,6 +250,7 @@ export const promoteSteers = Effect.fn("SessionInput.promoteSteers")(function* (
   events: EventV2.Interface,
   sessionID: SessionSchema.ID,
   cutoff: number,
+  continuation = false,
 ) {
   const rows = yield* db
     .select()
@@ -263,7 +266,7 @@ export const promoteSteers = Effect.fn("SessionInput.promoteSteers")(function* (
     .orderBy(asc(SessionInputTable.admitted_seq))
     .all()
     .pipe(Effect.orDie)
-  return yield* publish(db, events, sessionID, rows)
+  return yield* publish(db, events, sessionID, rows, continuation)
 })
 
 export const promoteNextQueued = Effect.fn("SessionInput.promoteNextQueued")(function* (

@@ -28,6 +28,7 @@ const execution = Layer.succeed(
   SessionExecution.Service,
   SessionExecution.Service.of({
     active: Effect.sync(() => new Set(activeSessions)),
+    join: () => Effect.succeed(undefined),
     resume: (sessionID) =>
       Effect.sync(() => {
         executionCalls.push(sessionID)

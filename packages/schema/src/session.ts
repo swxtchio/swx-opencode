@@ -5,9 +5,10 @@ import { Agent } from "./agent"
 import { Location } from "./location"
 import { Model } from "./model"
 import { Project } from "./project"
-import { DateTimeUtcFromMillis, optional, RelativePath } from "./schema"
+import { DateTimeUtcFromMillis, NonNegativeInt, optional, RelativePath } from "./schema"
 import { SessionEvent } from "./session-event"
 import { SessionID } from "./session-id"
+import { SessionMessage } from "./session-message"
 import { Revert } from "./revert"
 
 export const ID = SessionID
@@ -42,6 +43,29 @@ export const Info = Schema.Struct({
   subpath: RelativePath.pipe(optional),
   revert: Revert.State.pipe(optional),
 }).annotate({ identifier: "SessionV2.Info" })
+
+export type WaitResult = typeof WaitResult.Type
+export const WaitResult = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("idle") }),
+  Schema.Struct({ type: Schema.Literal("pending"), admittedSeq: NonNegativeInt, messageID: SessionMessage.ID }),
+  Schema.Struct({
+    type: Schema.Literal("completed"),
+    admittedSeq: NonNegativeInt,
+    assistantMessageID: SessionMessage.ID,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("failed"),
+    admittedSeq: NonNegativeInt.pipe(optional),
+    assistantMessageID: SessionMessage.ID.pipe(optional),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("interrupted"),
+    admittedSeq: NonNegativeInt.pipe(optional),
+    assistantMessageID: SessionMessage.ID.pipe(optional),
+  }),
+])
+  .pipe(Schema.toTaggedUnion("type"))
+  .annotate({ identifier: "Session.WaitResult" })
 
 export const ListAnchor = Schema.Struct({
   id: ID,

@@ -941,6 +941,7 @@ export type GlobalEvent = {
           messageID: string
           prompt: Prompt
           delivery: "steer" | "queue"
+          continuation?: true
         }
       }
     | {
@@ -1036,7 +1037,7 @@ export type GlobalEvent = {
           timestamp: number
           sessionID: string
           assistantMessageID: string
-          error: SessionErrorUnknown
+          error: SessionMessageAssistantError
         }
       }
     | {
@@ -3151,9 +3152,10 @@ export type PromptAgentAttachment = {
   source?: PromptSource
 }
 
-export type SessionErrorUnknown = {
+export type SessionMessageAssistantError = {
   type: "unknown"
   message: string
+  origin?: "runner-interruption"
 }
 
 export type LlmProviderMetadata = {
@@ -3175,6 +3177,11 @@ export type ToolFileContent = {
 }
 
 export type LlmToolContent = ToolTextContent | ToolFileContent
+
+export type SessionErrorUnknown = {
+  type: "unknown"
+  message: string
+}
 
 export type SessionNextRetryError = {
   message: string
@@ -3449,6 +3456,7 @@ export type SyncEventSessionNextPrompted = {
       messageID: string
       prompt: Prompt
       delivery: "steer" | "queue"
+      continuation?: true
     }
   }
 }
@@ -3600,7 +3608,7 @@ export type SyncEventSessionNextStepFailed = {
       timestamp: number
       sessionID: string
       assistantMessageID: string
-      error: SessionErrorUnknown
+      error: SessionMessageAssistantError
     }
   }
 }
@@ -4032,6 +4040,31 @@ export type SessionInputAdmitted = {
   promotedSeq?: number
 }
 
+export type SessionWaitResult =
+  | {
+      type: "idle"
+    }
+  | {
+      type: "pending"
+      admittedSeq: number
+      messageID: string
+    }
+  | {
+      type: "completed"
+      admittedSeq: number
+      assistantMessageID: string
+    }
+  | {
+      type: "failed"
+      admittedSeq?: number
+      assistantMessageID?: string
+    }
+  | {
+      type: "interrupted"
+      admittedSeq?: number
+      assistantMessageID?: string
+    }
+
 export type SessionMessageAgentSwitched = {
   id: string
   metadata?: {
@@ -4221,7 +4254,7 @@ export type SessionMessageAssistant = {
       write: number
     }
   }
-  error?: SessionErrorUnknown
+  error?: SessionMessageAssistantError
 }
 
 export type SessionMessageCompaction = {
@@ -4326,6 +4359,7 @@ export type SessionNextPrompted = {
     messageID: string
     prompt: Prompt
     delivery: "steer" | "queue"
+    continuation?: true
   }
 }
 
@@ -4501,7 +4535,7 @@ export type SessionNextStepFailed = {
     timestamp: number
     sessionID: string
     assistantMessageID: string
-    error: SessionErrorUnknown
+    error: SessionMessageAssistantError
   }
 }
 
@@ -6394,6 +6428,7 @@ export type EventSessionNextPrompted = {
     messageID: string
     prompt: Prompt
     delivery: "steer" | "queue"
+    continuation?: true
   }
 }
 
@@ -6497,7 +6532,7 @@ export type EventSessionNextStepFailed = {
     timestamp: number
     sessionID: string
     assistantMessageID: string
-    error: SessionErrorUnknown
+    error: SessionMessageAssistantError
   }
 }
 
@@ -11933,9 +11968,11 @@ export type V2SessionWaitError = V2SessionWaitErrors[keyof V2SessionWaitErrors]
 
 export type V2SessionWaitResponses = {
   /**
-   * <No Content>
+   * Success
    */
-  204: void
+  200: {
+    data: SessionWaitResult
+  }
 }
 
 export type V2SessionWaitResponse = V2SessionWaitResponses[keyof V2SessionWaitResponses]
