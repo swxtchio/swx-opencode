@@ -362,6 +362,17 @@ test("dry run names pending, unfinished, workspace-owned, receipt, and unreadabl
     expect(reasons()).toContain("v1-prompt-queue-row-present")
     db.query("DELETE FROM session_prompt_queue").run()
 
+    db.query(
+      "INSERT INTO event_aggregate_writer (aggregate_id, writer_id, time_last_append) VALUES ('ses_old', 'writer-unknown', 10)",
+    ).run()
+    expect(reasons()).toContain("session-writer-unregistered:ses_old")
+    db.query(
+      "INSERT INTO event_writer_process (writer_id, pid, boot_id, start_ticks, time_registered) VALUES ('writer-unknown', ?, NULL, NULL, 10)",
+    ).run(process.pid)
+    expect(reasons()).toContain("session-writer-liveness-unreadable:ses_old")
+    db.query("DELETE FROM event_aggregate_writer").run()
+    db.query("DELETE FROM event_writer_process").run()
+
     db.query("UPDATE event_sequence SET owner_id = 'owner-a' WHERE aggregate_id = 'ses_old'").run()
     expect(reasons()).toContain("session-owned-by-workspace:ses_old")
     db.query("UPDATE event_sequence SET owner_id = NULL WHERE aggregate_id = 'ses_old'").run()
