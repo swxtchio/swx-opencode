@@ -510,6 +510,37 @@ const layer = Layer.effect(
       return undefined
     })
 
+    // Drops every pending row's reservation, so a promotion prepared before a
+    // hold, reorder or consolidation can no longer commit; its loop reserves
+    // again under the new state. A reservation whose message already landed, left
+    // by a stopped process, is finished instead. Under the session lock, in `tx`.
+    const invalidate = Effect.fnUntraced(function* (tx: DatabaseTransaction, sessionID: SessionID) {
+      const reserved = yield* tx
+        .select()
+        .from(SessionPromptQueueTable)
+        .where(and(pending(sessionID), isNotNull(SessionPromptQueueTable.message_id)))
+        .all()
+        .pipe(Effect.orDie)
+      return yield* Effect.forEach(reserved, (row) =>
+        Effect.gen(function* () {
+          const done = yield* landed(tx, row.message_id!)
+          yield* tx
+            .update(SessionPromptQueueTable)
+            .set(done ? { time_promoted: Date.now() } : { message_id: null })
+            .where(eq(SessionPromptQueueTable.id, row.id))
+            .run()
+            .pipe(Effect.orDie)
+          return done ? [{ id: row.id, message: row.message_id! }] : []
+        }),
+      ).pipe(Effect.map((rows) => rows.flat()))
+    })
+
+    const finish = (finished: readonly { readonly id: ItemID; readonly message: MessageID }[]) =>
+      finished.forEach((row) => {
+        const channel = channels.get(row.id)
+        if (channel) channel.message = row.message
+      })
+
     const hold: Interface["hold"] = (sessionID, holder) =>
       exclusive(
         sessionID,
@@ -517,8 +548,12 @@ const layer = Layer.effect(
           const current = (yield* settle(sessionID, "lapsed")) ? holds.get(sessionID) : undefined
           const until = (yield* Clock.currentTimeMillis) + Duration.toMillis(holdLease)
           if (current) current.leases.set(holder, until)
-          if (!current)
+          if (!current) {
             holds.set(sessionID, { leases: new Map([[holder, until]]), ended: yield* Deferred.make<HoldEnd>() })
+            const finished = yield* writable(sessionID, (tx) => invalidate(tx, sessionID)).pipe(Effect.orDie)
+            finish(finished)
+            if (finished.length > 0) yield* publish(sessionID)
+          }
           return { started: !current, items: yield* list(sessionID) }
         }),
       ).pipe(Effect.withSpan("SessionQueue.hold"))
@@ -575,7 +610,8 @@ const layer = Layer.effect(
                 .where(and(pending(sessionID), inArray(SessionPromptQueueTable.id, [...itemIDs])))
                 .all()
                 .pipe(Effect.orDie)
-              if (rows.length !== itemIDs.length || new Set(itemIDs).size !== itemIDs.length) return false
+              if (rows.length !== itemIDs.length || new Set(itemIDs).size !== itemIDs.length) return undefined
+              const finished = yield* invalidate(tx, sessionID)
               const seqs = rows.map((row) => row.seq).toSorted((a, b) => a - b)
               // (session_id, seq) is unique, so every row first moves to a free negative seq.
               yield* Effect.forEach(rows, (row) =>
@@ -594,28 +630,30 @@ const layer = Layer.effect(
                   .run()
                   .pipe(Effect.orDie),
               )
-              return true
+              return finished
             }),
           ).pipe(Effect.orDie)
           if (!reordered) return Option.none()
+          finish(reordered)
           yield* publish(sessionID)
           return Option.some(yield* list(sessionID))
         }),
       )
     })
 
-    // A reserved row's message may already be prepared from its current input, so
-    // consolidation leaves it out.
+    // A promotion being prepared loses its reservation, so its item takes part
+    // like any other and its stale message never lands.
     const consolidate = Effect.fn("SessionQueue.consolidate")(function* (sessionID: SessionID) {
       return yield* exclusive(
         sessionID,
         Effect.gen(function* () {
           const changed = yield* writable(sessionID, (tx) =>
             Effect.gen(function* () {
+              const finished = yield* invalidate(tx, sessionID)
               const rows = yield* tx
                 .select()
                 .from(SessionPromptQueueTable)
-                .where(and(pending(sessionID), isNull(SessionPromptQueueTable.message_id)))
+                .where(pending(sessionID))
                 .orderBy(asc(SessionPromptQueueTable.seq))
                 .all()
                 .pipe(Effect.orDie)
@@ -639,7 +677,8 @@ const layer = Layer.effect(
                   .run()
                   .pipe(Effect.orDie),
               )
-              return plan.removed.length > 0
+              finish(finished)
+              return plan.removed.length > 0 || finished.length > 0
             }),
           ).pipe(Effect.orDie)
           if (changed) yield* publish(sessionID)
@@ -1169,8 +1208,8 @@ function fromRow(row: typeof SessionPromptQueueTable.$inferSelect): Item {
  * share a category, a leading verb (any case) and a target, the next word,
  * merge into the first of them as `<verb> <target>:` and numbered steps in
  * promotion order. A command is a prompt of one plain text part, `<verb>
- * <target> <step>`; a merged command parses back into its own steps, so a later
- * consolidation adds to them. Commands merge only with the same agent, model and
+ * <target> [step]`; a bare `<verb> <target>` is its own step, and a merged
+ * command parses back into its own steps, so a later consolidation adds to them. Commands merge only with the same agent, model and
  * options, which their steps then share.
  */
 export function consolidation(items: readonly Item[]) {
@@ -1185,7 +1224,9 @@ export function consolidation(items: readonly Item[]) {
     kept.flatMap((item) => {
       const command = parseCommand(item.input)
       if (!command) return []
-      const context = withoutUndefined({ ...withoutIDs(item.input), parts: [{ ...item.input.parts[0], text: "" }] })
+      // Built from the normalized input, so message and part IDs never decide similarity.
+      const normalized = withoutIDs(item.input)
+      const context = withoutUndefined({ ...normalized, parts: [{ ...normalized.parts[0], text: "" }] })
       return [
         { item, command, key: JSON.stringify([item.delivery, command.verb.toLowerCase(), command.target, context]) },
       ]
@@ -1216,9 +1257,11 @@ export function consolidation(items: readonly Item[]) {
 function parseCommand(input: SessionPromptQueue.QueuedInput) {
   const part = input.parts[0]
   if (input.parts.length !== 1 || part?.type !== "text" || part.synthetic) return undefined
-  const match = /^\s*(\S+)\s+(\S+?)[:,]?\s+(\S[\s\S]*)$/.exec(part.text)
+  const match = /^\s*(\S+)\s+(\S+?)[:,]?(?:\s+(\S[\s\S]*?))?\s*$/.exec(part.text)
   if (!match) return undefined
-  const rest = match[3]!.trim()
+  // A bare `<verb> <target>` is a step of its own.
+  if (match[3] === undefined) return { verb: match[1]!, target: match[2]!, steps: [`${match[1]} ${match[2]}`] }
+  const rest = match[3].trim()
   const lines = rest.split("\n")
   const numbered = lines.length > 1 && lines.every((line) => /^\d+\.\s+\S/.test(line))
   return {

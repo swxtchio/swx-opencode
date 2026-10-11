@@ -1673,7 +1673,7 @@ const layer = Layer.effect(
       if (idle && (yield* queue.empty(sessionID))) {
         // A review hold keeps even a new session's first prompt pending.
         yield* queue.released(sessionID)
-        const first =(delivery: SessionQueue.Delivery) =>
+        const first = (delivery: SessionQueue.Delivery) =>
           queue.promote({
             sessionID,
             delivery,

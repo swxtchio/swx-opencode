@@ -1,10 +1,12 @@
 import { useKeyboard } from "@opentui/solid"
 import type { SessionPromptQueueItem } from "@opencode-ai/sdk/v2"
-import { createMemo, onCleanup, onMount } from "solid-js"
+import { createMemo, createSignal, onCleanup, onMount } from "solid-js"
+import { reconcile } from "solid-js/store"
 import { useSDK } from "../context/sdk"
 import { useSync } from "../context/sync"
 import { useDialog, type DialogContext } from "../ui/dialog"
 import { DialogSelect } from "../ui/dialog-select"
+import { useToast } from "../ui/toast"
 import { Locale } from "../util/locale"
 
 // The review view of a session's pending prompts (swxtchio/swx-opencode#212).
@@ -16,26 +18,59 @@ export const REVIEW_IDLE_MS = 5 * 60 * 1000
 // The hold is a server lease, renewed on activity at most this often. It runs
 // a minute longer than REVIEW_IDLE_MS, so a renewal always lands in time.
 const RENEW_MS = 30 * 1000
+// No hold or release request waits longer than this for its response.
+const REQUEST_MS = 10 * 1000
 
 export function DialogQueue(props: { sessionID: string }) {
   const dialog = useDialog()
   const sdk = useSDK()
   const sync = useSync()
+  const toast = useToast()
   const holder = `tui_${crypto.randomUUID()}`
   const items = createMemo(() => sync.data.session_queue[props.sessionID] ?? [])
-  // Hold requests and the release go out in order, so a quick close can never
-  // release before the hold it ends has landed.
-  let requests = Promise.resolve()
-  const send = (request: () => Promise<unknown>) => {
-    requests = requests.then(request).then(
-      () => undefined,
-      () => undefined,
-    )
-  }
-  const hold = () => send(() => sdk.client.session.queue.hold({ sessionID: props.sessionID, holder }))
+  // Delivery is paused only once the server confirms the hold.
+  const [hold, setHold] = createSignal<"pending" | "held" | "failed">("pending")
   let closed = false
   let renewed = Date.now()
   let idle: ReturnType<typeof setTimeout> | undefined
+
+  const checked = async <R extends { error?: unknown; response?: Response }>(call: Promise<R>) => {
+    const result = await call
+    if (result.error !== undefined) throw result.error
+    if (result.response && !result.response.ok)
+      throw new Error(`${result.response.status} ${result.response.statusText}`)
+    return result
+  }
+  const failed = (action: string) => (error: unknown) =>
+    toast.show({
+      variant: "error",
+      message: `Could not ${action} the queued prompts: ${error instanceof Error ? error.message : String(error)}`,
+    })
+  const signal = () => AbortSignal.timeout(REQUEST_MS)
+
+  const release = () =>
+    void checked(sdk.client.session.queue.release({ sessionID: props.sessionID, holder }, { signal: signal() })).catch(
+      failed("resume delivery of"),
+    )
+
+  // A close releases at once, and again as each hold request still in flight
+  // settles, so no slow response delays the release and a hold the server
+  // accepts after the close never outlives it.
+  const request = (renewal: boolean) =>
+    void checked(sdk.client.session.queue.hold({ sessionID: props.sessionID, holder }, { signal: signal() }))
+      .then((result) => {
+        if (closed) return
+        setHold("held")
+        if (result.data) sync.set("session_queue", props.sessionID, reconcile(result.data))
+      })
+      .catch((error) => {
+        if (closed) return
+        if (!renewal) setHold("failed")
+        failed(renewal ? "keep pausing delivery of" : "pause delivery of")(error)
+      })
+      .finally(() => {
+        if (closed) release()
+      })
 
   const active = () => {
     if (closed) return
@@ -43,18 +78,18 @@ export function DialogQueue(props: { sessionID: string }) {
     idle = setTimeout(() => dialog.clear(), REVIEW_IDLE_MS)
     if (Date.now() - renewed < RENEW_MS) return
     renewed = Date.now()
-    hold()
+    request(true)
   }
 
   onMount(() => {
     dialog.setSize("large")
-    hold()
+    request(false)
     active()
   })
   onCleanup(() => {
     closed = true
     clearTimeout(idle)
-    send(() => sdk.client.session.queue.release({ sessionID: props.sessionID, holder }))
+    release()
   })
   useKeyboard(active)
 
@@ -68,10 +103,12 @@ export function DialogQueue(props: { sessionID: string }) {
     const order = list.map((item) => item.id)
     order[index] = neighbour.id
     order[index + step] = id
-    void sdk.client.session.queue.reorder({
-      sessionID: props.sessionID,
-      items: order.filter((_, position) => list[position]!.delivery === neighbour.delivery),
-    })
+    void checked(
+      sdk.client.session.queue.reorder({
+        sessionID: props.sessionID,
+        items: order.filter((_, position) => list[position]!.delivery === neighbour.delivery),
+      }),
+    ).catch(failed("reorder"))
   }
 
   const options = createMemo(() =>
@@ -86,49 +123,69 @@ export function DialogQueue(props: { sessionID: string }) {
     }),
   )
 
+  // The list may still change until the hold is confirmed, so it is edited only then.
+  const locked = () => hold() !== "held"
+
+  // Mouse use anywhere on the view, scrolling included, counts as activity.
   return (
-    <DialogSelect
-      title="Queued prompts (delivery paused)"
-      options={options()}
-      renderFilter={false}
-      preserveSelection
-      emptyView={<text>Nothing is waiting</text>}
-      onMove={active}
-      actions={[
-        {
-          command: "dialog.queue.delete",
-          title: "delete",
-          onTrigger: (option) => {
-            active()
-            void sdk.client.session.queue.remove({ sessionID: props.sessionID, id: option.value })
+    <box onMouse={active}>
+      <DialogSelect
+        title={
+          hold() === "held"
+            ? "Queued prompts (delivery paused)"
+            : hold() === "pending"
+              ? "Queued prompts (pausing delivery…)"
+              : "Queued prompts (delivery NOT paused)"
+        }
+        options={options()}
+        renderFilter={false}
+        preserveSelection
+        emptyView={<text>Nothing is waiting</text>}
+        onMove={active}
+        actions={[
+          {
+            command: "dialog.queue.delete",
+            title: "delete",
+            disabled: locked,
+            onTrigger: (option) => {
+              active()
+              void checked(sdk.client.session.queue.remove({ sessionID: props.sessionID, id: option.value })).catch(
+                failed("delete one of"),
+              )
+            },
           },
-        },
-        {
-          command: "dialog.queue.move_up",
-          title: "earlier",
-          onTrigger: (option) => {
-            active()
-            move(option.value, -1)
+          {
+            command: "dialog.queue.move_up",
+            title: "earlier",
+            disabled: locked,
+            onTrigger: (option) => {
+              active()
+              move(option.value, -1)
+            },
           },
-        },
-        {
-          command: "dialog.queue.move_down",
-          title: "later",
-          onTrigger: (option) => {
-            active()
-            move(option.value, 1)
+          {
+            command: "dialog.queue.move_down",
+            title: "later",
+            disabled: locked,
+            onTrigger: (option) => {
+              active()
+              move(option.value, 1)
+            },
           },
-        },
-        {
-          command: "dialog.queue.consolidate",
-          title: "consolidate",
-          onTrigger: () => {
-            active()
-            void sdk.client.session.queue.consolidate({ sessionID: props.sessionID })
+          {
+            command: "dialog.queue.consolidate",
+            title: "consolidate",
+            disabled: locked,
+            onTrigger: () => {
+              active()
+              void checked(sdk.client.session.queue.consolidate({ sessionID: props.sessionID })).catch(
+                failed("consolidate"),
+              )
+            },
           },
-        },
-      ]}
-    />
+        ]}
+      />
+    </box>
   )
 }
 

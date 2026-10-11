@@ -14,7 +14,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
 import { Session } from "@/session/session"
 import { SessionQueue } from "@/session/queue"
-import { SessionID } from "@/session/schema"
+import { MessageID, PartID, SessionID } from "@/session/schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceStore } from "@/project/instance-store"
@@ -79,6 +79,110 @@ const promoter = (sessionID: SessionID, written: string[]) => (delivery: Session
       rejected: () => Effect.void,
     })
   })
+
+// A promotion of `delivery` whose first preparation waits on `gate`; later ones
+// run straight through. `written` receives what the queue lets it commit.
+const gated = (sessionID: SessionID, delivery: SessionQueue.Delivery, written: string[]) =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const preparing = yield* Deferred.make<void>()
+    const gate = yield* Deferred.make<void>()
+    const fiber = yield* queue
+      .promote({
+        sessionID,
+        delivery,
+        prepare: (input) =>
+          Deferred.isDone(preparing).pipe(
+            Effect.flatMap((again) =>
+              again
+                ? Effect.void
+                : Deferred.succeed(preparing, undefined).pipe(Effect.andThen(Deferred.await(gate))),
+            ),
+            Effect.as(input),
+          ),
+        write: (input) =>
+          Effect.sync(() =>
+            written.push(input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")),
+          ),
+        rejected: () => Effect.void,
+      })
+      .pipe(Effect.forkChild)
+    yield* awaitWithTimeout(Deferred.await(preparing), "the gated promotion never began preparing")
+    return {
+      // Lets the gated preparation finish, and waits for its promotion to return.
+      finish: Deferred.succeed(gate, undefined).pipe(
+        Effect.andThen(awaitWithTimeout(Fiber.join(fiber), "the gated promotion never returned")),
+      ),
+    }
+  })
+
+it.instance(
+  "a promotion prepared before a reorder never commits out of the new order, held or closed",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+
+      // Reordered and closed while the first item's message is still being prepared.
+      const closed = yield* sessions.create({ title: "reorder, closed before the preparation ends" })
+      const closedWritten: string[] = []
+      const first = yield* admit(closed.id, "queue", "admitted first")
+      const second = yield* admit(closed.id, "queue", "admitted second")
+      const racing = yield* gated(closed.id, "queue", closedWritten)
+      yield* queue.hold(closed.id, "view")
+      yield* queue.reorder(closed.id, [second.id, first.id])
+      yield* queue.release(closed.id, "view")
+      yield* racing.finish
+      yield* promoter(closed.id, closedWritten)("queue")
+      expect(closedWritten).toEqual(["admitted second", "admitted first"])
+
+      // Reordered while held, the preparation ending before the release.
+      const held = yield* sessions.create({ title: "reorder, held through the preparation" })
+      const heldWritten: string[] = []
+      const one = yield* admit(held.id, "queue", "admitted first")
+      const two = yield* admit(held.id, "queue", "admitted second")
+      const holding = yield* gated(held.id, "queue", heldWritten)
+      yield* queue.hold(held.id, "view")
+      yield* queue.reorder(held.id, [two.id, one.id])
+      yield* holding.finish
+      expect(heldWritten).toEqual([])
+      yield* queue.release(held.id, "view")
+      yield* promoter(held.id, heldWritten)("queue")
+      yield* promoter(held.id, heldWritten)("queue")
+      expect(heldWritten).toEqual(["admitted second", "admitted first"])
+    }),
+  30_000,
+)
+
+it.instance(
+  "a duplicate being prepared when the review consolidates is delivered once, in either category",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      yield* Effect.forEach(["steer", "queue"] as const, (delivery) =>
+        Effect.gen(function* () {
+          const session = yield* sessions.create({ title: `consolidate a ${delivery} in preparation` })
+          const written: string[] = []
+          yield* admit(session.id, delivery, "the same instruction")
+          yield* admit(session.id, delivery, "the same instruction")
+          yield* admit(session.id, delivery, "another instruction")
+          const racing = yield* gated(session.id, delivery, written)
+          yield* queue.hold(session.id, "view")
+          expect((yield* queue.consolidate(session.id)).map(text)).toEqual([
+            "the same instruction",
+            "another instruction",
+          ])
+          yield* queue.release(session.id, "view")
+          yield* racing.finish
+          yield* promoter(session.id, written)(delivery)
+          yield* promoter(session.id, written)(delivery)
+          expect(written).toEqual(["the same instruction", "another instruction"])
+        }),
+      )
+    }),
+  30_000,
+)
 
 it.instance(
   "a review hold stops both categories, even a promotion already being prepared, until it is released",
@@ -294,6 +398,36 @@ it.instance(
         "run the full suite",
         "fix auth.ts: queued step",
       ])
+    }),
+  30_000,
+)
+
+it.instance(
+  "a bare command merges with a similar one as its own step, whatever its message and part IDs",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "review consolidate, bare command" })
+      const written: string[] = []
+      const identified = (value: string) =>
+        queue.admit({
+          sessionID: session.id,
+          delivery: "queue",
+          messageID: MessageID.ascending(),
+          parts: [{ id: PartID.ascending(), type: "text", text: value }],
+        })
+      yield* identified("run lint")
+      yield* identified("write the changelog")
+      yield* identified("run lint --fix")
+
+      expect((yield* queue.consolidate(session.id)).map(text)).toEqual([
+        "run lint:\n1. run lint\n2. --fix",
+        "write the changelog",
+      ])
+      yield* promoter(session.id, written)("queue")
+      yield* promoter(session.id, written)("queue")
+      expect(written).toEqual(["run lint:\n1. run lint\n2. --fix", "write the changelog"])
     }),
   30_000,
 )

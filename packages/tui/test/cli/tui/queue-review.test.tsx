@@ -21,7 +21,7 @@ import { ThemeProvider } from "../../../src/context/theme"
 import { TuiConfigProvider } from "../../../src/config"
 import { OpencodeKeymapProvider, registerOpencodeKeymap } from "../../../src/keymap"
 import { DialogProvider, useDialog } from "../../../src/ui/dialog"
-import { ToastProvider } from "../../../src/ui/toast"
+import { Toast, ToastProvider } from "../../../src/ui/toast"
 import { PromptQueueRow } from "../../../src/component/prompt/queue"
 import { DialogQueue, REVIEW_IDLE_MS } from "../../../src/component/dialog-queue"
 
@@ -58,7 +58,10 @@ async function wait(fn: () => boolean | Promise<boolean>, timeout = 3000) {
 
 type QueueRequest = { method: string; path: string; body: Record<string, unknown> | undefined }
 
-async function mount(initial: SessionPromptQueueItem[]) {
+// Answers a queue request in place of the scripted server, e.g. late or failing.
+type Serve = (path: string) => Promise<Response> | undefined
+
+async function mount(initial: SessionPromptQueueItem[], serve?: Serve) {
   await using tmp = await tmpdir()
   const state = path.join(tmp.path, "state")
   await mkdir(state, { recursive: true })
@@ -71,6 +74,8 @@ async function mount(initial: SessionPromptQueueItem[]) {
     if (url.pathname === `/session/${sessionID}/message`) return json([userMessage])
     if (url.pathname === `/session/${sessionID}/todo`) return json([])
     if (url.pathname === `/session/${sessionID}/diff`) return json([])
+    const served = serve?.(url.pathname)
+    if (served) return served
     if (url.pathname === `/session/${sessionID}/queue/release`) return new Response(null, { status: 204 })
     if (url.pathname === `/session/${sessionID}/queue/remove`) return json(queue.items[0])
     if (url.pathname.startsWith(`/session/${sessionID}/queue`)) return json(queue.items)
@@ -94,7 +99,12 @@ async function mount(initial: SessionPromptQueueItem[]) {
     sync = useSync()
     dialog = useDialog()
     onMount(ready)
-    return <PromptQueueRow sessionID={sessionID} />
+    return (
+      <box>
+        <PromptQueueRow sessionID={sessionID} />
+        <Toast />
+      </box>
+    )
   }
 
   function Harness() {
@@ -185,8 +195,8 @@ afterEach(() => {
   cleanup = undefined
 })
 
-async function setup(initial: SessionPromptQueueItem[]) {
-  const view = await mount(initial)
+async function setup(initial: SessionPromptQueueItem[], serve?: Serve) {
+  const view = await mount(initial, serve)
   cleanup = () => view.app.renderer.destroy()
   return view
 }
@@ -320,4 +330,100 @@ test("the consolidate button asks the server to consolidate the pending prompts"
   await wait(() => view.queued("consolidate").length === 1)
   view.app.mockInput.pressKey("o", { ctrl: true })
   await wait(() => view.queued("consolidate").length === 2)
+})
+
+// A response the test releases when it chooses.
+function later() {
+  let answer!: (response: Response) => void
+  const response = new Promise<Response>((resolve) => (answer = resolve))
+  return { response, answer }
+}
+
+// Fake timers stop Bun.sleep, so these wait on the event loop's own turns.
+async function settle(done: () => boolean) {
+  for (let turn = 0; turn < 1000 && !done(); turn++) await new Promise<void>((resolve) => queueMicrotask(resolve))
+  expect(done()).toBe(true)
+}
+
+test("the view says delivery is paused, and allows edits, only once the server confirms the hold", async () => {
+  const pending = later()
+  let holds = 0
+  const view = await setup([steer, queued], (path) =>
+    path.endsWith("/queue/hold") && holds++ === 0 ? pending.response : undefined,
+  )
+  await view.open()
+  await wait(async () => (await view.frame()).includes("pausing delivery"))
+  expect(await view.frame()).not.toContain("(delivery paused)")
+  view.app.mockInput.pressKey("d", { ctrl: true })
+  view.app.mockInput.pressKey("o", { ctrl: true })
+
+  // The confirmed hold's snapshot is the list the view shows.
+  pending.answer(json([queued]))
+  await wait(async () => (await view.frame()).includes("(delivery paused)"))
+  await wait(async () => !(await view.frame()).includes("steer the running turn"))
+  expect(view.queued("remove")).toEqual([])
+  expect(view.queued("consolidate")).toEqual([])
+  view.app.mockInput.pressKey("o", { ctrl: true })
+  await wait(() => view.queued("consolidate").length === 1)
+})
+
+test("a hold the server refuses says delivery is not paused", async () => {
+  const view = await setup([steer], (path) =>
+    path.endsWith("/queue/hold") ? Promise.resolve(json({ name: "Unavailable" }, { status: 503 })) : undefined,
+  )
+  await view.open()
+  await wait(async () => (await view.frame()).includes("delivery NOT paused"))
+  expect(await view.frame()).toContain("Could not pause delivery")
+})
+
+test("a close while the hold is unanswered releases at once, and again when the hold lands", async () => {
+  const pending = later()
+  const view = await setup([steer], (path) => (path.endsWith("/queue/hold") ? pending.response : undefined))
+  await view.open()
+  view.app.mockInput.pressEscape()
+  await wait(() => view.queued("release").length === 1)
+  pending.answer(json([steer]))
+  await wait(() => view.queued("release").length === 2)
+})
+
+test("a close with a renewal outstanding releases at once, and again when the renewal lands", async () => {
+  const renewal = later()
+  let holds = 0
+  const view = await setup([steer], (path) =>
+    path.endsWith("/queue/hold") && holds++ === 1 ? renewal.response : undefined,
+  )
+  jest.useFakeTimers()
+  DialogQueue.show(view.dialog, sessionID)
+  await settle(() => view.queued("hold").length === 1)
+  jest.advanceTimersByTime(60_000)
+  view.app.mockInput.pressKey("x")
+  await settle(() => view.queued("hold").length === 2)
+
+  view.app.mockInput.pressEscape()
+  await settle(() => view.queued("release").length === 1)
+  renewal.answer(json([steer]))
+  await settle(() => view.queued("release").length === 2)
+})
+
+test("scrolling the review with the mouse wheel restarts the inactivity interval", async () => {
+  const view = await setup([steer, queued])
+  await view.open()
+  const lines = (await view.frame()).split("\n")
+  const y = lines.findIndex((line) => line.includes("queued for later"))
+  const x = lines[y]!.indexOf("queued for later")
+  view.dialog.clear()
+  await wait(() => view.queued("release").length === 1)
+
+  jest.useFakeTimers()
+  DialogQueue.show(view.dialog, sessionID)
+  await settle(() => view.queued("hold").length === 2)
+  // Mouse events hit-test the last rendered frame.
+  expect(await view.frame()).toContain("queued for later")
+  jest.advanceTimersByTime(REVIEW_IDLE_MS - 60_000)
+  void view.app.mockMouse.scroll(x, y, "down")
+  jest.advanceTimersByTime(REVIEW_IDLE_MS - 1)
+  expect(view.dialog.stack.length).toBe(1)
+  jest.advanceTimersByTime(1)
+  await settle(() => view.queued("release").length === 2)
+  expect(view.dialog.stack.length).toBe(0)
 })
