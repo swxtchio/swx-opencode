@@ -955,6 +955,62 @@ describe("SessionV2.wait", () => {
     }),
   )
 
+  it.effect("completes when a later assistant retries a failed call with identical arguments and a fresh ID", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const registry = yield* ToolRegistry.Service
+      const commands: string[] = []
+      yield* registry.register({
+        bash: Tool.make({
+          description: "Run a command",
+          input: Schema.Struct({ command: Schema.String }),
+          output: Schema.Struct({}),
+          execute: ({ command }) =>
+            Effect.suspend(() => (commands.push(command) === 1 ? Effect.die("make test failed") : Effect.succeed({}))),
+        }),
+      })
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "call-wait-first-attempt", name: "bash", input: { command: "make test" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "call-wait-fresh-retry", name: "bash", input: { command: "make test" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        textTurn("text-wait-after-fresh-retry", "Tests pass"),
+      ]
+      const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run the tests" }) })
+      const result = yield* session.wait(sessionID)
+
+      expect(commands).toEqual(["make test", "make test"])
+      const assistants = (yield* session.messages({ sessionID, order: "asc" })).filter(
+        (message): message is SessionMessage.Assistant => message.type === "assistant",
+      )
+      const calls = assistants.flatMap((message) =>
+        message.content.flatMap((content) =>
+          content.type === "tool"
+            ? [{ assistantMessageID: message.id, id: content.id, status: content.state.status }]
+            : [],
+        ),
+      )
+      expect(calls.map((call) => [call.id, call.status])).toEqual([
+        ["call-wait-first-attempt", "error"],
+        ["call-wait-fresh-retry", "completed"],
+      ])
+      expect(calls[0]?.assistantMessageID).not.toBe(calls[1]?.assistantMessageID)
+      const answered = assistants.at(-1)
+      if (!answered) throw new Error("Expected the assistant that answered after the retry")
+      expect(result).toEqual({ type: "completed", admittedSeq: admitted.admittedSeq, assistantMessageID: answered.id })
+      expect(requests).toHaveLength(3)
+    }),
+  )
+
   it.effect("completes a tool call retried under the same assistant identity", () =>
     Effect.gen(function* () {
       yield* setupNative

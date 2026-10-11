@@ -418,7 +418,8 @@ const layer = Layer.effect(
             }
       }
       // A failed call is recovered only by a later successful retry, in this assistant or a later one. A retry has the
-      // same tool name, provider call ID, and arguments; providers such as Gemini reuse generated IDs across streams.
+      // same tool name and arguments. The provider call ID is ignored: a retry may carry a fresh ID, and providers such
+      // as Gemini reuse generated IDs across streams for unrelated calls.
       const failedTool = latestTools.find(
         ({ content }, index) =>
           content.state.status === "error" &&
@@ -428,7 +429,6 @@ const layer = Layer.effect(
               (later) =>
                 later.content.state.status === "completed" &&
                 later.content.name === content.name &&
-                later.content.id === content.id &&
                 Equal.equals(later.content.state.input, content.state.input),
             ),
       )
