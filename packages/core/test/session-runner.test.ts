@@ -6,10 +6,13 @@ import {
   Model,
   TransportReason,
   InvalidRequestReason,
+  LLM,
   type LLMClientShape,
   type LLMRequest,
 } from "@opencode-ai/llm"
+import { Gemini } from "@opencode-ai/llm/protocols/gemini"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
+import { RequestExecutor } from "@opencode-ai/llm/route"
 import { Database } from "@opencode-ai/core/database/database"
 import { makeLocationNode } from "@opencode-ai/core/effect/app-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -62,6 +65,7 @@ import { Location } from "@opencode-ai/core/location"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Queue, Schema, Stream } from "effect"
 import { asc, eq } from "drizzle-orm"
+import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { testEffect } from "./lib/effect"
 
 const requests: LLMRequest[] = []
@@ -913,21 +917,39 @@ describe("SessionV2.wait", () => {
             ),
         }),
       })
-      // Gemini restarts generated call IDs in each stream, so an unrelated later call can reuse tool_0.
+      // Each turn runs a Gemini SSE response through the real Gemini protocol. Its parser restarts generated call IDs
+      // in each stream, so the unrelated later call reuses tool_0.
+      const geminiTurn = (parts: ReadonlyArray<unknown>) =>
+        LLMClient.generate(
+          LLM.request({ model: Gemini.route.model({ id: "gemini-2.5-flash" }), prompt: "Replay" }),
+        ).pipe(
+          Effect.map((response) => [...response.events]),
+          Effect.provide(
+            LLMClient.layer.pipe(
+              Layer.provide(RequestExecutor.layer),
+              Layer.provide(
+                Layer.succeed(
+                  HttpClient.HttpClient,
+                  HttpClient.make((request) =>
+                    Effect.succeed(
+                      HttpClientResponse.fromWeb(
+                        request,
+                        new Response(
+                          `data: ${JSON.stringify({ candidates: [{ content: { role: "model", parts }, finishReason: "STOP" }] })}\n\n`,
+                          { headers: { "content-type": "text/event-stream" } },
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        )
       responses = [
-        [
-          LLMEvent.stepStart({ index: 0 }),
-          LLMEvent.toolCall({ id: "tool_0", name: "bash", input: { command: "make test" } }),
-          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
-          LLMEvent.finish({ reason: "tool-calls" }),
-        ],
-        [
-          LLMEvent.stepStart({ index: 0 }),
-          LLMEvent.toolCall({ id: "tool_0", name: "bash", input: { command: "ls" } }),
-          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
-          LLMEvent.finish({ reason: "tool-calls" }),
-        ],
-        textTurn("text-wait-after-reused-gemini-id", "Listed the files"),
+        yield* geminiTurn([{ functionCall: { name: "bash", args: { command: "make test" } } }]),
+        yield* geminiTurn([{ functionCall: { name: "bash", args: { command: "ls" } } }]),
+        yield* geminiTurn([{ text: "Listed the files" }]),
       ]
       const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run the tests" }) })
       const result = yield* session.wait(sessionID)
