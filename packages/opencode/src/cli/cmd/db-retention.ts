@@ -836,6 +836,23 @@ function holderFailures(db: SqliteAccess, holders: DatabaseHolderScan | undefine
   return Array.from(reasons).toSorted()
 }
 
+/**
+ * The evidence scan runs before the write lock, so a process that opens the database between that scan
+ * and BEGIN IMMEDIATE is missing from it. Called while the lock is held, this rescans the full holder set:
+ * every current holder must pass the same registration check, and any holder the evidence did not name
+ * refuses the batch.
+ */
+function lockedHolderFailures(db: SqliteAccess, scanned: DatabaseHolderScan | undefined) {
+  const current = scanDatabaseHolders(db.filename)
+  const reasons = new Set(holderFailures(db, current))
+  if (scanned?.state === "complete" && current.state === "complete") {
+    for (const pid of current.pids) {
+      if (!scanned.pids.includes(pid)) reasons.add(`database-holder-appeared-after-scan:${pid}`)
+    }
+  }
+  return Array.from(reasons).toSorted()
+}
+
 function sessionWorkFailures(db: SqliteAccess, sessionIDs: readonly string[]) {
   const reasons = new Set<string>()
   const ids = placeholders(sessionIDs.length)
@@ -1046,6 +1063,7 @@ function revalidateCandidate(db: SqliteAccess, expected: RetentionTree, evidence
   if (expected.rootSessionID === "" || expected.sessionIDs.length === 0) reasons.add("session-tree-unreadable")
   if (reasons.size > 0) return Array.from(reasons).toSorted()
   for (const reason of candidateFailures(db, expected.sessionIDs, evidence, now)) reasons.add(reason)
+  for (const reason of lockedHolderFailures(db, evidence.holders)) reasons.add(reason)
 
   const rows = allRows<SessionRow>(
     db,
@@ -1161,8 +1179,8 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
       readonly changedBytes: number
       readonly refusals?: readonly string[]
     }
-    // Evidence is produced before the write lock (the holder scan reads procfs) and revalidated
-    // against the database inside it.
+    // Evidence is produced before the write lock and revalidated against the database inside it, where
+    // the holders are also rescanned so none can arrive unchecked between the two.
     let evidence: RetentionEvidence
     try {
       evidence = input.evidence()

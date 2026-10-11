@@ -3,7 +3,8 @@ import { spawnSync } from "node:child_process"
 import { Database } from "bun:sqlite"
 import { Context, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { chmod, mkdtemp, readFile, rm, stat, statfs, writeFile } from "node:fs/promises"
+import { readdirSync } from "node:fs"
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, statfs, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { eq } from "drizzle-orm"
@@ -27,6 +28,11 @@ import {
 import { readExport } from "@/cli/cmd/db-export-usage"
 import { tmpdir } from "../../fixture/fixture"
 
+// The reduced fixture: a hand-built subset of the store schema and hand-built rows. It is for negative cases,
+// where a test plants a corruption, an exact timestamp or another refusal-provoking value the real producers
+// do not emit, and for scaffolding whose subject is something else: the Context Epoch producer the retention
+// marker fences, and the file in the fixture-compaction rehearsals. A case that proves Session rows are
+// selected and redacted correctly uses producedStore below.
 const session = (db: Database, id: string, timeCreated: number, parentID: string | null = null) => {
   db.query(
     "INSERT INTO session (id, parent_id, project_id, workspace_id, slug, directory, path, title, version, share_url, summary_diffs, metadata, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, revert, permission, agent, model, time_created, time_updated, time_archived) VALUES (?, ?, 'proj', NULL, 'slug', '/work', NULL, 'session title sentinel', 'v1', NULL, NULL, NULL, 12.5, 13, 17, 2, 3, 4, NULL, NULL, 'build', ?, ?, ?, NULL)",
@@ -57,13 +63,13 @@ const event = (db: Database, sessionID: string, seq = 0) => {
   )
 }
 
-function fixture() {
+function reducedFixture() {
   const db = new Database(":memory:")
-  createSchema(db)
+  createReducedSchema(db)
   return db
 }
 
-function createSchema(db: Database) {
+function createReducedSchema(db: Database) {
   db.exec(`
     CREATE TABLE session (
       id TEXT PRIMARY KEY, parent_id TEXT, project_id TEXT NOT NULL, workspace_id TEXT, slug TEXT NOT NULL,
@@ -93,9 +99,69 @@ function createSchema(db: Database) {
 
 const access = (db: Database) => db as unknown as SqliteAccess
 
+/**
+ * The positive fixture: a fresh private store, like the production data directory, initialized by the
+ * production Database layer, into which a separate OS process writes Session trees through the real
+ * Session, Todo and EventV2 producers and then exits, so its writer registration names a dead process.
+ * `sizes` lists one entry per tree, its Session count (a root plus children).
+ */
+async function producedStore(sizes: number[]) {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "opencode-retention-store-"))
+  const filename = path.join(directory, "opencode.db")
+  const project = path.join(directory, "project")
+  await mkdir(project)
+  const producer = Bun.spawn(
+    [
+      process.execPath,
+      path.join(import.meta.dir, "../../fixture/retention-producer.ts"),
+      filename,
+      project,
+      JSON.stringify(sizes),
+    ],
+    {
+      stdout: "pipe",
+      stderr: "pipe",
+      cwd: path.join(import.meta.dir, "../../.."),
+      env: { ...process.env, OPENCODE_DB: filename },
+      timeout: 30_000,
+    },
+  )
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(producer.stdout).text(),
+    new Response(producer.stderr).text(),
+    producer.exited,
+  ])
+  if (code !== 0) throw new Error(`retention producer exited ${code}: ${stderr}`)
+  const produced = JSON.parse(stdout.trim().split("\n").at(-1)!) as {
+    trees: { rootSessionID: string; sessionIDs: string[] }[]
+    usage: {
+      cost: number
+      tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
+    }
+    producedFrom: number
+    producedUntil: number
+  }
+  return {
+    filename,
+    ...produced,
+    // Just past the inactivity window after the producer's last write.
+    now: produced.producedUntil + inactivityPolicy.windowMs + 1,
+    [Symbol.asyncDispose]: () => rm(directory, { recursive: true, force: true }),
+  }
+}
+
+// Each Session's current event sequence, which a measurement receipt covering its final write records.
+const finalSequence = (db: Database, sessionIDs: string[]) =>
+  Object.fromEntries(
+    sessionIDs.map((id) => [
+      id,
+      db.query<{ seq: number }, [string]>("SELECT seq FROM event_sequence WHERE aggregate_id = ?").get(id)?.seq ?? -1,
+    ]),
+  )
+
 async function retentionCompactionFixture(sessionID: string) {
   const fixture = await createFixtureDatabase()
-  createSchema(fixture.db)
+  createReducedSchema(fixture.db)
   session(fixture.db, sessionID, 10)
   event(fixture.db, sessionID)
   return fixture
@@ -211,7 +277,7 @@ function addCopies(db: Database, sessionID: string) {
 }
 
 test("best-effort inventory does not open a read transaction", () => {
-  const db = fixture()
+  const db = reducedFixture()
   try {
     session(db, "ses_unproven", 10)
     event(db, "ses_unproven")
@@ -240,7 +306,7 @@ test("best-effort inventory does not open a read transaction", () => {
 
 test("retention CLI keeps inventory read-only and refuses apply before any write when no tree passes every gate", async () => {
   await using fixtureDB = await createFixtureDatabase()
-  createSchema(fixtureDB.db)
+  createReducedSchema(fixtureDB.db)
   session(fixtureDB.db, "ses_cli", 10)
   event(fixtureDB.db, "ses_cli")
   fixtureDB.db.query("UPDATE event SET data = 'not-json' WHERE aggregate_id = 'ses_cli'").run()
@@ -293,46 +359,53 @@ test("retention CLI keeps inventory read-only and refuses apply before any write
   }
 })
 
-test("dry run reports exact trees and refusals without changing SQLite", () => {
-  const db = fixture()
-  try {
-    session(db, "ses_parent", 10)
-    session(db, "ses_child", 20, "ses_parent")
-    event(db, "ses_parent")
-    db.query("INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES ('unknown-aggregate', 0, NULL)").run()
-    const before = db.serialize()
+test(
+  "dry run reports exact trees and refusals without changing SQLite",
+  async () => {
+    await using store = await producedStore([2])
+    const produced = store.trees[0]!
+    const db = new Database(store.filename)
+    try {
+      db.query("INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES ('unknown-aggregate', 0, NULL)").run()
+      const before = db.serialize()
 
-    const proof = evidence(["ses_child", "ses_parent"], { ses_child: -1, ses_parent: 0 })
-    const dryRun = inventory(access(db), proof, NOW)
+      const proof = evidence(produced.sessionIDs, finalSequence(db, produced.sessionIDs), store.filename)
+      const dryRun = inventory(access(db), proof, store.now)
 
-    expect(dryRun.unknownAggregates).toEqual(["unknown-aggregate"])
-    expect(dryRun.trees[0]).toMatchObject({
-      rootSessionID: "ses_parent",
-      sessionIDs: ["ses_child", "ses_parent"],
-      eligible: true,
-    })
-    expect(dryRun.trees[0]?.aggregates).toContainEqual({
-      aggregateID: "ses_parent",
-      seq: 0,
-      ownerID: null,
-      rows: 1,
-      eventTypes: ["session.next.context.updated.1"],
-      bytes: Buffer.byteLength(
-        db.query<{ data: string }, [string]>("SELECT data FROM event WHERE aggregate_id = ?").get("ses_parent")!.data,
-      ),
-    })
-    expect(db.serialize().equals(before)).toBe(true)
+      expect(dryRun.unknownAggregates).toEqual(["unknown-aggregate"])
+      expect(dryRun.trees).toHaveLength(1)
+      expect(dryRun.trees[0]).toMatchObject({
+        rootSessionID: produced.rootSessionID,
+        sessionIDs: produced.sessionIDs,
+        eligible: true,
+      })
+      const events = db
+        .query<{ seq: number; type: string; data: string }, [string]>(
+          "SELECT seq, type, data FROM event WHERE aggregate_id = ? ORDER BY seq",
+        )
+        .all(produced.rootSessionID)
+      expect(dryRun.trees[0]?.aggregates).toContainEqual({
+        aggregateID: produced.rootSessionID,
+        seq: events.at(-1)!.seq,
+        ownerID: null,
+        rows: events.length,
+        eventTypes: Array.from(new Set(events.map((row) => row.type))).toSorted(),
+        bytes: events.reduce((total, row) => total + Buffer.byteLength(row.data), 0),
+      })
+      expect(db.serialize().equals(before)).toBe(true)
 
-    const refused = inventory(access(db), { ...proof, holders: { state: "unreadable", reason: "fixture" } }, NOW)
-    expect(refused.trees[0]?.reasons).toContain("database-holder-scan-unreadable:fixture")
-    expect(db.serialize().equals(before)).toBe(true)
-  } finally {
-    db.close()
-  }
-})
+      const refused = inventory(access(db), { ...proof, holders: { state: "unreadable", reason: "fixture" } }, store.now)
+      expect(refused.trees[0]?.reasons).toContain("database-holder-scan-unreadable:fixture")
+      expect(db.serialize().equals(before)).toBe(true)
+    } finally {
+      db.close()
+    }
+  },
+  { timeout: 30_000 },
+)
 
 test("dry run names pending, unfinished, workspace-owned, receipt, and unreadable proofs", () => {
-  const db = fixture()
+  const db = reducedFixture()
   try {
     session(db, "ses_old", 10)
     event(db, "ses_old")
@@ -397,7 +470,7 @@ test("dry run names pending, unfinished, workspace-owned, receipt, and unreadabl
 })
 
 test("a missing measurement receipt refuses an otherwise proven tree without changing rows", () => {
-  const db = fixture()
+  const db = reducedFixture()
   try {
     session(db, "ses_old", 10)
     event(db, "ses_old")
@@ -419,7 +492,7 @@ test("a missing measurement receipt refuses an otherwise proven tree without cha
 })
 
 test("customer-bound and unclassified Session trees remain ineligible", () => {
-  const db = fixture()
+  const db = reducedFixture()
   try {
     session(db, "ses_customer", 10)
     event(db, "ses_customer")
@@ -449,7 +522,7 @@ test("customer-bound and unclassified Session trees remain ineligible", () => {
 })
 
 test("unknown event ownership, malformed event data, and new Session tables remain ineligible", () => {
-  const db = fixture()
+  const db = reducedFixture()
   try {
     session(db, "ses_old", 10)
     event(db, "ses_old")
@@ -483,187 +556,153 @@ test("unknown event ownership, malformed event data, and new Session tables rema
   }
 })
 
-test("apply redacts every copy in restartable batches and preserves metric values", async () => {
-  await using fixtureDB = await createFixtureDatabase()
-  const first = fixtureDB.db
-  createSchema(first)
-  session(first, "ses_old", 10)
-  event(first, "ses_old")
-  addCopies(first, "ses_old")
-  const exportBefore = readExport(first)
-  // The Session row is the per-session usage record the session-usage projection maintains.
-  const sessionUsage = (db: Database) =>
-    db
-      .query(
-        "SELECT cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, model, agent FROM session WHERE id = 'ses_old'",
+test(
+  "apply redacts every Session-produced copy in restartable batches and preserves metric values",
+  async () => {
+    await using store = await producedStore([1])
+    const sessionID = store.trees[0]!.rootSessionID
+    const first = new Database(store.filename)
+    const exportBefore = readExport(first)
+    // The Session row is the per-session usage record the session-usage projection maintains from the
+    // producer's one step-finish part.
+    const sessionUsage = (db: Database) =>
+      db
+        .query(
+          "SELECT cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, model, agent FROM session WHERE id = ?",
+        )
+        .get(sessionID)
+    const usageBefore = sessionUsage(first)
+    expect(usageBefore).toMatchObject({
+      cost: store.usage.cost,
+      tokens_input: store.usage.tokens.input,
+      tokens_output: store.usage.tokens.output,
+      tokens_reasoning: store.usage.tokens.reasoning,
+      tokens_cache_read: store.usage.tokens.cache.read,
+      tokens_cache_write: store.usage.tokens.cache.write,
+    })
+    const metrics = (db: Database) =>
+      ["message", "part", "session_message"].flatMap((table) =>
+        db
+          .query<{ id: string; data: string }, [string]>(`SELECT id, data FROM ${table} WHERE session_id = ? ORDER BY id`)
+          .all(sessionID)
+          .map((row) => {
+            const data = JSON.parse(row.data)
+            return {
+              table,
+              id: row.id,
+              providerID: data.providerID,
+              modelID: data.modelID,
+              model: data.model,
+              responseModelID: data.responseModelID,
+              responseModelIDs: data.responseModelIDs,
+              cost: data.cost,
+              tokens: data.tokens,
+              time: data.time,
+            }
+          }),
       )
-      .get()
-  const usageBefore = sessionUsage(first)
-  expect(usageBefore).toEqual({
-    cost: 12.5,
-    tokens_input: 13,
-    tokens_output: 17,
-    tokens_reasoning: 2,
-    tokens_cache_read: 3,
-    tokens_cache_write: 4,
-    model: JSON.stringify({ id: "requested-model", providerID: "provider-a" }),
-    agent: "build",
-  })
-  const proof = evidence(["ses_old"], { ses_old: 0 }, fixtureDB.filename)
-  const initial = inventory(access(first), proof, NOW)
-  expect(initial.trees[0]?.eligible).toBe(true)
-  const metricSnapshot = [
-    JSON.parse(
-      first.query<{ data: string }, [string]>("SELECT data FROM message WHERE id = ?").get("msg_ses_old")!.data,
-    ),
-    JSON.parse(first.query<{ data: string }, [string]>("SELECT data FROM part WHERE id = ?").get("part_ses_old")!.data),
-    JSON.parse(
-      first.query<{ data: string }, [string]>("SELECT data FROM session_message WHERE id = ?").get("v2_ses_old")!.data,
-    ),
-  ].map((data) => ({
-    providerID: data.providerID,
-    modelID: data.modelID,
-    responseModelID: data.responseModelID,
-    responseModelIDs: data.responseModelIDs,
-    cost: data.cost,
-    tokens: data.tokens,
-    time: data.time,
-  }))
+    const metricSnapshot = metrics(first)
+    // Every producer copy that carries usage: the V1 assistant, its step-finish part and the V2 assistant.
+    expect(metricSnapshot.filter((row) => row.cost === store.usage.cost)).toHaveLength(3)
+    const eventIdentities = (db: Database) =>
+      db.query("SELECT id, seq FROM event WHERE aggregate_id = ? ORDER BY seq").all(sessionID)
+    const eventsBefore = eventIdentities(first)
+    const rawCopies = (db: Database) =>
+      [
+        ...db.query<{ data: string }, []>("SELECT data FROM event").all().map((row) => row.data),
+        ...db.query<{ data: string }, []>("SELECT data FROM message").all().map((row) => row.data),
+        ...db.query<{ data: string }, []>("SELECT data FROM part").all().map((row) => row.data),
+        ...db.query<{ data: string }, []>("SELECT data FROM session_message").all().map((row) => row.data),
+        ...db.query<{ snapshot: string }, []>("SELECT snapshot FROM session_context_epoch").all().map((row) => row.snapshot),
+        ...db.query<{ baseline: string }, []>("SELECT baseline FROM session_context_epoch").all().map((row) => row.baseline),
+        ...db.query<{ content: string }, []>("SELECT content FROM todo").all().map((row) => row.content),
+        ...db.query<{ title: string }, []>("SELECT title FROM session").all().map((row) => row.title),
+      ].join("\n")
+    for (const sentinel of [
+      "retention title sentinel",
+      "user prompt sentinel",
+      "assistant text sentinel",
+      "v2 context sentinel",
+      "todo sentinel",
+      "context epoch sentinel",
+    ]) {
+      expect(rawCopies(first)).toContain(sentinel)
+    }
+    const proof = evidence([sessionID], finalSequence(first, [sessionID]), store.filename)
+    const initial = inventory(access(first), proof, store.now)
+    expect(initial.trees[0]?.eligible).toBe(true)
 
-  const firstBatch = apply(access(first), {
-    tree: initial.trees[0]!,
-    evidence: () => proof,
-    now: () => NOW,
-    batchSize: 1,
-    maxBatches: 1,
-  })
-  expect(firstBatch.state).toBe("in-progress")
-  expect(firstBatch.lockHold.batches).toBe(1)
-  expect(firstBatch.lockHold.maxMs).toBeGreaterThan(0)
-  expect(
-    first.query<{ state: string }, [string]>("SELECT state FROM event_retention WHERE aggregate_id = ?").get("ses_old")
-      ?.state,
-  ).toBe("redacting")
-  first.close()
-
-  const resumed = await fixtureDB.reopen()
-  try {
-    const result = apply(access(resumed), {
+    const firstBatch = apply(access(first), {
       tree: initial.trees[0]!,
       evidence: () => proof,
-      now: () => NOW,
+      now: () => store.now,
       batchSize: 1,
+      maxBatches: 1,
     })
-    expect(result.state).toBe("complete")
-    expect(result.changedRows).toBeGreaterThan(firstBatch.changedRows)
+    expect(firstBatch.state).toBe("in-progress")
+    expect(firstBatch.lockHold.batches).toBe(1)
+    expect(firstBatch.lockHold.maxMs).toBeGreaterThan(0)
     expect(
-      resumed
-        .query<{ state: string }, [string]>("SELECT state FROM event_retention WHERE aggregate_id = ?")
-        .get("ses_old")?.state,
-    ).toBe("complete")
-    const afterMetricSnapshot = [
-      JSON.parse(
-        resumed.query<{ data: string }, [string]>("SELECT data FROM message WHERE id = ?").get("msg_ses_old")!.data,
-      ),
-      JSON.parse(
-        resumed.query<{ data: string }, [string]>("SELECT data FROM part WHERE id = ?").get("part_ses_old")!.data,
-      ),
-      JSON.parse(
-        resumed.query<{ data: string }, [string]>("SELECT data FROM session_message WHERE id = ?").get("v2_ses_old")!
-          .data,
-      ),
-    ].map((data) => ({
-      providerID: data.providerID,
-      modelID: data.modelID,
-      responseModelID: data.responseModelID,
-      responseModelIDs: data.responseModelIDs,
-      cost: data.cost,
-      tokens: data.tokens,
-      time: data.time,
-    }))
-    expect(afterMetricSnapshot).toEqual(metricSnapshot)
-    expect(sessionUsage(resumed)).toEqual(usageBefore)
-    const exportAfter = readExport(resumed)
-    const usageAxes = (archive: ReturnType<typeof readExport>) =>
-      archive.records.map((record) => ({
-        providerID: record["providerID"],
-        modelID: record["modelID"],
-        servedModelIDs: record["servedModelIDs"],
-        tokens: record["tokens"],
-        reportedCost: record["reportedCost"],
-      }))
-    expect(usageAxes(exportAfter)).toEqual(usageAxes(exportBefore))
-    expect(exportAfter.reportedCostTotal).toBe(exportBefore.reportedCostTotal)
-    expect(exportAfter.check.ok).toBe(exportBefore.check.ok)
-    expect({
-      sessions: exportAfter.sessions.length,
-      records: exportAfter.records.length,
-      orphanMessages: exportAfter.orphanMessages,
-    }).toEqual({
-      sessions: exportBefore.sessions.length,
-      records: exportBefore.records.length,
-      orphanMessages: exportBefore.orphanMessages,
-    })
-    expect(resumed.query("SELECT count(*) AS rows FROM session_share").get()).toEqual({ rows: 0 })
-    expect(resumed.query("SELECT content FROM todo WHERE session_id = 'ses_old'").get()).toEqual({ content: "" })
-    expect(resumed.query("SELECT prompt FROM session_input WHERE session_id = 'ses_old'").get()).toBeNull()
-    expect(resumed.query("SELECT snapshot FROM session_context_epoch WHERE session_id = 'ses_old'").get()).toEqual({
-      snapshot: "{}",
-    })
-    expect(resumed.query("SELECT baseline FROM session_context_epoch WHERE session_id = 'ses_old'").get()).toEqual({
-      baseline: "",
-    })
+      first.query<{ state: string }, [string]>("SELECT state FROM event_retention WHERE aggregate_id = ?").get(sessionID)
+        ?.state,
+    ).toBe("redacting")
+    first.close()
 
-    const rawCopies = [
-      ...resumed
-        .query<{ data: string }, []>("SELECT data FROM event")
-        .all()
-        .map((row) => row.data),
-      ...resumed
-        .query<{ data: string }, []>("SELECT data FROM message")
-        .all()
-        .map((row) => row.data),
-      ...resumed
-        .query<{ data: string }, []>("SELECT data FROM part")
-        .all()
-        .map((row) => row.data),
-      ...resumed
-        .query<{ data: string }, []>("SELECT data FROM session_message")
-        .all()
-        .map((row) => row.data),
-      ...resumed
-        .query<{ prompt: string }, []>("SELECT prompt FROM session_input")
-        .all()
-        .map((row) => row.prompt),
-      ...resumed
-        .query<{ snapshot: string }, []>("SELECT snapshot FROM session_context_epoch")
-        .all()
-        .map((row) => row.snapshot),
-      ...resumed
-        .query<{ baseline: string }, []>("SELECT baseline FROM session_context_epoch")
-        .all()
-        .map((row) => row.baseline),
-      ...resumed
-        .query<{ content: string }, []>("SELECT content FROM todo")
-        .all()
-        .map((row) => row.content),
-      ...resumed
-        .query<{ title: string; directory: string }, []>("SELECT title, directory FROM session")
-        .all()
-        .map((row) => JSON.stringify(row)),
-    ]
-    expect(rawCopies.join("\n")).not.toContain("sentinel")
-    expect(resumed.query("SELECT id, seq FROM event WHERE aggregate_id = 'ses_old'").get()).toEqual({
-      id: "evt_ses_old",
-      seq: 0,
-    })
-  } finally {
-    resumed.close()
-  }
-})
+    const resumed = new Database(store.filename)
+    try {
+      const result = apply(access(resumed), {
+        tree: initial.trees[0]!,
+        evidence: () => proof,
+        now: () => store.now,
+        batchSize: 1,
+      })
+      expect(result.state).toBe("complete")
+      expect(result.changedRows).toBeGreaterThan(firstBatch.changedRows)
+      expect(
+        resumed
+          .query<{ state: string }, [string]>("SELECT state FROM event_retention WHERE aggregate_id = ?")
+          .get(sessionID)?.state,
+      ).toBe("complete")
+      expect(metrics(resumed)).toEqual(metricSnapshot)
+      expect(sessionUsage(resumed)).toEqual(usageBefore)
+      const exportAfter = readExport(resumed)
+      const usageAxes = (archive: ReturnType<typeof readExport>) =>
+        archive.records.map((record) => ({
+          providerID: record["providerID"],
+          modelID: record["modelID"],
+          servedModelIDs: record["servedModelIDs"],
+          tokens: record["tokens"],
+          reportedCost: record["reportedCost"],
+        }))
+      expect(exportBefore.records.length).toBeGreaterThan(0)
+      expect(usageAxes(exportAfter)).toEqual(usageAxes(exportBefore))
+      expect(exportAfter.reportedCostTotal).toBe(exportBefore.reportedCostTotal)
+      expect(exportAfter.check.ok).toBe(exportBefore.check.ok)
+      expect({
+        sessions: exportAfter.sessions.length,
+        records: exportAfter.records.length,
+        orphanMessages: exportAfter.orphanMessages,
+      }).toEqual({
+        sessions: exportBefore.sessions.length,
+        records: exportBefore.records.length,
+        orphanMessages: exportBefore.orphanMessages,
+      })
+      expect(resumed.query("SELECT content FROM todo WHERE session_id = ?").all(sessionID)).toEqual([{ content: "" }])
+      expect(resumed.query("SELECT snapshot, baseline FROM session_context_epoch WHERE session_id = ?").get(sessionID)).toEqual({
+        snapshot: "{}",
+        baseline: "",
+      })
+      expect(rawCopies(resumed)).not.toContain("sentinel")
+      expect(eventIdentities(resumed)).toEqual(eventsBefore)
+    } finally {
+      resumed.close()
+    }
+  },
+  { timeout: 30_000 },
+)
 
 test("failed apply evidence refuses before any row changes", () => {
-  const db = fixture()
+  const db = reducedFixture()
   try {
     session(db, "ses_old", 10)
     event(db, "ses_old")
@@ -683,38 +722,35 @@ test("failed apply evidence refuses before any row changes", () => {
   }
 })
 
-test("apply on a database outside the fixture factory requires a holder scan of that exact file", async () => {
-  await using tmp = await tmpdir()
-  // The production data directory admits only its owner, which the holder scan requires.
-  await chmod(tmp.path, 0o700)
-  const filename = path.join(tmp.path, "production-shaped.sqlite")
-  const db = new Database(filename)
-  try {
-    createSchema(db)
-    session(db, "ses_old", 10)
-    event(db, "ses_old")
-    const valid = evidence(["ses_old"], { ses_old: 0 }, filename)
-    const tree = inventory(access(db), valid, NOW).trees[0]!
-    expect(tree.reasons).toEqual([])
-    const before = db.serialize()
+test(
+  "apply on a database outside the fixture factory requires a holder scan of that exact file",
+  async () => {
+    await using store = await producedStore([1])
+    const sessionID = store.trees[0]!.rootSessionID
+    const db = new Database(store.filename)
+    try {
+      const valid = evidence([sessionID], finalSequence(db, [sessionID]), store.filename)
+      const tree = inventory(access(db), valid, store.now).trees[0]!
+      expect(tree.reasons).toEqual([])
+      const before = db.serialize()
 
-    const otherFile = { ...valid, holders: scanDatabaseHolders(":memory:") }
-    const mismatched = apply(access(db), { tree, evidence: () => otherFile, now: () => NOW })
-    expect(mismatched.state).toBe("refused")
-    expect(mismatched.changedRows).toBe(0)
-    expect(mismatched.reasons).toContain("database-holder-scan-target-mismatch")
-    expect(db.serialize().equals(before)).toBe(true)
+      const otherFile = { ...valid, holders: scanDatabaseHolders(":memory:") }
+      const mismatched = apply(access(db), { tree, evidence: () => otherFile, now: () => store.now })
+      expect(mismatched.state).toBe("refused")
+      expect(mismatched.changedRows).toBe(0)
+      expect(mismatched.reasons).toContain("database-holder-scan-target-mismatch")
+      expect(db.serialize().equals(before)).toBe(true)
 
-    const result = apply(access(db), { tree, evidence: () => valid, now: () => NOW })
-    expect(result.state).toBe("complete")
-    expect(db.query("SELECT state FROM event_retention").get()).toEqual({ state: "complete" })
-    expect(
-      db.query<{ data: string }, []>("SELECT data FROM event WHERE aggregate_id = 'ses_old'").get()?.data,
-    ).not.toContain("event sentinel")
-  } finally {
-    db.close()
-  }
-})
+      const result = apply(access(db), { tree, evidence: () => valid, now: () => store.now })
+      expect(result.state).toBe("complete")
+      expect(db.query("SELECT state FROM event_retention").get()).toEqual({ state: "complete" })
+      expect(eventRows(db, sessionID).map((row) => row.data).join("\n")).not.toContain("sentinel")
+    } finally {
+      db.close()
+    }
+  },
+  { timeout: 30_000 },
+)
 
 test(
   "compaction refuses a temporary database not issued by the fixture factory",
@@ -724,7 +760,7 @@ test(
     const backupPath = path.join(tmp.path, "unissued-backup.sqlite")
     const stagingPath = path.join(tmp.path, "unissued-staging.sqlite")
     const db = new Database(sourcePath)
-    createSchema(db)
+    createReducedSchema(db)
     session(db, "ses_unissued", 10)
     event(db, "ses_unissued")
     const before = db.serialize()
@@ -864,7 +900,7 @@ test(
 )
 
 test("apply revalidates evidence inside every batch and keeps partial history unreplayable", () => {
-  const db = fixture()
+  const db = reducedFixture()
   try {
     session(db, "ses_old", 10)
     event(db, "ses_old")
@@ -895,7 +931,7 @@ test("apply revalidates evidence inside every batch and keeps partial history un
 })
 
 test("apply refuses aggregate-owner changes after inventory before changing rows", () => {
-  const db = fixture()
+  const db = reducedFixture()
   try {
     session(db, "ses_owner", 10)
     event(db, "ses_owner")
@@ -917,7 +953,7 @@ test("apply refuses aggregate-owner changes after inventory before changing rows
 })
 
 test("apply refuses a newly added session-owned raw table before changing rows", () => {
-  const db = fixture()
+  const db = reducedFixture()
   try {
     session(db, "ses_schema", 10)
     event(db, "ses_schema")
@@ -940,7 +976,7 @@ test("apply refuses a newly added session-owned raw table before changing rows",
 })
 
 test("apply refuses event data corruption after inventory before changing rows", () => {
-  const db = fixture()
+  const db = reducedFixture()
   try {
     session(db, "ses_event", 10)
     event(db, "ses_event")
@@ -1049,7 +1085,7 @@ test(
     const stagingDirectory = await mkdtemp("/dev/shm/opencode-retention-stage-")
     await using cleanupStaging = { [Symbol.asyncDispose]: () => rm(stagingDirectory, { recursive: true, force: true }) }
     const beforeDB = sourceFixture.db
-    createSchema(beforeDB)
+    createReducedSchema(beforeDB)
     session(beforeDB, "ses_physical", 10)
     beforeDB.query("INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES ('ses_physical', 599, NULL)").run()
     const raw = "tool output sentinel ".repeat(800)
@@ -1331,7 +1367,7 @@ const gateReasons = (tree: { reasons: readonly string[] }) =>
   tree.reasons.filter((reason) => !reason.startsWith("event-payload-ownership-proof-unavailable:"))
 
 test("only a whole tree inactive for strictly more than seven days since its last activity is selected", () => {
-  const db = fixture()
+  const db = reducedFixture()
   try {
     const idleAt = 50 * DAY
     const boundary = idleAt + inactivityPolicy.windowMs
@@ -1402,7 +1438,7 @@ test("only a whole tree inactive for strictly more than seven days since its las
 })
 
 test("activity arriving after inventory refuses the next batch before it writes", () => {
-  const db = fixture()
+  const db = reducedFixture()
   try {
     session(db, "ses_old", 10)
     event(db, "ses_old")
@@ -1425,21 +1461,7 @@ test("activity arriving after inventory refuses the next batch before it writes"
   }
 })
 
-async function productionStore() {
-  // A fresh private directory, like the production data directory, initialized by the production layer.
-  const directory = await mkdtemp(path.join(os.tmpdir(), "opencode-retention-store-"))
-  const filename = path.join(directory, "opencode.db")
-  await Effect.runPromise(Effect.scoped(Layer.build(layerFromPath(filename))))
-  return { filename, [Symbol.asyncDispose]: () => rm(directory, { recursive: true, force: true }) }
-}
-
-function productionSession(db: Database, id: string, time: number) {
-  db.query(
-    "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?, 'proj', 'slug', '/work', 'held session sentinel', 'v1', ?, ?)",
-  ).run(id, time, time)
-}
-
-async function holdSession(filename: string, sessionID: string, mode: "write" | "open") {
+async function holdSession(filename: string, sessionID: string, mode: "write" | "open" | "hidden") {
   const holder = Bun.spawn(
     [process.execPath, path.join(import.meta.dir, "../../fixture/retention-holder.ts"), filename, sessionID, mode],
     { stdin: "pipe", stdout: "pipe", stderr: "pipe", cwd: path.join(import.meta.dir, "../../..") },
@@ -1471,17 +1493,17 @@ const eventRows = (db: Database, sessionID: string) =>
 test(
   "a Session written by a live process in another OS process is never selected, and is released when it exits",
   async () => {
-    await using store = await productionStore()
+    await using store = await producedStore([1])
+    const sessionID = store.trees[0]!.rootSessionID
     const db = new Database(store.filename)
     try {
-      productionSession(db, "ses_held", 10)
-      await using holder = await holdSession(store.filename, "ses_held", "write")
-      const proof = () => evidence(["ses_held"], { ses_held: 0 }, store.filename)
+      await using holder = await holdSession(store.filename, sessionID, "write")
+      const proof = () => evidence([sessionID], finalSequence(db, [sessionID]), store.filename)
       expect(proof().holders).toEqual(expect.objectContaining({ state: "complete", pids: [holder.pid] }))
 
-      const held = inventory(access(db), proof(), Date.now() + NOW).trees.find((item) => item.rootSessionID === "ses_held")!
+      const held = inventory(access(db), proof(), Date.now() + NOW).trees.find((item) => item.rootSessionID === sessionID)!
       expect(held.eligible).toBe(false)
-      expect(gateReasons(held)).toEqual(["session-held-by-live-process:ses_held"])
+      expect(gateReasons(held)).toEqual([`session-held-by-live-process:${sessionID}`])
       const before = db.serialize()
       const refused = apply(access(db), {
         tree: { ...held, eligible: true, reasons: [] },
@@ -1489,12 +1511,12 @@ test(
         now: () => Date.now() + NOW,
       })
       expect(refused).toMatchObject({ state: "refused", changedRows: 0 })
-      expect(refused.reasons).toContain("session-held-by-live-process:ses_held")
+      expect(refused.reasons).toContain(`session-held-by-live-process:${sessionID}`)
       expect(db.serialize().equals(before)).toBe(true)
 
       await holder.release()
       const released = inventory(access(db), proof(), Date.now() + NOW).trees.find(
-        (item) => item.rootSessionID === "ses_held",
+        (item) => item.rootSessionID === sessionID,
       )!
       expect(released.reasons).toEqual([])
     } finally {
@@ -1507,16 +1529,38 @@ test(
 test(
   "an unregistered process holding the database refuses every tree until it exits",
   async () => {
-    await using store = await productionStore()
+    await using store = await producedStore([1])
+    const sessionID = store.trees[0]!.rootSessionID
     const db = new Database(store.filename)
     try {
-      productionSession(db, "ses_quiet", 10)
-      await using holder = await holdSession(store.filename, "ses_quiet", "open")
-      const proof = () => evidence(["ses_quiet"], { ses_quiet: -1 }, store.filename)
-      const refused = inventory(access(db), proof(), Date.now() + NOW)
+      await using holder = await holdSession(store.filename, sessionID, "open")
+      const proof = () => evidence([sessionID], finalSequence(db, [sessionID]), store.filename)
+      const refused = inventory(access(db), proof(), store.now)
       expect(gateReasons(refused.trees[0]!)).toEqual([`unregistered-database-holder:${holder.pid}`])
       await holder.release()
-      expect(inventory(access(db), proof(), Date.now() + NOW).trees[0]?.reasons).toEqual([])
+      expect(inventory(access(db), proof(), store.now).trees[0]?.reasons).toEqual([])
+    } finally {
+      db.close()
+    }
+  },
+  { timeout: 30_000 },
+)
+
+test(
+  "a holder whose descriptors cannot be read is still found through its SQLite lock in /proc/locks",
+  async () => {
+    await using store = await producedStore([1])
+    const sessionID = store.trees[0]!.rootSessionID
+    const db = new Database(store.filename)
+    try {
+      await using holder = await holdSession(store.filename, sessionID, "hidden")
+      // The descriptor arm of the scan cannot see this holder: the kernel refuses to list its descriptors.
+      expect(() => readdirSync(`/proc/${holder.pid}/fd`)).toThrow()
+      expect(scanDatabaseHolders(store.filename)).toEqual(expect.objectContaining({ state: "complete", pids: [holder.pid] }))
+      const proof = evidence([sessionID], finalSequence(db, [sessionID]), store.filename)
+      expect(gateReasons(inventory(access(db), proof, store.now).trees[0]!)).toEqual([
+        `unregistered-database-holder:${holder.pid}`,
+      ])
     } finally {
       db.close()
     }
@@ -1527,37 +1571,33 @@ test(
 test(
   "a holder or pending work arriving between inventory and a batch refuses it before any write",
   async () => {
-    await using store = await productionStore()
+    await using store = await producedStore([1])
+    const sessionID = store.trees[0]!.rootSessionID
     const db = new Database(store.filename)
     try {
-      productionSession(db, "ses_late", 10)
-      const proof = () => evidence(["ses_late"], { ses_late: -1 }, store.filename)
+      const proof = () => evidence([sessionID], finalSequence(db, [sessionID]), store.filename)
       const now = () => Date.now() + NOW
       const tree = inventory(access(db), proof(), now()).trees[0]!
       expect(tree.reasons).toEqual([])
 
-      await using holder = await holdSession(store.filename, "ses_late", "write")
-      const eventsBefore = eventRows(db, "ses_late")
+      await using holder = await holdSession(store.filename, sessionID, "write")
+      const eventsBefore = eventRows(db, sessionID)
       const before = db.serialize()
       const result = apply(access(db), { tree, evidence: proof, now })
       expect(result).toMatchObject({ state: "refused", changedRows: 0 })
-      expect(result.reasons).toContain("session-held-by-live-process:ses_late")
-      expect(result.reasons).toContain("event-appended-after-inventory:ses_late")
+      expect(result.reasons).toContain(`session-held-by-live-process:${sessionID}`)
+      expect(result.reasons).toContain(`event-appended-after-inventory:${sessionID}`)
       expect(db.serialize().equals(before)).toBe(true)
-      expect(eventRows(db, "ses_late")).toEqual(eventsBefore)
+      expect(eventRows(db, sessionID)).toEqual(eventsBefore)
       await holder.release()
 
-      const current = inventory(access(db), { ...proof(), handoff: { ...proof().handoff!, finalSequence: { ses_late: 0 } } }, now()).trees[0]!
+      const current = inventory(access(db), proof(), now()).trees[0]!
       expect(current.reasons).toEqual([])
       db.query(
-        "INSERT INTO session_prompt_queue (id, session_id, seq, delivery, input, time_created) VALUES ('queued', 'ses_late', 1, 'queue', '{}', 10)",
-      ).run()
+        "INSERT INTO session_prompt_queue (id, session_id, seq, delivery, input, time_created) VALUES ('queued', ?, 1, 'queue', '{}', 10)",
+      ).run(sessionID)
       const queuedBefore = db.serialize()
-      const queued = apply(access(db), {
-        tree: current,
-        evidence: () => ({ ...proof(), handoff: { ...proof().handoff!, finalSequence: { ses_late: 0 } } }),
-        now,
-      })
+      const queued = apply(access(db), { tree: current, evidence: proof, now })
       expect(queued).toMatchObject({ state: "refused", changedRows: 0 })
       expect(queued.reasons).toContain("v1-prompt-queue-row-present")
       expect(db.serialize().equals(queuedBefore)).toBe(true)
@@ -1568,8 +1608,36 @@ test(
   { timeout: 30_000 },
 )
 
+test(
+  "a holder that opens the store after the evidence scan refuses the batch before any write",
+  async () => {
+    await using store = await producedStore([1])
+    const sessionID = store.trees[0]!.rootSessionID
+    const db = new Database(store.filename)
+    try {
+      // The evidence is scanned once, before the holder exists, and stays the batch's evidence.
+      const proof = evidence([sessionID], finalSequence(db, [sessionID]), store.filename)
+      expect(proof.holders).toEqual(expect.objectContaining({ state: "complete", pids: [] }))
+      const tree = inventory(access(db), proof, store.now).trees[0]!
+      expect(tree.reasons).toEqual([])
+
+      await using holder = await holdSession(store.filename, sessionID, "open")
+      const before = db.serialize()
+      const result = apply(access(db), { tree, evidence: () => proof, now: () => store.now })
+
+      expect(result).toMatchObject({ state: "refused", changedRows: 0 })
+      expect(result.reasons).toContain(`database-holder-appeared-after-scan:${holder.pid}`)
+      expect(result.reasons).toContain(`unregistered-database-holder:${holder.pid}`)
+      expect(db.serialize().equals(before)).toBe(true)
+    } finally {
+      db.close()
+    }
+  },
+  { timeout: 30_000 },
+)
+
 test("a promoted V2 input row refuses its tree literally, including one promoted after inventory", () => {
-  const db = fixture()
+  const db = reducedFixture()
   try {
     session(db, "ses_prompted", 10)
     event(db, "ses_prompted")
@@ -1593,83 +1661,85 @@ test("a promoted V2 input row refuses its tree literally, including one promoted
   }
 })
 
-test("gated apply redacts a production-shaped store only when every gate passes, and refuses before any write otherwise", async () => {
-  await using tmp = await tmpdir()
-  await chmod(tmp.path, 0o700)
-  const filename = path.join(tmp.path, "opencode.db")
-  const db = new Database(filename)
-  try {
-    createSchema(db)
-    session(db, "ses_old", 10)
-    event(db, "ses_old")
-    addCopies(db, "ses_old")
-    const valid = evidence(["ses_old"], { ses_old: 0 }, filename)
-    const before = db.serialize()
-    const failures: Array<[string, RetentionEvidence]> = [
-      ["cross-process-liveness-proof-unavailable", { ...valid, holders: undefined }],
-      ["database-holder-scan-unreadable", { ...valid, holders: { state: "unreadable", reason: "procfs gone" } }],
-      ["measurement-handoff-receipt-unavailable", { ...valid, handoff: undefined }],
-      ["customer-session-classification-unavailable", { ...valid, customerBinding: undefined }],
-      ["reader-contract-unreviewed", { ...valid, readerContract: undefined }],
-      ["evidence-unreadable", { ...valid, evidenceError: "receipt unreadable" }],
-    ]
-    for (const [reason, failed] of failures) {
-      const result = applyGated(access(db), () => failed, () => NOW)
-      expect(result).toMatchObject({ action: "refused", changedRows: 0, eligibleTrees: 0 })
-      expect(result.reasons).toContain(reason)
+test(
+  "gated apply redacts a Session-produced store only when every gate passes, and refuses before any write otherwise",
+  async () => {
+    await using store = await producedStore([1])
+    const sessionID = store.trees[0]!.rootSessionID
+    const db = new Database(store.filename)
+    try {
+      const valid = evidence([sessionID], finalSequence(db, [sessionID]), store.filename)
+      const before = db.serialize()
+      const failures: Array<[string, RetentionEvidence, number]> = [
+        ["cross-process-liveness-proof-unavailable", { ...valid, holders: undefined }, store.now],
+        ["database-holder-scan-unreadable", { ...valid, holders: { state: "unreadable", reason: "procfs gone" } }, store.now],
+        ["measurement-handoff-receipt-unavailable", { ...valid, handoff: undefined }, store.now],
+        ["customer-session-classification-unavailable", { ...valid, customerBinding: undefined }, store.now],
+        ["reader-contract-unreviewed", { ...valid, readerContract: undefined }, store.now],
+        ["evidence-unreadable", { ...valid, evidenceError: "receipt unreadable" }, store.now],
+        // The producer wrote at or after producedFrom, so a window ending there has not yet elapsed.
+        ["session-tree-active-within-inactivity-window", valid, store.producedFrom + inactivityPolicy.windowMs],
+      ]
+      for (const [reason, failed, now] of failures) {
+        const result = applyGated(access(db), () => failed, () => now)
+        expect(result).toMatchObject({ action: "refused", changedRows: 0, eligibleTrees: 0 })
+        expect(result.reasons).toContain(reason)
+        expect(result.reasons).toContain("production-apply-disabled")
+        expect(db.serialize().equals(before)).toBe(true)
+      }
+
+      const applied = applyGated(access(db), () => valid, () => store.now)
+      expect(applied).toMatchObject({ action: "applied", eligibleTrees: 1, completedSessionIDs: [sessionID], reasons: [] })
+      expect(applied.changedRows).toBeGreaterThan(0)
+      expect(db.query("SELECT state FROM event_retention WHERE aggregate_id = ?").get(sessionID)).toEqual({
+        state: "complete",
+      })
+      expect(eventRows(db, sessionID).map((row) => row.data).join("\n")).not.toContain("sentinel")
+    } finally {
+      db.close()
+    }
+  },
+  { timeout: 30_000 },
+)
+
+test(
+  "a gate failing after committed batches reports partial progress and stops every further write",
+  async () => {
+    await using store = await producedStore([1, 1])
+    const sessionIDs = store.trees.map((tree) => tree.rootSessionID).toSorted()
+    const db = new Database(store.filename)
+    try {
+      // The customer classification and receipt cover the whole store here, as a store-wide producer
+      // would; the holder scan is the real producer until it stops answering after two batches.
+      let calls = 0
+      const proof = (): RetentionEvidence => {
+        calls += 1
+        const current = evidence(sessionIDs, finalSequence(db, sessionIDs), store.filename)
+        return calls <= 3 ? current : { ...current, holders: { state: "unreadable", reason: "scan stopped" } }
+      }
+      const copies = (sessionID: string) =>
+        [eventRows(db, sessionID), db.query("SELECT data FROM part WHERE session_id = ?").all(sessionID)].map((rows) =>
+          JSON.stringify(rows),
+        )
+      const before = Object.fromEntries(sessionIDs.map((id) => [id, copies(id)]))
+
+      const result = applyGated(access(db), proof, () => store.now)
+
+      expect(result.action).toBe("partial")
+      expect(result.changedRows).toBeGreaterThan(0)
+      expect(result.reasons).toContain("database-holder-scan-unreadable:scan stopped")
       expect(result.reasons).toContain("production-apply-disabled")
-      expect(db.serialize().equals(before)).toBe(true)
+      const markers = db
+        .query<{ aggregate_id: string; state: string }, []>("SELECT aggregate_id, state FROM event_retention")
+        .all()
+      expect(markers.map((marker) => marker.state)).toEqual(["redacting"])
+      const untouched = sessionIDs.filter((id) => id !== markers[0]!.aggregate_id)
+      expect(untouched).toHaveLength(1)
+      expect(copies(untouched[0]!)).toEqual(before[untouched[0]!]!)
+    } finally {
+      db.close()
     }
+  },
+  { timeout: 30_000 },
+)
 
-    const applied = applyGated(access(db), () => valid, () => NOW)
-    expect(applied).toMatchObject({ action: "applied", eligibleTrees: 1, completedSessionIDs: ["ses_old"], reasons: [] })
-    expect(applied.changedRows).toBeGreaterThan(0)
-    expect(db.query("SELECT state FROM event_retention WHERE aggregate_id = 'ses_old'").get()).toEqual({
-      state: "complete",
-    })
-    expect(eventRows(db, "ses_old").map((row) => row.data).join("\n")).not.toContain("sentinel")
-  } finally {
-    db.close()
-  }
-})
-
-test("a gate failing after committed batches reports partial progress and stops every further write", async () => {
-  await using tmp = await tmpdir()
-  await chmod(tmp.path, 0o700)
-  const filename = path.join(tmp.path, "opencode.db")
-  const db = new Database(filename)
-  try {
-    createSchema(db)
-    for (const id of ["ses_a", "ses_b"]) {
-      session(db, id, 10)
-      event(db, id)
-      addCopies(db, id)
-    }
-    // The customer classification and receipt cover the whole store here, as a store-wide producer
-    // would; the holder scan is the real producer until it stops answering after two batches.
-    let calls = 0
-    const proof = (): RetentionEvidence => {
-      calls += 1
-      const store = evidence(["ses_a", "ses_b"], { ses_a: 0, ses_b: 0 }, filename)
-      return calls <= 3 ? store : { ...store, holders: { state: "unreadable", reason: "scan stopped" } }
-    }
-    const sessionB = () =>
-      [eventRows(db, "ses_b"), db.query("SELECT data FROM part WHERE session_id = 'ses_b'").all()].map((rows) =>
-        JSON.stringify(rows),
-      )
-    const bBefore = sessionB()
-
-    const result = applyGated(access(db), proof, () => NOW)
-
-    expect(result.action).toBe("partial")
-    expect(result.changedRows).toBeGreaterThan(0)
-    expect(result.reasons).toContain("database-holder-scan-unreadable:scan stopped")
-    expect(result.reasons).toContain("production-apply-disabled")
-    expect(db.query("SELECT aggregate_id, state FROM event_retention").all()).toEqual([
-      { aggregate_id: "ses_a", state: "redacting" },
-    ])
-    expect(sessionB()).toEqual(bBefore)
-  } finally {
-    db.close()
-  }
-})
