@@ -38,3 +38,22 @@ No live apply, process restart, file move or compaction is part of this work.
 Focused tests only: `packages/opencode/test/cli/db/retention.test.ts`,
 `packages/opencode/test/server/httpapi-sync.test.ts` (after D1), plus the core writer-record test.
 Each new or rewritten assertion gets a recorded removal red proof. `bun typecheck` per touched package.
+
+## Round 1 review fixes
+
+1. Holder freshness. `apply` rescans the database holders with `scanDatabaseHolders` inside each batch's
+   BEGIN IMMEDIATE transaction. Every holder in that scan must pass the registration check, and any holder
+   absent from the caller's evidence scan refuses the batch as `database-holder-appeared-after-scan:<pid>`.
+   Regression: a holder that opens the store after the evidence scan refuses before any write; it is red
+   with the in-lock rescan removed.
+2. Realistic fixtures. A child-process producer (`test/fixture/retention-producer.ts`) writes Session trees
+   into a store initialized by the production Database layer, through the real Session, Todo and EventV2
+   producers, then exits so its writer registration names a dead process. The positive retention tests
+   (metric-preserving restartable apply, exact dry-run tree, gated apply, partial gated apply, apply on a
+   scanned file, and the held/unregistered/late holder tests) run on that store. The reduced hand-built
+   schema stays only for tests that assert a refusal, and is named and commented as the negative fixture.
+3. `/proc/locks` arm. A holder that makes itself non-dumpable, so its descriptors cannot be read, is found
+   only through `/proc/locks`; the test is red with that arm removed.
+
+Production enablement stays refused (D1, D2, D3 unchanged); `production-apply-disabled` stays on every
+call that fails a gate.
