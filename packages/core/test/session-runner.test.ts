@@ -1096,8 +1096,9 @@ describe("SessionV2.wait", () => {
           message.type === "assistant" &&
           message.content.some((content) => content.type === "text" && content.text === "Recovered"),
       )
-      expect(recovered?.finish).toBe("stop")
-      expect(result).toEqual({ type: "completed", admittedSeq: second.admittedSeq, assistantMessageID: recovered?.id })
+      if (!recovered) throw new Error("Expected the recovered assistant")
+      expect(recovered.finish).toBe("stop")
+      expect(result).toEqual({ type: "completed", admittedSeq: second.admittedSeq, assistantMessageID: recovered.id })
       expect(second.admittedSeq).toBeGreaterThan(first.admittedSeq)
       expect(requests).toHaveLength(2)
     }),
@@ -1149,9 +1150,58 @@ describe("SessionV2.wait", () => {
             (content) => content.type === "text" && content.text === "Answered after the interruption",
           ),
       )
-      expect(answered?.finish).toBe("stop")
-      expect(result).toEqual({ type: "completed", admittedSeq: second.admittedSeq, assistantMessageID: answered?.id })
+      if (!answered) throw new Error("Expected the assistant that answered after the interruption")
+      expect(answered.finish).toBe("stop")
+      expect(result).toEqual({ type: "completed", admittedSeq: second.admittedSeq, assistantMessageID: answered.id })
       expect(requests).toHaveLength(2)
+    }),
+  )
+
+  it.effect("keeps an earlier drain's failure out of a later drain's continuation steer", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const gate = yield* Deferred.make<void>()
+      const providerStarted = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          responseStream = undefined
+        }).pipe(Effect.andThen(Deferred.succeed(gate, undefined)), Effect.asVoid),
+      )
+      responses = [
+        [LLMEvent.stepStart({ index: 0 }), LLMEvent.providerError({ message: "Provider failed the first drain" })],
+        textTurn("text-wait-steer-in-later-drain", "Steer answered"),
+      ]
+      const first = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Fail the first drain" }) })
+      expect(yield* session.wait(sessionID)).toMatchObject({ type: "failed", admittedSeq: first.admittedSeq })
+      expect(Array.from(yield* session.active)).toEqual([])
+
+      streamStartAcks.push(providerStarted)
+      responseStream = Stream.unwrap(
+        Deferred.await(gate).pipe(Effect.as(Stream.fromIterable(textTurn("text-wait-later-drain", "Second answered")))),
+      )
+      const second = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Start the later drain" }) })
+      yield* awaitStreamStart(providerStarted)
+      const steered = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Steer the later drain" }) })
+      yield* Deferred.succeed(gate, undefined)
+      const result = yield* session.wait(sessionID)
+
+      const history = yield* session.history({ sessionID, limit: 100 })
+      const steerPromotion = history.events.find(
+        (event): event is SessionEvent.Prompted =>
+          event.type === SessionEvent.Prompted.type && event.data.messageID === steered.id,
+      )
+      expect(steerPromotion?.data.continuation).toBe(true)
+      const answered = (yield* session.messages({ sessionID })).find(
+        (message): message is SessionMessage.Assistant =>
+          message.type === "assistant" &&
+          message.content.some((content) => content.type === "text" && content.text === "Steer answered"),
+      )
+      if (!answered) throw new Error("Expected the assistant that answered the steer")
+      expect(answered.finish).toBe("stop")
+      expect(result).toEqual({ type: "completed", admittedSeq: steered.admittedSeq, assistantMessageID: answered.id })
+      expect(steered.admittedSeq).toBeGreaterThan(second.admittedSeq)
+      expect(requests).toHaveLength(3)
     }),
   )
 

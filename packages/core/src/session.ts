@@ -3,7 +3,7 @@ export * from "./session/schema"
 
 import { Cause, DateTime, Effect, Exit, Layer, Schema, Context, Stream } from "effect"
 import { ListAnchor } from "@opencode-ai/schema/session"
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, like, lt, or, type SQL } from "drizzle-orm"
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, like, lt, lte, or, type SQL } from "drizzle-orm"
 import { ProjectV2 } from "./project"
 import { WorkspaceV2 } from "./workspace"
 import { ModelV2 } from "./model"
@@ -281,28 +281,29 @@ const layer = Layer.effect(
               .orderBy(desc(EventTable.seq))
               .all()
               .pipe(Effect.orDie)
-            const checkpointBefore = (seq: number, failureCloses: boolean) =>
+            const checkpointBefore = (seq: number, workStart: number) =>
               terminalSteps.find(
                 (event) =>
                   event.seq < seq &&
                   (event.type === EventV2.versionedType(SessionEvent.Step.Failed.type, 2)
-                    ? failureCloses
+                    ? event.seq < workStart
                     : Schema.decodeUnknownSync(SessionEvent.Step.Ended.data)(event.data).finish !== "tool-calls"),
               )
-            const latestPromotion =
+            const promotions =
               latestInput?.promoted_seq === null || latestInput?.promoted_seq === undefined
-                ? undefined
+                ? []
                 : yield* tx
-                    .select({ data: EventTable.data })
+                    .select({ seq: EventTable.seq, data: EventTable.data })
                     .from(EventTable)
                     .where(
                       and(
                         eq(EventTable.aggregate_id, sessionID),
-                        eq(EventTable.seq, latestInput.promoted_seq),
                         eq(EventTable.type, EventV2.versionedType(SessionEvent.Prompted.type, 1)),
+                        lte(EventTable.seq, latestInput.promoted_seq),
                       ),
                     )
-                    .get()
+                    .orderBy(desc(EventTable.seq))
+                    .all()
                     .pipe(Effect.orDie)
             const latestAssistant = latestInput
               ? undefined
@@ -314,16 +315,19 @@ const layer = Layer.effect(
                   .limit(1)
                   .get()
                   .pipe(Effect.orDie)
-            // A failed step stays in the work group of input its own drain promoted at a provider-turn boundary,
-            // until a successful non-continuation step closes the group. Input promoted any other way starts after it.
+            // Work starts at the latest promotion that was not a continuation: a drain start or a would-idle queue
+            // promotion. A failed step committed before that start closes the group; a failure inside the work stays
+            // until a successful non-continuation step closes it. Pending input has not started work yet.
+            const workStart =
+              latestInput?.promoted_seq === null || latestInput?.promoted_seq === undefined
+                ? Number.POSITIVE_INFINITY
+                : (promotions.find(
+                    (event) => Schema.decodeUnknownSync(SessionEvent.Prompted.data)(event.data).continuation !== true,
+                  )?.seq ?? -1)
             const checkpoint =
               latestInput !== undefined
-                ? checkpointBefore(
-                    latestInput.admitted_seq,
-                    latestPromotion === undefined ||
-                      Schema.decodeUnknownSync(SessionEvent.Prompted.data)(latestPromotion.data).continuation !== true,
-                  )?.seq
-                : latestAssistant && checkpointBefore(latestAssistant.seq, false)?.seq
+                ? checkpointBefore(latestInput.admitted_seq, workStart)?.seq
+                : latestAssistant && checkpointBefore(latestAssistant.seq, -1)?.seq
             const rows = yield* tx
               .select()
               .from(SessionMessageTable)
