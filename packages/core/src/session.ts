@@ -417,10 +417,10 @@ const layer = Layer.effect(
               assistantMessageID: failedAssistant.message.id,
             }
       }
-      // A failed call is recovered only by a later successful retry, in this assistant or a later one. A retry has the
-      // same tool name and arguments. The provider call ID is ignored: a retry may carry a fresh ID, and providers such
-      // as Gemini reuse generated IDs across streams for unrelated calls.
-      const failedTool = latestTools.find(
+      // A failed call is recovered only by a later repeat that completes, in this assistant or a later one. A repeat has
+      // the same tool name and arguments. The provider call ID is not part of a repeat: a recovery may carry a fresh ID,
+      // and providers such as Gemini reuse generated IDs across streams for unrelated calls.
+      const unrecoveredTool = latestTools.find(
         ({ content }, index) =>
           content.state.status === "error" &&
           !latestTools
@@ -432,11 +432,11 @@ const layer = Layer.effect(
                 Equal.equals(later.content.state.input, content.state.input),
             ),
       )
-      if (failedTool)
+      if (unrecoveredTool)
         return {
           type: "failed",
           ...(admittedSeq === undefined ? {} : { admittedSeq }),
-          assistantMessageID: failedTool.assistantMessageID,
+          assistantMessageID: unrecoveredTool.assistantMessageID,
         }
 
       if (projection.pending) {

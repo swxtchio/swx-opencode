@@ -786,7 +786,7 @@ describe("SessionV2.wait", () => {
     }),
   )
 
-  it.effect("completes when a later assistant retries a failed tool call across a steer", () =>
+  it.effect("completes when a later assistant recovers a failed tool call across a steer", () =>
     Effect.gen(function* () {
       yield* setupNative
       const session = yield* SessionV2.Service
@@ -802,7 +802,7 @@ describe("SessionV2.wait", () => {
         }).pipe(Effect.andThen(Deferred.succeed(toolGate, undefined)), Effect.asVoid),
       )
       yield* registry.register({
-        retryOnce: Tool.make({
+        recoverOnce: Tool.make({
           description: "Fail once, then recover",
           input: Schema.Struct({}),
           output: Schema.Struct({}),
@@ -819,19 +819,19 @@ describe("SessionV2.wait", () => {
       responses = [
         [
           LLMEvent.stepStart({ index: 0 }),
-          LLMEvent.toolCall({ id: "call-wait-retry", name: "retryOnce", input: {} }),
+          LLMEvent.toolCall({ id: "call-wait-recovery", name: "recoverOnce", input: {} }),
           LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
           LLMEvent.finish({ reason: "tool-calls" }),
         ],
         [
           LLMEvent.stepStart({ index: 0 }),
-          LLMEvent.toolCall({ id: "call-wait-retry", name: "retryOnce", input: {} }),
+          LLMEvent.toolCall({ id: "call-wait-recovery", name: "recoverOnce", input: {} }),
           LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
           LLMEvent.finish({ reason: "tool-calls" }),
         ],
-        textTurn("text-wait-after-retry", "Recovered"),
+        textTurn("text-wait-after-recovery", "Recovered"),
       ]
-      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Retry the tool call" }) })
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Repeat the tool call" }) })
       yield* Deferred.await(toolStarted)
       joinAck = joined
       const waiter = yield* session.wait(sessionID).pipe(
@@ -839,7 +839,7 @@ describe("SessionV2.wait", () => {
         Effect.flatMap((exit) => Deferred.succeed(outcome, exit)),
         Effect.forkChild,
       )
-      yield* awaitSignal(joined, "wait did not join the retrying tool turn")
+      yield* awaitSignal(joined, "wait did not join the recovering tool turn")
       const steered = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Keep going" }) })
       yield* Deferred.succeed(toolGate, undefined)
 
@@ -848,17 +848,17 @@ describe("SessionV2.wait", () => {
       const assistants = (yield* session.messages({ sessionID, order: "asc" })).filter(
         (message): message is SessionMessage.Assistant => message.type === "assistant",
       )
-      const retried = assistants.flatMap((message) =>
+      const repeated = assistants.flatMap((message) =>
         message.content.flatMap((content) =>
-          content.type === "tool" && content.id === "call-wait-retry"
+          content.type === "tool" && content.id === "call-wait-recovery"
             ? [{ assistantMessageID: message.id, status: content.state.status }]
             : [],
         ),
       )
-      expect(retried.map((tool) => tool.status)).toEqual(["error", "completed"])
-      expect(retried[0]?.assistantMessageID).not.toBe(retried[1]?.assistantMessageID)
+      expect(repeated.map((tool) => tool.status)).toEqual(["error", "completed"])
+      expect(repeated[0]?.assistantMessageID).not.toBe(repeated[1]?.assistantMessageID)
       const recovered = assistants.at(-1)
-      if (!recovered) throw new Error("Expected the assistant that answered after the retry")
+      if (!recovered) throw new Error("Expected the assistant that answered after the recovery")
       expect(recovered.content).toContainEqual(expect.objectContaining({ type: "text", text: "Recovered" }))
       expect(result).toMatchObject({
         _tag: "Success",
@@ -879,7 +879,7 @@ describe("SessionV2.wait", () => {
           description: "Fail with a provider-local call ID",
           input: Schema.Struct({}),
           output: Schema.Struct({}),
-          execute: () => Effect.die("tool failure that is never retried"),
+          execute: () => Effect.die("tool failure that is never repeated"),
         }),
         succeedsLater: Tool.make({
           description: "Succeed under the same provider-local call ID",
@@ -977,7 +977,7 @@ describe("SessionV2.wait", () => {
     }),
   )
 
-  it.effect("completes when a later assistant retries a failed call with identical arguments and a fresh ID", () =>
+  it.effect("completes when a later assistant recovers a failed call with a repeat under a fresh ID", () =>
     Effect.gen(function* () {
       yield* setupNative
       const session = yield* SessionV2.Service
@@ -1001,11 +1001,11 @@ describe("SessionV2.wait", () => {
         ],
         [
           LLMEvent.stepStart({ index: 0 }),
-          LLMEvent.toolCall({ id: "call-wait-fresh-retry", name: "bash", input: { command: "make test" } }),
+          LLMEvent.toolCall({ id: "call-wait-fresh-repeat", name: "bash", input: { command: "make test" } }),
           LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
           LLMEvent.finish({ reason: "tool-calls" }),
         ],
-        textTurn("text-wait-after-fresh-retry", "Tests pass"),
+        textTurn("text-wait-after-fresh-repeat", "Tests pass"),
       ]
       const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run the tests" }) })
       const result = yield* session.wait(sessionID)
@@ -1023,17 +1023,17 @@ describe("SessionV2.wait", () => {
       )
       expect(calls.map((call) => [call.id, call.status])).toEqual([
         ["call-wait-first-attempt", "error"],
-        ["call-wait-fresh-retry", "completed"],
+        ["call-wait-fresh-repeat", "completed"],
       ])
       expect(calls[0]?.assistantMessageID).not.toBe(calls[1]?.assistantMessageID)
       const answered = assistants.at(-1)
-      if (!answered) throw new Error("Expected the assistant that answered after the retry")
+      if (!answered) throw new Error("Expected the assistant that answered after the recovery")
       expect(result).toEqual({ type: "completed", admittedSeq: admitted.admittedSeq, assistantMessageID: answered.id })
       expect(requests).toHaveLength(3)
     }),
   )
 
-  it.effect("completes when a later Gemini stream retries a failed call at a new position", () =>
+  it.effect("completes when a later Gemini stream recovers a failed call with a repeat at a new position", () =>
     Effect.gen(function* () {
       yield* setupNative
       const session = yield* SessionV2.Service
@@ -1053,7 +1053,7 @@ describe("SessionV2.wait", () => {
             }),
         }),
       })
-      // The first stream numbers its two calls tool_0 and tool_1. The retry is the only call in the next stream, so the
+      // The first stream numbers its two calls tool_0 and tool_1. The repeat is the only call in the next stream, so the
       // parser numbers it tool_0, the ID of the first stream's other call.
       responses = [
         yield* geminiTurn([
@@ -1084,14 +1084,14 @@ describe("SessionV2.wait", () => {
         [],
       ])
       const answered = assistants.at(-1)
-      if (!answered) throw new Error("Expected the assistant that answered after the retry")
+      if (!answered) throw new Error("Expected the assistant that answered after the recovery")
       expect(answered.content).toContainEqual(expect.objectContaining({ type: "text", text: "Tests pass" }))
       expect(result).toEqual({ type: "completed", admittedSeq: admitted.admittedSeq, assistantMessageID: answered.id })
       expect(requests).toHaveLength(3)
     }),
   )
 
-  it.effect("completes a tool call retried under the same assistant identity", () =>
+  it.effect("completes a tool call recovered under the same assistant identity", () =>
     Effect.gen(function* () {
       yield* setupNative
       const session = yield* SessionV2.Service
@@ -1099,12 +1099,12 @@ describe("SessionV2.wait", () => {
       const { db } = yield* Database.Service
       const admission = yield* session.prompt({
         sessionID,
-        prompt: Prompt.make({ text: "Retry the same hosted tool call" }),
+        prompt: Prompt.make({ text: "Repeat the same hosted tool call" }),
         resume: false,
       })
       yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER)
       const assistantMessageID = SessionMessage.ID.create()
-      const callID = "call-same-assistant-retry"
+      const callID = "call-same-assistant-recovery"
       yield* publishHostedToolCall({ events, sessionID, assistantMessageID, callID })
       const failureTime = yield* DateTime.now
       yield* events.publish(SessionEvent.Tool.Failed, {
@@ -1115,10 +1115,10 @@ describe("SessionV2.wait", () => {
         error: { type: "unknown", message: "Transient hosted-tool failure" },
         provider: { executed: true },
       })
-      const retryTime = yield* DateTime.now
+      const repeatTime = yield* DateTime.now
       yield* events.publish(SessionEvent.Tool.Called, {
         sessionID,
-        timestamp: retryTime,
+        timestamp: repeatTime,
         assistantMessageID,
         callID,
         tool: "web_search",
