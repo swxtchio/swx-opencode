@@ -133,41 +133,59 @@ and re-run green.
   final-sequence receipt. The existing "a missing measurement receipt refuses…" test is kept.
 - Unproved: valid producer-derived coverage enabling a candidate, because no producer exists yet.
 
-### 5. Mixed `/sync/history` reader — implemented per captain decision 1; the production gate stays refused
+### 5. Mixed `/sync/history` reader — implemented per captain decisions; the production gate stays refused
 
-- Decision (2026-10-11): the reader must not fail on pruned data. A request touching a pruned Session returns 200
-  with the other Sessions' events; the pruned Session contributes none; `X-Pruned-Sessions` lists each pruned Session
-  with its last sequence number; the body stays the unchanged bare event array.
-- `readSyncHistory` (`packages/opencode/src/server/routes/instance/httpapi/handlers/sync.ts`) reads, in one
-  transaction, the aggregates the request touches (its payload keys plus every aggregate with events past its cursor)
-  and the retention markers in a state `EventV2.unreplayableRetentionStates` names (`redacting`, `complete`). The
-  touched marked aggregates are excluded in SQL, so their rows are never read or decoded, and are returned as
-  `pruned`, keyed by Session ID with `event_sequence.seq`.
-- The `history` handler returns the same event array. When `pruned` is non-empty, it sets
-  `X-Pruned-Sessions` to a JSON object of Session ID to last sequence, e.g. `{"ses_…":7}`. That is the request
-  payload's own shape and the same JSON-object convention as the existing fence header. With nothing pruned there is
-  no header. The endpoint's OpenAPI description says so; `packages/sdk/openapi.json` and the legacy JS SDK carry
-  the new description (only that line: regenerating `openapi.json` also surfaced unrelated pre-existing drift, which
-  is left out), and `packages/client` regenerates unchanged.
+- Decision 1 (2026-10-11): the reader must not fail on pruned data. A request touching a pruned Session returns 200
+  with the other Sessions' events, the pruned Session contributes none, and the body stays the unchanged bare event
+  array. Its fourth point, a header naming every pruned Session with its last sequence, is superseded by the
+  header-bound decision (2026-10-11): list them as ranges, best effort, within a safe header budget.
+- `readSyncHistory` (`packages/opencode/src/server/routes/instance/httpapi/handlers/sync.ts`) reads in one
+  transaction. Every aggregate whose retention marker is in a state `EventV2.unreplayableRetentionStates` names
+  (`redacting`, `complete`) is excluded from the event query through a subquery, so its rows are never read or
+  decoded and their count cannot reach SQLite's bound-variable limit. When any is pruned, it also reads every ID the
+  store holds (Session rows and event sequences) and returns the pruned ones as ranges.
+- Range semantics, against the identifier contract. A Session ID is any string starting with `ses`
+  (`packages/schema/src/session-id.ts`). Generated IDs are time-descending plus random, and callers may supply their
+  own, so no interval of IDs is reserved and a range can honestly speak only for Sessions this server holds:
+  - `first..last` (or a lone ID) means every Session this server holds whose ID sorts, in string order, between
+    first and last inclusive is pruned, as of the response.
+  - Ranges are maximal runs of pruned IDs over the server's sorted held IDs, so no range spans an unpruned Session
+    it holds. A range says nothing about IDs this server does not hold.
+  - Endpoints use only `[A-Za-z0-9_-]`; a pruned ID outside that set ends a run and is not listed. That keeps `,`
+    and `..` unambiguous, and with ASCII endpoints UTF-16 and byte order agree on which IDs fall in a range.
+- Bound and best effort: the header carries the ascending prefix of ranges whose whole line (name, `: `, value,
+  CRLF) fits `PrunedSessionsHeaderBudget`, 2048 bytes. That leaves half of a common 4 KiB proxy response-header
+  buffer (nginx's default `proxy_buffer_size`) for ordinary headers, well under Node's 16 KiB client limit. What is
+  listed is exact; a Session the header does not cover may still be pruned. There is no header when nothing is
+  listed. Per-Session last sequence numbers are no longer carried, because a range cannot hold one per Session.
+- The contract is documented in the endpoint's OpenAPI description. `packages/sdk/openapi.json` (that line only:
+  regenerating it also surfaces unrelated pre-existing drift, left out) and the legacy JS SDK carry it, and
+  `packages/client` regenerates unchanged.
 - `/sync/replay` onto a redacted aggregate stays refused ("refuses sync replay onto a redacted aggregate without
   changing its rows").
-- Tests in `packages/opencode/test/server/httpapi-sync.test.ts`, on one Session pruned by a real retention apply and
-  one kept peer, each across three payloads (the pruned Session omitted, listed past its first event, and listed at
-  its last sequence):
+- Tests in `packages/opencode/test/server/httpapi-sync.test.ts`. The first four use one Session pruned by a real
+  retention apply and one kept peer, each across three payloads (the pruned Session omitted, listed past its first
+  event, and listed at its last sequence):
   - "a history request touching a pruned Session returns 200 with the other Sessions' events".
   - "a pruned Session contributes no events to sync history, and its rows are never read": the pruned rows are made
     undecodable first, and the request still succeeds without them.
-  - "the X-Pruned-Sessions header lists each pruned Session with its last sequence number": the expected sequence
-    is read from the producer before retention.
+  - "the X-Pruned-Sessions header names the pruned Session as a range and no unpruned Session": it covers the pruned
+    Session, not the kept one, and no held Session inside a range is unpruned.
   - "sync history keeps its bare event array body when a Session is pruned": an array of rows with exactly
     `aggregate_id`, `data`, `id`, `seq`, `type`, equal to the unpruned rows past each cursor.
-- Red proofs: RP27 (the no-fail path reverted), RP28 (the header reverted), RP29 (the pruned-row exclusion reverted).
+  - "a standard HTTP client syncs a high-cardinality pruned history without response-header overflow": 700 Sessions,
+    550 of them pruned through a real retention apply (150 interleaved with kept ones, 400 contiguous). Node's
+    `http` client, with its default 16 KiB header limit, posts over TCP to the real Node HTTP server that serves the
+    app. The response is 200 with exactly the kept Sessions' events in a bare array. The header line fits 2048
+    bytes, its ranges ascend, cover the 400 contiguous Sessions, and cover no kept or other unpruned held Session.
+- The retention test fixture (`test/fixture/session-retention.ts`) now prunes many Sessions in one pass, on an
+  in-memory copy of the store, so pruning 550 takes seconds rather than paying a procfs holder scan per batch. The
+  apply code is unchanged.
+- Red proofs: RP27 to RP29 (decision 1), rerun against the range implementation, and RP30 to RP32.
 - Still refused: `readerContract` evidence is absent in production, so every tree refuses with
-  `reader-contract-unreviewed`. Supplying it would change the production refusal, which this scope addition forbids.
-- Not done, not required by the decision: `Workspace.syncHistory`, the in-repo client of this route, ignores the
-  header. A workspace that already holds a pruned Session gets no events for it and is not told it was pruned. A
-  store with many pruned Sessions also grows the header by about 40 bytes per touched pruned Session, and many HTTP
-  clients cap response headers near 16 KB, roughly 400 Sessions.
+  `reader-contract-unreviewed`. Supplying it would change the production refusal, which neither decision allows.
+- Not done, not required: `Workspace.syncHistory`, the in-repo client of this route, ignores the header. A workspace
+  that already holds a pruned Session gets no events for it and is not told it was pruned.
 
 ### 6. Literal `v2-input-promoted-row-present` — kept
 
@@ -247,6 +265,11 @@ and re-run green.
 | Round-1 fixes, `packages/opencode`: `bun test test/session/session.test.ts -t "retention\|Retention"` | 4 pass, 0 fail |
 | Round-1 fixes, `packages/opencode`: `bun test test/server/httpapi-sync.test.ts` | 4 pass, 0 fail, 1 skipped |
 | Decision 1, `packages/opencode`: `bun test test/server/httpapi-sync.test.ts` | 7 pass, 0 fail, 1 skipped |
+| Header bound, `packages/opencode`: `bun test test/server/httpapi-sync.test.ts` | 8 pass, 0 fail, 1 skipped |
+| Header bound, `packages/opencode`: `bun test test/session/session.test.ts -t "retention\|Retention"` | 4 pass, 0 fail |
+| Header bound, `packages/opencode`: `bun test test/server/httpapi-session.test.ts -t redacted` | 1 pass |
+| Header bound, `packages/opencode`: `bun test test/control-plane/workspace.test.ts -t redacted` | 1 pass |
+| Header bound, `packages/opencode`: `bun typecheck` | clean |
 | Decision 1, `packages/opencode`: `bun test test/control-plane/workspace.test.ts -t "redacted"` | 1 pass |
 | Decision 1, `packages/opencode`: `bun test test/server/httpapi-session.test.ts -t "redacted aggregate before returning content"` | 1 pass |
 | Decision 1, `packages/core` and `packages/opencode`: `bun typecheck` | clean |
@@ -287,9 +310,12 @@ restored from a byte copy, with `git status` clean afterwards.
 | RP24 | in-lock holder rescan (`lockedHolderFailures`) in `revalidateCandidate` | "opens the store after the evidence scan" 0 pass, 1 fail: apply completed 17 rows with the holder present |
 | RP25 | `/proc/locks` holders dropped from the scan result | "found through its SQLite lock" 0 pass, 1 fail: `pids: []` |
 | RP26 | `model` dropped from the retained metric objects | producer-built "restartable batches" 0 pass, 1 fail; the pre-fix reduced-fixture test at `9d5610eb` 1 pass |
-| RP27 | replayability preflight restored in `readSyncHistory` (no-fail path reverted) | `httpapi-sync.test.ts` 3 pass, 4 fail: all four pruned-Session tests |
-| RP28 | `X-Pruned-Sessions` header not set | 6 pass, 1 fail: the header test |
-| RP29 | pruned rows no longer excluded | 5 pass, 2 fail: "contributes no events" and "bare event array body" |
+| RP27 | replayability preflight restored in `readSyncHistory` (no-fail path reverted) | `httpapi-sync.test.ts`, range implementation: 3 pass, 5 fail: every pruned-Session test |
+| RP28 | `X-Pruned-Sessions` header not set | 6 pass, 2 fail: the range header test and the high-cardinality test |
+| RP29 | pruned rows no longer excluded | 5 pass, 3 fail: "contributes no events", "bare event array body" and the high-cardinality test |
+| RP30 | complete enumeration restored (a JSON object of every pruned Session) | high-cardinality test fails: Node's client reports `HPE_HEADER_OVERFLOW Parse Error: Header overflow` |
+| RP31 | header budget removed | 7 pass, 1 fail: the high-cardinality test, a 4,733-byte header line |
+| RP32 | runs allowed to span unpruned Sessions | 6 pass, 2 fail: the range header test and the high-cardinality test, a kept Session covered |
 
 ## Measured selection on the live store (read-only, 2026-10-11T20:23:44Z)
 
