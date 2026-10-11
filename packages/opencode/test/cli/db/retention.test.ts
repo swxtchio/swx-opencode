@@ -527,6 +527,8 @@ test("apply redacts every copy in restartable batches and preserves metric value
     maxBatches: 1,
   })
   expect(firstBatch.state).toBe("in-progress")
+  expect(firstBatch.lockHold.batches).toBe(1)
+  expect(firstBatch.lockHold.maxMs).toBeGreaterThan(0)
   expect(
     first.query<{ state: string }, [string]>("SELECT state FROM event_retention WHERE aggregate_id = ?").get("ses_old")
       ?.state,

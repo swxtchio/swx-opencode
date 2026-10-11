@@ -134,7 +134,12 @@ export type RetentionApplyResult = {
   readonly changedBytes: number
   readonly completedSessionIDs: readonly string[]
   readonly reasons: readonly string[]
+  // Write-lock hold per batch, from the moment BEGIN IMMEDIATE holds the lock (including in-lock
+  // revalidation) until COMMIT or ROLLBACK returns.
+  readonly lockHold: LockHold
 }
+
+export type LockHold = { readonly batches: number; readonly maxMs: number; readonly totalMs: number }
 
 export type CompactFixtureResult = {
   readonly state: "complete" | "refused"
@@ -1131,6 +1136,12 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
   let batches = 0
   const completedSessionIDs = new Set<string>()
   const reasons = new Set<string>()
+  const holds = new Array<number>()
+  const lockHold = (): LockHold => ({
+    batches: holds.length,
+    maxMs: holds.reduce((max, value) => Math.max(max, value), 0),
+    totalMs: holds.reduce((total, value) => total + value, 0),
+  })
 
   if (!input.tree.eligible) {
     return {
@@ -1139,6 +1150,7 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
       changedBytes,
       completedSessionIDs: [],
       reasons: input.tree.reasons,
+      lockHold: lockHold(),
     }
   }
   while (batches < maxBatches) {
@@ -1157,9 +1169,11 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
     } catch (error) {
       evidence = { evidenceError: error instanceof Error ? error.message : "unknown" }
     }
+    let acquired: number | undefined
     try {
       batch = db
         .transaction(() => {
+          acquired = performance.now()
           const proofFailures = revalidateCandidate(db, input.tree, evidence, now())
           if (proofFailures.length > 0) {
             return {
@@ -1248,7 +1262,9 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
           return { state: "complete" as const, changedRows: 0, changedBytes: 0 }
         })
         .immediate()
+      if (acquired !== undefined) holds.push(performance.now() - acquired)
     } catch (error) {
+      if (acquired !== undefined) holds.push(performance.now() - acquired)
       reasons.add(`apply-transaction-failed:${error instanceof Error ? error.message : "unknown"}`)
       return {
         state: batches > 0 ? "in-progress" : "refused",
@@ -1256,6 +1272,7 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
         changedBytes,
         completedSessionIDs: Array.from(completedSessionIDs).toSorted(),
         reasons: Array.from(reasons).toSorted(),
+        lockHold: lockHold(),
       }
     }
     if (batch.state === "refused") {
@@ -1266,6 +1283,7 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
         changedBytes,
         completedSessionIDs: Array.from(completedSessionIDs).toSorted(),
         reasons: Array.from(reasons).toSorted(),
+        lockHold: lockHold(),
       }
     }
     changedRows += batch.changedRows
@@ -1278,6 +1296,7 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
         changedBytes,
         completedSessionIDs: Array.from(completedSessionIDs).toSorted(),
         reasons: [],
+        lockHold: lockHold(),
       }
     }
   }
@@ -1288,6 +1307,7 @@ export function apply(db: SqliteAccess, input: ApplyInput): RetentionApplyResult
     changedBytes,
     completedSessionIDs: Array.from(completedSessionIDs).toSorted(),
     reasons: Array.from(reasons).toSorted(),
+    lockHold: lockHold(),
   }
 }
 
@@ -2010,6 +2030,7 @@ function productionEvidence(filename: string): RetentionEvidence {
 
 export type GatedApplyResult = {
   readonly action: "applied" | "partial" | "refused"
+  readonly lockHold: LockHold
   readonly changedRows: number
   readonly changedBytes: number
   readonly completedSessionIDs: readonly string[]
@@ -2033,6 +2054,7 @@ export function applyGated(db: SqliteAccess, evidence: () => RetentionEvidence, 
     if (dryRun.trees.length === 0) kinds.add("no-retention-candidate")
     return {
       action: "refused",
+      lockHold: { batches: 0, maxMs: 0, totalMs: 0 },
       changedRows: 0,
       changedBytes: 0,
       completedSessionIDs: [],
@@ -2042,16 +2064,24 @@ export function applyGated(db: SqliteAccess, evidence: () => RetentionEvidence, 
     }
   }
   const completed = new Array<string>()
+  const holds = new Array<LockHold>()
+  const lockHold = (): LockHold => ({
+    batches: holds.reduce((total, hold) => total + hold.batches, 0),
+    maxMs: holds.reduce((max, hold) => Math.max(max, hold.maxMs), 0),
+    totalMs: holds.reduce((total, hold) => total + hold.totalMs, 0),
+  })
   let changedRows = 0
   let changedBytes = 0
   for (const tree of eligible) {
     const result = apply(db, { tree, evidence, now })
+    holds.push(result.lockHold)
     changedRows += result.changedRows
     changedBytes += result.changedBytes
     completed.push(...result.completedSessionIDs)
     if (result.state === "complete") continue
     return {
       action: changedRows > 0 || completed.length > 0 ? "partial" : "refused",
+      lockHold: lockHold(),
       changedRows,
       changedBytes,
       completedSessionIDs: completed.toSorted(),
@@ -2062,6 +2092,7 @@ export function applyGated(db: SqliteAccess, evidence: () => RetentionEvidence, 
   }
   return {
     action: "applied",
+    lockHold: lockHold(),
     changedRows,
     changedBytes,
     completedSessionIDs: completed.toSorted(),
