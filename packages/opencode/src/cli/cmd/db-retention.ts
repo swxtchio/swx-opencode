@@ -41,8 +41,10 @@ export type RetentionEvidence = {
     readonly customerBoundSessionIDs: readonly string[]
     readonly nonCustomerSessionIDs: readonly string[]
   }
-  // The mixed /sync/history reader contract (swxtchio/swx-opencode#133 item 1) is a public
-  // decision; until one is recorded, production evidence carries none and every tree refuses.
+  // Proof that the mixed /sync/history reader contract (swxtchio/swx-opencode#133 item 1) has been reviewed. The
+  // reader behaviour is decided and implemented (captain decisions of 2026-10-11: pruned Sessions are omitted and
+  // reported as best-effort ranges), but production has no producer for this evidence, so it carries none and
+  // every tree refuses.
   readonly readerContract?: {
     readonly reviewed: boolean
     readonly id: string
@@ -2039,8 +2041,9 @@ export const RetentionCommand = cmd<{}, RetentionArgs>({
 })
 
 /**
- * The production evidence this build can produce. The measurement receipt, customer classification and
- * reader contract have no approved producer yet, so their gates refuse every tree.
+ * The production evidence this build can produce: the holder scan only. The measurement receipt, customer
+ * classification and reader-contract review have no approved producer yet, so their gates refuse every tree,
+ * even though the reader behaviour itself is decided.
  */
 function productionEvidence(filename: string): RetentionEvidence {
   return { holders: scanDatabaseHolders(filename) }

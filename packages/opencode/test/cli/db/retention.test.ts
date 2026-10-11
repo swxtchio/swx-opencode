@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process"
 import { Database } from "bun:sqlite"
 import { Context, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { readdirSync } from "node:fs"
+import { readdirSync, writeFileSync } from "node:fs"
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, statfs, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -1487,6 +1487,39 @@ async function holdSession(filename: string, sessionID: string, mode: "write" | 
   }
 }
 
+async function contendWriteLock(filename: string, sessionID: string, signal: string) {
+  const contender = Bun.spawn(
+    [
+      process.execPath,
+      path.join(import.meta.dir, "../../fixture/retention-holder.ts"),
+      filename,
+      sessionID,
+      "contend",
+      signal,
+    ],
+    { stdin: "pipe", stdout: "pipe", stderr: "pipe", cwd: path.join(import.meta.dir, "../../..") },
+  )
+  const reader = contender.stdout.getReader()
+  let output = ""
+  const until = async (line: string) => {
+    while (!output.includes(line)) {
+      const chunk = await reader.read()
+      if (chunk.done) throw new Error(`contender exited before ${line}: ${await new Response(contender.stderr).text()}`)
+      output += new TextDecoder().decode(chunk.value)
+    }
+    return output
+  }
+  await until("ready")
+  return {
+    pid: contender.pid,
+    until,
+    [Symbol.asyncDispose]: async () => {
+      contender.stdin.end()
+      await contender.exited
+    },
+  }
+}
+
 const eventRows = (db: Database, sessionID: string) =>
   db.query<{ data: string }, [string]>("SELECT data FROM event WHERE aggregate_id = ? ORDER BY seq").all(sessionID)
 
@@ -1634,6 +1667,59 @@ test(
     }
   },
   { timeout: 30_000 },
+)
+
+test(
+  "a holder admitted while the batch waits on a contended BEGIN IMMEDIATE refuses it before any write",
+  async () => {
+    await using store = await producedStore([1])
+    const sessionID = store.trees[0]!.rootSessionID
+    const signal = path.join(path.dirname(store.filename), "begin-immediate.signal")
+    const db = new Database(store.filename)
+    try {
+      db.exec("PRAGMA busy_timeout = 30000")
+      // A registered process that has written no Session holds the write lock and reports it.
+      await using contender = await contendWriteLock(store.filename, sessionID, signal)
+      const proof = evidence([sessionID], finalSequence(db, [sessionID]), store.filename)
+      expect(proof.holders).toEqual(expect.objectContaining({ state: "complete", pids: [contender.pid] }))
+      const tree = inventory(access(db), proof, store.now).trees[0]!
+      expect(tree.reasons).toEqual([])
+      const before = db.serialize()
+
+      // Signal the contender at the instant the batch issues BEGIN IMMEDIATE, after every pre-lock step. Only then
+      // does it admit the new holder, and it releases the lock only once that holder is ready.
+      const signalled = new Proxy(access(db), {
+        get(target, property) {
+          if (property !== "transaction") {
+            const value = Reflect.get(target, property, target)
+            return typeof value === "function" ? value.bind(target) : value
+          }
+          return <Result>(callback: () => Result) => {
+            const transaction = target.transaction(callback)
+            return Object.assign(() => transaction(), {
+              deferred: () => transaction.deferred(),
+              immediate: () => {
+                writeFileSync(signal, "")
+                return transaction.immediate()
+              },
+            })
+          }
+        },
+      })
+      const result = apply(signalled, { tree, evidence: () => proof, now: () => store.now })
+
+      const admitted = await contender.until("released")
+      const holderPID = Number(/holder (\d+)/.exec(admitted)?.[1])
+      expect(holderPID).toBeGreaterThan(0)
+      expect(result).toMatchObject({ state: "refused", changedRows: 0 })
+      expect(result.reasons).toContain(`database-holder-appeared-after-scan:${holderPID}`)
+      expect(result.reasons).toContain(`unregistered-database-holder:${holderPID}`)
+      expect(db.serialize().equals(before)).toBe(true)
+    } finally {
+      db.close()
+    }
+  },
+  { timeout: 60_000 },
 )
 
 test("a promoted V2 input row refuses its tree literally, including one promoted after inventory", () => {

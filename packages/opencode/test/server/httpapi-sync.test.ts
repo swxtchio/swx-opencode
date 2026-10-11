@@ -9,7 +9,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionMessage } from "@opencode-ai/core/session/message"
-import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { EventRetentionTable, EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import {
@@ -80,8 +80,10 @@ function postWithNodeHttp(url: URL, directory: string, body: string) {
   )
 }
 
-// One Session pruned by a real retention apply and one kept peer, both written by the real producers. The
-// payloads touch the pruned Session three ways: by omission, past its first event, and at its last sequence.
+// One pruned Session and one kept peer, both written by the real producers. The pruned Session carries the
+// retention marker a real apply wrote on a copy of the store; its rows in the served store stay unredacted, so these
+// tests exercise marker-driven exclusion, not an applied store. The payloads touch the pruned Session three ways: by
+// omission, past its first event, and at its last sequence.
 const prunedStore = Effect.gen(function* () {
   const tmp = yield* TestInstance
   const pruned = yield* Session.use.create({ title: "pruned sync sentinel" })
@@ -283,14 +285,80 @@ describe("sync HttpApi", () => {
   )
 
   it.instance(
+    "pruned rows stay excluded with more pruned Sessions than SQLite binds parameters",
+    () =>
+      Effect.gen(function* () {
+        const store = yield* prunedStore
+        // Copies of the pruned Session's real marker, sequence and events under 250,100 more aggregate IDs: more
+        // pruned aggregates than the bound parameters Bun's SQLite accepts in one statement (250,000).
+        const copies = 250_100
+        const clone = (table: string, columns: string, select: string) =>
+          store.db.run(
+            sql.raw(
+              `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${copies}) INSERT INTO ${table} (${columns}) SELECT ${select} FROM ${table}, n WHERE aggregate_id = '${store.pruned.id}'`,
+            ),
+          )
+        yield* clone("event_sequence", "aggregate_id, seq, owner_id", `aggregate_id || '_' || i, seq, owner_id`)
+        yield* clone(
+          "event",
+          "id, aggregate_id, seq, type, data",
+          `id || '_' || i, aggregate_id || '_' || i, seq, type, data`,
+        )
+        yield* clone(
+          "event_retention",
+          "aggregate_id, state, progress_table, progress_id, evidence, time_started, time_updated",
+          `aggregate_id || '_' || i, state, progress_table, progress_id, evidence, time_started, time_updated`,
+        )
+        const pruned = yield* store.db.select().from(EventRetentionTable).all()
+        expect(pruned.length).toBe(copies + 1)
+        for (const payload of store.payloads) {
+          const result = yield* readSyncHistory(store.db, payload)
+          expect(result.events.filter((row) => row.aggregate_id.startsWith(store.pruned.id))).toEqual([])
+          expect(
+            result.events
+              .filter((row) => row.aggregate_id === store.kept.id)
+              .map((row) => JSON.parse(JSON.stringify(row)) as HistoryRow),
+          ).toEqual(store.keptEvents.filter((row) => row.seq > (payload[store.kept.id] ?? -1)))
+        }
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 60_000 },
+  )
+
+  it.instance(
+    "an allowed cross-origin browser client can read the X-Pruned-Sessions header",
+    () =>
+      Effect.gen(function* () {
+        const store = yield* prunedStore
+        const tmp = yield* TestInstance
+        const response = yield* requestInDirectory(SyncPaths.history, tmp.directory, {
+          method: "POST",
+          headers: { "content-type": "application/json", origin: "http://localhost:3000" },
+          body: JSON.stringify({}),
+        })
+        expect(response.status).toBe(200)
+        expect(response.headers["access-control-allow-origin"]).toBe("http://localhost:3000")
+        expect(covered(parseRanges(response.headers["x-pruned-sessions"]), store.pruned.id)).toBe(true)
+        // A browser hides every non-safelisted response header the server does not expose.
+        const exposed = (response.headers["access-control-expose-headers"] ?? "")
+          .split(",")
+          .map((name) => name.trim().toLowerCase())
+        expect(exposed).toContain("x-pruned-sessions")
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 10_000 },
+  )
+
+  it.instance(
     "a standard HTTP client syncs a high-cardinality pruned history without response-header overflow",
     () =>
       Effect.gen(function* () {
         const tmp = yield* TestInstance
         const { db } = yield* Database.Service
         // 700 Sessions: across the first 300, every other one is kept, so the pruned ones there cannot be
-        // coalesced; the last 400 are all pruned. 550 pruned Sessions in all, enough that naming each one would
-        // overflow Node's 16 KiB response-header limit.
+        // coalesced; the last 400 are all pruned. 550 pruned Sessions in all, each marked by a real retention apply
+        // on a copy (marker-driven, rows unredacted), enough that naming each one would overflow Node's 16 KiB
+        // response-header limit.
         const sessions = new Array<{ id: string; prune: boolean }>()
         for (let index = 0; index < 700; index++) {
           const session = yield* Session.use.create({ title: `high-cardinality ${index}` })
@@ -323,6 +391,10 @@ describe("sync HttpApi", () => {
         expect(ranges.length).toBeGreaterThan(1)
         // Ranges, not a list: the budget cannot hold 400 IDs one by one, yet the contiguous block is covered.
         expect(pruned.filter((id) => covered(ranges, id)).length).toBeGreaterThanOrEqual(400)
+        // The notification is truncated, yet every pruned Session it leaves out is still excluded from the body.
+        const unlisted = pruned.filter((id) => !covered(ranges, id))
+        expect(unlisted.length).toBeGreaterThan(0)
+        expect(body.filter((row) => unlisted.includes(row.aggregate_id))).toEqual([])
         expect(ranges.map((range) => range.first)).toEqual(ranges.map((range) => range.first).toSorted())
         for (const id of kept) expect(covered(ranges, id)).toBe(false)
         for (const id of yield* heldIDs(db)) {

@@ -13,8 +13,10 @@ export function applyRetentionFixture(sessionID: string) {
 }
 
 /**
- * Prunes each listed Session, each its own tree, through a real retention apply on an exported copy of the store,
- * then copies the markers apply wrote back into the store, which is what makes those Sessions unreplayable there.
+ * Runs a real retention apply for each listed Session, each its own tree, on an in-memory copy of the store, then
+ * copies only the markers apply wrote back into the store. The store's own rows stay unredacted: what the store
+ * then shows is marker-driven behaviour, the marker alone making those Sessions unreplayable there. The returned
+ * copy holds the redacted rows.
  */
 export function applyRetentionFixtures(sessionIDs: readonly string[]) {
   return Effect.gen(function* () {

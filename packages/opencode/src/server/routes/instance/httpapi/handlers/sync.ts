@@ -180,9 +180,15 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
       const result = yield* readSyncHistory(db, ctx.payload)
       const pruned = prunedSessionsHeader(result.pruned)
       if (pruned !== undefined) {
-        // The body stays the bare event array; the pruned Sessions travel in a header.
+        // The body stays the bare event array; the pruned Sessions travel in a header, exposed to allowed
+        // cross-origin browser clients because it is not CORS-safelisted.
         yield* HttpEffect.appendPreResponseHandler((_request, response) =>
-          Effect.succeed(HttpServerResponse.setHeader(response, PrunedSessionsHeader, pruned)),
+          Effect.succeed(
+            HttpServerResponse.setHeaders(response, {
+              [PrunedSessionsHeader]: pruned,
+              "Access-Control-Expose-Headers": PrunedSessionsHeader,
+            }),
+          ),
         )
       }
       return result.events
