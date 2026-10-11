@@ -1,7 +1,7 @@
 export * as SessionV2 from "./session"
 export * from "./session/schema"
 
-import { Cause, DateTime, Effect, Exit, Layer, Schema, Context, Stream } from "effect"
+import { Cause, DateTime, Effect, Equal, Exit, Layer, Schema, Context, Stream } from "effect"
 import { ListAnchor } from "@opencode-ai/schema/session"
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, like, lt, lte, or, type SQL } from "drizzle-orm"
 import { ProjectV2 } from "./project"
@@ -417,11 +417,21 @@ const layer = Layer.effect(
               assistantMessageID: failedAssistant.message.id,
             }
       }
-      // A failed call is recovered by a later successful retry of the same call, in this assistant or a later one.
-      const finalTools = new Map(
-        latestTools.map((tool) => [JSON.stringify([tool.content.name, tool.content.id]), tool]),
+      // A failed call is recovered only by a later successful retry, in this assistant or a later one. A retry has the
+      // same tool name, provider call ID, and arguments; providers such as Gemini reuse generated IDs across streams.
+      const failedTool = latestTools.find(
+        ({ content }, index) =>
+          content.state.status === "error" &&
+          !latestTools
+            .slice(index + 1)
+            .some(
+              (later) =>
+                later.content.state.status === "completed" &&
+                later.content.name === content.name &&
+                later.content.id === content.id &&
+                Equal.equals(later.content.state.input, content.state.input),
+            ),
       )
-      const failedTool = Array.from(finalTools.values()).find(({ content }) => content.state.status === "error")
       if (failedTool)
         return {
           type: "failed",

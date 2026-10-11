@@ -896,6 +896,65 @@ describe("SessionV2.wait", () => {
     }),
   )
 
+  it.effect("keeps a tool failure when a later call reuses its name and ID with different arguments", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const registry = yield* ToolRegistry.Service
+      const commands: string[] = []
+      yield* registry.register({
+        bash: Tool.make({
+          description: "Run a command",
+          input: Schema.Struct({ command: Schema.String }),
+          output: Schema.Struct({}),
+          execute: ({ command }) =>
+            Effect.sync(() => commands.push(command)).pipe(
+              Effect.andThen(command === "make test" ? Effect.die("make test failed") : Effect.succeed({})),
+            ),
+        }),
+      })
+      // Gemini restarts generated call IDs in each stream, so an unrelated later call can reuse tool_0.
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "tool_0", name: "bash", input: { command: "make test" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "tool_0", name: "bash", input: { command: "ls" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        textTurn("text-wait-after-reused-gemini-id", "Listed the files"),
+      ]
+      const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run the tests" }) })
+      const result = yield* session.wait(sessionID)
+
+      expect(commands).toEqual(["make test", "ls"])
+      const calls = (yield* session.messages({ sessionID, order: "asc" })).flatMap((message) =>
+        message.type === "assistant"
+          ? message.content.flatMap((content) =>
+              content.type === "tool" && content.id === "tool_0"
+                ? [{ assistantMessageID: message.id, name: content.name, status: content.state.status }]
+                : [],
+            )
+          : [],
+      )
+      expect(calls.map((call) => [call.name, call.status])).toEqual([
+        ["bash", "error"],
+        ["bash", "completed"],
+      ])
+      expect(result).toEqual({
+        type: "failed",
+        admittedSeq: admitted.admittedSeq,
+        assistantMessageID: calls[0]?.assistantMessageID,
+      })
+      expect(requests).toHaveLength(3)
+    }),
+  )
+
   it.effect("completes a tool call retried under the same assistant identity", () =>
     Effect.gen(function* () {
       yield* setupNative
