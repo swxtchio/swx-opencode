@@ -754,7 +754,7 @@ describe("SessionV2.wait", () => {
     }),
   )
 
-  it.effect("fails when a later assistant reuses a provider-local tool ID", () =>
+  it.effect("completes when a later assistant retries a failed tool call across a steer", () =>
     Effect.gen(function* () {
       yield* setupNative
       const session = yield* SessionV2.Service
@@ -812,22 +812,87 @@ describe("SessionV2.wait", () => {
       yield* Deferred.succeed(toolGate, undefined)
 
       const result = yield* Deferred.await(outcome)
+      expect(attempts).toBe(2)
+      const assistants = (yield* session.messages({ sessionID, order: "asc" })).filter(
+        (message): message is SessionMessage.Assistant => message.type === "assistant",
+      )
+      const retried = assistants.flatMap((message) =>
+        message.content.flatMap((content) =>
+          content.type === "tool" && content.id === "call-wait-retry"
+            ? [{ assistantMessageID: message.id, status: content.state.status }]
+            : [],
+        ),
+      )
+      expect(retried.map((tool) => tool.status)).toEqual(["error", "completed"])
+      expect(retried[0]?.assistantMessageID).not.toBe(retried[1]?.assistantMessageID)
+      const recovered = assistants.at(-1)
+      if (!recovered) throw new Error("Expected the assistant that answered after the retry")
+      expect(recovered.content).toContainEqual(expect.objectContaining({ type: "text", text: "Recovered" }))
       expect(result).toMatchObject({
         _tag: "Success",
-        value: { type: "failed", admittedSeq: steered.admittedSeq },
+        value: { type: "completed", admittedSeq: steered.admittedSeq, assistantMessageID: recovered.id },
       })
-      expect(attempts).toBe(2)
-      const tools = (yield* session.messages({ sessionID, order: "asc" })).flatMap((message) =>
-        message.type === "assistant"
-          ? message.content.filter((content): content is SessionMessage.AssistantTool => content.type === "tool")
-          : [],
-      )
-      expect(tools.filter((tool) => tool.id === "call-wait-retry").map((tool) => tool.state.status)).toEqual([
-        "error",
-        "completed",
-      ])
       expect(requests).toHaveLength(3)
       yield* Fiber.join(waiter)
+    }),
+  )
+
+  it.effect("keeps a tool failure when a different tool later reuses its call ID", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const registry = yield* ToolRegistry.Service
+      yield* registry.register({
+        failsOnce: Tool.make({
+          description: "Fail with a provider-local call ID",
+          input: Schema.Struct({}),
+          output: Schema.Struct({}),
+          execute: () => Effect.die("tool failure that is never retried"),
+        }),
+        succeedsLater: Tool.make({
+          description: "Succeed under the same provider-local call ID",
+          input: Schema.Struct({}),
+          output: Schema.Struct({}),
+          execute: () => Effect.succeed({}),
+        }),
+      })
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "call-wait-shared-id", name: "failsOnce", input: {} }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "call-wait-shared-id", name: "succeedsLater", input: {} }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        textTurn("text-wait-after-shared-id", "Answered after another tool"),
+      ]
+      const admitted = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Run two different tools" }) })
+      const result = yield* session.wait(sessionID)
+
+      const shared = (yield* session.messages({ sessionID, order: "asc" })).flatMap((message) =>
+        message.type === "assistant"
+          ? message.content.flatMap((content) =>
+              content.type === "tool" && content.id === "call-wait-shared-id"
+                ? [{ assistantMessageID: message.id, name: content.name, status: content.state.status }]
+                : [],
+            )
+          : [],
+      )
+      expect(shared.map((tool) => [tool.name, tool.status])).toEqual([
+        ["failsOnce", "error"],
+        ["succeedsLater", "completed"],
+      ])
+      expect(result).toEqual({
+        type: "failed",
+        admittedSeq: admitted.admittedSeq,
+        assistantMessageID: shared[0]?.assistantMessageID,
+      })
+      expect(requests).toHaveLength(3)
     }),
   )
 

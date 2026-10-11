@@ -417,7 +417,9 @@ const layer = Layer.effect(
               assistantMessageID: failedAssistant.message.id,
             }
       }
-      const failedTool = latestTools.find(({ content }) => content.state.status === "error")
+      // A failed call is recovered by a later successful retry of the same call, in this assistant or a later one.
+      const finalTools = new Map(latestTools.map((tool) => [JSON.stringify([tool.content.name, tool.content.id]), tool]))
+      const failedTool = Array.from(finalTools.values()).find(({ content }) => content.state.status === "error")
       if (failedTool)
         return {
           type: "failed",
