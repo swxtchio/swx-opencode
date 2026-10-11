@@ -107,7 +107,7 @@ export const make = (
             try: () => statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>,
             catch: statementError,
           })
-          return retryLocked(execute)
+          return retryLocked(execute, sql)
         })
 
       const runValues = (sql: string, params: ReadonlyArray<unknown> = []) =>
@@ -120,7 +120,7 @@ export const make = (
               statement.all(...(params as SQLInputValue[])) as unknown as ReadonlyArray<ReadonlyArray<unknown>>,
             catch: statementError,
           })
-          return retryLocked(execute)
+          return retryLocked(execute, sql)
         })
 
       return identity<SqliteConnection>({

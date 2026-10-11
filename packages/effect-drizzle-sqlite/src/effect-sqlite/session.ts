@@ -3,6 +3,7 @@ import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Scope from "effect/Scope"
+import * as Tracer from "effect/Tracer"
 import type { SqlClient } from "effect/unstable/sql/SqlClient"
 import type { SqlError } from "effect/unstable/sql/SqlError"
 import type { EffectCacheShape } from "drizzle-orm/cache/core/cache-effect"
@@ -25,6 +26,15 @@ export interface EffectSQLiteQueryEffectHKT extends QueryEffectHKTBase {
 }
 
 export type EffectSQLiteRunResult = readonly never[]
+
+// Names what a write transaction is for in its lock-hold diagnostic. Unset, the diagnostic names the current span.
+export const TransactionPurpose = Context.Reference<string | undefined>(
+  "@opencode-ai/effect-drizzle-sqlite/TransactionPurpose",
+  { defaultValue: () => undefined },
+)
+
+// A write lock held longer than this is logged as a likely cause of another connection's lock wait.
+const longWriteLockHoldMs = 250
 
 export interface EffectSQLiteSessionOptions {
   logger: EffectLoggerShape
@@ -137,15 +147,34 @@ export class EffectSQLiteSession<TRelations extends AnyRelations> extends SQLite
                 ),
               )
         const id = connectionOption._tag === "Some" ? connectionOption.value[1] + 1 : 0
+        const behavior = config?.behavior ?? "deferred"
 
         return connection.pipe(
           Effect.flatMap(([scope, connection]) => {
             const transaction = this.executeTransactionStatement(
               connection,
-              id === 0 ? `begin ${config?.behavior ?? "deferred"}` : `savepoint effect_sql_${id}`,
+              id === 0 ? `begin ${behavior}` : `savepoint effect_sql_${id}`,
             ).pipe(
-              Effect.flatMap(() =>
-                Effect.provideContext(
+              Effect.flatMap(() => {
+                // A top-level immediate or exclusive BEGIN owns the write lock from here until COMMIT or ROLLBACK
+                // succeeds; time spent waiting for the lock is the retry gate's, not this hold's. Only those top-level
+                // statements report a release, so a savepoint neither starts nor ends a hold.
+                const acquiredAt = performance.now()
+                const released = (outcome: "commit" | "rollback") =>
+                  Effect.suspend(() => {
+                    const heldMs = performance.now() - acquiredAt
+                    if (behavior === "deferred" || heldMs <= longWriteLockHoldMs) return Effect.void
+                    const parent = Context.getOption(services, Tracer.ParentSpan)
+                    const span = parent._tag === "Some" && parent.value._tag === "Span" ? parent.value.name : undefined
+                    return Effect.logWarning("sqlite write lock held", {
+                      pid: process.pid,
+                      purpose: Context.get(services, TransactionPurpose) ?? span ?? "unknown",
+                      ...(span && { span }),
+                      outcome,
+                      durationMs: Math.round(heldMs),
+                    })
+                  })
+                return Effect.provideContext(
                   restore(effect),
                   Context.add(services, this.client.transactionService, [connection, id]),
                 ).pipe(
@@ -154,9 +183,11 @@ export class EffectSQLiteSession<TRelations extends AnyRelations> extends SQLite
                     const finalize = Exit.isSuccess(exit)
                       ? id === 0
                         ? this.executeTransactionStatement(connection, "commit").pipe(
+                            Effect.tap(() => released("commit")),
                             // SQLite keeps the transaction open after deferred constraint commit failures.
                             Effect.catch((error) =>
                               this.executeTransactionStatement(connection, "rollback").pipe(
+                                Effect.tap(() => released("rollback")),
                                 Effect.catch(() => Effect.void),
                                 Effect.andThen(Effect.fail(error)),
                               ),
@@ -164,7 +195,9 @@ export class EffectSQLiteSession<TRelations extends AnyRelations> extends SQLite
                           )
                         : this.executeTransactionStatement(connection, `release savepoint effect_sql_${id}`)
                       : id === 0
-                        ? this.executeTransactionStatement(connection, "rollback")
+                        ? this.executeTransactionStatement(connection, "rollback").pipe(
+                            Effect.tap(() => released("rollback")),
+                          )
                         : this.executeTransactionStatement(connection, `rollback to savepoint effect_sql_${id}`).pipe(
                             Effect.andThen(
                               this.executeTransactionStatement(connection, `release savepoint effect_sql_${id}`),
@@ -173,8 +206,8 @@ export class EffectSQLiteSession<TRelations extends AnyRelations> extends SQLite
 
                     return finalize.pipe(Effect.flatMap(() => exit))
                   }),
-                ),
-              ),
+                )
+              }),
             )
 
             return scope === undefined

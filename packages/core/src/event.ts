@@ -5,6 +5,8 @@ import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 import { and, asc, eq, gt, inArray } from "drizzle-orm"
 import { Database } from "./database/database"
+import { TransactionPurpose } from "@opencode-ai/effect-drizzle-sqlite"
+import { FailureOrigin } from "./observability/failure-origin"
 import { EventRetentionTable, EventSequenceTable, EventTable } from "./event/sql"
 import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
@@ -466,7 +468,11 @@ export const layerWith = (options?: LayerOptions) =>
                         }),
                       { behavior: "immediate" },
                     )
-                    .pipe(Effect.orDie)
+                    .pipe(
+                      Effect.provideService(TransactionPurpose, definition.type),
+                      Effect.tapCause((cause) => FailureOrigin.record(cause, { event: definition.type })),
+                      Effect.orDie,
+                    )
                   if (committed) {
                     yield* Effect.forEach(
                       pubsub.durable.get(committed.aggregateID) ?? [],
