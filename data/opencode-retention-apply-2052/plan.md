@@ -57,3 +57,19 @@ Each new or rewritten assertion gets a recorded removal red proof. `bun typechec
 
 Production enablement stays refused (D1, D2, D3 unchanged); `production-apply-disabled` stays on every
 call that fails a gate.
+
+## Scope addition: captain decision 1 (sync history over pruned Sessions)
+
+Source: `data/opencode-retention-fix-r2/scope-addition-decision1.md` in the firstmate home (2026-10-11).
+
+- `readSyncHistory` no longer fails on a redacted aggregate. Within its one read transaction it finds the touched
+  aggregates (payload keys plus aggregates with events past their cursor) that carry an unreplayable retention marker,
+  excludes their rows in SQL so no redacted row is read or returned, and returns `{ events, pruned }`, where `pruned`
+  maps each such Session to its `event_sequence.seq`.
+- The `history` handler returns the same bare event array and, when `pruned` is non-empty, sets
+  `X-Pruned-Sessions` to the JSON object `{ "<sessionID>": <last seq> }`, the same shape as the request payload
+  and the same JSON-object convention as the existing fence header. No header when nothing is pruned.
+- The endpoint's OpenAPI description is updated to say so, and the client is regenerated.
+- `/sync/replay` onto a redacted aggregate stays refused. The production apply refusal is unchanged.
+- Focused tests in `test/server/httpapi-sync.test.ts`, one per required behaviour, each red with the header or
+  the no-fail path reverted.
