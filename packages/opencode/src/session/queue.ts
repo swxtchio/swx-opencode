@@ -6,7 +6,22 @@ import { MessageTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm"
-import { Cause, Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Scope, Semaphore, Struct } from "effect"
+import {
+  Cause,
+  Clock,
+  Context,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Schema,
+  Scope,
+  Semaphore,
+  Struct,
+} from "effect"
 import { isDeepStrictEqual } from "node:util"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { sqliteLockMessage } from "@/util/sqlite-error"
@@ -63,6 +78,11 @@ const consumeAttempts = 5
 // BEGIN together: its own statement window plus one other statement's window
 // ahead of it on the connection. The body, once begun, is not timed.
 const consumeAcquireBackstop = Duration.seconds(10)
+// A review hold's lease (#212). Its client renews it on activity and closes its
+// view after 5 minutes without any, so a live view always renews in time; the
+// lease only ends a hold whose client vanished without releasing it.
+export const holdLease = Duration.minutes(6)
+export type HoldEnd = "released" | "lapsed"
 
 export interface Interface {
   readonly admit: (input: AdmitInput) => Effect.Effect<Item>
@@ -157,6 +177,37 @@ export interface Interface {
   readonly exclusive: <A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
   /** Runs a compaction; no steer is promoted until it and its follow-up messages are written. */
   readonly whileCompacting: <A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
+  /**
+   * Starts or renews `holder`'s review hold (#212). While a session has a live
+   * hold none of its items is promoted, including one whose promotion was
+   * already being prepared, so the returned pending list stays as it is until a
+   * release. `started` reports that this call began the session's hold.
+   */
+  readonly hold: (
+    sessionID: SessionID,
+    holder: string,
+  ) => Effect.Effect<{ readonly started: boolean; readonly items: Item[] }>
+  /** Ends `holder`'s hold; true when that ended the session's hold. */
+  readonly release: (sessionID: SessionID, holder: string) => Effect.Effect<boolean>
+  /**
+   * Waits until the session has no live hold, and reports how it ended: by a
+   * release, or by its last lease lapsing.
+   */
+  readonly released: (sessionID: SessionID) => Effect.Effect<HoldEnd>
+  /** Deletes a pending item for good. None tells the caller it was not pending. */
+  readonly remove: (sessionID: SessionID, itemID: ItemID) => Effect.Effect<Option.Option<Item>>
+  /**
+   * Gives the listed pending items their seqs back in the listed order, so they
+   * promote in that order; a category still decides when an item promotes. None,
+   * with nothing changed, when any of them is not pending.
+   */
+  readonly reorder: (sessionID: SessionID, itemIDs: readonly ItemID[]) => Effect.Effect<Option.Option<Item[]>>
+  /**
+   * Keeps the first of identical pending items, then merges similar commands of
+   * one category into the first of them as numbered steps; see `consolidation`.
+   * Returns the resulting pending list.
+   */
+  readonly consolidate: (sessionID: SessionID) => Effect.Effect<Item[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionQueue") {}
@@ -182,8 +233,14 @@ const layer = Layer.effect(
       ItemID,
       { readonly sessionID: SessionID; message?: MessageID; reply?: SessionV1.WithParts }
     >()
+    // Review holds by session (#212), process-local like the drains they hold:
+    // each holder's lease deadline, and the signal that the hold ended.
+    const holds = new Map<
+      SessionID,
+      { readonly leases: Map<string, number>; readonly ended: Deferred.Deferred<HoldEnd> }
+    >()
 
-    const semaphore = (map: Map<SessionID, Semaphore.Semaphore>, sessionID: SessionID) => {
+    const semaphore =(map: Map<SessionID, Semaphore.Semaphore>, sessionID: SessionID) => {
       const hit = map.get(sessionID)
       if (hit) return hit
       const next = Semaphore.makeUnsafe(1)
@@ -434,6 +491,161 @@ const layer = Layer.effect(
       return Option.some(fromRow(row))
     })
 
+    const held = (sessionID: SessionID) =>
+      Clock.currentTimeMillis.pipe(
+        Effect.map((now) => [...(holds.get(sessionID)?.leases.values() ?? [])].some((until) => until > now)),
+      )
+
+    // Drops lapsed leases and ends a hold left without a live one; under the lock.
+    const settle = Effect.fnUntraced(function* (sessionID: SessionID, end: HoldEnd) {
+      const current = holds.get(sessionID)
+      if (!current) return undefined
+      const now = yield* Clock.currentTimeMillis
+      current.leases.forEach((until, holder) => {
+        if (until <= now) current.leases.delete(holder)
+      })
+      if (current.leases.size > 0) return { ended: current.ended, wait: Math.min(...current.leases.values()) - now }
+      holds.delete(sessionID)
+      yield* Deferred.succeed(current.ended, end)
+      return undefined
+    })
+
+    const hold: Interface["hold"] = (sessionID, holder) =>
+      exclusive(
+        sessionID,
+        Effect.gen(function* () {
+          const current = (yield* settle(sessionID, "lapsed")) ? holds.get(sessionID) : undefined
+          const until = (yield* Clock.currentTimeMillis) + Duration.toMillis(holdLease)
+          if (current) current.leases.set(holder, until)
+          if (!current) holds.set(sessionID, { leases: new Map([[holder, until]]), ended: yield* Deferred.make<HoldEnd>() })
+          return { started: !current, items: yield* list(sessionID) }
+        }),
+      ).pipe(Effect.withSpan("SessionQueue.hold"))
+
+    const release: Interface["release"] = (sessionID, holder) =>
+      exclusive(
+        sessionID,
+        Effect.gen(function* () {
+          const current = holds.get(sessionID)
+          if (!current?.leases.delete(holder)) return false
+          return (yield* settle(sessionID, "released")) === undefined
+        }),
+      ).pipe(Effect.withSpan("SessionQueue.release"))
+
+    // A renewed lease outlasts the deadline this waits for, so it settles again.
+    const released: Interface["released"] = (sessionID) =>
+      Effect.gen(function* () {
+        while (true) {
+          const current = holds.get(sessionID)
+          const live = yield* exclusive(sessionID, settle(sessionID, "lapsed"))
+          if (!live) return current ? yield* Deferred.await(current.ended) : ("released" as const)
+          yield* Deferred.await(live.ended).pipe(Effect.timeoutOption(Duration.millis(live.wait)))
+        }
+      })
+
+    const remove = Effect.fn("SessionQueue.remove")(function* (sessionID: SessionID, itemID: ItemID) {
+      return yield* exclusive(
+        sessionID,
+        Effect.gen(function* () {
+          const row = yield* writable(sessionID, (tx) =>
+            tx
+              .delete(SessionPromptQueueTable)
+              .where(and(eq(SessionPromptQueueTable.id, itemID), pending(sessionID)))
+              .returning()
+              .get()
+              .pipe(Effect.orDie),
+          ).pipe(Effect.orDie)
+          if (!row) return Option.none()
+          yield* publish(sessionID)
+          return Option.some(fromRow(row))
+        }),
+      )
+    })
+
+    const reorder = Effect.fn("SessionQueue.reorder")(function* (sessionID: SessionID, itemIDs: readonly ItemID[]) {
+      return yield* exclusive(
+        sessionID,
+        Effect.gen(function* () {
+          const reordered = yield* writable(sessionID, (tx) =>
+            Effect.gen(function* () {
+              const rows = yield* tx
+                .select()
+                .from(SessionPromptQueueTable)
+                .where(and(pending(sessionID), inArray(SessionPromptQueueTable.id, [...itemIDs])))
+                .all()
+                .pipe(Effect.orDie)
+              if (rows.length !== itemIDs.length || new Set(itemIDs).size !== itemIDs.length) return false
+              const seqs = rows.map((row) => row.seq).toSorted((a, b) => a - b)
+              // (session_id, seq) is unique, so every row first moves to a free negative seq.
+              yield* Effect.forEach(rows, (row) =>
+                tx
+                  .update(SessionPromptQueueTable)
+                  .set({ seq: -row.seq })
+                  .where(eq(SessionPromptQueueTable.id, row.id))
+                  .run()
+                  .pipe(Effect.orDie),
+              )
+              yield* Effect.forEach(itemIDs, (id, index) =>
+                tx
+                  .update(SessionPromptQueueTable)
+                  .set({ seq: seqs[index] })
+                  .where(eq(SessionPromptQueueTable.id, id))
+                  .run()
+                  .pipe(Effect.orDie),
+              )
+              return true
+            }),
+          ).pipe(Effect.orDie)
+          if (!reordered) return Option.none()
+          yield* publish(sessionID)
+          return Option.some(yield* list(sessionID))
+        }),
+      )
+    })
+
+    // A reserved row's message may already be prepared from its current input, so
+    // consolidation leaves it out.
+    const consolidate = Effect.fn("SessionQueue.consolidate")(function* (sessionID: SessionID) {
+      return yield* exclusive(
+        sessionID,
+        Effect.gen(function* () {
+          const changed = yield* writable(sessionID, (tx) =>
+            Effect.gen(function* () {
+              const rows = yield* tx
+                .select()
+                .from(SessionPromptQueueTable)
+                .where(and(pending(sessionID), isNull(SessionPromptQueueTable.message_id)))
+                .orderBy(asc(SessionPromptQueueTable.seq))
+                .all()
+                .pipe(Effect.orDie)
+              const plan = consolidation(
+                [...rows.filter((row) => row.delivery === "steer"), ...rows.filter((row) => row.delivery !== "steer")].map(
+                  fromRow,
+                ),
+              )
+              if (plan.removed.length > 0)
+                yield* tx
+                  .delete(SessionPromptQueueTable)
+                  .where(inArray(SessionPromptQueueTable.id, plan.removed))
+                  .run()
+                  .pipe(Effect.orDie)
+              yield* Effect.forEach(plan.merged, (merged) =>
+                tx
+                  .update(SessionPromptQueueTable)
+                  .set({ input: encodeInput(merged.input) })
+                  .where(eq(SessionPromptQueueTable.id, merged.id))
+                  .run()
+                  .pipe(Effect.orDie),
+              )
+              return plan.removed.length > 0
+            }),
+          ).pipe(Effect.orDie)
+          if (changed) yield* publish(sessionID)
+          return yield* list(sessionID)
+        }),
+      )
+    })
+
     const compacting = (sessionID: SessionID) =>
       running.has(sessionID)
         ? Effect.succeed(true)
@@ -538,6 +750,7 @@ const layer = Layer.effect(
       exclusive(
         sessionID,
         Effect.gen(function* () {
+          if (yield* held(sessionID)) return undefined
           if (delivery === "steer") {
             const hasPendingSteer = yield* db
               .transaction((tx) =>
@@ -627,7 +840,8 @@ const layer = Layer.effect(
             .get()
             .pipe(Effect.orDie)
           if (!current) return false
-          if (delivery === "steer" && (yield* compacting(sessionID))) {
+          // A hold that began while this message was being prepared wins too.
+          if ((yield* held(sessionID)) || (delivery === "steer" && (yield* compacting(sessionID)))) {
             yield* unreserve(sessionID, itemID)
             return false
           }
@@ -782,12 +996,20 @@ const layer = Layer.effect(
         }),
       )
 
+    // A held pending item is not awaiting a drain: none could promote it, and the
+    // hold's end wakes the session instead.
     const awaitingDrain = Effect.fn("SessionQueue.awaitingDrain")(function* (sessionID: SessionID) {
       if (parked.has(sessionID)) return false
       const row = yield* db
         .select({ id: SessionPromptQueueTable.id })
         .from(SessionPromptQueueTable)
-        .where(and(eq(SessionPromptQueueTable.session_id, sessionID), isNull(SessionPromptQueueTable.time_withdrawn)))
+        .where(
+          and(
+            eq(SessionPromptQueueTable.session_id, sessionID),
+            isNull(SessionPromptQueueTable.time_withdrawn),
+            (yield* held(sessionID)) ? isNotNull(SessionPromptQueueTable.time_promoted) : undefined,
+          ),
+        )
         .limit(1)
         .get()
         .pipe(Effect.orDie)
@@ -893,6 +1115,12 @@ const layer = Layer.effect(
       empty,
       exclusive,
       whileCompacting,
+      hold,
+      release,
+      released,
+      remove,
+      reorder,
+      consolidate,
     })
   }),
 )
@@ -931,6 +1159,72 @@ function fromRow(row: typeof SessionPromptQueueTable.$inferSelect): Item {
     input: decodeInput(row.input),
     time: { created: row.time_created },
   }
+}
+
+/**
+ * The consolidate button's plan over pending items in promotion order (#212).
+ * Of identical items, in any category, the first stays. Then commands that
+ * share a category, a leading verb (any case) and a target, the next word,
+ * merge into the first of them as `<verb> <target>:` and numbered steps in
+ * promotion order. A command is a prompt of one plain text part, `<verb>
+ * <target> <step>`; a merged command parses back into its own steps, so a later
+ * consolidation adds to them. Commands merge only with the same agent, model and
+ * options, which their steps then share.
+ */
+export function consolidation(items: readonly Item[]) {
+  const seen = new Set<string>()
+  const kept = items.filter((item) => {
+    const key = JSON.stringify(withoutUndefined(withoutIDs(item.input)))
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+  const groups = Map.groupBy(
+    kept.flatMap((item) => {
+      const command = parseCommand(item.input)
+      if (!command) return []
+      const context = withoutUndefined({ ...withoutIDs(item.input), parts: [{ ...item.input.parts[0], text: "" }] })
+      return [
+        { item, command, key: JSON.stringify([item.delivery, command.verb.toLowerCase(), command.target, context]) },
+      ]
+    }),
+    (entry) => entry.key,
+  )
+  const merges = [...groups.values()].filter((group) => group.length > 1)
+  const mergedAway = new Set(merges.flatMap((group) => group.slice(1).map((entry) => entry.item.id)))
+  return {
+    removed: items.filter((item) => !kept.includes(item) || mergedAway.has(item.id)).map((item) => item.id),
+    merged: merges.map((group) => {
+      const first = group[0]!
+      const text = [
+        `${first.command.verb} ${first.command.target}:`,
+        ...group.flatMap((entry) => entry.command.steps).map((step, index) => `${index + 1}. ${step}`),
+      ].join("\n")
+      return {
+        id: first.item.id,
+        input: { ...first.item.input, parts: [{ ...first.item.input.parts[0]!, text }] } as SessionPromptQueue.QueuedInput,
+      }
+    }),
+  }
+}
+
+function parseCommand(input: SessionPromptQueue.QueuedInput) {
+  const part = input.parts[0]
+  if (input.parts.length !== 1 || part?.type !== "text" || part.synthetic) return undefined
+  const match = /^\s*(\S+)\s+(\S+?)[:,]?\s+(\S[\s\S]*)$/.exec(part.text)
+  if (!match) return undefined
+  const rest = match[3]!.trim()
+  const lines = rest.split("\n")
+  const numbered = lines.length > 1 && lines.every((line) => /^\d+\.\s+\S/.test(line))
+  return {
+    verb: match[1]!,
+    target: match[2]!,
+    steps: numbered ? lines.map((line) => line.replace(/^\d+\.\s+/, "")) : [rest],
+  }
+}
+
+function withoutIDs(input: SessionPromptQueue.QueuedInput) {
+  return { ...Struct.omit(input, ["messageID"]), parts: input.parts.map((part) => Struct.omit(part, ["id"])) }
 }
 
 function sameMessage(left: SessionV1.WithParts, right: SessionV1.WithParts) {

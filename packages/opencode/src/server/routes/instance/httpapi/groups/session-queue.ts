@@ -1,7 +1,7 @@
 import { SessionQueue } from "@/session/queue"
 import { SessionID } from "@/session/schema"
 import { Schema } from "effect"
-import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
+import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
 import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
@@ -16,10 +16,18 @@ export const SessionQueuePaths = {
   withdraw: `${root}/:itemID`,
   update: `${root}/:itemID`,
   restore: `${root}/restore`,
+  hold: `${root}/hold`,
+  release: `${root}/release`,
+  remove: `${root}/remove`,
+  reorder: `${root}/reorder`,
+  consolidate: `${root}/consolidate`,
 } as const
 
 export const RestorePayload = Schema.Struct({ id: SessionQueue.ItemID })
 export const UpdatePayload = Schema.Struct({ delivery: SessionQueue.Delivery })
+export const HoldPayload = Schema.Struct({ holder: Schema.String.check(Schema.isNonEmpty()) })
+export const RemovePayload = Schema.Struct({ id: SessionQueue.ItemID })
+export const ReorderPayload = Schema.Struct({ items: Schema.Array(SessionQueue.ItemID) })
 
 export const SessionQueueApi = HttpApi.make("sessionQueue").add(
   HttpApiGroup.make("sessionQueue")
@@ -76,6 +84,75 @@ export const SessionQueueApi = HttpApi.make("sessionQueue").add(
           summary: "Change queued prompt delivery",
           description:
             "Change how a pending prompt is delivered and wake the session. Setting steer sends a queued prompt at the next step.",
+        }),
+      ),
+      HttpApiEndpoint.post("hold", SessionQueuePaths.hold, {
+        params: { sessionID: SessionID },
+        query: WorkspaceRoutingQuery,
+        payload: HoldPayload,
+        success: described(Schema.Array(SessionQueue.Item), "Pending queue items in delivery order"),
+        error: [HttpApiError.BadRequest, ApiNotFoundError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "session.queue.hold",
+          summary: "Hold queued prompts for review",
+          description:
+            "Start or renew a review hold for this holder. While a session has a hold, none of its queued prompts reaches the model, so the returned list stays as it is until the hold ends. A hold the holder does not renew lapses after six minutes.",
+        }),
+      ),
+      HttpApiEndpoint.post("release", SessionQueuePaths.release, {
+        params: { sessionID: SessionID },
+        query: WorkspaceRoutingQuery,
+        payload: HoldPayload,
+        success: described(HttpApiSchema.NoContent, "Hold released"),
+        error: [HttpApiError.BadRequest, ApiNotFoundError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "session.queue.release",
+          summary: "Release a review hold",
+          description:
+            "End this holder's review hold. Once no hold is left, the session is woken and its queued prompts are delivered.",
+        }),
+      ),
+      HttpApiEndpoint.post("remove", SessionQueuePaths.remove, {
+        params: { sessionID: SessionID },
+        query: WorkspaceRoutingQuery,
+        payload: RemovePayload,
+        success: described(SessionQueue.Item, "Deleted queue item"),
+        error: [HttpApiError.BadRequest, ApiNotFoundError, QueueItemNotPendingError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "session.queue.remove",
+          summary: "Delete queued prompt",
+          description:
+            "Delete a pending prompt for good; unlike a withdrawn one it cannot be restored. Fails with QueueItemNotPending when it was already delivered, withdrawn or never existed.",
+        }),
+      ),
+      HttpApiEndpoint.post("reorder", SessionQueuePaths.reorder, {
+        params: { sessionID: SessionID },
+        query: WorkspaceRoutingQuery,
+        payload: ReorderPayload,
+        success: described(Schema.Array(SessionQueue.Item), "Pending queue items in delivery order"),
+        error: [HttpApiError.BadRequest, ApiNotFoundError, QueueItemNotPendingError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "session.queue.reorder",
+          summary: "Reorder queued prompts",
+          description:
+            "Deliver the listed pending prompts in the listed order. Steers still come before queued prompts, and no prompt changes how it is delivered. Fails with QueueItemNotPending, changing nothing, when any of them is not pending.",
+        }),
+      ),
+      HttpApiEndpoint.post("consolidate", SessionQueuePaths.consolidate, {
+        params: { sessionID: SessionID },
+        query: WorkspaceRoutingQuery,
+        success: described(Schema.Array(SessionQueue.Item), "Pending queue items in delivery order"),
+        error: [HttpApiError.BadRequest, ApiNotFoundError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "session.queue.consolidate",
+          summary: "Consolidate queued prompts",
+          description:
+            "Keep one of identical pending prompts, and merge pending commands of one delivery that share their leading verb and target into one command with numbered steps, in delivery order.",
         }),
       ),
     )

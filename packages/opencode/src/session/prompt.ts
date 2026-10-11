@@ -1671,7 +1671,9 @@ const layer = Layer.effect(
       // nothing running. A busy one (a shell, say) is joined as before.
       const idle = Exit.isSuccess(yield* state.assertNotBusy(sessionID).pipe(Effect.exit))
       if (idle && (yield* queue.empty(sessionID))) {
-        const first = (delivery: SessionQueue.Delivery) =>
+        // A review hold keeps even a new session's first prompt pending.
+        yield* queue.released(sessionID)
+        const first =(delivery: SessionQueue.Delivery) =>
           queue.promote({
             sessionID,
             delivery,
@@ -1683,6 +1685,9 @@ const layer = Layer.effect(
           })
         yield* first("steer")
         yield* first("queue")
+        // A deleted first prompt leaves no message to answer with, as a withdrawn one does.
+        if ((yield* queue.empty(sessionID)) && own && !(yield* queue.unread(sessionID, own)))
+          return yield* new SessionQueue.WithdrawnError({ sessionID, itemID: own })
         if (yield* queue.empty(sessionID)) return yield* withdrawn.pipe(Effect.andThen(lastAssistant(sessionID)))
       }
       const result = yield* state.ensureRunning(
