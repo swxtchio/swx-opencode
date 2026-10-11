@@ -94,9 +94,7 @@ const gated = (sessionID: SessionID, delivery: SessionQueue.Delivery, written: s
         prepare: (input) =>
           Deferred.isDone(preparing).pipe(
             Effect.flatMap((again) =>
-              again
-                ? Effect.void
-                : Deferred.succeed(preparing, undefined).pipe(Effect.andThen(Deferred.await(gate))),
+              again ? Effect.void : Deferred.succeed(preparing, undefined).pipe(Effect.andThen(Deferred.await(gate))),
             ),
             Effect.as(input),
           ),
