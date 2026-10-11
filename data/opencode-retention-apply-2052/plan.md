@@ -92,3 +92,25 @@ enumeration in `X-Pruned-Sessions`; the 200 response and bare-array body stay.
 - Regression: a standard Node HTTP client (default 16 KiB header limit) syncs a 550-pruned-Session history over TCP;
   red with complete enumeration restored (header overflow), with the budget removed, and with runs allowed to span
   unpruned Sessions.
+
+## Round-1 review fixes (pin d562be39eb)
+
+Source: `data/opencode-retention-fix-r2/review-round1-fixes.md` in the firstmate home.
+
+1. Header capacity (#224): the range work is committed. Add the missing proofs: the high-cardinality test also
+   shows pruned Sessions the truncated header does not cover are still excluded, and a reader test with more
+   pruned aggregates than SQLite's bound-parameter limit (32,766) stays correct; red with the exclusion bound as an
+   ID list.
+2. Holder interleaving (#226): a registered separate process holds BEGIN IMMEDIATE and reports it; apply's handle
+   signals at the instant it issues BEGIN IMMEDIATE; only then does the contender admit a new unregistered holder,
+   report it ready, and release. Apply must refuse with no write; moving the rescan anywhere before lock acquisition
+   (just after `input.evidence`) must turn it red.
+3. Browser visibility (#225): the history response that sets X-Pruned-Sessions also sets
+   `Access-Control-Expose-Headers: X-Pruned-Sessions`, as the session messages handler does for its paging headers;
+   an allowed-Origin regression checks it.
+4. Truthful text: the readerContract and productionEvidence comments (reader behaviour decided, production evidence
+   absent); the HTTP fixture descriptions (marker-driven exclusion over unredacted rows, not an applied store); the
+   missing-sequence sentinel is gone with the range contract; OpenAPI and SDK stay aligned.
+5. Workspace consumer (#223): already compatible with the best-effort range contract; any handling of cached
+   Sessions needs a client policy, reported on #223 rather than implemented.
+6. CHANGESET.md entry: at publication, once the PR number exists.
