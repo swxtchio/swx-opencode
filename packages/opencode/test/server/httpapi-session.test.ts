@@ -2251,6 +2251,208 @@ describe("session HttpApi", () => {
     30_000,
   )
 
+  // Review view (swxtchio/swx-opencode#212).
+  const reviewRoutes = (directory: string, sessionID: SessionIDType, llm: TestLLMServer["Service"]) => {
+    const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+    const params = { sessionID }
+    const post = (path: string, body?: unknown) =>
+      request(pathFor(path, params), {
+        method: "POST",
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+      })
+    const lastUsers = llm.inputs.pipe(
+      Effect.map((inputs) => inputs.map((input) => (Array.isArray(input.messages) ? input.messages.at(-1) : undefined))),
+    )
+    return {
+      headers,
+      post,
+      prompt: (text: string, delivery?: SessionQueue.Delivery) =>
+        post(SessionPaths.promptAsync, {
+          agent: "build",
+          model: { providerID: "test", modelID: "test-model" },
+          ...(delivery ? { delivery } : {}),
+          parts: [{ type: "text", text }],
+        }),
+      listed: () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }),
+      texts: (items: readonly SessionQueue.Item[]) =>
+        items.map((item) => item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")),
+      idle: () =>
+        pollWithTimeout(
+          requestJson<Record<string, { type: string }>>(SessionPaths.status, { headers }).pipe(
+            Effect.map((status) => (status[sessionID] === undefined ? true : undefined)),
+          ),
+          "session never went idle",
+        ),
+      lastUsers,
+      delivered: (count: number) =>
+        pollWithTimeout(
+          lastUsers.pipe(Effect.map((users) => (users.length >= count ? users : undefined))),
+          `the model never received ${count} turns`,
+          "10 seconds",
+        ),
+    }
+  }
+
+  it.live(
+    "a review hold keeps admitted steers and queued prompts pending until its release delivers them",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "review hold" }).pipe(provideInstanceEffect(directory))
+        const api = reviewRoutes(directory, session.id, llm)
+
+        yield* api.prompt("start")
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        const opened = yield* api.post(SessionQueuePaths.hold, { holder: "view" })
+        expect(opened.status).toBe(200)
+        expect(yield* json<SessionQueue.Item[]>(opened)).toEqual([])
+
+        // Unheld, the steer would be promoted at admission into the running turn's history.
+        yield* api.prompt("steer while held")
+        yield* api.prompt("queued while held", "queue")
+        const pending = yield* pollWithTimeout(
+          api.listed().pipe(Effect.map((items) => (items.length === 2 ? items : undefined))),
+          "prompts never queued",
+        )
+        expect(pending.map((item) => item.delivery)).toEqual(["steer", "queue"])
+
+        // The turn ends where it would promote both, and goes idle with both pending.
+        yield* Deferred.succeed(gate, undefined)
+        yield* api.idle()
+        expect(yield* llm.calls).toBe(1)
+        expect(api.texts(yield* api.listed())).toEqual(["steer while held", "queued while held"])
+        const messages = yield* requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, { sessionID: session.id }), {
+          headers: api.headers,
+        })
+        expect(JSON.stringify(messages)).not.toContain("while held")
+
+        // A sync prompt on a new session waits out the hold rather than failing.
+        const fresh = yield* createSession({ title: "review hold, new session" }).pipe(provideInstanceEffect(directory))
+        const freshApi = reviewRoutes(directory, fresh.id, llm)
+        expect((yield* freshApi.post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const first = yield* freshApi
+          .post(SessionPaths.prompt, {
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            parts: [{ type: "text", text: "first prompt while held" }],
+          })
+          .pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          freshApi.listed().pipe(Effect.map((items) => (items.length === 1 ? true : undefined))),
+          "first prompt never queued",
+        )
+
+        yield* llm.text("steer done")
+        yield* llm.text("queue done")
+        const released = yield* api.post(SessionQueuePaths.release, { holder: "view" })
+        expect(released.status).toBe(204)
+        expect(yield* api.delivered(3)).toEqual([
+          { role: "user", content: "start" },
+          { role: "user", content: "steer while held" },
+          { role: "user", content: "queued while held" },
+        ])
+        yield* api.idle()
+        expect(yield* api.listed()).toEqual([])
+
+        yield* llm.text("first done")
+        expect((yield* freshApi.post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+        const answered = yield* awaitWithTimeout(Fiber.join(first), "held first prompt never answered", "10 seconds")
+        expect(answered.status).toBe(200)
+        expect(yield* responseJson(answered)).toMatchObject({ info: { role: "assistant" } })
+        expect((yield* api.lastUsers).at(-1)).toEqual({ role: "user", content: "first prompt while held" })
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
+    "deleted, reordered and consolidated pending prompts are delivered as the review left them",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "review edits" }).pipe(provideInstanceEffect(directory))
+        const api = reviewRoutes(directory, session.id, llm)
+
+        yield* api.prompt("start")
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        expect((yield* api.post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const admitted = [
+          "drop this one",
+          "run lint now",
+          "fix auth.ts: handle a null token",
+          "run lint now",
+          "fix auth.ts: add a regression test",
+          "write the changelog",
+        ]
+        yield* Effect.forEach(admitted, (text) => api.prompt(text, "queue"), { discard: true })
+        const pending = yield* pollWithTimeout(
+          api.listed().pipe(Effect.map((items) => (items.length === admitted.length ? items : undefined))),
+          "prompts never queued",
+        )
+        const [doomed] = pending
+
+        const removed = yield* api.post(SessionQueuePaths.remove, { id: doomed!.id })
+        expect(removed.status).toBe(200)
+        expect(yield* json<SessionQueue.Item>(removed)).toEqual(doomed!)
+        const again = yield* api.post(SessionQueuePaths.remove, { id: doomed!.id })
+        expect(again.status).toBe(404)
+        expect(yield* responseJson(again)).toMatchObject({ _tag: "QueueItemNotPending", itemID: doomed!.id })
+
+        const consolidated = yield* api.post(SessionQueuePaths.consolidate)
+        expect(consolidated.status).toBe(200)
+        const merged = yield* json<SessionQueue.Item[]>(consolidated)
+        expect(api.texts(merged)).toEqual([
+          "run lint now",
+          "fix auth.ts:\n1. handle a null token\n2. add a regression test",
+          "write the changelog",
+        ])
+
+        const [lint, fix, changelog] = merged
+        const stale = yield* api.post(SessionQueuePaths.reorder, { items: [doomed!.id, lint!.id] })
+        expect(stale.status).toBe(404)
+        const reordered = yield* api.post(SessionQueuePaths.reorder, { items: [changelog!.id, fix!.id, lint!.id] })
+        expect(reordered.status).toBe(200)
+        expect(api.texts(yield* json<SessionQueue.Item[]>(reordered))).toEqual([
+          "write the changelog",
+          "fix auth.ts:\n1. handle a null token\n2. add a regression test",
+          "run lint now",
+        ])
+
+        yield* Deferred.succeed(gate, undefined)
+        yield* api.idle()
+        yield* llm.text("changelog done")
+        yield* llm.text("fix done")
+        yield* llm.text("lint done")
+        expect((yield* api.post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+        expect(yield* api.delivered(4)).toEqual([
+          { role: "user", content: "start" },
+          { role: "user", content: "write the changelog" },
+          { role: "user", content: "fix auth.ts:\n1. handle a null token\n2. add a regression test" },
+          { role: "user", content: "run lint now" },
+        ])
+        yield* api.idle()
+        expect(JSON.stringify(yield* llm.inputs)).not.toContain("drop this one")
+        expect(yield* api.listed()).toEqual([])
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
   it.live(
     "publishes session.queue.updated on the event stream with the full pending list",
     () => {

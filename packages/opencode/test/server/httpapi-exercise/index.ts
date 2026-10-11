@@ -1458,6 +1458,107 @@ const scenarios: Scenario[] = [
       }),
     ),
   http.protected
+    .post("/session/{sessionID}/queue/hold", "session.queue.hold")
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue hold session" })
+        const item = yield* ctx.queued(session.id, { text: "held" })
+        return { session, item }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/hold", { sessionID: ctx.state.session.id }),
+      headers: ctx.headers(),
+      body: { holder: "exercise" },
+    }))
+    .json(200, (body, ctx) => {
+      array(body)
+      check(stable(body) === stable([ctx.state.item]), "hold should return the pending items")
+    }),
+  http.protected
+    .post("/session/{sessionID}/queue/release", "session.queue.release")
+    .preserveDatabase()
+    .withLlm()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue release session" })
+        const item = yield* ctx.queued(session.id, { text: "released" })
+        yield* ctx.hold(session.id, "exercise")
+        yield* ctx.llmText("released reply")
+        return { session, item }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/release", { sessionID: ctx.state.session.id }),
+      headers: ctx.headers(),
+      body: { holder: "exercise" },
+    }))
+    .status(204, (ctx) => ctx.llmWait(1)),
+  http.protected
+    .post("/session/{sessionID}/queue/remove", "session.queue.remove")
+    .mutating()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue remove session" })
+        const item = yield* ctx.queued(session.id, { text: "removed" })
+        return { session, item }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/remove", { sessionID: ctx.state.session.id }),
+      headers: ctx.headers(),
+      body: { id: ctx.state.item.id },
+    }))
+    .jsonEffect(200, (body, ctx) =>
+      Effect.gen(function* () {
+        check(stable(body) === stable(ctx.state.item), "remove should return the item")
+        check((yield* ctx.queue(ctx.state.session.id)).length === 0, "removed item should leave the queue")
+      }),
+    ),
+  http.protected
+    .post("/session/{sessionID}/queue/reorder", "session.queue.reorder")
+    .mutating()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue reorder session" })
+        const first = yield* ctx.queued(session.id, { text: "first" })
+        const second = yield* ctx.queued(session.id, { text: "second" })
+        return { session, first, second }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/reorder", { sessionID: ctx.state.session.id }),
+      headers: ctx.headers(),
+      body: { items: [ctx.state.second.id, ctx.state.first.id] },
+    }))
+    .json(200, (body, ctx) => {
+      array(body)
+      check(
+        stable(body.map((item) => (isRecord(item) ? item.id : undefined))) ===
+          stable([ctx.state.second.id, ctx.state.first.id]),
+        "reorder should return the items in their new order",
+      )
+    }),
+  http.protected
+    .post("/session/{sessionID}/queue/consolidate", "session.queue.consolidate")
+    .mutating()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue consolidate session" })
+        const item = yield* ctx.queued(session.id, { text: "repeated" })
+        yield* ctx.queued(session.id, { text: "repeated" })
+        return { session, item }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/consolidate", { sessionID: ctx.state.session.id }),
+      headers: ctx.headers(),
+    }))
+    .json(200, (body, ctx) => {
+      array(body)
+      check(stable(body) === stable([ctx.state.item]), "consolidate should keep one of identical items")
+    }),
+  http.protected
     .post("/session/{sessionID}/fork", "session.fork")
     .mutating()
     .seeded((ctx) => ctx.session({ title: "Fork source" }))

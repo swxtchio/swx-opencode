@@ -10777,6 +10777,184 @@ export type SessionQueueRestoreResponses = {
 
 export type SessionQueueRestoreResponse = SessionQueueRestoreResponses[keyof SessionQueueRestoreResponses]
 
+export type SessionQueueHoldData = {
+  body?: {
+    holder: string
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/hold"
+}
+
+export type SessionQueueHoldErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionQueueHoldError = SessionQueueHoldErrors[keyof SessionQueueHoldErrors]
+
+export type SessionQueueHoldResponses = {
+  /**
+   * Pending queue items in delivery order
+   */
+  200: Array<SessionPromptQueueItem>
+}
+
+export type SessionQueueHoldResponse = SessionQueueHoldResponses[keyof SessionQueueHoldResponses]
+
+export type SessionQueueReleaseData = {
+  body?: {
+    holder: string
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/release"
+}
+
+export type SessionQueueReleaseErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionQueueReleaseError = SessionQueueReleaseErrors[keyof SessionQueueReleaseErrors]
+
+export type SessionQueueReleaseResponses = {
+  /**
+   * Hold released
+   */
+  204: void
+}
+
+export type SessionQueueReleaseResponse = SessionQueueReleaseResponses[keyof SessionQueueReleaseResponses]
+
+export type SessionQueueRemoveData = {
+  body?: {
+    id: string
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/remove"
+}
+
+export type SessionQueueRemoveErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError | QueueItemNotPending
+   */
+  404: NotFoundError | QueueItemNotPending
+}
+
+export type SessionQueueRemoveError = SessionQueueRemoveErrors[keyof SessionQueueRemoveErrors]
+
+export type SessionQueueRemoveResponses = {
+  /**
+   * Deleted queue item
+   */
+  200: SessionPromptQueueItem
+}
+
+export type SessionQueueRemoveResponse = SessionQueueRemoveResponses[keyof SessionQueueRemoveResponses]
+
+export type SessionQueueReorderData = {
+  body?: {
+    items: Array<string>
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/reorder"
+}
+
+export type SessionQueueReorderErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError | QueueItemNotPending
+   */
+  404: NotFoundError | QueueItemNotPending
+}
+
+export type SessionQueueReorderError = SessionQueueReorderErrors[keyof SessionQueueReorderErrors]
+
+export type SessionQueueReorderResponses = {
+  /**
+   * Pending queue items in delivery order
+   */
+  200: Array<SessionPromptQueueItem>
+}
+
+export type SessionQueueReorderResponse = SessionQueueReorderResponses[keyof SessionQueueReorderResponses]
+
+export type SessionQueueConsolidateData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/consolidate"
+}
+
+export type SessionQueueConsolidateErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionQueueConsolidateError = SessionQueueConsolidateErrors[keyof SessionQueueConsolidateErrors]
+
+export type SessionQueueConsolidateResponses = {
+  /**
+   * Pending queue items in delivery order
+   */
+  200: Array<SessionPromptQueueItem>
+}
+
+export type SessionQueueConsolidateResponse = SessionQueueConsolidateResponses[keyof SessionQueueConsolidateResponses]
+
 export type SyncStartData = {
   body?: never
   path?: never

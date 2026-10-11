@@ -212,6 +212,8 @@ function withContext<A, E>(
               ),
             ),
           queue: (sessionID) => run(modules.SessionQueue.Service.use((svc) => svc.list(sessionID))),
+          hold: (sessionID, holder) =>
+            run(modules.SessionQueue.Service.use((svc) => svc.hold(sessionID, holder).pipe(Effect.asVoid))),
           todos: (sessionID, todos) => run(modules.Todo.Service.use((svc) => svc.update({ sessionID, todos }))),
           worktree: (input) => run(modules.Worktree.Service.use((svc) => svc.create(input).pipe(Effect.orDie))),
           worktreeRemove: (directory) =>
