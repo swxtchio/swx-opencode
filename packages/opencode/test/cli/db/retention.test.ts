@@ -587,6 +587,32 @@ test("customer-bound and unclassified Session trees remain ineligible", () => {
   }
 })
 
+test("held alias custody blocks retention and follows queue-owner cleanup", async () => {
+  await using store = await producedStore([1])
+  const produced = store.trees[0]!
+  const db = new Database(store.filename)
+  try {
+    db.exec("PRAGMA foreign_keys=ON")
+    db.query(
+      "INSERT INTO session_prompt_queue(id,session_id,seq,delivery,input,time_created,time_withdrawn) VALUES ('que_held',?,1,'queue',?,10,11)",
+    ).run(produced.rootSessionID, JSON.stringify({ parts: [{ type: "text", text: "held original sentinel" }] }))
+    db.query("INSERT INTO session_prompt_queue_alias VALUES ('prt_original','que_held'),('prt_retry','que_held')").run()
+    const proof = evidence(produced.sessionIDs, finalSequence(db, produced.sessionIDs), store.filename)
+    const before = db.serialize()
+    const result = inventory(access(db), proof, store.now)
+    expect(result.trees[0]?.reasons).toContain("v1-prompt-queue-row-present")
+    expect(result.trees[0]?.eligible).toBe(false)
+    expect(result.refusals).not.toContain("unclassified-session-owned-table:session_prompt_queue_alias")
+    expect(db.serialize().equals(before)).toBe(true)
+    expect(db.query("SELECT count(*) AS count FROM session_prompt_queue_alias").get()).toEqual({ count: 2 })
+    // Exercise the source schema's cascade privately, not retention permission to discard a hold.
+    db.query("DELETE FROM session_prompt_queue WHERE id='que_held'").run()
+    expect(db.query("SELECT * FROM session_prompt_queue_alias").all()).toEqual([])
+  } finally {
+    db.close()
+  }
+})
+
 test("unknown event ownership, malformed event data, and new Session tables remain ineligible", () => {
   const db = reducedFixture()
   try {

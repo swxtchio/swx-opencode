@@ -4618,6 +4618,7 @@ const finish = <A, E>(...fibers: Fiber.Fiber<A, E>[]) =>
 
 const startHeld = Effect.fn("test.startHeld")(function* (input?: {
   tool?: boolean
+  agent?: string
   config?: (url: string) => Partial<ConfigV1.Info>
 }) {
   const { llm } = yield* useServerConfig(input?.config ?? providerCfg)
@@ -4633,9 +4634,46 @@ const startHeld = Effect.fn("test.startHeld")(function* (input?: {
     ? llm.push(reply().wait(deferredAsPromise(gate)).tool("first", { value: "first" }))
     : llm.hold("task done", deferredAsPromise(gate))
   const task = yield* prompt
-    .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("start the task") })
+    .prompt({ sessionID: chat.id, agent: input?.agent ?? "build", model: ref, parts: said("start the task") })
     .pipe(Effect.forkChild)
-  yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+  // A prompt setup failure must retain its cause rather than masquerade as provider readiness.
+  yield* awaitWithTimeout(
+    Effect.raceFirst(
+      llm.wait(1),
+      Fiber.join(task).pipe(Effect.andThen(Effect.fail(new Error("prompt finished before first provider call")))),
+    ),
+    "first provider call never started",
+    "10 seconds",
+  ).pipe(
+    Effect.onError((cause) =>
+      Effect.gen(function* () {
+        const pending = yield* queue.list(chat.id).pipe(Effect.timeoutOption("100 millis"), Effect.exit)
+        const history = yield* sessions.messages({ sessionID: chat.id }).pipe(
+          Effect.map((messages) =>
+            messages.map((message) => ({ id: message.info.id, role: message.info.role, parts: message.parts.length })),
+          ),
+          Effect.timeoutOption("100 millis"),
+          Effect.exit,
+        )
+        const calls = yield* llm.calls
+        const promptExit = task.pollUnsafe()
+        yield* Effect.sync(() =>
+          console.error("first provider boundary failed", {
+            cause: Cause.pretty(cause),
+            error: Cause.squash(cause),
+            promptExit: promptExit && (Exit.isFailure(promptExit) ? Cause.pretty(promptExit.cause) : "success"),
+            promptFrame: task.currentStackFrame,
+            calls,
+            pending:
+              Exit.isSuccess(pending) && Option.isSome(pending.value)
+                ? pending.value.value.map((item) => ({ id: item.id, delivery: item.delivery }))
+                : pending,
+            history,
+          }),
+        )
+      }),
+    ),
+  )
   const send = (text: string, extra?: Partial<SessionPrompt.PromptInput>) =>
     prompt
       .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said(text), ...extra })
@@ -9586,6 +9624,20 @@ it.instance(
       expect(inputs[1]?.reasoning_effort).toBe("high")
       expect(yield* held.queue.list(held.chat.id)).toEqual([])
     }),
+)
+
+it.instance("held provider setup exposes the actual prompt failure before any model call", () =>
+  Effect.gen(function* () {
+    const exit = yield* startHeld({ agent: "missing-provider-boundary-agent" }).pipe(Effect.exit)
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) throw new Error("expected actual preparation failure")
+    const error = Cause.squash(exit.cause)
+    expect(NamedError.Unknown.isInstance(error)).toBe(true)
+    if (!NamedError.Unknown.isInstance(error)) throw new Error("expected unknown-agent cause")
+    expect(error.data.message).toContain('Agent not found: "missing-provider-boundary-agent"')
+    const llm = yield* TestLLMServer
+    expect(yield* llm.calls).toBe(0)
+  }),
 )
 
 it.instance("captain critical peer remains an immediate steer during active provider work", () =>
