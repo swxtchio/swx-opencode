@@ -564,3 +564,203 @@ it.instance("peer batching retains complete file input alongside its literal env
     expect(metadata(message).constituents[0].input.parts[1]).toEqual(file)
   }),
 )
+
+it.instance("emits grouped consumer checkpoint through admission promotion and message reads", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const capture = process.env.OPENCODE_WRITE_GROUPED_FIXTURE === "1"
+    const git = (args: string[]) =>
+      Effect.promise(async () => {
+        const child = Bun.spawn(["git", ...args], { cwd: import.meta.dirname, stdout: "pipe", stderr: "pipe" })
+        const output = await new Response(child.stdout).text()
+        if (await child.exited) throw new Error(await new Response(child.stderr).text())
+        return output.trim()
+      })
+    const sha = yield* git(["rev-parse", "HEAD"])
+    if (capture) expect(yield* git(["status", "--porcelain"])).toBe("")
+    const model = {
+      id: ModelV2.ID.make("test"),
+      providerID: ProviderV2.ID.make("test"),
+      name: "Synthetic receiver",
+      api: { id: "test", url: "http://127.0.0.1:1", npm: "@ai-sdk/openai-compatible" },
+      capabilities: {
+        temperature: false,
+        reasoning: false,
+        attachment: false,
+        toolcall: true,
+        input: { text: true, audio: false, image: false, video: false, pdf: false },
+        output: { text: true, audio: false, image: false, video: false, pdf: false },
+        interleaved: false as const,
+      },
+      cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+      limit: { context: 100000, input: 100000, output: 10000 },
+      status: "active" as const,
+      options: {},
+      headers: {},
+      release_date: "2026-01-01",
+    }
+    const scenarios = yield* Effect.forEach(["peer", "automation"] as const, (name) =>
+      Effect.gen(function* () {
+        const session = yield* sessions.create({ title: `Synthetic grouped checkpoint: ${name}` })
+        const inputs: SessionQueue.AdmitInput[] =
+          name === "peer"
+            ? [
+                {
+                  sessionID: session.id,
+                  delivery: "queue",
+                  noReply: true,
+                  messageID: MessageID.make("msg_checkpoint_peer_request"),
+                  agent: "build",
+                  model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("synthetic-sender-model") },
+                  variant: "low",
+                  parts: [{ type: "text", text: peer(1, "request") }],
+                },
+                { sessionID: session.id, delivery: "queue", parts: [{ type: "text", text: peer(2, "info") }] },
+              ]
+            : [
+                {
+                  sessionID: session.id,
+                  delivery: "queue",
+                  messageID: MessageID.make("msg_checkpoint_notice_old"),
+                  parts: [{ type: "text", text: check("one", "historical stalled observation") }],
+                },
+                {
+                  sessionID: session.id,
+                  delivery: "queue",
+                  messageID: MessageID.make("msg_checkpoint_notice_distinct"),
+                  parts: [{ type: "text", text: check("two", "historical pending decision observation") }],
+                },
+                {
+                  sessionID: session.id,
+                  delivery: "queue",
+                  messageID: MessageID.make("msg_checkpoint_notice_later"),
+                  parts: [{ type: "text", text: check("one", "historical converged observation") }],
+                },
+              ]
+        const originals = yield* Effect.forEach(inputs, (input) => queue.admit(input))
+        const pending = yield* queue.list(session.id)
+        yield* queue.promote({
+          sessionID: session.id,
+          delivery: "queue",
+          prepare,
+          write: writer(sessions),
+          rejected: () => Effect.void,
+        })
+        const latest = (yield* MessageV2.stream(session.id))[0]
+        const returned = yield* MessageV2.get({ sessionID: session.id, messageID: latest.info.id })
+        const group = metadata(returned)
+        expect(group.constituents).toEqual(originals)
+        expect(group.constituents.map((item) => item.time.created)).toEqual(originals.map((item) => item.time.created))
+        const encoded = originals.map((item) => Schema.encodeSync(SessionPromptQueue.QueuedInput)(item.input))
+        expect(group.constituents.map((item) => Schema.encodeSync(SessionPromptQueue.QueuedInput)(item.input))).toEqual(
+          encoded,
+        )
+        const witnesses = returned.parts.flatMap((part) =>
+          part.type === "text" && part.metadata?.sessionQueue
+            ? [
+                {
+                  partID: part.id,
+                  messageID: part.messageID,
+                  ignored: part.ignored === true,
+                  synthetic: part.synthetic === true,
+                  constituentIDs: Schema.decodeUnknownSync(SessionPromptQueue.Group)(
+                    part.metadata.sessionQueue,
+                  ).constituents.map((item) => item.id),
+                },
+              ]
+            : [],
+        )
+        expect([...new Set(witnesses.flatMap((part) => part.constituentIDs))].sort()).toEqual(
+          originals.map((item) => item.id).sort(),
+        )
+        expect(
+          witnesses
+            .filter((part) => part.ignored)
+            .every((part) => part.synthetic && part.messageID === returned.info.id),
+        ).toBe(true)
+        expect(witnesses.filter((part) => !part.ignored)).toHaveLength(1)
+        expect(witnesses.filter((part) => part.ignored)).toHaveLength(3)
+        if (name === "peer") {
+          expect(
+            witnesses.filter((part) => part.ignored && part.constituentIDs.includes(originals[0].id)),
+          ).toHaveLength(2)
+          expect(Object.hasOwn(group.constituents[0].input, "noReply")).toBe(false)
+          expect(Object.hasOwn(group.constituents[0].input, "delivery")).toBe(false)
+          expect(group.constituents[0].delivery).toBe("queue")
+          expect(group.constituents[0].input.messageID).toBe(inputs[0].messageID)
+          expect(group.constituents[0].input.variant).toBe("low")
+        }
+        if (name === "automation") {
+          expect(text(returned)).not.toContain("historical stalled observation")
+          expect(text(returned)).toContain("historical pending decision observation")
+          expect(text(returned)).toContain("historical converged observation")
+          expect(text(returned)).toContain("not current measurements")
+        }
+        const modelInput = yield* Effect.promise(() => MessageV2.toModelMessages([returned], model))
+        expect(modelInput).toHaveLength(1)
+        expect(modelInput[0].role).toBe("user")
+        expect(modelInput[0].content).toHaveLength(1)
+        expect(JSON.stringify(modelInput)).not.toContain('"sessionQueue":')
+        expect(JSON.stringify(modelInput)).not.toContain("prt_queue_")
+        const marker = "SYNTHETIC_IGNORED_WITNESS_PROBE"
+        const probe = {
+          ...returned,
+          parts: returned.parts.map((part) =>
+            part.type === "text" && part.ignored ? { ...part, text: marker } : part,
+          ),
+        }
+        const excluded = yield* Effect.promise(() => MessageV2.toModelMessages([probe], model))
+        const control = yield* Effect.promise(() =>
+          MessageV2.toModelMessages(
+            [
+              {
+                ...probe,
+                parts: probe.parts.map((part) =>
+                  part.type === "text" && part.ignored ? { ...part, ignored: false } : part,
+                ),
+              },
+            ],
+            model,
+          ),
+        )
+        expect(JSON.stringify(excluded)).not.toContain(marker)
+        expect(JSON.stringify(control)).toContain(marker)
+        yield* queue.consume(session.id)
+        const afterConsume = yield* MessageV2.get({ sessionID: session.id, messageID: returned.info.id })
+        expect(afterConsume).toEqual(returned)
+        expect(yield* queue.list(session.id)).toEqual([])
+        return {
+          name,
+          originalCalls: inputs,
+          originals,
+          encodedOriginalInputs: encoded,
+          pendingBeforePromotion: pending,
+          returnedMessage: returned,
+          returnedAfterConsume: afterConsume,
+          witnesses,
+          modelInput,
+          modelExclusionProbe: { marker, excluded, unignoredControl: control },
+        }
+      }),
+    )
+    const fixture = {
+      provenance: {
+        producerSHA: sha,
+        generator: "packages/opencode/test/session/queue-dispatch.test.ts",
+        test: "emits grouped consumer checkpoint through admission promotion and message reads",
+        runtime: `Bun ${Bun.version}`,
+        syntheticOnly: true,
+        clockAndIDs: "Actual admission times and generated IDs are captured unchanged; reruns produce a new capture.",
+      },
+      scenarios,
+    }
+    if (capture)
+      yield* Effect.promise(() =>
+        Bun.write(
+          new URL("../fixture/grouped-delivery/checkpoint.json", import.meta.url),
+          JSON.stringify(fixture, null, 2) + "\n",
+        ),
+      )
+  }),
+)
