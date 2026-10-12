@@ -110,8 +110,8 @@ test("upgrade repairs history sorting and observed read/timer stalls while retai
       const native = yield* Sqlite.Native
       const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
       if (!(native instanceof sqlite.Database)) throw new Error("expected Bun SQLite")
-    if (!("clearQueryCache" in native) || typeof native.clearQueryCache !== "function")
-      throw new Error("Bun SQLite cannot release cached query plans before schema rollback")
+      if (!("clearQueryCache" in native) || typeof native.clearQueryCache !== "function")
+        throw new Error("Bun SQLite cannot release cached query plans before schema rollback")
       native.clearQueryCache()
       yield* client.unsafe(`DROP INDEX ${lookup}`)
       const rollback = yield* measure()

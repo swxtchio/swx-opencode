@@ -641,13 +641,15 @@ const layer = Layer.effect(
         .findMessage(sessionID, (m) => m.info.role === "user" && !!m.info.model)
         .pipe(Effect.orDie)
       if (Option.isSome(match) && match.value.info.role === "user") return match.value.info.model
-      return yield* provider.defaultModel().pipe(Effect.orDie)
+      return { ...(yield* provider.defaultModel().pipe(Effect.orDie)), variant: undefined }
     })
 
     // Resolves a prompt into its user message without storing it, so a queue
     // promotion can drop the result when a withdraw wins meanwhile.
-    const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (input: PromptInput) {
-      const agentName = input.agent
+    const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (
+      input: PromptInput & { readonly group?: SessionPromptQueue.Group },
+    ) {
+      const agentName = input.group ? (yield* sessions.get(input.sessionID).pipe(Effect.orDie)).agent : input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
         const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
@@ -657,7 +659,8 @@ const layer = Layer.effect(
         throw error
       }
 
-      const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
+      const selected = input.group ? yield* currentModel(input.sessionID) : undefined
+      const model = selected ?? input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       // Also fetched when a variant was requested explicitly, so it can be
       // validated. Without this an unknown name reached request.ts, where
@@ -681,7 +684,9 @@ const layer = Layer.effect(
         throw error
       }
 
-      const variant = input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
+      const variant = selected
+        ? selected.variant
+        : (input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined))
 
       const info: SessionV1.User = {
         id: input.messageID ?? MessageID.ascending(),
@@ -1055,8 +1060,23 @@ const layer = Layer.effect(
         })
       }
 
-      return { info, parts }
+      return { info, parts, ...(input.group ? { group: input.group } : {}) }
     }, Effect.scoped)
+
+    const currentSelection = Effect.fnUntraced(function* (message: {
+      readonly info: SessionV1.User
+      readonly group?: SessionPromptQueue.Group
+    }) {
+      if (!message.group) return true
+      const session = yield* sessions.get(message.info.sessionID).pipe(Effect.orDie)
+      const selected = yield* currentModel(message.info.sessionID)
+      return (
+        (session.agent ?? message.info.agent) === message.info.agent &&
+        selected.providerID === message.info.model.providerID &&
+        selected.modelID === message.info.model.modelID &&
+        selected.variant === message.info.model.variant
+      )
+    })
 
     // Stores a prepared user message; the session follows its agent and model.
     const writeUserMessage = Effect.fnUntraced(function* (message: {
@@ -1100,15 +1120,11 @@ const layer = Layer.effect(
       const classificationText = input.parts
         .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
         .join("")
-      const classification = MachineMessage.classify(
-        classificationText,
-        (yield* config.get()).machine_message_markers,
-      )
+      const classification = MachineMessage.classify(classificationText, (yield* config.get()).machine_message_markers)
       const delivery = classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
       const markedNoReply = input.noReply === true && classification === "hold"
       const initiallyHeldNoReply =
-        markedNoReply &&
-        Exit.isFailure(yield* state.assertNotBusy(input.sessionID).pipe(Effect.exit))
+        markedNoReply && Exit.isFailure(yield* state.assertNotBusy(input.sessionID).pipe(Effect.exit))
       const queuedInput = markedNoReply && !input.messageID ? { ...input, messageID: MessageID.ascending() } : input
       // Preparation can yield while another prompt starts a run. Revalidate at
       // the write boundary so a newly active run receives the marked message as
@@ -1125,27 +1141,25 @@ const layer = Layer.effect(
               discard: (message) => sessions.removeMessage({ sessionID: input.sessionID, messageID: message.info.id }),
             })
           : undefined
-      const heldNoReply =
-        markedNoReply && (initiallyHeldNoReply || noReplyDecision?.kind === "queued")
-      const entry =
-        markedNoReply
+      const heldNoReply = markedNoReply && (initiallyHeldNoReply || noReplyDecision?.kind === "queued")
+      const entry = markedNoReply
+        ? noReplyDecision
           ? noReplyDecision
-            ? noReplyDecision
-            : {
-                kind: "queued" as const,
-                own: yield* queue.admit({ ...queuedInput, ...(delivery ? { delivery } : {}) }),
-                prepared: undefined,
-              }
-          : input.noReply === true
-            ? {
-                kind: "direct" as const,
-                message: yield* queue.exclusive(input.sessionID, createUserMessage(input)),
-              }
-            : {
-                kind: "queued" as const,
-                own: yield* queue.admit({ ...queuedInput, ...(delivery ? { delivery } : {}) }),
-                prepared: undefined,
-              }
+          : {
+              kind: "queued" as const,
+              own: yield* queue.admit({ ...queuedInput, ...(delivery ? { delivery } : {}) }),
+              prepared: undefined,
+            }
+        : input.noReply === true
+          ? {
+              kind: "direct" as const,
+              message: yield* queue.exclusive(input.sessionID, createUserMessage(input)),
+            }
+          : {
+              kind: "queued" as const,
+              own: yield* queue.admit({ ...queuedInput, ...(delivery ? { delivery } : {}) }),
+              prepared: undefined,
+            }
       if (entry.kind === "queued") yield* Effect.addFinalizer(() => queue.forget(entry.own.id))
       // Only this prompt's own failure is this caller's error; an older steer
       // promoted alongside it is reported on its own.
@@ -1155,6 +1169,7 @@ const layer = Layer.effect(
           delivery: "steer",
           prepare: prepareUserMessage,
           write: writeUserMessage,
+          valid: currentSelection,
           rejected: rejected(input.sessionID),
           own: entry.own.id,
         })
@@ -1206,6 +1221,7 @@ const layer = Layer.effect(
           delivery,
           prepare: prepareUserMessage,
           write: writeUserMessage,
+          valid: currentSelection,
           rejected: rejected(sessionID),
         })
         .pipe(Effect.orDie)
@@ -1240,9 +1256,7 @@ const layer = Layer.effect(
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
           seen = yield* queue.consume(sessionID)
-          const history = yield* MessageV2.snapshot(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
+          const history = yield* MessageV2.snapshot(sessionID).pipe(Effect.provideService(Database.Service, database))
           let msgs = history.messages
           const selection = { admissionOrder: history.admissionOrder, excludeNoReply: true }
           const root =
@@ -1677,6 +1691,7 @@ const layer = Layer.effect(
             delivery,
             prepare: prepareUserMessage,
             write: writeUserMessage,
+            valid: currentSelection,
             rejected: rejected(sessionID),
             own,
             untilStarted: true,

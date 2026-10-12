@@ -408,6 +408,7 @@ function makeHttpNoLLMServer(input?: PromptTestOptions) {
 // SessionRunState.ensureRunning has joined or started a run, and records which.
 // With `hold`, that caller also waits after its run ends, as a slow one would.
 const gates = {
+  queueSelection: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   finishingRead: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   nextEnsureRunning: undefined as
     | undefined
@@ -602,6 +603,12 @@ const gatedPlugin = LayerNode.make({
       const real = yield* Plugin.Service
       const trigger = ((name, input, output) =>
         Effect.gen(function* () {
+          const selection = name === "chat.message" ? gates.queueSelection : undefined
+          if (selection) {
+            gates.queueSelection = undefined
+            yield* Deferred.succeed(selection.entered, undefined)
+            yield* Deferred.await(selection.release)
+          }
           const failure = gates.outcomeFailure
           if (name === "experimental.chat.messages.transform" && failure && !failure.triggered) {
             failure.triggered = true
@@ -9490,5 +9497,176 @@ it.instance("lists the available efforts when the model declares some", () =>
     expect(error.data.message).toContain("Available:")
     expect(error.data.message).toContain("high")
     expect(error.data.message).toContain("low")
+  }),
+)
+
+it.instance(
+  "captain peer batches reach the actual provider before coalesced automation using recipient model and effort",
+  () =>
+    Effect.gen(function* () {
+      const held = yield* startHeld({
+        config: (url) => {
+          const base = providerCfg(url)
+          return {
+            ...base,
+            agent: { build: { model: "test/test-model", variant: "low" } },
+            provider: {
+              ...base.provider,
+              test: {
+                ...base.provider.test,
+                models: {
+                  ...base.provider.test.models,
+                  "test-model": {
+                    ...base.provider.test.models["test-model"],
+                    variants: { low: { reasoningEffort: "low" } },
+                  },
+                  "selected-model": {
+                    ...base.provider.test.models["test-model"],
+                    id: "selected-model",
+                    name: "Selected model",
+                    variants: { high: { reasoningEffort: "high" } },
+                  },
+                },
+              },
+            },
+          }
+        },
+      })
+      const automation =
+        "[fm-level:nudge:watcher.wake]\x1f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/task.check.sh: still actionable"
+      yield* held.queue.admit({ sessionID: held.chat.id, delivery: "queue", model: ref, parts: said(automation) })
+      const peers = Array.from(
+        { length: 11 },
+        (_, index) =>
+          `[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791809000-${index + 1}-abcd\x1f [fm-level:request]\x1f provider peer ${index + 1}\ncomplete tail ${index + 1}`,
+      )
+      yield* Effect.forEach(peers, (value, index) =>
+        held.queue.admit({
+          sessionID: held.chat.id,
+          delivery: "queue",
+          model: ref,
+          parts: [
+            ...said(value),
+            ...(index === 0
+              ? [
+                  {
+                    type: "file" as const,
+                    mime: "text/plain",
+                    filename: "peer-evidence.txt",
+                    url: "data:text/plain;base64,Y29tcGxldGUgZXZpZGVuY2U=",
+                  },
+                ]
+              : []),
+          ],
+        }),
+      )
+      yield* held.sessions.setAgentModel({
+        sessionID: held.chat.id,
+        agent: "build",
+        model: { providerID: ref.providerID, id: ModelV2.ID.make("selected-model"), variant: "high" },
+        time: Date.now(),
+      })
+      yield* held.llm.text("first ten handled")
+      yield* held.llm.text("overflow handled")
+      yield* held.llm.text("automation handled")
+      yield* held.release
+      yield* finish(held.task)
+      const inputs = yield* held.llm.inputs
+      expect(inputs).toHaveLength(4)
+      peers
+        .slice(0, 10)
+        .forEach((value) =>
+          expect(lastUserContent(inputs[1])).toContain(value.replaceAll("\x1f", "\\u001f").replaceAll("\n", "\\n")),
+        )
+      expect(lastUserContent(inputs[1])).toContain("complete evidence")
+      expect(lastUserContent(inputs[1])).not.toContain("provider peer 11")
+      expect(lastUserContent(inputs[2])).toContain("provider peer 11")
+      expect(lastUserContent(inputs[3])).toContain("still actionable")
+      expect(inputs[1]?.model).toBe("selected-model")
+      expect(inputs[1]?.reasoning_effort).toBe("high")
+      expect(yield* held.queue.list(held.chat.id)).toEqual([])
+    }),
+)
+
+it.instance("captain critical peer remains an immediate steer during active provider work", () =>
+  Effect.gen(function* () {
+    const held = yield* startHeld({ tool: true })
+    const critical =
+      "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791809000-1-abcd\x1f [fm-level:critical]\x1f urgent peer direction"
+    const sent = yield* held.send(critical)
+    yield* pollWithTimeout(
+      held.sessions
+        .messages({ sessionID: held.chat.id })
+        .pipe(
+          Effect.map((messages) =>
+            messages.some((message) =>
+              message.parts.some((part) => part.type === "text" && part.text.includes(critical)),
+            )
+              ? true
+              : undefined,
+          ),
+        ),
+      "critical peer was not immediately promoted",
+    )
+    expect(yield* held.queue.list(held.chat.id)).toEqual([])
+    yield* held.llm.text("critical handled")
+    yield* held.release
+    yield* finish(held.task, sent)
+    expect(JSON.stringify((yield* held.llm.inputs)[1]?.messages)).toContain("urgent peer direction")
+  }),
+)
+
+gated.instance("captain grouped preparation cannot restore model selection changed before commit", () =>
+  Effect.gen(function* () {
+    const held = yield* startHeld({
+      config: (url) => {
+        const base = providerCfg(url)
+        return {
+          ...base,
+          provider: {
+            ...base.provider,
+            test: {
+              ...base.provider.test,
+              models: {
+                ...base.provider.test.models,
+                "picked-later": {
+                  ...base.provider.test.models["test-model"],
+                  id: "picked-later",
+                  name: "Picked later",
+                },
+              },
+            },
+          },
+        }
+      },
+    })
+    yield* held.queue.admit({
+      sessionID: held.chat.id,
+      delivery: "queue",
+      model: ref,
+      parts: said(
+        "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791809000-1-abcd\x1f [fm-level:request]\x1f select at committed promotion",
+      ),
+    })
+    const gate = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+    gates.queueSelection = gate
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        gates.queueSelection = undefined
+      }),
+    )
+    yield* held.llm.text("peer handled on later selection")
+    yield* held.release
+    yield* awaitWithTimeout(Deferred.await(gate.entered), "group never paused during preparation")
+    yield* held.sessions.setAgentModel({
+      sessionID: held.chat.id,
+      agent: "build",
+      model: { providerID: ref.providerID, id: ModelV2.ID.make("picked-later") },
+      time: Date.now(),
+    })
+    yield* Deferred.succeed(gate.release, undefined)
+    yield* finish(held.task)
+    expect((yield* held.llm.inputs)[1]?.model).toBe("picked-later")
+    expect((yield* held.sessions.get(held.chat.id)).model?.id).toBe(ModelV2.ID.make("picked-later"))
   }),
 )

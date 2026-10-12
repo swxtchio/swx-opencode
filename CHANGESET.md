@@ -69,6 +69,8 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **Pending PR (opencode-message-latency-p1)** Deliver pending peers before automation in complete numbered batches of at most ten; coalesce validated automation by type and newest identified episode while retaining every original constituent in text metadata for exact retry/reconciliation. Commit grouped delivery atomically, preserve recipient model/effort at promotion, and add an eligible ordered-history lookup without excluding legacy messages. Assign the PR number before opening the landing gate. _Fork-only._
+
 - **#202** Recover a consume that meets a held write lock (swxtchio/swx-opencode#167, #180): `SessionQueue.consume` re-attempts a consume whose write never began, up to 5 attempts, each with a 10 s acquisition backstop, then ends the run with `SessionQueueConsumeLockedError` and keeps the queued prompts for the next one. No transaction body is replayed. _Fork-only._
 - **#201** Log SQLite write-lock holds and lock-stop call sites, diagnostics only (firstmate task
   opencode-stop-instrument-180, follows #194): an immediate transaction holding the write lock over 250 ms logs its

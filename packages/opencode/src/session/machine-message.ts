@@ -7,6 +7,7 @@ type Level = "critical" | "request" | "info" | "directive" | "nudge"
 type LevelToken = {
   level: Level
   body: string
+  key?: string
 }
 
 const DEFAULT_HOLD_MARKERS: Marker[] = [
@@ -86,6 +87,47 @@ export function classify(input: string, config?: MarkerConfig) {
     return "hold" as const
 }
 
+// Only generated, validated framing authorizes grouping. Unknown held messages stay individual.
+export function dispatch(input: string) {
+  const token = parseLevelToken(input)
+  const peer = input.startsWith(PEER_PREFIX) ? peerEnvelope(input) : undefined
+  if (peer) {
+    return {
+      kind: "peer" as const,
+      sender: peer.sender,
+      home: peer.home,
+      messageID: peer.messageID,
+      level: token?.level,
+    }
+  }
+  if (isFleetHeartbeat(input) && token?.level !== "critical") {
+    const duty = (token?.body ?? input).match(/ Periodic nudge: (.+) See docs\/fleet-operating-process\.md\./)?.[1]
+    return { kind: "automation" as const, type: "heartbeat", episode: duty ? `heartbeat-duty:${duty}` : "heartbeat" }
+  }
+  if (token?.level === "critical") return
+  if (token && (input.startsWith(OBSERVER_PREFIX) || input.startsWith(FIRSTMATE_PREFIX)))
+    return {
+      kind: "automation" as const,
+      type: `${input.startsWith(OBSERVER_PREFIX) ? "observer" : "firstmate"}.${token.level}`,
+      episode: undefined,
+    }
+  if (token?.key && token.key !== "watcher.wake")
+    return { kind: "automation" as const, type: `nudge.${token.key}`, episode: undefined }
+  if (
+    token?.level === "request" &&
+    /^WATCHER FIRED \[(failure|lifecycle|session-lock)-[0-9]+\][^\n]*\n\nwatcher: /.test(token.body)
+  )
+    return { kind: "automation" as const, type: "watcher.lifecycle", episode: undefined }
+  if (token?.key !== "watcher.wake") return
+  const wake = token.body.match(
+    /^WATCHER FIRED \[[a-z]+-[0-9]+\][^\n]*\n\n(check|signal|waiting|stale|orphaned|turn-died|heartbeat):?\s*([\s\S]*)$/,
+  )
+  if (!wake) return
+  const check = wake[1] === "check" ? wake[2].match(/^(\/[^\n:]+\.check\.sh): /)?.[1] : undefined
+  // A check file is the producer's durable episode identity. Other wakes have no single episode key.
+  return { kind: "automation" as const, type: `watcher.${wake[1]}`, episode: check }
+}
+
 function matches(marker: Marker, input: string) {
   if (marker.type === "prefix") return marker.value.length > 0 && input.startsWith(marker.value)
   return isFleetHeartbeat(input)
@@ -114,21 +156,21 @@ function parseLevelToken(input: string): LevelToken | undefined {
   if (specification.startsWith("nudge:")) {
     const key = specification.slice("nudge:".length)
     if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(key)) return
-    return { level: "nudge", body: content }
+    return { level: "nudge", body: content, key }
   }
   if (["critical", "request", "info", "directive"].includes(specification))
     return { level: specification as Level, body: content }
 }
 
 function levelTokenBody(input: string): string | undefined {
-  if (input.startsWith(PEER_PREFIX)) return peerEnvelopeBody(input)
+  if (input.startsWith(PEER_PREFIX)) return peerEnvelope(input)?.body
   if (input.startsWith(FIRSTMATE_PREFIX)) return input.slice(FIRSTMATE_PREFIX.length)
   if (input.startsWith(OBSERVER_PREFIX)) return input.slice(OBSERVER_PREFIX.length)
   if (input.startsWith(UNIT_SEPARATOR)) return input.slice(UNIT_SEPARATOR.length)
   return input
 }
 
-function peerEnvelopeBody(input: string) {
+function peerEnvelope(input: string) {
   let rest = input.slice(PEER_PREFIX.length)
   let padded = false
   if (rest.startsWith(" ")) {
@@ -154,7 +196,7 @@ function peerEnvelopeBody(input: string) {
   if (!home.startsWith("/") || home.includes("\n") || home.includes("\r")) return
   if (!/^p[0-9]+-[0-9]+-[0-9a-f]{4}$/.test(messageID)) return
   if (padded && rest.startsWith(" ")) rest = rest.slice(1)
-  return rest
+  return { sender: name, home, messageID, body: rest }
 }
 
 function isPeerTaskLabel(name: string) {

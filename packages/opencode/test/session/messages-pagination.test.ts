@@ -249,6 +249,7 @@ describe("mixed-version message admission migration", () => {
 
           yield* db.run(sql`DROP TRIGGER IF EXISTS message_admission_seq_legacy_insert`)
           yield* db.run(sql`DROP INDEX IF EXISTS message_session_admission_seq_idx`)
+          yield* db.run(sql`DROP INDEX IF EXISTS message_session_admission_order_idx`)
           yield* db.run(sql`ALTER TABLE message DROP COLUMN admission_seq`)
           yield* db.run(sql`DELETE FROM migration WHERE id = ${sessionMessageAdmissionOrderMigration.id}`)
 

@@ -2,16 +2,18 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionPromptQueueSequenceTable, SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
-import { MessageTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm"
 import { Cause, Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Scope, Semaphore, Struct } from "effect"
 import { isDeepStrictEqual } from "node:util"
+import { createHash } from "node:crypto"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { sqliteLockMessage } from "@/util/sqlite-error"
 import { MessageV2 } from "./message-v2"
-import { MessageID, SessionID } from "./schema"
+import { MachineMessage } from "./machine-message"
+import { MessageID, PartID, SessionID } from "./schema"
 
 type DatabaseService = Database.Interface["db"]
 type DatabaseTransaction = Parameters<Parameters<DatabaseService["transaction"]>[0]>[0]
@@ -34,6 +36,7 @@ export type AdmitInput = SessionPromptQueue.Input & { readonly sessionID: Sessio
 export type PromotedInput = SessionPromptQueue.QueuedInput & {
   readonly sessionID: SessionID
   readonly messageID: MessageID
+  readonly group?: SessionPromptQueue.Group
 }
 
 /** A prompt's own item was withdrawn, by an editor, before it could be delivered. */
@@ -103,14 +106,16 @@ export interface Interface {
    * wins. Steers wait while a compaction is pending or running, so they never
    * become its parent or input, and queued items go one per call so the loop
    * reevaluates between their turns. An item that cannot become a message is
-   * dropped: the caller's `own` item fails the call, any other goes to
-   * `rejected`, so one prompt's failure never lands on another.
+   * dropped for individual native input: the caller's `own` item fails the call,
+   * any other goes to `rejected`. Failed machine groups retain every constituent
+   * for retry. Peers batch up to ten ahead of same-type automation groups.
    */
   readonly promote: <P, E>(input: {
     readonly sessionID: SessionID
     readonly delivery: Delivery
     readonly prepare: (input: PromotedInput) => Effect.Effect<P, E>
     readonly write: (prepared: P) => Effect.Effect<unknown>
+    readonly valid?: (prepared: P) => Effect.Effect<boolean>
     readonly rejected: (cause: Cause.Cause<E>) => Effect.Effect<void>
     readonly own?: ItemID
     /** Stops once the session has any message, for a new session's first promotion. */
@@ -250,8 +255,64 @@ const layer = Layer.effect(
     })
 
     const admitLocked = Effect.fnUntraced(function* (input: AdmitInput) {
-      const row = yield* writable(input.sessionID, (tx) =>
+      const result = yield* writable(input.sessionID, (tx) =>
         Effect.gen(function* () {
+          const keys = constituentIDs(input.sessionID, input)
+          const delivered = keys.length
+            ? yield* tx.select().from(PartTable).where(inArray(PartTable.id, keys)).all()
+            : []
+          const originals = delivered.map((row) => {
+            const part = Schema.decodeUnknownOption(SessionV1.TextPart)({
+              ...row.data,
+              id: row.id,
+              sessionID: row.session_id,
+              messageID: row.message_id,
+            })
+            const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(
+              Option.getOrUndefined(part)?.metadata?.sessionQueue,
+            )
+            const original =
+              Option.isSome(group) && group.value.sessionID === input.sessionID
+                ? group.value.constituents.find((item) =>
+                    constituentIDs(input.sessionID, item.input).some((id) => id === row.id),
+                  )
+                : undefined
+            if (
+              !original ||
+              original.sessionID !== input.sessionID ||
+              row.session_id !== input.sessionID ||
+              !sameQueuedInput(original.input, input) ||
+              original.delivery !== (input.delivery ?? "steer")
+            )
+              throw new Error(`Conflicting delivered constituent: ${row.id}`)
+            return { item: original, messageID: MessageID.make(row.message_id) }
+          })
+          if (keys.length) {
+            const candidates = yield* tx
+              .select()
+              .from(SessionPromptQueueTable)
+              .where(
+                and(
+                  eq(SessionPromptQueueTable.session_id, input.sessionID),
+                  ...(input.messageID && dispatch(input)?.kind !== "peer"
+                    ? [sql`json_extract(${SessionPromptQueueTable.input}, '$.messageID') = ${input.messageID}`]
+                    : []),
+                ),
+              )
+              .all()
+            const matches = candidates.filter((row) =>
+              constituentIDs(input.sessionID, decodeInput(row.input)).some((id) => keys.includes(id)),
+            )
+            if (
+              matches.some(
+                (row) =>
+                  !sameQueuedInput(decodeInput(row.input), input) || row.delivery !== (input.delivery ?? "steer"),
+              )
+            )
+              return yield* Effect.die(new Error(`Conflicting prompt message ID: ${input.messageID ?? keys[0]}`))
+            if (originals.length) return { kind: "delivered" as const, ...originals[0] }
+            if (matches.length) return { kind: "row" as const, row: matches[0] }
+          }
           const allocated = yield* tx
             .insert(SessionPromptQueueSequenceTable)
             .values({ session_id: input.sessionID, seq: 1 })
@@ -262,7 +323,7 @@ const layer = Layer.effect(
             .returning({ seq: SessionPromptQueueSequenceTable.seq })
             .get()
           if (!allocated) return yield* Effect.die(new Error(`No queue seq allocated for ${input.sessionID}`))
-          return yield* tx
+          const row = yield* tx
             .insert(SessionPromptQueueTable)
             .values({
               id: ItemID.create(),
@@ -274,19 +335,29 @@ const layer = Layer.effect(
             })
             .returning()
             .get()
+          if (!row) return yield* Effect.die(new Error(`Queue admission for ${input.sessionID} stored nothing`))
+          return { kind: "row" as const, row }
         }),
       ).pipe(Effect.orDie)
-      if (!row) return yield* Effect.die(new Error(`Queue admission for ${input.sessionID} stored nothing`))
-      channels.set(row.id, { sessionID: input.sessionID })
-      wake(input.sessionID)
+      if (result.kind === "delivered") {
+        channels.set(result.item.id, { sessionID: input.sessionID, message: result.messageID })
+        return result.item
+      }
+      if (!channels.has(result.row.id))
+        channels.set(result.row.id, {
+          sessionID: input.sessionID,
+          ...(result.row.time_promoted && result.row.message_id ? { message: result.row.message_id } : {}),
+        })
+      if (!result.row.time_promoted) wake(input.sessionID)
       yield* publish(input.sessionID)
-      return fromRow(row)
+      return fromRow(result.row)
     })
 
     const writeOrAdmit: Interface["writeOrAdmit"] = (input) =>
       exclusive(
         input.admission.sessionID,
         Effect.gen(function* () {
+          if (dispatch(input.admission)) return { kind: "queued" as const, own: yield* admitLocked(input.admission) }
           const busy = input.forceQueue === true || (yield* input.isBusy)
           const existingRow = input.admission.messageID
             ? yield* db
@@ -459,14 +530,13 @@ const layer = Layer.effect(
         ),
       )
 
-    const oldest = (query: DatabaseAccess, sessionID: SessionID, delivery: Delivery) =>
+    const eligible = (query: DatabaseAccess, sessionID: SessionID, delivery: Delivery) =>
       query
         .select()
         .from(SessionPromptQueueTable)
         .where(and(pending(sessionID), eq(SessionPromptQueueTable.delivery, delivery)))
         .orderBy(asc(SessionPromptQueueTable.seq))
-        .limit(1)
-        .get()
+        .all()
         .pipe(Effect.orDie)
 
     // A promoted message sorts after the session's history: V1 clients order
@@ -499,151 +569,158 @@ const layer = Layer.effect(
           Effect.map((row) => row !== undefined),
         )
 
-    const markPromoted = (sessionID: SessionID, itemID: ItemID, id: MessageID) =>
-      writable(sessionID, (tx) =>
-        tx
-          .update(SessionPromptQueueTable)
-          .set({ time_promoted: Date.now() })
-          .where(eq(SessionPromptQueueTable.id, itemID))
-          .run()
-          .pipe(Effect.orDie),
-      ).pipe(
-        Effect.orDie,
-        Effect.tap(() =>
-          Effect.sync(() => {
-            const channel = channels.get(itemID)
-            if (channel) channel.message = id
-          }),
-        ),
-      )
-
-    const drop = (sessionID: SessionID, itemID: ItemID) =>
-      writable(sessionID, (tx) =>
-        tx.delete(SessionPromptQueueTable).where(eq(SessionPromptQueueTable.id, itemID)).run(),
-      ).pipe(Effect.orDie)
-
-    const unreserve = (sessionID: SessionID, itemID: ItemID) =>
-      writable(sessionID, (tx) =>
-        tx
-          .update(SessionPromptQueueTable)
-          .set({ message_id: null })
-          .where(eq(SessionPromptQueueTable.id, itemID))
-          .run(),
-      ).pipe(Effect.orDie)
-
-    // Picks the oldest eligible row and reserves its message id, under the lock.
-    // A reservation whose message already landed (a process stopped between the
-    // write and the mark) is finished instead of prepared again.
+    // A shared reservation ID fixes membership across process restart. Preparation holds no DB/session lock.
     const reserve = (sessionID: SessionID, delivery: Delivery) =>
       exclusive(
         sessionID,
         Effect.gen(function* () {
-          if (delivery === "steer") {
-            const hasPendingSteer = yield* db
-              .transaction((tx) =>
-                Effect.gen(function* () {
-                  return yield* tx
-                    .select({ id: SessionPromptQueueTable.id })
-                    .from(SessionPromptQueueTable)
-                    .where(pending(sessionID))
-                    .orderBy(asc(SessionPromptQueueTable.seq))
-                    .limit(1)
-                    .get()
-                    .pipe(
-                      Effect.map((row) => row !== undefined),
-                      Effect.orDie,
-                    )
-                }),
-              )
-              .pipe(Effect.orDie)
-            if (!hasPendingSteer || (yield* compacting(sessionID))) return undefined
-          }
+          if (delivery === "steer" && (yield* compacting(sessionID))) return undefined
           const result = yield* writable(sessionID, (tx) =>
             Effect.gen(function* () {
-              const row = yield* oldest(tx, sessionID, delivery)
-              if (!row) return undefined
-              if (row.message_id && (yield* landed(tx, row.message_id))) {
-                yield* tx
-                  .update(SessionPromptQueueTable)
-                  .set({ time_promoted: Date.now() })
-                  .where(eq(SessionPromptQueueTable.id, row.id))
-                  .run()
-                  .pipe(Effect.orDie)
-                return { kind: "finished" as const, row }
-              }
+              const rows = yield* eligible(tx, sessionID, delivery)
+              if (!rows.length) return undefined
+              const selected = selection(rows)
+              const row = selected[0]
               const decoded = Schema.decodeUnknownExit(SessionPromptQueue.QueuedInput)(row.input)
               if (Exit.isFailure(decoded)) {
                 yield* tx.delete(SessionPromptQueueTable).where(eq(SessionPromptQueueTable.id, row.id)).run()
                 return { kind: "invalid" as const, row, cause: decoded.cause }
               }
-              const id = yield* messageID(tx, sessionID, decoded.value.messageID)
+              const id =
+                row.message_id ??
+                (yield* messageID(tx, sessionID, selected.length === 1 ? decoded.value.messageID : undefined))
+              const ids = selected.map((item) => item.id)
+              if (yield* landed(tx, id)) {
+                yield* tx
+                  .update(SessionPromptQueueTable)
+                  .set({ time_promoted: Date.now() })
+                  .where(inArray(SessionPromptQueueTable.id, ids))
+                  .run()
+                return { kind: "finished" as const, rows: selected, id }
+              }
               yield* tx
                 .update(SessionPromptQueueTable)
                 .set({ message_id: id })
-                .where(eq(SessionPromptQueueTable.id, row.id))
+                .where(inArray(SessionPromptQueueTable.id, ids))
                 .run()
-                .pipe(Effect.orDie)
-              return { kind: "reserved" as const, row, input: decoded.value, id }
+              return { kind: "reserved" as const, rows: selected, input: grouped(selected), id }
             }),
           ).pipe(Effect.orDie)
           if (!result) return undefined
-          if (result.kind === "finished") {
-            const channel = channels.get(result.row.id)
-            if (channel) channel.message = result.row.message_id!
-            yield* publish(sessionID)
-            return result
-          }
-          if (result.kind === "invalid") {
-            yield* publish(sessionID)
-            return result
-          }
+          if (result.kind === "finished")
+            result.rows.forEach((row) => {
+              const channel = channels.get(row.id)
+              if (channel) channel.message = result.id
+            })
+          if (result.kind !== "reserved") yield* publish(sessionID)
           return result
         }),
       )
 
-    // Writes the prepared message only while its item is still pending with this
-    // reservation; a withdraw or a compaction that began meanwhile wins.
+    const release = (
+      sessionID: SessionID,
+      rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[],
+      id: MessageID,
+    ) =>
+      writable(sessionID, (tx) =>
+        tx
+          .update(SessionPromptQueueTable)
+          .set({ message_id: null })
+          .where(
+            and(
+              inArray(
+                SessionPromptQueueTable.id,
+                rows.map((row) => row.id),
+              ),
+              eq(SessionPromptQueueTable.message_id, id),
+              pending(sessionID),
+            ),
+          )
+          .run(),
+      ).pipe(Effect.orDie)
+
+    // The prepared message, all its parts and every constituent's promotion commit together.
     const commit = <P>(
       sessionID: SessionID,
       delivery: Delivery,
-      itemID: ItemID,
+      rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[],
       id: MessageID,
       prepared: P,
       write: (prepared: P) => Effect.Effect<unknown>,
+      valid?: (prepared: P) => Effect.Effect<boolean>,
     ) =>
       exclusive(
         sessionID,
         Effect.gen(function* () {
-          const current = yield* db
-            .select({ id: SessionPromptQueueTable.id })
-            .from(SessionPromptQueueTable)
-            .where(
-              and(
-                eq(SessionPromptQueueTable.id, itemID),
-                pending(sessionID),
-                eq(SessionPromptQueueTable.message_id, id),
-              ),
-            )
-            .get()
-            .pipe(Effect.orDie)
-          if (!current) return false
           if (delivery === "steer" && (yield* compacting(sessionID))) {
-            yield* unreserve(sessionID, itemID)
+            yield* release(sessionID, rows, id)
             return false
           }
-          yield* write(prepared).pipe(
-            Effect.onExit((exit) =>
-              Exit.isSuccess(exit)
-                ? markPromoted(sessionID, itemID, id)
-                : landed(db, id).pipe(
-                    Effect.flatMap((exists) =>
-                      exists ? markPromoted(sessionID, itemID, id) : unreserve(sessionID, itemID),
+          const written = yield* EventV2.withDeferredNotifications(
+            writable(sessionID, (tx) =>
+              Effect.gen(function* () {
+                const current = yield* eligible(tx, sessionID, delivery)
+                const members = current.filter((row) => row.message_id === id)
+                // A withdrawn/edited constituent cancels the whole preparation. Concurrent arrivals stay outside it.
+                if (
+                  members.length !== rows.length ||
+                  rows.some(
+                    (row) =>
+                      !members.some(
+                        (member) =>
+                          member.id === row.id && member.seq === row.seq && isDeepStrictEqual(member.input, row.input),
+                      ),
+                  )
+                ) {
+                  yield* tx
+                    .update(SessionPromptQueueTable)
+                    .set({ message_id: null })
+                    .where(and(eq(SessionPromptQueueTable.message_id, id), pending(sessionID)))
+                    .run()
+                  return false
+                }
+                const picked = selection(current)
+                if (picked[0].message_id !== id) {
+                  yield* tx
+                    .update(SessionPromptQueueTable)
+                    .set({ message_id: null })
+                    .where(and(eq(SessionPromptQueueTable.message_id, id), pending(sessionID)))
+                    .run()
+                  return false
+                }
+                if (valid && !(yield* valid(prepared))) {
+                  yield* tx
+                    .update(SessionPromptQueueTable)
+                    .set({ message_id: null })
+                    .where(and(eq(SessionPromptQueueTable.message_id, id), pending(sessionID)))
+                    .run()
+                  return false
+                }
+                yield* write(prepared)
+                yield* tx
+                  .update(SessionPromptQueueTable)
+                  .set({ time_promoted: Date.now() })
+                  .where(
+                    inArray(
+                      SessionPromptQueueTable.id,
+                      rows.map((row) => row.id),
                     ),
-                  ),
+                  )
+                  .run()
+                return true
+              }),
             ),
-            Effect.ensuring(publish(sessionID)),
+          ).pipe(
+            Effect.orDie,
+            Effect.onError(() => release(sessionID, rows, id)),
           )
-          return true
+          if (written)
+            rows.forEach((row) => {
+              const channel = channels.get(row.id)
+              if (channel) channel.message = id
+            })
+          yield* publish(sessionID)
+          return written
         }),
       )
 
@@ -652,6 +729,7 @@ const layer = Layer.effect(
       readonly delivery: Delivery
       readonly prepare: (input: PromotedInput) => Effect.Effect<P, E>
       readonly write: (prepared: P) => Effect.Effect<unknown>
+      readonly valid?: (prepared: P) => Effect.Effect<boolean>
       readonly rejected: (cause: Cause.Cause<E>) => Effect.Effect<void>
       readonly own?: ItemID
       readonly untilStarted?: boolean
@@ -678,26 +756,30 @@ const layer = Layer.effect(
                 .prepare({ ...next.input, sessionID: input.sessionID, messageID: next.id })
                 .pipe(Effect.exit)
               if (Exit.isFailure(prepared)) {
-                // A prompt that cannot become a message is consumed, as a failed prompt was before the queue.
+                // Failed preparation must leave every constituent available for an explicit retry.
                 yield* exclusive(
                   input.sessionID,
-                  (Cause.hasInterruptsOnly(prepared.cause)
-                    ? unreserve(input.sessionID, next.row.id)
-                    : drop(input.sessionID, next.row.id)
+                  ("group" in next.input || Cause.hasInterruptsOnly(prepared.cause)
+                    ? release(input.sessionID, next.rows, next.id)
+                    : writable(input.sessionID, (tx) =>
+                        tx.delete(SessionPromptQueueTable).where(eq(SessionPromptQueueTable.id, next.rows[0].id)).run(),
+                      ).pipe(Effect.orDie)
                   ).pipe(Effect.andThen(publish(input.sessionID))),
                 )
-                if (Cause.hasInterruptsOnly(prepared.cause) || next.row.id === input.own)
+                if (Cause.hasInterruptsOnly(prepared.cause) || next.rows.some((row) => row.id === input.own))
                   return yield* Effect.failCause(prepared.cause)
                 yield* input.rejected(prepared.cause)
+                if ("group" in next.input) return yield* Effect.failCause(prepared.cause)
                 continue
               }
               const written = yield* commit(
                 input.sessionID,
                 input.delivery,
-                next.row.id,
+                next.rows,
                 next.id,
                 prepared.value,
                 input.write,
+                input.valid,
               )
               // Queued items run one per turn; the loop reevaluates before the next.
               if (written && input.delivery === "queue") return true
@@ -707,7 +789,7 @@ const layer = Layer.effect(
         )
         .pipe(Effect.withSpan("SessionQueue.promote"))
 
-    // Only an attempt whose delete never ran is made again, so no executed
+    // Only an attempt whose consume never ran is made again, so no executed
     // transaction body is replayed. Success is the attempt's own commit.
     const consume = Effect.fn("SessionQueue.consume")(function* (sessionID: SessionID) {
       for (let attempts = 1; ; attempts++) {
@@ -930,6 +1012,124 @@ function fromRow(row: typeof SessionPromptQueueTable.$inferSelect): Item {
     delivery: row.delivery,
     input: decodeInput(row.input),
     time: { created: row.time_created },
+  }
+}
+
+function constituentIDs(sessionID: SessionID, input: SessionPromptQueue.QueuedInput) {
+  const machine = dispatch(input)
+  const identities = [
+    ...(input.messageID ? [["message", input.messageID]] : []),
+    ...(machine?.kind === "peer" ? [["peer", machine.sender, machine.home, machine.messageID]] : []),
+  ]
+  return identities.map((identity) =>
+    PartID.make(
+      "prt_queue_" +
+        createHash("sha256")
+          .update(JSON.stringify([sessionID, identity]))
+          .digest("hex"),
+    ),
+  )
+}
+
+function dispatch(input: SessionPromptQueue.QueuedInput, delivery?: Delivery) {
+  if (!input.parts.length || input.parts.some((part) => part.type === "text" && (part.synthetic || part.ignored)))
+    return
+  // Incompatible execution controls cannot be absorbed into another sender's prompt.
+  if (input.format || input.system || input.tools) return
+  const kind = MachineMessage.dispatch(
+    input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
+  )
+  if (input.parts.some((part) => part.type !== "text" && (kind?.kind !== "peer" || part.type !== "file"))) return
+  // Configured critical markers and an editor's send-now keep their immediate, individual meaning.
+  return kind?.kind === "automation" && delivery === "steer" ? undefined : kind
+}
+
+function selection(rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[]) {
+  const classified = rows.map((row) => {
+    const decoded = Schema.decodeUnknownOption(SessionPromptQueue.QueuedInput)(row.input)
+    return { row, kind: Option.isSome(decoded) ? dispatch(decoded.value, row.delivery) : undefined }
+  })
+  // Native/unknown work remains individual and keeps human authority. Peers precede every automation type.
+  const first =
+    classified.find((item) => !item.kind) ?? classified.find((item) => item.kind?.kind === "peer") ?? classified[0]
+  if (first.row.message_id) return rows.filter((row) => row.message_id === first.row.message_id)
+  if (!first.kind) return [first.row]
+  if (first.kind.kind === "peer")
+    return classified
+      .filter((item) => item.kind?.kind === "peer" && !item.row.message_id)
+      .slice(0, 10)
+      .map((item) => item.row)
+  const type = first.kind.type
+  return classified
+    .filter((item) => item.kind?.kind === "automation" && item.kind.type === type && !item.row.message_id)
+    .map((item) => item.row)
+}
+
+function grouped(rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[]) {
+  const items = rows.map(fromRow)
+  const kind = dispatch(items[0].input)
+  if (!kind) return items[0].input
+  const group: SessionPromptQueue.Group = {
+    version: 1,
+    sessionID: items[0].sessionID,
+    kind: kind.kind === "peer" ? "peer" : kind.type,
+    constituents: items,
+  }
+  const latest = new Map<string, ItemID>()
+  items.forEach((item) => {
+    const machine = dispatch(item.input)
+    if (machine?.kind === "automation" && machine.episode) latest.set(machine.episode, item.id)
+  })
+  const current =
+    kind.kind === "peer"
+      ? items
+      : items.filter((item) => {
+          const machine = dispatch(item.input)
+          return machine?.kind !== "automation" || !machine.episode || latest.get(machine.episode) === item.id
+        })
+  const heading =
+    kind.kind === "peer"
+      ? "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation."
+      : `Automated notices: ${kind.type}. Newest state per identified episode; every distinct condition remains below. Original constituents remain in sessionQueue metadata.`
+  return {
+    ...items[0].input,
+    model: undefined,
+    variant: undefined,
+    group,
+    parts: [
+      {
+        type: "text" as const,
+        text:
+          heading +
+          "\n\n" +
+          current
+            .map(
+              (item, index) =>
+                `${index + 1}. [Admitted ${new Date(item.time.created).toISOString()}; queue ${item.id}]\n${item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")}`,
+            )
+            .join("\n\n"),
+        metadata: { sessionQueue: Schema.encodeSync(SessionPromptQueue.Group)(group) },
+      },
+      ...current.flatMap((item, index) => {
+        const files = item.input.parts.filter((part) => part.type === "file")
+        return files.length
+          ? [
+              { type: "text" as const, synthetic: true, text: `Files for numbered peer ${index + 1} (${item.id}):` },
+              ...files,
+            ]
+          : []
+      }),
+      ...items.flatMap((item) =>
+        constituentIDs(item.sessionID, item.input).map((id) => ({
+          type: "text" as const,
+          id,
+          text: "",
+          ignored: true,
+          synthetic: true,
+          metadata: { sessionQueue: Schema.encodeSync(SessionPromptQueue.Group)({ ...group, constituents: [item] }) },
+        })),
+      ),
+    ],
   }
 }
 

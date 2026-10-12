@@ -24,6 +24,21 @@ export type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 export type Subscriber<D extends Definition = Definition> = (event: Payload<D>) => Effect.Effect<void>
 export type Unsubscribe = Effect.Effect<void>
 
+class DeferredNotifications extends Context.Service<DeferredNotifications, Effect.Effect<void>[]>()(
+  "@opencode/EventV2/DeferredNotifications",
+) {}
+
+// A composite durable write uses nested event transactions. Notify only after its outer commit succeeds.
+export function withDeferredNotifications<A, E, R>(effect: Effect.Effect<A, E, R>) {
+  return Effect.gen(function* () {
+    if (Option.isSome(yield* Effect.serviceOption(DeferredNotifications))) return yield* effect
+    const notifications: Effect.Effect<void>[] = []
+    const result = yield* effect.pipe(Effect.provideService(DeferredNotifications, notifications))
+    yield* Effect.forEach(notifications, (notification) => notification, { discard: true })
+    return result
+  })
+}
+
 export const latestSequence = Effect.fn("EventV2.latestSequence")(function* (
   db: Database.Interface["db"],
   aggregateID: string,
@@ -540,6 +555,11 @@ export const layerWith = (options?: LayerOptions) =>
 
       function notify(event: Payload, isolateListeners: boolean) {
         return Effect.gen(function* () {
+          const deferred = yield* Effect.serviceOption(DeferredNotifications)
+          if (Option.isSome(deferred)) {
+            deferred.value.push(notify(event, isolateListeners))
+            return
+          }
           yield* Effect.forEach(
             listeners,
             (listener) => (isolateListeners ? observe(event, listener) : listener(event)),
