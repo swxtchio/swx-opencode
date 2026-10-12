@@ -1160,7 +1160,6 @@ const layer = Layer.effect(
               own: yield* queue.admit({ ...queuedInput, ...(delivery ? { delivery } : {}) }),
               prepared: undefined,
             }
-      if (entry.kind === "queued") yield* Effect.addFinalizer(() => queue.forget(entry.own.id))
       // Only this prompt's own failure is this caller's error; an older steer
       // promoted alongside it is reported on its own.
       if (entry.kind === "queued")
@@ -1203,8 +1202,7 @@ const layer = Layer.effect(
       return yield* drain(input.sessionID, entry.own.id)
     }, Effect.scoped)
 
-    // A queued prompt that cannot become a message is dropped by the queue;
-    // report it the way prompt_async reports a failed prompt.
+    // Failed originals are reported through the existing session error channel.
     const rejected = (sessionID: SessionID) => (cause: Cause.Cause<unknown>) =>
       events
         .publish(Session.Event.Error, {
@@ -1213,7 +1211,7 @@ const layer = Layer.effect(
         })
         .pipe(Effect.asVoid)
 
-    // Inside a drain no item is the caller's own, so only an interrupt can fail this.
+    // The queue isolates preparation failures; infrastructure and interruption can still stop a drain.
     const promoteInLoop = (sessionID: SessionID, delivery: SessionQueue.Delivery) =>
       queue
         .promote({
@@ -1670,6 +1668,8 @@ const layer = Layer.effect(
       rootMessageID?: MessageID,
       retryFailedRoot?: boolean,
     ) {
+      const recorded = own ? yield* queue.reply(own) : undefined
+      if (recorded) return recorded
       const withdrawn = own
         ? queue
             .withdrawn(sessionID, own)

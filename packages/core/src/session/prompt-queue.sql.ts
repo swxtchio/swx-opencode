@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, uniqueIndex, index } from "drizzle-orm/sqlite-core"
+import { sqliteTable, text, integer, uniqueIndex, index, primaryKey } from "drizzle-orm/sqlite-core"
 import type { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import type { SessionSchema } from "./schema"
 import type { MessageID } from "../v1/session"
@@ -40,4 +40,21 @@ export const SessionPromptQueueSequenceTable = sqliteTable("session_prompt_queue
     .primaryKey()
     .references(() => SessionTable.id, { onDelete: "cascade" }),
   seq: integer().notNull(),
+  aliases_indexed: integer({ mode: "boolean" }).notNull().default(false),
 })
+
+// Pending identity custody moves to the existing ignored text-part witnesses at promotion/consume.
+export const SessionPromptQueueAliasTable = sqliteTable(
+  "session_prompt_queue_alias",
+  {
+    id: text().notNull(),
+    item_id: text()
+      .$type<SessionPromptQueue.ItemID>()
+      .notNull()
+      .references(() => SessionPromptQueueTable.id, { onDelete: "cascade" }),
+  },
+  (table) => [
+    primaryKey({ columns: [table.id, table.item_id] }),
+    index("session_prompt_queue_alias_item_idx").on(table.item_id),
+  ],
+)

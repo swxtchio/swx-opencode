@@ -3,14 +3,19 @@ import { randomUUID } from "node:crypto"
 import { rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
-import { eq } from "drizzle-orm"
+import { pathToFileURL } from "node:url"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Scope } from "effect"
+import { eq, sql } from "drizzle-orm"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
+import {
+  SessionPromptQueueAliasTable,
+  SessionPromptQueueSequenceTable,
+  SessionPromptQueueTable,
+} from "@opencode-ai/core/session/prompt-queue.sql"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventWriter } from "@opencode-ai/core/event/writer"
 import { EventAggregateWriterTable } from "@opencode-ai/core/event/writer.sql"
@@ -27,6 +32,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceStore } from "@/project/instance-store"
 import { InstanceBootstrap } from "@/project/bootstrap"
 import { testEffect } from "../lib/effect"
+import { TestInstance } from "../fixture/fixture"
 
 const filename = path.join(os.tmpdir(), `opencode-queue-dispatch-${randomUUID()}.db`)
 const it = testEffect(
@@ -287,6 +293,7 @@ it.instance(
       const failed = yield* queue
         .promote({
           sessionID: session.id,
+          own: original.id,
           delivery: "queue",
           prepare,
           write: (message) =>
@@ -301,7 +308,8 @@ it.instance(
       expect(seen).toEqual([])
       expect(yield* writing()).toEqual([{ aggregate_id: session.id, writer_id: EventWriter.id(), time_last_append: 1 }])
       expect(yield* MessageV2.stream(session.id)).toEqual([])
-      expect((yield* queue.list(session.id)).map((item) => item.id)).toEqual([original.id])
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(Option.isSome(yield* queue.restore(session.id, original.id))).toBe(true)
       yield* queue.promote({
         sessionID: session.id,
         delivery: "queue",
@@ -641,6 +649,7 @@ it.instance("caller cancellation after commit cannot discard part notifications 
     })
     const notified = yield* Deferred.make<void>()
     const release = yield* Deferred.make<void>()
+    const completed = yield* Deferred.make<void>()
     const seen: string[] = []
     const unsubscribe = yield* events.listen((event) => {
       if (event.type === SessionV1.Event.MessageUpdated.type)
@@ -648,7 +657,13 @@ it.instance("caller cancellation after commit cannot discard part notifications 
       if (event.type === SessionV1.Event.PartUpdated.type)
         return Effect.sync(() => {
           seen.push(Schema.decodeUnknownSync(Schema.Struct({ part: SessionV1.Part }))(event.data).part.id)
-        })
+        }).pipe(
+          Effect.andThen(
+            Effect.suspend(() =>
+              seen.length === 2 ? Deferred.succeed(completed, undefined).pipe(Effect.asVoid) : Effect.void,
+            ),
+          ),
+        )
       return Effect.void
     })
     const running = yield* queue
@@ -661,15 +676,210 @@ it.instance("caller cancellation after commit cannot discard part notifications 
       })
       .pipe(Effect.forkChild)
     yield* Deferred.await(notified)
+    const [committed] = yield* MessageV2.stream(session.id)
+    yield* queue.answer(session.id, committed.info.id, committed)
+    expect(yield* queue.reply(original.id)).toEqual(committed)
     const stopping = yield* Fiber.interrupt(running).pipe(Effect.forkChild)
-    yield* Effect.yieldNow
-    yield* Deferred.succeed(release, undefined)
-    yield* Fiber.join(stopping)
+    const ended = yield* Fiber.join(stopping).pipe(
+      Effect.timeoutOption("1 second"),
+      Effect.ensuring(Deferred.succeed(release, undefined)),
+    )
+    expect(Option.isSome(ended)).toBe(true)
+    yield* Deferred.await(completed)
     yield* unsubscribe
     const [message] = yield* MessageV2.stream(session.id)
     expect(seen.toSorted()).toEqual(message.parts.map((part) => part.id).toSorted())
     yield* queue.answer(session.id, message.info.id, message)
     expect(yield* queue.reply(original.id)).toEqual(message)
+  }),
+)
+
+it.instance("accepted changed transport aliases cannot be borrowed in pending delivered or consumed state", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    for (const state of ["pending", "delivered", "consumed"] as const) {
+      const session = yield* sessions.create({})
+      const originalInput = {
+        sessionID: session.id,
+        delivery: "queue" as const,
+        messageID: MessageID.ascending(),
+        parts: [{ type: "text" as const, text: peer(910) }],
+      }
+      const original = yield* queue.admit(originalInput)
+      if (state !== "pending")
+        yield* queue.promote({
+          sessionID: session.id,
+          delivery: "queue",
+          prepare,
+          write: writer(sessions),
+          rejected: () => Effect.void,
+        })
+      if (state === "consumed") yield* queue.consume(session.id)
+      const accepted = MessageID.ascending()
+      expect((yield* queue.admit({ ...originalInput, messageID: accepted })).id).toBe(original.id)
+      const conflict = yield* queue
+        .admit({ ...originalInput, messageID: accepted, parts: [{ type: "text", text: peer(911) }] })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(conflict)).toBe(true)
+      if (state === "pending") {
+        yield* queue.promote({
+          sessionID: session.id,
+          delivery: "queue",
+          prepare,
+          write: writer(sessions),
+          rejected: () => Effect.void,
+        })
+        yield* queue.consume(session.id)
+        expect((yield* queue.admit({ ...originalInput, messageID: accepted })).id).toBe(original.id)
+        expect(
+          Exit.isFailure(
+            yield* queue
+              .admit({ ...originalInput, messageID: accepted, parts: [{ type: "text", text: peer(912) }] })
+              .pipe(Effect.exit),
+          ),
+        ).toBe(true)
+      }
+    }
+  }),
+)
+
+it.instance("exact retry preserves recorded answer and independently released callers", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const input = {
+      sessionID: session.id,
+      delivery: "queue" as const,
+      parts: [{ type: "text" as const, text: peer(920) }],
+    }
+    const first = yield* queue.admit(input)
+    const second = yield* queue.admit(input)
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "queue",
+      prepare,
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+    const [message] = yield* MessageV2.stream(session.id)
+    yield* queue.consume(session.id)
+    yield* queue.answer(session.id, message.info.id, message)
+    const third = yield* queue.admit(input)
+    yield* queue.forget(first.id)
+    expect(yield* queue.reply(second.id)).toEqual(message)
+    expect(yield* queue.reply(third.id)).toEqual(message)
+    yield* queue.forget(second.id)
+    expect(yield* queue.reply(third.id)).toEqual(message)
+    yield* queue.forget(third.id)
+    expect(yield* queue.reply(first.id)).toBeUndefined()
+  }),
+)
+
+it.instance("malformed withdrawn input cannot poison unrelated peer admission but retains its transport claim", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const session = yield* sessions.create({})
+    const messageID = MessageID.ascending()
+    const old = yield* queue.admit({
+      sessionID: session.id,
+      delivery: "queue",
+      messageID,
+      parts: [{ type: "text", text: "editor intent" }],
+    })
+    yield* queue.withdraw(session.id, old.id)
+    const malformed = { messageID, parts: [{ type: "corrupted" }] }
+    yield* database.db.run(sql`UPDATE session_prompt_queue SET input=${JSON.stringify(malformed)} WHERE id=${old.id}`)
+    yield* database.db
+      .delete(SessionPromptQueueAliasTable)
+      .where(eq(SessionPromptQueueAliasTable.item_id, old.id))
+      .run()
+    yield* database.db
+      .update(SessionPromptQueueSequenceTable)
+      .set({ aliases_indexed: false })
+      .where(eq(SessionPromptQueueSequenceTable.session_id, session.id))
+      .run()
+    const good = yield* queue.admit({
+      sessionID: session.id,
+      delivery: "queue",
+      parts: [{ type: "text", text: peer(930) }],
+    })
+    expect(good.id).not.toBe(old.id)
+    const retained = yield* database.db
+      .select()
+      .from(SessionPromptQueueTable)
+      .where(eq(SessionPromptQueueTable.id, old.id))
+      .get()
+    expect(retained?.input as unknown).toEqual(malformed)
+    expect(retained?.time_withdrawn).toBeGreaterThan(0)
+    expect(
+      Exit.isFailure(
+        yield* queue
+          .admit({ sessionID: session.id, messageID, delivery: "queue", parts: [{ type: "text", text: peer(931) }] })
+          .pipe(Effect.exit),
+      ),
+    ).toBe(true)
+  }),
+)
+
+it.instance("individual stable transport retry reconciles through normal consume", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    for (const parts of [
+      [{ type: "text" as const, text: "ordinary request" }],
+      [{ type: "text" as const, text: peer(940), synthetic: true }],
+    ]) {
+      const session = yield* sessions.create({})
+      const input = { sessionID: session.id, delivery: "queue" as const, messageID: MessageID.ascending(), parts }
+      const original = yield* queue.admit(input)
+      yield* queue.promote({
+        sessionID: session.id,
+        delivery: "queue",
+        prepare,
+        write: writer(sessions),
+        rejected: () => Effect.void,
+      })
+      yield* queue.consume(session.id)
+      expect((yield* queue.admit(input)).id).toBe(original.id)
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(yield* MessageV2.stream(session.id)).toHaveLength(1)
+    }
+  }),
+)
+
+it.instance("historical marked noReply retry without witnesses retains existing-message reconciliation", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    for (const system of [undefined, "individual execution context"]) {
+      const session = yield* sessions.create({})
+      const input = {
+        sessionID: session.id,
+        delivery: "queue" as const,
+        noReply: true,
+        system,
+        messageID: MessageID.ascending(),
+        parts: [{ type: "text" as const, text: peer(950) }],
+      }
+      const prepared = yield* prepare(input)
+      yield* writer(sessions)(prepared)
+      for (const busy of [false, true]) {
+        const retry = yield* queue.writeOrAdmit({
+          admission: input,
+          isBusy: Effect.succeed(busy),
+          prepare: () => prepare(input),
+          write: (value) => writer(sessions)(value).pipe(Effect.as(value)),
+          discard: () => Effect.void,
+        })
+        expect(retry.kind).toBe("direct")
+        expect(yield* queue.list(session.id)).toEqual([])
+      }
+      expect(yield* MessageV2.stream(session.id)).toHaveLength(1)
+    }
   }),
 )
 
@@ -708,7 +918,7 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
       headers: {},
       release_date: "2026-01-01",
     }
-    const scenarios = yield* Effect.forEach(["peer", "automation"] as const, (name) =>
+    const scenarios = yield* Effect.forEach(["peer", "automation", "heartbeat", "individual"] as const, (name) =>
       Effect.gen(function* () {
         const session = yield* sessions.create({ title: `Synthetic grouped checkpoint: ${name}` })
         const inputs: SessionQueue.AdmitInput[] =
@@ -726,27 +936,51 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
                 },
                 { sessionID: session.id, delivery: "queue", parts: [{ type: "text", text: peer(2, "info") }] },
               ]
-            : [
-                {
-                  sessionID: session.id,
-                  delivery: "queue",
-                  messageID: MessageID.make("msg_checkpoint_notice_old"),
-                  parts: [{ type: "text", text: check("one", "historical stalled observation") }],
-                },
-                {
-                  sessionID: session.id,
-                  delivery: "queue",
-                  messageID: MessageID.make("msg_checkpoint_notice_distinct"),
-                  parts: [{ type: "text", text: check("two", "historical pending decision observation") }],
-                },
-                {
-                  sessionID: session.id,
-                  delivery: "queue",
-                  messageID: MessageID.make("msg_checkpoint_notice_later"),
-                  parts: [{ type: "text", text: check("one", "historical converged observation") }],
-                },
-              ]
+            : name === "automation"
+              ? [
+                  {
+                    sessionID: session.id,
+                    delivery: "queue",
+                    messageID: MessageID.make("msg_checkpoint_notice_old"),
+                    parts: [{ type: "text", text: check("one", "historical stalled observation") }],
+                  },
+                  {
+                    sessionID: session.id,
+                    delivery: "queue",
+                    messageID: MessageID.make("msg_checkpoint_notice_distinct"),
+                    parts: [{ type: "text", text: check("two", "historical pending decision observation") }],
+                  },
+                  {
+                    sessionID: session.id,
+                    delivery: "queue",
+                    messageID: MessageID.make("msg_checkpoint_notice_later"),
+                    parts: [{ type: "text", text: check("one", "historical converged observation") }],
+                  },
+                ]
+              : name === "heartbeat"
+                ? ["one", "two"].map((duty) => ({
+                    sessionID: session.id,
+                    delivery: "queue" as const,
+                    messageID: MessageID.make(`msg_checkpoint_heartbeat_${duty}`),
+                    parts: [
+                      {
+                        type: "text" as const,
+                        text: `[fm-level:nudge:heartbeat]\x1f Heartbeat summary: ${"Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain.".slice(0, 240)}… Full message: /scratch/duty-${duty}.txt [fm-heartbeat-receipt:${duty}]`,
+                      },
+                    ],
+                  }))
+                : [
+                    {
+                      sessionID: session.id,
+                      delivery: "queue",
+                      messageID: MessageID.make("msg_checkpoint_individual"),
+                      parts: [{ type: "text", text: "Synthetic individual original with stable transport identity" }],
+                    },
+                  ]
         const originals = yield* Effect.forEach(inputs, (input) => queue.admit(input))
+        const retryCalls =
+          name === "peer" ? [{ ...inputs[0], messageID: MessageID.make("msg_checkpoint_peer_retry_alias") }] : []
+        yield* Effect.forEach(retryCalls, (input) => queue.admit(input))
         const pending = yield* queue.list(session.id)
         yield* queue.promote({
           sessionID: session.id,
@@ -757,7 +991,14 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
         })
         const latest = (yield* MessageV2.stream(session.id))[0]
         const returned = yield* MessageV2.get({ sessionID: session.id, messageID: latest.info.id })
-        const group = metadata(returned)
+        const group =
+          name === "individual"
+            ? Schema.decodeUnknownSync(SessionPromptQueue.Group)(
+                returned.parts.find(
+                  (part): part is SessionV1.TextPart => part.type === "text" && !!part.metadata?.sessionQueue,
+                )?.metadata?.sessionQueue,
+              )
+            : metadata(returned)
         expect(group.constituents).toEqual(originals)
         expect(group.constituents.map((item) => item.time.created)).toEqual(originals.map((item) => item.time.created))
         const encoded = originals.map((item) => Schema.encodeSync(SessionPromptQueue.QueuedInput)(item.input))
@@ -787,12 +1028,14 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
             .filter((part) => part.ignored)
             .every((part) => part.synthetic && part.messageID === returned.info.id),
         ).toBe(true)
-        expect(witnesses.filter((part) => !part.ignored)).toHaveLength(1)
-        expect(witnesses.filter((part) => part.ignored)).toHaveLength(3)
+        expect(witnesses.filter((part) => !part.ignored)).toHaveLength(name === "individual" ? 0 : 1)
+        expect(witnesses.filter((part) => part.ignored)).toHaveLength(
+          name === "individual" ? 1 : name === "heartbeat" ? 2 : name === "peer" ? 4 : 3,
+        )
         if (name === "peer") {
           expect(
             witnesses.filter((part) => part.ignored && part.constituentIDs.includes(originals[0].id)),
-          ).toHaveLength(2)
+          ).toHaveLength(3)
           expect(Object.hasOwn(group.constituents[0].input, "noReply")).toBe(false)
           expect(Object.hasOwn(group.constituents[0].input, "delivery")).toBe(false)
           expect(group.constituents[0].delivery).toBe("queue")
@@ -806,6 +1049,14 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
           expect(text(returned)).toContain("not current measurements")
         }
         const modelInput = yield* Effect.promise(() => MessageV2.toModelMessages([returned], model))
+        if (name === "heartbeat") {
+          expect(JSON.stringify(modelInput)).toContain("Full message: /scratch/duty-one.txt")
+          expect(JSON.stringify(modelInput)).toContain("Full message: /scratch/duty-two.txt")
+        }
+        if (name === "individual") {
+          expect(group.kind).toBe("individual")
+          expect(text(returned)).toBe(inputs[0].parts[0].type === "text" ? inputs[0].parts[0].text : "")
+        }
         expect(modelInput).toHaveLength(1)
         expect(modelInput[0].role).toBe("user")
         expect(modelInput[0].content).toHaveLength(1)
@@ -838,9 +1089,19 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
         const afterConsume = yield* MessageV2.get({ sessionID: session.id, messageID: returned.info.id })
         expect(afterConsume).toEqual(returned)
         expect(yield* queue.list(session.id)).toEqual([])
+        const afterConsumeRetryCalls =
+          name === "peer" ? [{ ...inputs[0], messageID: MessageID.make("msg_checkpoint_peer_late_alias") }] : []
+        yield* Effect.forEach(afterConsumeRetryCalls, (input) => queue.admit(input))
+        const afterRetry = yield* MessageV2.get({ sessionID: session.id, messageID: returned.info.id })
+        const modelAfterRetry = yield* Effect.promise(() => MessageV2.toModelMessages([afterRetry], model))
+        expect(modelAfterRetry).toEqual(modelInput)
         return {
           name,
           originalCalls: inputs,
+          retryCalls,
+          afterConsumeRetryCalls,
+          returnedAfterRetry: afterRetry,
+          modelAfterRetry,
           originals,
           encodedOriginalInputs: encoded,
           pendingBeforePromotion: pending,
@@ -870,5 +1131,241 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
           JSON.stringify(fixture, null, 2) + "\n",
         ),
       )
+  }),
+)
+
+it.instance("removed binary constituent is held without poisoning complete peers or automation", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const session = yield* sessions.create({})
+    const instance = yield* TestInstance
+    const removed = path.join(instance.directory, "removed-peer-obligation.bin")
+    yield* Effect.promise(() => Bun.write(removed, new Uint8Array([1, 2, 3])))
+    const bad = yield* queue.admit({
+      sessionID: session.id,
+      delivery: "queue",
+      parts: [
+        { type: "text", text: peer(970) },
+        {
+          type: "file",
+          mime: "application/octet-stream",
+          url: pathToFileURL(removed).href,
+          filename: "removed.bin",
+        },
+      ],
+    })
+    yield* Effect.promise(() => rm(removed))
+    const good = yield* queue.admit({
+      sessionID: session.id,
+      delivery: "queue",
+      parts: [{ type: "text", text: peer(971) }],
+    })
+    const notice = yield* queue.admit({
+      sessionID: session.id,
+      delivery: "queue",
+      parts: [{ type: "text", text: check("unrelated", "historical notice") }],
+    })
+    const rejected: string[] = []
+    const options = {
+      sessionID: session.id,
+      delivery: "queue" as const,
+      prepare: (input: SessionQueue.PromotedInput) =>
+        Effect.forEach(
+          input.parts.filter((part) => part.type === "file"),
+          (part) => Effect.promise(() => Bun.file(new URL(part.url)).arrayBuffer()),
+        ).pipe(Effect.andThen(prepare(input))),
+      write: writer(sessions),
+      rejected: (cause: Cause.Cause<unknown>) =>
+        Effect.sync(() => {
+          rejected.push(Cause.pretty(cause))
+        }),
+    }
+    const result = yield* queue.promote({ ...options, own: good.id }).pipe(Effect.exit)
+    expect(Exit.isSuccess(result)).toBe(true)
+    expect(metadata((yield* MessageV2.stream(session.id))[0]).constituents.map((item) => item.id)).toEqual([good.id])
+    const held = yield* database.db
+      .select()
+      .from(SessionPromptQueueTable)
+      .where(eq(SessionPromptQueueTable.id, bad.id))
+      .get()
+    expect(held?.input).toEqual(Schema.encodeSync(SessionPromptQueue.QueuedInput)(bad.input))
+    expect(held?.time_withdrawn).toBeGreaterThan(0)
+    expect(held?.time_created).toBe(bad.time.created)
+    expect(rejected.join(" ")).toContain(bad.id)
+    yield* queue.consume(session.id)
+    yield* queue.promote(options)
+    expect(metadata((yield* MessageV2.stream(session.id))[0]).constituents.map((item) => item.id)).toEqual([notice.id])
+    yield* queue.consume(session.id)
+    expect(yield* queue.list(session.id)).toEqual([])
+    yield* Effect.promise(() => Bun.write(removed, new Uint8Array([1, 2, 3])))
+    const restored = yield* queue.restore(session.id, bad.id)
+    expect(Option.getOrThrow(restored).seq).toBe(bad.seq)
+    yield* queue.promote(options)
+    expect(metadata((yield* MessageV2.stream(session.id))[0]).constituents.map((item) => item.id)).toEqual([bad.id])
+    expect(yield* MessageV2.stream(session.id)).toHaveLength(3)
+  }),
+)
+
+it.instance("deterministic constituent write rollback is isolated without committing or dropping its obligation", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const session = yield* sessions.create({})
+    const bad = yield* queue.admit({
+      sessionID: session.id,
+      delivery: "queue",
+      parts: [{ type: "text", text: peer(980) }],
+    })
+    const good = yield* queue.admit({
+      sessionID: session.id,
+      delivery: "queue",
+      parts: [{ type: "text", text: peer(981) }],
+    })
+    const rejected: string[] = []
+    const result = yield* queue
+      .promote({
+        sessionID: session.id,
+        delivery: "queue",
+        own: good.id,
+        prepare,
+        write: (message) =>
+          metadata(message).constituents.some((item) => item.id === bad.id)
+            ? sessions.updateMessage(message.info).pipe(Effect.andThen(Effect.die("deterministic bad part")))
+            : writer(sessions)(message),
+        rejected: (cause) =>
+          Effect.sync(() => {
+            rejected.push(Cause.pretty(cause))
+          }),
+      })
+      .pipe(Effect.exit)
+    expect(Exit.isSuccess(result)).toBe(true)
+    const messages = yield* MessageV2.stream(session.id)
+    expect(messages).toHaveLength(1)
+    expect(metadata(messages[0]).constituents.map((item) => item.id)).toEqual([good.id])
+    const held = yield* database.db
+      .select()
+      .from(SessionPromptQueueTable)
+      .where(eq(SessionPromptQueueTable.id, bad.id))
+      .get()
+    expect(held?.time_withdrawn).toBeGreaterThan(0)
+    expect(held?.time_promoted).toBeNull()
+    expect(held?.message_id).toBeNull()
+    expect(rejected.join(" ")).toContain(bad.id)
+  }),
+)
+
+it.instance("admission scope release and repeated forget cannot steal a different caller answer", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const oneScope = yield* Scope.make()
+    const twoScope = yield* Scope.make()
+    const input = {
+      sessionID: session.id,
+      delivery: "queue" as const,
+      parts: [{ type: "text" as const, text: peer(990) }],
+    }
+    const first = yield* queue.admit(input).pipe(Effect.provideService(Scope.Scope, oneScope))
+    const second = yield* queue.admit(input).pipe(Effect.provideService(Scope.Scope, twoScope))
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "queue",
+      prepare,
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+    const [message] = yield* MessageV2.stream(session.id)
+    yield* queue.answer(session.id, message.info.id, message)
+    yield* Scope.close(oneScope, Exit.void)
+    yield* queue.forget(first.id).pipe(Effect.provideService(Scope.Scope, oneScope))
+    yield* queue.forget(first.id).pipe(Effect.provideService(Scope.Scope, oneScope))
+    expect(yield* queue.reply(second.id)).toEqual(message)
+    yield* Scope.close(twoScope, Exit.void)
+    expect(yield* queue.reply(first.id)).toBeUndefined()
+  }),
+)
+
+it.instance("new accepted alias during preparation invalidates reservation and commits its witness once", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const input = {
+      sessionID: session.id,
+      delivery: "queue" as const,
+      messageID: MessageID.ascending(),
+      parts: [{ type: "text" as const, text: peer(991) }],
+    }
+    const original = yield* queue.admit(input)
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let preparations = 0
+    const promoting = yield* queue
+      .promote({
+        sessionID: session.id,
+        delivery: "queue",
+        prepare: (value) =>
+          Effect.gen(function* () {
+            preparations++
+            if (preparations === 1) {
+              yield* Deferred.succeed(entered, undefined)
+              yield* Deferred.await(release)
+            }
+            return yield* prepare(value)
+          }),
+        write: writer(sessions),
+        rejected: () => Effect.void,
+      })
+      .pipe(Effect.forkChild)
+    yield* Deferred.await(entered)
+    const alias = { ...input, messageID: MessageID.ascending() }
+    expect((yield* queue.admit(alias)).id).toBe(original.id)
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(promoting)
+    expect(preparations).toBe(2)
+    expect(yield* MessageV2.stream(session.id)).toHaveLength(1)
+    yield* queue.consume(session.id)
+    expect((yield* queue.admit(alias)).id).toBe(original.id)
+    expect(
+      Exit.isFailure(yield* queue.admit({ ...alias, parts: [{ type: "text", text: peer(992) }] }).pipe(Effect.exit)),
+    ).toBe(true)
+  }),
+)
+
+it.instance("already projected retained original transfers identity before ordinary consume", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const session = yield* sessions.create({})
+    const input = {
+      sessionID: session.id,
+      delivery: "queue" as const,
+      messageID: MessageID.ascending(),
+      parts: [{ type: "text" as const, text: peer(993) }],
+    }
+    const original = yield* queue.admit(input)
+    const legacy = yield* prepare(input)
+    yield* writer(sessions)(legacy)
+    yield* database.db
+      .update(SessionPromptQueueTable)
+      .set({ message_id: legacy.info.id })
+      .where(eq(SessionPromptQueueTable.id, original.id))
+      .run()
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "queue",
+      prepare,
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+    yield* queue.consume(session.id)
+    expect((yield* queue.admit(input)).id).toBe(original.id)
+    expect(yield* MessageV2.stream(session.id)).toHaveLength(1)
+    expect(yield* queue.list(session.id)).toEqual([])
   }),
 )

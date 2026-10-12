@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "7fde3149-ddb9-4a4f-8922-9b730d84c09b",
+  "id": "d0278ae1-bc57-4fd9-9c2c-8b0f42060068",
   "prevIds": [
-    "f28ff033-4d20-49ab-adb6-fbf1a96a3a7d"
+    "7fde3149-ddb9-4a4f-8922-9b730d84c09b"
   ],
   "ddl": [
     {
@@ -20,6 +20,10 @@
     },
     {
       "name": "event_writer_process",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_prompt_queue_alias",
       "entityType": "tables"
     },
     {
@@ -284,6 +288,26 @@
     },
     {
       "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "session_prompt_queue_alias"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "item_id",
+      "entityType": "columns",
+      "table": "session_prompt_queue_alias"
+    },
+    {
+      "type": "text",
       "notNull": false,
       "autoincrement": false,
       "default": null,
@@ -299,6 +323,16 @@
       "default": null,
       "generated": null,
       "name": "seq",
+      "entityType": "columns",
+      "table": "session_prompt_queue_sequence"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "aliases_indexed",
       "entityType": "columns",
       "table": "session_prompt_queue_sequence"
     },
@@ -1789,6 +1823,21 @@
     },
     {
       "columns": [
+        "item_id"
+      ],
+      "tableTo": "session_prompt_queue",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_prompt_queue_alias_item_id_session_prompt_queue_id_fk",
+      "entityType": "fks",
+      "table": "session_prompt_queue_alias"
+    },
+    {
+      "columns": [
         "session_id"
       ],
       "tableTo": "session",
@@ -2009,6 +2058,16 @@
     },
     {
       "columns": [
+        "id",
+        "item_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_prompt_queue_alias_pk",
+      "entityType": "pks",
+      "table": "session_prompt_queue_alias"
+    },
+    {
+      "columns": [
         "email",
         "url"
       ],
@@ -2216,6 +2275,20 @@
       "name": "session_share_pk",
       "table": "session_share",
       "entityType": "pks"
+    },
+    {
+      "columns": [
+        {
+          "value": "item_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_prompt_queue_alias_item_idx",
+      "entityType": "indexes",
+      "table": "session_prompt_queue_alias"
     },
     {
       "columns": [

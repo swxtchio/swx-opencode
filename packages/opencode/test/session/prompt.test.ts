@@ -9670,3 +9670,64 @@ gated.instance("captain grouped preparation cannot restore model selection chang
     expect((yield* held.sessions.get(held.chat.id)).model?.id).toBe(ModelV2.ID.make("picked-later"))
   }),
 )
+
+it.instance(
+  "exact peer retry callers survive one cancelled lifetime and receive their own turn once",
+  () =>
+    Effect.gen(function* () {
+      const held = yield* startHeld()
+      yield* held.llm.text("peer original answer")
+      const content =
+        "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791809000-999-abcd\x1f [fm-level:request]\x1f Exact retry caller obligation"
+      const messageID = MessageID.ascending()
+      const manual = yield* held.queue.admit({
+        sessionID: held.chat.id,
+        messageID,
+        delivery: "queue",
+        agent: "build",
+        model: ref,
+        parts: said(content),
+      })
+      const admittedAll = yield* Deferred.make<void>()
+      const events = yield* EventV2Bridge.Service
+      let admissions = 0
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === SessionQueue.Event.Updated.type
+          ? Effect.sync(() => {
+              admissions++
+            }).pipe(
+              Effect.andThen(
+                Effect.suspend(() =>
+                  admissions === 3 ? Deferred.succeed(admittedAll, undefined).pipe(Effect.asVoid) : Effect.void,
+                ),
+              ),
+            )
+          : Effect.void,
+      )
+      const first = yield* held.send(content, { messageID, delivery: "queue" })
+      const second = yield* held.send(content, { messageID, delivery: "queue" })
+      const cancelled = yield* held.send(content, { messageID, delivery: "queue" })
+      yield* Deferred.await(admittedAll)
+      yield* unsubscribe
+      yield* Fiber.interrupt(cancelled)
+      yield* held.release
+      const [root, one, two] = yield* finish(held.task, first, second)
+      expect(answered(root)?.texts).toEqual(["task done"])
+      expect(answered(one)?.texts).toEqual(["peer original answer"])
+      expect(answered(two)).toEqual(answered(one))
+      const recorded = yield* held.prompt.prompt({
+        sessionID: held.chat.id,
+        messageID,
+        delivery: "queue",
+        agent: "build",
+        model: ref,
+        parts: said(content),
+      })
+      expect(answered(recorded)).toEqual(answered(one))
+      expect(yield* held.llm.calls).toBe(2)
+      expect(yield* held.queue.list(held.chat.id)).toEqual([])
+      yield* held.queue.forget(manual.id)
+      expect(yield* held.queue.reply(manual.id)).toBeUndefined()
+    }),
+  20000,
+)
