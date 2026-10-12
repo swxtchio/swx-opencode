@@ -701,6 +701,118 @@ test(
   { timeout: 30_000 },
 )
 
+test(
+  "apply redacts an unchanged producer root-plus-child tree and preserves both Sessions' metrics",
+  async () => {
+    await using store = await producedStore([2])
+    const produced = store.trees[0]!
+    const db = new Database(store.filename)
+    try {
+      const sessionUsage = () =>
+        db
+          .query(
+            "SELECT id, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, model FROM session ORDER BY id",
+          )
+          .all()
+      const usageBefore = sessionUsage()
+      expect(usageBefore).toHaveLength(2)
+      for (const row of usageBefore) expect(row).toMatchObject({ cost: store.usage.cost })
+      const usageAxes = () =>
+        readExport(db).records.map((record) => ({
+          providerID: record["providerID"],
+          modelID: record["modelID"],
+          servedModelIDs: record["servedModelIDs"],
+          tokens: record["tokens"],
+          reportedCost: record["reportedCost"],
+        }))
+      const axesBefore = usageAxes()
+      expect(axesBefore.length).toBeGreaterThan(0)
+      const eventIdentities = () =>
+        db.query("SELECT id, aggregate_id, seq, type FROM event ORDER BY aggregate_id, seq").all()
+      const eventsBefore = eventIdentities()
+      const rawCopies = () =>
+        ["event", "message", "part", "session_message"]
+          .flatMap((table) =>
+            db
+              .query<{ data: string }, []>(`SELECT data FROM ${table}`)
+              .all()
+              .map((row) => row.data),
+          )
+          .join("\n")
+      expect(rawCopies()).toContain("assistant text sentinel")
+
+      const proof = evidence(produced.sessionIDs, finalSequence(db, produced.sessionIDs), store.filename)
+      const tree = inventory(access(db), proof, store.now).trees[0]!
+      expect(tree).toMatchObject({ sessionIDs: produced.sessionIDs, eligible: true, reasons: [] })
+
+      const result = apply(access(db), { tree, evidence: () => proof, now: () => store.now })
+
+      expect(result.reasons).toEqual([])
+      expect(result.state).toBe("complete")
+      expect(result.completedSessionIDs).toEqual(produced.sessionIDs)
+      expect(db.query("SELECT aggregate_id, state FROM event_retention ORDER BY aggregate_id").all()).toEqual(
+        produced.sessionIDs.map((id) => ({ aggregate_id: id, state: "complete" })),
+      )
+      expect(rawCopies()).not.toContain("sentinel")
+      expect(sessionUsage()).toEqual(usageBefore)
+      expect(usageAxes()).toEqual(axesBefore)
+      expect(eventIdentities()).toEqual(eventsBefore)
+    } finally {
+      db.close()
+    }
+  },
+  { timeout: 30_000 },
+)
+
+test(
+  "a producer root-plus-child tree whose child set or event types change after inventory refuses before any write",
+  async () => {
+    await using store = await producedStore([2])
+    const produced = store.trees[0]!
+    const child = produced.sessionIDs.find((id) => id !== produced.rootSessionID)!
+    const db = new Database(store.filename)
+    try {
+      const proof = evidence(produced.sessionIDs, finalSequence(db, produced.sessionIDs), store.filename)
+      const tree = inventory(access(db), proof, store.now).trees[0]!
+      expect(tree.eligible).toBe(true)
+      const refusedUnchanged = (reason: string) => {
+        const before = db.serialize()
+        const result = apply(access(db), { tree, evidence: () => proof, now: () => store.now })
+        expect(result).toMatchObject({ state: "refused", changedRows: 0, changedBytes: 0 })
+        expect(result.reasons).toContain(reason)
+        expect(db.serialize().equals(before)).toBe(true)
+      }
+
+      // A child admitted to the tree after inventory.
+      db.exec(`CREATE TEMP TABLE late_child AS SELECT * FROM session WHERE id = '${child}'`)
+      db.exec(`UPDATE late_child SET id = '${child}late'`)
+      db.exec("INSERT INTO session SELECT * FROM late_child")
+      refusedUnchanged("session-tree-changed")
+      db.exec(`DELETE FROM session WHERE id = '${child}late'`)
+
+      // A child event retyped after inventory, with its sequence unchanged. The child's only event of one type
+      // takes another type it already has; the root still has the first type, so the tree's set of event types
+      // is unchanged and only the number of Sessions holding that type shows the change.
+      const childTypes = db
+        .query<
+          { type: string; rows: number },
+          [string]
+        >("SELECT type, count(*) AS rows FROM event WHERE aggregate_id = ? GROUP BY type ORDER BY type")
+        .all(child)
+      const lone = childTypes.find((row) => row.rows === 1)!
+      const kept = childTypes.find((row) => row.type !== lone.type)!
+      expect(tree.aggregates.find((item) => item.aggregateID === produced.rootSessionID)?.eventTypes).toContain(
+        lone.type,
+      )
+      db.query("UPDATE event SET type = ? WHERE aggregate_id = ? AND type = ?").run(kept.type, child, lone.type)
+      refusedUnchanged("event-type-set-changed")
+    } finally {
+      db.close()
+    }
+  },
+  { timeout: 30_000 },
+)
+
 test("failed apply evidence refuses before any row changes", () => {
   const db = reducedFixture()
   try {

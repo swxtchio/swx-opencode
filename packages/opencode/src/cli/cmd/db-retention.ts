@@ -1985,8 +1985,11 @@ function parseJson(value: string) {
   }
 }
 
+// Equal as multisets. Both sides are sorted: the flattened per-aggregate event-type lists of a multi-Session
+// tree are sorted only within each aggregate, so a one-sided sort refused every unchanged tree (#230).
 function sameIDs(left: readonly string[], right: readonly string[]) {
-  return left.length === right.length && left.toSorted().every((id, index) => id === right[index])
+  const sorted = right.toSorted()
+  return left.length === right.length && left.toSorted().every((id, index) => id === sorted[index])
 }
 
 function placeholders(count: number) {
