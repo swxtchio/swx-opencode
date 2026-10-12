@@ -1,10 +1,10 @@
-import { expect, spyOn, test } from "bun:test"
+import { afterAll, expect, spyOn, test } from "bun:test"
 import { spawnSync } from "node:child_process"
 import { Database } from "bun:sqlite"
 import { Context, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { readdirSync, writeFileSync } from "node:fs"
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, statfs, writeFile } from "node:fs/promises"
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, statfs, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { eq } from "drizzle-orm"
@@ -104,9 +104,49 @@ const access = (db: Database) => db as unknown as SqliteAccess
  * production Database layer, into which a separate OS process writes Session trees through the real
  * Session, Todo and EventV2 producers and then exits, so its writer registration names a dead process.
  * `sizes` lists one entry per tree, its Session count (a root plus children).
+ *
+ * The producer runs once per tree shape in this file, and each test gets its own private copy of the store
+ * it left. A spawn costs about a second, and one per test put this file's runtime on the unit CI step's
+ * critical path.
  */
 async function producedStore(sizes: number[]) {
+  const key = JSON.stringify(sizes)
+  const template = producedTemplates.get(key) ?? produceStore(sizes)
+  producedTemplates.set(key, template)
+  const produced = await template
   const directory = await mkdtemp(path.join(os.tmpdir(), "opencode-retention-store-"))
+  const filename = path.join(directory, "opencode.db")
+  // The producer has exited and closed the store; a WAL left behind would still hold committed writes.
+  for (const suffix of ["", "-wal"]) {
+    if (await Bun.file(produced.filename + suffix).exists())
+      await copyFile(produced.filename + suffix, filename + suffix)
+  }
+  return {
+    filename,
+    trees: produced.trees,
+    usage: produced.usage,
+    producedFrom: produced.producedFrom,
+    producedUntil: produced.producedUntil,
+    // Just past the inactivity window after the producer's last write.
+    now: produced.producedUntil + inactivityPolicy.windowMs + 1,
+    [Symbol.asyncDispose]: () => rm(directory, { recursive: true, force: true }),
+  }
+}
+
+const producedTemplates = new Map<string, ReturnType<typeof produceStore>>()
+afterAll(() =>
+  Promise.all(
+    Array.from(producedTemplates.values(), (template) =>
+      template.then(
+        (produced) => rm(produced.directory, { recursive: true, force: true }),
+        () => undefined,
+      ),
+    ),
+  ),
+)
+
+async function produceStore(sizes: number[]) {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "opencode-retention-template-"))
   const filename = path.join(directory, "opencode.db")
   const project = path.join(directory, "project")
   await mkdir(project)
@@ -141,13 +181,7 @@ async function producedStore(sizes: number[]) {
     producedFrom: number
     producedUntil: number
   }
-  return {
-    filename,
-    ...produced,
-    // Just past the inactivity window after the producer's last write.
-    now: produced.producedUntil + inactivityPolicy.windowMs + 1,
-    [Symbol.asyncDispose]: () => rm(directory, { recursive: true, force: true }),
-  }
+  return { directory, filename, ...produced }
 }
 
 // Each Session's current event sequence, which a measurement receipt covering its final write records.

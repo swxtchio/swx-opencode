@@ -309,8 +309,11 @@ describe("sync HttpApi", () => {
           "aggregate_id, state, progress_table, progress_id, evidence, time_started, time_updated",
           `aggregate_id || '_' || i, state, progress_table, progress_id, evidence, time_started, time_updated`,
         )
-        const pruned = yield* store.db.select().from(EventRetentionTable).all()
-        expect(pruned.length).toBe(copies + 1)
+        const pruned = yield* store.db
+          .select({ markers: sql<number>`count(*)` })
+          .from(EventRetentionTable)
+          .get()
+        expect(pruned?.markers).toBe(copies + 1)
         for (const payload of store.payloads) {
           const result = yield* readSyncHistory(store.db, payload)
           expect(result.events.filter((row) => row.aggregate_id.startsWith(store.pruned.id))).toEqual([])
