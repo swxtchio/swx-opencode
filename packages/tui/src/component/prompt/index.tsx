@@ -335,6 +335,32 @@ export function Prompt(props: PromptProps) {
     }
   })
 
+  // The picker is the open session's selection, which its pending prompts run
+  // at when they are delivered (swxtchio/swx-opencode#212).
+  createEffect(
+    on(
+      local.model.chosen,
+      () => {
+        const model = local.model.current()
+        if (!props.sessionID || !model) return
+        void sdk.client.session
+          .update({
+            sessionID: props.sessionID,
+            model: {
+              providerID: model.providerID,
+              id: model.modelID,
+              variant: local.model.variant.current() ?? "default",
+            },
+          })
+          .then((result) => {
+            if (result.error)
+              toast.show({ variant: "error", message: "Could not select this model for the session's queued prompts" })
+          })
+      },
+      { defer: true },
+    ),
+  )
+
   const promptCommands = createMemo(() =>
     [
       {

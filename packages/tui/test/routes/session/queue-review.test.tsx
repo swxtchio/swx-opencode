@@ -21,7 +21,7 @@ const provider = {
   source: "api",
   env: [],
   options: {},
-  models: { model: { id: "model", providerID: "test", name: "Model" } },
+  models: { model: { id: "model", providerID: "test", name: "Model", variants: { low: {}, high: {} } } },
 } as unknown as Provider
 
 const transcript = {
@@ -59,6 +59,7 @@ async function startSession() {
   const setup = await createTestRenderer({ width: 160, height: 45, useThread: false })
   const events = createEventSource()
   const requests: string[] = []
+  const selections: unknown[] = []
   const calls = createFetch((url) => {
     if (url.pathname === "/config/providers") return json({ providers: [provider], default: { test: "model" } })
     if (url.pathname === `/session/${sessionID}`)
@@ -81,6 +82,7 @@ async function startSession() {
     const request = input instanceof Request ? input : new Request(input, init)
     const path = new URL(request.url).pathname
     if (path.startsWith(`/session/${sessionID}/queue/`)) requests.push(path.split("/").pop()!)
+    if (path === `/session/${sessionID}` && request.method === "PATCH") selections.push(await request.clone().json())
     return calls.fetch(request)
   }) as typeof globalThis.fetch
   let api: TuiPluginApi | undefined
@@ -113,6 +115,7 @@ async function startSession() {
   return {
     renderer: setup,
     requests,
+    selections,
     dispatch: (command: string) => api?.keymap.dispatchCommand(command),
     async stop() {
       try {
@@ -154,6 +157,25 @@ test("the session prompt shows pending prompts, and session.queued_prompts opens
     app.renderer.mockInput.pressEscape()
     await until(() => app.requests.includes("release"), "the release request")
     expect(app.requests).toEqual(["hold", "release"])
+  } finally {
+    await app.stop()
+  }
+})
+
+test("an effort the user picks becomes the open session's selection, which its pending prompts run at", async () => {
+  const app = await startSession()
+  try {
+    await app.renderer.renderOnce()
+    await until(async () => {
+      await app.renderer.renderOnce()
+      return app.renderer.captureCharFrame().includes("2 pending")
+    }, "the session")
+    // Restoring the transcript's model is not a choice, so nothing is selected yet.
+    expect(app.selections).toEqual([])
+
+    app.dispatch("variant.cycle")
+    await until(() => app.selections.length === 1, "the selection update")
+    expect(app.selections).toEqual([{ model: { providerID: "test", id: "model", variant: "low" } }])
   } finally {
     await app.stop()
   }

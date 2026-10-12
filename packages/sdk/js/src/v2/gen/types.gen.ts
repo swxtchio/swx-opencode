@@ -9765,6 +9765,11 @@ export type SessionUpdateData = {
       [key: string]: unknown
     }
     permission?: PermissionRuleset
+    model?: {
+      id: string
+      providerID: string
+      variant?: string
+    }
     time?: {
       archived?: number
     }

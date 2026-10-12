@@ -25,6 +25,8 @@ import * as HttpSessionError from "../../src/server/routes/instance/httpapi/hand
 import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/groups/experimental"
 import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
 import { SessionQueuePaths } from "../../src/server/routes/instance/httpapi/groups/session-queue"
+import { SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
+import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { EventPaths } from "../../src/server/routes/instance/httpapi/groups/event"
 import { WorkspacePaths } from "../../src/server/routes/instance/httpapi/groups/workspace"
 import type { SessionQueue } from "../../src/session/queue"
@@ -2585,6 +2587,174 @@ describe("session HttpApi", () => {
         expect(yield* nextQueueUpdate).toEqual([])
       }).pipe(
         Effect.ensuring(Deferred.succeed(gate, void 0)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+})
+
+describe("session HttpApi pending prompt selection", () => {
+  // Two models, each with two efforts, so a test can tell which selection a
+  // provider request was made under.
+  const selectableConfig = (url: string) => {
+    const base = testProviderConfig(url)
+    const model = (id: string) => ({
+      ...base.provider.test.models["test-model"],
+      id,
+      name: id,
+      variants: { low: { reasoningEffort: "low" }, high: { reasoningEffort: "high" } },
+    })
+    return {
+      ...base,
+      provider: {
+        test: { ...base.provider.test, models: { "model-a": model("model-a"), "model-b": model("model-b") } },
+      },
+    }
+  }
+
+  it.live(
+    "pending prompts run at the session's selection when delivered, not the one they were sent with",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: selectableConfig(llm.url) })
+        const session = yield* createSession({ title: "current selection" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const post = (path: string, body?: unknown) =>
+          request(pathFor(path, params), {
+            method: "POST",
+            headers,
+            body: body === undefined ? undefined : JSON.stringify(body),
+          })
+        const underA = (text: string, delivery?: SessionQueue.Delivery) =>
+          post(SessionPaths.promptAsync, {
+            agent: "build",
+            model: { providerID: "test", modelID: "model-a" },
+            variant: "low",
+            ...(delivery ? { delivery } : {}),
+            parts: [{ type: "text", text }],
+          })
+        const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+
+        yield* underA("start")
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        // Held, the steer stays pending as a queued prompt does.
+        yield* underA("steer under a")
+        yield* underA("queued under a", "queue")
+        yield* underA("run lint", "queue")
+        yield* underA("run lint --fix", "queue")
+        yield* pollWithTimeout(
+          listed().pipe(Effect.map((items) => (items.length === 4 ? true : undefined))),
+          "prompts never queued",
+        )
+        expect((yield* post(SessionQueuePaths.consolidate)).status).toBe(200)
+        // A row a stopped process left behind, admitted under A.
+        const { db } = yield* Database.Service
+        yield* db
+          .insert(SessionPromptQueueTable)
+          .values({
+            id: SessionPromptQueue.ItemID.create(),
+            session_id: session.id,
+            seq: 1000,
+            delivery: "queue",
+            input: {
+              agent: "build",
+              model: { providerID: "test", modelID: "model-a" },
+              variant: "low",
+              parts: [{ type: "text", text: "persisted under a" }],
+            },
+            time_created: Date.now(),
+          })
+          .run()
+
+        const selected = yield* request(pathFor(SessionPaths.update, params), {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ model: { providerID: "test", id: "model-b", variant: "high" } }),
+        })
+        expect(selected.status).toBe(200)
+        expect((yield* json<{ model?: unknown }>(selected)).model).toEqual({
+          providerID: "test",
+          id: "model-b",
+          variant: "high",
+        })
+
+        yield* Deferred.succeed(gate, undefined)
+        for (const text of ["steer done", "queued done", "lint done", "persisted done"]) yield* llm.text(text)
+        expect((yield* post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+        const sent = yield* pollWithTimeout(
+          llm.inputs.pipe(Effect.map((inputs) => (inputs.length === 5 ? inputs : undefined))),
+          "the model never received every pending prompt",
+          "10 seconds",
+        )
+        const turns = sent.map((input) => {
+          const messages = input.messages as { role: string; content: unknown }[]
+          return { model: input.model, effort: input.reasoning_effort, last: JSON.stringify(messages.at(-1)) }
+        })
+        expect(turns.map((turn) => [turn.model, turn.effort])).toEqual([
+          ["model-a", "low"],
+          ["model-b", "high"],
+          ["model-b", "high"],
+          ["model-b", "high"],
+          ["model-b", "high"],
+        ])
+        expect(turns[1]!.last).toContain("steer under a")
+        expect(turns[2]!.last).toContain("queued under a")
+        expect(turns[3]!.last).toContain("--fix")
+        expect(turns[4]!.last).toContain("persisted under a")
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
+    "a prompt's own model and effort become the selection its delivery and later prompts run at",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: selectableConfig(llm.url) })
+        const session = yield* createSession({ title: "selection by prompt" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const send = (text: string, selection: object) =>
+          request(pathFor(SessionPaths.promptAsync, { sessionID: session.id }), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ agent: "build", delivery: "queue", ...selection, parts: [{ type: "text", text }] }),
+          })
+
+        yield* send("start", { model: { providerID: "test", modelID: "model-a" }, variant: "low" })
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        yield* send("queued under b", { model: { providerID: "test", modelID: "model-b" }, variant: "high" })
+        // Names no model, as a firstmate send to an unmanaged session does.
+        yield* send("queued with no selection", {})
+
+        yield* llm.text("b done")
+        yield* llm.text("unnamed done")
+        yield* Deferred.succeed(gate, undefined)
+        const sent = yield* pollWithTimeout(
+          llm.inputs.pipe(Effect.map((inputs) => (inputs.length === 3 ? inputs : undefined))),
+          "the model never received every queued prompt",
+          "10 seconds",
+        )
+        expect(sent.map((input) => [input.model, input.reasoning_effort])).toEqual([
+          ["model-a", "low"],
+          ["model-b", "high"],
+          ["model-b", "high"],
+        ])
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
         Effect.provide(TestLLMServer.layer),
         Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
       )

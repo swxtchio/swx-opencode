@@ -166,6 +166,10 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       const state = {
         pending: false,
       }
+      // Counts the user's own model and effort choices, so the open session can
+      // follow them; one restored from session history is not a choice.
+      const [chosen, setChosen] = createSignal(0)
+      const choose = () => setChosen((count) => count + 1)
 
       function save() {
         if (!modelStore.ready) {
@@ -265,6 +269,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
 
       return {
         current: currentModel,
+        chosen,
         get ready() {
           return modelStore.ready
         },
@@ -305,6 +310,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           const a = agent.current()
           if (!a) return
           setModelStore("model", a.name, { ...val })
+          choose()
         },
         cycleFavorite(direction: 1 | -1) {
           const favorites = modelStore.favorite.filter((item) => isModelValid(item))
@@ -335,6 +341,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           setModelStore("model", a.name, { ...next })
           setModelStore("recent", recentModels(next, modelStore.recent))
           save()
+          choose()
         },
         set(model: { providerID: string; modelID: string }, options?: { recent?: boolean }) {
           batch(() => {
@@ -352,6 +359,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             if (options?.recent) {
               setModelStore("recent", recentModels(model, modelStore.recent))
               save()
+              choose()
             }
           })
         },
@@ -405,6 +413,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           set(value: string | undefined) {
             setLaunchActive(false)
             this.restore(value)
+            choose()
           },
           // Record an effort from session history without it counting as the user's choice: a
           // still-active --effort keeps winning wherever the model declares it, and this effort

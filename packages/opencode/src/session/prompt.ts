@@ -634,14 +634,14 @@ const layer = Layer.effect(
         return {
           providerID: ProviderV2.ID.make(current.model.providerID),
           modelID: ModelV2.ID.make(current.model.id),
-          ...(current.model.variant && current.model.variant !== "default" ? { variant: current.model.variant } : {}),
+          variant: current.model.variant && current.model.variant !== "default" ? current.model.variant : undefined,
         }
       }
       const match = yield* sessions
         .findMessage(sessionID, (m) => m.info.role === "user" && !!m.info.model)
         .pipe(Effect.orDie)
       if (Option.isSome(match) && match.value.info.role === "user") return match.value.info.model
-      return yield* provider.defaultModel().pipe(Effect.orDie)
+      return { ...(yield* provider.defaultModel().pipe(Effect.orDie)), variant: undefined }
     })
 
     // Resolves a prompt into its user message without storing it, so a queue
@@ -657,7 +657,8 @@ const layer = Layer.effect(
         throw error
       }
 
-      const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
+      const selected = input.model || ag.model ? undefined : yield* currentModel(input.sessionID)
+      const model = input.model ?? ag.model ?? selected!
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       // Also fetched when a variant was requested explicitly, so it can be
       // validated. Without this an unknown name reached request.ts, where
@@ -681,7 +682,9 @@ const layer = Layer.effect(
         throw error
       }
 
-      const variant = input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
+      // The session's own model runs at the session's variant.
+      const variant =
+        input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined) ?? selected?.variant
 
       const info: SessionV1.User = {
         id: input.messageID ?? MessageID.ascending(),
@@ -1089,6 +1092,21 @@ const layer = Layer.effect(
 
     const createUserMessage = (input: PromptInput) => prepareUserMessage(input).pipe(Effect.flatMap(writeUserMessage))
 
+    // A pending prompt that named a model or variant is delivered at the
+    // session's selection then current, never the one it was admitted with.
+    const prepareQueued = (input: SessionQueue.PromotedInput) =>
+      input.model || input.variant
+        ? currentModel(input.sessionID).pipe(
+            Effect.flatMap((current) =>
+              prepareUserMessage({
+                ...input,
+                model: { providerID: current.providerID, modelID: current.modelID },
+                variant: current.variant,
+              }),
+            ),
+          )
+        : prepareUserMessage(input)
+
     const prompt: (
       input: PromptInput,
     ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError> = Effect.fn(
@@ -1096,6 +1114,16 @@ const layer = Layer.effect(
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
+      // A prompt's model and variant become the session's selection now, and a
+      // pending prompt runs at whichever selection is current when it is
+      // delivered (swxtchio/swx-opencode#212).
+      if (input.model || input.variant) {
+        const model = input.model ?? (yield* currentModel(input.sessionID))
+        yield* sessions.setModel({
+          sessionID: input.sessionID,
+          model: { id: model.modelID, providerID: model.providerID, variant: input.variant ?? "default" },
+        })
+      }
       // TUI prepends synthetic editor context; only flattened user text owns marker framing.
       const classificationText = input.parts
         .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
@@ -1153,7 +1181,7 @@ const layer = Layer.effect(
         yield* queue.promote({
           sessionID: input.sessionID,
           delivery: "steer",
-          prepare: prepareUserMessage,
+          prepare: prepareQueued,
           write: writeUserMessage,
           rejected: rejected(input.sessionID),
           own: entry.own.id,
@@ -1204,7 +1232,7 @@ const layer = Layer.effect(
         .promote({
           sessionID,
           delivery,
-          prepare: prepareUserMessage,
+          prepare: prepareQueued,
           write: writeUserMessage,
           rejected: rejected(sessionID),
         })
@@ -1677,7 +1705,7 @@ const layer = Layer.effect(
           queue.promote({
             sessionID,
             delivery,
-            prepare: prepareUserMessage,
+            prepare: prepareQueued,
             write: writeUserMessage,
             rejected: rejected(sessionID),
             own,
