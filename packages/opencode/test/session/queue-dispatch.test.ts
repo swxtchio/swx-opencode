@@ -1289,6 +1289,144 @@ it.instance("admission scope release and repeated forget cannot steal a differen
   }),
 )
 
+it.instance("accepted alias binds answer ownership before a held committed listener", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const events = yield* EventV2.Service
+    for (const state of ["delivered", "consumed"] as const) {
+      for (const route of ["admit", "writeOrAdmit"] as const) {
+        const session = yield* sessions.create({})
+        const firstScope = yield* Effect.acquireRelease(Scope.make(), (scope) => Scope.close(scope, Exit.void))
+        const retryScope = yield* Effect.acquireRelease(Scope.make(), (scope) => Scope.close(scope, Exit.void))
+        const input = {
+          sessionID: session.id,
+          delivery: "queue" as const,
+          messageID: MessageID.ascending(),
+          parts: [{ type: "text" as const, text: peer(995) }],
+        }
+        const original = yield* queue.admit(input).pipe(Effect.provideService(Scope.Scope, firstScope))
+        yield* queue.promote({
+          sessionID: session.id,
+          delivery: "queue",
+          prepare,
+          write: writer(sessions),
+          rejected: () => Effect.void,
+        })
+        const [message] = yield* MessageV2.stream(session.id)
+        if (state === "consumed") yield* queue.consume(session.id)
+        yield* queue.answer(session.id, message.info.id, message)
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
+        const unsubscribe = yield* events.listen((event) =>
+          event.type === SessionV1.Event.PartUpdated.type
+            ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.asVoid)
+            : Effect.void,
+        )
+        const retryInput = { ...input, messageID: MessageID.ascending() }
+        const retry = yield* (
+          route === "admit"
+            ? queue.admit(retryInput)
+            : queue
+                .writeOrAdmit({
+                  admission: retryInput,
+                  isBusy: Effect.succeed(false),
+                  prepare: () => Effect.die("witnessed retry must not prepare another original"),
+                  write: () => Effect.die("witnessed retry must not write another original"),
+                  discard: () => Effect.die("witnessed retry must not discard its original"),
+                })
+                .pipe(
+                  Effect.map((result) => {
+                    if (result.kind !== "queued") throw new Error("expected witnessed original")
+                    return result.own
+                  }),
+                )
+        ).pipe(Effect.provideService(Scope.Scope, retryScope), Effect.forkChild)
+        yield* Deferred.await(entered)
+        yield* Scope.close(firstScope, Exit.void)
+        expect(yield* queue.reply(original.id)).toEqual(message)
+        yield* Deferred.succeed(release, undefined)
+        expect((yield* Fiber.join(retry)).id).toBe(original.id)
+        expect(yield* queue.reply(original.id)).toEqual(message)
+        yield* unsubscribe
+        yield* Scope.close(retryScope, Exit.void)
+        expect(yield* queue.reply(original.id)).toBeUndefined()
+      }
+    }
+  }),
+)
+
+it.instance("accepted alias ownership respects SQL rollback and cancellation during publication", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const events = yield* EventV2.Service
+    const database = yield* Database.Service
+    for (const boundary of ["rollback", "cancel"] as const) {
+      const session = yield* sessions.create({})
+      const firstScope = yield* Effect.acquireRelease(Scope.make(), (scope) => Scope.close(scope, Exit.void))
+      const input = {
+        sessionID: session.id,
+        delivery: "queue" as const,
+        messageID: MessageID.ascending(),
+        parts: [{ type: "text" as const, text: peer(996) }],
+      }
+      const original = yield* queue.admit(input).pipe(Effect.provideService(Scope.Scope, firstScope))
+      yield* queue.promote({
+        sessionID: session.id,
+        delivery: "queue",
+        prepare,
+        write: writer(sessions),
+        rejected: () => Effect.void,
+      })
+      const [message] = yield* MessageV2.stream(session.id)
+      yield* queue.consume(session.id)
+      yield* queue.answer(session.id, message.info.id, message)
+      const retryInput = { ...input, messageID: MessageID.ascending() }
+      if (boundary === "rollback") {
+        yield* database.db.run(
+          sql`CREATE TRIGGER fail_alias_insert BEFORE INSERT ON part BEGIN SELECT RAISE(ABORT,'controlled alias rollback'); END`,
+        )
+        const attempt = yield* queue
+          .admit(retryInput)
+          .pipe(
+            Effect.scoped,
+            Effect.exit,
+            Effect.ensuring(database.db.run(sql`DROP TRIGGER fail_alias_insert`).pipe(Effect.orDie)),
+          )
+        expect(Exit.isFailure(attempt)).toBe(true)
+        expect((yield* MessageV2.stream(session.id))[0].parts).toEqual(message.parts)
+      }
+      if (boundary === "cancel") {
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const completed = yield* Deferred.make<void>()
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
+        const unsubscribe = yield* events.listen((event) =>
+          event.type === SessionV1.Event.PartUpdated.type
+            ? Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.andThen(Deferred.succeed(completed, undefined)),
+                Effect.asVoid,
+              )
+            : Effect.void,
+        )
+        const retry = yield* queue.admit(retryInput).pipe(Effect.scoped, Effect.forkChild)
+        yield* Deferred.await(entered)
+        const stopped = yield* Fiber.interrupt(retry).pipe(Effect.timeoutOption("1 second"))
+        expect(Option.isSome(stopped)).toBe(true)
+        expect(yield* queue.reply(original.id)).toEqual(message)
+        yield* Deferred.succeed(release, undefined)
+        yield* Deferred.await(completed)
+        yield* unsubscribe
+      }
+      yield* Scope.close(firstScope, Exit.void)
+      expect(yield* queue.reply(original.id)).toBeUndefined()
+    }
+  }),
+)
+
 it.instance("new accepted alias during preparation invalidates reservation and commits its witness once", () =>
   Effect.gen(function* () {
     const queue = yield* SessionQueue.Service

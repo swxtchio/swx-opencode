@@ -408,6 +408,7 @@ function makeHttpNoLLMServer(input?: PromptTestOptions) {
 // SessionRunState.ensureRunning has joined or started a run, and records which.
 // With `hold`, that caller also waits after its run ends, as a slow one would.
 const gates = {
+  messagesTransform: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   queueSelection: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   finishingRead: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   nextEnsureRunning: undefined as
@@ -609,6 +610,12 @@ const gatedPlugin = LayerNode.make({
             yield* Deferred.succeed(selection.entered, undefined)
             yield* Deferred.await(selection.release)
           }
+          const transform = name === "experimental.chat.messages.transform" ? gates.messagesTransform : undefined
+          if (transform)
+            yield* Effect.fn("test.experimental.chat.messages.transform")(function* () {
+              yield* Deferred.succeed(transform.entered, undefined)
+              yield* Deferred.await(transform.release)
+            })()
           const failure = gates.outcomeFailure
           if (name === "experimental.chat.messages.transform" && failure && !failure.triggered) {
             failure.triggered = true
@@ -4619,12 +4626,18 @@ const finish = <A, E>(...fibers: Fiber.Fiber<A, E>[]) =>
 const startHeld = Effect.fn("test.startHeld")(function* (input?: {
   tool?: boolean
   agent?: string
+  diagnostic?: (value: {
+    sessionID: SessionID
+    calls: number
+    runner?: { state: string; frame?: string; fiberID?: number }
+  }) => void
   config?: (url: string) => Partial<ConfigV1.Info>
 }) {
   const { llm } = yield* useServerConfig(input?.config ?? providerCfg)
   const prompt = yield* SessionPrompt.Service
   const sessions = yield* Session.Service
   const queue = yield* SessionQueue.Service
+  const runState = yield* SessionRunState.Service
   const chat = yield* sessions.create({
     title: "Pinned",
     permission: [{ permission: "*", pattern: "*", action: "allow" }],
@@ -4657,12 +4670,23 @@ const startHeld = Effect.fn("test.startHeld")(function* (input?: {
         )
         const calls = yield* llm.calls
         const promptExit = task.pollUnsafe()
+        const active = yield* runState.current(chat.id)
+        const running =
+          active?._tag === "Running"
+            ? active.run.fiber
+            : active?._tag === "Shell" || active?._tag === "ShellThenRun"
+              ? active.shell.fiber
+              : undefined
+        const runner = active && { state: active._tag, frame: running?.currentStackFrame?.name, fiberID: running?.id }
+        input?.diagnostic?.({ sessionID: chat.id, calls, runner })
         yield* Effect.sync(() =>
           console.error("first provider boundary failed", {
             cause: Cause.pretty(cause),
             error: Cause.squash(cause),
             promptExit: promptExit && (Exit.isFailure(promptExit) ? Cause.pretty(promptExit.cause) : "success"),
             promptFrame: task.currentStackFrame,
+            runner,
+            runnerExit: running?.pollUnsafe(),
             calls,
             pending:
               Exit.isSuccess(pending) && Option.isSome(pending.value)
@@ -9638,6 +9662,51 @@ it.instance("held provider setup exposes the actual prompt failure before any mo
     const llm = yield* TestLLMServer
     expect(yield* llm.calls).toBe(0)
   }),
+)
+
+gated.instance(
+  "first-provider diagnostic identifies the held actual runner under its unchanged bound",
+  () =>
+    Effect.gen(function* () {
+      const gate = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      const observed: {
+        sessionID?: SessionID
+        calls?: number
+        runner?: { state: string; frame?: string; fiberID?: number }
+      } = {}
+      gates.messagesTransform = gate
+      yield* Effect.addFinalizer(() =>
+        Deferred.succeed(gate.release, undefined).pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              gates.messagesTransform = undefined
+            }),
+          ),
+          Effect.asVoid,
+        ),
+      )
+      const started = yield* startHeld({ diagnostic: (value) => Object.assign(observed, value) }).pipe(
+        Effect.exit,
+        Effect.forkChild,
+      )
+      yield* awaitWithTimeout(
+        Deferred.await(gate.entered),
+        "valid runner never reached its real transform hook",
+        "10 seconds",
+      )
+      const exit = yield* Fiber.join(started)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) throw new Error("held runner unexpectedly reached the provider")
+      expect(Cause.squash(exit.cause)).toMatchObject({ message: "first provider call never started" })
+      expect(observed.calls).toBe(0)
+      expect(observed.runner?.state).toBe("Running")
+      expect(observed.runner?.frame).toBe("test.experimental.chat.messages.transform")
+      expect(observed.runner?.fiberID).toBeGreaterThan(0)
+      if (!observed.sessionID) throw new Error("expected inspected session owner")
+      const prompt = yield* SessionPrompt.Service
+      yield* prompt.cancel(observed.sessionID)
+    }),
+  20000,
 )
 
 it.instance("captain critical peer remains an immediate steer during active provider work", () =>

@@ -11,6 +11,7 @@ import { SessionStatus } from "./status"
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  readonly current: (sessionID: SessionID) => Effect.Effect<Runner.State<SessionV1.WithParts, never> | undefined>
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -74,6 +75,11 @@ const layer = Layer.effect(
       if (existing?.busy) yield* busyError(sessionID)
     })
 
+    // Inspect only an existing local owner; diagnostics must not start or adopt a run.
+    const current = Effect.fn("SessionRunState.current")(function* (sessionID: SessionID) {
+      return (yield* InstanceState.get(state)).runners.get(sessionID)?.state
+    })
+
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
       yield* cancelBackgroundJobs(background, sessionID)
       const data = yield* InstanceState.get(state)
@@ -105,7 +111,7 @@ const layer = Layer.effect(
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
-    return Service.of({ assertNotBusy, cancel, ensureRunning, startShell })
+    return Service.of({ assertNotBusy, cancel, current, ensureRunning, startShell })
   }),
 )
 

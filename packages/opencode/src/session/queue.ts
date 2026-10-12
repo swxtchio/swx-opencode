@@ -263,10 +263,9 @@ const layer = Layer.effect(
       return yield* exclusive(input.sessionID, admitLocked(input))
     })
 
-    const openChannel = (item: Item, message?: MessageID) =>
+    const openChannel = (item: Item, message: MessageID | undefined, callerScope: Scope.Scope | undefined) =>
       Effect.uninterruptible(
         Effect.gen(function* () {
-          const callerScope = Option.getOrUndefined(yield* Effect.serviceOption(Scope.Scope))
           const existing = channels.get(item.id)
           const channel = existing ?? {
             sessionID: item.sessionID,
@@ -386,6 +385,7 @@ const layer = Layer.effect(
       })
 
     const admitLocked = Effect.fnUntraced(function* (input: AdmitInput) {
+      const callerScope = Option.getOrUndefined(yield* Effect.serviceOption(Scope.Scope))
       const result = yield* writable(input.sessionID, (tx) =>
         Effect.gen(function* () {
           const keys = constituentIDs(input.sessionID, input)
@@ -516,14 +516,24 @@ const layer = Layer.effect(
               .values(keys.map((id) => ({ id, item_id: row.id })))
               .run()
           return { kind: "row" as const, row }
-        }),
+        }).pipe(
+          Effect.tap((accepted) =>
+            // The retry owns the existing answer once committed, before alias observers can suspend admission.
+            DatabaseTransaction.afterCommit(
+              accepted.kind === "delivered"
+                ? openChannel(accepted.item, accepted.messageID, callerScope)
+                : openChannel(
+                    fromRow(accepted.row),
+                    accepted.row.time_promoted && accepted.row.message_id ? accepted.row.message_id : undefined,
+                    callerScope,
+                  ),
+              true,
+            ),
+          ),
+        ),
       ).pipe(Effect.orDie)
-      if (result.kind === "delivered") {
-        yield* openChannel(result.item, result.messageID)
-        return result.item
-      }
+      if (result.kind === "delivered") return result.item
       const item = fromRow(result.row)
-      yield* openChannel(item, result.row.time_promoted && result.row.message_id ? result.row.message_id : undefined)
       if (!result.row.time_promoted) wake(input.sessionID)
       yield* publish(input.sessionID)
       return item
@@ -573,7 +583,8 @@ const layer = Layer.effect(
                 )
               : undefined
             if (duplicate) {
-              yield* openChannel(duplicate)
+              const callerScope = Option.getOrUndefined(yield* Effect.serviceOption(Scope.Scope))
+              yield* openChannel(duplicate, undefined, callerScope)
               return { kind: "queued" as const, own: duplicate, prepared }
             }
             const active = busy || (yield* input.isBusy)
