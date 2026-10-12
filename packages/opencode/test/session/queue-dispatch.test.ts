@@ -382,6 +382,10 @@ it.instance("heartbeat duties survive type coalescing and malformed peer frames 
       heartbeat("check task B", "b1"),
       heartbeat("", "telemetry1"),
       heartbeat("", "telemetry2"),
+      ...["duty-one", "duty-two"].map(
+        (duty) =>
+          `[fm-level:nudge:heartbeat]\x1f Heartbeat summary: ${heartbeat(duty, duty).split("\x1f ")[1].slice(0, 240)}… Full message: /scratch/${duty}.txt [fm-heartbeat-receipt:${duty}]`,
+      ),
     ]
     yield* Effect.forEach(values, (value) =>
       queue.admit({ sessionID: session.id, delivery: "queue", parts: [{ type: "text", text: value }] }),
@@ -397,7 +401,10 @@ it.instance("heartbeat duties survive type coalescing and malformed peer frames 
     expect(text(message)).toContain("check task A")
     expect(text(message)).toContain("check task B")
     expect(text(message)).toContain("telemetry2")
-    expect(metadata(message).constituents).toHaveLength(4)
+    expect(text(message)).toContain("Full message: /scratch/duty-one.txt")
+    expect(text(message)).toContain("Full message: /scratch/duty-two.txt")
+    expect(message.parts.find((part) => part.type === "text")?.ignored).not.toBe(true)
+    expect(metadata(message).constituents).toHaveLength(6)
     const malformed = "[fm-from-peer]\x1f invalid sender\x1f relative-home\x1f bad-id\x1f meaningful unknown content"
     yield* queue.admit({ sessionID: session.id, delivery: "queue", parts: [{ type: "text", text: malformed }] })
     yield* queue.promote({
@@ -578,6 +585,91 @@ it.instance("peer batching retains complete file input alongside its literal env
     expect(text(message)).toContain(peer(1))
     expect(metadata(message).constituents[0].id).toBe(original.id)
     expect(metadata(message).constituents[0].input.parts[1]).toEqual(file)
+  }),
+)
+
+it.instance("interrupting message observer cannot lose committed parts or answer binding", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const events = yield* EventV2.Service
+    const session = yield* sessions.create({})
+    const original = yield* queue.admit({
+      sessionID: session.id,
+      delivery: "queue",
+      messageID: MessageID.ascending(),
+      parts: [{ type: "text", text: peer(900) }],
+    })
+    const seen: string[] = []
+    const unsubscribe = yield* events.listen((event) => {
+      if (event.type === SessionV1.Event.MessageUpdated.type) return Effect.interrupt
+      if (event.type === SessionV1.Event.PartUpdated.type)
+        return Effect.sync(() => {
+          seen.push(Schema.decodeUnknownSync(Schema.Struct({ part: SessionV1.Part }))(event.data).part.id)
+        })
+      return Effect.void
+    })
+    const result = yield* queue
+      .promote({
+        sessionID: session.id,
+        delivery: "queue",
+        prepare,
+        write: writer(sessions),
+        rejected: () => Effect.void,
+      })
+      .pipe(Effect.exit)
+    yield* unsubscribe
+    expect(Exit.isFailure(result)).toBe(true)
+    const [message] = yield* MessageV2.stream(session.id)
+    expect(message.parts.length).toBeGreaterThan(1)
+    expect(seen.toSorted()).toEqual(message.parts.map((part) => part.id).toSorted())
+    yield* queue.answer(session.id, message.info.id, message)
+    expect(yield* queue.reply(original.id)).toEqual(message)
+  }),
+)
+
+it.instance("caller cancellation after commit cannot discard part notifications or binding", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const events = yield* EventV2.Service
+    const session = yield* sessions.create({})
+    const original = yield* queue.admit({
+      sessionID: session.id,
+      delivery: "queue",
+      parts: [{ type: "text", text: peer(901) }],
+    })
+    const notified = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const seen: string[] = []
+    const unsubscribe = yield* events.listen((event) => {
+      if (event.type === SessionV1.Event.MessageUpdated.type)
+        return Deferred.succeed(notified, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.asVoid)
+      if (event.type === SessionV1.Event.PartUpdated.type)
+        return Effect.sync(() => {
+          seen.push(Schema.decodeUnknownSync(Schema.Struct({ part: SessionV1.Part }))(event.data).part.id)
+        })
+      return Effect.void
+    })
+    const running = yield* queue
+      .promote({
+        sessionID: session.id,
+        delivery: "queue",
+        prepare,
+        write: writer(sessions),
+        rejected: () => Effect.void,
+      })
+      .pipe(Effect.forkChild)
+    yield* Deferred.await(notified)
+    const stopping = yield* Fiber.interrupt(running).pipe(Effect.forkChild)
+    yield* Effect.yieldNow
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(stopping)
+    yield* unsubscribe
+    const [message] = yield* MessageV2.stream(session.id)
+    expect(seen.toSorted()).toEqual(message.parts.map((part) => part.id).toSorted())
+    yield* queue.answer(session.id, message.info.id, message)
+    expect(yield* queue.reply(original.id)).toEqual(message)
   }),
 )
 

@@ -10,6 +10,7 @@ import { resolvePath } from "./resolve-path"
 import { InstallationChannel } from "../installation/version"
 import { makeGlobalNode } from "../effect/app-node"
 import { EventWriter } from "../event/writer"
+import { DatabaseTransaction } from "./transaction"
 
 const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
 const nativeBusyTimeoutMs = 5
@@ -24,7 +25,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const db = yield* makeDatabase
+    const db = DatabaseTransaction.wrap(yield* makeDatabase)
 
     yield* db.run(`PRAGMA busy_timeout = ${nativeBusyTimeoutMs}`)
     yield* db.run("PRAGMA cache_size = -64000")

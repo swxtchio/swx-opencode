@@ -5,6 +5,7 @@ import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 import { and, asc, eq, gt, inArray } from "drizzle-orm"
 import { Database } from "./database/database"
+import { DatabaseTransaction } from "./database/transaction"
 import { TransactionPurpose } from "@opencode-ai/effect-drizzle-sqlite"
 import { FailureOrigin } from "./observability/failure-origin"
 import { EventRetentionTable, EventSequenceTable, EventTable } from "./event/sql"
@@ -25,21 +26,6 @@ export type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 
 export type Subscriber<D extends Definition = Definition> = (event: Payload<D>) => Effect.Effect<void>
 export type Unsubscribe = Effect.Effect<void>
-
-class DeferredNotifications extends Context.Service<DeferredNotifications, Effect.Effect<void>[]>()(
-  "@opencode/EventV2/DeferredNotifications",
-) {}
-
-// A composite durable write uses nested event transactions. Notify only after its outer commit succeeds.
-export function withDeferredNotifications<A, E, R>(effect: Effect.Effect<A, E, R>) {
-  return Effect.gen(function* () {
-    if (Option.isSome(yield* Effect.serviceOption(DeferredNotifications))) return yield* effect
-    const notifications: Effect.Effect<void>[] = []
-    const result = yield* effect.pipe(Effect.provideService(DeferredNotifications, notifications))
-    yield* Effect.forEach(notifications, (notification) => notification, { discard: true })
-    return result
-  })
-}
 
 export const latestSequence = Effect.fn("EventV2.latestSequence")(function* (
   db: Database.Interface["db"],
@@ -495,10 +481,12 @@ export const layerWith = (options?: LayerOptions) =>
                       Effect.orDie,
                     )
                   if (committed) {
-                    yield* Effect.forEach(
-                      pubsub.durable.get(committed.aggregateID) ?? [],
-                      (wake) => PubSub.publish(wake, undefined),
-                      { discard: true },
+                    yield* DatabaseTransaction.afterCommit(
+                      Effect.forEach(
+                        pubsub.durable.get(committed.aggregateID) ?? [],
+                        (wake) => PubSub.publish(wake, undefined),
+                        { discard: true },
+                      ),
                     )
                   }
                   return committed
@@ -560,21 +548,18 @@ export const layerWith = (options?: LayerOptions) =>
         )
 
       function notify(event: Payload, isolateListeners: boolean) {
-        return Effect.gen(function* () {
-          const deferred = yield* Effect.serviceOption(DeferredNotifications)
-          if (Option.isSome(deferred)) {
-            deferred.value.push(notify(event, isolateListeners))
-            return
-          }
-          yield* Effect.forEach(
-            listeners,
-            (listener) => (isolateListeners ? observe(event, listener) : listener(event)),
-            { discard: true },
-          )
-          const typed = pubsub.typed.get(event.type)
-          if (typed) yield* PubSub.publish(typed, event)
-          yield* PubSub.publish(pubsub.all, event)
-        })
+        return DatabaseTransaction.afterCommit(
+          Effect.gen(function* () {
+            yield* Effect.forEach(
+              listeners,
+              (listener) => (isolateListeners ? observe(event, listener) : listener(event)),
+              { discard: true },
+            )
+            const typed = pubsub.typed.get(event.type)
+            if (typed) yield* PubSub.publish(typed, event)
+            yield* PubSub.publish(pubsub.all, event)
+          }),
+        )
       }
 
       function publish<D extends Definition>(definition: D, data: Data<D>, options?: PublishOptions) {

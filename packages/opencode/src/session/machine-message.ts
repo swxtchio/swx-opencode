@@ -102,7 +102,7 @@ export function dispatch(input: string) {
   }
   if (isFleetHeartbeat(input) && token?.level !== "critical") {
     const duty = (token?.body ?? input).match(/ Periodic nudge: (.+) See docs\/fleet-operating-process\.md\./)?.[1]
-    return { kind: "automation" as const, type: "heartbeat", episode: duty ? `heartbeat-duty:${duty}` : "heartbeat" }
+    return { kind: "automation" as const, type: "heartbeat", episode: duty ? `heartbeat-duty:${duty}` : undefined }
   }
   if (token?.level === "critical") return
   if (token && (input.startsWith(OBSERVER_PREFIX) || input.startsWith(FIRSTMATE_PREFIX)))

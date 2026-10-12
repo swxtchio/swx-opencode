@@ -1,6 +1,7 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
+import { DatabaseTransaction } from "@opencode-ai/core/database/transaction"
 import { SessionPromptQueueSequenceTable, SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
 import { MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -656,70 +657,72 @@ const layer = Layer.effect(
             yield* release(sessionID, rows, id)
             return false
           }
-          const written = yield* EventV2.withDeferredNotifications(
-            writable(sessionID, (tx) =>
-              Effect.gen(function* () {
-                const current = yield* eligible(tx, sessionID, delivery)
-                const members = current.filter((row) => row.message_id === id)
-                // A withdrawn/edited constituent cancels the whole preparation. Concurrent arrivals stay outside it.
-                if (
-                  members.length !== rows.length ||
-                  rows.some(
-                    (row) =>
-                      !members.some(
-                        (member) =>
-                          member.id === row.id && member.seq === row.seq && isDeepStrictEqual(member.input, row.input),
-                      ),
-                  )
-                ) {
-                  yield* tx
-                    .update(SessionPromptQueueTable)
-                    .set({ message_id: null })
-                    .where(and(eq(SessionPromptQueueTable.message_id, id), pending(sessionID)))
-                    .run()
-                  return false
-                }
-                const picked = selection(current)
-                if (picked[0].message_id !== id) {
-                  yield* tx
-                    .update(SessionPromptQueueTable)
-                    .set({ message_id: null })
-                    .where(and(eq(SessionPromptQueueTable.message_id, id), pending(sessionID)))
-                    .run()
-                  return false
-                }
-                if (valid && !(yield* valid(prepared))) {
-                  yield* tx
-                    .update(SessionPromptQueueTable)
-                    .set({ message_id: null })
-                    .where(and(eq(SessionPromptQueueTable.message_id, id), pending(sessionID)))
-                    .run()
-                  return false
-                }
-                yield* write(prepared)
+          const written = yield* writable(sessionID, (tx) =>
+            Effect.gen(function* () {
+              const current = yield* eligible(tx, sessionID, delivery)
+              const members = current.filter((row) => row.message_id === id)
+              // A withdrawn/edited constituent cancels the whole preparation. Concurrent arrivals stay outside it.
+              if (
+                members.length !== rows.length ||
+                rows.some(
+                  (row) =>
+                    !members.some(
+                      (member) =>
+                        member.id === row.id && member.seq === row.seq && isDeepStrictEqual(member.input, row.input),
+                    ),
+                )
+              ) {
                 yield* tx
                   .update(SessionPromptQueueTable)
-                  .set({ time_promoted: Date.now() })
-                  .where(
-                    inArray(
-                      SessionPromptQueueTable.id,
-                      rows.map((row) => row.id),
-                    ),
-                  )
+                  .set({ message_id: null })
+                  .where(and(eq(SessionPromptQueueTable.message_id, id), pending(sessionID)))
                   .run()
-                return true
-              }),
-            ),
+                return false
+              }
+              const picked = selection(current)
+              if (picked[0].message_id !== id) {
+                yield* tx
+                  .update(SessionPromptQueueTable)
+                  .set({ message_id: null })
+                  .where(and(eq(SessionPromptQueueTable.message_id, id), pending(sessionID)))
+                  .run()
+                return false
+              }
+              if (valid && !(yield* valid(prepared))) {
+                yield* tx
+                  .update(SessionPromptQueueTable)
+                  .set({ message_id: null })
+                  .where(and(eq(SessionPromptQueueTable.message_id, id), pending(sessionID)))
+                  .run()
+                return false
+              }
+              yield* write(prepared)
+              yield* tx
+                .update(SessionPromptQueueTable)
+                .set({ time_promoted: Date.now() })
+                .where(
+                  inArray(
+                    SessionPromptQueueTable.id,
+                    rows.map((row) => row.id),
+                  ),
+                )
+                .run()
+              yield* DatabaseTransaction.afterCommit(
+                Effect.gen(function* () {
+                  rows.forEach((row) => {
+                    const channel = channels.get(row.id)
+                    if (channel) channel.message = id
+                  })
+                  yield* publish(sessionID)
+                }),
+              )
+              return true
+            }),
           ).pipe(
             Effect.orDie,
             Effect.onError(() => release(sessionID, rows, id)),
           )
-          if (written)
-            rows.forEach((row) => {
-              const channel = channels.get(row.id)
-              if (channel) channel.message = id
-            })
-          yield* publish(sessionID)
+          if (!written) yield* publish(sessionID)
           return written
         }),
       )
