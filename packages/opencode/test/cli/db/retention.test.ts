@@ -80,7 +80,7 @@ function createSchema(db: Database) {
     CREATE TABLE session_context_epoch (session_id TEXT PRIMARY KEY, baseline TEXT NOT NULL, snapshot TEXT NOT NULL);
     CREATE TABLE session_prompt_queue (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, input TEXT NOT NULL);
     CREATE TABLE session_prompt_queue_sequence (session_id TEXT PRIMARY KEY, seq INTEGER NOT NULL);
-    CREATE TABLE session_prompt_provenance (message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, origins TEXT NOT NULL, waited INTEGER NOT NULL);
+    CREATE TABLE session_prompt_provenance (message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, origins TEXT NOT NULL);
     CREATE TABLE todo (session_id TEXT NOT NULL, position INTEGER NOT NULL, content TEXT NOT NULL);
     CREATE TABLE session_share (session_id TEXT PRIMARY KEY, id TEXT NOT NULL, secret TEXT NOT NULL, url TEXT NOT NULL);
   `)

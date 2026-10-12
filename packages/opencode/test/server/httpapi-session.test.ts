@@ -1871,7 +1871,7 @@ describe("session HttpApi", () => {
         const inputs = yield* llm.inputs
         expect(inputs).toHaveLength(3)
         const lastUser = (input: Record<string, unknown> | undefined) =>
-          Array.isArray(input?.messages) ? input.messages.at(-1) : undefined
+          Array.isArray(input?.messages) ? withoutQueueNote(input.messages.at(-1)) : undefined
         const userText = (input: Record<string, unknown> | undefined) =>
           JSON.stringify(
             Array.isArray(input?.messages) ? input.messages.filter((message) => message?.role === "user") : [],
@@ -2186,7 +2186,9 @@ describe("session HttpApi", () => {
               Effect.map((inputs) =>
                 inputs.some((input) => {
                   const messages = Array.isArray(input.messages) ? input.messages : []
-                  return JSON.stringify(messages.at(-1)) === JSON.stringify({ role: "user", content: text })
+                  return (
+                    JSON.stringify(withoutQueueNote(messages.at(-1))) === JSON.stringify({ role: "user", content: text })
+                  )
                 })
                   ? true
                   : undefined,
@@ -2221,7 +2223,7 @@ describe("session HttpApi", () => {
         yield* answered("parked after abort")
         // The wake delivers the parked prompts in admission order and never retries the aborted turn.
         const lastUsers = (yield* llm.inputs).map((input) =>
-          Array.isArray(input.messages) ? input.messages.at(-1) : undefined,
+          Array.isArray(input.messages) ? withoutQueueNote(input.messages.at(-1)) : undefined,
         )
         expect(lastUsers).toEqual([
           { role: "user", content: "start" },
@@ -2868,8 +2870,8 @@ describe("session HttpApi queue freshness", () => {
           "10 seconds",
         )
         const lastUser = sent.map((input) => JSON.stringify((input.messages as unknown[]).at(-1)))
-        // Delivered by its own admission, the first prompt never waited.
-        expect(lastUser[0]).not.toContain("[Queued prompt")
+        // Delivered by its own admission, the first prompt is timestamped too.
+        expect(lastUser[0]).toMatch(/\[Queued prompt: queued at \S+; delivered at \S+, \d+s after it was first queued\.]/)
         expect(lastUser[1]).toContain(
           `[Queued prompt: queued at ${iso(first!.time.created)}, and again at ${iso(second!.time.created)}; delivered at `,
         )

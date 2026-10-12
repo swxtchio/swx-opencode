@@ -295,11 +295,11 @@ it.live(
       yield* tui.idle
       expect((yield* lastUsers(llm)).filter((text) => text === "write the changelog")).toHaveLength(1)
       expect(JSON.stringify(yield* llm.inputs)).not.toContain("drop this one")
-      // Each prompt the review held reached the model saying when it was queued.
+      // Every prompt, those the review held among them, reached the model saying when it was queued.
       const notes = (yield* llm.inputs).map((input) =>
         JSON.stringify((input.messages as unknown[]).at(-1)).includes("[Queued prompt"),
       )
-      expect(notes).toEqual([false, true, true, true])
+      expect(notes).toEqual([true, true, true, true])
       expect(texts(yield* tui.rows)).toEqual([])
     }).pipe(Effect.ensuring(Deferred.succeed(gate, undefined)), Effect.provide(TestLLMServer.layer))
   },

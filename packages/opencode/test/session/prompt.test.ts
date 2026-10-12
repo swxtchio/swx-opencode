@@ -4490,9 +4490,7 @@ it.instance("prompt submitted during an active run is included in the next LLM i
 
     const inputs = yield* llm.inputs
     expect(inputs).toHaveLength(2)
-    const messages = inputs.at(-1)?.messages
-    if (!Array.isArray(messages)) throw new Error("expected LLM messages")
-    expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
+    expect(modelMessages(inputs.at(-1)).at(-1)).toEqual({ role: "user", content: "second" })
   }),
 )
 
@@ -4546,9 +4544,7 @@ gated.instance(
       // would mean this setup never exercised the finishing window.
       expect(joined.startedRun).toBe(false)
       yield* awaitWithTimeout(llm.wait(2), "second prompt was never answered")
-      const messages = (yield* llm.inputs).at(1)?.messages
-      if (!Array.isArray(messages)) throw new Error("expected LLM messages")
-      expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
+      expect(modelMessages((yield* llm.inputs).at(1)).at(-1)).toEqual({ role: "user", content: "second" })
       // A synchronous caller gets the reply to its own prompt, not the run it joined.
       const asked = (yield* sessions.messages({ sessionID: chat.id })).find((msg) =>
         msg.parts.some((part) => part.type === "text" && part.text === "second"),

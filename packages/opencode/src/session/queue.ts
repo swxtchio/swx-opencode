@@ -219,9 +219,9 @@ export interface Interface {
     markers?: ConfigV1.Info["machine_message_markers"],
   ) => Effect.Effect<Item[]>
   /**
-   * The messages with a synthetic note, on each one a queued prompt became after
-   * it waited, of when that prompt was queued and delivered (#212). Only the
-   * model request carries it; the stored message stays as the sender sent it.
+   * The messages with a synthetic note, on each one a queued prompt became, of
+   * when that prompt was queued and delivered (#212). Only the model request
+   * carries it; the stored message stays as the sender sent it.
    */
   readonly annotate: (
     sessionID: SessionID,
@@ -543,7 +543,7 @@ const layer = Layer.effect(
       return yield* Effect.forEach(reserved, (row) =>
         Effect.gen(function* () {
           const done = yield* landed(tx, row.message_id!)
-          if (done) yield* promoted(tx, row, row.message_id!, true)
+          if (done) yield* promoted(tx, row, row.message_id!)
           if (!done)
             yield* tx
               .update(SessionPromptQueueTable)
@@ -782,12 +782,7 @@ const layer = Layer.effect(
         )
 
     // A promoted row's queue times outlive it as its message's provenance.
-    const promoted = (
-      tx: DatabaseTransaction,
-      row: typeof SessionPromptQueueTable.$inferSelect,
-      message: MessageID,
-      waited: boolean,
-    ) =>
+    const promoted = (tx: DatabaseTransaction, row: typeof SessionPromptQueueTable.$inferSelect, message: MessageID) =>
       Effect.gen(function* () {
         yield* tx
           .update(SessionPromptQueueTable)
@@ -797,13 +792,13 @@ const layer = Layer.effect(
           .pipe(Effect.orDie)
         yield* tx
           .insert(SessionPromptProvenanceTable)
-          .values({ message_id: message, session_id: row.session_id, origins: origins(row), waited })
+          .values({ message_id: message, session_id: row.session_id, origins: origins(row) })
           .onConflictDoNothing()
           .run()
           .pipe(Effect.orDie)
       })
 
-    const markPromoted = (sessionID: SessionID, itemID: ItemID, id: MessageID, waited: boolean) =>
+    const markPromoted = (sessionID: SessionID, itemID: ItemID, id: MessageID) =>
       writable(sessionID, (tx) =>
         Effect.gen(function* () {
           const row = yield* tx
@@ -812,7 +807,7 @@ const layer = Layer.effect(
             .where(eq(SessionPromptQueueTable.id, itemID))
             .get()
             .pipe(Effect.orDie)
-          if (row) yield* promoted(tx, row, id, waited)
+          if (row) yield* promoted(tx, row, id)
         }),
       ).pipe(
         Effect.orDie,
@@ -871,7 +866,7 @@ const layer = Layer.effect(
               const row = yield* oldest(tx, sessionID, delivery)
               if (!row) return undefined
               if (row.message_id && (yield* landed(tx, row.message_id))) {
-                yield* promoted(tx, row, row.message_id, true)
+                yield* promoted(tx, row, row.message_id)
                 return { kind: "finished" as const, row }
               }
               const decoded = Schema.decodeUnknownExit(SessionPromptQueue.QueuedInput)(row.input)
@@ -913,7 +908,6 @@ const layer = Layer.effect(
       id: MessageID,
       prepared: P,
       write: (prepared: P) => Effect.Effect<unknown>,
-      waited: boolean,
     ) =>
       exclusive(
         sessionID,
@@ -939,10 +933,10 @@ const layer = Layer.effect(
           yield* write(prepared).pipe(
             Effect.onExit((exit) =>
               Exit.isSuccess(exit)
-                ? markPromoted(sessionID, itemID, id, waited)
+                ? markPromoted(sessionID, itemID, id)
                 : landed(db, id).pipe(
                     Effect.flatMap((exists) =>
-                      exists ? markPromoted(sessionID, itemID, id, waited) : unreserve(sessionID, itemID),
+                      exists ? markPromoted(sessionID, itemID, id) : unreserve(sessionID, itemID),
                     ),
                   ),
             ),
@@ -1003,8 +997,6 @@ const layer = Layer.effect(
                 next.id,
                 prepared.value,
                 input.write,
-                // Delivered by its own admission, a prompt never waited behind anything.
-                next.row.id !== input.own,
               )
               // Queued items run one per turn; the loop reevaluates before the next.
               if (written && input.delivery === "queue") return true
@@ -1193,16 +1185,14 @@ const layer = Layer.effect(
       db
         .select()
         .from(SessionPromptProvenanceTable)
-        .where(
-          and(eq(SessionPromptProvenanceTable.session_id, sessionID), eq(SessionPromptProvenanceTable.waited, true)),
-        )
+        .where(eq(SessionPromptProvenanceTable.session_id, sessionID))
         .all()
         .pipe(
           Effect.orDie,
           Effect.map((rows) => {
-            const waited = new Map(rows.map((row) => [row.message_id, row.origins]))
+            const queued = new Map(rows.map((row) => [row.message_id, row.origins]))
             return messages.map((message) => {
-              const found = message.info.role === "user" ? waited.get(message.info.id) : undefined
+              const found = message.info.role === "user" ? queued.get(message.info.id) : undefined
               if (!found) return message
               const note: SessionV1.TextPart = {
                 id: PartID.ascending(),
@@ -1290,7 +1280,7 @@ function origins(row: typeof SessionPromptQueueTable.$inferSelect): SessionPromp
 }
 
 /**
- * What a model is told of a prompt that waited in the queue: when each of its
+ * What a model is told of a prompt delivered from the queue: when each of its
  * instructions was first queued, when identical copies of it were queued again,
  * and when it was delivered. Built from stored times only, so the request for a
  * turn reads the same every time it is sent.

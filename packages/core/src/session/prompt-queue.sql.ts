@@ -51,8 +51,6 @@ export const SessionPromptQueueSequenceTable = sqliteTable("session_prompt_queue
 // The queue times of a message promoted from the queue (#212), kept as long as
 // the message, so the model request can say when its prompt was queued and
 // delivered while the stored message stays exactly what the sender sent.
-// `waited` is set when something other than the prompt's own admission
-// delivered it: it sat pending behind a running turn, a hold or a compaction.
 export const SessionPromptProvenanceTable = sqliteTable(
   "session_prompt_provenance",
   {
@@ -62,7 +60,6 @@ export const SessionPromptProvenanceTable = sqliteTable(
       .notNull()
       .references(() => SessionTable.id, { onDelete: "cascade" }),
     origins: text({ mode: "json" }).notNull().$type<SessionPromptQueue.Origin[]>(),
-    waited: integer({ mode: "boolean" }).notNull(),
   },
   (table) => [index("session_prompt_provenance_session_idx").on(table.session_id)],
 )

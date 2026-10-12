@@ -1,7 +1,7 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "a09337ea-390d-41b8-b4ab-89103a013b36",
+  "id": "0138d55a-77b4-4957-8b04-f5989335e610",
   "prevIds": [
     "f28ff033-4d20-49ab-adb6-fbf1a96a3a7d"
   ],
@@ -225,16 +225,6 @@
       "default": null,
       "generated": null,
       "name": "origins",
-      "entityType": "columns",
-      "table": "session_prompt_provenance"
-    },
-    {
-      "type": "integer",
-      "notNull": true,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "waited",
       "entityType": "columns",
       "table": "session_prompt_provenance"
     },

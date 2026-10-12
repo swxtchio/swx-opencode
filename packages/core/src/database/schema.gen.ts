@@ -28,7 +28,6 @@ export default {
           \`message_id\` text PRIMARY KEY,
           \`session_id\` text NOT NULL,
           \`origins\` text NOT NULL,
-          \`waited\` integer NOT NULL,
           CONSTRAINT \`fk_session_prompt_provenance_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
