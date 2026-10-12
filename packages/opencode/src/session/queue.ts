@@ -1080,7 +1080,7 @@ function grouped(rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[])
     const machine = dispatch(item.input)
     if (machine?.kind === "automation" && machine.episode) latest.set(machine.episode, item.id)
   })
-  const current =
+  const shown =
     kind.kind === "peer"
       ? items
       : items.filter((item) => {
@@ -1090,7 +1090,7 @@ function grouped(rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[])
   const heading =
     kind.kind === "peer"
       ? "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation."
-      : `Automated notices: ${kind.type}. Newest state per identified episode; every distinct condition remains below. Original constituents remain in sessionQueue metadata.`
+      : `Queued automation: ${kind.type}. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.`
   return {
     ...items[0].input,
     model: undefined,
@@ -1102,7 +1102,7 @@ function grouped(rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[])
         text:
           heading +
           "\n\n" +
-          current
+          shown
             .map(
               (item, index) =>
                 `${index + 1}. [Admitted ${new Date(item.time.created).toISOString()}; queue ${item.id}]\n${item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")}`,
@@ -1110,7 +1110,7 @@ function grouped(rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[])
             .join("\n\n"),
         metadata: { sessionQueue: Schema.encodeSync(SessionPromptQueue.Group)(group) },
       },
-      ...current.flatMap((item, index) => {
+      ...shown.flatMap((item, index) => {
         const files = item.input.parts.filter((part) => part.type === "file")
         return files.length
           ? [

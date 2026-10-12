@@ -166,9 +166,14 @@ it.instance(
       })
       const message = (yield* MessageV2.stream(session.id))[0]
       expect(text(message)).not.toContain("stalled")
+      expect(text(message)).toContain("Historical producer observations, not current measurements")
+      expect(text(message)).toContain("the producer owns fresh measurements and pacing")
       expect(text(message)).toContain("converged")
       expect(text(message)).toContain("pending decision")
       expect(metadata(message).constituents.map((item) => item.id)).toEqual(originals.map((item) => item.id))
+      expect(metadata(message).constituents.map((item) => item.time.created)).toEqual(
+        originals.map((item) => item.time.created),
+      )
       expect(metadata(message).constituents[0].input.parts[0]).toEqual({ type: "text", text: inputs[0] })
       expect(yield* queue.list(session.id)).toHaveLength(1)
     }),
