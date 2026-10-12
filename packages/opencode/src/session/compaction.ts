@@ -571,7 +571,8 @@ const layer = Layer.effect(
       function* (input: {
         sessionID: SessionID
         agent: string
-        model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+        // The variant is kept, so the compaction and its continuation run at it (#227).
+        model: { providerID: ProviderV2.ID; modelID: ModelV2.ID; variant?: string }
         auto: boolean
         overflow?: boolean
       }) {

@@ -284,10 +284,28 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof SummarizePayload.Type
     }) {
-      yield* SessionError.mapSessionWriteNotFound(revertSvc.cleanup(yield* requireSession(ctx.params.sessionID)))
+      const current = yield* requireSession(ctx.params.sessionID)
+      yield* SessionError.mapSessionWriteNotFound(revertSvc.cleanup(current))
       const messages = yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
       const defaultAgent = yield* agentSvc.defaultAgent()
-      const currentAgent = messages.findLast((message) => message.info.role === "user")?.info.agent ?? defaultAgent
+      const lastUser = messages.findLast((message) => message.info.role === "user")?.info
+      const currentAgent = lastUser?.agent ?? defaultAgent
+      // A compaction on the session's selected model runs at its selected variant,
+      // and so does the continuation it writes (swxtchio/swx-opencode#227). The
+      // selection is the session's, else its last prompt's, as a prompt resolves it.
+      const selected = current.model
+        ? {
+            providerID: current.model.providerID,
+            modelID: current.model.id,
+            variant: current.model.variant === "default" ? undefined : current.model.variant,
+          }
+        : lastUser?.role === "user"
+          ? lastUser.model
+          : undefined
+      const variant =
+        selected?.providerID === ctx.payload.providerID && selected.modelID === ctx.payload.modelID
+          ? selected.variant
+          : undefined
 
       const messageID = yield* SessionError.mapSessionWriteNotFound(
         compactSvc.create({
@@ -296,6 +314,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           model: {
             providerID: ctx.payload.providerID,
             modelID: ctx.payload.modelID,
+            ...(variant ? { variant } : {}),
           },
           auto: ctx.payload.auto ?? false,
         }),
