@@ -1,0 +1,1286 @@
+{
+  "provenance": {
+    "producerSHA": "32ab3987ac3dfe4df141f211b6a691aeafe06506",
+    "generator": "packages/opencode/test/session/queue-dispatch.test.ts",
+    "test": "emits grouped consumer checkpoint through admission promotion and message reads",
+    "runtime": "Bun 1.4.2",
+    "syntheticOnly": true,
+    "clockAndIDs": "Actual admission times and generated IDs are captured unchanged; reruns produce a new capture."
+  },
+  "scenarios": [
+    {
+      "name": "peer",
+      "originalCalls": [
+        {
+          "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+          "delivery": "queue",
+          "noReply": true,
+          "messageID": "msg_checkpoint_peer_request",
+          "agent": "build",
+          "model": {
+            "providerID": "test",
+            "modelID": "synthetic-sender-model"
+          },
+          "variant": "low",
+          "parts": [
+            {
+              "type": "text",
+              "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1"
+            }
+          ]
+        },
+        {
+          "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+          "delivery": "queue",
+          "parts": [
+            {
+              "type": "text",
+              "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+            }
+          ]
+        }
+      ],
+      "originals": [
+        {
+          "id": "que_1309bfda7001S1xf4it4fbbfzo",
+          "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+          "seq": 1,
+          "delivery": "queue",
+          "input": {
+            "messageID": "msg_checkpoint_peer_request",
+            "model": {
+              "providerID": "test",
+              "modelID": "synthetic-sender-model"
+            },
+            "agent": "build",
+            "variant": "low",
+            "parts": [
+              {
+                "type": "text",
+                "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1"
+              }
+            ]
+          },
+          "time": {
+            "created": 1791816891815
+          }
+        },
+        {
+          "id": "que_1309bfdad001OK89nc54YZgs5w",
+          "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+          "seq": 2,
+          "delivery": "queue",
+          "input": {
+            "parts": [
+              {
+                "type": "text",
+                "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+              }
+            ]
+          },
+          "time": {
+            "created": 1791816891821
+          }
+        }
+      ],
+      "encodedOriginalInputs": [
+        {
+          "messageID": "msg_checkpoint_peer_request",
+          "model": {
+            "providerID": "test",
+            "modelID": "synthetic-sender-model"
+          },
+          "agent": "build",
+          "variant": "low",
+          "parts": [
+            {
+              "type": "text",
+              "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1"
+            }
+          ]
+        },
+        {
+          "parts": [
+            {
+              "type": "text",
+              "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+            }
+          ]
+        }
+      ],
+      "pendingBeforePromotion": [
+        {
+          "id": "que_1309bfda7001S1xf4it4fbbfzo",
+          "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+          "seq": 1,
+          "delivery": "queue",
+          "input": {
+            "messageID": "msg_checkpoint_peer_request",
+            "model": {
+              "providerID": "test",
+              "modelID": "synthetic-sender-model"
+            },
+            "agent": "build",
+            "variant": "low",
+            "parts": [
+              {
+                "type": "text",
+                "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1"
+              }
+            ]
+          },
+          "time": {
+            "created": 1791816891815
+          }
+        },
+        {
+          "id": "que_1309bfdad001OK89nc54YZgs5w",
+          "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+          "seq": 2,
+          "delivery": "queue",
+          "input": {
+            "parts": [
+              {
+                "type": "text",
+                "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+              }
+            ]
+          },
+          "time": {
+            "created": 1791816891821
+          }
+        }
+      ],
+      "returnedMessage": {
+        "info": {
+          "role": "user",
+          "time": {
+            "created": 1791816891829
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "test",
+            "modelID": "test"
+          },
+          "id": "msg_1309bfdb3001OBnzNlvaPtKIbf",
+          "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-12T14:54:51.815Z; queue que_1309bfda7001S1xf4it4fbbfzo]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-12T14:54:51.821Z; queue que_1309bfdad001OK89nc54YZgs5w]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2",
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                "kind": "peer",
+                "constituents": [
+                  {
+                    "id": "que_1309bfda7001S1xf4it4fbbfzo",
+                    "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                    "seq": 1,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_peer_request",
+                      "model": {
+                        "providerID": "test",
+                        "modelID": "synthetic-sender-model"
+                      },
+                      "agent": "build",
+                      "variant": "low",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891815
+                    }
+                  },
+                  {
+                    "id": "que_1309bfdad001OK89nc54YZgs5w",
+                    "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                    "seq": 2,
+                    "delivery": "queue",
+                    "input": {
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891821
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_1309bfdb5001KK3wPPAsogjNG1",
+            "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+            "messageID": "msg_1309bfdb3001OBnzNlvaPtKIbf"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                "kind": "peer",
+                "constituents": [
+                  {
+                    "id": "que_1309bfda7001S1xf4it4fbbfzo",
+                    "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                    "seq": 1,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_peer_request",
+                      "model": {
+                        "providerID": "test",
+                        "modelID": "synthetic-sender-model"
+                      },
+                      "agent": "build",
+                      "variant": "low",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891815
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_09b5ef2983471da1405f174897099d5949b66d527c7c7661d744b9ebe28c8187",
+            "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+            "messageID": "msg_1309bfdb3001OBnzNlvaPtKIbf"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                "kind": "peer",
+                "constituents": [
+                  {
+                    "id": "que_1309bfdad001OK89nc54YZgs5w",
+                    "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                    "seq": 2,
+                    "delivery": "queue",
+                    "input": {
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891821
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_09bf35f32c854d7b4c4809ac841ae0d7409da7423e7405031570fd4fe62c371f",
+            "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+            "messageID": "msg_1309bfdb3001OBnzNlvaPtKIbf"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                "kind": "peer",
+                "constituents": [
+                  {
+                    "id": "que_1309bfda7001S1xf4it4fbbfzo",
+                    "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                    "seq": 1,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_peer_request",
+                      "model": {
+                        "providerID": "test",
+                        "modelID": "synthetic-sender-model"
+                      },
+                      "agent": "build",
+                      "variant": "low",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891815
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_73c9f451c3d5255069a622e197a4cf26aae34b798e7c520894528594dd1d56e1",
+            "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+            "messageID": "msg_1309bfdb3001OBnzNlvaPtKIbf"
+          }
+        ]
+      },
+      "returnedAfterConsume": {
+        "info": {
+          "role": "user",
+          "time": {
+            "created": 1791816891829
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "test",
+            "modelID": "test"
+          },
+          "id": "msg_1309bfdb3001OBnzNlvaPtKIbf",
+          "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-12T14:54:51.815Z; queue que_1309bfda7001S1xf4it4fbbfzo]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-12T14:54:51.821Z; queue que_1309bfdad001OK89nc54YZgs5w]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2",
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                "kind": "peer",
+                "constituents": [
+                  {
+                    "id": "que_1309bfda7001S1xf4it4fbbfzo",
+                    "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                    "seq": 1,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_peer_request",
+                      "model": {
+                        "providerID": "test",
+                        "modelID": "synthetic-sender-model"
+                      },
+                      "agent": "build",
+                      "variant": "low",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891815
+                    }
+                  },
+                  {
+                    "id": "que_1309bfdad001OK89nc54YZgs5w",
+                    "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                    "seq": 2,
+                    "delivery": "queue",
+                    "input": {
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891821
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_1309bfdb5001KK3wPPAsogjNG1",
+            "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+            "messageID": "msg_1309bfdb3001OBnzNlvaPtKIbf"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                "kind": "peer",
+                "constituents": [
+                  {
+                    "id": "que_1309bfda7001S1xf4it4fbbfzo",
+                    "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                    "seq": 1,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_peer_request",
+                      "model": {
+                        "providerID": "test",
+                        "modelID": "synthetic-sender-model"
+                      },
+                      "agent": "build",
+                      "variant": "low",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891815
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_09b5ef2983471da1405f174897099d5949b66d527c7c7661d744b9ebe28c8187",
+            "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+            "messageID": "msg_1309bfdb3001OBnzNlvaPtKIbf"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                "kind": "peer",
+                "constituents": [
+                  {
+                    "id": "que_1309bfdad001OK89nc54YZgs5w",
+                    "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                    "seq": 2,
+                    "delivery": "queue",
+                    "input": {
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891821
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_09bf35f32c854d7b4c4809ac841ae0d7409da7423e7405031570fd4fe62c371f",
+            "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+            "messageID": "msg_1309bfdb3001OBnzNlvaPtKIbf"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                "kind": "peer",
+                "constituents": [
+                  {
+                    "id": "que_1309bfda7001S1xf4it4fbbfzo",
+                    "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+                    "seq": 1,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_peer_request",
+                      "model": {
+                        "providerID": "test",
+                        "modelID": "synthetic-sender-model"
+                      },
+                      "agent": "build",
+                      "variant": "low",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891815
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_73c9f451c3d5255069a622e197a4cf26aae34b798e7c520894528594dd1d56e1",
+            "sessionID": "ses_ecf640262ffeqMukMb17GXlcuX",
+            "messageID": "msg_1309bfdb3001OBnzNlvaPtKIbf"
+          }
+        ]
+      },
+      "witnesses": [
+        {
+          "partID": "prt_1309bfdb5001KK3wPPAsogjNG1",
+          "messageID": "msg_1309bfdb3001OBnzNlvaPtKIbf",
+          "ignored": false,
+          "synthetic": false,
+          "constituentIDs": [
+            "que_1309bfda7001S1xf4it4fbbfzo",
+            "que_1309bfdad001OK89nc54YZgs5w"
+          ]
+        },
+        {
+          "partID": "prt_queue_09b5ef2983471da1405f174897099d5949b66d527c7c7661d744b9ebe28c8187",
+          "messageID": "msg_1309bfdb3001OBnzNlvaPtKIbf",
+          "ignored": true,
+          "synthetic": true,
+          "constituentIDs": [
+            "que_1309bfda7001S1xf4it4fbbfzo"
+          ]
+        },
+        {
+          "partID": "prt_queue_09bf35f32c854d7b4c4809ac841ae0d7409da7423e7405031570fd4fe62c371f",
+          "messageID": "msg_1309bfdb3001OBnzNlvaPtKIbf",
+          "ignored": true,
+          "synthetic": true,
+          "constituentIDs": [
+            "que_1309bfdad001OK89nc54YZgs5w"
+          ]
+        },
+        {
+          "partID": "prt_queue_73c9f451c3d5255069a622e197a4cf26aae34b798e7c520894528594dd1d56e1",
+          "messageID": "msg_1309bfdb3001OBnzNlvaPtKIbf",
+          "ignored": true,
+          "synthetic": true,
+          "constituentIDs": [
+            "que_1309bfda7001S1xf4it4fbbfzo"
+          ]
+        }
+      ],
+      "modelInput": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-12T14:54:51.815Z; queue que_1309bfda7001S1xf4it4fbbfzo]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-12T14:54:51.821Z; queue que_1309bfdad001OK89nc54YZgs5w]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+            }
+          ]
+        }
+      ],
+      "modelExclusionProbe": {
+        "marker": "SYNTHETIC_IGNORED_WITNESS_PROBE",
+        "excluded": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-12T14:54:51.815Z; queue que_1309bfda7001S1xf4it4fbbfzo]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-12T14:54:51.821Z; queue que_1309bfdad001OK89nc54YZgs5w]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+              }
+            ]
+          }
+        ],
+        "unignoredControl": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-12T14:54:51.815Z; queue que_1309bfda7001S1xf4it4fbbfzo]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-12T14:54:51.821Z; queue que_1309bfdad001OK89nc54YZgs5w]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+              },
+              {
+                "type": "text",
+                "text": "SYNTHETIC_IGNORED_WITNESS_PROBE"
+              },
+              {
+                "type": "text",
+                "text": "SYNTHETIC_IGNORED_WITNESS_PROBE"
+              },
+              {
+                "type": "text",
+                "text": "SYNTHETIC_IGNORED_WITNESS_PROBE"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "automation",
+      "originalCalls": [
+        {
+          "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+          "delivery": "queue",
+          "messageID": "msg_checkpoint_notice_old",
+          "parts": [
+            {
+              "type": "text",
+              "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical stalled observation"
+            }
+          ]
+        },
+        {
+          "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+          "delivery": "queue",
+          "messageID": "msg_checkpoint_notice_distinct",
+          "parts": [
+            {
+              "type": "text",
+              "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation"
+            }
+          ]
+        },
+        {
+          "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+          "delivery": "queue",
+          "messageID": "msg_checkpoint_notice_later",
+          "parts": [
+            {
+              "type": "text",
+              "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+            }
+          ]
+        }
+      ],
+      "originals": [
+        {
+          "id": "que_1309bfdd1001P2Abb0yb0MjCr9",
+          "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+          "seq": 1,
+          "delivery": "queue",
+          "input": {
+            "messageID": "msg_checkpoint_notice_old",
+            "parts": [
+              {
+                "type": "text",
+                "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical stalled observation"
+              }
+            ]
+          },
+          "time": {
+            "created": 1791816891858
+          }
+        },
+        {
+          "id": "que_1309bfdd3001MN2M7Sb13XlQ8d",
+          "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+          "seq": 2,
+          "delivery": "queue",
+          "input": {
+            "messageID": "msg_checkpoint_notice_distinct",
+            "parts": [
+              {
+                "type": "text",
+                "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation"
+              }
+            ]
+          },
+          "time": {
+            "created": 1791816891859
+          }
+        },
+        {
+          "id": "que_1309bfdd50014drrbIfuqK4g3w",
+          "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+          "seq": 3,
+          "delivery": "queue",
+          "input": {
+            "messageID": "msg_checkpoint_notice_later",
+            "parts": [
+              {
+                "type": "text",
+                "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+              }
+            ]
+          },
+          "time": {
+            "created": 1791816891861
+          }
+        }
+      ],
+      "encodedOriginalInputs": [
+        {
+          "messageID": "msg_checkpoint_notice_old",
+          "parts": [
+            {
+              "type": "text",
+              "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical stalled observation"
+            }
+          ]
+        },
+        {
+          "messageID": "msg_checkpoint_notice_distinct",
+          "parts": [
+            {
+              "type": "text",
+              "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation"
+            }
+          ]
+        },
+        {
+          "messageID": "msg_checkpoint_notice_later",
+          "parts": [
+            {
+              "type": "text",
+              "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+            }
+          ]
+        }
+      ],
+      "pendingBeforePromotion": [
+        {
+          "id": "que_1309bfdd1001P2Abb0yb0MjCr9",
+          "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+          "seq": 1,
+          "delivery": "queue",
+          "input": {
+            "messageID": "msg_checkpoint_notice_old",
+            "parts": [
+              {
+                "type": "text",
+                "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical stalled observation"
+              }
+            ]
+          },
+          "time": {
+            "created": 1791816891858
+          }
+        },
+        {
+          "id": "que_1309bfdd3001MN2M7Sb13XlQ8d",
+          "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+          "seq": 2,
+          "delivery": "queue",
+          "input": {
+            "messageID": "msg_checkpoint_notice_distinct",
+            "parts": [
+              {
+                "type": "text",
+                "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation"
+              }
+            ]
+          },
+          "time": {
+            "created": 1791816891859
+          }
+        },
+        {
+          "id": "que_1309bfdd50014drrbIfuqK4g3w",
+          "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+          "seq": 3,
+          "delivery": "queue",
+          "input": {
+            "messageID": "msg_checkpoint_notice_later",
+            "parts": [
+              {
+                "type": "text",
+                "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+              }
+            ]
+          },
+          "time": {
+            "created": 1791816891861
+          }
+        }
+      ],
+      "returnedMessage": {
+        "info": {
+          "role": "user",
+          "time": {
+            "created": 1791816891864
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "test",
+            "modelID": "test"
+          },
+          "id": "msg_1309bfdd7001B8EZMZENyZyUVC",
+          "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-12T14:54:51.859Z; queue que_1309bfdd3001MN2M7Sb13XlQ8d]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-12T14:54:51.861Z; queue que_1309bfdd50014drrbIfuqK4g3w]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation",
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                "kind": "watcher.check",
+                "constituents": [
+                  {
+                    "id": "que_1309bfdd1001P2Abb0yb0MjCr9",
+                    "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                    "seq": 1,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_old",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical stalled observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891858
+                    }
+                  },
+                  {
+                    "id": "que_1309bfdd3001MN2M7Sb13XlQ8d",
+                    "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                    "seq": 2,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_distinct",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891859
+                    }
+                  },
+                  {
+                    "id": "que_1309bfdd50014drrbIfuqK4g3w",
+                    "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                    "seq": 3,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_later",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891861
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_1309bfdd8001Pnc8iFbsgslmJw",
+            "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+            "messageID": "msg_1309bfdd7001B8EZMZENyZyUVC"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                "kind": "watcher.check",
+                "constituents": [
+                  {
+                    "id": "que_1309bfdd1001P2Abb0yb0MjCr9",
+                    "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                    "seq": 1,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_old",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical stalled observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891858
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_27f2761e69849e6ef8daff8e75697ed29453b3f7acfb1ddfb241bc3ec9c804a6",
+            "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+            "messageID": "msg_1309bfdd7001B8EZMZENyZyUVC"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                "kind": "watcher.check",
+                "constituents": [
+                  {
+                    "id": "que_1309bfdd50014drrbIfuqK4g3w",
+                    "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                    "seq": 3,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_later",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891861
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_897cd818d9fbc8544344f8d73f52e0795211911eda7ef96193777267a1896f3e",
+            "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+            "messageID": "msg_1309bfdd7001B8EZMZENyZyUVC"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                "kind": "watcher.check",
+                "constituents": [
+                  {
+                    "id": "que_1309bfdd3001MN2M7Sb13XlQ8d",
+                    "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                    "seq": 2,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_distinct",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891859
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_b31630f3b5054bee52c504adf8414d5f5e75b04d2b0ff628f7c8021254c13990",
+            "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+            "messageID": "msg_1309bfdd7001B8EZMZENyZyUVC"
+          }
+        ]
+      },
+      "returnedAfterConsume": {
+        "info": {
+          "role": "user",
+          "time": {
+            "created": 1791816891864
+          },
+          "agent": "build",
+          "model": {
+            "providerID": "test",
+            "modelID": "test"
+          },
+          "id": "msg_1309bfdd7001B8EZMZENyZyUVC",
+          "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-12T14:54:51.859Z; queue que_1309bfdd3001MN2M7Sb13XlQ8d]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-12T14:54:51.861Z; queue que_1309bfdd50014drrbIfuqK4g3w]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation",
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                "kind": "watcher.check",
+                "constituents": [
+                  {
+                    "id": "que_1309bfdd1001P2Abb0yb0MjCr9",
+                    "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                    "seq": 1,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_old",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical stalled observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891858
+                    }
+                  },
+                  {
+                    "id": "que_1309bfdd3001MN2M7Sb13XlQ8d",
+                    "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                    "seq": 2,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_distinct",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891859
+                    }
+                  },
+                  {
+                    "id": "que_1309bfdd50014drrbIfuqK4g3w",
+                    "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                    "seq": 3,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_later",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891861
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_1309bfdd8001Pnc8iFbsgslmJw",
+            "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+            "messageID": "msg_1309bfdd7001B8EZMZENyZyUVC"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                "kind": "watcher.check",
+                "constituents": [
+                  {
+                    "id": "que_1309bfdd1001P2Abb0yb0MjCr9",
+                    "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                    "seq": 1,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_old",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical stalled observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891858
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_27f2761e69849e6ef8daff8e75697ed29453b3f7acfb1ddfb241bc3ec9c804a6",
+            "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+            "messageID": "msg_1309bfdd7001B8EZMZENyZyUVC"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                "kind": "watcher.check",
+                "constituents": [
+                  {
+                    "id": "que_1309bfdd50014drrbIfuqK4g3w",
+                    "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                    "seq": 3,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_later",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891861
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_897cd818d9fbc8544344f8d73f52e0795211911eda7ef96193777267a1896f3e",
+            "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+            "messageID": "msg_1309bfdd7001B8EZMZENyZyUVC"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                "kind": "watcher.check",
+                "constituents": [
+                  {
+                    "id": "que_1309bfdd3001MN2M7Sb13XlQ8d",
+                    "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+                    "seq": 2,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_distinct",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791816891859
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_b31630f3b5054bee52c504adf8414d5f5e75b04d2b0ff628f7c8021254c13990",
+            "sessionID": "ses_ecf640230ffefnxeVP11ZcNqFk",
+            "messageID": "msg_1309bfdd7001B8EZMZENyZyUVC"
+          }
+        ]
+      },
+      "witnesses": [
+        {
+          "partID": "prt_1309bfdd8001Pnc8iFbsgslmJw",
+          "messageID": "msg_1309bfdd7001B8EZMZENyZyUVC",
+          "ignored": false,
+          "synthetic": false,
+          "constituentIDs": [
+            "que_1309bfdd1001P2Abb0yb0MjCr9",
+            "que_1309bfdd3001MN2M7Sb13XlQ8d",
+            "que_1309bfdd50014drrbIfuqK4g3w"
+          ]
+        },
+        {
+          "partID": "prt_queue_27f2761e69849e6ef8daff8e75697ed29453b3f7acfb1ddfb241bc3ec9c804a6",
+          "messageID": "msg_1309bfdd7001B8EZMZENyZyUVC",
+          "ignored": true,
+          "synthetic": true,
+          "constituentIDs": [
+            "que_1309bfdd1001P2Abb0yb0MjCr9"
+          ]
+        },
+        {
+          "partID": "prt_queue_897cd818d9fbc8544344f8d73f52e0795211911eda7ef96193777267a1896f3e",
+          "messageID": "msg_1309bfdd7001B8EZMZENyZyUVC",
+          "ignored": true,
+          "synthetic": true,
+          "constituentIDs": [
+            "que_1309bfdd50014drrbIfuqK4g3w"
+          ]
+        },
+        {
+          "partID": "prt_queue_b31630f3b5054bee52c504adf8414d5f5e75b04d2b0ff628f7c8021254c13990",
+          "messageID": "msg_1309bfdd7001B8EZMZENyZyUVC",
+          "ignored": true,
+          "synthetic": true,
+          "constituentIDs": [
+            "que_1309bfdd3001MN2M7Sb13XlQ8d"
+          ]
+        }
+      ],
+      "modelInput": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-12T14:54:51.859Z; queue que_1309bfdd3001MN2M7Sb13XlQ8d]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-12T14:54:51.861Z; queue que_1309bfdd50014drrbIfuqK4g3w]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+            }
+          ]
+        }
+      ],
+      "modelExclusionProbe": {
+        "marker": "SYNTHETIC_IGNORED_WITNESS_PROBE",
+        "excluded": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-12T14:54:51.859Z; queue que_1309bfdd3001MN2M7Sb13XlQ8d]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-12T14:54:51.861Z; queue que_1309bfdd50014drrbIfuqK4g3w]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+              }
+            ]
+          }
+        ],
+        "unignoredControl": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-12T14:54:51.859Z; queue que_1309bfdd3001MN2M7Sb13XlQ8d]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-12T14:54:51.861Z; queue que_1309bfdd50014drrbIfuqK4g3w]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+              },
+              {
+                "type": "text",
+                "text": "SYNTHETIC_IGNORED_WITNESS_PROBE"
+              },
+              {
+                "type": "text",
+                "text": "SYNTHETIC_IGNORED_WITNESS_PROBE"
+              },
+              {
+                "type": "text",
+                "text": "SYNTHETIC_IGNORED_WITNESS_PROBE"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
