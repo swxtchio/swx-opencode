@@ -101,7 +101,7 @@ const awaitDeferredEffect = (wait: Effect.Effect<void>, message: string) =>
 
 const remove = (id: SessionID) => SessionNs.use.remove(id)
 
-function retentionEvidence(sessionID: string, seq: number, ownerID: string | null, now: number): RetentionEvidence {
+function retentionEvidence(sessionID: string, seq: number, filename: string): RetentionEvidence {
   return {
     customerBinding: {
       proofID: "producer-fixture-unbound-session",
@@ -110,24 +110,8 @@ function retentionEvidence(sessionID: string, seq: number, ownerID: string | nul
       customerBoundSessionIDs: [],
       nonCustomerSessionIDs: [sessionID],
     },
-    policy: {
-      reviewed: true,
-      cutoffEpochMs: now + 60_000,
-      reviewedReference: "swxtchio/swx-opencode#97",
-      policyDigest: "fixture-policy-digest",
-      readerContractReviewed: true,
-      readerContractID: "fixture-reader-contract",
-    },
-    liveness: {
-      proofID: "producer-fixture-liveness",
-      observedAtEpochMs: now,
-      sessionIDs: [sessionID],
-      aggregateOwners: { [sessionID]: ownerID },
-      servingProcesses: [],
-      canResume: false,
-      unfinishedOwnedWork: false,
-      validThroughEpochMs: now + 60_000,
-    },
+    readerContract: { reviewed: true, id: "fixture-reader-contract" },
+    holders: DbRetention.scanDatabaseHolders(filename),
     handoff: {
       receiptID: "producer-fixture-receipt",
       durable: true,
@@ -833,12 +817,7 @@ describe("Session retention producer path", () => {
       const queuedProof = retentionEvidence(
         queued.id,
         yield* EventV2.latestSequence(db, queued.id),
-        (yield* db
-          .select({ ownerID: EventSequenceTable.owner_id })
-          .from(EventSequenceTable)
-          .where(eq(EventSequenceTable.aggregate_id, queued.id))
-          .get())?.ownerID ?? null,
-        now,
+        databasePath,
       )
       const queuedTree = DbRetention.inventory(native as unknown as SqliteAccess, queuedProof, now).trees.find(
         (item) => item.rootSessionID === queued.id,
@@ -849,12 +828,7 @@ describe("Session retention producer path", () => {
       const admittedProof = retentionEvidence(
         admitted.id,
         yield* EventV2.latestSequence(db, admitted.id),
-        (yield* db
-          .select({ ownerID: EventSequenceTable.owner_id })
-          .from(EventSequenceTable)
-          .where(eq(EventSequenceTable.aggregate_id, admitted.id))
-          .get())?.ownerID ?? null,
-        now,
+        databasePath,
       )
       const admittedTree = DbRetention.inventory(native as unknown as SqliteAccess, admittedProof, now).trees.find(
         (item) => item.rootSessionID === admitted.id,
@@ -865,12 +839,7 @@ describe("Session retention producer path", () => {
       const promotedProof = retentionEvidence(
         promoted.id,
         yield* EventV2.latestSequence(db, promoted.id),
-        (yield* db
-          .select({ ownerID: EventSequenceTable.owner_id })
-          .from(EventSequenceTable)
-          .where(eq(EventSequenceTable.aggregate_id, promoted.id))
-          .get())?.ownerID ?? null,
-        now,
+        databasePath,
       )
       const promotedTree = DbRetention.inventory(native as unknown as SqliteAccess, promotedProof, now).trees.find(
         (item) => item.rootSessionID === promoted.id,

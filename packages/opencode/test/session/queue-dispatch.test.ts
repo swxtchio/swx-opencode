@@ -12,6 +12,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
 import { EventV2 } from "@opencode-ai/core/event"
+import { EventWriter } from "@opencode-ai/core/event/writer"
+import { EventAggregateWriterTable } from "@opencode-ai/core/event/writer.sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -264,6 +266,18 @@ it.instance(
       const original = yield* queue.admit(admission)
       expect((yield* queue.admit({ ...admission, messageID: undefined })).id).toBe(original.id)
       expect((yield* queue.admit({ ...admission, messageID: MessageID.ascending() })).id).toBe(original.id)
+      // PR228 records event writers inside nested event transactions; a failed outer group must roll that back too.
+      yield* database.db
+        .update(EventAggregateWriterTable)
+        .set({ time_last_append: 1 })
+        .where(eq(EventAggregateWriterTable.aggregate_id, session.id))
+        .run()
+      const writing = () =>
+        database.db
+          .select()
+          .from(EventAggregateWriterTable)
+          .where(eq(EventAggregateWriterTable.aggregate_id, session.id))
+          .all()
       const seen: string[] = []
       const unsubscribe = yield* events.listen((event) =>
         Effect.sync(() => {
@@ -285,6 +299,7 @@ it.instance(
         .pipe(Effect.exit)
       expect(Exit.isFailure(failed)).toBe(true)
       expect(seen).toEqual([])
+      expect(yield* writing()).toEqual([{ aggregate_id: session.id, writer_id: EventWriter.id(), time_last_append: 1 }])
       expect(yield* MessageV2.stream(session.id)).toEqual([])
       expect((yield* queue.list(session.id)).map((item) => item.id)).toEqual([original.id])
       yield* queue.promote({
@@ -295,6 +310,7 @@ it.instance(
         rejected: () => Effect.void,
       })
       expect(seen).toHaveLength(1)
+      expect((yield* writing())[0]?.time_last_append).toBeGreaterThan(1)
       yield* unsubscribe
       yield* queue.consume(session.id)
       const retry = yield* queue.admit(admission)
