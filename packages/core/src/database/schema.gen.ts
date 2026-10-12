@@ -284,6 +284,9 @@ export default {
         `CREATE UNIQUE INDEX \`message_session_admission_seq_idx\` ON \`message\` (\`session_id\`,\`admission_seq\`) WHERE "message"."admission_seq" > 0;`,
       )
       yield* tx.run(
+        `CREATE INDEX \`message_session_admission_order_idx\` ON \`message\` (\`session_id\`,\`admission_seq\`);`,
+      )
+      yield* tx.run(
         `CREATE INDEX \`message_session_time_created_id_idx\` ON \`message\` (\`session_id\`,\`time_created\`,\`id\`);`,
       )
       yield* tx.run(`CREATE INDEX \`part_message_id_id_idx\` ON \`part\` (\`message_id\`,\`id\`);`)

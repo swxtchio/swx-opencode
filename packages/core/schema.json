@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "f28ff033-4d20-49ab-adb6-fbf1a96a3a7d",
+  "id": "7fde3149-ddb9-4a4f-8922-9b730d84c09b",
   "prevIds": [
-    "1b57e6eb-f423-4b30-a122-08148e532a83"
+    "f28ff033-4d20-49ab-adb6-fbf1a96a3a7d"
   ],
   "ddl": [
     {
@@ -2227,6 +2227,24 @@
       "where": "\"message\".\"admission_seq\" > 0",
       "origin": "manual",
       "name": "message_session_admission_seq_idx",
+      "entityType": "indexes",
+      "table": "message"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        },
+        {
+          "value": "admission_seq",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "message_session_admission_order_idx",
       "entityType": "indexes",
       "table": "message"
     },

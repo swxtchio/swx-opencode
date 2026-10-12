@@ -82,6 +82,8 @@ export const MessageTable = sqliteTable(
     uniqueIndex("message_session_admission_seq_idx")
       .on(table.session_id, table.admission_seq)
       .where(sql`${table.admission_seq} > 0`),
+    // History includes legacy seq 0 rows, so its unfiltered paging cannot use the partial unique index.
+    index("message_session_admission_order_idx").on(table.session_id, table.admission_seq),
     index("message_session_time_created_id_idx").on(table.session_id, table.time_created, table.id),
   ],
 )
