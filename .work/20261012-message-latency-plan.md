@@ -1,0 +1,29 @@
+# Captain queue policy and ordered history lookup
+
+Authority: `/home/byates/fm-llmrouter/data/opencode-message-latency-p1/captain-queue-policy.md` and implementation-handoff.md (2026-10-12). Existing branch `fm/opencode-message-latency-p1`; no rollout, live store changes, push, PR, merge, package installation, or full/derived suite.
+
+## Design
+
+Keep `session/queue.ts` the single scheduling owner. At an eligible queued boundary select validated peer envelopes before automation, up to ten original rows in seq order. Deliver complete literal envelopes as numbered entries with admission timestamps, lower-authority framing and explicit acknowledgment of each original peer ID. Leave overflow pending. Native/manual/unknown inputs retain their own message and existing delivery semantics; critical inputs keep immediate meaning.
+
+For validated automation families/subtypes, select one type together. Keep latest state for positively identified same episodes/checks, retain every distinct actionable episode, and preserve all original constituents for introspection. Classification is based on validated generated framing, never free-form semantic similarity. Admission and promotion use this same selection path, including previously stored rows.
+
+Reserve all selected original rows against one message ID in BEGIN IMMEDIATE. Revalidate every constituent before commit; withdrawal, edits or new higher-priority work invalidate preparation without deleting originals. Preparation/write failures and restart must not lose a group. Persist constituent identity and original encoded input/time in the existing text-part metadata surface (`sessionQueue`, version1); a group is visible through normal message GET, no generic requestID/receipt endpoint or new scheduler. Pending queue GET continues to expose original rows. After promotion/consume, the projected text metadata is the durable exact-constituent lookup. Firstmate must add a focused metadata-aware grouped lookup before deployment; no edits to its primary here.
+
+Machine delivery resolves recipient current model/variant at promotion; retain sender input in constituent metadata rather than letting old automated selections restore it. Explicit native selection stays authoritative.
+
+Add a nonunique `(session_id, admission_seq)` index alongside partial admission uniqueness. Generate migration, schema snapshot/registry with the core generator. Preserve zero-sequence inclusion, legacy pagination and compaction behavior. Test fresh and upgrade stores, actual Bun driver query plan and observable connection/timer regression under a discriminating synthetic workload.
+
+## Focused execution and validation
+
+1. Commit this plan; inventory/exclude `.latency` scratch and reuse existing dependencies within worktree without installs.
+2. Add ordered lookup/migration and focused query-plan, upgrade/fresh and actual-driver regression proof, including remove-index red.
+3. Add validated dispatch metadata/classification and atomic multi-row queue reservation/promotion; test real durable queue through existing service fixtures and actual model request capture.
+4. Exercise ten/eleven peers, peer-before-old-automation, complete numbered framing, same-type latest-state and distinct episodes, unknown/manual/critical preservation, concurrent admission/withdrawal, preparation/write failure, restart/retry, current model/effort and exact constituent lookup after consume.
+5. Run only focused related queue/history/machine tests, package type/lint checks, targeted behavior-removal reds, and review. Commit intended files only; update report with clean head, evidence and cross-repo needs.
+
+## Parked #212 integration
+
+Inspected parked head `bc7592ea56` and review-current-intent.md. It adds `SessionPromptProvenanceTable`/Origin timestamps, queue editor hold/reorder/consolidate and current-model selection. Its provenance holds timestamps only, not exact constituents, and its requestID/receipt proposal is explicitly unapproved. This branch uses existing text metadata for exact constituent input instead of introducing a competing provenance table. Queue reserve/commit changes overlap directly; integration must merge these into the existing hold/reservation checks and combine origins with constituent metadata, preserving its current-model-at-promotion hook. No parked TUI/retention/compaction work is copied or overwritten.
+
+The independent index fix can land without #212/PR228 or #2081. Grouping cannot be deployed as text-equality-compatible with Firstmate: its minimal companion must inspect `message.parts[].metadata.sessionQueue.constituents`, validate version/session/original identity/input and positively reconcile the exact constituent. HTTP204 remains acceptance only.
