@@ -4,7 +4,7 @@ import { Database } from "bun:sqlite"
 import { Context, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { readdirSync, writeFileSync } from "node:fs"
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, statfs, writeFile } from "node:fs/promises"
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, statfs, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { eq } from "drizzle-orm"
@@ -106,25 +106,29 @@ const access = (db: Database) => db as unknown as SqliteAccess
  * `sizes` lists one entry per tree, its Session count (a root plus children).
  *
  * The producer runs once per tree shape in this file, and each test gets its own private copy of the store
- * it left. A spawn costs about a second, and one per test put this file's runtime on the unit CI step's
- * critical path.
+ * it left, with its own copy of the trees and usage the producer reported. A spawn costs about a second, and
+ * one per test put this file's runtime on the unit CI step's critical path.
+ *
+ * `scratch` holds the template and copy directories and `timeout` bounds the producer. Both are part of the
+ * template key, so a test that provokes an acquisition failure never shares a template with the others.
  */
-async function producedStore(sizes: number[]) {
-  const key = JSON.stringify(sizes)
-  const template = producedTemplates.get(key) ?? produceStore(sizes)
+async function producedStore(sizes: number[], options: { scratch?: string; timeout?: number } = {}) {
+  const scratch = options.scratch ?? os.tmpdir()
+  const key = JSON.stringify([sizes, scratch, options.timeout])
+  const template = producedTemplates.get(key) ?? produceStore(sizes, scratch, options.timeout ?? 30_000)
   producedTemplates.set(key, template)
   const produced = await template
-  const directory = await mkdtemp(path.join(os.tmpdir(), "opencode-retention-store-"))
+  const directory = await mkdtemp(path.join(scratch, "opencode-retention-store-"))
   const filename = path.join(directory, "opencode.db")
-  // The producer has exited and closed the store; a WAL left behind would still hold committed writes.
-  for (const suffix of ["", "-wal"]) {
-    if (await Bun.file(produced.filename + suffix).exists())
-      await copyFile(produced.filename + suffix, filename + suffix)
-  }
+  // Nothing owns the directory until the fixture is returned, so a failed copy removes it before rejecting.
+  await copyFile(produced.filename, filename).catch(async (error) => {
+    await rm(directory, { recursive: true, force: true })
+    throw error
+  })
   return {
     filename,
-    trees: produced.trees,
-    usage: produced.usage,
+    trees: structuredClone(produced.trees),
+    usage: structuredClone(produced.usage),
     producedFrom: produced.producedFrom,
     producedUntil: produced.producedUntil,
     // Just past the inactivity window after the producer's last write.
@@ -139,49 +143,77 @@ afterAll(() =>
     Array.from(producedTemplates.values(), (template) =>
       template.then(
         (produced) => rm(produced.directory, { recursive: true, force: true }),
+        // A failed template already removed its own directory.
         () => undefined,
       ),
     ),
   ),
 )
 
-async function produceStore(sizes: number[]) {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "opencode-retention-template-"))
+async function produceStore(sizes: number[], scratch: string, timeout: number) {
+  const directory = await mkdtemp(path.join(scratch, "opencode-retention-template-"))
   const filename = path.join(directory, "opencode.db")
   const project = path.join(directory, "project")
-  await mkdir(project)
-  const producer = Bun.spawn(
-    [
-      process.execPath,
-      path.join(import.meta.dir, "../../fixture/retention-producer.ts"),
-      filename,
-      project,
-      JSON.stringify(sizes),
-    ],
-    {
-      stdout: "pipe",
-      stderr: "pipe",
-      cwd: path.join(import.meta.dir, "../../.."),
-      env: { ...process.env, OPENCODE_DB: filename },
-      timeout: 30_000,
-    },
-  )
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(producer.stdout).text(),
-    new Response(producer.stderr).text(),
-    producer.exited,
-  ])
-  if (code !== 0) throw new Error(`retention producer exited ${code}: ${stderr}`)
-  const produced = JSON.parse(stdout.trim().split("\n").at(-1)!) as {
-    trees: { rootSessionID: string; sessionIDs: string[] }[]
-    usage: {
-      cost: number
-      tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
+  // Nothing owns the directory until the template is returned, so any failure removes it before rejecting,
+  // once disposing the producer has killed it if it is still running and waited for it to exit.
+  try {
+    await mkdir(project)
+    await using producer = Bun.spawn(
+      [
+        process.execPath,
+        path.join(import.meta.dir, "../../fixture/retention-producer.ts"),
+        filename,
+        project,
+        JSON.stringify(sizes),
+      ],
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+        cwd: path.join(import.meta.dir, "../../.."),
+        env: { ...process.env, OPENCODE_DB: filename },
+        timeout,
+      },
+    )
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(producer.stdout).text(),
+      new Response(producer.stderr).text(),
+      producer.exited,
+    ])
+    if (code !== 0) throw new Error(`retention producer exited ${code}: ${stderr}`)
+    // Copies take the database file alone, which holds every committed write because the producer closed the
+    // store on exit, checkpointing and deleting its WAL. Any WAL left behind means it did not, and could hold
+    // writes a copy of the file misses.
+    if (await Bun.file(filename + "-wal").exists()) throw new Error(`retention producer left a WAL: ${filename}-wal`)
+    const produced = JSON.parse(stdout.trim().split("\n").at(-1)!) as {
+      trees: { rootSessionID: string; sessionIDs: string[] }[]
+      usage: {
+        cost: number
+        tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
+      }
+      producedFrom: number
+      producedUntil: number
     }
-    producedFrom: number
-    producedUntil: number
+    return { directory, filename, ...produced }
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true })
+    throw error
   }
-  return { directory, filename, ...produced }
+}
+
+// What a fixture's copied store holds: its integrity check and every Session ID, sorted.
+function storedSessions(filename: string) {
+  const db = new Database(filename, { readonly: true })
+  try {
+    return {
+      integrity: db.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get()?.integrity_check,
+      sessionIDs: db
+        .query<{ id: string }, []>("SELECT id FROM session ORDER BY id")
+        .all()
+        .map((row) => row.id),
+    }
+  } finally {
+    db.close()
+  }
 }
 
 // Each Session's current event sequence, which a measurement receipt covering its final write records.
@@ -1975,3 +2007,87 @@ test(
   { timeout: 30_000 },
 )
 
+test(
+  "same-shape fixtures acquired together or later each own their trees and usage",
+  async () => {
+    const acquired = await Promise.all([producedStore([2]), producedStore([2]), producedStore([2])])
+    await using edited = acquired[0]
+    await using peer = acquired[1]
+    await using other = acquired[2]
+    const reported = structuredClone({ trees: peer.trees, usage: peer.usage })
+
+    edited.trees[0]!.rootSessionID = "ses_edited_only"
+    edited.trees[0]!.sessionIDs.push("ses_edited_only")
+    edited.trees.push({ rootSessionID: "ses_edited_only", sessionIDs: ["ses_edited_only"] })
+    edited.usage.cost = 999
+    edited.usage.tokens.input = 999
+    edited.usage.tokens.cache.read = 999
+    await using later = await producedStore([2])
+
+    for (const fixture of [peer, other, later]) {
+      expect({ trees: fixture.trees, usage: fixture.usage }).toEqual(reported)
+      expect(storedSessions(fixture.filename)).toEqual({
+        integrity: "ok",
+        sessionIDs: fixture.trees.flatMap((tree) => tree.sessionIDs).toSorted(),
+      })
+    }
+  },
+  { timeout: 30_000 },
+)
+
+test(
+  "a producer that fails removes its own template directory, leaves no producer running and spares other fixtures",
+  async () => {
+    await using scratch = await tmpdir()
+    await using before = await producedStore([1])
+    const failed = () =>
+      // A one-millisecond bound kills the real producer long before it can finish.
+      producedStore([1], { scratch: scratch.path, timeout: 1 }).then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+
+    expect(String(await failed())).toContain("retention producer exited")
+    expect(readdirSync(scratch.path)).toEqual([])
+    const running = spawnSync("ps", ["-eo", "args="], { encoding: "utf8" })
+    expect(running.status).toBe(0)
+    expect(running.stdout.split("\n").filter((line) => line.includes(scratch.path))).toEqual([])
+    // The failed template stays failed: a later same-key acquisition rejects without producing anything.
+    expect(String(await failed())).toContain("retention producer exited")
+    expect(readdirSync(scratch.path)).toEqual([])
+
+    await using after = await producedStore([1])
+    for (const fixture of [before, after])
+      expect(storedSessions(fixture.filename)).toEqual({ integrity: "ok", sessionIDs: fixture.trees[0]!.sessionIDs })
+  },
+  { timeout: 30_000 },
+)
+
+test(
+  "a private copy that fails removes its own directory and leaves the template and other fixtures intact",
+  async () => {
+    await using scratch = await tmpdir()
+    await using kept = await producedStore([1], { scratch: scratch.path })
+    const listing = readdirSync(scratch.path).toSorted()
+    const template = path.join(
+      scratch.path,
+      listing.find((name) => name.startsWith("opencode-retention-template-"))!,
+      "opencode.db",
+    )
+
+    await rename(template, `${template}.aside`)
+    const failure = await producedStore([1], { scratch: scratch.path }).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    await rename(`${template}.aside`, template)
+
+    expect((failure as NodeJS.ErrnoException | undefined)?.code).toBe("ENOENT")
+    expect(readdirSync(scratch.path).toSorted()).toEqual(listing)
+    await using after = await producedStore([1], { scratch: scratch.path })
+    expect(after.trees).toEqual(kept.trees)
+    for (const fixture of [kept, after])
+      expect(storedSessions(fixture.filename)).toEqual({ integrity: "ok", sessionIDs: kept.trees[0]!.sessionIDs })
+  },
+  { timeout: 30_000 },
+)
