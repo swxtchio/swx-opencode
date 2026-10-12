@@ -293,14 +293,15 @@ it.live(
   60_000,
 )
 
-// The review's idle timer is the app's only five-minute timer. This captures
-// it so the test can fire it instead of waiting; every other timer runs as usual.
+// Captures the review's five-minute idle timer, set from dialog-queue, so the
+// test can fire it instead of waiting; every other timer runs as usual.
 // The exact interval is proven with fake timers in packages/tui.
 function captureIdleTimer() {
   const real = { set: globalThis.setTimeout, clear: globalThis.clearTimeout }
   const pending = new Set<{ readonly fire: () => void }>()
   globalThis.setTimeout = ((handler: () => void, ms?: number, ...rest: unknown[]) => {
-    if (ms !== 5 * 60 * 1000) return real.set(handler, ms, ...rest)
+    // The provider's stream chunk timeout is five minutes too.
+    if (ms !== 5 * 60 * 1000 || !new Error().stack?.includes("dialog-queue")) return real.set(handler, ms, ...rest)
     const timer = { fire: handler }
     pending.add(timer)
     return timer
