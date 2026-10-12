@@ -24,6 +24,15 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`session_prompt_provenance\` (
+          \`message_id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`origins\` text NOT NULL,
+          \`waited\` integer NOT NULL,
+          CONSTRAINT \`fk_session_prompt_provenance_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`session_prompt_queue_sequence\` (
           \`session_id\` text PRIMARY KEY,
           \`seq\` integer NOT NULL,
@@ -39,6 +48,7 @@ export default {
           \`input\` text NOT NULL,
           \`message_id\` text,
           \`time_created\` integer NOT NULL,
+          \`origins\` text,
           \`time_promoted\` integer,
           \`time_withdrawn\` integer,
           CONSTRAINT \`fk_session_prompt_queue_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
@@ -269,6 +279,9 @@ export default {
           CONSTRAINT \`fk_session_share_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      yield* tx.run(
+        `CREATE INDEX \`session_prompt_provenance_session_idx\` ON \`session_prompt_provenance\` (\`session_id\`);`,
+      )
       yield* tx.run(
         `CREATE UNIQUE INDEX \`session_prompt_queue_session_seq_idx\` ON \`session_prompt_queue\` (\`session_id\`,\`seq\`);`,
       )

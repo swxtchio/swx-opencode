@@ -11,7 +11,10 @@ import { SessionTable } from "./sql"
 // is reserved before the message is written, so a promotion a stopped process
 // left half done is finished rather than repeated. A promoted row stays until
 // the next drain's history read has seen its message; a withdrawn row stays so
-// it can be restored.
+// it can be restored. `origins` keeps when each instruction the row carries was
+// first queued, and when its identical copies were, through consolidation
+// (#212); a row stored before it existed has one origin, time_created, which is
+// when the row's own copy was last admitted.
 export const SessionPromptQueueTable = sqliteTable(
   "session_prompt_queue",
   {
@@ -25,6 +28,7 @@ export const SessionPromptQueueTable = sqliteTable(
     input: text({ mode: "json" }).notNull().$type<SessionPromptQueue.QueuedInputEncoded>(),
     message_id: text().$type<MessageID>(),
     time_created: integer().notNull(),
+    origins: text({ mode: "json" }).$type<SessionPromptQueue.Origin[]>(),
     time_promoted: integer(),
     time_withdrawn: integer(),
   },
@@ -43,3 +47,22 @@ export const SessionPromptQueueSequenceTable = sqliteTable("session_prompt_queue
     .references(() => SessionTable.id, { onDelete: "cascade" }),
   seq: integer().notNull(),
 })
+
+// The queue times of a message promoted from the queue (#212), kept as long as
+// the message, so the model request can say when its prompt was queued and
+// delivered while the stored message stays exactly what the sender sent.
+// `waited` is set when something other than the prompt's own admission
+// delivered it: it sat pending behind a running turn, a hold or a compaction.
+export const SessionPromptProvenanceTable = sqliteTable(
+  "session_prompt_provenance",
+  {
+    message_id: text().$type<MessageID>().primaryKey(),
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    origins: text({ mode: "json" }).notNull().$type<SessionPromptQueue.Origin[]>(),
+    waited: integer({ mode: "boolean" }).notNull(),
+  },
+  (table) => [index("session_prompt_provenance_session_idx").on(table.session_id)],
+)

@@ -33,7 +33,15 @@ const sessionID = "ses_queue_review"
 const session = { id: sessionID, title: "review", time: { created: 0, updated: 0 }, version: "1", directory }
 
 function item(id: string, delivery: "steer" | "queue", text: string, seq: number): SessionPromptQueueItem {
-  return { id, sessionID, seq, delivery, input: { parts: [{ type: "text", text }] }, time: { created: seq } }
+  return {
+    id,
+    sessionID,
+    seq,
+    delivery,
+    input: { parts: [{ type: "text", text }] },
+    time: { created: seq },
+    origins: [{ time: seq }],
+  }
 }
 
 const userMessage = {
@@ -417,13 +425,39 @@ test("scrolling the review with the mouse wheel restarts the inactivity interval
   jest.useFakeTimers()
   DialogQueue.show(view.dialog, sessionID)
   await settle(() => view.queued("hold").length === 2)
-  // Mouse events hit-test the last rendered frame.
-  expect(await view.frame()).toContain("queued for later")
   jest.advanceTimersByTime(REVIEW_IDLE_MS - 60_000)
+  // Mouse events hit-test the last rendered frame, and the ages have ticked since.
+  expect(await view.frame()).toContain("queued for later")
   void view.app.mockMouse.scroll(x, y, "down")
   jest.advanceTimersByTime(REVIEW_IDLE_MS - 1)
   expect(view.dialog.stack.length).toBe(1)
   jest.advanceTimersByTime(1)
   await settle(() => view.queued("release").length === 2)
   expect(view.dialog.stack.length).toBe(0)
+})
+
+test("each pending prompt shows when it was first queued, how long ago, its repeats and merged steps", async () => {
+  const now = Date.now()
+  const minutes = (count: number) => now - count * 60_000
+  const repeated = {
+    ...item("que_4", "queue", "check the build", 5),
+    time: { created: minutes(5) },
+    origins: [{ time: minutes(17), repeats: [minutes(5)] }],
+  }
+  const merged = {
+    ...item("que_5", "queue", "run lint:\n1. run lint\n2. --fix", 6),
+    time: { created: minutes(30) },
+    origins: [{ time: minutes(40) }, { time: minutes(30) }],
+  }
+  const view = await setup([repeated, merged])
+  jest.useFakeTimers({ now })
+  DialogQueue.show(view.dialog, sessionID)
+  await settle(() => view.queued("hold").length === 1)
+  const line = async (text: string) => (await view.frame()).split("\n").find((row) => row.includes(text)) ?? ""
+  expect(await line("check the build")).toContain("17m ago · sent 2×")
+  expect(await line("run lint:")).toContain("40m ago · 2 merged")
+
+  // The ages count on while the view stays open.
+  jest.advanceTimersByTime(60_000)
+  expect(await line("check the build")).toContain("18m ago")
 })

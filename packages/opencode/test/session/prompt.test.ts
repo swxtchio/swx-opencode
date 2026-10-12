@@ -4565,10 +4565,19 @@ gated.instance(
 
 const said = (value: string) => [{ type: "text" as const, text: value }]
 
+// Without the note a prompt that waited in the queue is delivered with (#212),
+// which test/server/httpapi-session.test.ts checks.
 const modelMessages = (input: Record<string, unknown> | undefined) => {
   const messages = input?.messages
   if (!Array.isArray(messages)) throw new Error("expected LLM messages")
-  return messages
+  return messages.map((message) => {
+    if (message?.role !== "user" || !Array.isArray(message.content)) return message
+    const kept = message.content.filter(
+      (part: { type?: string; text?: string }) => !(part.type === "text" && part.text?.startsWith("[Queued prompt")),
+    )
+    if (kept.length === message.content.length) return message
+    return { ...message, content: kept.length === 1 && kept[0].type === "text" ? kept[0].text : kept }
+  })
 }
 
 const lastUser = (input: Record<string, unknown> | undefined) => modelMessages(input).at(-1)

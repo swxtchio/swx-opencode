@@ -331,6 +331,8 @@ const requiredRetentionTables = new Set([
   "event_sequence",
   "event_retention",
   "session_prompt_queue_sequence",
+  // Queue times of promoted prompts (#212): timestamps and a flag, no content.
+  "session_prompt_provenance",
 ])
 const classifiedSessionTables = new Set([...requiredRetentionTables])
 

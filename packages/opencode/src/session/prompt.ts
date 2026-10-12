@@ -1544,7 +1544,9 @@ const layer = Layer.effect(
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
-              MessageV2.toModelMessagesEffect(msgs, model),
+              queue
+                .annotate(sessionID, msgs)
+                .pipe(Effect.flatMap((annotated) => MessageV2.toModelMessagesEffect(annotated, model))),
             ])
             const system = [
               ...env,

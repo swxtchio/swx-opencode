@@ -1,3 +1,4 @@
+import { Config } from "@/config/config"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionQueue } from "@/session/queue"
@@ -18,6 +19,7 @@ export const sessionQueueHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
     const promptSvc = yield* SessionPrompt.Service
     const events = yield* EventV2Bridge.Service
     const scope = yield* Scope.Scope
+    const config = yield* Config.Service
 
     const requireSession = (sessionID: SessionID) => SessionError.mapStorageNotFound(session.get(sessionID))
 
@@ -143,7 +145,7 @@ export const sessionQueueHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       params: { sessionID: SessionID }
     }) {
       yield* requireSession(ctx.params.sessionID)
-      return yield* queue.consolidate(ctx.params.sessionID)
+      return yield* queue.consolidate(ctx.params.sessionID, (yield* config.get()).machine_message_markers)
     })
 
     return handlers

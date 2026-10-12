@@ -63,6 +63,14 @@ export type QueuedInput = Schema.Schema.Type<typeof QueuedInput>
 // The stored form; `format` holds class instances only once decoded.
 export type QueuedInputEncoded = typeof QueuedInput.Encoded
 
+// When an instruction was first queued, and when identical copies of it were
+// queued after it and collapsed into it (#212).
+export const Origin = Schema.Struct({
+  time: NonNegativeInt,
+  repeats: Schema.optional(Schema.Array(NonNegativeInt)),
+}).annotate({ identifier: "SessionPromptQueueOrigin" })
+export type Origin = Schema.Schema.Type<typeof Origin>
+
 export const Item = Schema.Struct({
   id: ItemID,
   sessionID: SessionID,
@@ -73,7 +81,13 @@ export const Item = Schema.Struct({
   delivery: Delivery,
   input: QueuedInput,
   time: Schema.Struct({
-    created: NonNegativeInt,
+    created: NonNegativeInt.annotate({
+      description: "When this item's own copy was last admitted; origins say when its instructions were first queued",
+    }),
+  }),
+  origins: Schema.Array(Origin).annotate({
+    description:
+      "One per instruction the item carries, in order: a merged command has one per step; repeats are identical copies collapsed into it",
   }),
 }).annotate({ identifier: "SessionPromptQueueItem" })
 export type Item = Schema.Schema.Type<typeof Item>

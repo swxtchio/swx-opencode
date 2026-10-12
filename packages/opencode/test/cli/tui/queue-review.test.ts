@@ -166,7 +166,15 @@ const lastUsers = (llm: TestLLMServer["Service"]) =>
     Effect.map((inputs) =>
       inputs.map((input) => {
         const last = Array.isArray(input.messages) ? input.messages.at(-1) : undefined
-        return last && typeof last.content === "string" ? last.content : JSON.stringify(last)
+        if (last && typeof last.content === "string") return last.content
+        // A prompt that waited also carries the note of when it was queued.
+        if (last && Array.isArray(last.content))
+          return last.content
+            .flatMap((part: { type?: string; text?: string }) =>
+              part.type === "text" && !part.text?.startsWith("[Queued prompt") ? [part.text] : [],
+            )
+            .join("")
+        return JSON.stringify(last)
       }),
     ),
   )
@@ -287,6 +295,11 @@ it.live(
       yield* tui.idle
       expect((yield* lastUsers(llm)).filter((text) => text === "write the changelog")).toHaveLength(1)
       expect(JSON.stringify(yield* llm.inputs)).not.toContain("drop this one")
+      // Each prompt the review held reached the model saying when it was queued.
+      const notes = (yield* llm.inputs).map((input) =>
+        JSON.stringify((input.messages as unknown[]).at(-1)).includes("[Queued prompt"),
+      )
+      expect(notes).toEqual([false, true, true, true])
       expect(texts(yield* tui.rows)).toEqual([])
     }).pipe(Effect.ensuring(Deferred.succeed(gate, undefined)), Effect.provide(TestLLMServer.layer))
   },

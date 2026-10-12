@@ -111,13 +111,18 @@ export function DialogQueue(props: { sessionID: string }) {
     ).catch(failed("reorder"))
   }
 
+  // Ages count on while the view is open.
+  const [now, setNow] = createSignal(Date.now())
+  const tick = setInterval(() => setNow(Date.now()), 30 * 1000)
+  onCleanup(() => clearInterval(tick))
+
   const options = createMemo(() =>
     items().map((item) => {
       const lines = preview(item).split("\n")
       return {
         title: Locale.truncate(lines[0]!.trim(), 60),
         value: item.id,
-        description: item.delivery,
+        description: [item.delivery, ...freshness(item, now())].join(" · "),
         footer: lines.length > 1 ? `+${lines.length - 1} lines` : undefined,
       }
     }),
@@ -191,6 +196,28 @@ export function DialogQueue(props: { sessionID: string }) {
 
 DialogQueue.show = (dialog: DialogContext, sessionID: string) =>
   dialog.replace(() => <DialogQueue sessionID={sessionID} />)
+
+// When the item's oldest instruction was queued and how long ago, how often
+// identical copies were sent, and how many queued instructions it merges.
+function freshness(item: SessionPromptQueueItem, now: number) {
+  const times = item.origins.flatMap((origin) => [origin.time, ...(origin.repeats ?? [])])
+  const first = Math.min(...item.origins.map((origin) => origin.time))
+  const sent = item.origins.length === 1 ? times.length : 0
+  return [
+    `queued ${Locale.todayTimeOrDateTime(first)}`,
+    `${age(now - first)} ago`,
+    ...(sent > 1 ? [`sent ${sent}×`] : []),
+    ...(item.origins.length > 1 ? [`${item.origins.length} merged`] : []),
+  ]
+}
+
+function age(ms: number) {
+  const minutes = Math.floor(Math.max(0, ms) / 60000)
+  if (minutes < 1) return "<1m"
+  if (minutes < 60) return `${minutes}m`
+  if (minutes < 1440) return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+  return `${Math.floor(minutes / 1440)}d ${Math.floor((minutes % 1440) / 60)}h`
+}
 
 // What a pending item will say: its typed text, or the kinds of its parts.
 function preview(item: SessionPromptQueueItem) {

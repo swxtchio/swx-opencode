@@ -2263,9 +2263,11 @@ describe("session HttpApi", () => {
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
       })
+    // Without the note a prompt that waited is delivered with, which the
+    // queue freshness tests check.
     const lastUsers = llm.inputs.pipe(
       Effect.map((inputs) =>
-        inputs.map((input) => (Array.isArray(input.messages) ? input.messages.at(-1) : undefined)),
+        inputs.map((input) => (Array.isArray(input.messages) ? withoutQueueNote(input.messages.at(-1)) : undefined)),
       ),
     )
     return {
@@ -2296,6 +2298,15 @@ describe("session HttpApi", () => {
           "10 seconds",
         ),
     }
+  }
+
+  const withoutQueueNote = (message: unknown) => {
+    if (!message || typeof message !== "object" || !("content" in message) || !Array.isArray(message.content))
+      return message
+    const kept = message.content.filter(
+      (part: { type?: string; text?: string }) => !(part.type === "text" && part.text?.startsWith("[Queued prompt")),
+    )
+    return { ...message, content: kept.length === 1 && kept[0].type === "text" ? kept[0].text : kept }
   }
 
   it.live(
@@ -2752,6 +2763,139 @@ describe("session HttpApi pending prompt selection", () => {
           ["model-a", "low"],
           ["model-b", "high"],
           ["model-b", "high"],
+        ])
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+})
+
+describe("session HttpApi queue freshness", () => {
+  const iso = (time: number) => new Date(time).toISOString().replace(/\.\d{3}Z$/, "Z")
+  const envelope = (msgid: string, text: string) =>
+    `[fm-from-peer]\x1f peer-a\x1f /home/peer\x1f ${msgid}\x1f [fm-level:request]\x1f ${text}`
+
+  it.live(
+    "a prompt that waited is delivered with when it was queued, while its stored message stays as sent",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue freshness" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const post = (path: string, body?: unknown) =>
+          request(pathFor(path, params), {
+            method: "POST",
+            headers,
+            body: body === undefined ? undefined : JSON.stringify(body),
+          })
+        const send = (text: string, selection: object = {}) =>
+          post(SessionPaths.promptAsync, {
+            agent: "build",
+            delivery: "queue",
+            ...selection,
+            parts: [{ type: "text", text }],
+          })
+        const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+        const text = (item: SessionQueue.Item) =>
+          item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")
+        const peerOne = envelope("p1760000000-1-abcd", "please check the build")
+        const peerTwo = envelope("p1760000001-2-beef", "please check the deploy")
+
+        yield* send("start")
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        yield* send("same request")
+        // A copy that names the model it was sent under is still the same request.
+        yield* send("same request", { model: { providerID: "test", modelID: "test-model" } })
+        for (const prompt of ["run lint", "run lint --fix", peerOne, peerTwo]) yield* send(prompt)
+        const admitted = yield* pollWithTimeout(
+          listed().pipe(Effect.map((items) => (items.length === 6 ? items : undefined))),
+          "prompts never queued",
+        )
+        // Pending, each is listed exactly as sent, as an exact-text delivery check expects.
+        expect(admitted.map(text)).toEqual([
+          "same request",
+          "same request",
+          "run lint",
+          "run lint --fix",
+          peerOne,
+          peerTwo,
+        ])
+        expect(admitted.map((item) => item.origins)).toEqual(admitted.map((item) => [{ time: item.time.created }]))
+        // A row a stopped process left two hours ago, stored before origins were kept.
+        const old = Date.now() - 2 * 60 * 60 * 1000
+        const { db } = yield* Database.Service
+        yield* db
+          .insert(SessionPromptQueueTable)
+          .values({
+            id: SessionPromptQueue.ItemID.create(),
+            session_id: session.id,
+            seq: 1000,
+            delivery: "queue",
+            input: { agent: "build", parts: [{ type: "text", text: "left by a stopped process" }] },
+            time_created: old,
+          })
+          .run()
+
+        const consolidated = yield* json<SessionQueue.Item[]>(yield* post(SessionQueuePaths.consolidate))
+        const [first, second, lint, fix] = admitted
+        expect(consolidated.map(text)).toEqual([
+          "same request",
+          "run lint:\n1. run lint\n2. --fix",
+          peerOne,
+          peerTwo,
+          "left by a stopped process",
+        ])
+        expect(consolidated[0]!.origins).toEqual([{ time: first!.time.created, repeats: [second!.time.created] }])
+        expect(consolidated[0]!.time.created).toBe(second!.time.created)
+        expect(consolidated[1]!.origins).toEqual([{ time: lint!.time.created }, { time: fix!.time.created }])
+        expect(consolidated[4]!.origins).toEqual([{ time: old }])
+
+        yield* Deferred.succeed(gate, undefined)
+        for (const reply of ["same done", "lint done", "build done", "deploy done", "old done"]) yield* llm.text(reply)
+        expect((yield* post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+        const sent = yield* pollWithTimeout(
+          llm.inputs.pipe(Effect.map((inputs) => (inputs.length === 6 ? inputs : undefined))),
+          "the model never received every queued prompt",
+          "10 seconds",
+        )
+        const lastUser = sent.map((input) => JSON.stringify((input.messages as unknown[]).at(-1)))
+        // Delivered by its own admission, the first prompt never waited.
+        expect(lastUser[0]).not.toContain("[Queued prompt")
+        expect(lastUser[1]).toContain(
+          `[Queued prompt: queued at ${iso(first!.time.created)}, and again at ${iso(second!.time.created)}; delivered at `,
+        )
+        expect(lastUser[2]).toContain(
+          `[Queued prompt merged from 2 queued instructions: step 1 at ${iso(lint!.time.created)}; step 2 at ${iso(fix!.time.created)}; delivered at `,
+        )
+        expect(lastUser[3]).toContain("please check the build")
+        expect(lastUser[3]).toContain("[Queued prompt: queued at ")
+        expect(lastUser[4]).toContain("please check the deploy")
+        expect(lastUser[5]).toContain(`[Queued prompt: queued at ${iso(old)}; delivered at `)
+        expect(lastUser[5]).toMatch(/, 2h(\d+m)?(\d+s)? after it was first queued\.]/)
+
+        // The stored messages hold exactly what was sent, with no note.
+        const messages = yield* requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, params), {
+          headers,
+        })
+        const stored = messages
+          .filter((message) => message.info.role === "user")
+          .map((message) => message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""))
+        expect(stored).toEqual([
+          "start",
+          "same request",
+          "run lint:\n1. run lint\n2. --fix",
+          peerOne,
+          peerTwo,
+          "left by a stopped process",
         ])
       }).pipe(
         Effect.ensuring(Deferred.succeed(gate, undefined)),

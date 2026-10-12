@@ -1,9 +1,14 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
-import { SessionPromptQueueSequenceTable, SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
+import {
+  SessionPromptProvenanceTable,
+  SessionPromptQueueSequenceTable,
+  SessionPromptQueueTable,
+} from "@opencode-ai/core/session/prompt-queue.sql"
 import { MessageTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm"
 import {
@@ -25,8 +30,9 @@ import {
 import { isDeepStrictEqual } from "node:util"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { sqliteLockMessage } from "@/util/sqlite-error"
+import { MachineMessage } from "./machine-message"
 import { MessageV2 } from "./message-v2"
-import { MessageID, SessionID } from "./schema"
+import { MessageID, PartID, SessionID } from "./schema"
 
 type DatabaseService = Database.Interface["db"]
 type DatabaseTransaction = Parameters<Parameters<DatabaseService["transaction"]>[0]>[0]
@@ -205,9 +211,22 @@ export interface Interface {
   /**
    * Keeps the first of identical pending items, then merges similar commands of
    * one category into the first of them as numbered steps; see `consolidation`.
-   * Returns the resulting pending list.
+   * `markers` are the configured machine-message markers, whose messages never
+   * merge as commands. Returns the resulting pending list.
    */
-  readonly consolidate: (sessionID: SessionID) => Effect.Effect<Item[]>
+  readonly consolidate: (
+    sessionID: SessionID,
+    markers?: ConfigV1.Info["machine_message_markers"],
+  ) => Effect.Effect<Item[]>
+  /**
+   * The messages with a synthetic note, on each one a queued prompt became after
+   * it waited, of when that prompt was queued and delivered (#212). Only the
+   * model request carries it; the stored message stays as the sender sent it.
+   */
+  readonly annotate: (
+    sessionID: SessionID,
+    messages: readonly SessionV1.WithParts[],
+  ) => Effect.Effect<SessionV1.WithParts[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionQueue") {}
@@ -524,12 +543,14 @@ const layer = Layer.effect(
       return yield* Effect.forEach(reserved, (row) =>
         Effect.gen(function* () {
           const done = yield* landed(tx, row.message_id!)
-          yield* tx
-            .update(SessionPromptQueueTable)
-            .set(done ? { time_promoted: Date.now() } : { message_id: null })
-            .where(eq(SessionPromptQueueTable.id, row.id))
-            .run()
-            .pipe(Effect.orDie)
+          if (done) yield* promoted(tx, row, row.message_id!, true)
+          if (!done)
+            yield* tx
+              .update(SessionPromptQueueTable)
+              .set({ message_id: null })
+              .where(eq(SessionPromptQueueTable.id, row.id))
+              .run()
+              .pipe(Effect.orDie)
           return done ? [{ id: row.id, message: row.message_id! }] : []
         }),
       ).pipe(Effect.map((rows) => rows.flat()))
@@ -643,7 +664,10 @@ const layer = Layer.effect(
 
     // A promotion being prepared loses its reservation, so its item takes part
     // like any other and its stale message never lands.
-    const consolidate = Effect.fn("SessionQueue.consolidate")(function* (sessionID: SessionID) {
+    const consolidate = Effect.fn("SessionQueue.consolidate")(function* (
+      sessionID: SessionID,
+      markers?: ConfigV1.Info["machine_message_markers"],
+    ) {
       return yield* exclusive(
         sessionID,
         Effect.gen(function* () {
@@ -662,6 +686,7 @@ const layer = Layer.effect(
                   ...rows.filter((row) => row.delivery === "steer"),
                   ...rows.filter((row) => row.delivery !== "steer"),
                 ].map(fromRow),
+                markers,
               )
               if (plan.removed.length > 0)
                 yield* tx
@@ -669,11 +694,15 @@ const layer = Layer.effect(
                   .where(inArray(SessionPromptQueueTable.id, plan.removed))
                   .run()
                   .pipe(Effect.orDie)
-              yield* Effect.forEach(plan.merged, (merged) =>
+              yield* Effect.forEach(plan.changed, (changed) =>
                 tx
                   .update(SessionPromptQueueTable)
-                  .set({ input: encodeInput(merged.input) })
-                  .where(eq(SessionPromptQueueTable.id, merged.id))
+                  .set({
+                    input: encodeInput(changed.input),
+                    origins: [...changed.origins],
+                    time_created: changed.time.created,
+                  })
+                  .where(eq(SessionPromptQueueTable.id, changed.id))
                   .run()
                   .pipe(Effect.orDie),
               )
@@ -752,14 +781,39 @@ const layer = Layer.effect(
           Effect.map((row) => row !== undefined),
         )
 
-    const markPromoted = (sessionID: SessionID, itemID: ItemID, id: MessageID) =>
-      writable(sessionID, (tx) =>
-        tx
+    // A promoted row's queue times outlive it as its message's provenance.
+    const promoted = (
+      tx: DatabaseTransaction,
+      row: typeof SessionPromptQueueTable.$inferSelect,
+      message: MessageID,
+      waited: boolean,
+    ) =>
+      Effect.gen(function* () {
+        yield* tx
           .update(SessionPromptQueueTable)
           .set({ time_promoted: Date.now() })
-          .where(eq(SessionPromptQueueTable.id, itemID))
+          .where(eq(SessionPromptQueueTable.id, row.id))
           .run()
-          .pipe(Effect.orDie),
+          .pipe(Effect.orDie)
+        yield* tx
+          .insert(SessionPromptProvenanceTable)
+          .values({ message_id: message, session_id: row.session_id, origins: origins(row), waited })
+          .onConflictDoNothing()
+          .run()
+          .pipe(Effect.orDie)
+      })
+
+    const markPromoted = (sessionID: SessionID, itemID: ItemID, id: MessageID, waited: boolean) =>
+      writable(sessionID, (tx) =>
+        Effect.gen(function* () {
+          const row = yield* tx
+            .select()
+            .from(SessionPromptQueueTable)
+            .where(eq(SessionPromptQueueTable.id, itemID))
+            .get()
+            .pipe(Effect.orDie)
+          if (row) yield* promoted(tx, row, id, waited)
+        }),
       ).pipe(
         Effect.orDie,
         Effect.tap(() =>
@@ -817,12 +871,7 @@ const layer = Layer.effect(
               const row = yield* oldest(tx, sessionID, delivery)
               if (!row) return undefined
               if (row.message_id && (yield* landed(tx, row.message_id))) {
-                yield* tx
-                  .update(SessionPromptQueueTable)
-                  .set({ time_promoted: Date.now() })
-                  .where(eq(SessionPromptQueueTable.id, row.id))
-                  .run()
-                  .pipe(Effect.orDie)
+                yield* promoted(tx, row, row.message_id, true)
                 return { kind: "finished" as const, row }
               }
               const decoded = Schema.decodeUnknownExit(SessionPromptQueue.QueuedInput)(row.input)
@@ -864,6 +913,7 @@ const layer = Layer.effect(
       id: MessageID,
       prepared: P,
       write: (prepared: P) => Effect.Effect<unknown>,
+      waited: boolean,
     ) =>
       exclusive(
         sessionID,
@@ -889,10 +939,10 @@ const layer = Layer.effect(
           yield* write(prepared).pipe(
             Effect.onExit((exit) =>
               Exit.isSuccess(exit)
-                ? markPromoted(sessionID, itemID, id)
+                ? markPromoted(sessionID, itemID, id, waited)
                 : landed(db, id).pipe(
                     Effect.flatMap((exists) =>
-                      exists ? markPromoted(sessionID, itemID, id) : unreserve(sessionID, itemID),
+                      exists ? markPromoted(sessionID, itemID, id, waited) : unreserve(sessionID, itemID),
                     ),
                   ),
             ),
@@ -953,6 +1003,8 @@ const layer = Layer.effect(
                 next.id,
                 prepared.value,
                 input.write,
+                // Delivered by its own admission, a prompt never waited behind anything.
+                next.row.id !== input.own,
               )
               // Queued items run one per turn; the loop reevaluates before the next.
               if (written && input.delivery === "queue") return true
@@ -1137,6 +1189,34 @@ const layer = Layer.effect(
         return answered
       })
 
+    const annotate: Interface["annotate"] = (sessionID, messages) =>
+      db
+        .select()
+        .from(SessionPromptProvenanceTable)
+        .where(
+          and(eq(SessionPromptProvenanceTable.session_id, sessionID), eq(SessionPromptProvenanceTable.waited, true)),
+        )
+        .all()
+        .pipe(
+          Effect.orDie,
+          Effect.map((rows) => {
+            const waited = new Map(rows.map((row) => [row.message_id, row.origins]))
+            return messages.map((message) => {
+              const found = message.info.role === "user" ? waited.get(message.info.id) : undefined
+              if (!found) return message
+              const note: SessionV1.TextPart = {
+                id: PartID.ascending(),
+                sessionID,
+                messageID: message.info.id,
+                type: "text",
+                text: deliveryNote(found, message.info.time.created),
+                synthetic: true,
+              }
+              return { ...message, parts: [note, ...message.parts] }
+            })
+          }),
+        )
+
     return Service.of({
       admit,
       writeOrAdmit,
@@ -1162,6 +1242,7 @@ const layer = Layer.effect(
       remove,
       reorder,
       consolidate,
+      annotate,
     })
   }),
 )
@@ -1199,59 +1280,145 @@ function fromRow(row: typeof SessionPromptQueueTable.$inferSelect): Item {
     delivery: row.delivery,
     input: decodeInput(row.input),
     time: { created: row.time_created },
+    origins: origins(row),
   }
+}
+
+// A row stored before origins were kept has one: the time it was admitted.
+function origins(row: typeof SessionPromptQueueTable.$inferSelect): SessionPromptQueue.Origin[] {
+  return row.origins ?? [{ time: row.time_created }]
+}
+
+/**
+ * What a model is told of a prompt that waited in the queue: when each of its
+ * instructions was first queued, when identical copies of it were queued again,
+ * and when it was delivered. Built from stored times only, so the request for a
+ * turn reads the same every time it is sent.
+ */
+export function deliveryNote(origins: readonly SessionPromptQueue.Origin[], delivered: number) {
+  const at = (time: number) => new Date(time).toISOString().replace(/\.\d{3}Z$/, "Z")
+  const again = (origin: SessionPromptQueue.Origin) =>
+    origin.repeats?.length ? `, and again at ${origin.repeats.map(at).join(", ")}` : ""
+  const first = Math.min(...origins.map((origin) => origin.time))
+  const waited = `${elapsed(delivered - first)} after it was first queued`
+  if (origins.length === 1)
+    return `[Queued prompt: queued at ${at(origins[0]!.time)}${again(origins[0]!)}; delivered at ${at(delivered)}, ${waited}.]`
+  const steps = origins.map((origin, index) => `step ${index + 1} at ${at(origin.time)}${again(origin)}`)
+  return `[Queued prompt merged from ${origins.length} queued instructions: ${steps.join("; ")}; delivered at ${at(delivered)}, ${waited}.]`
+}
+
+function elapsed(ms: number) {
+  const seconds = Math.max(0, Math.round(ms / 1000))
+  const parts = [
+    [Math.floor(seconds / 86400), "d"],
+    [Math.floor(seconds / 3600) % 24, "h"],
+    [Math.floor(seconds / 60) % 60, "m"],
+    [seconds % 60, "s"],
+  ] as const
+  const shown = parts.filter(([value]) => value > 0)
+  return shown.length === 0 ? "0s" : shown.map(([value, unit]) => `${value}${unit}`).join("")
 }
 
 /**
  * The consolidate button's plan over pending items in promotion order (#212).
- * Of identical items, in any category, the first stays. Then commands that
- * share a category, a leading verb (any case) and a target, the next word,
- * merge into the first of them as `<verb> <target>:` and numbered steps in
- * promotion order. A command is a prompt of one plain text part, `<verb>
- * <target> [step]`; a bare `<verb> <target>` is its own step, and a merged
- * command parses back into its own steps, so a later consolidation adds to them. Commands merge only with the same agent, model and
- * options, which their steps then share.
+ * Identical items, in any category, collapse into the first: it keeps its
+ * place, takes the newest copy's admission time, and keeps every copy's queue
+ * time. Then commands that share a category, a leading verb (any case) and a
+ * target, the next word, merge into the first of them as `<verb> <target>:` and
+ * numbered steps in promotion order, each step keeping its own queue times. A
+ * command is a prompt of one plain text part, `<verb> <target> [step]`; a bare
+ * `<verb> <target>` is its own step, and a merged command parses back into its
+ * own steps, so a later consolidation adds to them. A machine message (one
+ * `markers` or the built-in envelopes mark) is never a command. Commands merge
+ * only with the same agent and options, which their steps then share. The model
+ * and variant a prompt was sent with decide nothing, since a pending prompt runs
+ * at the session's selection when it is delivered.
  */
-export function consolidation(items: readonly Item[]) {
-  const seen = new Set<string>()
-  const kept = items.filter((item) => {
-    const key = JSON.stringify(withoutUndefined(withoutIDs(item.input)))
-    if (seen.has(key)) return false
-    seen.add(key)
-    return true
-  })
+export function consolidation(items: readonly Item[], markers?: ConfigV1.Info["machine_message_markers"]) {
+  const copies = Map.groupBy(items, (item) => JSON.stringify(withoutUndefined(comparable(item.input))))
+  const kept = [...copies.values()].map((group) => ({
+    item: {
+      ...group[0]!,
+      time: { created: Math.max(...group.map((copy) => copy.time.created)) },
+      origins: group.slice(1).reduce((origins, copy) => repeated(origins, copy.origins), group[0]!.origins),
+    },
+    collapsed: group.length > 1,
+  }))
   const groups = Map.groupBy(
-    kept.flatMap((item) => {
-      const command = parseCommand(item.input)
+    kept.flatMap((entry) => {
+      const command = marked(entry.item.input, markers) ? undefined : parseCommand(entry.item.input)
       if (!command) return []
-      // Built from the normalized input, so message and part IDs never decide similarity.
-      const normalized = withoutIDs(item.input)
+      const normalized = comparable(entry.item.input)
       const context = withoutUndefined({ ...normalized, parts: [{ ...normalized.parts[0], text: "" }] })
       return [
-        { item, command, key: JSON.stringify([item.delivery, command.verb.toLowerCase(), command.target, context]) },
+        {
+          item: entry.item,
+          command,
+          key: JSON.stringify([entry.item.delivery, command.verb.toLowerCase(), command.target, context]),
+        },
       ]
     }),
     (entry) => entry.key,
   )
   const merges = [...groups.values()].filter((group) => group.length > 1)
   const mergedAway = new Set(merges.flatMap((group) => group.slice(1).map((entry) => entry.item.id)))
-  return {
-    removed: items.filter((item) => !kept.includes(item) || mergedAway.has(item.id)).map((item) => item.id),
-    merged: merges.map((group) => {
+  const heads = new Map(
+    merges.map((group) => {
       const first = group[0]!
       const text = [
         `${first.command.verb} ${first.command.target}:`,
         ...group.flatMap((entry) => entry.command.steps).map((step, index) => `${index + 1}. ${step}`),
       ].join("\n")
-      return {
-        id: first.item.id,
-        input: {
-          ...first.item.input,
-          parts: [{ ...first.item.input.parts[0]!, text }],
-        } as SessionPromptQueue.QueuedInput,
-      }
+      return [
+        first.item.id,
+        {
+          ...first.item,
+          time: { created: Math.max(...group.map((entry) => entry.item.time.created)) },
+          input: {
+            ...first.item.input,
+            parts: [{ ...first.item.input.parts[0]!, text }],
+          } as SessionPromptQueue.QueuedInput,
+          origins: group.flatMap((entry) =>
+            entry.item.origins.length === entry.command.steps.length
+              ? entry.item.origins
+              : entry.command.steps.map(() => entry.item.origins.reduce(combine)),
+          ),
+        },
+      ]
+    }),
+  )
+  const survivors = new Set(kept.map((entry) => entry.item.id))
+  return {
+    removed: items.filter((item) => !survivors.has(item.id) || mergedAway.has(item.id)).map((item) => item.id),
+    changed: kept.flatMap((entry) => {
+      const head = heads.get(entry.item.id)
+      if (head) return [head]
+      return entry.collapsed && !mergedAway.has(entry.item.id) ? [entry.item] : []
     }),
   }
+}
+
+// What two inputs are compared by: never their transport IDs, nor the model and
+// variant they were sent with, which only selected the session's.
+function comparable(input: SessionPromptQueue.QueuedInput) {
+  return Struct.omit(withoutIDs(input), ["model", "variant"])
+}
+
+function marked(input: SessionPromptQueue.QueuedInput, markers?: ConfigV1.Info["machine_message_markers"]) {
+  const text = input.parts.flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : [])).join("")
+  return MachineMessage.classify(text, markers) !== undefined
+}
+
+// A copy's queue times join the survivor's: step by step when both carry the
+// same instructions, otherwise all on the first.
+function repeated(origins: readonly SessionPromptQueue.Origin[], copy: readonly SessionPromptQueue.Origin[]) {
+  if (origins.length === copy.length) return origins.map((origin, index) => combine(origin, copy[index]!))
+  return [copy.reduce(combine, origins[0]!), ...origins.slice(1)]
+}
+
+function combine(left: SessionPromptQueue.Origin, right: SessionPromptQueue.Origin): SessionPromptQueue.Origin {
+  const times = [left.time, ...(left.repeats ?? []), right.time, ...(right.repeats ?? [])].sort((a, b) => a - b)
+  return { time: times[0]!, repeats: times.slice(1) }
 }
 
 function parseCommand(input: SessionPromptQueue.QueuedInput) {

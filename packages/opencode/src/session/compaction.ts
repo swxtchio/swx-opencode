@@ -377,7 +377,8 @@ const layer = Layer.effect(
         { sessionID: input.sessionID },
         { context: [], prompt: undefined },
       )
-      const msgs = structuredClone(selected.head)
+      // Queue times reach the summary, as they reach a turn's request (#212).
+      const msgs = structuredClone(yield* queue.annotate(input.sessionID, selected.head))
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
       const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
       const nextPrompt =

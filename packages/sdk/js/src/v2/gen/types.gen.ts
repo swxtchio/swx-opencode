@@ -762,6 +762,11 @@ export type SessionPromptQueueInput = {
   parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
 }
 
+export type SessionPromptQueueOrigin = {
+  time: number
+  repeats?: Array<number>
+}
+
 export type SessionPromptQueueItem = {
   id: string
   sessionID: string
@@ -772,8 +777,15 @@ export type SessionPromptQueueItem = {
   delivery: "steer" | "queue"
   input: SessionPromptQueueInput
   time: {
+    /**
+     * When this item's own copy was last admitted; origins say when its instructions were first queued
+     */
     created: number
   }
+  /**
+   * One per instruction the item carries, in order: a merged command has one per step; repeats are identical copies collapsed into it
+   */
+  origins: Array<SessionPromptQueueOrigin>
 }
 
 export type QuestionOption = {

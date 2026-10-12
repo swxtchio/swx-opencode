@@ -44,6 +44,7 @@ const items: SessionPromptQueueItem[] = [
     delivery: "steer",
     input: { parts: [{ type: "text", text: "steer the running turn" }] },
     time: { created: 2 },
+    origins: [{ time: 2 }],
   },
   {
     id: "que_queue",
@@ -52,6 +53,7 @@ const items: SessionPromptQueueItem[] = [
     delivery: "queue",
     input: { parts: [{ type: "text", text: "queued for later" }] },
     time: { created: 3 },
+    origins: [{ time: 3 }],
   },
 ]
 
@@ -173,9 +175,18 @@ test("an effort the user picks becomes the open session's selection, which its p
     // Restoring the transcript's model is not a choice, so nothing is selected yet.
     expect(app.selections).toEqual([])
 
+    // Saved efforts outlive a run, so the cycle starts anywhere; each pick is sent.
     app.dispatch("variant.cycle")
-    await until(() => app.selections.length === 1, "the selection update")
-    expect(app.selections).toEqual([{ model: { providerID: "test", id: "model", variant: "low" } }])
+    await until(() => app.selections.length === 1, "the first selection update")
+    app.dispatch("variant.cycle")
+    await until(() => app.selections.length === 2, "the second selection update")
+    const picked = app.selections as { model: { providerID: string; id: string; variant: string } }[]
+    expect(picked.map((selection) => [selection.model.providerID, selection.model.id])).toEqual([
+      ["test", "model"],
+      ["test", "model"],
+    ])
+    expect(["low", "high", "default"]).toContain(picked[0]!.model.variant)
+    expect(picked[1]!.model.variant).not.toBe(picked[0]!.model.variant)
   } finally {
     await app.stop()
   }
