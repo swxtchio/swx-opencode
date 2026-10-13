@@ -41,7 +41,7 @@
    Resending recalled text is an ordinary new send with a new `requestID`. The withdrawn original's
    POST answers 409 PromptWithdrawn; the TUI no longer reports that as a send failure.
 4. Commands (`/cmd`) and shell mode keep today's path: a command is expanded before it is admitted
-   and names no request, so it cannot be confirmed by receipt. Filed as a follow-up rather than
+   and names no request, so it cannot be confirmed by receipt. Filed as swxtchio/swx-opencode#250 rather than
    widening this change into the command-expansion path that swxtchio/swx-opencode#244 reworks.
 
 ## Tests

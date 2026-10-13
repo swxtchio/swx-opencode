@@ -162,6 +162,12 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Features
 
+- **#249** The TUI shows a sent prompt the moment the composer clears (swxtchio/swx-opencode#249). The pending row
+  under the prompt box lists the most recent pending prompts, each marked `QUEUED`, and a prompt still being sent
+  shows under the `requestID` it is sent as until the queue lists that request. UP on an empty composer withdraws the
+  last pending prompt and puts its typed text and mentions back in the composer; a prompt promoted before the
+  withdrawal is never copied, and one the composer can no longer take is restored to the queue. A send that ends
+  withdrawn is not reported as a failure. Server queue handling is unchanged. _Fork-only._
 - **#245** Review and freshen pending queued prompts (swxtchio/swx-opencode#212). The TUI lists a session's pending
   prompts under the prompt box; reviewing them holds promotion (`hold`/`release` in `session/queue.ts`) while they are
   deleted, reordered or consolidated. A pending prompt runs at the session's current model and variant when it is
