@@ -204,27 +204,28 @@ it.live(
 
       yield* tui.prompt("start")
       yield* llm.wait(1)
-      // Queued behind the running turn, these wait for it to end.
+      // Queued behind the running turn, these wait for it to end; the second
+      // changelog takes the first in as it is admitted.
       yield* Effect.forEach(
         ["drop this one", "run lint", "write the changelog", "run lint --fix", "write the changelog"],
         (text) => tui.prompt(text, "queue"),
         { discard: true },
       )
-      yield* tui.screen("5 pending · 0 steer · 5 queue", "the prompt's row")
+      yield* tui.screen("4 pending · 0 steer · 4 queue", "the prompt's row")
 
       // Activating the row pauses delivery; the confirmed hold says so.
       yield* tui.open
       yield* tui.screen("(delivery paused)", "the review view")
       // Unheld, a steer is delivered into the running turn at admission.
       yield* tui.prompt("steer while reviewing")
-      const listed = yield* tui.screen("6 pending · 1 steer · 5 queue", "the prompt's row")
+      const listed = yield* tui.screen("5 pending · 1 steer · 4 queue", "the prompt's row")
       const order = ["steer while reviewing", "drop this one", "run lint", "write the changelog", "run lint --fix"].map(
         (text) => listed.indexOf(text),
       )
       expect(order.every((at) => at >= 0)).toBe(true)
       expect(order).toEqual(order.toSorted((a, b) => a - b))
 
-      // The turn ends where it would deliver them, and goes idle with all six pending.
+      // The turn ends where it would deliver them, and goes idle with all five pending.
       yield* Deferred.succeed(gate, undefined)
       yield* tui.idle
       expect(yield* llm.calls).toBe(1)
@@ -234,7 +235,6 @@ it.live(
         "run lint",
         "write the changelog",
         "run lint --fix",
-        "write the changelog",
       ])
 
       // Delete the second row; its durable row is gone, not withdrawn.
@@ -249,7 +249,7 @@ it.live(
         "the deleted prompt's row was never removed",
       )
 
-      // Consolidate: one changelog, and the two lint commands as one with steps.
+      // Consolidate: the two lint commands as one with steps.
       tui.renderer.mockInput.pressKey("o", { ctrl: true })
       yield* pollWithTimeout(
         tui.rows.pipe(Effect.map((rows) => (texts(rows).length === 3 ? texts(rows) : undefined))),

@@ -1141,14 +1141,12 @@ const layer = Layer.effect(
       const classificationText = input.parts
         .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
         .join("")
-      const classification = MachineMessage.classify(
-        classificationText,
-        (yield* config.get()).machine_message_markers,
-      )
+      const markers = (yield* config.get()).machine_message_markers
+      const classification = MachineMessage.classify(classificationText, markers)
       const delivery = classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
       // A request the session already has is followed, never admitted or applied again (#212).
       if (input.requestID && Option.isSome(yield* queue.receipt(input.sessionID, input.requestID)))
-        return yield* followRequest(input, yield* queue.request({ ...input, ...(delivery ? { delivery } : {}) }))
+        return yield* followRequest(input, yield* queue.request({ ...input, ...(delivery ? { delivery } : {}) }, markers))
       // A prompt's model and variant become the session's selection now, and a
       // pending prompt runs at whichever selection is current when it is
       // delivered (swxtchio/swx-opencode#212).
@@ -1183,7 +1181,7 @@ const layer = Layer.effect(
       const heldNoReply =
         markedNoReply && (initiallyHeldNoReply || noReplyDecision?.kind === "queued")
       const requested =
-        noReplyDecision || (input.noReply === true && !markedNoReply) ? undefined : yield* queue.request(admission)
+        noReplyDecision || (input.noReply === true && !markedNoReply) ? undefined : yield* queue.request(admission, markers)
       // Another caller admitted the same request first.
       if (requested?.kind === "retry") return yield* followRequest(input, requested)
       const entry = noReplyDecision

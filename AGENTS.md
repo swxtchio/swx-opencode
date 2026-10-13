@@ -183,6 +183,10 @@ const table = sqliteTable("session", {
   on the request only (#212). A pending prompt runs at the session's model and variant when it is delivered
   (`prepareQueued` in `prompt.ts`), never the ones it was admitted with.
 - The TUI review view holds a session's promotion (`hold`/`release` in `queue.ts`, #212). Both `reserve` and `commit` check `held()`: without the `reserve` check a promotion loop re-reserves forever against a `commit` that refuses. A new promotion path needs the same checks, and `awaitingDrain` must keep ignoring held pending rows or a drain caller re-drains in a loop.
+- A sender that names a `requestID` confirms by receipt, not text (#212). Receipts ride on the item that carries them
+  (`settleReceipts` in `queue.ts`), so any new path that deletes, merges or promotes a pending row must settle them, or
+  the sender sees its request pending forever. Rules that hide a sender's text (`admission`) apply only when every item
+  involved names a request.
 
 ## Session Retention (fork)
 

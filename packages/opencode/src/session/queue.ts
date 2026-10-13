@@ -110,10 +110,13 @@ export interface Interface {
    * Admits a prompt, unless it names a request this session already has (#212).
    * The same prompt again is a retry: nothing is admitted, and `own` is a new
    * waiter's id that follows whatever carries the request now. A different
-   * prompt under that request fails with RequestConflictError.
+   * prompt under that request fails with RequestConflictError. An admitted
+   * prompt then retires the pending items it positively replaces; see
+   * `admission`. `markers` are the configured machine-message markers.
    */
   readonly request: (
     input: AdmitInput,
+    markers?: ConfigV1.Info["machine_message_markers"],
   ) => Effect.Effect<
     | { readonly kind: "admitted"; readonly own: Item }
     | { readonly kind: "retry"; readonly own: ItemID; readonly receipt: Receipt },
@@ -367,9 +370,12 @@ const layer = Layer.effect(
       return admitted.own
     })
 
-    const admitLocked = Effect.fnUntraced(function* (input: AdmitInput) {
+    const admitLocked = Effect.fnUntraced(function* (
+      input: AdmitInput,
+      markers?: ConfigV1.Info["machine_message_markers"],
+    ) {
       const now = Date.now()
-      const row = yield* writable(input.sessionID, (tx) =>
+      const admitted = yield* writable(input.sessionID, (tx) =>
         Effect.gen(function* () {
           const allocated = yield* tx
             .insert(SessionPromptQueueSequenceTable)
@@ -408,15 +414,94 @@ const layer = Layer.effect(
                 time_updated: now,
               })
               .run()
-          return row
+          if (!row) return undefined
+          return { row, ...(yield* replace(tx, input.sessionID, row, markers)) }
         }),
       ).pipe(Effect.orDie)
-      if (!row) return yield* Effect.die(new Error(`Queue admission for ${input.sessionID} stored nothing`))
-      channels.set(row.id, { sessionID: input.sessionID })
+      if (!admitted) return yield* Effect.die(new Error(`Queue admission for ${input.sessionID} stored nothing`))
+      channels.set(admitted.row.id, { sessionID: input.sessionID })
+      retire(admitted.retired, admitted.row.id)
+      if (admitted.into) retire([admitted.row.id], admitted.into)
+      finish(admitted.finished)
       wake(input.sessionID)
       yield* publish(input.sessionID)
-      return fromRow(row)
+      return fromRow(admitted.row)
     })
+
+    // Applies `admission` for a just-admitted row, in its transaction: the row
+    // takes in identical copies and repeated peer requests and retires the
+    // notices it supersedes, taking the place of the oldest of them, and then
+    // joins a command it continues as that command's next step.
+    const replace = Effect.fnUntraced(function* (
+      tx: DatabaseTransaction,
+      sessionID: SessionID,
+      added: typeof SessionPromptQueueTable.$inferSelect,
+      markers?: ConfigV1.Info["machine_message_markers"],
+    ) {
+      const pendingOf = () =>
+        tx
+          .select()
+          .from(SessionPromptQueueTable)
+          .where(and(pending(sessionID), eq(SessionPromptQueueTable.delivery, added.delivery)))
+          .orderBy(asc(SessionPromptQueueTable.seq))
+          .all()
+          .pipe(Effect.orDie)
+      const first = admission((yield* pendingOf()).map(fromRow), fromRow(added), markers)
+      if (first.absorbed.length + first.superseded.length === 0 && !first.into)
+        return {
+          retired: [] as ItemID[],
+          into: undefined,
+          finished: [] as { readonly id: ItemID; readonly message: MessageID }[],
+        }
+      // A promotion being prepared for any of them must prepare again.
+      const finished = yield* invalidate(tx, sessionID)
+      const rows = yield* pendingOf()
+      const plan = admission(rows.map(fromRow), fromRow(added), markers)
+      const retired = [...plan.absorbed, ...plan.superseded]
+      if (retired.length > 0) {
+        yield* tx
+          .delete(SessionPromptQueueTable)
+          .where(inArray(SessionPromptQueueTable.id, retired))
+          .run()
+          .pipe(Effect.orDie)
+        const absorbed = rows.filter((row) => plan.absorbed.includes(row.id))
+        yield* tx
+          .update(SessionPromptQueueTable)
+          .set({
+            seq: Math.min(added.seq, ...rows.filter((row) => retired.includes(row.id)).map((row) => row.seq)),
+            origins: [...absorbed, added].map(origins).reduce(repeated),
+          })
+          .where(eq(SessionPromptQueueTable.id, added.id))
+          .run()
+          .pipe(Effect.orDie)
+        if (plan.superseded.length > 0)
+          yield* settleReceipts(tx, sessionID, plan.superseded, { kind: "superseded", by: added.request_id! })
+        if (absorbed.length > 0)
+          yield* settleReceipts(tx, sessionID, plan.absorbed, { kind: "merged", into: (yield* rowOf(tx, added.id))! })
+      }
+      const survivor = (yield* rowOf(tx, added.id))!
+      const head = plan.into ? rows.find((row) => row.id === plan.into) : undefined
+      if (!head) return { retired, into: undefined, finished, row: survivor }
+      const merged = consolidation([fromRow(head), fromRow(survivor)], markers).changed.find(
+        (item) => item.id === head.id,
+      )!
+      yield* tx
+        .update(SessionPromptQueueTable)
+        .set({ input: encodeInput(merged.input), origins: [...merged.origins], time_created: merged.time.created })
+        .where(eq(SessionPromptQueueTable.id, head.id))
+        .run()
+        .pipe(Effect.orDie)
+      yield* tx
+        .delete(SessionPromptQueueTable)
+        .where(eq(SessionPromptQueueTable.id, survivor.id))
+        .run()
+        .pipe(Effect.orDie)
+      yield* settleReceipts(tx, sessionID, [survivor.id], { kind: "merged", into: (yield* rowOf(tx, head.id))! })
+      return { retired, into: head.id, finished, row: survivor }
+    })
+
+    const rowOf = (tx: DatabaseTransaction, itemID: ItemID) =>
+      tx.select().from(SessionPromptQueueTable).where(eq(SessionPromptQueueTable.id, itemID)).get().pipe(Effect.orDie)
 
     const receiptRow = (sessionID: SessionID, requestID: RequestID) =>
       db
@@ -431,12 +516,12 @@ const layer = Layer.effect(
     const receipt: Interface["receipt"] = (sessionID, requestID) =>
       receiptRow(sessionID, requestID).pipe(Effect.map((row) => Option.fromNullishOr(row).pipe(Option.map(toReceipt))))
 
-    const request: Interface["request"] = (input) =>
+    const request: Interface["request"] = (input, markers) =>
       exclusive(
         input.sessionID,
         Effect.gen(function* () {
           const prior = input.requestID ? yield* receiptRow(input.sessionID, input.requestID) : undefined
-          if (!prior) return { kind: "admitted" as const, own: yield* admitLocked(input) }
+          if (!prior) return { kind: "admitted" as const, own: yield* admitLocked(input, markers) }
           if (prior.fingerprint !== fingerprint(input))
             return yield* new RequestConflictError({ sessionID: input.sessionID, requestID: prior.request_id })
           return { kind: "retry" as const, own: yield* follow(prior), receipt: toReceipt(prior) }
@@ -1611,7 +1696,7 @@ function elapsed(ms: number) {
  * at the session's selection when it is delivered.
  */
 export function consolidation(items: readonly Item[], markers?: ConfigV1.Info["machine_message_markers"]) {
-  const copies = Map.groupBy(items, (item) => JSON.stringify(withoutUndefined(comparable(item.input))))
+  const copies = Map.groupBy(items, copyKey)
   const kept = [...copies.values()].map((group) => ({
     item: {
       ...group[0]!,
@@ -1624,15 +1709,7 @@ export function consolidation(items: readonly Item[], markers?: ConfigV1.Info["m
     kept.flatMap((entry) => {
       const command = marked(entry.item.input, markers) ? undefined : parseCommand(entry.item.input)
       if (!command) return []
-      const normalized = comparable(entry.item.input)
-      const context = withoutUndefined({ ...normalized, parts: [{ ...normalized.parts[0], text: "" }] })
-      return [
-        {
-          item: entry.item,
-          command,
-          key: JSON.stringify([entry.item.delivery, command.verb.toLowerCase(), command.target, context]),
-        },
-      ]
+      return [{ item: entry.item, command, key: commandKey(entry.item, command) }]
     }),
     (entry) => entry.key,
   )
@@ -1679,6 +1756,77 @@ export function consolidation(items: readonly Item[], markers?: ConfigV1.Info["m
       return entry.collapsed && !mergedAway.has(entry.item.id) ? [entry.item] : []
     }),
   }
+}
+
+/**
+ * What admitting `added` replaces among the pending items of its delivery
+ * (#212), each only on positive evidence and never by age:
+ *
+ * - `absorbed`: identical copies, from any sender, whose text the survivor
+ *   repeats exactly; and earlier sends of the same peer request (same peer,
+ *   level, key and text, under another msgid). The added item takes them in,
+ *   keeping each one's queue time and request.
+ * - `superseded`: earlier notices with the added one's supersede key
+ *   (`[fm-level:nudge:<key>]`) from the same sender. They retire undelivered.
+ * - `into`: the earlier command `added` continues, under the verb-and-target
+ *   rule, which takes it in as its next step.
+ *
+ * Every rule but the identical copy hides what the sender sent, so it applies
+ * only when each item involved names a request, whose receipt then says what
+ * became of it. A critical message, a reply, and a message from another sender
+ * or with another reply target are never replaced.
+ */
+export function admission(pending: readonly Item[], added: Item, markers?: ConfigV1.Info["machine_message_markers"]) {
+  const others = pending.filter((item) => item.id !== added.id && item.delivery === added.delivery)
+  const own = envelopeOf(added)
+  const absorbed = others.filter((item) => {
+    if (copyKey(item) === copyKey(added)) return own?.level !== "critical"
+    if (!item.requestID || !added.requestID || !own?.sender.startsWith("peer") || own.reply) return false
+    if (own.level === "critical") return false
+    const other = envelopeOf(item)
+    return (
+      other?.sender === own.sender &&
+      other.level === own.level &&
+      other.key === own.key &&
+      !other.reply &&
+      other.body === own.body
+    )
+  })
+  const superseded =
+    own?.level === "nudge" && own.key && added.requestID
+      ? others.filter((item) => {
+          if (!item.requestID || absorbed.includes(item)) return false
+          const other = envelopeOf(item)
+          return other?.sender === own.sender && other.level === "nudge" && other.key === own.key
+        })
+      : []
+  const command = added.requestID && !marked(added.input, markers) ? parseCommand(added.input) : undefined
+  const into = command
+    ? others.find((item) => {
+        if (!item.requestID || absorbed.includes(item) || marked(item.input, markers)) return false
+        const other = parseCommand(item.input)
+        return other !== undefined && commandKey(item, other) === commandKey(added, command)
+      })
+    : undefined
+  return { absorbed: absorbed.map((item) => item.id), superseded: superseded.map((item) => item.id), into: into?.id }
+}
+
+function envelopeOf(item: Item) {
+  return MachineMessage.envelope(
+    item.input.parts.flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : [])).join(""),
+  )
+}
+
+function copyKey(item: Item) {
+  return JSON.stringify(withoutUndefined(comparable(item.input)))
+}
+
+// Commands merge within one delivery, verb (any case) and target, and with the
+// same agent and options.
+function commandKey(item: Item, command: { readonly verb: string; readonly target: string }) {
+  const normalized = comparable(item.input)
+  const context = withoutUndefined({ ...normalized, parts: [{ ...normalized.parts[0], text: "" }] })
+  return JSON.stringify([item.delivery, command.verb.toLowerCase(), command.target, context])
 }
 
 // What two inputs are compared by: never their transport IDs, nor the model and

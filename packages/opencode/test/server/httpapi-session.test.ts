@@ -2417,10 +2417,18 @@ describe("session HttpApi", () => {
           "write the changelog",
         ]
         yield* Effect.forEach(admitted, (text) => api.prompt(text, "queue"), { discard: true })
+        // The second "run lint now" is taken into the first as it is admitted.
         const pending = yield* pollWithTimeout(
-          api.listed().pipe(Effect.map((items) => (items.length === admitted.length ? items : undefined))),
+          api.listed().pipe(Effect.map((items) => (items.length === admitted.length - 1 ? items : undefined))),
           "prompts never queued",
         )
+        expect(api.texts(pending)).toEqual([
+          "drop this one",
+          "run lint now",
+          "fix auth.ts: handle a null token",
+          "fix auth.ts: add a regression test",
+          "write the changelog",
+        ])
         const [doomed] = pending
 
         const removed = yield* api.post(SessionQueuePaths.remove, { id: doomed!.id })
@@ -2918,19 +2926,19 @@ describe("session HttpApi queue freshness", () => {
         yield* send("same request", { model: { providerID: "test", modelID: "test-model" } })
         for (const prompt of ["run lint", "run lint --fix", peerOne, peerTwo]) yield* send(prompt)
         const admitted = yield* pollWithTimeout(
-          listed().pipe(Effect.map((items) => (items.length === 6 ? items : undefined))),
+          listed().pipe(Effect.map((items) => (items.length === 5 ? items : undefined))),
           "prompts never queued",
         )
-        // Pending, each is listed exactly as sent, as an exact-text delivery check expects.
-        expect(admitted.map(text)).toEqual([
-          "same request",
-          "same request",
-          "run lint",
-          "run lint --fix",
-          peerOne,
-          peerTwo,
-        ])
-        expect(admitted.map((item) => item.origins)).toEqual(admitted.map((item) => [{ time: item.time.created }]))
+        // Pending, each is listed exactly as sent, as an exact-text delivery check expects; the
+        // second copy of "same request" took the first in as it was admitted, keeping its time.
+        expect(admitted.map(text)).toEqual(["same request", "run lint", "run lint --fix", peerOne, peerTwo])
+        const [same, lint, fix] = admitted
+        const first = same!.origins[0]!.time
+        expect(same!.origins).toEqual([{ time: first, repeats: [{ time: same!.time.created }] }])
+        expect(first).toBeLessThanOrEqual(same!.time.created)
+        expect(admitted.slice(1).map((item) => item.origins)).toEqual(
+          admitted.slice(1).map((item) => [{ time: item.time.created }]),
+        )
         // A row a stopped process left two hours ago, stored before origins were kept.
         const old = Date.now() - 2 * 60 * 60 * 1000
         const { db } = yield* Database.Service
@@ -2947,7 +2955,6 @@ describe("session HttpApi queue freshness", () => {
           .run()
 
         const consolidated = yield* json<SessionQueue.Item[]>(yield* post(SessionQueuePaths.consolidate))
-        const [first, second, lint, fix] = admitted
         expect(consolidated.map(text)).toEqual([
           "same request",
           "run lint:\n1. run lint\n2. --fix",
@@ -2955,10 +2962,7 @@ describe("session HttpApi queue freshness", () => {
           peerTwo,
           "left by a stopped process",
         ])
-        expect(consolidated[0]!.origins).toEqual([
-          { time: first!.time.created, repeats: [{ time: second!.time.created }] },
-        ])
-        expect(consolidated[0]!.time.created).toBe(second!.time.created)
+        expect(consolidated[0]).toEqual(same)
         expect(consolidated[1]!.origins).toEqual([{ time: lint!.time.created }, { time: fix!.time.created }])
         expect(consolidated[4]!.origins).toEqual([{ time: old }])
 
@@ -2976,7 +2980,7 @@ describe("session HttpApi queue freshness", () => {
           /\[Queued prompt: queued at \S+; delivered at \S+, \d+s after it was first queued\.]/,
         )
         expect(lastUser[1]).toContain(
-          `[Queued prompt: queued at ${iso(first!.time.created)}, and again at ${iso(second!.time.created)}; delivered at `,
+          `[Queued prompt: queued at ${iso(first)}, and again at ${iso(same!.time.created)}; delivered at `,
         )
         expect(lastUser[2]).toContain(
           `[Queued prompt merged from 2 queued instructions: step 1 at ${iso(lint!.time.created)}; step 2 at ${iso(fix!.time.created)}; delivered at `,
@@ -3166,6 +3170,222 @@ describe("session HttpApi request receipts", () => {
       )
     },
     30_000,
+  )
+})
+
+describe("session HttpApi queue replacement at admission", () => {
+  const iso = (time: number) => new Date(time).toISOString().replace(/\.\d{3}Z$/, "Z")
+  const firstmate = (level: string, text: string) => `[fm-from-firstmate]\x1f[fm-level:${level}]\x1f ${text}`
+  const peer = (name: string, msgid: string, level: string, text: string) =>
+    `[fm-from-peer]\x1f ${name}\x1f /home/${name}\x1f ${msgid}\x1f [fm-level:${level}]\x1f ${text}`
+  const routesFor = (directory: string, sessionID: SessionIDType) => {
+    const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+    const params = { sessionID }
+    const body = (text: string, requestID?: string) => ({
+      agent: "build",
+      ...(requestID ? { requestID } : {}),
+      parts: [{ type: "text", text }],
+    })
+    return {
+      send: (text: string, requestID?: string, delivery?: SessionQueue.Delivery) =>
+        request(pathFor(SessionPaths.promptAsync, params), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ...body(text, requestID), ...(delivery ? { delivery } : {}) }),
+        }),
+      sync: (text: string, requestID: string) =>
+        request(pathFor(SessionPaths.prompt, params), {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body(text, requestID)),
+        }),
+      listed: () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }),
+      receipt: (requestID: string) =>
+        requestJson<SessionQueue.Receipt>(pathFor(SessionQueuePaths.receipt, { ...params, requestID }), { headers }),
+    }
+  }
+  const text = (item: SessionQueue.Item) =>
+    item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")
+
+  it.live(
+    "notices a newer one positively supersedes retire, repeated peer requests merge, and every distinct item stays with its age",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue replacement" }).pipe(provideInstanceEffect(directory))
+        const routes = routesFor(directory, session.id)
+        const ask = "please review the hostname brief"
+        const notices = {
+          waiting1: firstmate("nudge:wait.hostname", "Waiting on the hostname brief review since 10:00"),
+          review1: firstmate("nudge:review.r1", "Reviewer r1 completed round 1"),
+          idle1: firstmate("nudge:idle.datadog", "Datadog task idle for 10m"),
+          clerk1: firstmate("nudge:state.clerk", "Clerk draft: convergence approved"),
+          ask1: peer("peer-a", "p1760000000-1-aaaa", "request", ask),
+          waiting2: firstmate("nudge:wait.hostname", "Waiting on the hostname brief review since 10:00, now 40m"),
+          idle2: firstmate("nudge:idle.datadog", "Datadog task idle for 20m"),
+          review2: firstmate("nudge:review.r1", "Reviewer r1 completed round 2"),
+          ask2: peer("peer-a", "p1760000000-2-bbbb", "request", ask),
+          clerk2: firstmate(
+            "nudge:state.clerk",
+            "Clerk draft: exchange missing; earlier convergence notices are stale",
+          ),
+          storageA: firstmate("nudge:wait.storage-a", "Storage A held on dependency X"),
+          storageB: firstmate("nudge:wait.storage-b", "Storage B held on dependency Y"),
+          otherPeer: peer("peer-b", "p1760000000-3-cccc", "request", ask),
+          reply: peer("peer-a", "p1760000000-4-dddd", "info", "re:p1760000000-1-aaaa thanks"),
+          emulator: firstmate("request", "Emulator removal is active"),
+          quote: firstmate("request", "Plan the quote recovery"),
+          unnamed: firstmate("nudge:idle.datadog", "Datadog task idle for 30m, sent without a request"),
+          // Another sender's notice under the same key, and the same reply sent again.
+          peerWaiting: peer("peer-b", "p1760000000-7-abab", "nudge:wait.hostname", "peer-b waits on the brief too"),
+          reply2: peer("peer-a", "p1760000000-8-efef", "info", "re:p1760000000-1-aaaa thanks"),
+        }
+        const requestIDs: Record<string, string | undefined> = {
+          ask1: "p1760000000-1-aaaa",
+          ask2: "p1760000000-2-bbbb",
+          otherPeer: "p1760000000-3-cccc",
+          reply: "p1760000000-4-dddd",
+          unnamed: undefined,
+          peerWaiting: "p1760000000-7-abab",
+          reply2: "p1760000000-8-efef",
+        }
+        const named = (key: string) => (key in requestIDs ? requestIDs[key] : `fm-${key}`)
+
+        yield* routes.send("start")
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        for (const [key, message] of Object.entries(notices))
+          expect((yield* routes.send(message, named(key))).status).toBe(204)
+        const survivors = [
+          notices.waiting2,
+          notices.review2,
+          notices.idle2,
+          notices.clerk2,
+          notices.ask2,
+          notices.storageA,
+          notices.storageB,
+          notices.otherPeer,
+          notices.reply,
+          notices.emulator,
+          notices.quote,
+          notices.unnamed,
+          notices.peerWaiting,
+          notices.reply2,
+        ]
+        const pending = yield* pollWithTimeout(
+          routes.listed().pipe(Effect.map((items) => (items.length === survivors.length ? items : undefined))),
+          "the notices never settled",
+        )
+        // The newest of each kind holds the place of the oldest it replaced.
+        expect(pending.map(text)).toEqual(survivors)
+
+        for (const [old, by] of [
+          ["waiting1", "waiting2"],
+          ["review1", "review2"],
+          ["idle1", "idle2"],
+          ["clerk1", "clerk2"],
+        ])
+          expect(yield* routes.receipt(named(old)!)).toEqual({ state: "superseded", by: named(by)! })
+        const merged = pending.find((item) => item.requestID === "p1760000000-2-bbbb")!
+        expect(merged.origins).toHaveLength(1)
+        expect(merged.origins[0]).toMatchObject({
+          requestID: "p1760000000-1-aaaa",
+          repeats: [{ requestID: "p1760000000-2-bbbb" }],
+        })
+        expect(yield* routes.receipt("p1760000000-1-aaaa")).toEqual({ state: "merged", into: "p1760000000-2-bbbb" })
+        for (const key of ["storageA", "storageB", "otherPeer", "reply", "emulator", "quote"])
+          expect(yield* routes.receipt(named(key)!)).toMatchObject({ state: "pending" })
+
+        yield* Deferred.succeed(gate, undefined)
+        const inputs = yield* pollWithTimeout(
+          llm.inputs.pipe(Effect.map((inputs) => (inputs.length === survivors.length + 1 ? inputs : undefined))),
+          "the survivors were never all delivered",
+          "20 seconds",
+        )
+        const last = inputs.map((input) => JSON.stringify((input.messages as unknown[]).at(-1)))
+        survivors.forEach((survivor, index) => expect(last[index + 1]).toContain(JSON.stringify(survivor).slice(1, -1)))
+        const sent = JSON.stringify(inputs)
+        for (const retired of ["convergence approved", "completed round 1", "idle for 10m", 'since 10:00"'])
+          expect(sent).not.toContain(retired)
+        // The merged peer request says when each send was queued, and names both requests to answer.
+        const askNote = last.find(
+          (message) => message.includes("p1760000000-2-bbbb") && message.includes("[Queued prompt"),
+        )!
+        expect(askNote).toContain(
+          `[Queued prompt: queued at ${iso(merged.origins[0]!.time)}, and again at ${iso(merged.origins[0]!.repeats![0]!.time)}; delivered at `,
+        )
+        expect(askNote).toContain(
+          "It carries 2 requests, each owed its own reply: p1760000000-1-aaaa, p1760000000-2-bbbb.",
+        )
+        const delivered = yield* routes.receipt("p1760000000-2-bbbb")
+        expect(delivered.state).toBe("delivered")
+        expect(yield* routes.receipt("p1760000000-1-aaaa")).toEqual({
+          state: "merged",
+          into: "p1760000000-2-bbbb",
+          messageID: (delivered as Extract<SessionQueue.Receipt, { state: "delivered" }>).messageID,
+        })
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    60_000,
+  )
+
+  it.live(
+    "a sync caller of a merged request gets its survivor's reply, and commands merge only when each names a request",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue replacement" }).pipe(provideInstanceEffect(directory))
+        const routes = routesFor(directory, session.id)
+        const ask = "please rerun the deploy check"
+
+        yield* routes.send("start")
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        const waiting = yield* routes
+          .sync(peer("peer-a", "p1760000000-5-eeee", "request", ask), "p1760000000-5-eeee")
+          .pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          routes.listed().pipe(Effect.map((items) => (items.length === 1 ? items : undefined))),
+          "the sync request never queued",
+        )
+        yield* routes.send(peer("peer-a", "p1760000000-6-ffff", "request", ask), "p1760000000-6-ffff")
+        yield* routes.send("run lint", "tui-lint", "queue")
+        yield* routes.send("run lint --fix", "tui-fix", "queue")
+        yield* routes.send("deploy app", undefined, "queue")
+        yield* routes.send("deploy app now", "tui-deploy", "queue")
+        const pending = yield* pollWithTimeout(
+          routes.listed().pipe(Effect.map((items) => (items.length === 4 ? items : undefined))),
+          "the prompts never settled",
+        )
+        expect(pending.map(text)).toEqual([
+          peer("peer-a", "p1760000000-6-ffff", "request", ask),
+          "run lint:\n1. run lint\n2. --fix",
+          "deploy app",
+          "deploy app now",
+        ])
+        expect(yield* routes.receipt("tui-fix")).toEqual({ state: "merged", into: "tui-lint" })
+        expect(yield* routes.receipt("p1760000000-5-eeee")).toEqual({ state: "merged", into: "p1760000000-6-ffff" })
+
+        yield* llm.text("deploy check rerun")
+        yield* Deferred.succeed(gate, undefined)
+        const reply = yield* Fiber.join(waiting).pipe(Effect.flatMap(json<SessionV1.WithParts>))
+        expect(reply.info.role).toBe("assistant")
+        expect(reply.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual(["deploy check rerun"])
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    60_000,
   )
 })
 
