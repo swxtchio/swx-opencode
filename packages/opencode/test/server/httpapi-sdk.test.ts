@@ -251,7 +251,8 @@ function withStandardProject<A, E>(
 function withFakeLlm<A, E>(serverPath: ServerPath, run: (input: LlmProjectFixture) => Effect.Effect<A, E, TestScope>) {
   return Effect.gen(function* () {
     const llm = yield* TestLLMServer
-    return yield* withProject(serverPath, { config: testProviderConfig(llm.url) }, (input) => run({ ...input, llm }))
+    // Provider queue fixtures own their configuration boundary; a non-Git project scans ancestors up to "/".
+    return yield* withProject(serverPath, { git: true, config: testProviderConfig(llm.url) }, (input) => run({ ...input, llm }))
   }).pipe(Effect.provide(TestLLMServer.layer))
 }
 
@@ -774,8 +775,11 @@ describe("HttpApi SDK", () => {
   // Prompt queue (swxtchio/swx-opencode#68) through the regenerated V1 client.
   serverPathParity("drives the prompt queue through the generated SDK", (serverPath) => {
     const gate = Deferred.makeUnsafe<void>()
-    return withFakeLlm(serverPath, ({ sdk, llm }) =>
+    return withFakeLlm(serverPath, ({ sdk, llm, directory }) =>
       Effect.gen(function* () {
+        const paths = yield* capture(() => sdk.path.get())
+        expect(paths.status).toBe(200)
+        expect(record(paths.data).worktree).toBe(directory)
         yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
         yield* llm.text("queued done")
         const session = yield* capture(() => sdk.session.create({ title: "sdk queue" }))
