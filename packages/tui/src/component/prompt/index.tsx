@@ -54,6 +54,7 @@ import { useArgs } from "../../context/args"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useLeaderActive, useOpencodeKeymap } from "../../keymap"
 import { useTuiConfig } from "../../config"
 import { usePromptWorkspace } from "./workspace"
+import { PromptQueueRow } from "./queue"
 import { usePromptMove } from "./move"
 import { readLocalAttachment } from "./local-attachment"
 import { useLocation } from "../../context/location"
@@ -333,6 +334,32 @@ export function Prompt(props: PromptProps) {
       }
     }
   })
+
+  // The picker is the open session's selection, which its pending prompts run
+  // at when they are delivered (swxtchio/swx-opencode#212).
+  createEffect(
+    on(
+      local.model.chosen,
+      () => {
+        const model = local.model.current()
+        if (!props.sessionID || !model) return
+        void sdk.client.session
+          .update({
+            sessionID: props.sessionID,
+            model: {
+              providerID: model.providerID,
+              id: model.modelID,
+              variant: local.model.variant.current() ?? "default",
+            },
+          })
+          .then((result) => {
+            if (result.error)
+              toast.show({ variant: "error", message: "Could not select this model for the session's queued prompts" })
+          })
+      },
+      { defer: true },
+    ),
+  )
 
   const promptCommands = createMemo(() =>
     [
@@ -1097,6 +1124,8 @@ export function Prompt(props: PromptProps) {
         .prompt(
           {
             sessionID,
+            // Names this send, so the server can say what became of it (#212).
+            requestID: crypto.randomUUID(),
             ...selectedModel,
             agent: agent.name,
             model: selectedModel,
@@ -1690,6 +1719,7 @@ export function Prompt(props: PromptProps) {
             </box>
           </Show>
         </box>
+        <PromptQueueRow sessionID={props.sessionID} />
       </box>
       <Autocomplete
         sessionID={props.sessionID}

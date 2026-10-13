@@ -143,6 +143,17 @@ export class PromptWithdrawnError extends Schema.TaggedErrorClass<PromptWithdraw
   { httpApiStatus: 409 },
 ) {}
 
+// A prompt named a request the session already has, with a different prompt (#212).
+export class PromptRequestConflictError extends Schema.TaggedErrorClass<PromptRequestConflictError>()(
+  "PromptRequestConflict",
+  {
+    sessionID: Schema.String,
+    requestID: Schema.String,
+    message: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {}
+
 export class QueueItemNotWithdrawnError extends Schema.TaggedErrorClass<QueueItemNotWithdrawnError>()(
   "QueueItemNotWithdrawn",
   {

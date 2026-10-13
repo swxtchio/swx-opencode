@@ -825,7 +825,10 @@ describe("HttpApi SDK", () => {
         yield* Deferred.succeed(gate, void 0)
         yield* awaitWithTimeout(llm.wait(2), "sent-now prompt never reached the model", "10 seconds")
         const messages = (yield* llm.inputs)[1]?.messages
-        expect(Array.isArray(messages) ? messages.at(-1) : undefined).toEqual({ role: "user", content: "sdk queued" })
+        // Delivered from the queue, it says when it was queued (#212).
+        const delivered = JSON.stringify(Array.isArray(messages) ? messages.at(-1) : undefined)
+        expect(delivered).toContain('"text":"sdk queued"')
+        expect(delivered).toContain("[Queued prompt: queued at ")
       }).pipe(Effect.ensuring(Deferred.succeed(gate, void 0))),
     )
   })

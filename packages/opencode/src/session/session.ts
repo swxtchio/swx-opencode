@@ -435,6 +435,8 @@ export interface Interface {
     model: NonNullable<Info["model"]>
     time: number
   }) => Effect.Effect<void>
+  /** Selects the model a pending prompt runs at when it is delivered (swxtchio/swx-opencode#212). */
+  readonly setModel: (input: { sessionID: SessionID; model: NonNullable<Info["model"]> }) => Effect.Effect<void>
   readonly setPermission: (input: { sessionID: SessionID; permission: PermissionV1.Ruleset }) => Effect.Effect<void>
   readonly setRevert: (input: {
     sessionID: SessionID
@@ -810,6 +812,13 @@ const layer: Layer.Layer<
       }).pipe(Effect.orDie)
     })
 
+    const setModel = Effect.fn("Session.setModel")(function* (input: {
+      sessionID: SessionID
+      model: NonNullable<Info["model"]>
+    }) {
+      yield* patch(input.sessionID, { model: input.model, time: { updated: Date.now() } }).pipe(Effect.orDie)
+    })
+
     const setPermission = Effect.fn("Session.setPermission")(function* (input: {
       sessionID: SessionID
       permission: PermissionV1.Ruleset
@@ -952,6 +961,7 @@ const layer: Layer.Layer<
       setArchived,
       setMetadata,
       setAgentModel,
+      setModel,
       setPermission,
       setRevert,
       clearRevert,

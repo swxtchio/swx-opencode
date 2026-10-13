@@ -164,6 +164,18 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Features
 
+- **#245** Review and freshen pending queued prompts (swxtchio/swx-opencode#212). The TUI lists a session's pending
+  prompts under the prompt box; reviewing them holds promotion (`hold`/`release` in `session/queue.ts`) while they are
+  deleted, reordered or consolidated. A pending prompt runs at the session's current model and variant when it is
+  delivered, and reaches the model, on the request only, saying when it was queued (provenance timestamps in
+  migration `20261012010120`). Prompts take an optional `requestID`: an exact retry admits nothing, a different
+  prompt under the same ID is 409 `PromptRequestConflict`, and `GET /session/:id/queue/receipt/:requestID` reports
+  `pending`, `delivered`, `merged`, `superseded` or `deleted` (`session_prompt_receipt`, migration
+  `20261013020615`, classified by the retention tool). Admission absorbs identical copies, and, when every item names
+  a request, merges repeated peer requests, supersedes same-sender `[fm-level:nudge:<key>]` notices and joins verb and
+  target continuations; critical messages and replies are never replaced. A waiter on its own prompt no longer
+  starts a run on a session a cancel parked. A summary records the variant and effort its request actually sent,
+  including when interrupted, without changing what it selects (swxtchio/swx-opencode#227). _Fork-only._
 - **#205** Native V2 `SessionV2.wait` and `POST /api/session/:sessionID/wait` return a positive outcome from committed state, either `idle`, `pending`, `completed`, `failed` or `interrupted`, with the highest admitted sequence covered, instead of always answering 503. Wait joins an active drain but never starts or recovers work, still answers 503 when committed state cannot establish the outcome, and attributes a failure only to the work that contained it, using the new optional `Prompted.continuation` marker. An interruption is identified by the new optional assistant error `origin` (swxtchio/swx-opencode#179). _Upstreamable._
 - **#161** The TUI collapses each run of consecutive encrypted reasoning parts from OpenAI Responses models, such as GPT-6 Luna and Sol through `swx-azure`, into one `Thought <count> · <duration>` line that updates as each part arrives, in the live stream and in loaded history. A tool call, visible text, or a message error starts a new line; non-encrypted reasoning renders as before (swxtchio/swx-opencode#53). _Upstreamable._
 - **#159** Add `skills.exclude`, glob patterns for `SKILL.md` files that skip copies in every skill root, such as hidden per-host installs and `.trash` folders. Patterns match relative to each root, and excluded skills are not loaded, so they cannot shadow the canonical skill of the same name (swxtchio/swx-opencode#59). _Upstreamable._

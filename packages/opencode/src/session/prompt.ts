@@ -106,7 +106,9 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
-  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError>
+  readonly prompt: (
+    input: PromptInput,
+  ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError | SessionQueue.RequestConflictError>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (
@@ -634,7 +636,7 @@ const layer = Layer.effect(
         return {
           providerID: ProviderV2.ID.make(current.model.providerID),
           modelID: ModelV2.ID.make(current.model.id),
-          ...(current.model.variant && current.model.variant !== "default" ? { variant: current.model.variant } : {}),
+          variant: current.model.variant && current.model.variant !== "default" ? current.model.variant : undefined,
         }
       }
       const match = yield* sessions
@@ -659,8 +661,8 @@ const layer = Layer.effect(
         throw error
       }
 
-      const selected = input.group ? yield* currentModel(input.sessionID) : undefined
-      const model = selected ?? input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
+      const selected = input.group || !(input.model || ag.model) ? yield* currentModel(input.sessionID) : undefined
+      const model = selected ?? input.model ?? ag.model!
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       // Also fetched when a variant was requested explicitly, so it can be
       // validated. Without this an unknown name reached request.ts, where
@@ -684,9 +686,9 @@ const layer = Layer.effect(
         throw error
       }
 
-      const variant = selected
-        ? selected.variant
-        : (input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined))
+      const variant = input.group
+        ? selected?.variant
+        : (input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined) ?? selected?.variant)
 
       const info: SessionV1.User = {
         id: input.messageID ?? MessageID.ascending(),
@@ -1107,19 +1109,62 @@ const layer = Layer.effect(
       return { info, parts: [...message.parts] }
     })
 
+    // A pending prompt that named a model or variant is delivered at the
+    // session's selection then current, never the one it was admitted with.
+    const prepareQueued = (input: SessionQueue.PromotedInput) =>
+      input.model || input.variant
+        ? currentModel(input.sessionID).pipe(
+            Effect.flatMap((current) =>
+              prepareUserMessage({
+                ...input,
+                model: { providerID: current.providerID, modelID: current.modelID },
+                variant: current.variant,
+              }),
+            ),
+          )
+        : prepareUserMessage(input)
+
+    // A retried request waits on whatever carries it now, as its first send did.
+    // A deleted one was withdrawn; a noReply one answers with its message.
+    const followRequest = Effect.fnUntraced(function* (
+      input: PromptInput,
+      followed: Effect.Success<ReturnType<SessionQueue.Interface["request"]>>,
+    ) {
+      const own = followed.kind === "retry" ? followed.own : followed.own.id
+      yield* Effect.addFinalizer(() => queue.forget(own))
+      const receipt = followed.kind === "retry" ? followed.receipt : undefined
+      if (receipt?.state === "deleted")
+        return yield* new SessionQueue.WithdrawnError({ sessionID: input.sessionID, itemID: own })
+      if (input.noReply !== true) return yield* drain(input.sessionID, own)
+      const messageID = receipt && "messageID" in receipt ? receipt.messageID : undefined
+      if (!messageID) return yield* prepareUserMessage(input)
+      return yield* MessageV2.get({ sessionID: input.sessionID, messageID }).pipe(
+        Effect.provideService(Database.Service, database),
+        Effect.orDie,
+      )
+    })
+
     const prompt: (
       input: PromptInput,
       admitted?: SessionQueue.Item,
-    ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput, admitted?: SessionQueue.Item) {
+    ) => Effect.Effect<
+      SessionV1.WithParts,
+      Image.Error | SessionQueue.WithdrawnError | SessionQueue.RequestConflictError
+    > = Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput, admitted?: SessionQueue.Item) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       // TUI prepends synthetic editor context; only flattened user text owns marker framing.
       const classificationText = input.parts
         .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
         .join("")
-      const classification = MachineMessage.classify(classificationText, (yield* config.get()).machine_message_markers)
+      const markers = (yield* config.get()).machine_message_markers
+      const classification = MachineMessage.classify(classificationText, markers)
       const delivery = classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
+      // A request the session already has is followed, never admitted or applied again (#212).
+      if (input.requestID && Option.isSome(yield* queue.receipt(input.sessionID, input.requestID)))
+        return yield* followRequest(
+          input,
+          yield* queue.request({ ...input, ...(delivery ? { delivery } : {}) }, markers),
+        )
       const reconciled = admitted ? undefined : yield* queue.reconcile({ ...input, ...(delivery ? { delivery } : {}) })
       if (reconciled?.kind === "direct") return reconciled.message
       if (reconciled?.kind === "queued") {
@@ -1131,10 +1176,24 @@ const layer = Layer.effect(
         return yield* drain(input.sessionID, reconciled.own.id)
       }
       yield* revert.cleanup(session)
+      // A prompt's model and variant become the session's selection now, and a
+      // pending prompt runs at whichever selection is current when it is
+      // delivered (swxtchio/swx-opencode#212).
+      if (
+        (input.model || input.variant) &&
+        (classification === "critical" || !MachineMessage.dispatch(classificationText))
+      ) {
+        const model = input.model ?? (yield* currentModel(input.sessionID))
+        yield* sessions.setModel({
+          sessionID: input.sessionID,
+          model: { id: model.modelID, providerID: model.providerID, variant: input.variant ?? "default" },
+        })
+      }
       const markedNoReply = input.noReply === true && classification === "hold"
       const initiallyHeldNoReply =
         markedNoReply && Exit.isFailure(yield* state.assertNotBusy(input.sessionID).pipe(Effect.exit))
       const queuedInput = markedNoReply && !input.messageID ? { ...input, messageID: MessageID.ascending() } : input
+      const admission = { ...queuedInput, ...(delivery ? { delivery } : {}) }
       // Preparation can yield while another prompt starts a run. Revalidate at
       // the write boundary so a newly active run receives the marked message as
       // queued input instead of seeing it in its next history reload. The queue
@@ -1142,7 +1201,7 @@ const layer = Layer.effect(
       const noReplyDecision =
         markedNoReply && (!initiallyHeldNoReply || input.messageID !== undefined)
           ? yield* queue.writeOrAdmit({
-              admission: { ...queuedInput, ...(delivery ? { delivery } : {}) },
+              admission,
               forceQueue: initiallyHeldNoReply,
               isBusy: state.assertNotBusy(input.sessionID).pipe(Effect.exit, Effect.map(Exit.isFailure)),
               prepare: () => prepareUserMessage(queuedInput),
@@ -1151,6 +1210,11 @@ const layer = Layer.effect(
             })
           : undefined
       const heldNoReply = markedNoReply && (initiallyHeldNoReply || noReplyDecision?.kind === "queued")
+      const requested =
+        admitted || noReplyDecision || (input.noReply === true && !markedNoReply)
+          ? undefined
+          : yield* queue.request(admission, markers)
+      if (requested?.kind === "retry") return yield* followRequest(input, requested)
       const entry = admitted
         ? { kind: "queued" as const, own: admitted, prepared: undefined }
         : markedNoReply
@@ -1158,7 +1222,7 @@ const layer = Layer.effect(
             ? noReplyDecision
             : {
                 kind: "queued" as const,
-                own: yield* queue.admit({ ...queuedInput, ...(delivery ? { delivery } : {}) }),
+                own: requested!.own,
                 prepared: undefined,
               }
           : input.noReply === true
@@ -1172,16 +1236,17 @@ const layer = Layer.effect(
               }
             : {
                 kind: "queued" as const,
-                own: yield* queue.admit({ ...queuedInput, ...(delivery ? { delivery } : {}) }),
+                own: requested!.own,
                 prepared: undefined,
               }
+      if (entry.kind === "direct") yield* queue.delivered(admission, entry.message.info.id)
       // Only this prompt's own failure is this caller's error; an older steer
       // promoted alongside it is reported on its own.
       if (entry.kind === "queued")
         yield* queue.promote({
           sessionID: input.sessionID,
           delivery: "steer",
-          prepare: prepareUserMessage,
+          prepare: prepareQueued,
           write: writeUserMessage,
           valid: currentSelection,
           rejected: rejected(input.sessionID),
@@ -1233,7 +1298,7 @@ const layer = Layer.effect(
           sessionID,
           delivery,
           peersOnly,
-          prepare: prepareUserMessage,
+          prepare: prepareQueued,
           write: writeUserMessage,
           valid: currentSelection,
           rejected: rejected(sessionID),
@@ -1564,7 +1629,9 @@ const layer = Layer.effect(
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
-              MessageV2.toModelMessagesEffect(msgs, model),
+              queue
+                .annotate(sessionID, msgs)
+                .pipe(Effect.flatMap((annotated) => MessageV2.toModelMessagesEffect(annotated, model))),
             ])
             const system = [
               ...env,
@@ -1722,11 +1789,13 @@ const layer = Layer.effect(
       // nothing running. A busy one (a shell, say) is joined as before.
       const idle = Exit.isSuccess(yield* state.assertNotBusy(sessionID).pipe(Effect.exit))
       if (idle && (yield* queue.empty(sessionID))) {
+        // A review hold keeps even a new session's first prompt pending.
+        yield* queue.released(sessionID)
         const first = (delivery: SessionQueue.Delivery) =>
           queue.promote({
             sessionID,
             delivery,
-            prepare: prepareUserMessage,
+            prepare: prepareQueued,
             write: writeUserMessage,
             valid: currentSelection,
             rejected: rejected(sessionID),
@@ -1735,8 +1804,19 @@ const layer = Layer.effect(
           })
         yield* first("steer")
         yield* first("queue")
+        // A deleted first prompt leaves no message to answer with, as a withdrawn one does.
+        if ((yield* queue.empty(sessionID)) && own && !(yield* queue.unread(sessionID, own)))
+          return yield* new SessionQueue.WithdrawnError({ sessionID, itemID: own })
         if (yield* queue.empty(sessionID)) return yield* withdrawn.pipe(Effect.andThen(lastAssistant(sessionID)))
       }
+      // A cancel that parked the session after this prompt was admitted leaves it
+      // pending, as it would have had this caller joined the run the cancel stopped.
+      if (
+        own &&
+        Exit.isSuccess(yield* state.assertNotBusy(sessionID).pipe(Effect.exit)) &&
+        (yield* queue.isParked(sessionID))
+      )
+        return yield* withdrawn.pipe(Effect.andThen(lastAssistant(sessionID)))
       const result = yield* state.ensureRunning(
         sessionID,
         lastAssistant(sessionID),
@@ -1918,7 +1998,9 @@ const layer = Layer.effect(
             }
           }),
       })
-      const result = yield* prompt(prepared.input, prepared.own)
+      const result = yield* prompt(prepared.input, prepared.own).pipe(
+        Effect.catchTag("SessionQueueRequestConflictError", Effect.die),
+      )
       yield* events.publish(Command.Event.Executed, {
         name: input.command,
         sessionID: input.sessionID,

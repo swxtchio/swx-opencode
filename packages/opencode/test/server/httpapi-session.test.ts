@@ -4,6 +4,7 @@ import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
+import { pathToFileURL } from "node:url"
 import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer, Queue, Schema, Stream, Tracer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { Sse } from "effect/unstable/encoding"
@@ -25,6 +26,8 @@ import * as HttpSessionError from "../../src/server/routes/instance/httpapi/hand
 import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/groups/experimental"
 import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
 import { SessionQueuePaths } from "../../src/server/routes/instance/httpapi/groups/session-queue"
+import { SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
+import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { EventPaths } from "../../src/server/routes/instance/httpapi/groups/event"
 import { WorkspacePaths } from "../../src/server/routes/instance/httpapi/groups/workspace"
 import type { SessionQueue } from "../../src/session/queue"
@@ -1869,7 +1872,7 @@ describe("session HttpApi", () => {
         const inputs = yield* llm.inputs
         expect(inputs).toHaveLength(3)
         const lastUser = (input: Record<string, unknown> | undefined) =>
-          Array.isArray(input?.messages) ? input.messages.at(-1) : undefined
+          Array.isArray(input?.messages) ? withoutQueueNote(input.messages.at(-1)) : undefined
         const userText = (input: Record<string, unknown> | undefined) =>
           JSON.stringify(
             Array.isArray(input?.messages) ? input.messages.filter((message) => message?.role === "user") : [],
@@ -2184,7 +2187,10 @@ describe("session HttpApi", () => {
               Effect.map((inputs) =>
                 inputs.some((input) => {
                   const messages = Array.isArray(input.messages) ? input.messages : []
-                  return JSON.stringify(messages.at(-1)) === JSON.stringify({ role: "user", content: text })
+                  return (
+                    JSON.stringify(withoutQueueNote(messages.at(-1))) ===
+                    JSON.stringify({ role: "user", content: text })
+                  )
                 })
                   ? true
                   : undefined,
@@ -2219,7 +2225,7 @@ describe("session HttpApi", () => {
         yield* answered("parked after abort")
         // The wake delivers the parked prompts in admission order and never retries the aborted turn.
         const lastUsers = (yield* llm.inputs).map((input) =>
-          Array.isArray(input.messages) ? input.messages.at(-1) : undefined,
+          Array.isArray(input.messages) ? withoutQueueNote(input.messages.at(-1)) : undefined,
         )
         expect(lastUsers).toEqual([
           { role: "user", content: "start" },
@@ -2248,6 +2254,260 @@ describe("session HttpApi", () => {
         expect(steered.status).toBe(200)
         yield* answered("steered after abort")
       }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  // Review view (swxtchio/swx-opencode#212).
+  const reviewRoutes = (directory: string, sessionID: SessionIDType, llm: TestLLMServer["Service"]) => {
+    const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+    const params = { sessionID }
+    const post = (path: string, body?: unknown) =>
+      request(pathFor(path, params), {
+        method: "POST",
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+      })
+    // Without the note a prompt that waited is delivered with, which the
+    // queue freshness tests check.
+    const lastUsers = llm.inputs.pipe(
+      Effect.map((inputs) =>
+        inputs.map((input) => (Array.isArray(input.messages) ? withoutQueueNote(input.messages.at(-1)) : undefined)),
+      ),
+    )
+    return {
+      headers,
+      post,
+      prompt: (text: string, delivery?: SessionQueue.Delivery) =>
+        post(SessionPaths.promptAsync, {
+          agent: "build",
+          model: { providerID: "test", modelID: "test-model" },
+          ...(delivery ? { delivery } : {}),
+          parts: [{ type: "text", text }],
+        }),
+      listed: () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }),
+      texts: (items: readonly SessionQueue.Item[]) =>
+        items.map((item) => item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")),
+      idle: () =>
+        pollWithTimeout(
+          requestJson<Record<string, { type: string }>>(SessionPaths.status, { headers }).pipe(
+            Effect.map((status) => (status[sessionID] === undefined ? true : undefined)),
+          ),
+          "session never went idle",
+        ),
+      lastUsers,
+      delivered: (count: number) =>
+        pollWithTimeout(
+          lastUsers.pipe(Effect.map((users) => (users.length >= count ? users : undefined))),
+          `the model never received ${count} turns`,
+          "10 seconds",
+        ),
+    }
+  }
+
+  const withoutQueueNote = (message: unknown) => {
+    if (!message || typeof message !== "object" || !("content" in message) || !Array.isArray(message.content))
+      return message
+    const kept = message.content.filter(
+      (part: { type?: string; text?: string }) => !(part.type === "text" && part.text?.startsWith("[Queued prompt")),
+    )
+    return { ...message, content: kept.length === 1 && kept[0].type === "text" ? kept[0].text : kept }
+  }
+
+  it.live(
+    "a review hold keeps admitted steers and queued prompts pending until its release delivers them",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "review hold" }).pipe(provideInstanceEffect(directory))
+        const api = reviewRoutes(directory, session.id, llm)
+
+        yield* api.prompt("start")
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        const opened = yield* api.post(SessionQueuePaths.hold, { holder: "view" })
+        expect(opened.status).toBe(200)
+        expect(yield* json<SessionQueue.Item[]>(opened)).toEqual([])
+
+        // Unheld, the steer would be promoted at admission into the running turn's history.
+        yield* api.prompt("steer while held")
+        yield* api.prompt("queued while held", "queue")
+        const pending = yield* pollWithTimeout(
+          api.listed().pipe(Effect.map((items) => (items.length === 2 ? items : undefined))),
+          "prompts never queued",
+        )
+        expect(pending.map((item) => item.delivery)).toEqual(["steer", "queue"])
+
+        // The turn ends where it would promote both, and goes idle with both pending.
+        yield* Deferred.succeed(gate, undefined)
+        yield* api.idle()
+        expect(yield* llm.calls).toBe(1)
+        expect(api.texts(yield* api.listed())).toEqual(["steer while held", "queued while held"])
+        const messages = yield* requestJson<SessionV1.WithParts[]>(
+          pathFor(SessionPaths.messages, { sessionID: session.id }),
+          {
+            headers: api.headers,
+          },
+        )
+        expect(JSON.stringify(messages)).not.toContain("while held")
+
+        // A sync prompt on a new session waits out the hold rather than failing.
+        const fresh = yield* createSession({ title: "review hold, new session" }).pipe(provideInstanceEffect(directory))
+        const freshApi = reviewRoutes(directory, fresh.id, llm)
+        expect((yield* freshApi.post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const first = yield* freshApi
+          .post(SessionPaths.prompt, {
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            parts: [{ type: "text", text: "first prompt while held" }],
+          })
+          .pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          freshApi.listed().pipe(Effect.map((items) => (items.length === 1 ? true : undefined))),
+          "first prompt never queued",
+        )
+
+        yield* llm.text("steer done")
+        yield* llm.text("queue done")
+        const released = yield* api.post(SessionQueuePaths.release, { holder: "view" })
+        expect(released.status).toBe(204)
+        expect(yield* api.delivered(3)).toEqual([
+          { role: "user", content: "start" },
+          { role: "user", content: "steer while held" },
+          { role: "user", content: "queued while held" },
+        ])
+        yield* api.idle()
+        expect(yield* api.listed()).toEqual([])
+
+        yield* llm.text("first done")
+        expect((yield* freshApi.post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+        const answered = yield* awaitWithTimeout(Fiber.join(first), "held first prompt never answered", "10 seconds")
+        expect(answered.status).toBe(200)
+        expect(yield* responseJson(answered)).toMatchObject({ info: { role: "assistant" } })
+        expect((yield* api.lastUsers).at(-1)).toEqual({ role: "user", content: "first prompt while held" })
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
+    "deleted, reordered and consolidated pending prompts are delivered as the review left them",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "review edits" }).pipe(provideInstanceEffect(directory))
+        const api = reviewRoutes(directory, session.id, llm)
+
+        yield* api.prompt("start")
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        expect((yield* api.post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const admitted = [
+          "drop this one",
+          "run lint now",
+          "fix auth.ts: handle a null token",
+          "run lint now",
+          "fix auth.ts: add a regression test",
+          "write the changelog",
+        ]
+        yield* Effect.forEach(admitted, (text) => api.prompt(text, "queue"), { discard: true })
+        // The second "run lint now" is taken into the first as it is admitted.
+        const pending = yield* pollWithTimeout(
+          api.listed().pipe(Effect.map((items) => (items.length === admitted.length - 1 ? items : undefined))),
+          "prompts never queued",
+        )
+        expect(api.texts(pending)).toEqual([
+          "drop this one",
+          "run lint now",
+          "fix auth.ts: handle a null token",
+          "fix auth.ts: add a regression test",
+          "write the changelog",
+        ])
+        const [doomed] = pending
+
+        const removed = yield* api.post(SessionQueuePaths.remove, { id: doomed!.id })
+        expect(removed.status).toBe(200)
+        expect(yield* json<SessionQueue.Item>(removed)).toEqual(doomed!)
+        const again = yield* api.post(SessionQueuePaths.remove, { id: doomed!.id })
+        expect(again.status).toBe(404)
+        expect(yield* responseJson(again)).toMatchObject({ _tag: "QueueItemNotPending", itemID: doomed!.id })
+
+        const consolidated = yield* api.post(SessionQueuePaths.consolidate)
+        expect(consolidated.status).toBe(200)
+        const merged = yield* json<SessionQueue.Item[]>(consolidated)
+        expect(api.texts(merged)).toEqual([
+          "run lint now",
+          "fix auth.ts:\n1. handle a null token\n2. add a regression test",
+          "write the changelog",
+        ])
+
+        const [lint, fix, changelog] = merged
+        const stale = yield* api.post(SessionQueuePaths.reorder, { items: [doomed!.id, lint!.id] })
+        expect(stale.status).toBe(404)
+        const reordered = yield* api.post(SessionQueuePaths.reorder, { items: [changelog!.id, fix!.id, lint!.id] })
+        expect(reordered.status).toBe(200)
+        expect(api.texts(yield* json<SessionQueue.Item[]>(reordered))).toEqual([
+          "write the changelog",
+          "fix auth.ts:\n1. handle a null token\n2. add a regression test",
+          "run lint now",
+        ])
+
+        yield* Deferred.succeed(gate, undefined)
+        yield* api.idle()
+        yield* llm.text("changelog done")
+        yield* llm.text("fix done")
+        yield* llm.text("lint done")
+        expect((yield* api.post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+        expect(yield* api.delivered(4)).toEqual([
+          { role: "user", content: "start" },
+          { role: "user", content: "write the changelog" },
+          { role: "user", content: "fix auth.ts:\n1. handle a null token\n2. add a regression test" },
+          { role: "user", content: "run lint now" },
+        ])
+        yield* api.idle()
+        expect(JSON.stringify(yield* llm.inputs)).not.toContain("drop this one")
+        expect(yield* api.listed()).toEqual([])
+
+        // Deleting a new session's first prompt answers its sync caller as withdrawn.
+        const fresh = yield* createSession({ title: "review edits, new session" }).pipe(
+          provideInstanceEffect(directory),
+        )
+        const freshApi = reviewRoutes(directory, fresh.id, llm)
+        expect((yield* freshApi.post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const first = yield* freshApi
+          .post(SessionPaths.prompt, {
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            parts: [{ type: "text", text: "deleted before it started" }],
+          })
+          .pipe(Effect.forkChild)
+        const [firstItem] = yield* pollWithTimeout(
+          freshApi.listed().pipe(Effect.map((items) => (items.length === 1 ? items : undefined))),
+          "first prompt never queued",
+        )
+        expect((yield* freshApi.post(SessionQueuePaths.remove, { id: firstItem!.id })).status).toBe(200)
+        expect((yield* freshApi.post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+        const withdrawn = yield* awaitWithTimeout(
+          Fiber.join(first),
+          "deleted first prompt never answered",
+          "10 seconds",
+        )
+        expect(withdrawn.status).toBe(409)
+        expect(yield* responseJson(withdrawn)).toMatchObject({ _tag: "PromptWithdrawn", itemID: firstItem!.id })
+        expect(yield* llm.calls).toBe(4)
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
     30_000,
   )
 
@@ -2355,6 +2615,985 @@ describe("session HttpApi", () => {
       )
     },
     30_000,
+  )
+})
+
+describe("session HttpApi pending prompt selection", () => {
+  // Two models, each with two efforts, so a test can tell which selection a
+  // provider request was made under.
+  const selectableConfig = (url: string) => {
+    const base = testProviderConfig(url)
+    const model = (id: string) => ({
+      ...base.provider.test.models["test-model"],
+      id,
+      name: id,
+      variants: { low: { reasoningEffort: "low" }, high: { reasoningEffort: "high" } },
+    })
+    return {
+      ...base,
+      provider: {
+        test: { ...base.provider.test, models: { "model-a": model("model-a"), "model-b": model("model-b") } },
+      },
+    }
+  }
+
+  it.live(
+    "pending prompts run at the session's selection when delivered, not the one they were sent with",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: selectableConfig(llm.url) })
+        const session = yield* createSession({ title: "current selection" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const post = (path: string, body?: unknown) =>
+          request(pathFor(path, params), {
+            method: "POST",
+            headers,
+            body: body === undefined ? undefined : JSON.stringify(body),
+          })
+        const underA = (text: string, delivery?: SessionQueue.Delivery) =>
+          post(SessionPaths.promptAsync, {
+            agent: "build",
+            model: { providerID: "test", modelID: "model-a" },
+            variant: "low",
+            ...(delivery ? { delivery } : {}),
+            parts: [{ type: "text", text }],
+          })
+        const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+
+        yield* underA("start")
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        // Held, the steer stays pending as a queued prompt does.
+        yield* underA("steer under a")
+        yield* underA("queued under a", "queue")
+        yield* underA("run lint", "queue")
+        yield* underA("run lint --fix", "queue")
+        yield* pollWithTimeout(
+          listed().pipe(Effect.map((items) => (items.length === 4 ? true : undefined))),
+          "prompts never queued",
+        )
+        expect((yield* post(SessionQueuePaths.consolidate)).status).toBe(200)
+        // A row a stopped process left behind, admitted under A.
+        const { db } = yield* Database.Service
+        yield* db
+          .insert(SessionPromptQueueTable)
+          .values({
+            id: SessionPromptQueue.ItemID.create(),
+            session_id: session.id,
+            seq: 1000,
+            delivery: "queue",
+            input: {
+              agent: "build",
+              model: { providerID: "test", modelID: "model-a" },
+              variant: "low",
+              parts: [{ type: "text", text: "persisted under a" }],
+            },
+            time_created: Date.now(),
+          })
+          .run()
+
+        const selected = yield* request(pathFor(SessionPaths.update, params), {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ model: { providerID: "test", id: "model-b", variant: "high" } }),
+        })
+        expect(selected.status).toBe(200)
+        expect((yield* json<{ model?: unknown }>(selected)).model).toEqual({
+          providerID: "test",
+          id: "model-b",
+          variant: "high",
+        })
+
+        yield* Deferred.succeed(gate, undefined)
+        for (const text of ["steer done", "queued done", "lint done", "persisted done"]) yield* llm.text(text)
+        expect((yield* post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+        const sent = yield* pollWithTimeout(
+          llm.inputs.pipe(Effect.map((inputs) => (inputs.length === 5 ? inputs : undefined))),
+          "the model never received every pending prompt",
+          "10 seconds",
+        )
+        const turns = sent.map((input) => {
+          const messages = input.messages as { role: string; content: unknown }[]
+          return { model: input.model, effort: input.reasoning_effort, last: JSON.stringify(messages.at(-1)) }
+        })
+        expect(turns.map((turn) => [turn.model, turn.effort])).toEqual([
+          ["model-a", "low"],
+          ["model-b", "high"],
+          ["model-b", "high"],
+          ["model-b", "high"],
+          ["model-b", "high"],
+        ])
+        expect(turns[1]!.last).toContain("steer under a")
+        expect(turns[2]!.last).toContain("queued under a")
+        expect(turns[3]!.last).toContain("--fix")
+        expect(turns[4]!.last).toContain("persisted under a")
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
+    "a prompt's own model and effort become the selection its delivery and later prompts run at",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: selectableConfig(llm.url) })
+        const session = yield* createSession({ title: "selection by prompt" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const send = (text: string, selection: object) =>
+          request(pathFor(SessionPaths.promptAsync, { sessionID: session.id }), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ agent: "build", delivery: "queue", ...selection, parts: [{ type: "text", text }] }),
+          })
+
+        yield* send("start", { model: { providerID: "test", modelID: "model-a" }, variant: "low" })
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        yield* send("queued under b", { model: { providerID: "test", modelID: "model-b" }, variant: "high" })
+        // Names no model, as a firstmate send to an unmanaged session does.
+        yield* send("queued with no selection", {})
+
+        yield* llm.text("b done")
+        yield* llm.text("unnamed done")
+        yield* Deferred.succeed(gate, undefined)
+        const sent = yield* pollWithTimeout(
+          llm.inputs.pipe(Effect.map((inputs) => (inputs.length === 3 ? inputs : undefined))),
+          "the model never received every queued prompt",
+          "10 seconds",
+        )
+        expect(sent.map((input) => [input.model, input.reasoning_effort])).toEqual([
+          ["model-a", "low"],
+          ["model-b", "high"],
+          ["model-b", "high"],
+        ])
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+})
+
+describe("session HttpApi summary records what it sent", () => {
+  // swxtchio/swx-opencode#227: a summary keeps the selection it always had and
+  // records the variant and effort its request actually sent. model-a's own
+  // options send a high effort; its variants send low or high.
+  const effortConfig = (url: string) => {
+    const base = testProviderConfig(url)
+    return {
+      ...base,
+      provider: {
+        test: {
+          ...base.provider.test,
+          models: {
+            "model-a": {
+              ...base.provider.test.models["test-model"],
+              id: "model-a",
+              name: "model-a",
+              options: { reasoningEffort: "high" },
+              variants: { low: { reasoningEffort: "low" }, high: { reasoningEffort: "high" } },
+            },
+          },
+        },
+      },
+    }
+  }
+  const routes = (directory: string, sessionID: SessionIDType) => {
+    const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+    const params = { sessionID }
+    return {
+      prompt: (text: string, variant?: string) =>
+        request(pathFor(SessionPaths.prompt, params), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            agent: "build",
+            model: { providerID: "test", modelID: "model-a" },
+            ...(variant ? { variant } : {}),
+            parts: [{ type: "text", text }],
+          }),
+        }),
+      summarize: () =>
+        request(pathFor(SessionPaths.summarize, params), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ providerID: "test", modelID: "model-a", auto: false }),
+        }),
+      summaries: () =>
+        requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, params), { headers }).pipe(
+          Effect.map((messages) =>
+            messages.flatMap((message) =>
+              message.info.role === "assistant" && message.info.summary
+                ? [
+                    {
+                      modelID: String(message.info.modelID),
+                      variant: message.info.variant,
+                      effort: message.info.effort,
+                    },
+                  ]
+                : [],
+            ),
+          ),
+        ),
+    }
+  }
+
+  it.live(
+    "an explicit summary runs as it always has and records the effort its request sent",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: effortConfig(llm.url) })
+        const api = routes(
+          directory,
+          (yield* createSession({ title: "explicit summary" }).pipe(provideInstanceEffect(directory))).id,
+        )
+        yield* llm.text("start done")
+        expect((yield* api.prompt("start")).status).toBe(200)
+        yield* llm.text("first summary")
+        expect((yield* api.summarize()).status).toBe(200)
+        // A selected variant is the prompts' selection; an explicit summary names no variant, as before.
+        yield* llm.text("low done")
+        expect((yield* api.prompt("at low effort", "low")).status).toBe(200)
+        yield* llm.text("second summary")
+        expect((yield* api.summarize()).status).toBe(200)
+
+        const sent = yield* llm.inputs
+        expect(sent.map((input) => input.reasoning_effort)).toEqual(["high", "high", "low", "high"])
+        expect(yield* api.summaries()).toEqual([
+          { modelID: "model-a", variant: undefined, effort: "high" },
+          { modelID: "model-a", variant: undefined, effort: "high" },
+        ])
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
+    "a summary records the effort a plugin's chat.params left its request with",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const plugin = path.join(yield* tmpdirScoped(), "summary-effort.ts")
+        yield* Effect.promise(() =>
+          Bun.write(
+            plugin,
+            [
+              "export default async () => ({",
+              '  "chat.params": async (input, output) => {',
+              '    if (input.agent === "compaction") output.options.reasoningEffort = "low"',
+              "  },",
+              "})",
+              "",
+            ].join("\n"),
+          ),
+        )
+        const directory = yield* tmpdirScoped({
+          git: true,
+          config: { ...effortConfig(llm.url), plugin: [pathToFileURL(plugin).href] },
+        })
+        const api = routes(
+          directory,
+          (yield* createSession({ title: "plugin-adjusted summary" }).pipe(provideInstanceEffect(directory))).id,
+        )
+        yield* llm.text("start done")
+        expect((yield* api.prompt("start")).status).toBe(200)
+        yield* llm.text("summary")
+        expect((yield* api.summarize()).status).toBe(200)
+
+        expect((yield* llm.inputs).map((input) => input.reasoning_effort)).toEqual(["high", "low"])
+        expect(yield* api.summaries()).toEqual([{ modelID: "model-a", variant: undefined, effort: "low" }])
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
+    "a Gemini summary records the thinking level its request sent by default",
+    () =>
+      Effect.gen(function* () {
+        // A Gemini endpoint that answers every request with one finished reply.
+        const bodies: { generationConfig?: { thinkingConfig?: { thinkingLevel?: string } } }[] = []
+        const server = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            Bun.serve({
+              port: 0,
+              async fetch(request) {
+                bodies.push(await request.json())
+                const chunk = {
+                  candidates: [
+                    { content: { parts: [{ text: "done" }], role: "model" }, finishReason: "STOP", index: 0 },
+                  ],
+                  usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+                }
+                return new Response(`data: ${JSON.stringify(chunk)}\n\n`, {
+                  headers: { "content-type": "text/event-stream" },
+                })
+              },
+            }),
+          ),
+          (server) => Effect.promise(() => server.stop(true)),
+        )
+        const directory = yield* tmpdirScoped({
+          git: true,
+          config: {
+            formatter: false,
+            lsp: false,
+            provider: {
+              gemini: {
+                name: "Gemini",
+                id: "gemini",
+                env: [],
+                npm: "@ai-sdk/google",
+                options: { apiKey: "test-key", baseURL: server.url.href.replace(/\/$/, "") },
+                models: {
+                  "gemini-3-pro-preview": {
+                    id: "gemini-3-pro-preview",
+                    name: "Gemini 3 Pro",
+                    attachment: false,
+                    reasoning: true,
+                    temperature: false,
+                    tool_call: true,
+                    release_date: "2025-01-01",
+                    limit: { context: 100_000, output: 10_000 },
+                    cost: { input: 0, output: 0 },
+                    options: {},
+                  },
+                },
+              },
+            },
+          },
+        })
+        const sessionID = (yield* createSession({ title: "gemini summary" }).pipe(provideInstanceEffect(directory))).id
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const model = { providerID: "gemini", modelID: "gemini-3-pro-preview" }
+        const prompted = yield* request(pathFor(SessionPaths.prompt, { sessionID }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ agent: "build", model, parts: [{ type: "text", text: "start" }] }),
+        })
+        expect(prompted.status).toBe(200)
+        const summarized = yield* request(pathFor(SessionPaths.summarize, { sessionID }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ...model, auto: false }),
+        })
+        expect(summarized.status).toBe(200)
+
+        expect(bodies.map((body) => body.generationConfig?.thinkingConfig?.thinkingLevel)).toEqual(["high", "high"])
+        const messages = yield* requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, { sessionID }), {
+          headers,
+        })
+        expect(
+          messages.flatMap((message) =>
+            message.info.role === "assistant" && message.info.summary ? [message.info.effort] : [],
+          ),
+        ).toEqual(["high"])
+      }).pipe(Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
+    "a summary interrupted after its request was sent still records what it sent",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: effortConfig(llm.url) })
+        const sessionID = (yield* createSession({ title: "interrupted summary" }).pipe(
+          provideInstanceEffect(directory),
+        )).id
+        const api = routes(directory, sessionID)
+        yield* llm.text("start done")
+        expect((yield* api.prompt("start")).status).toBe(200)
+        yield* llm.hold("summary", Effect.runPromise(Deferred.await(gate)))
+        const summarizing = yield* api.summarize().pipe(Effect.forkChild)
+        yield* awaitWithTimeout(llm.wait(2), "the summary never reached the provider", "10 seconds")
+        expect((yield* llm.inputs)[1]?.reasoning_effort).toBe("high")
+        const aborted = yield* request(pathFor(SessionPaths.abort, { sessionID }), {
+          method: "POST",
+          headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+          body: "{}",
+        })
+        expect(aborted.status).toBe(200)
+        yield* awaitWithTimeout(Fiber.await(summarizing), "the summary request never returned", "10 seconds")
+        const stopped = yield* pollWithTimeout(
+          requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, { sessionID }), {
+            headers: { "x-opencode-directory": directory },
+          }).pipe(
+            Effect.map((messages) =>
+              messages.find(
+                (message) =>
+                  message.info.role === "assistant" &&
+                  message.info.summary &&
+                  message.info.time.completed !== undefined,
+              ),
+            ),
+          ),
+          "the interrupted summary never ended",
+          "10 seconds",
+        )
+        expect(stopped.info.role === "assistant" ? stopped.info.effort : undefined).toBe("high")
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
+    "an automatic summary runs at the last prompt's variant, as it always has, and records it",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: effortConfig(llm.url) })
+        const api = routes(
+          directory,
+          (yield* createSession({ title: "automatic summary" }).pipe(provideInstanceEffect(directory))).id,
+        )
+        // A turn that fills the context, so the next prompt compacts first.
+        yield* llm.text("start done", { usage: { input: 95_000, output: 10 } })
+        expect((yield* api.prompt("start", "low")).status).toBe(200)
+        yield* llm.text("automatic summary")
+        yield* llm.text("continued")
+        yield* llm.text("answered")
+        expect((yield* api.prompt("after the context filled", "low")).status).toBe(200)
+
+        const sent = yield* llm.inputs
+        expect(sent.map((input) => input.reasoning_effort)).toEqual(["low", "low", "low", "low"])
+        expect(JSON.stringify((sent[1]!.messages as unknown[]).at(-1))).toContain("Here is the conversation so far")
+        expect(yield* api.summaries()).toEqual([{ modelID: "model-a", variant: "low", effort: "low" }])
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+})
+
+describe("session HttpApi queue freshness", () => {
+  const iso = (time: number) => new Date(time).toISOString().replace(/\.\d{3}Z$/, "Z")
+  const envelope = (msgid: string, text: string) =>
+    `[fm-from-peer]\x1f peer-a\x1f /home/peer\x1f ${msgid}\x1f [fm-level:request]\x1f ${text}`
+
+  it.live(
+    "a prompt that waited is delivered with when it was queued, while its stored message stays as sent",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue freshness" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const post = (path: string, body?: unknown) =>
+          request(pathFor(path, params), {
+            method: "POST",
+            headers,
+            body: body === undefined ? undefined : JSON.stringify(body),
+          })
+        const send = (text: string, selection: object = {}) =>
+          post(SessionPaths.promptAsync, {
+            agent: "build",
+            delivery: "queue",
+            ...selection,
+            parts: [{ type: "text", text }],
+          })
+        const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+        const text = (item: SessionQueue.Item) =>
+          item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")
+        const peerOne = envelope("p1760000000-1-abcd", "please check the build")
+        const peerTwo = envelope("p1760000001-2-beef", "please check the deploy")
+
+        yield* send("start")
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        yield* send("same request")
+        // A copy that names the model it was sent under is still the same request.
+        yield* send("same request", { model: { providerID: "test", modelID: "test-model" } })
+        for (const prompt of ["run lint", "run lint --fix", peerOne, peerTwo]) yield* send(prompt)
+        const admitted = yield* pollWithTimeout(
+          listed().pipe(Effect.map((items) => (items.length === 5 ? items : undefined))),
+          "prompts never queued",
+        )
+        // Pending, each is listed exactly as sent, as an exact-text delivery check expects; the
+        // second copy of "same request" took the first in as it was admitted, keeping its time.
+        expect(admitted.map(text)).toEqual(["same request", "run lint", "run lint --fix", peerOne, peerTwo])
+        const [same, lint, fix] = admitted
+        const first = same!.origins[0]!.time
+        expect(same!.origins).toEqual([{ time: first, repeats: [{ time: same!.time.created }] }])
+        expect(first).toBeLessThanOrEqual(same!.time.created)
+        expect(admitted.slice(1).map((item) => item.origins)).toEqual(
+          admitted.slice(1).map((item) => [{ time: item.time.created }]),
+        )
+        // A row a stopped process left two hours ago, stored before origins were kept.
+        const old = Date.now() - 2 * 60 * 60 * 1000
+        const { db } = yield* Database.Service
+        yield* db
+          .insert(SessionPromptQueueTable)
+          .values({
+            id: SessionPromptQueue.ItemID.create(),
+            session_id: session.id,
+            seq: 1000,
+            delivery: "queue",
+            input: { agent: "build", parts: [{ type: "text", text: "left by a stopped process" }] },
+            time_created: old,
+          })
+          .run()
+
+        const consolidated = yield* json<SessionQueue.Item[]>(yield* post(SessionQueuePaths.consolidate))
+        expect(consolidated.map(text)).toEqual([
+          "same request",
+          "run lint:\n1. run lint\n2. --fix",
+          peerOne,
+          peerTwo,
+          "left by a stopped process",
+        ])
+        expect(consolidated[0]).toEqual(same)
+        expect(consolidated[1]!.origins).toEqual([{ time: lint!.time.created }, { time: fix!.time.created }])
+        expect(consolidated[4]!.origins).toEqual([{ time: old }])
+
+        yield* Deferred.succeed(gate, undefined)
+        for (const reply of ["same done", "lint done", "build done", "deploy done", "old done"]) yield* llm.text(reply)
+        expect((yield* post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+        const sent = yield* pollWithTimeout(
+          llm.inputs.pipe(Effect.map((inputs) => (inputs.length === 6 ? inputs : undefined))),
+          "the model never received every queued prompt",
+          "10 seconds",
+        )
+        const lastUser = sent.map((input) => JSON.stringify((input.messages as unknown[]).at(-1)))
+        // Delivered by its own admission, the first prompt is timestamped too.
+        expect(lastUser[0]).toMatch(
+          /\[Queued prompt: queued at \S+; delivered at \S+, \d+s after it was first queued\.]/,
+        )
+        expect(lastUser[1]).toContain(
+          `[Queued prompt: queued at ${iso(first)}, and again at ${iso(same!.time.created)}; delivered at `,
+        )
+        expect(lastUser[2]).toContain(
+          `[Queued prompt merged from 2 queued instructions: step 1 at ${iso(lint!.time.created)}; step 2 at ${iso(fix!.time.created)}; delivered at `,
+        )
+        expect(lastUser[3]).toContain("please check the build")
+        expect(lastUser[3]).toContain("[Queued prompt: queued at ")
+        expect(lastUser[4]).toContain("please check the deploy")
+        expect(lastUser[5]).toContain(`[Queued prompt: queued at ${iso(old)}; delivered at `)
+        expect(lastUser[5]).toMatch(/, 2h(\d+m)?(\d+s)? after it was first queued\.]/)
+
+        // The stored messages hold exactly what was sent, with no note.
+        const messages = yield* requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, params), {
+          headers,
+        })
+        const stored = messages
+          .filter((message) => message.info.role === "user")
+          .map((message) => message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""))
+        expect(stored).toEqual([
+          "start",
+          "same request",
+          "run lint:\n1. run lint\n2. --fix",
+          peerOne,
+          peerTwo,
+          "left by a stopped process",
+        ])
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+})
+
+describe("session HttpApi request receipts", () => {
+  const receiptRoutes = (directory: string, sessionID: SessionIDType) => {
+    const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+    const params = { sessionID }
+    const post = (path: string, body?: unknown) =>
+      request(pathFor(path, params), {
+        method: "POST",
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+      })
+    return {
+      headers,
+      params,
+      post,
+      send: (text: string, requestID?: string) =>
+        post(SessionPaths.promptAsync, {
+          agent: "build",
+          delivery: "queue",
+          ...(requestID ? { requestID } : {}),
+          parts: [{ type: "text", text }],
+        }),
+      listed: () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }),
+      receipt: (requestID: string) =>
+        request(pathFor(SessionQueuePaths.receipt, { ...params, requestID }), { headers }),
+      users: () =>
+        requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, params), { headers }).pipe(
+          Effect.map((messages) =>
+            messages
+              .filter((message) => message.info.role === "user")
+              .map((message) => ({
+                id: message.info.id,
+                text: message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
+              })),
+          ),
+        ),
+    }
+  }
+
+  it.live(
+    "a request's receipt follows it from pending to delivered, and its retry admits nothing",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "request receipts" }).pipe(provideInstanceEffect(directory))
+        const routes = receiptRoutes(directory, session.id)
+        const sent = "please check the build"
+
+        expect((yield* routes.send("start")).status).toBe(204)
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        expect((yield* routes.send(sent, "p1760000000-1-abcd")).status).toBe(204)
+        const [item] = yield* pollWithTimeout(
+          routes.listed().pipe(Effect.map((items) => (items.length === 1 ? items : undefined))),
+          "the request never queued",
+        )
+        expect(item!.requestID).toBe("p1760000000-1-abcd")
+        expect(yield* json(yield* routes.receipt("p1760000000-1-abcd"))).toEqual({ state: "pending", itemID: item!.id })
+
+        // The same prompt again is the same request: nothing more is queued.
+        expect((yield* routes.send(sent, "p1760000000-1-abcd")).status).toBe(204)
+        // The same request with another prompt is refused before anything runs.
+        const conflict = yield* routes.send("please check the deploy", "p1760000000-1-abcd")
+        expect(conflict.status).toBe(409)
+        expect(yield* conflict.json).toMatchObject({ _tag: "PromptRequestConflict", requestID: "p1760000000-1-abcd" })
+        const unknown = yield* routes.receipt("p1760000009-9-0000")
+        expect(unknown.status).toBe(404)
+        expect(yield* unknown.json).toMatchObject({ name: "NotFoundError" })
+        expect((yield* routes.receipt("not a request id")).status).toBe(400)
+        expect((yield* routes.listed()).map((queued) => queued.id)).toEqual([item!.id])
+
+        yield* llm.text("build checked")
+        yield* Deferred.succeed(gate, undefined)
+        const delivered = yield* pollWithTimeout(
+          routes.receipt("p1760000000-1-abcd").pipe(
+            Effect.flatMap(json<SessionQueue.Receipt>),
+            Effect.map((receipt) => (receipt.state === "delivered" ? receipt : undefined)),
+          ),
+          "the request was never delivered",
+          "10 seconds",
+        )
+        const users = yield* routes.users()
+        expect(users.filter((user) => user.text === sent)).toEqual([{ id: delivered.messageID, text: sent }])
+
+        // A retry after delivery admits nothing either.
+        expect((yield* routes.send(sent, "p1760000000-1-abcd")).status).toBe(204)
+        expect(yield* routes.listed()).toEqual([])
+        expect((yield* routes.users()).filter((user) => user.text === sent)).toHaveLength(1)
+        expect(yield* json(yield* routes.receipt("p1760000000-1-abcd"))).toEqual(delivered)
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
+    "a deleted request says so, and a survivor without a request carries the one merged into it",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "request receipts" }).pipe(provideInstanceEffect(directory))
+        const routes = receiptRoutes(directory, session.id)
+
+        yield* routes.send("start")
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        expect((yield* routes.post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        yield* routes.send("run lint")
+        yield* routes.send("run lint --fix", "tui-fix")
+        yield* routes.send("drop this", "tui-drop")
+        const queued = yield* pollWithTimeout(
+          routes.listed().pipe(Effect.map((items) => (items.length === 3 ? items : undefined))),
+          "prompts never queued",
+        )
+        expect((yield* routes.post(SessionQueuePaths.remove, { id: queued[2]!.id })).status).toBe(200)
+        expect(yield* json(yield* routes.receipt("tui-drop"))).toEqual({ state: "deleted" })
+
+        const [merged] = yield* json<SessionQueue.Item[]>(yield* routes.post(SessionQueuePaths.consolidate))
+        expect(merged!.id).toBe(queued[0]!.id)
+        expect(merged!.requestID).toBe("tui-fix")
+        expect(merged!.origins).toEqual([
+          { time: queued[0]!.time.created },
+          { time: queued[1]!.time.created, requestID: "tui-fix" },
+        ])
+        expect(yield* json(yield* routes.receipt("tui-fix"))).toEqual({ state: "pending", itemID: merged!.id })
+
+        yield* llm.text("lint done")
+        yield* Deferred.succeed(gate, undefined)
+        expect((yield* routes.post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+        const delivered = yield* pollWithTimeout(
+          routes.receipt("tui-fix").pipe(
+            Effect.flatMap(json<SessionQueue.Receipt>),
+            Effect.map((receipt) => (receipt.state === "delivered" ? receipt : undefined)),
+          ),
+          "the merged prompt was never delivered",
+          "10 seconds",
+        )
+        expect((yield* routes.users()).find((user) => user.id === delivered.messageID)?.text).toBe(
+          "run lint:\n1. run lint\n2. --fix",
+        )
+        expect(yield* json(yield* routes.receipt("tui-drop"))).toEqual({ state: "deleted" })
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+})
+
+describe("session HttpApi queue replacement at admission", () => {
+  const iso = (time: number) => new Date(time).toISOString().replace(/\.\d{3}Z$/, "Z")
+  const firstmate = (level: string, text: string) => `[fm-from-firstmate]\x1f[fm-level:${level}]\x1f ${text}`
+  const peer = (name: string, msgid: string, level: string, text: string) =>
+    `[fm-from-peer]\x1f ${name}\x1f /home/${name}\x1f ${msgid}\x1f [fm-level:${level}]\x1f ${text}`
+  const routesFor = (directory: string, sessionID: SessionIDType) => {
+    const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+    const params = { sessionID }
+    const body = (text: string, requestID?: string) => ({
+      agent: "build",
+      ...(requestID ? { requestID } : {}),
+      parts: [{ type: "text", text }],
+    })
+    return {
+      send: (text: string, requestID?: string, delivery?: SessionQueue.Delivery) =>
+        request(pathFor(SessionPaths.promptAsync, params), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ...body(text, requestID), ...(delivery ? { delivery } : {}) }),
+        }),
+      sync: (text: string, requestID: string) =>
+        request(pathFor(SessionPaths.prompt, params), {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body(text, requestID)),
+        }),
+      listed: () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }),
+      receipt: (requestID: string) =>
+        requestJson<SessionQueue.Receipt>(pathFor(SessionQueuePaths.receipt, { ...params, requestID }), { headers }),
+    }
+  }
+  const text = (item: SessionQueue.Item) =>
+    item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")
+
+  it.live(
+    "notices a newer one positively supersedes retire, repeated peer requests merge, and every distinct item stays with its age",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue replacement" }).pipe(provideInstanceEffect(directory))
+        const routes = routesFor(directory, session.id)
+        const ask = "please review the hostname brief"
+        const notices = {
+          waiting1: firstmate("nudge:wait.hostname", "Waiting on the hostname brief review since 10:00"),
+          review1: firstmate("nudge:review.r1", "Reviewer r1 completed round 1"),
+          idle1: firstmate("nudge:idle.datadog", "Datadog task idle for 10m"),
+          clerk1: firstmate("nudge:state.clerk", "Clerk draft: convergence approved"),
+          ask1: peer("peer-a", "p1760000000-1-aaaa", "request", ask),
+          waiting2: firstmate("nudge:wait.hostname", "Waiting on the hostname brief review since 10:00, now 40m"),
+          idle2: firstmate("nudge:idle.datadog", "Datadog task idle for 20m"),
+          review2: firstmate("nudge:review.r1", "Reviewer r1 completed round 2"),
+          ask2: peer("peer-a", "p1760000000-2-bbbb", "request", ask),
+          clerk2: firstmate(
+            "nudge:state.clerk",
+            "Clerk draft: exchange missing; earlier convergence notices are stale",
+          ),
+          storageA: firstmate("nudge:wait.storage-a", "Storage A held on dependency X"),
+          storageB: firstmate("nudge:wait.storage-b", "Storage B held on dependency Y"),
+          otherPeer: peer("peer-b", "p1760000000-3-cccc", "request", ask),
+          reply: peer("peer-a", "p1760000000-4-dddd", "info", "re:p1760000000-1-aaaa thanks"),
+          emulator: firstmate("request", "Emulator removal is active"),
+          quote: firstmate("request", "Plan the quote recovery"),
+          unnamed: firstmate("nudge:idle.datadog", "Datadog task idle for 30m, sent without a request"),
+          // Another sender's notice under the same key, and the same reply sent again.
+          peerWaiting: peer("peer-b", "p1760000000-7-abab", "nudge:wait.hostname", "peer-b waits on the brief too"),
+          reply2: peer("peer-a", "p1760000000-8-efef", "info", "re:p1760000000-1-aaaa thanks"),
+        }
+        const requestIDs: Record<string, string | undefined> = {
+          ask1: "p1760000000-1-aaaa",
+          ask2: "p1760000000-2-bbbb",
+          otherPeer: "p1760000000-3-cccc",
+          reply: "p1760000000-4-dddd",
+          unnamed: undefined,
+          peerWaiting: "p1760000000-7-abab",
+          reply2: "p1760000000-8-efef",
+        }
+        const named = (key: string) => (key in requestIDs ? requestIDs[key] : `fm-${key}`)
+
+        yield* routes.send("start")
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        for (const [key, message] of Object.entries(notices))
+          expect((yield* routes.send(message, named(key))).status).toBe(204)
+        const survivors = [
+          notices.waiting2,
+          notices.review2,
+          notices.idle2,
+          notices.clerk2,
+          notices.ask2,
+          notices.storageA,
+          notices.storageB,
+          notices.otherPeer,
+          notices.reply,
+          notices.emulator,
+          notices.quote,
+          notices.unnamed,
+          notices.peerWaiting,
+          notices.reply2,
+        ]
+        const pending = yield* pollWithTimeout(
+          routes.listed().pipe(Effect.map((items) => (items.length === survivors.length ? items : undefined))),
+          "the notices never settled",
+        )
+        // The newest of each kind holds the place of the oldest it replaced.
+        expect(pending.map(text)).toEqual(survivors)
+
+        for (const [old, by] of [
+          ["waiting1", "waiting2"],
+          ["review1", "review2"],
+          ["idle1", "idle2"],
+          ["clerk1", "clerk2"],
+        ])
+          expect(yield* routes.receipt(named(old)!)).toEqual({ state: "superseded", by: named(by)! })
+        const merged = pending.find((item) => item.requestID === "p1760000000-2-bbbb")!
+        expect(merged.origins).toHaveLength(1)
+        expect(merged.origins[0]).toMatchObject({
+          requestID: "p1760000000-1-aaaa",
+          repeats: [{ requestID: "p1760000000-2-bbbb" }],
+        })
+        expect(yield* routes.receipt("p1760000000-1-aaaa")).toEqual({ state: "merged", into: "p1760000000-2-bbbb" })
+        for (const key of ["storageA", "storageB", "otherPeer", "reply", "emulator", "quote"])
+          expect(yield* routes.receipt(named(key)!)).toMatchObject({ state: "pending" })
+
+        yield* Deferred.succeed(gate, undefined)
+        const inputs = yield* pollWithTimeout(
+          llm.inputs.pipe(Effect.map((inputs) => (inputs.length === 4 ? inputs : undefined))),
+          "the survivors were never all delivered",
+          "20 seconds",
+        )
+        const last = inputs.map((input) => JSON.stringify((input.messages as unknown[]).at(-1)))
+        survivors.forEach((survivor) =>
+          expect(last.slice(1).some((message) => message.includes(JSON.stringify(survivor).slice(1, -1)))).toBe(true),
+        )
+        expect(last[1]).toContain(JSON.stringify(notices.ask1).slice(1, -1))
+        expect(last[1]).toContain("informational entries create no reply obligation")
+        const sent = JSON.stringify(inputs)
+        for (const retired of ["convergence approved", "completed round 1", "idle for 10m", 'since 10:00"'])
+          expect(sent).not.toContain(retired)
+        // The merged peer request says when each send was queued, and names both requests to answer.
+        const askNote = last.find(
+          (message) => message.includes("p1760000000-2-bbbb") && message.includes("[Queued prompt"),
+        )!
+        expect(askNote).toContain(
+          `step 1 at ${iso(merged.origins[0]!.time)}, and again at ${iso(merged.origins[0]!.repeats![0]!.time)}`,
+        )
+        expect(askNote).not.toContain("each owed its own reply")
+        expect(askNote).toContain("Reply only to each response-owed original msgid")
+        const delivered = yield* routes.receipt("p1760000000-2-bbbb")
+        expect(delivered.state).toBe("delivered")
+        expect(yield* routes.receipt("p1760000000-1-aaaa")).toEqual({
+          state: "merged",
+          into: "p1760000000-2-bbbb",
+          messageID: (delivered as Extract<SessionQueue.Receipt, { state: "delivered" }>).messageID,
+        })
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    60_000,
+  )
+
+  it.live(
+    "a sync caller of a merged request gets its survivor's reply, and commands merge only when each names a request",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue replacement" }).pipe(provideInstanceEffect(directory))
+        const routes = routesFor(directory, session.id)
+        const ask = "please rerun the deploy check"
+
+        yield* routes.send("start")
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        const waiting = yield* routes
+          .sync(peer("peer-a", "p1760000000-5-eeee", "request", ask), "p1760000000-5-eeee")
+          .pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          routes.listed().pipe(Effect.map((items) => (items.length === 1 ? items : undefined))),
+          "the sync request never queued",
+        )
+        yield* routes.send(peer("peer-a", "p1760000000-6-ffff", "request", ask), "p1760000000-6-ffff")
+        yield* routes.send("run lint", "tui-lint", "queue")
+        yield* routes.send("run lint --fix", "tui-fix", "queue")
+        yield* routes.send("deploy app", undefined, "queue")
+        yield* routes.send("deploy app now", "tui-deploy", "queue")
+        const pending = yield* pollWithTimeout(
+          routes.listed().pipe(Effect.map((items) => (items.length === 4 ? items : undefined))),
+          "the prompts never settled",
+        )
+        expect(pending.map(text)).toEqual([
+          peer("peer-a", "p1760000000-6-ffff", "request", ask),
+          "run lint:\n1. run lint\n2. --fix",
+          "deploy app",
+          "deploy app now",
+        ])
+        expect(yield* routes.receipt("tui-fix")).toEqual({ state: "merged", into: "tui-lint" })
+        expect(yield* routes.receipt("p1760000000-5-eeee")).toEqual({ state: "merged", into: "p1760000000-6-ffff" })
+
+        // Held human/native commands keep their individual precedence; the peer batch follows them.
+        yield* llm.text("lint checked")
+        yield* llm.text("app checked")
+        yield* llm.text("app now checked")
+        yield* llm.text("deploy check rerun")
+        yield* Deferred.succeed(gate, undefined)
+        const reply = yield* Fiber.join(waiting).pipe(Effect.flatMap(json<SessionV1.WithParts>))
+        expect(reply.info.role).toBe("assistant")
+        expect(reply.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual(["deploy check rerun"])
+        const delivered = yield* routes.receipt("p1760000000-6-ffff")
+        expect(delivered.state).toBe("delivered")
+        if (delivered.state === "delivered" && reply.info.role === "assistant")
+          expect(reply.info.parentID).toBe(delivered.messageID)
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    60_000,
   )
 })
 
@@ -2700,7 +3939,6 @@ describe("session HttpApi writes racing removal", () => {
     racing,
   )
 })
-
 
 it.live(
   "historical executable prompt and command IDs are refused over HTTP before side effects",

@@ -205,6 +205,7 @@ function withContext<A, E>(
                     model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
                     delivery: "queue",
                     parts: [{ type: "text", text: input.text }],
+                    ...(input.requestID ? { requestID: input.requestID } : {}),
                   })
                   if (input.withdrawn) yield* svc.withdraw(sessionID, item.id)
                   return item
@@ -212,6 +213,8 @@ function withContext<A, E>(
               ),
             ),
           queue: (sessionID) => run(modules.SessionQueue.Service.use((svc) => svc.list(sessionID))),
+          hold: (sessionID, holder) =>
+            run(modules.SessionQueue.Service.use((svc) => svc.hold(sessionID, holder).pipe(Effect.asVoid))),
           todos: (sessionID, todos) => run(modules.Todo.Service.use((svc) => svc.update({ sessionID, todos }))),
           worktree: (input) => run(modules.Worktree.Service.use((svc) => svc.create(input).pipe(Effect.orDie))),
           worktreeRemove: (directory) =>

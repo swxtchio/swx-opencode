@@ -1644,6 +1644,169 @@ describe("session.llm.stream", () => {
     { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, "https://injected-openai.test/v1") },
   )
 
+  // swxtchio/swx-opencode#227: a summary records the effort each request
+  // reports sending, so the report is the effort on the wire the runtime chose.
+  const reportedRun = (input: {
+    readonly providerID: string
+    readonly modelID: string
+    readonly variant?: string
+    readonly sessionID: string
+  }) =>
+    Effect.gen(function* () {
+      const resolved = yield* Provider.use.getModel(
+        ProviderV2.ID.make(input.providerID),
+        ModelV2.ID.make(input.modelID),
+      )
+      const sessionID = SessionID.make(input.sessionID)
+      const agent = {
+        name: "test",
+        mode: "primary",
+        options: {},
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      } satisfies Agent.Info
+      const reported: { readonly variant?: string; readonly effort?: string }[] = []
+      yield* drainWith(llmLayerWithExecutor({ flags: { experimentalNativeLlm: true } }), {
+        user: {
+          id: MessageID.make(`msg_user-${input.sessionID}`),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: {
+            providerID: ProviderV2.ID.make(input.providerID),
+            modelID: resolved.id,
+            ...(input.variant ? { variant: input.variant } : {}),
+          },
+        } satisfies SessionV1.User,
+        sessionID,
+        model: resolved,
+        agent,
+        system: [],
+        messages: [{ role: "user", content: "Hello" }],
+        tools: {},
+        sent: (request) => reported.push(request),
+      })
+      return reported
+    })
+
+  it.instance(
+    "a native OpenAI request reports the effort its wire body carries",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const request = waitRequest(
+          "/responses",
+          createEventResponse(
+            [
+              { type: "response.created", response: { id: "resp-effort" } },
+              {
+                type: "response.completed",
+                response: { incomplete_details: null, usage: { input_tokens: 1, output_tokens: 1 } },
+              },
+            ],
+            true,
+          ),
+        )
+        const reported = yield* reportedRun({
+          providerID: "openai",
+          modelID: model.id,
+          variant: "high",
+          sessionID: "session-native-openai-effort",
+        })
+        const capture = yield* Effect.promise(() => request)
+        expect((capture.body.reasoning as { effort?: string } | undefined)?.effort).toBe("high")
+        expect(reported).toEqual([{ variant: "high", effort: "high" }])
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  it.instance(
+    "a native Anthropic request reports only the effort its wire body carries",
+    () =>
+      Effect.gen(function* () {
+        const request = waitRequest(
+          "/messages",
+          createEventResponse([
+            {
+              type: "message_start",
+              message: { id: "msg-effort", model: "claude-opus-4-6", usage: { input_tokens: 3 } },
+            },
+            { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+            { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hello" } },
+            { type: "content_block_stop", index: 0 },
+            {
+              type: "message_delta",
+              delta: { stop_reason: "end_turn", stop_sequence: null },
+              usage: { input_tokens: 3, output_tokens: 2 },
+            },
+            { type: "message_stop" },
+          ]),
+        )
+        const reported = yield* reportedRun({
+          providerID: "anthropic",
+          modelID: "claude-opus-4-6",
+          variant: "high",
+          sessionID: "session-native-anthropic-effort",
+        })
+        const capture = yield* Effect.promise(() => request)
+        expect(capture.url.pathname.endsWith("/messages")).toBe(true)
+        expect(reported).toEqual([
+          { variant: "high", effort: (capture.body.output_config as { effort?: string } | undefined)?.effort },
+        ])
+      }),
+    {
+      config: () => ({
+        enabled_providers: ["anthropic"],
+        provider: {
+          anthropic: { options: { apiKey: "test-anthropic-key", baseURL: `${state.server!.url.origin}/v1` } },
+        },
+      }),
+    },
+  )
+
+  it.instance(
+    "a native OpenAI-compatible request reports only the effort its wire body carries",
+    () =>
+      Effect.gen(function* () {
+        const request = waitRequest(
+          "/chat/completions",
+          new Response(createChatStream("Hello"), { headers: { "Content-Type": "text/event-stream" } }),
+        )
+        const reported = yield* reportedRun({
+          providerID: "opencode-probe",
+          modelID: "probe-model",
+          sessionID: "session-native-compatible-effort",
+        })
+        const capture = yield* Effect.promise(() => request)
+        expect(capture.url.pathname.endsWith("/chat/completions")).toBe(true)
+        expect(reported).toEqual([{ variant: undefined, effort: capture.body.reasoning_effort as string | undefined }])
+      }),
+    {
+      config: () => ({
+        enabled_providers: ["opencode-probe"],
+        provider: {
+          "opencode-probe": {
+            name: "Probe",
+            npm: "@ai-sdk/openai-compatible",
+            env: [],
+            models: {
+              "probe-model": {
+                id: "probe-model",
+                name: "Probe Model",
+                reasoning: true,
+                tool_call: true,
+                release_date: "2025-01-01",
+                limit: { context: 100_000, output: 10_000 },
+                options: { reasoningEffort: "high" },
+              },
+            },
+            options: { apiKey: "test-probe-key", baseURL: `${state.server!.url.origin}/v1` },
+          },
+        },
+      }),
+    },
+  )
+
   it.instance(
     "executes OpenAI tool calls through native runtime",
     () =>

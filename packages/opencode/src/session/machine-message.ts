@@ -6,8 +6,8 @@ type Level = "critical" | "request" | "info" | "directive" | "nudge"
 
 type LevelToken = {
   level: Level
-  body: string
   key?: string
+  body: string
 }
 
 const DEFAULT_HOLD_MARKERS: Marker[] = [
@@ -94,7 +94,7 @@ export function dispatch(input: string) {
   if (peer) {
     return {
       kind: "peer" as const,
-      sender: peer.sender,
+      sender: peer.name,
       home: peer.home,
       messageID: peer.messageID,
       level: token?.level,
@@ -156,10 +156,40 @@ function parseLevelToken(input: string): LevelToken | undefined {
   if (specification.startsWith("nudge:")) {
     const key = specification.slice("nudge:".length)
     if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(key)) return
-    return { level: "nudge", body: content, key }
+    return { level: "nudge", key, body: content }
   }
   if (["critical", "request", "info", "directive"].includes(specification))
     return { level: specification as Level, body: content }
+}
+
+/**
+ * Who sent a framed message, at what level, under which supersede key, and its
+ * text after the framing (#212); undefined when it carries no framing. A peer
+ * is named by its name and home, so its msgid never makes two senders.
+ */
+export function envelope(input: string) {
+  const peer = input.startsWith(PEER_PREFIX) ? peerEnvelope(input) : undefined
+  if (input.startsWith(PEER_PREFIX) && !peer) return
+  const token = parseLevelToken(input)
+  const sender = peer
+    ? `peer${UNIT_SEPARATOR}${peer.name}${UNIT_SEPARATOR}${peer.home}`
+    : input.startsWith(FIRSTMATE_PREFIX)
+      ? "firstmate"
+      : input.startsWith(OBSERVER_PREFIX)
+        ? "observer"
+        : token
+          ? "unaddressed"
+          : undefined
+  if (!sender) return
+  const body = token?.body ?? peer?.body ?? levelTokenBody(input) ?? input
+  return {
+    sender,
+    level: token?.level,
+    key: token?.key,
+    body,
+    // A reply acknowledges one msgid, so replies to different ones never meet.
+    reply: /^re:p[0-9]+-[0-9]+-[0-9a-f]{4}(?=\s|$)/.exec(body)?.[0],
+  }
 }
 
 function levelTokenBody(input: string): string | undefined {
@@ -168,6 +198,10 @@ function levelTokenBody(input: string): string | undefined {
   if (input.startsWith(OBSERVER_PREFIX)) return input.slice(OBSERVER_PREFIX.length)
   if (input.startsWith(UNIT_SEPARATOR)) return input.slice(UNIT_SEPARATOR.length)
   return input
+}
+
+function peerEnvelopeBody(input: string) {
+  return peerEnvelope(input)?.body
 }
 
 function peerEnvelope(input: string) {
@@ -196,7 +230,7 @@ function peerEnvelope(input: string) {
   if (!home.startsWith("/") || home.includes("\n") || home.includes("\r")) return
   if (!/^p[0-9]+-[0-9]+-[0-9a-f]{4}$/.test(messageID)) return
   if (padded && rest.startsWith(" ")) rest = rest.slice(1)
-  return { sender: name, home, messageID, body: rest }
+  return { name, home, messageID, body: rest }
 }
 
 function isPeerTaskLabel(name: string) {

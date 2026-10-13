@@ -204,9 +204,22 @@ import type {
   SessionPromptAsyncErrors,
   SessionPromptAsyncResponses,
   SessionPromptErrors,
+  SessionPromptQueueRequestId,
   SessionPromptResponses,
+  SessionQueueConsolidateErrors,
+  SessionQueueConsolidateResponses,
+  SessionQueueHoldErrors,
+  SessionQueueHoldResponses,
   SessionQueueListErrors,
   SessionQueueListResponses,
+  SessionQueueReceiptErrors,
+  SessionQueueReceiptResponses,
+  SessionQueueReleaseErrors,
+  SessionQueueReleaseResponses,
+  SessionQueueRemoveErrors,
+  SessionQueueRemoveResponses,
+  SessionQueueReorderErrors,
+  SessionQueueReorderResponses,
   SessionQueueRestoreErrors,
   SessionQueueRestoreResponses,
   SessionQueueUpdateErrors,
@@ -3371,7 +3384,7 @@ export class Queue extends HeyApiClient {
   /**
    * List queued prompts
    *
-   * List the prompts admitted to a session that have not reached the model yet: pending steers first, then queued prompts, each in admission order.
+   * List the prompts admitted to a session that have not reached the model yet: pending steers first, then queued prompts, each in the order it is delivered.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters: {
@@ -3518,6 +3531,236 @@ export class Queue extends HeyApiClient {
         },
       },
     )
+  }
+
+  /**
+   * Hold queued prompts for review
+   *
+   * Start or renew a review hold for this holder. While a session has a hold, none of its queued prompts reaches the model, so the returned list stays as it is until the hold ends. A hold the holder does not renew lapses after six minutes.
+   */
+  public hold<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      holder?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "holder" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionQueueHoldResponses, SessionQueueHoldErrors, ThrowOnError>({
+      url: "/session/{sessionID}/queue/hold",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Release a review hold
+   *
+   * End this holder's review hold. Once no hold is left, the session is woken and its queued prompts are delivered.
+   */
+  public release<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      holder?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "holder" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionQueueReleaseResponses, SessionQueueReleaseErrors, ThrowOnError>(
+      {
+        url: "/session/{sessionID}/queue/release",
+        ...options,
+        ...params,
+        headers: {
+          "Content-Type": "application/json",
+          ...options?.headers,
+          ...params.headers,
+        },
+      },
+    )
+  }
+
+  /**
+   * Delete queued prompt
+   *
+   * Delete a pending prompt for good; unlike a withdrawn one it cannot be restored. Fails with QueueItemNotPending when it was already delivered, withdrawn or never existed.
+   */
+  public remove<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      id?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "id" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionQueueRemoveResponses, SessionQueueRemoveErrors, ThrowOnError>({
+      url: "/session/{sessionID}/queue/remove",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Reorder queued prompts
+   *
+   * Deliver the listed pending prompts in the listed order. Steers still come before queued prompts, and no prompt changes how it is delivered. Fails with QueueItemNotPending, changing nothing, when any of them is not pending.
+   */
+  public reorder<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      items?: Array<string>
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "items" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionQueueReorderResponses, SessionQueueReorderErrors, ThrowOnError>(
+      {
+        url: "/session/{sessionID}/queue/reorder",
+        ...options,
+        ...params,
+        headers: {
+          "Content-Type": "application/json",
+          ...options?.headers,
+          ...params.headers,
+        },
+      },
+    )
+  }
+
+  /**
+   * Consolidate queued prompts
+   *
+   * Keep one of identical pending prompts, and merge pending commands of one delivery that share their leading verb and target into one command with numbered steps, in delivery order.
+   */
+  public consolidate<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      SessionQueueConsolidateResponses,
+      SessionQueueConsolidateErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/queue/consolidate",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get a request's receipt
+   *
+   * Say what became of a prompt sent with this request ID: pending in the queue, delivered as a message, merged into another request's prompt, superseded by a newer request, or deleted undelivered. Receipts last as long as the session. Fails with NotFound when the session has no such request.
+   */
+  public receipt<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      requestID: SessionPromptQueueRequestId
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "requestID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SessionQueueReceiptResponses, SessionQueueReceiptErrors, ThrowOnError>({
+      url: "/session/{sessionID}/queue/receipt/{requestID}",
+      ...options,
+      ...params,
+    })
   }
 }
 
@@ -3728,6 +3971,11 @@ export class Session2 extends HeyApiClient {
         [key: string]: unknown
       }
       permission?: PermissionRuleset
+      model?: {
+        id: string
+        providerID: string
+        variant?: string
+      }
       time?: {
         archived?: number
       }
@@ -3745,6 +3993,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "title" },
             { in: "body", key: "metadata" },
             { in: "body", key: "permission" },
+            { in: "body", key: "model" },
             { in: "body", key: "time" },
           ],
         },
@@ -3906,6 +4155,7 @@ export class Session2 extends HeyApiClient {
       sessionID: string
       directory?: string
       workspace?: string
+      requestID?: SessionPromptQueueRequestId
       messageID?: string
       model?: {
         providerID: string
@@ -3932,6 +4182,7 @@ export class Session2 extends HeyApiClient {
             { in: "path", key: "sessionID" },
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
+            { in: "body", key: "requestID" },
             { in: "body", key: "messageID" },
             { in: "body", key: "model" },
             { in: "body", key: "agent" },
@@ -4254,13 +4505,14 @@ export class Session2 extends HeyApiClient {
   /**
    * Send async message
    *
-   * Create and send a new message to a session asynchronously, starting the session if needed and returning immediately.
+   * Create and send a new message to a session asynchronously, starting the session if needed and returning immediately. Sending a request ID the session already has is a retry when the prompt is the same, and fails with PromptRequestConflict when it is not.
    */
   public promptAsync<ThrowOnError extends boolean = false>(
     parameters: {
       sessionID: string
       directory?: string
       workspace?: string
+      requestID?: SessionPromptQueueRequestId
       messageID?: string
       model?: {
         providerID: string
@@ -4287,6 +4539,7 @@ export class Session2 extends HeyApiClient {
             { in: "path", key: "sessionID" },
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
+            { in: "body", key: "requestID" },
             { in: "body", key: "messageID" },
             { in: "body", key: "model" },
             { in: "body", key: "agent" },

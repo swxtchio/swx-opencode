@@ -19,6 +19,7 @@ import type {
   VcsInfo,
   SnapshotFileDiff,
   ConsoleState,
+  SessionPromptQueueItem,
 } from "@opencode-ai/sdk/v2"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { useProject } from "./project"
@@ -96,6 +97,10 @@ export const {
       todo: {
         [sessionID: string]: Todo[]
       }
+      // Prompts admitted to a session that are not messages yet, in delivery order.
+      session_queue: {
+        [sessionID: string]: SessionPromptQueueItem[]
+      }
       message: {
         [sessionID: string]: Message[]
       }
@@ -134,6 +139,7 @@ export const {
       session_status: {},
       session_diff: {},
       todo: {},
+      session_queue: {},
       message: {},
       part: {},
       lsp: [],
@@ -149,7 +155,7 @@ export const {
 
     const fullSyncedSessions = new Set<string>()
     const syncingSessions = new Map<string, Promise<void>>()
-    const hydratingSessions = new Map<string, { messages: Set<string>; parts: Set<string> }>()
+    const hydratingSessions = new Map<string, { messages: Set<string>; parts: Set<string>; queue: boolean }>()
     const touchMessage = (sessionID: string, messageID: string) => {
       hydratingSessions.get(sessionID)?.messages.add(messageID)
     }
@@ -259,6 +265,13 @@ export const {
               draft.splice(match.index, 0, request)
             }),
           )
+          break
+        }
+
+        case "session.queue.updated": {
+          const tracker = hydratingSessions.get(event.properties.sessionID)
+          if (tracker) tracker.queue = true
+          setStore("session_queue", event.properties.sessionID, reconcile(event.properties.items))
           break
         }
 
@@ -599,14 +612,15 @@ export const {
           if (fullSyncedSessions.has(sessionID)) return
           const syncing = syncingSessions.get(sessionID)
           if (syncing) return syncing
-          const tracker = { messages: new Set<string>(), parts: new Set<string>() }
+          const tracker = { messages: new Set<string>(), parts: new Set<string>(), queue: false }
           hydratingSessions.set(sessionID, tracker)
           const task = (async () => {
-            const [session, messages, todo, diff] = await Promise.all([
+            const [session, messages, todo, diff, queue] = await Promise.all([
               sdk.client.session.get({ sessionID }, { throwOnError: true }),
               sdk.client.session.messages({ sessionID, limit: 100 }),
               sdk.client.session.todo({ sessionID }),
               sdk.client.session.diff({ sessionID }),
+              sdk.client.session.queue.list({ sessionID }),
             ])
             setStore(
               produce((draft) => {
@@ -614,6 +628,8 @@ export const {
                 if (match.found) draft.session[match.index] = session.data!
                 if (!match.found) draft.session.splice(match.index, 0, session.data!)
                 draft.todo[sessionID] = todo.data ?? []
+                // A live update carries the whole list and is newer than this read.
+                if (!tracker.queue) draft.session_queue[sessionID] = queue.data ?? []
                 const currentMessages = draft.message[sessionID] ?? []
                 const infos = (messages.data ?? []).flatMap((message) => {
                   if (!tracker.messages.has(message.info.id)) return [message.info]

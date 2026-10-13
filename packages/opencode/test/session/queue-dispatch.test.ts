@@ -4,7 +4,7 @@ import { rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Scope } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Scope, Struct } from "effect"
 import { eq, sql } from "drizzle-orm"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
@@ -1023,7 +1023,7 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
               : metadata(returned)
           const afterPromotion = yield* queue.list(session.id)
           expect(afterPromotion).toEqual(name === "peerContinuation" ? originals.slice(2) : [])
-          expect(group.constituents).toEqual(selected)
+          expect(group.constituents).toEqual(selected.map((item) => Struct.omit(item, ["origins", "requestID"])))
           expect(group.constituents.map((item) => item.time.created)).toEqual(selected.map((item) => item.time.created))
           const encoded = originals.map((item) => Schema.encodeSync(SessionPromptQueue.QueuedInput)(item.input))
           expect(
@@ -1637,7 +1637,9 @@ it.instance("peer-only continuation promotion preserves pending compaction custo
     yield* Deferred.succeed(release, undefined)
     yield* Fiber.join(running)
     expect(yield* promote()).toBe(true)
-    expect(metadata((yield* MessageV2.stream(session.id))[0]).constituents).toEqual([original])
+    expect(metadata((yield* MessageV2.stream(session.id))[0]).constituents).toEqual([
+      Struct.omit(original, ["origins", "requestID"]),
+    ])
     expect(yield* queue.list(session.id)).toEqual([human, automation])
   }),
 )
@@ -1875,5 +1877,153 @@ it.instance("round6 executable reservation is released after failed or cancelled
     const admitted = yield* queue.prepareExecutable({ ...input, prepare: () => Effect.succeed(input) })
     expect(admitted.input).toEqual(input)
     expect((yield* queue.list(session.id)).map((item) => item.id)).toEqual([admitted.own.id])
+  }),
+)
+
+it.instance("receipt peer carriers preserve every original and bound delivery by ten constituents", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const inputs = Array.from({ length: 11 }, (_, index) => ({
+      sessionID: session.id,
+      delivery: "queue" as const,
+      requestID: `p1791809000-${index + 1}-abcd`,
+      messageID: MessageID.ascending(),
+      parts: [{ type: "text" as const, text: peer(1).replace("p1791809000-1-abcd", `p1791809000-${index + 1}-abcd`) }],
+    }))
+    const admitted = yield* Effect.forEach(inputs, (input) => queue.request(input))
+    expect(yield* queue.list(session.id)).toHaveLength(2)
+    const promote = () =>
+      queue.promote({
+        sessionID: session.id,
+        delivery: "queue",
+        prepare,
+        write: writer(sessions),
+        rejected: () => Effect.void,
+      })
+    yield* promote()
+    const first = (yield* MessageV2.stream(session.id))[0]
+    expect(metadata(first).constituents.map((item) => item.input)).toEqual(
+      inputs.slice(0, 10).map((input) => Struct.omit(input, ["sessionID", "delivery", "requestID"])),
+    )
+    inputs.slice(0, 10).forEach((input) => expect(text(first)).toContain(input.parts[0].text))
+    expect(yield* queue.list(session.id)).toHaveLength(1)
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, inputs[0].requestID))).toEqual({
+      state: "merged",
+      into: inputs[9].requestID,
+      messageID: first.info.id,
+    })
+    yield* queue.consume(session.id)
+    const original = yield* queue.reconcile({ ...inputs[0], requestID: undefined })
+    expect(original?.kind).toBe("queued")
+    if (original?.kind === "queued" && admitted[0].kind === "admitted") expect(original.own.id).toBe(admitted[0].own.id)
+    yield* promote()
+    const messages = yield* MessageV2.stream(session.id)
+    expect(messages).toHaveLength(2)
+    const overflow = messages.find((message) => message.info.id !== first.info.id)!
+    expect(metadata(overflow).constituents).toHaveLength(1)
+    expect(text(overflow)).toContain(inputs[10].parts[0].text)
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, inputs[10].requestID))).toEqual({
+      state: "delivered",
+      messageID: overflow.info.id,
+    })
+  }),
+)
+
+it.instance("a receipt retry cannot borrow a foreign projected transport identity", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const input = {
+      sessionID: session.id,
+      delivery: "queue" as const,
+      requestID: "peer-receipt",
+      parts: [{ type: "text" as const, text: peer(1100) }],
+    }
+    yield* queue.request(input)
+    const other = yield* sessions.create({})
+    const foreign = yield* prepare({
+      sessionID: other.id,
+      messageID: MessageID.ascending(),
+      parts: [{ type: "text", text: "other owner" }],
+    })
+    yield* writer(sessions)(foreign)
+    const retry = yield* queue.request({ ...input, messageID: foreign.info.id }).pipe(Effect.exit)
+    expect(Exit.isFailure(retry)).toBe(true)
+    if (Exit.isFailure(retry)) expect(Cause.pretty(retry.cause)).toContain("belongs to another projected message")
+    expect(yield* queue.list(session.id)).toHaveLength(1)
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, input.requestID)).state).toBe("pending")
+  }),
+)
+
+it.instance("receipt command consolidation retains each stable-ID original after consume", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const inputs = ["run lint", "run lint --fix"].map((text, index) => ({
+      sessionID: session.id,
+      delivery: "queue" as const,
+      requestID: `lint-${index}`,
+      messageID: MessageID.ascending(),
+      parts: [{ type: "text" as const, text }],
+    }))
+    const admitted = yield* Effect.forEach(inputs, (input) => queue.request(input))
+    expect(yield* queue.list(session.id)).toHaveLength(1)
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "queue",
+      prepare,
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+    const message = (yield* MessageV2.stream(session.id))[0]
+    expect(text(message)).toBe("run lint:\n1. run lint\n2. --fix")
+    yield* queue.consume(session.id)
+    const retry = yield* queue.reconcile({ ...inputs[1], requestID: undefined })
+    expect(retry?.kind).toBe("queued")
+    if (retry?.kind === "queued" && admitted[1].kind === "admitted") expect(retry.own.id).toBe(admitted[1].own.id)
+    expect(yield* queue.list(session.id)).toEqual([])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, inputs[1].requestID))).toEqual({
+      state: "merged",
+      into: inputs[0].requestID,
+      messageID: message.info.id,
+    })
+  }),
+)
+
+it.instance("a new receipt name on an exact stable-ID retry follows the retained original", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const input = {
+      sessionID: session.id,
+      delivery: "queue" as const,
+      requestID: "original",
+      messageID: MessageID.ascending(),
+      parts: [{ type: "text" as const, text: "held original" }],
+    }
+    const original = yield* queue.request(input)
+    const retried = yield* queue.reconcile({ ...input, requestID: "alias" })
+    expect(retried?.kind).toBe("queued")
+    if (original.kind === "admitted" && retried?.kind === "queued") expect(retried.own.id).toBe(original.own.id)
+    expect(yield* queue.list(session.id)).toHaveLength(1)
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias"))).toEqual({ state: "merged", into: "original" })
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "queue",
+      prepare,
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+    const message = (yield* MessageV2.stream(session.id))[0]
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias"))).toEqual({
+      state: "merged",
+      into: "original",
+      messageID: message.info.id,
+    })
   }),
 )
