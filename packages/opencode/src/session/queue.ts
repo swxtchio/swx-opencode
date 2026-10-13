@@ -113,10 +113,14 @@ export interface Interface {
    * prompt under that request fails with RequestConflictError. An admitted
    * prompt then retires the pending items it positively replaces; see
    * `admission`. `markers` are the configured machine-message markers.
+   * `ready` runs once the prompt is admitted, still under the session's lock,
+   * so session work its delivery depends on cannot delay its admission and no
+   * promotion takes it before that work is done (#249).
    */
   readonly request: (
     input: AdmitInput,
     markers?: ConfigV1.Info["machine_message_markers"],
+    ready?: Effect.Effect<void>,
   ) => Effect.Effect<
     | { readonly kind: "admitted"; readonly own: Item }
     | { readonly kind: "retry"; readonly own: ItemID; readonly receipt: Receipt },
@@ -516,12 +520,16 @@ const layer = Layer.effect(
     const receipt: Interface["receipt"] = (sessionID, requestID) =>
       receiptRow(sessionID, requestID).pipe(Effect.map((row) => Option.fromNullishOr(row).pipe(Option.map(toReceipt))))
 
-    const request: Interface["request"] = (input, markers) =>
+    const request: Interface["request"] = (input, markers, ready) =>
       exclusive(
         input.sessionID,
         Effect.gen(function* () {
           const prior = input.requestID ? yield* receiptRow(input.sessionID, input.requestID) : undefined
-          if (!prior) return { kind: "admitted" as const, own: yield* admitLocked(input, markers) }
+          if (!prior) {
+            const own = yield* admitLocked(input, markers)
+            if (ready) yield* ready
+            return { kind: "admitted" as const, own }
+          }
           if (prior.fingerprint !== fingerprint(input))
             return yield* new RequestConflictError({ sessionID: input.sessionID, requestID: prior.request_id })
           return { kind: "retry" as const, own: yield* follow(prior), receipt: toReceipt(prior) }
@@ -645,6 +653,28 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
     })
 
+    // The request an item carries is withdrawn with it and pending again when
+    // it is restored (#249). Requests merged into it keep naming that request.
+    const carried = (
+      tx: DatabaseTransaction,
+      sessionID: SessionID,
+      itemID: ItemID,
+      from: "pending" | "withdrawn",
+      to: "pending" | "withdrawn",
+    ) =>
+      tx
+        .update(SessionPromptReceiptTable)
+        .set({ state: to, time_updated: Date.now() })
+        .where(
+          and(
+            eq(SessionPromptReceiptTable.session_id, sessionID),
+            eq(SessionPromptReceiptTable.item_id, itemID),
+            eq(SessionPromptReceiptTable.state, from),
+          ),
+        )
+        .run()
+        .pipe(Effect.orDie)
+
     // A waiter on a retired item now waits on its survivor, and so does anyone
     // already following it.
     const retire = (items: readonly ItemID[], survivor: ItemID) =>
@@ -737,13 +767,17 @@ const layer = Layer.effect(
         sessionID,
         Effect.gen(function* () {
           const row = yield* writable(sessionID, (tx) =>
-            tx
-              .update(SessionPromptQueueTable)
-              .set({ time_withdrawn: Date.now(), message_id: null })
-              .where(and(eq(SessionPromptQueueTable.id, itemID), pending(sessionID)))
-              .returning()
-              .get()
-              .pipe(Effect.orDie),
+            Effect.gen(function* () {
+              const row = yield* tx
+                .update(SessionPromptQueueTable)
+                .set({ time_withdrawn: Date.now(), message_id: null })
+                .where(and(eq(SessionPromptQueueTable.id, itemID), pending(sessionID)))
+                .returning()
+                .get()
+                .pipe(Effect.orDie)
+              if (row) yield* carried(tx, sessionID, itemID, "pending", "withdrawn")
+              return row
+            }),
           ).pipe(Effect.orDie)
           if (!row) return Option.none()
           yield* publish(sessionID)
@@ -758,19 +792,23 @@ const layer = Layer.effect(
 
     const restoreLocked = Effect.fnUntraced(function* (sessionID: SessionID, itemID: ItemID) {
       const row = yield* writable(sessionID, (tx) =>
-        tx
-          .update(SessionPromptQueueTable)
-          .set({ time_withdrawn: null })
-          .where(
-            and(
-              eq(SessionPromptQueueTable.id, itemID),
-              eq(SessionPromptQueueTable.session_id, sessionID),
-              isNotNull(SessionPromptQueueTable.time_withdrawn),
-            ),
-          )
-          .returning()
-          .get()
-          .pipe(Effect.orDie),
+        Effect.gen(function* () {
+          const row = yield* tx
+            .update(SessionPromptQueueTable)
+            .set({ time_withdrawn: null })
+            .where(
+              and(
+                eq(SessionPromptQueueTable.id, itemID),
+                eq(SessionPromptQueueTable.session_id, sessionID),
+                isNotNull(SessionPromptQueueTable.time_withdrawn),
+              ),
+            )
+            .returning()
+            .get()
+            .pipe(Effect.orDie)
+          if (row) yield* carried(tx, sessionID, itemID, "withdrawn", "pending")
+          return row
+        }),
       ).pipe(Effect.orDie)
       if (!row) return Option.none()
       wake(sessionID)
@@ -1641,6 +1679,7 @@ function fromRow(row: typeof SessionPromptQueueTable.$inferSelect): Item {
 
 function toReceipt(row: typeof SessionPromptReceiptTable.$inferSelect): Receipt {
   if (row.state === "pending") return { state: "pending", itemID: row.item_id! }
+  if (row.state === "withdrawn") return { state: "withdrawn", itemID: row.item_id! }
   if (row.state === "delivered") return { state: "delivered", messageID: row.message_id! }
   if (row.state === "merged")
     return { state: "merged", into: row.into_request_id!, ...(row.message_id ? { messageID: row.message_id } : {}) }

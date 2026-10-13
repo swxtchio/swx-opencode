@@ -115,10 +115,13 @@ export type Item = Schema.Schema.Type<typeof Item>
 
 // What became of a request (#212). Merged: its instruction is delivered as part
 // of the survivor `into`, once that has a message. Superseded: a newer request
-// of the same kind, `by`, retired it undelivered. Deleted: removed from the
+// of the same kind, `by`, retired it undelivered. Withdrawn: taken out of the
+// queue undelivered, for example to be edited and sent again as a new request
+// (#249); restoring the item makes it pending again. Deleted: removed from the
 // queue undelivered, by its reviewer or because it could not become a message.
 export const Receipt = Schema.Union([
   Schema.Struct({ state: Schema.Literal("pending"), itemID: ItemID }),
+  Schema.Struct({ state: Schema.Literal("withdrawn"), itemID: ItemID }),
   Schema.Struct({ state: Schema.Literal("delivered"), messageID: MessageID }),
   Schema.Struct({ state: Schema.Literal("merged"), into: RequestID, messageID: Schema.optional(MessageID) }),
   Schema.Struct({ state: Schema.Literal("superseded"), by: RequestID }),
