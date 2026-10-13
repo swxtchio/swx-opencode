@@ -5819,6 +5819,22 @@
                   "permission": {
                     "$ref": "#/components/schemas/PermissionRuleset"
                   },
+                  "model": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "providerID": {
+                        "type": "string"
+                      },
+                      "variant": {
+                        "type": "string"
+                      }
+                    },
+                    "required": ["id", "providerID"],
+                    "additionalProperties": false
+                  },
                   "time": {
                     "type": "object",
                     "properties": {
@@ -6281,11 +6297,18 @@
             }
           },
           "409": {
-            "description": "PromptWithdrawn",
+            "description": "PromptWithdrawn | PromptRequestConflict",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PromptWithdrawn"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/PromptWithdrawn"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PromptRequestConflict"
+                    }
+                  ]
                 }
               }
             }
@@ -6299,6 +6322,9 @@
               "schema": {
                 "type": "object",
                 "properties": {
+                  "requestID": {
+                    "$ref": "#/components/schemas/SessionPromptQueueRequestID"
+                  },
                   "messageID": {
                     "type": "string",
                     "pattern": "^msg"
@@ -7175,9 +7201,19 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "PromptRequestConflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PromptRequestConflict"
+                }
+              }
+            }
           }
         },
-        "description": "Create and send a new message to a session asynchronously, starting the session if needed and returning immediately.",
+        "description": "Create and send a new message to a session asynchronously, starting the session if needed and returning immediately. Sending a request ID the session already has is a retry when the prompt is the same, and fails with PromptRequestConflict when it is not.",
         "summary": "Send async message",
         "requestBody": {
           "content": {
@@ -7185,6 +7221,9 @@
               "schema": {
                 "type": "object",
                 "properties": {
+                  "requestID": {
+                    "$ref": "#/components/schemas/SessionPromptQueueRequestID"
+                  },
                   "messageID": {
                     "type": "string",
                     "pattern": "^msg"
@@ -8161,7 +8200,7 @@
             }
           }
         },
-        "description": "List the prompts admitted to a session that have not reached the model yet: pending steers first, then queued prompts, each in admission order.",
+        "description": "List the prompts admitted to a session that have not reached the model yet: pending steers first, then queued prompts, each in the order it is delivered.",
         "summary": "List queued prompts",
         "x-codeSamples": [
           {
@@ -8478,6 +8517,584 @@
           {
             "lang": "js",
             "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.queue.restore({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/session/{sessionID}/queue/hold": {
+      "post": {
+        "tags": ["session queue"],
+        "operationId": "session.queue.hold",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pending queue items in delivery order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SessionPromptQueueItem"
+                  },
+                  "description": "Pending queue items in delivery order"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Start or renew a review hold for this holder. While a session has a hold, none of its queued prompts reaches the model, so the returned list stays as it is until the hold ends. A hold the holder does not renew lapses after six minutes.",
+        "summary": "Hold queued prompts for review",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "holder": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": ["holder"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.queue.hold({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/session/{sessionID}/queue/release": {
+      "post": {
+        "tags": ["session queue"],
+        "operationId": "session.queue.release",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Hold released"
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "End this holder's review hold. Once no hold is left, the session is woken and its queued prompts are delivered.",
+        "summary": "Release a review hold",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "holder": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": ["holder"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.queue.release({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/session/{sessionID}/queue/remove": {
+      "post": {
+        "tags": ["session queue"],
+        "operationId": "session.queue.remove",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted queue item",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionPromptQueueItem"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError | QueueItemNotPending",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/NotFoundError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/QueueItemNotPending"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "description": "Delete a pending prompt for good; unlike a withdrawn one it cannot be restored. Fails with QueueItemNotPending when it was already delivered, withdrawn or never existed.",
+        "summary": "Delete queued prompt",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^que_"
+                  }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.queue.remove({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/session/{sessionID}/queue/reorder": {
+      "post": {
+        "tags": ["session queue"],
+        "operationId": "session.queue.reorder",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pending queue items in delivery order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SessionPromptQueueItem"
+                  },
+                  "description": "Pending queue items in delivery order"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError | QueueItemNotPending",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/NotFoundError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/QueueItemNotPending"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "description": "Deliver the listed pending prompts in the listed order. Steers still come before queued prompts, and no prompt changes how it is delivered. Fails with QueueItemNotPending, changing nothing, when any of them is not pending.",
+        "summary": "Reorder queued prompts",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^que_"
+                    }
+                  }
+                },
+                "required": ["items"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.queue.reorder({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/session/{sessionID}/queue/consolidate": {
+      "post": {
+        "tags": ["session queue"],
+        "operationId": "session.queue.consolidate",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pending queue items in delivery order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SessionPromptQueueItem"
+                  },
+                  "description": "Pending queue items in delivery order"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Keep one of identical pending prompts, and merge pending commands of one delivery that share their leading verb and target into one command with numbered steps, in delivery order.",
+        "summary": "Consolidate queued prompts",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.queue.consolidate({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/session/{sessionID}/queue/receipt/{requestID}": {
+      "get": {
+        "tags": ["session queue"],
+        "operationId": "session.queue.receipt",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "requestID",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/SessionPromptQueueRequestID"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "What became of the request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionPromptQueueReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Say what became of a prompt sent with this request ID: pending in the queue, delivered as a message, merged into another request's prompt, superseded by a newer request, or deleted undelivered. Receipts last as long as the session. Fails with NotFound when the session has no such request.",
+        "summary": "Get a request's receipt",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.queue.receipt({\n  ...\n})"
           }
         ]
       }
@@ -11142,8 +11759,22 @@
         ],
         "security": [],
         "responses": {
-          "204": {
-            "description": "<No Content>"
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/SessionWaitResult"
+                    }
+                  },
+                  "required": ["data"],
+                  "additionalProperties": false
+                }
+              }
+            }
           },
           "400": {
             "description": "InvalidRequestError",
@@ -11193,7 +11824,7 @@
             }
           }
         },
-        "description": "Wait for a session agent loop to become idle.",
+        "description": "Wait for current admitted work to settle and return its durable outcome.",
         "summary": "Wait for session",
         "x-codeSamples": [
           {
@@ -16799,6 +17430,9 @@
           "variant": {
             "type": "string"
           },
+          "effort": {
+            "type": "string"
+          },
           "finish": {
             "type": "string"
           }
@@ -17761,6 +18395,17 @@
               "next": {
                 "type": "integer",
                 "minimum": 0
+              },
+              "activeAssistantMessageID": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^msg"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": ["type", "attempt", "message", "next"],
@@ -17772,12 +18417,27 @@
               "type": {
                 "type": "string",
                 "enum": ["busy"]
+              },
+              "activeAssistantMessageID": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^msg"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             },
             "required": ["type"],
             "additionalProperties": false
           }
         ]
+      },
+      "SessionPromptQueueRequestID": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._:-]{1,128}$"
       },
       "TextPartInput": {
         "type": "object",
@@ -17985,6 +18645,40 @@
         "required": ["parts"],
         "additionalProperties": false
       },
+      "SessionPromptQueueRepeat": {
+        "type": "object",
+        "properties": {
+          "time": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "requestID": {
+            "$ref": "#/components/schemas/SessionPromptQueueRequestID"
+          }
+        },
+        "required": ["time"],
+        "additionalProperties": false
+      },
+      "SessionPromptQueueOrigin": {
+        "type": "object",
+        "properties": {
+          "time": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "requestID": {
+            "$ref": "#/components/schemas/SessionPromptQueueRequestID"
+          },
+          "repeats": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionPromptQueueRepeat"
+            }
+          }
+        },
+        "required": ["time"],
+        "additionalProperties": false
+      },
       "SessionPromptQueueItem": {
         "type": "object",
         "properties": {
@@ -17999,11 +18693,14 @@
           "seq": {
             "type": "integer",
             "minimum": 0,
-            "description": "Admission order within the session; never reused"
+            "description": "Delivery order within the session: admission order until a reorder trades it between pending items; never reused"
           },
           "delivery": {
             "type": "string",
             "enum": ["steer", "queue"]
+          },
+          "requestID": {
+            "$ref": "#/components/schemas/SessionPromptQueueRequestID"
           },
           "input": {
             "$ref": "#/components/schemas/SessionPromptQueueInput"
@@ -18013,14 +18710,22 @@
             "properties": {
               "created": {
                 "type": "integer",
-                "minimum": 0
+                "minimum": 0,
+                "description": "When this item's own copy was last admitted; origins say when its instructions were first queued"
               }
             },
             "required": ["created"],
             "additionalProperties": false
+          },
+          "origins": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionPromptQueueOrigin"
+            },
+            "description": "One per instruction the item carries, in order: a merged command has one per step; repeats are copies of it collapsed into it"
           }
         },
-        "required": ["id", "sessionID", "seq", "delivery", "input", "time"],
+        "required": ["id", "sessionID", "seq", "delivery", "input", "time", "origins"],
         "additionalProperties": false
       },
       "QuestionOption": {
@@ -18532,6 +19237,10 @@
                       "delivery": {
                         "type": "string",
                         "enum": ["steer", "queue"]
+                      },
+                      "continuation": {
+                        "type": "boolean",
+                        "enum": [true]
                       }
                     },
                     "required": ["timestamp", "sessionID", "messageID", "prompt", "delivery"],
@@ -18872,7 +19581,7 @@
                         "pattern": "^msg_"
                       },
                       "error": {
-                        "$ref": "#/components/schemas/SessionErrorUnknown"
+                        "$ref": "#/components/schemas/SessionMessageAssistantError"
                       }
                     },
                     "required": ["timestamp", "sessionID", "assistantMessageID", "error"],
@@ -23884,6 +24593,26 @@
         "required": ["_tag", "sessionID", "itemID", "message"],
         "additionalProperties": false
       },
+      "PromptRequestConflict": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["PromptRequestConflict"]
+          },
+          "sessionID": {
+            "type": "string"
+          },
+          "requestID": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": ["_tag", "sessionID", "requestID", "message"],
+        "additionalProperties": false
+      },
       "SessionBusyError": {
         "type": "object",
         "properties": {
@@ -23940,6 +24669,83 @@
         },
         "required": ["_tag", "sessionID", "itemID", "message"],
         "additionalProperties": false
+      },
+      "SessionPromptQueueReceipt": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": ["pending"]
+              },
+              "itemID": {
+                "type": "string",
+                "pattern": "^que_"
+              }
+            },
+            "required": ["state", "itemID"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": ["delivered"]
+              },
+              "messageID": {
+                "type": "string",
+                "pattern": "^msg"
+              }
+            },
+            "required": ["state", "messageID"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": ["merged"]
+              },
+              "into": {
+                "$ref": "#/components/schemas/SessionPromptQueueRequestID"
+              },
+              "messageID": {
+                "type": "string",
+                "pattern": "^msg"
+              }
+            },
+            "required": ["state", "into"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": ["superseded"]
+              },
+              "by": {
+                "$ref": "#/components/schemas/SessionPromptQueueRequestID"
+              }
+            },
+            "required": ["state", "by"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": ["deleted"]
+              }
+            },
+            "required": ["state"],
+            "additionalProperties": false
+          }
+        ]
       },
       "EventTuiPromptAppend": {
         "type": "object",
@@ -25308,7 +26114,7 @@
         "required": ["name"],
         "additionalProperties": false
       },
-      "SessionErrorUnknown": {
+      "SessionMessageAssistantError": {
         "type": "object",
         "properties": {
           "type": {
@@ -25317,6 +26123,10 @@
           },
           "message": {
             "type": "string"
+          },
+          "origin": {
+            "type": "string",
+            "enum": ["runner-interruption"]
           }
         },
         "required": ["type", "message"],
@@ -25371,6 +26181,20 @@
             "$ref": "#/components/schemas/ToolFileContent"
           }
         ]
+      },
+      "SessionErrorUnknown": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["unknown"]
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": ["type", "message"],
+        "additionalProperties": false
       },
       "SessionNextRetry_error": {
         "type": "object",
@@ -26186,6 +27010,10 @@
                   "delivery": {
                     "type": "string",
                     "enum": ["steer", "queue"]
+                  },
+                  "continuation": {
+                    "type": "boolean",
+                    "enum": [true]
                   }
                 },
                 "required": ["timestamp", "sessionID", "messageID", "prompt", "delivery"],
@@ -26694,7 +27522,7 @@
                     "pattern": "^msg_"
                   },
                   "error": {
-                    "$ref": "#/components/schemas/SessionErrorUnknown"
+                    "$ref": "#/components/schemas/SessionMessageAssistantError"
                   }
                 },
                 "required": ["timestamp", "sessionID", "assistantMessageID", "error"],
@@ -28070,6 +28898,97 @@
         "required": ["admittedSeq", "id", "sessionID", "prompt", "delivery", "timeCreated"],
         "additionalProperties": false
       },
+      "SessionWaitResult": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["idle"]
+              }
+            },
+            "required": ["type"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["pending"]
+              },
+              "admittedSeq": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "messageID": {
+                "type": "string",
+                "pattern": "^msg_"
+              }
+            },
+            "required": ["type", "admittedSeq", "messageID"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["completed"]
+              },
+              "admittedSeq": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "assistantMessageID": {
+                "type": "string",
+                "pattern": "^msg_"
+              }
+            },
+            "required": ["type", "admittedSeq", "assistantMessageID"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["failed"]
+              },
+              "admittedSeq": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "assistantMessageID": {
+                "type": "string",
+                "pattern": "^msg_"
+              }
+            },
+            "required": ["type"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["interrupted"]
+              },
+              "admittedSeq": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "assistantMessageID": {
+                "type": "string",
+                "pattern": "^msg_"
+              }
+            },
+            "required": ["type"],
+            "additionalProperties": false
+          }
+        ]
+      },
       "SessionMessageAgentSwitched": {
         "type": "object",
         "properties": {
@@ -28602,7 +29521,7 @@
             "additionalProperties": false
           },
           "error": {
-            "$ref": "#/components/schemas/SessionErrorUnknown"
+            "$ref": "#/components/schemas/SessionMessageAssistantError"
           }
         },
         "required": ["id", "time", "type", "agent", "model", "content"],
@@ -28900,6 +29819,10 @@
               "delivery": {
                 "type": "string",
                 "enum": ["steer", "queue"]
+              },
+              "continuation": {
+                "type": "boolean",
+                "enum": [true]
               }
             },
             "required": ["timestamp", "sessionID", "messageID", "prompt", "delivery"],
@@ -29416,7 +30339,7 @@
                 "pattern": "^msg_"
               },
               "error": {
-                "$ref": "#/components/schemas/SessionErrorUnknown"
+                "$ref": "#/components/schemas/SessionMessageAssistantError"
               }
             },
             "required": ["timestamp", "sessionID", "assistantMessageID", "error"],
@@ -35010,6 +35933,10 @@
               "delivery": {
                 "type": "string",
                 "enum": ["steer", "queue"]
+              },
+              "continuation": {
+                "type": "boolean",
+                "enum": [true]
               }
             },
             "required": ["timestamp", "sessionID", "messageID", "prompt", "delivery"],
@@ -35350,7 +36277,7 @@
                 "pattern": "^msg_"
               },
               "error": {
-                "$ref": "#/components/schemas/SessionErrorUnknown"
+                "$ref": "#/components/schemas/SessionMessageAssistantError"
               }
             },
             "required": ["timestamp", "sessionID", "assistantMessageID", "error"],
