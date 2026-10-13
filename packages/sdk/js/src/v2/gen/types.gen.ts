@@ -373,6 +373,7 @@ export type AssistantMessage = {
   }
   structured?: unknown
   variant?: string
+  effort?: string
   finish?: string
 }
 

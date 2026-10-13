@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { LLMRequestPrep } from "./llm/request"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Session } from "./session"
@@ -393,6 +394,13 @@ const layer = Layer.effect(
           .filter(Boolean)
           .join("\n\n")
       const ctx = yield* InstanceState.context
+      // The summary records the variant and effort its request sends, which
+      // selection leaves as it was (swxtchio/swx-opencode#227).
+      const sent = { user: userMessage, sessionID: input.sessionID, model, agent }
+      const variant = LLMRequestPrep.appliedVariant(sent)
+      const effort = LLMRequestPrep.effort(
+        LLMRequestPrep.staticOptions({ ...sent, provider: yield* provider.getProvider(model.providerID) }),
+      )
       const msg: SessionV1.Assistant = {
         id: MessageID.ascending(),
         role: "assistant",
@@ -400,7 +408,8 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         mode: "compaction",
         agent: "compaction",
-        variant: userMessage.model.variant,
+        ...(variant ? { variant } : {}),
+        ...(effort ? { effort } : {}),
         summary: true,
         path: {
           cwd: ctx.directory,

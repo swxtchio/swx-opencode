@@ -2187,7 +2187,8 @@ describe("session HttpApi", () => {
                 inputs.some((input) => {
                   const messages = Array.isArray(input.messages) ? input.messages : []
                   return (
-                    JSON.stringify(withoutQueueNote(messages.at(-1))) === JSON.stringify({ role: "user", content: text })
+                    JSON.stringify(withoutQueueNote(messages.at(-1))) ===
+                    JSON.stringify({ role: "user", content: text })
                   )
                 })
                   ? true
@@ -2784,6 +2785,127 @@ describe("session HttpApi pending prompt selection", () => {
   )
 })
 
+describe("session HttpApi summary records what it sent", () => {
+  // swxtchio/swx-opencode#227: a summary keeps the selection it always had and
+  // records the variant and effort its request actually sent. model-a's own
+  // options send a high effort; its variants send low or high.
+  const effortConfig = (url: string) => {
+    const base = testProviderConfig(url)
+    return {
+      ...base,
+      provider: {
+        test: {
+          ...base.provider.test,
+          models: {
+            "model-a": {
+              ...base.provider.test.models["test-model"],
+              id: "model-a",
+              name: "model-a",
+              options: { reasoningEffort: "high" },
+              variants: { low: { reasoningEffort: "low" }, high: { reasoningEffort: "high" } },
+            },
+          },
+        },
+      },
+    }
+  }
+  const routes = (directory: string, sessionID: SessionIDType) => {
+    const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+    const params = { sessionID }
+    return {
+      prompt: (text: string, variant?: string) =>
+        request(pathFor(SessionPaths.prompt, params), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            agent: "build",
+            model: { providerID: "test", modelID: "model-a" },
+            ...(variant ? { variant } : {}),
+            parts: [{ type: "text", text }],
+          }),
+        }),
+      summarize: () =>
+        request(pathFor(SessionPaths.summarize, params), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ providerID: "test", modelID: "model-a", auto: false }),
+        }),
+      summaries: () =>
+        requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, params), { headers }).pipe(
+          Effect.map((messages) =>
+            messages.flatMap((message) =>
+              message.info.role === "assistant" && message.info.summary
+                ? [
+                    {
+                      modelID: String(message.info.modelID),
+                      variant: message.info.variant,
+                      effort: message.info.effort,
+                    },
+                  ]
+                : [],
+            ),
+          ),
+        ),
+    }
+  }
+
+  it.live(
+    "an explicit summary runs as it always has and records the effort its request sent",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: effortConfig(llm.url) })
+        const api = routes(
+          directory,
+          (yield* createSession({ title: "explicit summary" }).pipe(provideInstanceEffect(directory))).id,
+        )
+        yield* llm.text("start done")
+        expect((yield* api.prompt("start")).status).toBe(200)
+        yield* llm.text("first summary")
+        expect((yield* api.summarize()).status).toBe(200)
+        // A selected variant is the prompts' selection; an explicit summary names no variant, as before.
+        yield* llm.text("low done")
+        expect((yield* api.prompt("at low effort", "low")).status).toBe(200)
+        yield* llm.text("second summary")
+        expect((yield* api.summarize()).status).toBe(200)
+
+        const sent = yield* llm.inputs
+        expect(sent.map((input) => input.reasoning_effort)).toEqual(["high", "high", "low", "high"])
+        expect(yield* api.summaries()).toEqual([
+          { modelID: "model-a", variant: undefined, effort: "high" },
+          { modelID: "model-a", variant: undefined, effort: "high" },
+        ])
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
+    "an automatic summary runs at the last prompt's variant, as it always has, and records it",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: effortConfig(llm.url) })
+        const api = routes(
+          directory,
+          (yield* createSession({ title: "automatic summary" }).pipe(provideInstanceEffect(directory))).id,
+        )
+        // A turn that fills the context, so the next prompt compacts first.
+        yield* llm.text("start done", { usage: { input: 95_000, output: 10 } })
+        expect((yield* api.prompt("start", "low")).status).toBe(200)
+        yield* llm.text("automatic summary")
+        yield* llm.text("continued")
+        yield* llm.text("answered")
+        expect((yield* api.prompt("after the context filled", "low")).status).toBe(200)
+
+        const sent = yield* llm.inputs
+        expect(sent.map((input) => input.reasoning_effort)).toEqual(["low", "low", "low", "low"])
+        expect(JSON.stringify((sent[1]!.messages as unknown[]).at(-1))).toContain("Here is the conversation so far")
+        expect(yield* api.summaries()).toEqual([{ modelID: "model-a", variant: "low", effort: "low" }])
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+})
+
 describe("session HttpApi queue freshness", () => {
   const iso = (time: number) => new Date(time).toISOString().replace(/\.\d{3}Z$/, "Z")
   const envelope = (msgid: string, text: string) =>
@@ -2877,7 +2999,9 @@ describe("session HttpApi queue freshness", () => {
         )
         const lastUser = sent.map((input) => JSON.stringify((input.messages as unknown[]).at(-1)))
         // Delivered by its own admission, the first prompt is timestamped too.
-        expect(lastUser[0]).toMatch(/\[Queued prompt: queued at \S+; delivered at \S+, \d+s after it was first queued\.]/)
+        expect(lastUser[0]).toMatch(
+          /\[Queued prompt: queued at \S+; delivered at \S+, \d+s after it was first queued\.]/,
+        )
         expect(lastUser[1]).toContain(
           `[Queued prompt: queued at ${iso(first)}, and again at ${iso(same!.time.created)}; delivered at `,
         )

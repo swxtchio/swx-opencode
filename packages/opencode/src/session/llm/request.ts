@@ -53,6 +53,39 @@ export type Prepared = {
 const mergeOptions = (target: Record<string, any>, source: Record<string, any> | undefined): Record<string, any> =>
   mergeDeep(target, source ?? {}) as Record<string, any>
 
+/**
+ * The provider options a request sends before plugins adjust them: the
+ * provider's and model's defaults, the agent's, then the user's variant when
+ * the model has one by that name. A summary records what these resolve to
+ * (swxtchio/swx-opencode#227).
+ */
+export function staticOptions(
+  input: Pick<PrepareInput, "user" | "sessionID" | "model" | "agent" | "small" | "provider">,
+): Record<string, any> {
+  const variant =
+    !input.small && input.user.model.variant ? input.model.variants?.[input.user.model.variant] : undefined
+  const base = input.small
+    ? ProviderTransform.smallOptions(input.model)
+    : ProviderTransform.options({
+        model: input.model,
+        sessionID: input.sessionID,
+        providerOptions: input.provider.options,
+      })
+  return mergeOptions(mergeOptions(mergeOptions(base, input.model.options), input.agent.options), variant)
+}
+
+/** The variant a request applies: the user's, when the model has one by that name. */
+export function appliedVariant(input: Pick<PrepareInput, "user" | "model" | "small">) {
+  const variant = input.user.model.variant
+  return !input.small && variant && input.model.variants?.[variant] ? variant : undefined
+}
+
+/** The reasoning effort static options send, under the names providers take it by. */
+export function effort(options: Record<string, any>): string | undefined {
+  const value = options.reasoningEffort ?? options.effort ?? options.reasoning?.effort
+  return typeof value === "string" ? value : undefined
+}
+
 export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: PrepareInput) {
   const isOpenaiOauth = input.provider.id === "openai" && input.auth?.type === "oauth"
   const system = [
@@ -77,18 +110,7 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     system.push(header, rest.join("\n"))
   }
 
-  const variant =
-    !input.small && input.model.variants && input.user.model.variant
-      ? input.model.variants[input.user.model.variant]
-      : {}
-  const base = input.small
-    ? ProviderTransform.smallOptions(input.model)
-    : ProviderTransform.options({
-        model: input.model,
-        sessionID: input.sessionID,
-        providerOptions: input.provider.options,
-      })
-  const options = mergeOptions(mergeOptions(mergeOptions(base, input.model.options), input.agent.options), variant)
+  const options = staticOptions(input)
   if (
     input.model.api.npm === "@ai-sdk/azure" &&
     (input.provider.options.useCompletionUrls || input.model.options.useCompletionUrls || options.useCompletionUrls)
