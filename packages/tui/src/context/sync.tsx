@@ -60,9 +60,14 @@ const messageKey = (message: Message) => message.time.created + message.id
 
 export type SendingPrompt = { requestID: string; text: string }
 
+// The prompts being sent that a list of queue items does not carry yet.
+function unlisted(sending: SendingPrompt[], items: SessionPromptQueueItem[]) {
+  return sending.filter((prompt) => !items.some((item) => carries(item, prompt.requestID)))
+}
+
 // Whether a queue item delivers a request: as its own, or as one merged or
 // collapsed into it.
-function carries(item: SessionPromptQueueItem, requestID: string) {
+export function carries(item: SessionPromptQueueItem, requestID: string) {
   return (
     item.requestID === requestID ||
     item.origins.some(
@@ -291,13 +296,7 @@ export const {
         case "session.queue.updated": {
           const tracker = hydratingSessions.get(event.properties.sessionID)
           if (tracker) tracker.queue = true
-          setStore("session_queue", event.properties.sessionID, reconcile(event.properties.items))
-          // Once the queue lists a request, its item shows it instead.
-          const sending = store.session_sending[event.properties.sessionID] ?? []
-          const unlisted = sending.filter(
-            (prompt) => !event.properties.items.some((item) => carries(item, prompt.requestID)),
-          )
-          if (unlisted.length < sending.length) setStore("session_sending", event.properties.sessionID, unlisted)
+          result.queue.listed(event.properties.sessionID, event.properties.items)
           break
         }
 
@@ -598,6 +597,22 @@ export const {
       data: store,
       set: setStore,
       queue: {
+        // Every authoritative list of a session's queue comes through here:
+        // once it lists a request, its item shows that prompt instead.
+        listed(sessionID: string, items: SessionPromptQueueItem[]) {
+          setStore("session_queue", sessionID, reconcile(items))
+          const sending = store.session_sending[sessionID] ?? []
+          const remaining = unlisted(sending, items)
+          if (remaining.length < sending.length) setStore("session_sending", sessionID, remaining)
+        },
+        // An item taken out of the queue, and any send it carried, are not
+        // pending, whether or not the queue's own update has arrived yet.
+        withdrawn(sessionID: string, taken: SessionPromptQueueItem) {
+          setStore("session_queue", sessionID, (list) => (list ?? []).filter((item) => item.id !== taken.id))
+          setStore("session_sending", sessionID, (list) =>
+            (list ?? []).filter((prompt) => !carries(taken, prompt.requestID)),
+          )
+        },
         // Shows a prompt being sent until its session's queue lists it, or
         // until the returned callback says its send settled.
         sending(sessionID: string, prompt: SendingPrompt) {
@@ -666,7 +681,10 @@ export const {
                 if (!match.found) draft.session.splice(match.index, 0, session.data!)
                 draft.todo[sessionID] = todo.data ?? []
                 // A live update carries the whole list and is newer than this read.
-                if (!tracker.queue) draft.session_queue[sessionID] = queue.data ?? []
+                if (!tracker.queue) {
+                  draft.session_queue[sessionID] = queue.data ?? []
+                  draft.session_sending[sessionID] = unlisted(draft.session_sending[sessionID] ?? [], queue.data ?? [])
+                }
                 const currentMessages = draft.message[sessionID] ?? []
                 const infos = (messages.data ?? []).flatMap((message) => {
                   if (!tracker.messages.has(message.info.id)) return [message.info]

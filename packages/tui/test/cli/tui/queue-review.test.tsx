@@ -69,7 +69,12 @@ type QueueRequest = { method: string; path: string; body: Record<string, unknown
 // Answers a queue request in place of the scripted server, e.g. late or failing.
 type Serve = (path: string) => Promise<Response> | undefined
 
-async function mount(initial: SessionPromptQueueItem[], serve?: Serve) {
+async function mount(
+  initial: SessionPromptQueueItem[],
+  serve?: Serve,
+  // Runs before the session's queue is first read.
+  beforeSync?: (sync: ReturnType<typeof useSync>) => void,
+) {
   await using tmp = await tmpdir()
   const state = path.join(tmp.path, "state")
   await mkdir(state, { recursive: true })
@@ -154,6 +159,7 @@ async function mount(initial: SessionPromptQueueItem[], serve?: Serve) {
   const app = await testRender(() => <Harness />, { kittyKeyboard: true, width: 100, height: 40 })
   await mounted
   await wait(() => sync.status === "complete")
+  beforeSync?.(sync)
   await sync.session.sync(sessionID)
 
   const frame = async () => {
@@ -203,8 +209,12 @@ afterEach(() => {
   cleanup = undefined
 })
 
-async function setup(initial: SessionPromptQueueItem[], serve?: Serve) {
-  const view = await mount(initial, serve)
+async function setup(
+  initial: SessionPromptQueueItem[],
+  serve?: Serve,
+  beforeSync?: (sync: ReturnType<typeof useSync>) => void,
+) {
+  const view = await mount(initial, serve, beforeSync)
   cleanup = () => view.app.renderer.destroy()
   return view
 }
@@ -501,4 +511,17 @@ test("each pending prompt shows when it was first queued, how long ago, its repe
   // The ages count on while the view stays open.
   jest.advanceTimersByTime(60_000)
   expect(await line("check the build")).toContain("18m ago")
+})
+
+// swxtchio/swx-opencode#249: a prompt being sent shows until a list of the
+// queue carries its request, whichever way that list arrives.
+test("reading a session's queue shows a prompt being sent once, as the item that carries it", async () => {
+  const sent = { ...item("que_sent", "steer", "check the build", 4), requestID: "sent-request" }
+  const view = await setup([steer, sent], undefined, (sync) =>
+    sync.queue.sending(sessionID, { requestID: "sent-request", text: "check the build" }),
+  )
+  expect(view.sync.data.session_sending[sessionID]).toEqual([])
+  const lines = (await view.frame()).split("\n")
+  expect(lines.filter((line) => line.includes("QUEUED") && line.includes("check the build"))).toHaveLength(1)
+  expect(lines.some((line) => line.includes("2 pending"))).toBe(true)
 })

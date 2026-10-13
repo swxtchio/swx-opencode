@@ -1,7 +1,6 @@
 import { useKeyboard } from "@opentui/solid"
 import type { SessionPromptQueueItem } from "@opencode-ai/sdk/v2"
 import { createMemo, createSignal, onCleanup, onMount } from "solid-js"
-import { reconcile } from "solid-js/store"
 import { useSDK } from "../context/sdk"
 import { useSync } from "../context/sync"
 import { useDialog, type DialogContext } from "../ui/dialog"
@@ -63,7 +62,7 @@ export function DialogQueue(props: { sessionID: string }) {
       .then((result) => {
         if (closed) return
         setHold("held")
-        if (result.data) sync.set("session_queue", props.sessionID, reconcile(result.data))
+        if (result.data) sync.queue.listed(props.sessionID, result.data)
       })
       .catch((error) => {
         if (closed) return

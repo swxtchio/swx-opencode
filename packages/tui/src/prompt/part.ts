@@ -30,38 +30,79 @@ export function expandTrackedPastedText(text: string, ranges: { start: number; e
     .reduce((result, part) => displaySlice(result, 0, part.start) + part.text + displaySlice(result, part.end), text)
 }
 
-// What a withdrawn queue item returns to the composer (swxtchio/swx-opencode#249):
-// its typed text with the file and agent mentions the text still holds, never
-// the synthetic context a client added when it sent the prompt.
-export function recalledPrompt(item: SessionPromptQueueItem): PromptInfo {
-  const input = item.input.parts
-    .flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : []))
-    .join("\n")
-  return {
-    input,
-    parts: item.input.parts.flatMap((part): PromptInfo["parts"] => {
-      if (part.type === "file") {
-        const text = part.source && mention(input, part.source.text)
-        return part.source && text ? [{ ...withoutID(part), source: { ...part.source, text } }] : []
-      }
-      if (part.type === "agent") {
-        const source = part.source && mention(input, part.source)
-        return source ? [{ ...withoutID(part), source }] : []
-      }
-      return []
-    }),
-  }
+// Where a composer offset lands once tracked pasted text is expanded, so a
+// mention sent with the expanded text still marks its own text there.
+export function expandedOffset(offset: number, ranges: readonly { start: number; end: number; text: string }[]) {
+  return ranges.reduce(
+    (at, range) => (range.end <= offset ? at + promptOffsetWidth(range.text) - (range.end - range.start) : at),
+    offset,
+  )
 }
 
-// A mention keeps its place while the text holds it there. Pasted text the
-// prompt expanded before it moves it, to where the text first holds it.
-function mention<At extends { value: string; start: number; end: number }>(text: string, at: At) {
+// What a withdrawn queue item returns to the composer (swxtchio/swx-opencode#249):
+// its typed text and every file and agent part, never the synthetic context a
+// client added when it sent the prompt. A part the text does not mention, such
+// as an attachment sent without one, gets a mention at the end of the text, so
+// the composer keeps it as it keeps a pasted attachment.
+export function recalledPrompt(item: SessionPromptQueueItem): PromptInfo {
+  const typed = item.input.parts
+    .flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : []))
+    .join("\n")
+  return item.input.parts.reduce<PromptInfo>(
+    (prompt, part) => {
+      if (part.type !== "file" && part.type !== "agent") return prompt
+      const claimed = prompt.parts.flatMap((kept) => {
+        const at = kept.type === "agent" ? kept.source : kept.type === "file" ? kept.source?.text : undefined
+        return at ? [at] : []
+      })
+      const sent = part.type === "agent" ? part.source : part.source?.text
+      const found = sent && mention(prompt.input, sent, claimed)
+      const value = sent?.value || (part.type === "agent" ? `@${part.name}` : attachmentLabel(part, prompt.parts))
+      const input = found ? prompt.input : appended(prompt.input, value)
+      const start = found ? found.start : promptOffsetWidth(input) - promptOffsetWidth(value)
+      const at = found ?? { value, start, end: start + promptOffsetWidth(value) }
+      if (part.type === "agent") return { input, parts: [...prompt.parts, { ...withoutID(part), source: at }] }
+      const source = part.source
+        ? { ...part.source, text: at }
+        : { type: "file" as const, path: part.filename ?? "", text: at }
+      return { input, parts: [...prompt.parts, { ...withoutID(part), source }] }
+    },
+    { input: typed, parts: [] },
+  )
+}
+
+// Where the text holds a mention: at its own place while the text holds it
+// there, otherwise at the nearest copy of it no other part has taken.
+function mention<At extends { value: string; start: number; end: number }>(
+  text: string,
+  at: At,
+  claimed: readonly { start: number; end: number }[],
+) {
   if (!at.value) return undefined
-  if (displaySlice(text, at.start, at.end) === at.value) return at
-  const index = text.indexOf(at.value)
-  if (index < 0) return undefined
-  const start = promptOffsetWidth(text.slice(0, index))
-  return { ...at, start, end: start + promptOffsetWidth(at.value) }
+  const free = (start: number, end: number) => claimed.every((other) => end <= other.start || start >= other.end)
+  if (displaySlice(text, at.start, at.end) === at.value && free(at.start, at.end)) return at
+  const width = promptOffsetWidth(at.value)
+  return [...text.matchAll(new RegExp(RegExp.escape(at.value), "g"))]
+    .map((match) => promptOffsetWidth(text.slice(0, match.index)))
+    .filter((start) => free(start, start + width))
+    .toSorted((a, b) => Math.abs(a - at.start) - Math.abs(b - at.start))
+    .map((start) => ({ ...at, start, end: start + width }))
+    .at(0)
+}
+
+function appended(text: string, value: string) {
+  if (!text || /\s$/.test(text)) return text + value
+  return `${text} ${value}`
+}
+
+// The name the composer gives an attachment, as pasting one does.
+function attachmentLabel(part: { mime: string; filename?: string }, kept: PromptInfo["parts"]) {
+  const pdf = part.mime === "application/pdf"
+  if (!pdf && !part.mime.startsWith("image/")) return `[File ${part.filename ?? "attachment"}]`
+  const count = kept.filter(
+    (other) => other.type === "file" && (pdf ? other.mime === part.mime : other.mime.startsWith("image/")),
+  ).length
+  return pdf ? `[PDF ${count + 1}]` : `[Image ${count + 1}]`
 }
 
 function withoutID<Part extends { id?: string }>(part: Part) {

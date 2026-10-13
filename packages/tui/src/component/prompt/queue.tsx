@@ -7,20 +7,28 @@ import { useDialog } from "../../ui/dialog"
 import { Locale } from "../../util/locale"
 import { DialogQueue, preview } from "../dialog-queue"
 
-// Only the most recent pending prompts are listed under the prompt; the review
-// view shows them all.
+// Only the most recently sent pending prompts are listed under the prompt; the
+// review view shows them all.
 const SHOWN = 3
 
-// A session's pending prompts as the user sees them, in delivery order: the
-// queue's items, then prompts this client sent that the queue has not listed
-// yet. An item is set only on what the queue holds, which alone can be withdrawn.
-export type PendingPrompt = { text: string; item?: SessionPromptQueueItem }
+// A session's pending prompts as the user sees them, oldest sent first: the
+// queue's items by when each was last sent, then prompts this client is still
+// sending, which the queue has not listed yet (#249). Delivery order differs,
+// since pending steers go before queued prompts; the review view shows that.
+// `item` is set only on what the queue holds, which alone can be withdrawn;
+// `requestID` names a send still on its way to the queue.
+export type PendingPrompt = { text: string; item?: SessionPromptQueueItem; requestID?: string }
 
 export function pendingPrompts(sync: ReturnType<typeof useSync>, sessionID: string | undefined): PendingPrompt[] {
   if (!sessionID) return []
   return [
-    ...(sync.data.session_queue[sessionID] ?? []).map((item) => ({ text: preview(item), item })),
-    ...(sync.data.session_sending[sessionID] ?? []).map((prompt) => ({ text: prompt.text })),
+    ...(sync.data.session_queue[sessionID] ?? [])
+      .toSorted((a, b) => a.time.created - b.time.created || a.seq - b.seq)
+      .map((item) => ({ text: preview(item), item })),
+    ...(sync.data.session_sending[sessionID] ?? []).map((prompt) => ({
+      text: prompt.text,
+      requestID: prompt.requestID,
+    })),
   ]
 }
 
@@ -41,6 +49,11 @@ export function PromptQueueRow(props: { sessionID?: string }) {
     <Show when={props.sessionID && prompts().length > 0 ? props.sessionID : undefined}>
       {(sessionID) => (
         <box paddingLeft={1} flexDirection="column" onMouseUp={() => DialogQueue.show(dialog, sessionID())}>
+          <Show when={prompts().length > SHOWN}>
+            <text fg={theme.textMuted} wrapMode="none">
+              … {prompts().length - SHOWN} sent earlier
+            </text>
+          </Show>
           <For each={prompts().slice(-SHOWN)}>
             {(prompt) => (
               <text fg={theme.text} wrapMode="none">

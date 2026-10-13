@@ -6,6 +6,7 @@ import type { GlobalEvent, Provider, Session, SessionPromptQueueItem } from "@op
 import { Effect } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Global } from "@opencode-ai/core/global"
+import path from "node:path"
 import { tmpdir } from "../../fixture/fixture"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
@@ -62,11 +63,16 @@ const items: SessionPromptQueueItem[] = [
 // until the turn that answers it ends.
 type HeldPrompt = { requestID?: string; parts: { type: string; text?: string }[]; answer: (response: Response) => void }
 
+// The scripted server keeps real custody of its queue: a withdrawal takes an
+// item out and a restore puts it back, each publishing the list. A test's
+// stand-in for one of them gets `apply`, which does what the server would, so
+// it can let the change land and still lose or fail the answer.
+type Apply = () => Response
 async function startSession(
   options: {
     queue?: SessionPromptQueueItem[]
-    // Answers a withdrawal in place of the scripted queue, which hands over any pending item.
-    withdraw?: (itemID: string) => Response | Promise<Response>
+    withdraw?: (itemID: string, apply: Apply) => Response | Promise<Response>
+    restore?: (itemID: string, apply: Apply) => Response | Promise<Response>
   } = {},
 ) {
   const setup = await createTestRenderer({ width: 160, height: 45, useThread: false })
@@ -74,7 +80,7 @@ async function startSession(
   // of the user's own and of the next test's.
   const state = await tmpdir()
   const events = createEventSource()
-  const queue = { items: options.queue ?? items }
+  const queue = { items: options.queue ?? items, withdrawn: [] as SessionPromptQueueItem[] }
   const requests: string[] = []
   const selections: unknown[] = []
   const prompts: HeldPrompt[] = []
@@ -88,11 +94,26 @@ async function startSession(
       payload: { id: `evt_${Math.random()}`, type: "session.queue.updated", properties: { sessionID, items: next } },
     } as GlobalEvent)
   }
-  const withdraw = (itemID: string) => {
+  const withdraw = (itemID: string) => () => {
     const found = queue.items.find((item) => item.id === itemID)
     if (!found) return json({ _tag: "QueueItemNotPending", sessionID, itemID }, { status: 404 })
+    queue.withdrawn.push(found)
     publish(queue.items.filter((item) => item.id !== itemID))
     return json(found)
+  }
+  const restore = (itemID: string) => () => {
+    const found = queue.withdrawn.find((item) => item.id === itemID)
+    if (!found) return json({ _tag: "QueueItemNotWithdrawn", sessionID, itemID }, { status: 404 })
+    queue.withdrawn = queue.withdrawn.filter((item) => item.id !== itemID)
+    publish([...queue.items, found].toSorted((a, b) => a.seq - b.seq))
+    return json(found)
+  }
+  const receipt = (requestID: string) => {
+    const pending = queue.items.find((item) => item.requestID === requestID)
+    if (pending) return json({ state: "pending", itemID: pending.id })
+    const withdrawn = queue.withdrawn.find((item) => item.requestID === requestID)
+    if (withdrawn) return json({ state: "withdrawn", itemID: withdrawn.id })
+    return json({ name: "NotFoundError", data: { message: "No such request" } }, { status: 404 })
   }
   const calls = createFetch((url) => {
     if (url.pathname === "/config/providers") return json({ providers: [provider], default: { test: "model" } })
@@ -123,11 +144,15 @@ async function startSession(
       return new Promise<Response>((answer) => prompts.push({ ...body, answer }))
     }
     if (path === `/session/${sessionID}/queue/restore`) {
-      restored.push(await request.clone().json())
-      return json(queue.items[0])
+      const body = (await request.clone().json()) as { id: string }
+      restored.push(body)
+      return options.restore ? options.restore(body.id, restore(body.id)) : restore(body.id)()
     }
-    if (path.startsWith(`/session/${sessionID}/queue/que_`) && request.method === "DELETE")
-      return (options.withdraw ?? withdraw)(path.split("/").pop()!)
+    if (path.startsWith(`/session/${sessionID}/queue/receipt/`)) return receipt(path.split("/").pop()!)
+    if (path.startsWith(`/session/${sessionID}/queue/que_`) && request.method === "DELETE") {
+      const itemID = path.split("/").pop()!
+      return options.withdraw ? options.withdraw(itemID, withdraw(itemID)) : withdraw(itemID)()
+    }
     return calls.fetch(request)
   }) as typeof globalThis.fetch
   let api: TuiPluginApi | undefined
@@ -166,6 +191,8 @@ async function startSession(
     prompts,
     restored,
     publish,
+    queue,
+    state: state.path,
     dispatch: (command: string) => api?.keymap.dispatchCommand(command),
     async stop() {
       try {
@@ -425,18 +452,29 @@ test("UP in a composer holding text leaves the pending prompts queued", async ()
   }
 })
 
+const shows = async (app: Awaited<ReturnType<typeof startSession>>, text: string) =>
+  (await screen(app)).some((line) => line.includes(text))
+// A notice wraps inside its toast, so it is read across lines.
+const said = async (app: Awaited<ReturnType<typeof startSession>>, text: string) =>
+  (await screen(app)).join(" ").replace(/[┃│]/g, " ").replace(/\s+/g, " ").includes(text)
+const queuedIDs = (app: Awaited<ReturnType<typeof startSession>>) => app.queue.items.map((item) => item.id)
+const deletes = (app: Awaited<ReturnType<typeof startSession>>, itemID: string) =>
+  app.requests.filter((request) => request === itemID).length
+
 test("a prompt withdrawn while the composer was typed in goes back to the queue", async () => {
-  let answer!: (response: Response) => void
-  const withdrawal = new Promise<Response>((resolve) => (answer = resolve))
-  const app = await startSession({ queue: [items[1]!], withdraw: () => withdrawal })
+  let answer!: () => void
+  const answered = new Promise<void>((resolve) => (answer = resolve))
+  const app = await startSession({ queue: [items[1]!], withdraw: (_, apply) => answered.then(apply) })
   try {
-    await until(async () => (await screen(app)).some((line) => line.includes("1 pending")), "session")
+    await until(() => shows(app, "1 pending"), "session")
     app.renderer.mockInput.pressArrow("up")
     await until(() => app.requests.includes("que_queue"), "the withdrawal")
     await app.renderer.mockInput.typeText("draft")
-    answer(json(items[1]))
-    await until(() => app.restored.length === 1, "the restore")
-    expect(app.restored).toEqual([{ id: "que_queue" }])
+    answer()
+    await until(() => said(app, "it stays queued"), "the notice")
+    // The queue holds it again, and the composer only what was typed.
+    expect(queuedIDs(app)).toEqual(["que_queue"])
+    expect(queuedLines(await screen(app), "queued for later")).toHaveLength(1)
     expect(composerLines(await screen(app), "queued for later")).toEqual([])
     expect(composerLines(await screen(app), "draft")).toHaveLength(1)
     // Sent, the draft is not stashed into the next test's composer.
@@ -449,22 +487,253 @@ test("a prompt withdrawn while the composer was typed in goes back to the queue"
 })
 
 test("a withdrawal whose answer is lost copies nothing and returns the prompt to the queue", async () => {
-  let landed = false
   const app = await startSession({
     queue: [items[1]!],
     // The server withdrew it, but the answer never arrived.
-    withdraw: () => {
-      landed = true
+    withdraw: (_, apply) => {
+      apply()
       throw new TypeError("fetch failed")
     },
   })
   try {
-    await until(async () => (await screen(app)).some((line) => line.includes("1 pending")), "session")
+    await until(() => shows(app, "1 pending"), "session")
+    app.renderer.mockInput.pressArrow("up")
+    await until(() => said(app, "it stays queued"), "the notice")
+    expect(app.restored).toEqual([{ id: "que_queue" }])
+    expect(queuedIDs(app)).toEqual(["que_queue"])
+    expect(queuedLines(await screen(app), "queued for later")).toHaveLength(1)
+    expect(composerLines(await screen(app), "queued for later")).toEqual([])
+  } finally {
+    await app.stop()
+  }
+})
+
+test("a prompt withdrawn and then not restored is kept in the prompt stash, and the notice says so", async () => {
+  const app = await startSession({
+    queue: [items[1]!],
+    withdraw: (_, apply) => {
+      apply()
+      throw new TypeError("fetch failed")
+    },
+    restore: () => json({ name: "UnknownError", data: { message: "restore failed" } }, { status: 500 }),
+  })
+  try {
+    await until(() => shows(app, "1 pending"), "session")
+    app.renderer.mockInput.pressArrow("up")
+    await until(() => said(app, "its text is in the prompt stash"), "the notice")
+    // Withdrawn and not restored: neither queued nor in the composer, but not lost.
+    expect(queuedIDs(app)).toEqual([])
+    expect(await said(app, "it stays queued")).toBe(false)
+    expect(composerLines(await screen(app), "queued for later")).toEqual([])
+    const stashed = Bun.file(path.join(app.state, "prompt-stash.jsonl"))
+    await until(
+      async () => (await stashed.exists()) && (await stashed.text()).includes("queued for later"),
+      "the stash",
+    )
+    expect(
+      (await stashed.text())
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line).input),
+    ).toEqual(["queued for later"])
+  } finally {
+    await app.stop()
+  }
+})
+
+test("a second UP while a recall is still restoring takes nothing", async () => {
+  let release!: () => void
+  const released = new Promise<void>((resolve) => (release = resolve))
+  const app = await startSession({
+    queue: [items[1]!],
+    // The first withdrawal never reaches the server; its restore is slow.
+    withdraw: (itemID, apply) => {
+      if (deletes(app, itemID) === 1) throw new TypeError("fetch failed")
+      return apply()
+    },
+    restore: (_, apply) => released.then(apply),
+  })
+  try {
+    await until(() => shows(app, "1 pending"), "session")
     app.renderer.mockInput.pressArrow("up")
     await until(() => app.restored.length === 1, "the restore")
-    expect(landed).toBe(true)
-    expect(app.restored).toEqual([{ id: "que_queue" }])
+    app.renderer.mockInput.pressArrow("up")
+    // Time for a second recall to start, were one allowed.
+    await Bun.sleep(200)
+    release()
+    await until(() => said(app, "it stays queued"), "the notice")
+    expect(deletes(app, "que_queue")).toBe(1)
+    expect(queuedIDs(app)).toEqual(["que_queue"])
     expect(composerLines(await screen(app), "queued for later")).toEqual([])
+  } finally {
+    await app.stop()
+  }
+})
+
+test("a sent steer stays shown and is the one UP takes back, behind older queued prompts", async () => {
+  const older = [3, 4, 5, 6].map((at) =>
+    pendingItem(`que_older${at}`, `older ${at}`, { delivery: "queue", seq: at, time: { created: at } }),
+  )
+  const app = await startSession({ queue: older })
+  try {
+    await until(() => shows(app, "4 pending"), "session")
+    await app.renderer.mockInput.typeText("check the build")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the send")
+    const requestID = app.prompts[0]!.requestID!
+    // The queue lists pending steers first, ahead of the older queued prompts.
+    const mine = pendingItem("que_mine", "check the build", { requestID, seq: 7, time: { created: 20 } })
+    app.publish([mine, ...older])
+    await until(() => shows(app, "5 pending"), "the listed prompt")
+    const lines = await screen(app)
+    expect(queuedLines(lines, "check the build")).toHaveLength(1)
+    expect(lines.some((line) => line.includes("2 sent earlier"))).toBe(true)
+
+    app.renderer.mockInput.pressArrow("up")
+    await until(async () => composerLines(await screen(app), "check the build").length === 1, "the recall")
+    expect(app.requests).toEqual(["que_mine"])
+    expect(queuedIDs(app)).toEqual(older.map((item) => item.id))
+  } finally {
+    await app.stop()
+  }
+})
+
+test("UP takes back a prompt still being sent once the queue admits it", async () => {
+  const app = await startSession({ queue: [] })
+  try {
+    await until(() => shows(app, "already in the transcript"), "session")
+    await app.renderer.mockInput.typeText("check the build")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the send")
+    const requestID = app.prompts[0]!.requestID!
+    app.renderer.mockInput.pressArrow("up")
+    // It asks the server until the send is admitted.
+    await until(() => app.requests.includes(requestID), "the receipt")
+    expect(composerLines(await screen(app), "check the build")).toEqual([])
+    app.queue.items = [pendingItem("que_mine", "check the build", { requestID })]
+    await until(async () => composerLines(await screen(app), "check the build").length === 1, "the recall")
+    expect(app.requests.filter((request) => request.startsWith("que_"))).toEqual(["que_mine"])
+    expect(queuedLines(await screen(app), "check the build")).toEqual([])
+  } finally {
+    await app.stop()
+  }
+})
+
+test("a send the server refuses before listing it leaves no QUEUED prompt", async () => {
+  const app = await startSession({ queue: [] })
+  try {
+    await until(() => shows(app, "already in the transcript"), "session")
+    await app.renderer.mockInput.typeText("rejected input")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the send")
+    await until(async () => queuedLines(await screen(app), "rejected input").length === 1, "the QUEUED prompt")
+    app.prompts[0]!.answer(json({ name: "BadRequest", data: { message: "refused" } }, { status: 400 }))
+    await until(() => shows(app, "Failed to send prompt"), "the failure")
+    expect(queuedLines(await screen(app), "rejected input")).toEqual([])
+  } finally {
+    await app.stop()
+  }
+})
+
+test("a send answered without its listing ever arriving leaves no QUEUED prompt", async () => {
+  const app = await startSession({ queue: [] })
+  try {
+    await until(() => shows(app, "already in the transcript"), "session")
+    await app.renderer.mockInput.typeText("check the build")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the send")
+    await until(async () => queuedLines(await screen(app), "check the build").length === 1, "the QUEUED prompt")
+    app.prompts[0]!.answer(json(transcript))
+    await until(async () => queuedLines(await screen(app), "check the build").length === 0, "the settled send")
+    expect(await shows(app, "pending")).toBe(false)
+  } finally {
+    await app.stop()
+  }
+})
+
+test("the review view's list shows a sent prompt it carries once, though its listing event was missed", async () => {
+  const app = await startSession({ queue: [] })
+  try {
+    await until(() => shows(app, "already in the transcript"), "session")
+    await app.renderer.mockInput.typeText("check the build")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the send")
+    // Admitted, but its event never reached the client.
+    app.queue.items = [pendingItem("que_mine", "check the build", { requestID: app.prompts[0]!.requestID! })]
+    app.dispatch("session.queued_prompts")
+    await until(() => shows(app, "delivery paused"), "the review view")
+    app.renderer.mockInput.pressEscape()
+    await until(async () => !(await shows(app, "Queued prompts")), "the closed view")
+    expect(queuedLines(await screen(app), "check the build")).toHaveLength(1)
+    expect(await shows(app, "1 pending")).toBe(true)
+  } finally {
+    await app.stop()
+  }
+})
+
+test("a recalled prompt keeps its attachments and each mention, and resends them", async () => {
+  const text = "compare @a.ts with @a.ts"
+  const mention = (start: number) => ({ value: "@a.ts", start, end: start + 5 })
+  const file = (start: number) => ({
+    type: "file" as const,
+    mime: "text/plain",
+    filename: "a.ts",
+    url: "file:///repo/a.ts",
+    source: { type: "file" as const, path: "a.ts", text: mention(start) },
+  })
+  const image = { type: "file" as const, mime: "image/png", filename: "shot.png", url: "data:image/png;base64,AA" }
+  const app = await startSession({
+    queue: [pendingItem("que_peer", text, { input: { parts: [{ type: "text", text }, file(8), file(19), image] } })],
+  })
+  try {
+    await until(() => shows(app, "1 pending"), "session")
+    app.renderer.mockInput.pressArrow("up")
+    await until(async () => composerLines(await screen(app), "compare").length === 1, "the recall")
+    await app.renderer.mockInput.typeText(" now")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the resend")
+    const parts = app.prompts[0]!.parts as SessionPromptQueueItem["input"]["parts"]
+    const sent = parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")
+    expect(sent).toBe("compare @a.ts with @a.ts [Image 1] now")
+    const files = parts.flatMap((part) => (part.type === "file" ? [part] : []))
+    expect(files.map((part) => [part.url, part.source?.text.start, part.source?.text.value])).toEqual([
+      ["file:///repo/a.ts", 8, "@a.ts"],
+      ["file:///repo/a.ts", 19, "@a.ts"],
+      ["data:image/png;base64,AA", 25, "[Image 1]"],
+    ])
+    app.prompts[0]!.answer(json(transcript))
+  } finally {
+    await app.stop()
+  }
+})
+
+test("a mention sent after an expanded paste marks the text it was sent with", async () => {
+  const text = "compare @a.ts"
+  const file = {
+    type: "file" as const,
+    mime: "text/plain",
+    filename: "a.ts",
+    url: "file:///repo/a.ts",
+    source: { type: "file" as const, path: "a.ts", text: { value: "@a.ts", start: 8, end: 13 } },
+  }
+  const app = await startSession({
+    queue: [pendingItem("que_peer", text, { input: { parts: [{ type: "text", text }, file] } })],
+  })
+  try {
+    await until(() => shows(app, "1 pending"), "session")
+    app.renderer.mockInput.pressArrow("up")
+    await until(async () => composerLines(await screen(app), "compare").length === 1, "the recall")
+    app.renderer.mockInput.pressKey("HOME")
+    await app.renderer.mockInput.pasteBracketedText("one\ntwo\nthree")
+    await until(() => shows(app, "[Pasted ~3 lines]"), "the paste")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the send")
+    const parts = app.prompts[0]!.parts as SessionPromptQueueItem["input"]["parts"]
+    const sent = parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")
+    expect(sent).toBe("one\ntwo\nthree compare @a.ts")
+    const at = parts.flatMap((part) => (part.type === "file" && part.source ? [part.source.text] : []))
+    expect(at).toEqual([{ value: "@a.ts", start: sent.indexOf("@a.ts"), end: sent.indexOf("@a.ts") + 5 }])
+    app.prompts[0]!.answer(json(transcript))
   } finally {
     await app.stop()
   }

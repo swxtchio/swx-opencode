@@ -23,7 +23,7 @@ import { Spinner } from "../spinner"
 import { useSDK } from "../../context/sdk"
 import { useRoute } from "../../context/route"
 import { useProject } from "../../context/project"
-import { useSync } from "../../context/sync"
+import { carries, useSync } from "../../context/sync"
 import { useEvent } from "../../context/event"
 import { editorSelectionKey, useEditorContext, type EditorSelection } from "../../context/editor"
 import { normalizePromptContent, openEditor } from "../../editor"
@@ -32,7 +32,12 @@ import { promptOffsetWidth } from "../../prompt/display"
 import { createStore, produce, unwrap } from "solid-js/store"
 import { usePromptHistory, type PromptInfo } from "../../prompt/history"
 import { computePromptTraits } from "../../prompt/traits"
-import { expandPastedTextPlaceholders, expandTrackedPastedText, recalledPrompt } from "../../prompt/part"
+import {
+  expandedOffset,
+  expandPastedTextPlaceholders,
+  expandTrackedPastedText,
+  recalledPrompt,
+} from "../../prompt/part"
 import { usePromptStash } from "../../prompt/stash"
 import { DialogStash } from "../dialog-stash"
 import { type AutocompleteRef, Autocomplete } from "./autocomplete"
@@ -104,6 +109,10 @@ const money = new Intl.NumberFormat("en-US", {
 })
 
 const DRAFT_RETENTION_MIN_CHARS = 20
+// A recall of a prompt still being sent asks the server whether it is queued
+// yet this often, until this backstop; the server admits it on arrival.
+const ADMISSION_POLL_MS = 50
+const ADMISSION_BACKSTOP_MS = 10_000
 
 function randomIndex(count: number) {
   if (count <= 0) return 0
@@ -964,49 +973,79 @@ export function Prompt(props: PromptProps) {
     }
   })
 
-  // Only a withdrawal the server confirms hands a pending prompt to the
-  // composer, so one promoted meanwhile is never copied, and a withdrawn one is
-  // never delivered too. A prompt the composer cannot take any more, because it
-  // was typed in or left the session meanwhile, goes back to the queue.
+  // UP takes back the last pending prompt (#249). Only a withdrawal the server
+  // confirms hands it to the composer, so one promoted meanwhile is never
+  // copied. One recall runs at a time, through any restore it needs, so a
+  // second UP never takes a prompt the first is still putting back.
   let recalling = false
   async function recall(prompt: PendingPrompt) {
     const sessionID = props.sessionID
     if (recalling || !sessionID) return
-    if (!prompt.item) {
-      toast.show({ variant: "info", message: "That prompt is still being sent" })
-      return
-    }
     recalling = true
-    const withdrawn = await sdk.client.session.queue
-      .withdraw({ sessionID, itemID: prompt.item.id })
-      .catch(() => undefined)
-      .finally(() => (recalling = false))
-    if (withdrawn?.response?.status === 404) {
-      toast.show({ variant: "info", message: "That prompt is no longer pending" })
-      return
-    }
-    // Any other failure may still have withdrawn it. Restoring puts it back
-    // if so, and is refused if not.
-    if (!withdrawn?.data) {
-      await sdk.client.session.queue.restore({ sessionID, id: prompt.item.id }).catch(() => undefined)
-      toast.show({ variant: "error", message: "Could not take that prompt back; it stays queued" })
-      return
-    }
-    // The queue's own update may arrive after its answer.
-    const itemID = withdrawn.data.id
-    sync.set("session_queue", sessionID, (list) => (list ?? []).filter((item) => item.id !== itemID))
-    if (input.isDestroyed || input.plainText || props.sessionID !== sessionID) {
-      const restored = await sdk.client.session.queue.restore({ sessionID, id: itemID }).catch(() => undefined)
-      if (!restored?.data)
-        toast.show({ variant: "error", message: "Could not return the recalled prompt to the queue" })
-      return
-    }
+    await takeBack(sessionID, prompt).finally(() => (recalling = false))
+  }
+
+  async function takeBack(sessionID: string, prompt: PendingPrompt) {
+    const admission = prompt.item ? { itemID: prompt.item.id } : await admitted(sessionID, prompt.requestID)
+    if (admission === "sending") return toast.show({ variant: "info", message: "That prompt is still being sent" })
+    if (!admission) return toast.show({ variant: "info", message: "That prompt is no longer pending" })
+    const itemID = admission.itemID
+    const withdrawn = await sdk.client.session.queue.withdraw({ sessionID, itemID }).catch(() => undefined)
+    if (withdrawn?.response?.status === 404)
+      return toast.show({ variant: "info", message: "That prompt is no longer pending" })
+    // Any other failure may still have withdrawn it.
+    if (!withdrawn?.data)
+      return giveBack(
+        sessionID,
+        itemID,
+        prompt.item ? recalledPrompt(prompt.item) : { input: prompt.text, parts: [] },
+        "Could not take that prompt back",
+      )
+    sync.queue.withdrawn(sessionID, withdrawn.data)
     const recalled = recalledPrompt(withdrawn.data)
+    if (input.isDestroyed || input.plainText || props.sessionID !== sessionID)
+      return giveBack(sessionID, itemID, recalled, "The composer was in use")
     input.setText(recalled.input)
     setStore("prompt", recalled)
     setStore("mode", "normal")
     restoreExtmarksFromParts(recalled.parts)
     input.gotoBufferEnd()
+  }
+
+  // The item a send still on its way became, once the server admits it, which
+  // it does before any other work on the prompt; nothing when the send settled
+  // without leaving one pending.
+  async function admitted(sessionID: string, requestID: string | undefined) {
+    if (!requestID) return undefined
+    const deadline = Date.now() + ADMISSION_BACKSTOP_MS
+    while (Date.now() < deadline) {
+      const listed = sync.data.session_queue[sessionID]?.find((item) => carries(item, requestID))
+      if (listed) return { itemID: listed.id }
+      const receipt = await sdk.client.session.queue.receipt({ sessionID, requestID }).catch(() => undefined)
+      if (receipt?.data) return receipt.data.state === "pending" ? { itemID: receipt.data.itemID } : undefined
+      if (!sync.data.session_sending[sessionID]?.some((sending) => sending.requestID === requestID)) return undefined
+      await Bun.sleep(ADMISSION_POLL_MS)
+    }
+    return "sending" as const
+  }
+
+  // Puts a prompt this recall may have withdrawn back in the queue, then reads
+  // the queue to say truthfully where it is. When nothing shows it pending,
+  // its text goes to the prompt stash rather than being lost.
+  async function giveBack(sessionID: string, itemID: string, prompt: PromptInfo, reason: string) {
+    const restored = await sdk.client.session.queue.restore({ sessionID, id: itemID }).catch(() => undefined)
+    const listed = await sdk.client.session.queue.list({ sessionID }).catch(() => undefined)
+    if (listed?.data) sync.queue.listed(sessionID, listed.data)
+    if (restored?.data || listed?.data?.some((item) => item.id === itemID))
+      return toast.show({ variant: "info", message: `${reason}; it stays queued` })
+    // Refused because it was never withdrawn, and no longer listed: it was delivered.
+    if (restored?.response?.status === 404 && listed?.data)
+      return toast.show({ variant: "info", message: "That prompt is no longer pending" })
+    stash.push({ input: prompt.input, parts: prompt.parts })
+    toast.show({
+      variant: "error",
+      message: `${reason}, and could not confirm it is still queued; its text is in the prompt stash`,
+    })
   }
 
   let submitting = false
@@ -1105,18 +1144,27 @@ export function Prompt(props: PromptProps) {
       sessionID = res.data.id
     }
 
-    const inputText = expandTrackedPastedText(
-      store.prompt.input,
-      input.extmarks.getAllForTypeId(promptPartTypeId).flatMap((extmark) => {
-        const partIndex = store.extmarkToPartIndex.get(extmark.id)
-        const part = partIndex === undefined ? undefined : store.prompt.parts[partIndex]
-        if (part?.type !== "text") return []
-        return [{ start: extmark.start, end: extmark.end, text: part.text }]
-      }),
-    )
+    const pasted = input.extmarks.getAllForTypeId(promptPartTypeId).flatMap((extmark) => {
+      const partIndex = store.extmarkToPartIndex.get(extmark.id)
+      const part = partIndex === undefined ? undefined : store.prompt.parts[partIndex]
+      if (part?.type !== "text") return []
+      return [{ start: extmark.start, end: extmark.end, text: part.text }]
+    })
+    const inputText = expandTrackedPastedText(store.prompt.input, pasted)
 
-    // Filter out text parts (pasted content) since they're now expanded inline
-    const nonTextParts = store.prompt.parts.filter((part) => part.type !== "text")
+    // Filter out text parts (pasted content) since they're now expanded inline,
+    // and mark each mention where the expanded text holds it, so a recall of
+    // the queued prompt finds it there (#249).
+    const nonTextParts = store.prompt.parts.flatMap((part): PromptInfo["parts"] => {
+      const at = <At extends { start: number; end: number }>(mention: At) => ({
+        ...mention,
+        start: expandedOffset(mention.start, pasted),
+        end: expandedOffset(mention.end, pasted),
+      })
+      if (part.type === "text") return []
+      if (part.type === "agent") return [part.source ? { ...part, source: at(part.source) } : part]
+      return [part.source ? { ...part, source: { ...part.source, text: at(part.source.text) } } : part]
+    })
 
     // Capture mode before it gets reset
     const currentMode = store.mode
