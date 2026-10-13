@@ -373,6 +373,7 @@ export type AssistantMessage = {
   }
   structured?: unknown
   variant?: string
+  effort?: string
   finish?: string
 }
 
@@ -698,6 +699,8 @@ export type SessionStatus =
       activeAssistantMessageID?: string | null
     }
 
+export type SessionPromptQueueRequestId = string
+
 export type TextPartInput = {
   id?: string
   type: "text"
@@ -762,18 +765,37 @@ export type SessionPromptQueueInput = {
   parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
 }
 
+export type SessionPromptQueueRepeat = {
+  time: number
+  requestID?: SessionPromptQueueRequestId
+}
+
+export type SessionPromptQueueOrigin = {
+  time: number
+  requestID?: SessionPromptQueueRequestId
+  repeats?: Array<SessionPromptQueueRepeat>
+}
+
 export type SessionPromptQueueItem = {
   id: string
   sessionID: string
   /**
-   * Admission order within the session; never reused
+   * Delivery order within the session: admission order until a reorder trades it between pending items; never reused
    */
   seq: number
   delivery: "steer" | "queue"
+  requestID?: SessionPromptQueueRequestId
   input: SessionPromptQueueInput
   time: {
+    /**
+     * When this item's own copy was last admitted; origins say when its instructions were first queued
+     */
     created: number
   }
+  /**
+   * One per instruction the item carries, in order: a merged command has one per step; repeats are copies of it collapsed into it
+   */
+  origins: Array<SessionPromptQueueOrigin>
 }
 
 export type QuestionOption = {
@@ -2667,6 +2689,13 @@ export type PromptWithdrawn = {
   message: string
 }
 
+export type PromptRequestConflict = {
+  _tag: "PromptRequestConflict"
+  sessionID: string
+  requestID: string
+  message: string
+}
+
 export type SessionBusyError = {
   _tag: "SessionBusyError"
   sessionID: string
@@ -2686,6 +2715,28 @@ export type QueueItemNotWithdrawn = {
   itemID: string
   message: string
 }
+
+export type SessionPromptQueueReceipt =
+  | {
+      state: "pending"
+      itemID: string
+    }
+  | {
+      state: "delivered"
+      messageID: string
+    }
+  | {
+      state: "merged"
+      into: SessionPromptQueueRequestId
+      messageID?: string
+    }
+  | {
+      state: "superseded"
+      by: SessionPromptQueueRequestId
+    }
+  | {
+      state: "deleted"
+    }
 
 export type EventTuiPromptAppend = {
   type: "tui.prompt.append"
@@ -9765,6 +9816,11 @@ export type SessionUpdateData = {
       [key: string]: unknown
     }
     permission?: PermissionRuleset
+    model?: {
+      id: string
+      providerID: string
+      variant?: string
+    }
     time?: {
       archived?: number
     }
@@ -9941,6 +9997,7 @@ export type SessionMessagesResponse2 = SessionMessagesResponses[keyof SessionMes
 
 export type SessionPromptData = {
   body?: {
+    requestID?: SessionPromptQueueRequestId
     messageID?: string
     model?: {
       providerID: string
@@ -9977,9 +10034,9 @@ export type SessionPromptErrors = {
    */
   404: NotFoundError
   /**
-   * PromptWithdrawn
+   * PromptWithdrawn | PromptRequestConflict
    */
-  409: PromptWithdrawn
+  409: PromptWithdrawn | PromptRequestConflict
 }
 
 export type SessionPromptError = SessionPromptErrors[keyof SessionPromptErrors]
@@ -10293,6 +10350,7 @@ export type SessionSummarizeResponse = SessionSummarizeResponses[keyof SessionSu
 
 export type SessionPromptAsyncData = {
   body?: {
+    requestID?: SessionPromptQueueRequestId
     messageID?: string
     model?: {
       providerID: string
@@ -10328,6 +10386,10 @@ export type SessionPromptAsyncErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * PromptRequestConflict
+   */
+  409: PromptRequestConflict
 }
 
 export type SessionPromptAsyncError = SessionPromptAsyncErrors[keyof SessionPromptAsyncErrors]
@@ -10776,6 +10838,219 @@ export type SessionQueueRestoreResponses = {
 }
 
 export type SessionQueueRestoreResponse = SessionQueueRestoreResponses[keyof SessionQueueRestoreResponses]
+
+export type SessionQueueHoldData = {
+  body?: {
+    holder: string
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/hold"
+}
+
+export type SessionQueueHoldErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionQueueHoldError = SessionQueueHoldErrors[keyof SessionQueueHoldErrors]
+
+export type SessionQueueHoldResponses = {
+  /**
+   * Pending queue items in delivery order
+   */
+  200: Array<SessionPromptQueueItem>
+}
+
+export type SessionQueueHoldResponse = SessionQueueHoldResponses[keyof SessionQueueHoldResponses]
+
+export type SessionQueueReleaseData = {
+  body?: {
+    holder: string
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/release"
+}
+
+export type SessionQueueReleaseErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionQueueReleaseError = SessionQueueReleaseErrors[keyof SessionQueueReleaseErrors]
+
+export type SessionQueueReleaseResponses = {
+  /**
+   * Hold released
+   */
+  204: void
+}
+
+export type SessionQueueReleaseResponse = SessionQueueReleaseResponses[keyof SessionQueueReleaseResponses]
+
+export type SessionQueueRemoveData = {
+  body?: {
+    id: string
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/remove"
+}
+
+export type SessionQueueRemoveErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError | QueueItemNotPending
+   */
+  404: NotFoundError | QueueItemNotPending
+}
+
+export type SessionQueueRemoveError = SessionQueueRemoveErrors[keyof SessionQueueRemoveErrors]
+
+export type SessionQueueRemoveResponses = {
+  /**
+   * Deleted queue item
+   */
+  200: SessionPromptQueueItem
+}
+
+export type SessionQueueRemoveResponse = SessionQueueRemoveResponses[keyof SessionQueueRemoveResponses]
+
+export type SessionQueueReorderData = {
+  body?: {
+    items: Array<string>
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/reorder"
+}
+
+export type SessionQueueReorderErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError | QueueItemNotPending
+   */
+  404: NotFoundError | QueueItemNotPending
+}
+
+export type SessionQueueReorderError = SessionQueueReorderErrors[keyof SessionQueueReorderErrors]
+
+export type SessionQueueReorderResponses = {
+  /**
+   * Pending queue items in delivery order
+   */
+  200: Array<SessionPromptQueueItem>
+}
+
+export type SessionQueueReorderResponse = SessionQueueReorderResponses[keyof SessionQueueReorderResponses]
+
+export type SessionQueueConsolidateData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/consolidate"
+}
+
+export type SessionQueueConsolidateErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionQueueConsolidateError = SessionQueueConsolidateErrors[keyof SessionQueueConsolidateErrors]
+
+export type SessionQueueConsolidateResponses = {
+  /**
+   * Pending queue items in delivery order
+   */
+  200: Array<SessionPromptQueueItem>
+}
+
+export type SessionQueueConsolidateResponse = SessionQueueConsolidateResponses[keyof SessionQueueConsolidateResponses]
+
+export type SessionQueueReceiptData = {
+  body?: never
+  path: {
+    sessionID: string
+    requestID: SessionPromptQueueRequestId
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/receipt/{requestID}"
+}
+
+export type SessionQueueReceiptErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionQueueReceiptError = SessionQueueReceiptErrors[keyof SessionQueueReceiptErrors]
+
+export type SessionQueueReceiptResponses = {
+  /**
+   * What became of the request
+   */
+  200: SessionPromptQueueReceipt
+}
+
+export type SessionQueueReceiptResponse = SessionQueueReceiptResponses[keyof SessionQueueReceiptResponses]
 
 export type SyncStartData = {
   body?: never

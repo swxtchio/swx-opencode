@@ -36,7 +36,7 @@ import {
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError, PromptWithdrawnError } from "../errors"
+import { PermissionNotFoundError, PromptRequestConflictError, PromptWithdrawnError } from "../errors"
 import * as SessionError from "./session-errors"
 import { SessionQueue } from "@/session/queue"
 
@@ -51,6 +51,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const session = yield* Session.Service
     const shareSvc = yield* SessionShare.Service
     const promptSvc = yield* SessionPrompt.Service
+    const queue = yield* SessionQueue.Service
     const revertSvc = yield* SessionRevert.Service
     const compactSvc = yield* SessionCompaction.Service
     const runState = yield* SessionRunState.Service
@@ -200,6 +201,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
               permission: Permission.merge(current.permission ?? [], ctx.payload.permission),
             })
           }
+          if (ctx.payload.model !== undefined) {
+            yield* session.setModel({ sessionID: ctx.params.sessionID, model: ctx.payload.model })
+          }
           if (ctx.payload.time?.archived !== undefined) {
             yield* session.setArchived({ sessionID: ctx.params.sessionID, time: ctx.payload.time.archived })
           }
@@ -319,6 +323,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
 
     // A withdrawn prompt is its own answer, so a client can tell it from a bad request.
     const promptError = (error: unknown) =>
+      error instanceof SessionQueue.RequestConflictError ? requestConflict(error) : commandError(error)
+
+    const commandError = (error: unknown) =>
       error instanceof SessionQueue.WithdrawnError
         ? new PromptWithdrawnError({
             sessionID: error.sessionID,
@@ -327,11 +334,20 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           })
         : new HttpApiError.BadRequest({})
 
+    const requestConflict = (error: SessionQueue.RequestConflictError) =>
+      new PromptRequestConflictError({
+        sessionID: error.sessionID,
+        requestID: error.requestID,
+        message: `Request ${error.requestID} was already sent with a different prompt`,
+      })
+
     const promptAsync = Effect.fn("SessionHttpApi.promptAsync")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof PromptPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
+      // A reused request is refused before the prompt runs in the background (#212).
+      yield* queue.check({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(Effect.mapError(requestConflict))
       yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
         // A withdrawn prompt ended as its editor asked; it is not a session error.
         Effect.catchTag("SessionQueueWithdrawnError", (error) =>
@@ -361,7 +377,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       yield* requireSession(ctx.params.sessionID)
       return yield* promptSvc
         .command({ ...ctx.payload, sessionID: ctx.params.sessionID })
-        .pipe(Effect.mapError(promptError))
+        .pipe(Effect.mapError(commandError))
     })
 
     const shell = Effect.fn("SessionHttpApi.shell")(function* (ctx: {

@@ -1791,6 +1791,26 @@ function reasoningToggle(model: Provider.Model): NonNullable<Provider.Model["var
   return {}
 }
 
+/**
+ * The reasoning effort a request's provider options carry, read back from
+ * every place `reasoningEffort` below, and `options` for Gemini's default
+ * thinking level, encode one; a token budget or an on/off toggle is not an
+ * effort. A summary records it (swxtchio/swx-opencode#227), so an encoding
+ * added there belongs here too.
+ */
+export function effort(options: Record<string, any>): string | undefined {
+  return [
+    options.reasoningEffort,
+    options.effort,
+    options.reasoning?.effort,
+    options.thinking?.effort,
+    options.thinkingConfig?.thinkingLevel,
+    options.reasoningConfig?.maxReasoningEffort,
+    options.modelParams?.reasoning_effort,
+    options.modelParams?.output_config?.effort,
+  ].find((value) => typeof value === "string")
+}
+
 function reasoningEffort(model: Provider.Model, effort: string) {
   switch (model.api.npm) {
     case "@openrouter/ai-sdk-provider":

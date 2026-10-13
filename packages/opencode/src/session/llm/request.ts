@@ -48,6 +48,8 @@ export type Prepared = {
   }
   readonly messageTransformOptions: Record<string, any>
   readonly headers: Record<string, string>
+  /** The user's variant, when the model has one by that name and so the request applied it. */
+  readonly variant?: string
 }
 
 const mergeOptions = (target: Record<string, any>, source: Record<string, any> | undefined): Record<string, any> =>
@@ -77,10 +79,11 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     system.push(header, rest.join("\n"))
   }
 
-  const variant =
-    !input.small && input.model.variants && input.user.model.variant
-      ? input.model.variants[input.user.model.variant]
-      : {}
+  const applied =
+    !input.small && input.user.model.variant && input.model.variants?.[input.user.model.variant]
+      ? input.user.model.variant
+      : undefined
+  const variant = applied ? input.model.variants![applied] : {}
   const base = input.small
     ? ProviderTransform.smallOptions(input.model)
     : ProviderTransform.options({
@@ -184,6 +187,7 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     tools: Object.fromEntries(Object.entries(tools).toSorted(([a], [b]) => a.localeCompare(b))),
     params,
     messageTransformOptions: options,
+    ...(applied ? { variant: applied } : {}),
     headers: {
       ...(input.model.providerID.startsWith("opencode")
         ? {

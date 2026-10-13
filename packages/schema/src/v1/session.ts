@@ -503,6 +503,8 @@ export const Assistant = Schema.Struct({
   }),
   structured: Schema.optional(Schema.Any),
   variant: Schema.optional(Schema.String),
+  /** The reasoning effort a summary's request sent, as its static options resolved it (#227). */
+  effort: Schema.optional(Schema.String),
   finish: Schema.optional(Schema.String),
 }).annotate({ identifier: "AssistantMessage" })
 export type Assistant = Omit<Types.DeepMutable<Schema.Schema.Type<typeof Assistant>>, "error"> & {

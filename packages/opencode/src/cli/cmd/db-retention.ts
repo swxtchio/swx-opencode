@@ -348,6 +348,10 @@ const requiredRetentionTables = new Set([
   "event_writer_process",
   "event_aggregate_writer",
   "session_prompt_queue_sequence",
+  // Queue times of promoted prompts (#212): timestamps only, no content.
+  "session_prompt_provenance",
+  // Request receipts (#212): sender request IDs, states, message IDs and a prompt digest; no prompt text.
+  "session_prompt_receipt",
 ])
 const classifiedSessionTables = new Set([...requiredRetentionTables])
 

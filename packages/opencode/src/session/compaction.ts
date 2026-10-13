@@ -377,7 +377,8 @@ const layer = Layer.effect(
         { sessionID: input.sessionID },
         { context: [], prompt: undefined },
       )
-      const msgs = structuredClone(selected.head)
+      // Queue times reach the summary, as they reach a turn's request (#212).
+      const msgs = structuredClone(yield* queue.annotate(input.sessionID, selected.head))
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
       const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
       const nextPrompt =
@@ -399,7 +400,6 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         mode: "compaction",
         agent: "compaction",
-        variant: userMessage.model.variant,
         summary: true,
         path: {
           cwd: ctx.directory,
@@ -432,10 +432,18 @@ const layer = Layer.effect(
               : Effect.void,
           ),
         )
+      // The summary records the variant and effort its request actually sent,
+      // plugins' adjustments and the runtime's lowering included; how they are
+      // chosen is unchanged (#227). They land on the message before it streams,
+      // so a summary interrupted after sending still persists them.
       const result = yield* processor.process({
         user: userMessage,
         agent,
         sessionID: input.sessionID,
+        sent: (request) => {
+          processor.message.variant = request.variant
+          processor.message.effort = request.effort
+        },
         tools: {},
         system: [],
         messages: [

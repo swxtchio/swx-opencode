@@ -178,6 +178,15 @@ const table = sqliteTable("session", {
 - A `steer` (the default) is promoted at admission so it still reaches the running turn's next step; only an explicit `queue` waits for the would-idle boundary. Holding every steer until the loop top would break senders that expect their message in history mid-run.
 - Never name a fork table, route or event after upstream v2's `session_input`, `session_pending` or `session_inbox`; a sync bringing v2 in would collide with it.
 - Every queue write goes through `writable()` in `queue.ts`, which opens its transaction with `BEGIN IMMEDIATE`. A deferred transaction that reads before it writes pins a read snapshot, and a later commit by another writer then fails the write with `SQLITE_BUSY_SNAPSHOT`, which the driver does not retry (#162). Add new queue writes inside `writable()`; read-only queue transactions may stay deferred.
+- Never write queue metadata into a stored user message. Firstmate confirms a delivery by finding its exact text,
+  synthetic parts included, in `/message` or `/queue`; queue times reach the model through `SessionQueue.annotate`
+  on the request only (#212). A pending prompt runs at the session's model and variant when it is delivered
+  (`prepareQueued` in `prompt.ts`), never the ones it was admitted with.
+- The TUI review view holds a session's promotion (`hold`/`release` in `queue.ts`, #212). Both `reserve` and `commit` check `held()`: without the `reserve` check a promotion loop re-reserves forever against a `commit` that refuses. A new promotion path needs the same checks, and `awaitingDrain` must keep ignoring held pending rows or a drain caller re-drains in a loop.
+- A sender that names a `requestID` confirms by receipt, not text (#212). Receipts ride on the item that carries them
+  (`settleReceipts` in `queue.ts`), so any new path that deletes, merges or promotes a pending row must settle them, or
+  the sender sees its request pending forever. Rules that hide a sender's text (`admission`) apply only when every item
+  involved names a request.
 
 ## Session Retention (fork)
 

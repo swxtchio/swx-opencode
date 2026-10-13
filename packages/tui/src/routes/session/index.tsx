@@ -53,6 +53,7 @@ import type { PromptInfo } from "../../component/prompt/history"
 import { DialogConfirm } from "../../ui/dialog-confirm"
 import { DialogTimeline } from "./dialog-timeline"
 import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
+import { DialogQueue } from "../../component/dialog-queue"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
@@ -186,6 +187,7 @@ const sessionBindingCommands = [
   "session.toggle.actions",
   "session.toggle.scrollbar",
   "session.toggle.generic_tool_output",
+  "session.queued_prompts",
   "session.first",
   "session.last",
   "session.messages_last_user",
@@ -605,6 +607,17 @@ export function Session() {
             })
           })
         dialog.clear()
+      },
+    },
+    {
+      title: "Review queued prompts",
+      value: "session.queued_prompts",
+      category: "Session",
+      slash: {
+        name: "queue",
+      },
+      run: () => {
+        DialogQueue.show(dialog, route.sessionID)
       },
     },
     {

@@ -3883,6 +3883,58 @@ describe("ProviderTransform.reasoningVariants", () => {
     expect(ProviderTransform.reasoningVariants(model([]), target("@ai-sdk/openai"))).toEqual({})
   })
 
+  // A summary records the effort its request sent (swxtchio/swx-opencode#227), so
+  // every encoding of an effort must read back as that effort.
+  test.each([
+    ["@openrouter/ai-sdk-provider", "test-model", ""],
+    ["@ai-sdk/anthropic", "claude-opus-4-6", ""],
+    ["@ai-sdk/anthropic", "claude-opus-4-5", ""],
+    ["@ai-sdk/anthropic", "kimi-k2", ""],
+    ["@ai-sdk/anthropic", "test-model", ""],
+    ["@ai-sdk/google-vertex/anthropic", "claude-opus-4-7", ""],
+    ["@ai-sdk/google", "test-model", ""],
+    ["@ai-sdk/google-vertex", "test-model", ""],
+    ["@ai-sdk/amazon-bedrock", "anthropic.claude-opus-4-6", ""],
+    ["@ai-sdk/amazon-bedrock", "anthropic.claude-opus-4-5", ""],
+    ["@ai-sdk/amazon-bedrock", "amazon.nova-pro", ""],
+    ["@ai-sdk/gateway", "anthropic/claude-opus-4-6", ""],
+    ["@ai-sdk/gateway", "google/gemini-3-pro", ""],
+    ["@ai-sdk/gateway", "openai/gpt-5", ""],
+    ["@ai-sdk/github-copilot", "claude-sonnet-4.6", ""],
+    ["@ai-sdk/github-copilot", "gpt-5", ""],
+    ["@ai-sdk/openai", "test-model", ""],
+    ["@ai-sdk/amazon-bedrock/mantle", "test-model", ""],
+    ["@ai-sdk/azure", "test-model", ""],
+    ["@jerome-benoit/sap-ai-provider-v2", "anthropic--claude-opus-4-6", ""],
+    ["@jerome-benoit/sap-ai-provider-v2", "gpt-5", ""],
+    ["@ai-sdk/openai-compatible", "test-model", ""],
+    ["@ai-sdk/xai", "test-model", ""],
+    ["gitlab-ai-provider", "duo-chat-gpt-5", "gpt-5"],
+    ["gitlab-ai-provider", "duo-chat-opus-4-6", "claude-opus"],
+  ])("reads back each effort %s %s encodes", (npm: string, id: string, family: string) => {
+    const variants = ProviderTransform.reasoningVariants(
+      model([{ type: "effort", values: ["low", "high"] }]),
+      target(npm, id, family),
+    )!
+    expect(Object.keys(variants)).toEqual(["low", "high"])
+    for (const [name, options] of Object.entries(variants)) expect(ProviderTransform.effort(options)).toBe(name)
+  })
+
+  test("reads Gemini's default thinking level as the effort its options send", () => {
+    const gemini = { ...target("@ai-sdk/google", "gemini-3-pro-preview"), capabilities: { reasoning: true } }
+    const options = ProviderTransform.options({ model: gemini, sessionID: "ses_test", providerOptions: {} })
+    expect(options.thinkingConfig?.thinkingLevel).toBe("high")
+    expect(ProviderTransform.effort(options)).toBe("high")
+  })
+
+  test("a token budget or a thinking toggle is not an effort", () => {
+    expect(ProviderTransform.effort({ thinkingConfig: { includeThoughts: true, thinkingBudget: 16_000 } })).toBe(
+      undefined,
+    )
+    expect(ProviderTransform.effort({ thinking: { type: "enabled", budgetTokens: 16_000 } })).toBe(undefined)
+    expect(ProviderTransform.effort({ enableThinking: true })).toBe(undefined)
+  })
+
   test.each([
     ["@openrouter/ai-sdk-provider", { reasoning: { effort: "high" } }],
     ["@ai-sdk/anthropic", { thinking: { type: "adaptive" }, effort: "high" }, "claude-opus-4-6"],
