@@ -2715,7 +2715,10 @@ it.live(
           path.join(directory, "opencode.json"),
           JSON.stringify({
             ...testProviderConfig(llm.url),
-            command: { historical: { template: `!\`printf replay >> '${marker}'; printf historical\`` } },
+            command: {
+              historical: { template: `!\`printf replay >> '${marker}'; printf historical\`` },
+              init: { template: `!\`printf init-replay >> '${marker}'; printf initialize\`` },
+            },
           }),
         ),
       )
@@ -2757,6 +2760,7 @@ it.live(
           },
         ],
         [SessionPaths.command, { messageID: original.info.id, command: "historical", arguments: "" }],
+        [SessionPaths.init, { messageID: original.info.id, providerID: "test", modelID: "test" }],
       ] as const) {
         const response = yield* request(pathFor(route, params), { method: "POST", headers, body: JSON.stringify(body) })
         expect(response.status).toBe(400)

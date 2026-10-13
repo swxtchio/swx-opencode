@@ -252,7 +252,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           command: Command.Default.INIT,
           arguments: "",
         })
-        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+        .pipe(
+          Effect.catchDefect(historicalRefusal),
+          Effect.mapError(() => new HttpApiError.BadRequest({})),
+        )
       return true
     })
 
