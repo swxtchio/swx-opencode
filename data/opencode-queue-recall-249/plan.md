@@ -101,3 +101,15 @@
   then reads config and runs the strict `reconcile` with its configured classification, so #244's conflict check
   holds. Reconciled and retried prompts skip revert cleanup and model selection, as in #244.
 - `eligible` (#244's promotion selection) keeps `promotable`; `reserve` sweeps orphaned preparing rows.
+
+## Round 4 (review round 4 adjudication)
+
+- UP does nothing while a recall is outstanding: a withdrawal can publish the emptied list before it answers, and
+  history would then copy the prompt being taken back.
+- `prepared` merges a prompt only with rows admitted before it (`replace(..., earlierOnly)`), then readmits each ready
+  row admitted after it, oldest first, so a late preparation never supersedes or absorbs newer prompts.
+- `dropPreparing` and the orphan sweep keep withdrawn rows and their `withdrawn` receipts; restoring a withdrawn
+  preparing row whose sender is gone is refused, so the TUI stashes its text instead.
+- An exact retry of a still-preparing original waits on `awaitPrepared` without the lock, then strictly reconciles
+  under its classified delivery, or is sent anew if the original was dropped.
+- Cross-process ownership of preparing rows stays process-local: swxtchio/swx-opencode#254.

@@ -2022,9 +2022,7 @@ it.instance(
         queue
           .list(session.id)
           .pipe(
-            Effect.map((items) =>
-              items.find((item) => item.input.messageID === heldID && item.delivery === "queue"),
-            ),
+            Effect.map((items) => items.find((item) => item.input.messageID === heldID && item.delivery === "queue")),
           ),
         "configured hold marker did not queue the prompt",
         "30 seconds",
@@ -2109,7 +2107,14 @@ it.instance(
       yield* queue.hold(session.id, "review")
       const send = (messageID: MessageID, delivery: SessionQueue.Delivery, text: string) =>
         prompt
-          .prompt({ sessionID: session.id, messageID, agent: "build", model: ref, delivery, parts: [{ type: "text", text }] })
+          .prompt({
+            sessionID: session.id,
+            messageID,
+            agent: "build",
+            model: ref,
+            delivery,
+            parts: [{ type: "text", text }],
+          })
           .pipe(Effect.forkChild)
       const listed = (messageID: MessageID, delivery: SessionQueue.Delivery) =>
         pollWithTimeout(
@@ -2139,7 +2144,9 @@ it.instance(
         "a retry under another delivery was not refused",
         "30 seconds",
       )
-      expect(Exit.isFailure(conflict) && String(Cause.squash(conflict.cause))).toContain("Conflicting prompt message ID")
+      expect(Exit.isFailure(conflict) && String(Cause.squash(conflict.cause))).toContain(
+        "Conflicting prompt message ID",
+      )
 
       yield* llm.push(reply().text("held handled").stop().item(), reply().text("plain handled").stop().item())
       expect(yield* queue.release(session.id, "review")).toBe(true)
@@ -2148,9 +2155,9 @@ it.instance(
         [retried, "its retry"],
         [plain, "the plain prompt"],
       ] as const)
-        expect(Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(fiber), `${what} did not finish`, "30 seconds"))).toBe(
-          true,
-        )
+        expect(
+          Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(fiber), `${what} did not finish`, "30 seconds")),
+        ).toBe(true)
       expect(yield* queue.list(session.id)).toEqual([])
     }),
   60_000,

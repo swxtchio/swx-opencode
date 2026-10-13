@@ -1182,7 +1182,11 @@ const layer = Layer.effect(
               ? early.receipt.itemID
               : undefined
         if (original) yield* queue.awaitPrepared(original)
-        if (early.kind === "retry" && input.requestID && Option.isNone(yield* queue.receipt(input.sessionID, input.requestID))) {
+        if (
+          early.kind === "retry" &&
+          input.requestID &&
+          Option.isNone(yield* queue.receipt(input.sessionID, input.requestID))
+        ) {
           yield* queue.forget(early.own)
           return yield* prompt(input)
         }
@@ -1208,7 +1212,10 @@ const layer = Layer.effect(
             retry: yield* queue.request({ ...input, ...(delivery ? { delivery: delivery } : {}) }, markers),
             reconciled: undefined,
           }
-        const reconciled = own || admitted ? undefined : yield* queue.reconcile({ ...input, ...(delivery ? { delivery: delivery } : {}) })
+        const reconciled =
+          own || admitted
+            ? undefined
+            : yield* queue.reconcile({ ...input, ...(delivery ? { delivery: delivery } : {}) })
         if (reconciled) return { markers, classification, delivery, retry: undefined, reconciled }
         yield* revert.cleanup(yield* sessions.get(input.sessionID).pipe(Effect.orDie))
         // A prompt's model and variant become the session's selection now, and a
@@ -1227,7 +1234,9 @@ const layer = Layer.effect(
         if (own) yield* queue.prepared({ sessionID: input.sessionID, itemID: own.id, delivery, markers })
         return { markers, classification, delivery, retry: undefined, reconciled: undefined }
       }).pipe(
-        Effect.onExit((exit) => (own && Exit.isFailure(exit) ? queue.unprepared(input.sessionID, own.id) : Effect.void)),
+        Effect.onExit((exit) =>
+          own && Exit.isFailure(exit) ? queue.unprepared(input.sessionID, own.id) : Effect.void,
+        ),
       )
       if (prepared.retry) return yield* followRequest(input, prepared.retry)
       if (prepared.reconciled?.kind === "direct") return prepared.reconciled.message
@@ -1261,7 +1270,9 @@ const layer = Layer.effect(
           : undefined
       const heldNoReply = markedNoReply && (initiallyHeldNoReply || noReplyDecision?.kind === "queued")
       const requested =
-        own || admitted || noReplyDecision || !markedNoReply ? undefined : yield* queue.request(admission, prepared.markers)
+        own || admitted || noReplyDecision || !markedNoReply
+          ? undefined
+          : yield* queue.request(admission, prepared.markers)
       // Another caller admitted the same request first.
       if (requested?.kind === "retry") return yield* followRequest(input, requested)
       const queued = own ?? admitted ?? (requested?.kind === "admitted" ? requested.own : undefined)

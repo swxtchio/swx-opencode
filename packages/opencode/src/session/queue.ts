@@ -431,8 +431,7 @@ const layer = Layer.effect(
       )
 
     // A pending row its sender is still preparing is never promoted or merged.
-    const promotable = (sessionID: SessionID) =>
-      and(pending(sessionID), isNull(SessionPromptQueueTable.time_preparing))
+    const promotable = (sessionID: SessionID) => and(pending(sessionID), isNull(SessionPromptQueueTable.time_preparing))
 
     const list = Effect.fn("SessionQueue.list")(function* (sessionID: SessionID) {
       const rows = yield* db

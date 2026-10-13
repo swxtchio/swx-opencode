@@ -618,7 +618,11 @@ test("UP takes back a prompt still being sent that the queue merged into another
     app.queue.items = [
       pendingItem("que_carrier", "check the lint, then check the build", {
         requestID: "carrier",
-        origins: [{ time: 10, requestID: "carrier" }, { time: 11, requestID: "middle" }, { time: 12, requestID }],
+        origins: [
+          { time: 10, requestID: "carrier" },
+          { time: 11, requestID: "middle" },
+          { time: 12, requestID },
+        ],
       }),
     ]
     app.queue.merged = { [requestID]: "middle", middle: "carrier" }

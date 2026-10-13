@@ -4169,9 +4169,7 @@ describe("session HttpApi submission-time admission", () => {
         expect((yield* post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
         // Both callers followed the one prompt, so both are told it was withdrawn.
         for (const fiber of [original, retry])
-          expect((yield* awaitWithTimeout(Fiber.join(fiber), "a caller never answered", "30 seconds")).status).toBe(
-            409,
-          )
+          expect((yield* awaitWithTimeout(Fiber.join(fiber), "a caller never answered", "30 seconds")).status).toBe(409)
       }),
     {
       ...options,
@@ -4194,7 +4192,12 @@ describe("session HttpApi submission-time admission", () => {
           const params = { sessionID: created.id }
           const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
           // As below: with only an absent provider configured, a variant has no model to select it on.
-          const body = { ...identity, agent: "build", variant: "high", parts: [{ type: "text", text: "check the build" }] }
+          const body = {
+            ...identity,
+            agent: "build",
+            variant: "high",
+            parts: [{ type: "text", text: "check the build" }],
+          }
           const send = () =>
             request(pathFor(SessionPaths.prompt, params), { method: "POST", headers, body: JSON.stringify(body) })
           const hold = yield* racingSpans.arm({ name: "Session.get", parent: "SessionPrompt.prompt" })
