@@ -494,6 +494,7 @@ function makeHttpNoLLMServer(input?: PromptTestOptions) {
 // SessionRunState.ensureRunning has joined or started a run, and records which.
 // With `hold`, that caller also waits after its run ends, as a slow one would.
 const gates = {
+  commandBefore: undefined as undefined | Effect.Effect<void, unknown>,
   messagesTransform: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   queueSelection: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   finishingRead: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
@@ -690,6 +691,11 @@ const gatedPlugin = LayerNode.make({
       const real = yield* Plugin.Service
       const trigger = ((name, input, output) =>
         Effect.gen(function* () {
+          const command = name === "command.execute.before" ? gates.commandBefore : undefined
+          if (command) {
+            gates.commandBefore = undefined
+            yield* command
+          }
           const selection = name === "chat.message" ? gates.queueSelection : undefined
           if (selection) {
             gates.queueSelection = undefined
@@ -10602,6 +10608,243 @@ it.instance(
       )
       const sdk = yield* Effect.promise(() => import(pathToFileURL(actual).href))
       expect(typeof sdk.tool).toBe("function")
+    }),
+  30000,
+)
+
+unix(
+  "round6 held executable IO allows critical steer direct prompt and active cancellation",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const marker = path.join(instance.directory, "round6-control-entered")
+      const release = path.join(instance.directory, "round6-control-release")
+      const held = yield* startHeld({
+        config: (url) => ({
+          ...providerCfg(url),
+          command: {
+            probe: {
+              template: `!\`printf 'execution\\n' >> '${marker}'; while [ ! -f '${release}' ]; do sleep 0.01; done; printf 'held command intent'\``,
+            },
+          },
+        }),
+      })
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      const expanding = yield* held.prompt
+        .command({
+          sessionID: held.chat.id,
+          messageID: MessageID.ascending(),
+          command: "probe",
+          arguments: "",
+          delivery: "queue",
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        Effect.promise(async () => ((await Bun.file(marker).exists()) ? true : undefined)),
+        "command never entered external preparation",
+      )
+      const critical =
+        "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791854000-998-abcd\x1f [fm-level:critical]\x1f Critical full envelope while expansion is held"
+      const criticalID = MessageID.ascending()
+      const sent = yield* held.send(critical, { messageID: criticalID })
+      const visible = yield* pollWithTimeout(
+        held.sessions
+          .messages({ sessionID: held.chat.id })
+          .pipe(
+            Effect.map((messages) =>
+              messages.some((message) =>
+                message.parts.some((part) => part.type === "text" && part.text.includes(critical)),
+              )
+                ? true
+                : undefined,
+            ),
+          ),
+        "critical steer blocked by expansion",
+        "2 seconds",
+      ).pipe(Effect.exit)
+      const criticalProjection = (yield* held.sessions.messages({ sessionID: held.chat.id })).find((message) =>
+        message.parts.some((part) => part.type === "text" && part.text.includes(critical)),
+      )
+      const directID = MessageID.ascending()
+      const direct = yield* awaitWithTimeout(
+        held.prompt.prompt({
+          sessionID: held.chat.id,
+          messageID: directID,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: said("independent direct original"),
+        }),
+        "direct prompt blocked by expansion",
+        "2 seconds",
+      ).pipe(Effect.exit)
+      const cancellation = yield* awaitWithTimeout(
+        held.prompt.cancel(held.chat.id),
+        "active cancel blocked by expansion",
+        "2 seconds",
+      ).pipe(Effect.exit)
+      const terminal = yield* awaitWithTimeout(
+        Fiber.await(held.task),
+        "active provider remained running after cancellation",
+        "2 seconds",
+      ).pipe(Effect.exit)
+      if (Exit.isFailure(visible) || Exit.isFailure(direct) || Exit.isFailure(cancellation) || Exit.isFailure(terminal))
+        yield* Effect.sync(() =>
+          console.error("held executable progress failures", {
+            critical: Exit.isFailure(visible) ? Cause.pretty(visible.cause) : "Success",
+            direct: Exit.isFailure(direct) ? Cause.pretty(direct.cause) : "Success",
+            cancel: Exit.isFailure(cancellation) ? Cause.pretty(cancellation.cause) : "Success",
+            providerTerminal: Exit.isFailure(terminal) ? Cause.pretty(terminal.cause) : "Success",
+          }),
+        )
+      const callsBeforeRelease = yield* held.llm.calls
+      const stillHeld = !(yield* Effect.promise(() => Bun.file(release).exists()))
+      yield* held.llm.text("critical answered")
+      yield* held.llm.text("command answered")
+      yield* writeText(release, "released")
+      yield* held.release
+      yield* finish(held.task, sent, expanding)
+      expect(Exit.isSuccess(visible)).toBe(true)
+      const witness = criticalProjection?.parts.flatMap((part) =>
+        part.type === "text" && !part.ignored && part.metadata?.sessionQueue ? [part.metadata.sessionQueue] : [],
+      )[0]
+      const original = Schema.decodeUnknownSync(SessionPromptQueue.Group)(witness).constituents[0]
+      expect(original?.delivery).toBe("steer")
+      expect(original?.input.messageID).toBe(criticalID)
+      expect(original?.input.parts).toEqual(said(critical))
+      expect(Exit.isSuccess(direct)).toBe(true)
+      if (Exit.isSuccess(direct)) expect(direct.value.info.id).toBe(directID)
+      expect(Exit.isSuccess(cancellation)).toBe(true)
+      expect(Exit.isSuccess(terminal)).toBe(true)
+      expect(callsBeforeRelease).toBe(1)
+      expect(stillHeld).toBe(true)
+      expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("execution\n")
+    }),
+  30000,
+)
+
+unix(
+  "round6 ordinary peer provider continuation completes while command expansion remains held",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const file = path.join(instance.directory, "round6-real-read.txt")
+      const marker = path.join(instance.directory, "round6-continuation-entered")
+      const release = path.join(instance.directory, "round6-continuation-release")
+      yield* writeText(file, "retained real read result")
+      const held = yield* startHeld({
+        tool: { name: "read", args: { filePath: file } },
+        config: (url) => ({
+          ...providerCfg(url),
+          command: {
+            probe: {
+              template: `!\`printf 'execution\\n' >> '${marker}'; while [ ! -f '${release}' ]; do sleep 0.01; done; printf 'deferred command intent'\``,
+            },
+          },
+        }),
+      })
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      const expanding = yield* held.prompt
+        .command({
+          sessionID: held.chat.id,
+          messageID: MessageID.ascending(),
+          command: "probe",
+          arguments: "",
+          delivery: "queue",
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        Effect.promise(async () => ((await Bun.file(marker).exists()) ? true : undefined)),
+        "command preparation did not enter",
+      )
+      const input = {
+        messageID: MessageID.ascending(),
+        text: "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791854000-999-abcd\x1f [fm-level:request]\x1f Ordinary peer during expansion\nComplete original tail",
+      }
+      const sent = yield* held.send(input.text, { messageID: input.messageID })
+      const original = (yield* awaitWithTimeout(
+        queued(held.chat.id, 1),
+        "ordinary peer admission blocked by expansion",
+        "2 seconds",
+      ))[0]
+      if (!original) throw new Error("missing admitted peer")
+      expect(original.input.messageID).toBe(input.messageID)
+      // Retain a caller in this scope so reply custody remains readable after child callers finish.
+      const custody = yield* held.queue.admit({
+        ...original.input,
+        sessionID: held.chat.id,
+        delivery: original.delivery,
+      })
+      expect(custody.id).toBe(original.id)
+      yield* held.llm.text("peer continuation complete")
+      yield* held.release
+      yield* awaitWithTimeout(held.llm.wait(2), "continuation blocked by command expansion", "2 seconds")
+      const replies = yield* finish(held.task, sent)
+      expect(replies[0]?.info.id).toBe(replies[1]?.info.id)
+      expect((yield* held.queue.reply(original.id))?.info.id).toBe(replies[1]?.info.id)
+      const requests = yield* held.llm.inputs
+      expect(JSON.stringify(requests[1]?.messages)).toContain("retained real read result")
+      expect(JSON.stringify(requests[1]?.messages)).toContain("Complete original tail")
+      expect(yield* held.queue.list(held.chat.id)).toEqual([])
+      expect(yield* held.llm.calls).toBe(2)
+      expect(yield* Effect.promise(() => Bun.file(release).exists())).toBe(false)
+      yield* held.llm.text("command complete")
+      yield* writeText(release, "released")
+      yield* finish(expanding)
+      expect(yield* held.llm.calls).toBe(3)
+      expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("execution\n")
+    }),
+  30000,
+)
+
+gated.instance(
+  "round6 command pre-execution hook can await a distinct same-session direct prompt",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: { probe: { template: "plain command intent" } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({})
+      const directID = MessageID.ascending()
+      const observed: SessionV1.WithParts[] = []
+      gates.commandBefore = prompt
+        .prompt({
+          sessionID: session.id,
+          messageID: directID,
+          model: ref,
+          agent: "build",
+          noReply: true,
+          parts: said("direct input from awaited hook"),
+        })
+        .pipe(
+          Effect.tap((message) =>
+            Effect.sync(() => {
+              observed.push(message)
+            }),
+          ),
+          Effect.asVoid,
+        )
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          gates.commandBefore = undefined
+        }),
+      )
+      yield* llm.text("command complete")
+      const result = yield* awaitWithTimeout(
+        prompt.command({ sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" }),
+        "awaited hook deadlocked on session permit",
+        "2 seconds",
+      )
+      expect(observed).toHaveLength(1)
+      expect(observed[0]?.info.id).toBe(directID)
+      expect(result.info.role).toBe("assistant")
+      expect(yield* llm.calls).toBe(1)
+      expect(
+        (yield* sessions.messages({ sessionID: session.id })).filter((message) => message.info.role === "user"),
+      ).toHaveLength(2)
     }),
   30000,
 )

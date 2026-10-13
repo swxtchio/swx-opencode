@@ -1769,3 +1769,96 @@ it.instance("round5 peer aliases cannot borrow bare projected IDs in pending pro
     }
   }),
 )
+
+it.instance("round6 in-flight executable identity refuses competing entries before their preparation", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const input = {
+      sessionID: session.id,
+      messageID: MessageID.ascending(),
+      delivery: "queue" as const,
+      parts: [{ type: "text" as const, text: "original executable input" }],
+    }
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
+    const first = yield* queue
+      .prepareExecutable({
+        ...input,
+        prepare: () =>
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.as(input)),
+      })
+      .pipe(Effect.forkChild)
+    yield* Deferred.await(entered)
+    const forbidden = () => Effect.die(new Error("competing input reached preparation"))
+    const exits = yield* Effect.all(
+      [
+        queue.prepareExecutable({ ...input, prepare: forbidden }),
+        queue.admit(input),
+        queue.reconcile(input),
+        queue.assertFreshIdentity(session.id, input.messageID),
+        queue.writeDirect({ admission: { ...input, noReply: true }, prepare: forbidden, write: forbidden }),
+        queue.writeOrAdmit({
+          admission: { ...input, noReply: true },
+          isBusy: Effect.succeed(false),
+          prepare: forbidden,
+          write: forbidden,
+          discard: () => Effect.void,
+        }),
+      ].map((effect) =>
+        effect.pipe(
+          Effect.timeoutOrElse({
+            duration: "2 seconds",
+            orElse: () => Effect.die(new Error("competing identity waited on preparation")),
+          }),
+          Effect.exit,
+        ),
+      ),
+      { concurrency: "unbounded" },
+    )
+    yield* Deferred.succeed(release, undefined)
+    const completed = yield* Fiber.await(first)
+    exits.forEach((exit) => {
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+    })
+    expect(Exit.isSuccess(completed)).toBe(true)
+    if (Exit.isSuccess(completed))
+      expect((yield* queue.list(session.id)).map((item) => item.id)).toEqual([completed.value.own.id])
+    expect(yield* sessions.messages({ sessionID: session.id })).toEqual([])
+  }),
+)
+
+it.instance("round6 executable reservation is released by failure and cancellation before fresh admission", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const input = {
+      sessionID: session.id,
+      messageID: MessageID.ascending(),
+      parts: [{ type: "text" as const, text: "failed preparation has no admitted original" }],
+    }
+    const failure = yield* Effect.exit(
+      queue.prepareExecutable({ ...input, prepare: () => Effect.fail("preparation failed") }),
+    )
+    expect(Exit.isFailure(failure)).toBe(true)
+    if (Exit.isFailure(failure)) expect(Cause.squash(failure.cause)).toBe("preparation failed")
+    yield* queue.assertFreshIdentity(session.id, input.messageID)
+    const entered = yield* Deferred.make<void>()
+    const first = yield* queue
+      .prepareExecutable({
+        ...input,
+        prepare: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      })
+      .pipe(Effect.forkChild)
+    yield* Deferred.await(entered)
+    yield* Fiber.interrupt(first)
+    yield* queue.assertFreshIdentity(session.id, input.messageID)
+    const admitted = yield* queue.prepareExecutable({ ...input, prepare: () => Effect.succeed(input) })
+    expect(admitted.input).toEqual(input)
+    expect((yield* queue.list(session.id)).map((item) => item.id)).toEqual([admitted.own.id])
+  }),
+)

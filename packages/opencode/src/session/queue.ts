@@ -103,7 +103,7 @@ export interface Interface {
   >
   /** Executable command/shell input has no retained expansion provenance; existing identity cannot run again. */
   readonly assertFreshIdentity: (sessionID: SessionID, messageID?: MessageID) => Effect.Effect<void>
-  /** Serialize executable preparation through durable admission, without a database transaction across IO. */
+  /** Reserve only the executable identity across unlocked IO, then recheck and admit under the session lock. */
   readonly prepareExecutable: <P extends AdmitInput, E>(input: {
     readonly sessionID: SessionID
     readonly messageID?: MessageID
@@ -227,6 +227,7 @@ const layer = Layer.effect(
     // across their unlocked preparation; nothing else waits on it.
     const locks = new Map<SessionID, Semaphore.Semaphore>()
     const order = new Map<SessionID, Semaphore.Semaphore>()
+    const preparations = new Map<string, symbol>()
     const parked = new Set<SessionID>()
     const wakes = new Map<SessionID, number>()
     const running = new Set<SessionID>()
@@ -429,6 +430,16 @@ const layer = Layer.effect(
         )
       })
 
+    const assertNotPreparing = (sessionID: SessionID, messageID?: MessageID) =>
+      Effect.sync(() => {
+        if (messageID && preparations.has(JSON.stringify([sessionID, messageID])))
+          throw new HistoricalIdentityError({
+            sessionID,
+            messageID,
+            message: `Executable identity ${messageID} is still preparing; competing admission refused before side effects`,
+          })
+      })
+
     const assertIdentityIn = (
       query: DatabaseAccess,
       sessionID: SessionID,
@@ -436,6 +447,7 @@ const layer = Layer.effect(
       checkCustody = true,
     ) =>
       Effect.gen(function* () {
+        yield* assertNotPreparing(sessionID, messageID)
         if (!messageID) return
         const projected = yield* query
           .select({ id: MessageTable.id })
@@ -527,6 +539,7 @@ const layer = Layer.effect(
           )
 
     const admission = Effect.fnUntraced(function* (input: AdmitInput, existingOnly = false) {
+      yield* assertNotPreparing(input.sessionID, input.messageID)
       const callerScope = Option.getOrUndefined(yield* Effect.serviceOption(Scope.Scope))
       const result = yield* writable(input.sessionID, (tx) =>
         Effect.gen(function* () {
@@ -694,6 +707,7 @@ const layer = Layer.effect(
       )
 
     const reconcileLocked = Effect.fnUntraced(function* (input: AdmitInput) {
+      yield* assertNotPreparing(input.sessionID, input.messageID)
       const keys = constituentIDs(input.sessionID, input)
       if (!keys.length) return undefined
       const parts = yield* db.select().from(PartTable).where(inArray(PartTable.id, keys)).all().pipe(Effect.orDie)
@@ -786,6 +800,7 @@ const layer = Layer.effect(
       !messageID
         ? Effect.void
         : Effect.gen(function* () {
+            yield* assertNotPreparing(sessionID, messageID)
             const projected = yield* db
               .select({ id: MessageTable.id })
               .from(MessageTable)
@@ -827,18 +842,39 @@ const layer = Layer.effect(
           }).pipe(Effect.orDie)
     const assertFreshIdentity: Interface["assertFreshIdentity"] = (sessionID, messageID) =>
       exclusive(sessionID, assertFreshIdentityLocked(sessionID, messageID))
-    const prepareExecutable: Interface["prepareExecutable"] = (input) =>
-      exclusive(
-        input.sessionID,
-        Effect.gen(function* () {
-          yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
-          const prepared = yield* input.prepare()
-          // A foreign writer can commit while preparation performs IO; check again before binding its input.
-          yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
-          const own = yield* admitLocked(prepared)
-          return { input: prepared, own }
-        }),
+    const prepareExecutable: Interface["prepareExecutable"] = (input) => {
+      const key = input.messageID ? JSON.stringify([input.sessionID, input.messageID]) : undefined
+      const release = (owner: symbol) =>
+        Effect.sync(() => {
+          if (key && preparations.get(key) === owner) preparations.delete(key)
+        })
+      return Effect.acquireUseRelease(
+        exclusive(
+          input.sessionID,
+          Effect.gen(function* () {
+            yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
+            const owner = Symbol()
+            if (key) preparations.set(key, owner)
+            return owner
+          }),
+        ),
+        (owner) =>
+          Effect.gen(function* () {
+            const prepared = yield* input.prepare()
+            return yield* exclusive(
+              input.sessionID,
+              Effect.gen(function* () {
+                // Handoff to durable custody is serialized, but shell and hook IO never hold the session permit.
+                yield* release(owner)
+                yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
+                const own = yield* admitLocked(prepared)
+                return { input: prepared, own }
+              }),
+            )
+          }),
+        release,
       )
+    }
 
     const writeOriginal = <P extends SessionV1.WithParts>(
       input: { admission: AdmitInput; write: (prepared: P) => Effect.Effect<SessionV1.WithParts> },
