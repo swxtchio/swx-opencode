@@ -63,7 +63,10 @@ export type ScenarioContext = {
   message: (sessionID: SessionID, input?: { text?: string }) => Effect.Effect<MessageSeed>
   messages: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts[]>
   /** Admits a queued prompt without draining, so it stays pending. */
-  queued: (sessionID: SessionID, input: { text: string; withdrawn?: boolean }) => Effect.Effect<SessionQueue.Item>
+  queued: (
+    sessionID: SessionID,
+    input: { text: string; withdrawn?: boolean; requestID?: SessionQueue.RequestID },
+  ) => Effect.Effect<SessionQueue.Item>
   queue: (sessionID: SessionID) => Effect.Effect<SessionQueue.Item[]>
   /** Starts a review hold directly on the queue service. */
   hold: (sessionID: SessionID, holder: string) => Effect.Effect<void>

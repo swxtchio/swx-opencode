@@ -1458,6 +1458,39 @@ const scenarios: Scenario[] = [
       }),
     ),
   http.protected
+    .get("/session/{sessionID}/queue/receipt/{requestID}", "session.queue.receipt")
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue receipt session" })
+        const item = yield* ctx.queued(session.id, { text: "receipted", requestID: "exercise-request" })
+        return { session, item }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/receipt/{requestID}", {
+        sessionID: ctx.state.session.id,
+        requestID: "exercise-request",
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(200, (body, ctx) => {
+      check(
+        stable(body) === stable({ state: "pending", itemID: ctx.state.item.id }),
+        "receipt should say the request is pending as its item",
+      )
+    }),
+  http.protected
+    .get("/session/{sessionID}/queue/receipt/{requestID}", "session.queue.receipt.missing")
+    .seeded((ctx) => ctx.session({ title: "Queue receipt missing session" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/receipt/{requestID}", {
+        sessionID: ctx.state.id,
+        requestID: "exercise-unknown",
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(404, object, "status"),
+  http.protected
     .post("/session/{sessionID}/queue/hold", "session.queue.hold")
     .seeded((ctx) =>
       Effect.gen(function* () {
@@ -1545,8 +1578,10 @@ const scenarios: Scenario[] = [
     .seeded((ctx) =>
       Effect.gen(function* () {
         const session = yield* ctx.session({ title: "Queue consolidate session" })
-        const item = yield* ctx.queued(session.id, { text: "repeated" })
-        yield* ctx.queued(session.id, { text: "repeated" })
+        // Admission already absorbs identical copies, and joins commands only when they name requests,
+        // so two commands without request IDs are what is left for consolidate to merge.
+        const item = yield* ctx.queued(session.id, { text: "fix parser first" })
+        yield* ctx.queued(session.id, { text: "fix parser second" })
         return { session, item }
       }),
     )
@@ -1556,7 +1591,18 @@ const scenarios: Scenario[] = [
     }))
     .json(200, (body, ctx) => {
       array(body)
-      check(stable(body) === stable([ctx.state.item]), "consolidate should keep one of identical items")
+      const merged = body[0]
+      check(
+        body.length === 1 &&
+          isRecord(merged) &&
+          merged.id === ctx.state.item.id &&
+          stable(merged.input) ===
+            stable({
+              ...ctx.state.item.input,
+              parts: [{ ...ctx.state.item.input.parts[0], text: "fix parser:\n1. first\n2. second" }],
+            }),
+        "consolidate should merge commands sharing a verb and target into the first",
+      )
     }),
   http.protected
     .post("/session/{sessionID}/fork", "session.fork")

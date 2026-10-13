@@ -205,6 +205,7 @@ function withContext<A, E>(
                     model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
                     delivery: "queue",
                     parts: [{ type: "text", text: input.text }],
+                    ...(input.requestID ? { requestID: input.requestID } : {}),
                   })
                   if (input.withdrawn) yield* svc.withdraw(sessionID, item.id)
                   return item
