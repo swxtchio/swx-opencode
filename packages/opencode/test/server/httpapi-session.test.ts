@@ -2700,3 +2700,74 @@ describe("session HttpApi writes racing removal", () => {
     racing,
   )
 })
+
+
+it.live(
+  "historical executable prompt and command IDs are refused over HTTP before side effects",
+  () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      const directory = yield* tmpdirScoped({ git: true })
+      const marker = path.join(directory, "command-executions.txt")
+      yield* Effect.promise(() => Bun.write(marker, "retained original\n"))
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(directory, "opencode.json"),
+          JSON.stringify({
+            ...testProviderConfig(llm.url),
+            command: { historical: { template: `!\`printf replay >> '${marker}'; printf historical\`` } },
+          }),
+        ),
+      )
+      const session = yield* createSession({ title: "Historical HTTP original" }).pipe(provideInstanceEffect(directory))
+      const original = yield* createTextMessage(session.id, "historical").pipe(provideInstanceEffect(directory))
+      const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+      const params = { sessionID: session.id }
+      const before = yield* Session.Service.use((svc) => svc.messages({ sessionID: session.id })).pipe(
+        provideInstanceEffect(directory),
+      )
+      for (const [route, body] of [
+        [
+          SessionPaths.prompt,
+          {
+            messageID: original.info.id,
+            agent: "build",
+            model: { providerID: "test", modelID: "test" },
+            parts: [{ type: "text", text: "historical" }],
+          },
+        ],
+        [
+          SessionPaths.prompt,
+          {
+            messageID: original.info.id,
+            agent: "build",
+            model: { providerID: "test", modelID: "test" },
+            system: "excluded controls",
+            parts: [{ type: "text", text: "changed" }],
+          },
+        ],
+        [
+          SessionPaths.prompt,
+          {
+            messageID: original.info.id,
+            noReply: true,
+            agent: "build",
+            model: { providerID: "test", modelID: "test" },
+            parts: [{ type: "text", text: "historical" }],
+          },
+        ],
+        [SessionPaths.command, { messageID: original.info.id, command: "historical", arguments: "" }],
+      ] as const) {
+        const response = yield* request(pathFor(route, params), { method: "POST", headers, body: JSON.stringify(body) })
+        expect(response.status).toBe(400)
+        expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("retained original\n")
+        expect(
+          yield* Session.Service.use((svc) => svc.messages({ sessionID: session.id })).pipe(
+            provideInstanceEffect(directory),
+          ),
+        ).toEqual(before)
+      }
+      expect(yield* llm.calls).toBe(0)
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  30000,
+)

@@ -1,5 +1,6 @@
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -4624,7 +4625,7 @@ const finish = <A, E>(...fibers: Fiber.Fiber<A, E>[]) =>
   awaitWithTimeout(Effect.all(fibers.map((fiber) => Fiber.join(fiber))), "prompts never finished", "10 seconds")
 
 const startHeld = Effect.fn("test.startHeld")(function* (input?: {
-  tool?: boolean
+  tool?: boolean | { name: string; args: Record<string, unknown> }
   agent?: string
   diagnostic?: (value: {
     sessionID: SessionID
@@ -4644,7 +4645,14 @@ const startHeld = Effect.fn("test.startHeld")(function* (input?: {
   })
   const gate = yield* Deferred.make<void>()
   yield* input?.tool
-    ? llm.push(reply().wait(deferredAsPromise(gate)).tool("first", { value: "first" }))
+    ? llm.push(
+        reply()
+          .wait(deferredAsPromise(gate))
+          .tool(
+            input.tool === true ? "first" : input.tool.name,
+            input.tool === true ? { value: "first" } : input.tool.args,
+          ),
+      )
     : llm.hold("task done", deferredAsPromise(gate))
   const task = yield* prompt
     .prompt({ sessionID: chat.id, agent: input?.agent ?? "build", model: ref, parts: said("start the task") })
@@ -7704,7 +7712,7 @@ gated.instance(
 )
 
 it.instance(
-  "does not rewrite an exact marked noReply messageID retry",
+  "refuses an exact marked noReply messageID retry without custody",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
@@ -7724,10 +7732,10 @@ it.instance(
       }
 
       const original = yield* prompt.prompt(input)
-      const retry = yield* prompt.prompt(input)
-      if (original.info.role !== "user" || retry.info.role !== "user")
-        throw new Error("expected both exact retry results to be user messages")
-      expect(retry.info.id).toBe(original.info.id)
+      const retry = yield* prompt.prompt(input).pipe(Effect.exit)
+      expect(Exit.isFailure(retry)).toBe(true)
+      if (!Exit.isFailure(retry)) throw new Error("bare projected identity was accepted")
+      expect(Cause.squash(retry.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
       const messages = yield* sessions.messages({ sessionID: session.id })
       expect(messages).toHaveLength(1)
       expect(messages[0]?.parts.filter((part) => part.type === "text" && part.text === markedText)).toHaveLength(1)
@@ -7738,7 +7746,7 @@ it.instance(
 )
 
 it.instance(
-  "keeps an idle changed marked noReply messageID retry from starting a provider turn",
+  "refuses an idle changed marked noReply messageID without original custody",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
@@ -7759,16 +7767,19 @@ it.instance(
       })
       if (original.info.role !== "user") throw new Error("expected the original marked message")
 
-      const retry = yield* prompt.prompt({
-        sessionID: session.id,
-        messageID,
-        agent: "build",
-        model: ref,
-        noReply: true,
-        parts: said(changedText),
-      })
-      if (retry.info.role !== "user") throw new Error("expected the idle retry result")
-      expect(retry.info.id).toBe(messageID)
+      const retry = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          messageID,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: said(changedText),
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(retry)).toBe(true)
+      if (!Exit.isFailure(retry)) throw new Error("changed bare identity was accepted")
+      expect(Cause.squash(retry.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
       expect(yield* llm.calls).toBe(0)
       expect(yield* queue.list(session.id)).toEqual([])
       const messages = yield* sessions.messages({ sessionID: session.id })
@@ -7781,7 +7792,7 @@ it.instance(
 )
 
 it.instance(
-  "deduplicates repeated changed marked same-ID retries during a busy multi-step run",
+  "refuses repeated changed marked same-ID retries while preserving a busy multi-step run",
   () =>
     Effect.gen(function* () {
       const { dir, llm } = yield* useServerConfig(providerCfg)
@@ -7830,18 +7841,13 @@ it.instance(
         noReply: true,
         parts: said(changedText),
       }
-      yield* prompt.prompt(retryInput)
-      const firstQueue = yield* pollWithTimeout(
-        queue.list(session.id).pipe(Effect.map((items) => items.find((item) => item.input.messageID === messageID))),
-        "first changed same-ID retry was not held",
-        "10 seconds",
-      )
-      yield* prompt.prompt(retryInput)
-      const pending = yield* queue.list(session.id)
-      expect(pending).toHaveLength(1)
-      expect(pending[0]?.id).toBe(firstQueue.id)
-      expect(pending[0]?.seq).toBe(firstQueue.seq)
-      expect(pending[0]?.delivery).toBe("queue")
+      for (const attempt of [1, 2, 3]) {
+        const exit = yield* prompt.prompt(retryInput).pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (!Exit.isFailure(exit)) throw new Error(`ambiguous retry ${attempt} was accepted`)
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+        expect(yield* queue.list(session.id)).toEqual([])
+      }
       expect(yield* llm.calls).toBe(1)
 
       yield* Deferred.succeed(toolResponse, undefined)
@@ -7849,10 +7855,6 @@ it.instance(
       const continuation = (yield* llm.inputs)[1]
       if (!continuation) throw new Error("expected the active root continuation")
       expect(JSON.stringify(continuation.messages)).not.toContain("repeated busy machine mail")
-      yield* awaitWithTimeout(llm.wait(3), "held same-ID retry did not reach its turn", "10 seconds")
-      const held = (yield* llm.inputs)[2]
-      if (!held) throw new Error("expected the single held retry request")
-      expect(JSON.stringify(held.messages).split("repeated busy machine mail").length - 1).toBe(1)
       const exit = yield* awaitWithTimeout(Fiber.await(active), "active root did not finish", "10 seconds")
       expect(Exit.isSuccess(exit)).toBe(true)
 
@@ -7861,20 +7863,17 @@ it.instance(
       if (!originalRow || originalRow.info.role !== "user") throw new Error("expected the old row to remain")
       expect(originalRow.parts.some((part) => part.type === "text" && part.text === originalText)).toBe(true)
       expect(originalRow.parts.some((part) => part.type === "text" && part.text === changedText)).toBe(false)
-      const promoted = messages.find(
-        (message) => message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === changedText),
-      )
-      if (!promoted || promoted.info.role !== "user") throw new Error("expected the retry to promote exactly once")
-      expect(promoted.info.id).not.toBe(messageID)
-      expect(messages.filter((message) => message.parts.some((part) => part.type === "text" && part.text === changedText))).toHaveLength(1)
+      expect(
+        messages.some((message) => message.parts.some((part) => part.type === "text" && part.text === changedText)),
+      ).toBe(false)
       expect(yield* queue.list(session.id)).toEqual([])
-      expect(yield* llm.calls).toBe(3)
+      expect(yield* llm.calls).toBe(2)
     }),
   60_000,
 )
 
 it.instance(
-  "does not queue an initially-busy exact marked same-ID retry of a persisted message",
+  "refuses an initially-busy exact marked same-ID retry without original custody",
   () =>
     Effect.gen(function* () {
       const { dir, llm } = yield* useServerConfig(providerCfg)
@@ -7914,9 +7913,10 @@ it.instance(
       const active = yield* prompt.loop({ sessionID: session.id, messageID: root.info.id }).pipe(Effect.forkChild)
       yield* awaitWithTimeout(llm.wait(1), "active root did not reach the provider", "10 seconds")
 
-      const retry = yield* prompt.prompt(input)
-      if (retry.info.role !== "user") throw new Error("expected the exact retry result")
-      expect(retry.info.id).toBe(messageID)
+      const retry = yield* prompt.prompt(input).pipe(Effect.exit)
+      expect(Exit.isFailure(retry)).toBe(true)
+      if (!Exit.isFailure(retry)) throw new Error("unwitnessed projection was accepted")
+      expect(Cause.squash(retry.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
       expect(yield* queue.list(session.id)).toEqual([])
       expect(yield* llm.calls).toBe(1)
       yield* Deferred.succeed(toolResponse, undefined)
@@ -7929,151 +7929,64 @@ it.instance(
       expect(yield* queue.list(session.id)).toEqual([])
       expect(yield* llm.calls).toBe(2)
       const messages = yield* sessions.messages({ sessionID: session.id })
-      expect(messages.filter((message) => message.info.role === "user" && message.info.id === messageID)).toHaveLength(1)
-      expect(messages.filter((message) => message.info.role === "assistant" && message.info.parentID === messageID)).toHaveLength(0)
+      expect(messages.filter((message) => message.info.role === "user" && message.info.id === messageID)).toHaveLength(
+        1,
+      )
+      expect(
+        messages.filter((message) => message.info.role === "assistant" && message.info.parentID === messageID),
+      ).toHaveLength(0)
     }),
   60_000,
 )
 
 gated.instance(
-  "holds a changed marked noReply messageID retry out of an older rootful run and promotes it once",
+  "ambiguous changed marked identity is refused before idle-write race gates",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
       const prompt = yield* SessionPrompt.Service
       const queue = yield* SessionQueue.Service
-      const run = yield* SessionRunState.Service
       const sessions = yield* Session.Service
-      const session = yield* sessions.create({
-        title: "Same-ID marked retry race",
-        permission: [{ permission: "*", pattern: "*", action: "allow" }],
-      })
+      const session = yield* sessions.create({ title: "Ambiguous identity before write race" })
       const messageID = MessageID.ascending()
-      const originalText = "[fm-from-firstmate]\x1f same-ID original machine mail"
-      const changedText = "[fm-from-firstmate]\x1f changed during active task"
-      const original = yield* prompt.prompt({
+      const originalText = "[fm-from-firstmate]\x1f original marker without custody"
+      const input = {
         sessionID: session.id,
         messageID,
         agent: "build",
         model: ref,
         noReply: true,
         parts: said(originalText),
-      })
-      if (original.info.role !== "user") throw new Error("expected the original marked message")
-      const root = yield* seedUser({
-        sessionID: session.id,
-        agent: "build",
-        model: ref,
-        parts: said("same-ID active task"),
-      })
-      const admissionEntered = yield* Deferred.make<void>()
-      const admissionRelease = yield* Deferred.make<void>()
-      const writeEntered = yield* Deferred.make<void>()
-      const writeRelease = yield* Deferred.make<void>()
+      }
+      yield* prompt.prompt(input)
+      const before = yield* sessions.messages({ sessionID: session.id })
+      const admission = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      const write = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      gates.noReplyAdmission = admission
+      gates.noReplyWrite = write
       yield* Effect.addFinalizer(() =>
-        Effect.all(
-          [admissionRelease, writeRelease].map((gate) => Deferred.succeed(gate, undefined).pipe(Effect.ignore)),
-          { discard: true },
-        ).pipe(
-          Effect.andThen(
-            Effect.sync(() => {
-              gates.noReplyAdmission = undefined
-              gates.noReplyWrite = undefined
-            }),
-          ),
+        Effect.sync(() => {
+          gates.noReplyAdmission = undefined
+          gates.noReplyWrite = undefined
+        }).pipe(
+          Effect.andThen(Deferred.succeed(admission.release, undefined)),
+          Effect.andThen(Deferred.succeed(write.release, undefined)),
+          Effect.asVoid,
         ),
       )
-      yield* llm.push(
-        reply().text("root task finished").stop().item(),
-        reply().text("held retry handled").stop().item(),
-      )
-
-      gates.noReplyAdmission = { entered: admissionEntered, release: admissionRelease, skip: 1 }
-      gates.noReplyWrite = { entered: writeEntered, release: writeRelease }
-      const retry = yield* prompt
-        .prompt({
-          sessionID: session.id,
-          messageID,
-          agent: "build",
-          model: ref,
-          noReply: true,
-          parts: said(changedText),
-        })
-        .pipe(Effect.forkChild)
-      yield* awaitWithTimeout(
-        Deferred.await(admissionEntered),
-        "same-ID retry did not pause after its idle write-boundary sample",
-        "10 seconds",
-      )
-
-      const active = yield* prompt.loop({ sessionID: session.id, messageID: root.info.id }).pipe(Effect.forkChild)
-      yield* pollWithTimeout(
-        run.assertNotBusy(session.id).pipe(
-          Effect.exit,
-          Effect.map((exit) => (Exit.isFailure(exit) ? true : undefined)),
-        ),
-        "rootful run did not start between the retry check and its write",
-        "10 seconds",
-      )
-      expect(yield* llm.calls).toBe(0)
-      yield* Deferred.succeed(admissionRelease, undefined)
-
-      const outcome = yield* Effect.raceFirst(
-        Deferred.await(writeEntered).pipe(Effect.as("writing" as const)),
-        pollWithTimeout(
-          queue.list(session.id).pipe(
-            Effect.map((items) =>
-              items.find((item) => item.input.parts.some((part) => part.type === "text" && part.text === changedText)),
-            ),
-          ),
-          "same-ID retry was neither written nor held",
-          "10 seconds",
-        ).pipe(Effect.as("held" as const)),
-      )
-      if (outcome === "writing") yield* Deferred.succeed(writeRelease, undefined)
-      const retryExit = yield* awaitWithTimeout(Fiber.await(retry), "same-ID retry did not finish", "10 seconds")
-      expect(Exit.isSuccess(retryExit)).toBe(true)
-      const pending = (yield* queue.list(session.id)).find((item) =>
-        item.input.parts.some((part) => part.type === "text" && part.text === changedText),
-      )
-      if (!pending) throw new Error("changed same-ID retry was not held for later promotion")
-      expect(pending.delivery).toBe("queue")
-
-      yield* awaitWithTimeout(llm.wait(1), "rootful run did not reach the provider", "10 seconds")
-      const first = (yield* llm.inputs)[0]
-      if (!first) throw new Error("expected the rootful first provider request")
-      const firstHistory = JSON.stringify(first.messages)
-      expect(firstHistory).toContain("same-ID original machine mail")
-      expect(firstHistory).not.toContain("changed during active task")
-
-      yield* awaitWithTimeout(llm.wait(2), "held same-ID retry did not reach its own turn", "10 seconds")
-      const held = (yield* llm.inputs)[1]
-      if (!held) throw new Error("expected the promoted same-ID retry request")
-      const heldHistory = JSON.stringify(held.messages)
-      expect(heldHistory.split("changed during active task").length - 1).toBe(1)
-      const activeExit = yield* awaitWithTimeout(Fiber.await(active), "rootful run did not finish", "10 seconds")
-      expect(Exit.isSuccess(activeExit)).toBe(true)
-
-      const messages = yield* sessions.messages({ sessionID: session.id })
-      const persistedOriginal = messages.find((message) => message.info.id === messageID)
-      if (!persistedOriginal || persistedOriginal.info.role !== "user")
-        throw new Error("expected the original historical row to remain persisted")
-      expect(persistedOriginal.parts.filter((part) => part.type === "text" && part.text === originalText)).toHaveLength(1)
-      expect(persistedOriginal.parts.some((part) => part.type === "text" && part.text === changedText)).toBe(false)
-      const promoted = messages.find(
-        (message) => message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === changedText),
-      )
-      if (!promoted || promoted.info.role !== "user") throw new Error("expected the held retry to be promoted once")
-      expect(promoted.info.id).not.toBe(messageID)
-      expect(promoted.info.noReply).toBeUndefined()
-      expect(messages.filter((message) => message.parts.some((part) => part.type === "text" && part.text === changedText))).toHaveLength(1)
-      expect(
-        messages.filter((message) => message.info.role === "assistant" && message.info.parentID === promoted.info.id),
-      ).toHaveLength(1)
+      const exit = yield* prompt
+        .prompt({ ...input, parts: said("[fm-from-firstmate]\x1f conflicting retry") })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) throw new Error("ambiguous changed identity was written")
+      expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+      expect(yield* Deferred.isDone(admission.entered)).toBe(false)
+      expect(yield* Deferred.isDone(write.entered)).toBe(false)
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
       expect(yield* queue.list(session.id)).toEqual([])
-      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.calls).toBe(0)
     }),
-  60_000,
+  30000,
 )
 
 it.instance(
@@ -9851,4 +9764,284 @@ it.instance(
       expect(yield* held.queue.reply(manual.id)).toBeUndefined()
     }),
   20000,
+)
+
+
+it.instance(
+  "ordinary peers reach each safe active tool continuation in capped batches without advancing holds",
+  () =>
+    Effect.gen(function* () {
+      const directory = yield* TestInstance
+      const file = path.join(directory.directory, "peer-continuation.txt")
+      yield* writeText(file, "real tool result retained")
+      const held = yield* startHeld({ tool: { name: "read", args: { filePath: file } } })
+      const lastGate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(lastGate, undefined).pipe(Effect.asVoid))
+      yield* held.llm.tool("read", { filePath: file })
+      yield* held.llm.hold("active peers handled", deferredAsPromise(lastGate))
+      yield* held.llm.text("held human handled")
+      yield* held.llm.text("automation handled")
+      const automationText =
+        "[fm-level:nudge:watcher.wake]\x1f WATCHER FIRED [active-1] - handle wake.\n\ncheck: /scratch/active.check.sh: historical notice"
+      const automation = yield* held.send(automationText)
+      const human = yield* held.send("held human must wait", { delivery: "queue" })
+      const inputs = Array.from({ length: 11 }, (_, index) => ({
+        messageID: MessageID.ascending(),
+        text: `[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791900000-${index + 1}-abcd\x1f [fm-level:request]\x1f Active peer ${index + 1}\nFull original tail ${index + 1}`,
+      }))
+      const peers = yield* Effect.forEach(inputs, (input) => held.send(input.text, { messageID: input.messageID }))
+      const pending = yield* queued(held.chat.id, 13)
+      expect(pending.every((item) => item.delivery === "queue")).toBe(true)
+      const originals = inputs.map((input) => pending.find((item) => item.input.messageID === input.messageID)!)
+      expect(yield* held.llm.calls).toBe(1)
+      expect(
+        (yield* held.sessions.messages({ sessionID: held.chat.id })).filter((message) => message.info.role === "user"),
+      ).toHaveLength(1)
+      yield* held.release
+      yield* awaitWithTimeout(held.llm.wait(3), "active overflow never reached the continuing provider", "10 seconds")
+      const requests = yield* held.llm.inputs
+      if (!requests[1] || !requests[2]) throw new Error("expected both peer provider continuations")
+      inputs
+        .slice(0, 10)
+        .forEach((input) =>
+          expect(lastUserContent(requests[1])).toContain(
+            input.text.replaceAll("\x1f", "\\u001f").replaceAll("\n", "\\n"),
+          ),
+        )
+      expect(lastUserContent(requests[1])).not.toContain("Active peer 11")
+      expect(lastUserContent(requests[2])).toContain("Active peer 11")
+      expect(JSON.stringify(requests[1]?.messages)).toContain("real tool result retained")
+      expect(JSON.stringify(requests[2]?.messages)).toContain("real tool result retained")
+      expect(JSON.stringify(requests[2]?.messages)).not.toContain(automationText)
+      expect(JSON.stringify(requests[2]?.messages)).not.toContain("held human must wait")
+      expect((yield* held.queue.list(held.chat.id)).map((item) => item.input.parts[0])).toEqual([
+        said(automationText)[0],
+        said("held human must wait")[0],
+      ])
+      const messages = yield* held.sessions.messages({ sessionID: held.chat.id })
+      const groups = messages.flatMap((message) =>
+        message.parts.flatMap((part) =>
+          part.type === "text" && !part.ignored && part.metadata?.sessionQueue
+            ? [Schema.decodeUnknownSync(SessionPromptQueue.Group)(part.metadata.sessionQueue)]
+            : [],
+        ),
+      )
+      expect(groups.map((group) => group.constituents.map((item) => item.id))).toEqual([
+        originals.slice(0, 10).map((item) => item.id),
+        [originals[10].id],
+      ])
+      const retry = yield* held.queue.admit({
+        sessionID: held.chat.id,
+        messageID: MessageID.ascending(),
+        delivery: "queue",
+        agent: "build",
+        model: ref,
+        parts: said(inputs[0].text),
+      })
+      expect(retry.id).toBe(originals[0].id)
+      yield* Deferred.succeed(lastGate, undefined)
+      const replies = yield* finish(held.task, ...peers, human, automation)
+      expect(replies.slice(0, 12).map((reply) => answered(reply)?.texts)).toEqual(
+        Array.from({ length: 12 }, () => ["active peers handled"]),
+      )
+      expect(answered(replies[12])?.texts).toEqual(["held human handled"])
+      expect(answered(replies[13])?.texts).toEqual(["automation handled"])
+      expect(answered(yield* held.queue.reply(retry.id))?.texts).toEqual(["active peers handled"])
+      expect(yield* held.llm.calls).toBe(5)
+      expect(yield* held.queue.list(held.chat.id)).toEqual([])
+    }),
+  30000,
+)
+
+it.instance(
+  "ordinary peer arriving during a long tool waits for its completion before model visibility",
+  () =>
+    Effect.gen(function* () {
+      const directory = yield* TestInstance
+      const file = path.join(directory.directory, "long-peer-tool.txt")
+      yield* writeText(file, "completed long tool evidence")
+      const held = yield* startHeld({ tool: { name: "read", args: { filePath: file } } })
+      const registry = yield* ToolRegistry.Service
+      const named = yield* registry.named()
+      const original = named.read.execute
+      const toolEntered = yield* Deferred.make<void>()
+      const toolRelease = yield* Deferred.make<void>()
+      const providerRelease = yield* Deferred.make<void>()
+      const executed: string[] = []
+      const interrupted: boolean[] = []
+      named.read.execute = (args, ctx) =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(toolEntered, undefined)
+          yield* Deferred.await(toolRelease)
+          expect(ctx.abort.aborted).toBe(false)
+          executed.push(args.filePath)
+          return yield* original(args, ctx)
+        }).pipe(
+          Effect.onInterrupt(() =>
+            Effect.sync(() => {
+              interrupted.push(true)
+            }),
+          ),
+        )
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          named.read.execute = original
+        }).pipe(
+          Effect.andThen(Deferred.succeed(toolRelease, undefined)),
+          Effect.andThen(Deferred.succeed(providerRelease, undefined)),
+          Effect.asVoid,
+        ),
+      )
+      yield* held.llm.tool("read", { filePath: file })
+      yield* held.llm.hold("long-tool peers answered", deferredAsPromise(providerRelease))
+      yield* held.llm.text("long-tool human answered")
+      yield* held.llm.text("long-tool automation answered")
+      const firstText =
+        "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791900001-1-abcd\x1f [fm-level:request]\x1f Peer before tool\nOriginal first obligation"
+      const first = yield* held.send(firstText)
+      yield* queued(held.chat.id, 1)
+      yield* held.release
+      yield* awaitWithTimeout(Deferred.await(toolEntered), "real long read tool did not start", "10 seconds")
+      const secondText =
+        "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791900001-2-abcd\x1f [fm-level:info]\x1f Peer during tool\nOriginal second tail"
+      const automationText =
+        "[fm-level:nudge:watcher.wake]\x1f WATCHER FIRED [wake-2] - handle wake.\n\ncheck: /scratch/long.check.sh: historical observation"
+      const second = yield* held.send(secondText)
+      const human = yield* held.send("long-tool held human", { delivery: "queue" })
+      const automation = yield* held.send(automationText)
+      yield* queued(held.chat.id, 3)
+      expect(yield* held.llm.calls).toBe(2)
+      expect(executed).toEqual([])
+      expect(interrupted).toEqual([])
+      const during = yield* held.sessions.messages({ sessionID: held.chat.id })
+      expect(
+        during
+          .flatMap((message) => message.parts)
+          .some((part) => part.type === "tool" && part.state.status === "running"),
+      ).toBe(true)
+      expect(
+        during
+          .flatMap((message) => message.parts)
+          .some((part) => part.type === "text" && part.text.includes(secondText)),
+      ).toBe(false)
+      yield* Deferred.succeed(toolRelease, undefined)
+      yield* awaitWithTimeout(held.llm.wait(3), "long-tool peer never reached the next provider request", "10 seconds")
+      const requests = yield* held.llm.inputs
+      if (!requests[1] || !requests[2]) throw new Error("expected actual tool continuations")
+      expect(lastUserContent(requests[1])).toContain("Peer before tool")
+      expect(lastUserContent(requests[1])).not.toContain("Peer during tool")
+      expect(lastUserContent(requests[2])).toContain("Peer during tool")
+      expect(lastUserContent(requests[2])).toContain("Original second tail")
+      expect(JSON.stringify(requests[2].messages)).toContain("completed long tool evidence")
+      expect(JSON.stringify(requests[2].messages)).not.toContain("long-tool held human")
+      expect(JSON.stringify(requests[2].messages)).not.toContain("historical observation")
+      expect(executed).toEqual([file])
+      expect(interrupted).toEqual([])
+      const after = yield* held.sessions.messages({ sessionID: held.chat.id })
+      expect(
+        after
+          .flatMap((message) => message.parts)
+          .filter((part) => part.type === "tool" && part.state.status === "completed"),
+      ).toHaveLength(2)
+      yield* Deferred.succeed(providerRelease, undefined)
+      const replies = yield* finish(held.task, first, second, human, automation)
+      expect(replies.slice(0, 3).map((reply) => answered(reply)?.texts)).toEqual(
+        Array.from({ length: 3 }, () => ["long-tool peers answered"]),
+      )
+      expect(answered(replies[3])?.texts).toEqual(["long-tool human answered"])
+      expect(answered(replies[4])?.texts).toEqual(["long-tool automation answered"])
+      expect(yield* held.llm.calls).toBe(5)
+    }),
+  30000,
+)
+
+it.instance(
+  "historical native stable-ID admission refuses uncertainty with zero provider execution",
+  () =>
+    Effect.gen(function* () {
+      const config = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      for (const system of [undefined, "excluded original execution controls"]) {
+        const session = yield* sessions.create({ title: "Historical stable original" })
+        const input = {
+          sessionID: session.id,
+          messageID: MessageID.ascending(),
+          agent: "build",
+          model: ref,
+          system,
+          parts: said("historical native request"),
+        }
+        yield* seedUser(input)
+        const before = yield* sessions.messages({ sessionID: session.id })
+        for (const retry of [
+          input,
+          { ...input, delivery: "queue" as const },
+          { ...input, parts: said("changed historical intent") },
+          { ...input, system: "conflicting execution controls" },
+          { ...input, noReply: true },
+        ]) {
+          const exit = yield* prompt.prompt(retry).pipe(Effect.exit)
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (!Exit.isFailure(exit)) throw new Error("historical identity was silently replayed")
+          expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+          expect(yield* queue.list(session.id)).toEqual([])
+          expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+        }
+      }
+      expect(yield* config.llm.calls).toBe(0)
+    }),
+  30000,
+)
+
+unix(
+  "historical command stable-ID refusal occurs before shell expansion and provider execution",
+  () =>
+    Effect.gen(function* () {
+      const directory = yield* TestInstance
+      const marker = path.join(directory.directory, "old-command-executions.txt")
+      yield* writeText(marker, "original execution retained\n")
+      const config = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: {
+          historical: {
+            template: `!\`printf 'second execution\\n' >> '${marker}'; printf 'historical command intent'\``,
+          },
+        },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "Historical command original" })
+      const messageID = MessageID.ascending()
+      yield* seedUser({
+        sessionID: session.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        parts: said("historical command intent"),
+      })
+      const before = yield* sessions.messages({ sessionID: session.id })
+      for (const args of ["", "changed arguments"]) {
+        const exit = yield* prompt
+          .command({
+            sessionID: session.id,
+            messageID,
+            command: "historical",
+            arguments: args,
+            agent: "build",
+            model: "test/test-model",
+          })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (!Exit.isFailure(exit)) throw new Error("historical command was replayed")
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+        expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("original execution retained\n")
+        expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+        expect(yield* queue.list(session.id)).toEqual([])
+      }
+      expect(yield* config.llm.calls).toBe(0)
+    }),
+  30000,
 )

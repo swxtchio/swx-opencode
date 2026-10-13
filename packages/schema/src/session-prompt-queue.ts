@@ -43,7 +43,7 @@ export const Input = Schema.Struct({
   variant: Schema.optional(Schema.String),
   delivery: Schema.optional(Delivery).annotate({
     description:
-      "steer (the default) reaches the next step of an active run; queue waits until the run would otherwise go idle and then runs as its own turn",
+      "steer (the default) reaches the next step of an active run; queue waits until the run would otherwise go idle; validated compatible peer envelopes also reach a safe provider-continuation boundary",
   }),
   parts: Schema.Array(
     Schema.Union([TextPartInput, FilePartInput, AgentPartInput, SubtaskPartInput]).annotate({

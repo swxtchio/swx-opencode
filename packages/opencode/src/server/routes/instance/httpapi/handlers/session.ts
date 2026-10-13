@@ -311,7 +311,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           ...ctx.payload,
           sessionID: ctx.params.sessionID,
         })
-        .pipe(Effect.mapError(promptError))
+        .pipe(Effect.catchDefect(historicalRefusal), Effect.mapError(promptError))
       return HttpServerResponse.stream(Stream.make(JSON.stringify(message)).pipe(Stream.encodeText), {
         contentType: "application/json",
       })
@@ -326,6 +326,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
             message: `The prompt was withdrawn from the queue before delivery: ${error.itemID}`,
           })
         : new HttpApiError.BadRequest({})
+
+    // Ambiguous historical input is a native admission refusal, not an internal server failure.
+    const historicalRefusal = (error: unknown) =>
+      error instanceof SessionQueue.HistoricalIdentityError ? Effect.fail(error) : Effect.die(error)
 
     const promptAsync = Effect.fn("SessionHttpApi.promptAsync")(function* (ctx: {
       params: { sessionID: SessionID }
@@ -361,7 +365,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       yield* requireSession(ctx.params.sessionID)
       return yield* promptSvc
         .command({ ...ctx.payload, sessionID: ctx.params.sessionID })
-        .pipe(Effect.mapError(promptError))
+        .pipe(Effect.catchDefect(historicalRefusal), Effect.mapError(promptError))
     })
 
     const shell = Effect.fn("SessionHttpApi.shell")(function* (ctx: {

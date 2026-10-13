@@ -1115,6 +1115,7 @@ const layer = Layer.effect(
       "SessionPrompt.prompt",
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      yield* queue.assertIdentity(input.sessionID, input.messageID)
       yield* revert.cleanup(session)
       // TUI prepends synthetic editor context; only flattened user text owns marker framing.
       const classificationText = input.parts
@@ -1212,11 +1213,12 @@ const layer = Layer.effect(
         .pipe(Effect.asVoid)
 
     // The queue isolates preparation failures; infrastructure and interruption can still stop a drain.
-    const promoteInLoop = (sessionID: SessionID, delivery: SessionQueue.Delivery) =>
+    const promoteInLoop = (sessionID: SessionID, delivery: SessionQueue.Delivery, peersOnly = false) =>
       queue
         .promote({
           sessionID,
           delivery,
+          peersOnly,
           prepare: prepareUserMessage,
           write: writeUserMessage,
           valid: currentSelection,
@@ -1244,6 +1246,8 @@ const layer = Layer.effect(
         let step = 0
         let settled = false
         let seen = 0
+        // The drain already selected its initial input. Each provider completion opens one new queue boundary.
+        let queuedInputSelected = true
         let initialRootSelected = false
         let pinnedRootOrder: number | undefined
         const retriedAssistantIDs = new Set<MessageID>()
@@ -1323,6 +1327,7 @@ const layer = Layer.effect(
           if (yield* promoteInLoop(sessionID, "steer")) continue
           if (!lastUser) {
             if (yield* promoteInLoop(sessionID, "queue")) {
+              queuedInputSelected = true
               step = 0
               continue
             }
@@ -1371,7 +1376,12 @@ const layer = Layer.effect(
             // Queued prompts wait for this point and run one turn each, so a steer
             // or another admission arriving meanwhile is weighed before the next.
             // Each such turn is new user input and gets a fresh step allowance.
-            if ((yield* promoteInLoop(sessionID, "steer")) || (yield* promoteInLoop(sessionID, "queue"))) {
+            if (yield* promoteInLoop(sessionID, "steer")) {
+              step = 0
+              continue
+            }
+            if (yield* promoteInLoop(sessionID, "queue")) {
+              queuedInputSelected = true
               step = 0
               continue
             }
@@ -1380,6 +1390,17 @@ const layer = Layer.effect(
             break
           }
 
+          // Prior provider/tools have settled. Select one peer batch for the next request, then reload history.
+          // Pending tasks keep their original execution custody; overflow waits for another provider boundary.
+          if (
+            !queuedInputSelected &&
+            !SessionQueue.openTasks(msgs, selection).length &&
+            (yield* promoteInLoop(sessionID, "queue", true))
+          ) {
+            queuedInputSelected = true
+            step = 0
+            continue
+          }
           step++
           if (step === 1)
             yield* title({
@@ -1608,6 +1629,7 @@ const layer = Layer.effect(
                 : Effect.void,
             ),
           )
+          queuedInputSelected = false
           if (outcome === "break") break
           continue
         }
@@ -1740,6 +1762,7 @@ const layer = Layer.effect(
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
+      yield* queue.assertIdentity(input.sessionID, input.messageID)
       yield* Effect.logInfo("command", {
         "session.id": input.sessionID,
         command: input.command,

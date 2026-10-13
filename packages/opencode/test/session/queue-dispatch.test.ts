@@ -851,7 +851,7 @@ it.instance("individual stable transport retry reconciles through normal consume
   }),
 )
 
-it.instance("historical marked noReply retry without witnesses retains existing-message reconciliation", () =>
+it.instance("historical marked noReply retry without custody is refused despite matching projection", () =>
   Effect.gen(function* () {
     const queue = yield* SessionQueue.Service
     const sessions = yield* Session.Service
@@ -868,14 +868,18 @@ it.instance("historical marked noReply retry without witnesses retains existing-
       const prepared = yield* prepare(input)
       yield* writer(sessions)(prepared)
       for (const busy of [false, true]) {
-        const retry = yield* queue.writeOrAdmit({
-          admission: input,
-          isBusy: Effect.succeed(busy),
-          prepare: () => prepare(input),
-          write: (value) => writer(sessions)(value).pipe(Effect.as(value)),
-          discard: () => Effect.void,
-        })
-        expect(retry.kind).toBe("direct")
+        const retry = yield* queue
+          .writeOrAdmit({
+            admission: input,
+            isBusy: Effect.succeed(busy),
+            prepare: () => prepare(input),
+            write: (value) => writer(sessions)(value).pipe(Effect.as(value)),
+            discard: () => Effect.void,
+          })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(retry)).toBe(true)
+        if (!Exit.isFailure(retry)) throw new Error("unwitnessed projection was silently accepted")
+        expect(Cause.squash(retry.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
         expect(yield* queue.list(session.id)).toEqual([])
       }
       expect(yield* MessageV2.stream(session.id)).toHaveLength(1)
@@ -918,11 +922,13 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
       headers: {},
       release_date: "2026-01-01",
     }
-    const scenarios = yield* Effect.forEach(["peer", "automation", "heartbeat", "individual"] as const, (name) =>
-      Effect.gen(function* () {
-        const session = yield* sessions.create({ title: `Synthetic grouped checkpoint: ${name}` })
-        const inputs: SessionQueue.AdmitInput[] =
-          name === "peer"
+    const scenarios = yield* Effect.forEach(
+      ["peer", "automation", "heartbeat", "individual", "peerContinuation"] as const,
+      (name) =>
+        Effect.gen(function* () {
+          const session = yield* sessions.create({ title: `Synthetic grouped checkpoint: ${name}` })
+          const peerScenario = name === "peer" || name === "peerContinuation"
+          const inputs: SessionQueue.AdmitInput[] = peerScenario
             ? [
                 {
                   sessionID: session.id,
@@ -977,141 +983,163 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
                       parts: [{ type: "text", text: "Synthetic individual original with stable transport identity" }],
                     },
                   ]
-        const originals = yield* Effect.forEach(inputs, (input) => queue.admit(input))
-        const retryCalls =
-          name === "peer" ? [{ ...inputs[0], messageID: MessageID.make("msg_checkpoint_peer_retry_alias") }] : []
-        yield* Effect.forEach(retryCalls, (input) => queue.admit(input))
-        const pending = yield* queue.list(session.id)
-        yield* queue.promote({
-          sessionID: session.id,
-          delivery: "queue",
-          prepare,
-          write: writer(sessions),
-          rejected: () => Effect.void,
-        })
-        const latest = (yield* MessageV2.stream(session.id))[0]
-        const returned = yield* MessageV2.get({ sessionID: session.id, messageID: latest.info.id })
-        const group =
-          name === "individual"
-            ? Schema.decodeUnknownSync(SessionPromptQueue.Group)(
-                returned.parts.find(
-                  (part): part is SessionV1.TextPart => part.type === "text" && !!part.metadata?.sessionQueue,
-                )?.metadata?.sessionQueue,
-              )
-            : metadata(returned)
-        expect(group.constituents).toEqual(originals)
-        expect(group.constituents.map((item) => item.time.created)).toEqual(originals.map((item) => item.time.created))
-        const encoded = originals.map((item) => Schema.encodeSync(SessionPromptQueue.QueuedInput)(item.input))
-        expect(group.constituents.map((item) => Schema.encodeSync(SessionPromptQueue.QueuedInput)(item.input))).toEqual(
-          encoded,
-        )
-        const witnesses = returned.parts.flatMap((part) =>
-          part.type === "text" && part.metadata?.sessionQueue
-            ? [
-                {
-                  partID: part.id,
-                  messageID: part.messageID,
-                  ignored: part.ignored === true,
-                  synthetic: part.synthetic === true,
-                  constituentIDs: Schema.decodeUnknownSync(SessionPromptQueue.Group)(
-                    part.metadata.sessionQueue,
-                  ).constituents.map((item) => item.id),
-                },
-              ]
-            : [],
-        )
-        expect([...new Set(witnesses.flatMap((part) => part.constituentIDs))].sort()).toEqual(
-          originals.map((item) => item.id).sort(),
-        )
-        expect(
-          witnesses
-            .filter((part) => part.ignored)
-            .every((part) => part.synthetic && part.messageID === returned.info.id),
-        ).toBe(true)
-        expect(witnesses.filter((part) => !part.ignored)).toHaveLength(name === "individual" ? 0 : 1)
-        expect(witnesses.filter((part) => part.ignored)).toHaveLength(
-          name === "individual" ? 1 : name === "heartbeat" ? 2 : name === "peer" ? 4 : 3,
-        )
-        if (name === "peer") {
-          expect(
-            witnesses.filter((part) => part.ignored && part.constituentIDs.includes(originals[0].id)),
-          ).toHaveLength(3)
-          expect(Object.hasOwn(group.constituents[0].input, "noReply")).toBe(false)
-          expect(Object.hasOwn(group.constituents[0].input, "delivery")).toBe(false)
-          expect(group.constituents[0].delivery).toBe("queue")
-          expect(group.constituents[0].input.messageID).toBe(inputs[0].messageID)
-          expect(group.constituents[0].input.variant).toBe("low")
-        }
-        if (name === "automation") {
-          expect(text(returned)).not.toContain("historical stalled observation")
-          expect(text(returned)).toContain("historical pending decision observation")
-          expect(text(returned)).toContain("historical converged observation")
-          expect(text(returned)).toContain("not current measurements")
-        }
-        const modelInput = yield* Effect.promise(() => MessageV2.toModelMessages([returned], model))
-        if (name === "heartbeat") {
-          expect(JSON.stringify(modelInput)).toContain("Full message: /scratch/duty-one.txt")
-          expect(JSON.stringify(modelInput)).toContain("Full message: /scratch/duty-two.txt")
-        }
-        if (name === "individual") {
-          expect(group.kind).toBe("individual")
-          expect(text(returned)).toBe(inputs[0].parts[0].type === "text" ? inputs[0].parts[0].text : "")
-        }
-        expect(modelInput).toHaveLength(1)
-        expect(modelInput[0].role).toBe("user")
-        expect(modelInput[0].content).toHaveLength(1)
-        expect(JSON.stringify(modelInput)).not.toContain('"sessionQueue":')
-        expect(JSON.stringify(modelInput)).not.toContain("prt_queue_")
-        const marker = "SYNTHETIC_IGNORED_WITNESS_PROBE"
-        const probe = {
-          ...returned,
-          parts: returned.parts.map((part) =>
-            part.type === "text" && part.ignored ? { ...part, text: marker } : part,
-          ),
-        }
-        const excluded = yield* Effect.promise(() => MessageV2.toModelMessages([probe], model))
-        const control = yield* Effect.promise(() =>
-          MessageV2.toModelMessages(
-            [
+          if (name === "peerContinuation")
+            inputs.push(
               {
-                ...probe,
-                parts: probe.parts.map((part) =>
-                  part.type === "text" && part.ignored ? { ...part, ignored: false } : part,
-                ),
+                sessionID: session.id,
+                delivery: "queue",
+                parts: [{ type: "text", text: check("deferred", "historical pending observation") }],
               },
-            ],
-            model,
-          ),
-        )
-        expect(JSON.stringify(excluded)).not.toContain(marker)
-        expect(JSON.stringify(control)).toContain(marker)
-        yield* queue.consume(session.id)
-        const afterConsume = yield* MessageV2.get({ sessionID: session.id, messageID: returned.info.id })
-        expect(afterConsume).toEqual(returned)
-        expect(yield* queue.list(session.id)).toEqual([])
-        const afterConsumeRetryCalls =
-          name === "peer" ? [{ ...inputs[0], messageID: MessageID.make("msg_checkpoint_peer_late_alias") }] : []
-        yield* Effect.forEach(afterConsumeRetryCalls, (input) => queue.admit(input))
-        const afterRetry = yield* MessageV2.get({ sessionID: session.id, messageID: returned.info.id })
-        const modelAfterRetry = yield* Effect.promise(() => MessageV2.toModelMessages([afterRetry], model))
-        expect(modelAfterRetry).toEqual(modelInput)
-        return {
-          name,
-          originalCalls: inputs,
-          retryCalls,
-          afterConsumeRetryCalls,
-          returnedAfterRetry: afterRetry,
-          modelAfterRetry,
-          originals,
-          encodedOriginalInputs: encoded,
-          pendingBeforePromotion: pending,
-          returnedMessage: returned,
-          returnedAfterConsume: afterConsume,
-          witnesses,
-          modelInput,
-          modelExclusionProbe: { marker, excluded, unignoredControl: control },
-        }
-      }),
+              {
+                sessionID: session.id,
+                delivery: "queue",
+                parts: [{ type: "text", text: "Held human original remains pending" }],
+              },
+            )
+          const originals = yield* Effect.forEach(inputs, (input) => queue.admit(input))
+          const selected = name === "peerContinuation" ? originals.slice(0, 2) : originals
+          const retryCalls = peerScenario
+            ? [{ ...inputs[0], messageID: MessageID.make("msg_checkpoint_peer_retry_alias") }]
+            : []
+          yield* Effect.forEach(retryCalls, (input) => queue.admit(input))
+          const pending = yield* queue.list(session.id)
+          yield* queue.promote({
+            sessionID: session.id,
+            delivery: "queue",
+            peersOnly: name === "peerContinuation",
+            prepare,
+            write: writer(sessions),
+            rejected: () => Effect.void,
+          })
+          const latest = (yield* MessageV2.stream(session.id))[0]
+          const returned = yield* MessageV2.get({ sessionID: session.id, messageID: latest.info.id })
+          const group =
+            name === "individual"
+              ? Schema.decodeUnknownSync(SessionPromptQueue.Group)(
+                  returned.parts.find(
+                    (part): part is SessionV1.TextPart => part.type === "text" && !!part.metadata?.sessionQueue,
+                  )?.metadata?.sessionQueue,
+                )
+              : metadata(returned)
+          const afterPromotion = yield* queue.list(session.id)
+          expect(afterPromotion).toEqual(name === "peerContinuation" ? originals.slice(2) : [])
+          expect(group.constituents).toEqual(selected)
+          expect(group.constituents.map((item) => item.time.created)).toEqual(selected.map((item) => item.time.created))
+          const encoded = originals.map((item) => Schema.encodeSync(SessionPromptQueue.QueuedInput)(item.input))
+          expect(
+            group.constituents.map((item) => Schema.encodeSync(SessionPromptQueue.QueuedInput)(item.input)),
+          ).toEqual(selected.map((item) => Schema.encodeSync(SessionPromptQueue.QueuedInput)(item.input)))
+          const witnesses = returned.parts.flatMap((part) =>
+            part.type === "text" && part.metadata?.sessionQueue
+              ? [
+                  {
+                    partID: part.id,
+                    messageID: part.messageID,
+                    ignored: part.ignored === true,
+                    synthetic: part.synthetic === true,
+                    constituentIDs: Schema.decodeUnknownSync(SessionPromptQueue.Group)(
+                      part.metadata.sessionQueue,
+                    ).constituents.map((item) => item.id),
+                  },
+                ]
+              : [],
+          )
+          expect([...new Set(witnesses.flatMap((part) => part.constituentIDs))].sort()).toEqual(
+            selected.map((item) => item.id).sort(),
+          )
+          expect(
+            witnesses
+              .filter((part) => part.ignored)
+              .every((part) => part.synthetic && part.messageID === returned.info.id),
+          ).toBe(true)
+          expect(witnesses.filter((part) => !part.ignored)).toHaveLength(name === "individual" ? 0 : 1)
+          expect(witnesses.filter((part) => part.ignored)).toHaveLength(
+            name === "individual" ? 1 : name === "heartbeat" ? 2 : peerScenario ? 4 : 3,
+          )
+          if (peerScenario) {
+            expect(
+              witnesses.filter((part) => part.ignored && part.constituentIDs.includes(originals[0].id)),
+            ).toHaveLength(3)
+            expect(Object.hasOwn(group.constituents[0].input, "noReply")).toBe(false)
+            expect(Object.hasOwn(group.constituents[0].input, "delivery")).toBe(false)
+            expect(group.constituents[0].delivery).toBe("queue")
+            expect(group.constituents[0].input.messageID).toBe(inputs[0].messageID)
+            expect(group.constituents[0].input.variant).toBe("low")
+          }
+          if (name === "automation") {
+            expect(text(returned)).not.toContain("historical stalled observation")
+            expect(text(returned)).toContain("historical pending decision observation")
+            expect(text(returned)).toContain("historical converged observation")
+            expect(text(returned)).toContain("not current measurements")
+          }
+          const modelInput = yield* Effect.promise(() => MessageV2.toModelMessages([returned], model))
+          if (name === "heartbeat") {
+            expect(JSON.stringify(modelInput)).toContain("Full message: /scratch/duty-one.txt")
+            expect(JSON.stringify(modelInput)).toContain("Full message: /scratch/duty-two.txt")
+          }
+          if (name === "individual") {
+            expect(group.kind).toBe("individual")
+            expect(text(returned)).toBe(inputs[0].parts[0].type === "text" ? inputs[0].parts[0].text : "")
+          }
+          expect(modelInput).toHaveLength(1)
+          expect(modelInput[0].role).toBe("user")
+          expect(modelInput[0].content).toHaveLength(1)
+          expect(JSON.stringify(modelInput)).not.toContain('"sessionQueue":')
+          expect(JSON.stringify(modelInput)).not.toContain("prt_queue_")
+          const marker = "SYNTHETIC_IGNORED_WITNESS_PROBE"
+          const probe = {
+            ...returned,
+            parts: returned.parts.map((part) =>
+              part.type === "text" && part.ignored ? { ...part, text: marker } : part,
+            ),
+          }
+          const excluded = yield* Effect.promise(() => MessageV2.toModelMessages([probe], model))
+          const control = yield* Effect.promise(() =>
+            MessageV2.toModelMessages(
+              [
+                {
+                  ...probe,
+                  parts: probe.parts.map((part) =>
+                    part.type === "text" && part.ignored ? { ...part, ignored: false } : part,
+                  ),
+                },
+              ],
+              model,
+            ),
+          )
+          expect(JSON.stringify(excluded)).not.toContain(marker)
+          expect(JSON.stringify(control)).toContain(marker)
+          yield* queue.consume(session.id)
+          const afterConsume = yield* MessageV2.get({ sessionID: session.id, messageID: returned.info.id })
+          expect(afterConsume).toEqual(returned)
+          expect(yield* queue.list(session.id)).toEqual(afterPromotion)
+          const afterConsumeRetryCalls = peerScenario
+            ? [{ ...inputs[0], messageID: MessageID.make("msg_checkpoint_peer_late_alias") }]
+            : []
+          yield* Effect.forEach(afterConsumeRetryCalls, (input) => queue.admit(input))
+          const afterRetry = yield* MessageV2.get({ sessionID: session.id, messageID: returned.info.id })
+          const modelAfterRetry = yield* Effect.promise(() => MessageV2.toModelMessages([afterRetry], model))
+          expect(modelAfterRetry).toEqual(modelInput)
+          return {
+            name,
+            originalCalls: inputs,
+            retryCalls,
+            afterConsumeRetryCalls,
+            returnedAfterRetry: afterRetry,
+            modelAfterRetry,
+            originals,
+            encodedOriginalInputs: encoded,
+            pendingBeforePromotion: pending,
+            promotion: { delivery: "queue", peersOnly: name === "peerContinuation" },
+            deliveredOriginalIDs: selected.map((item) => item.id),
+            pendingAfterPromotion: afterPromotion,
+            returnedMessage: returned,
+            returnedAfterConsume: afterConsume,
+            witnesses,
+            modelInput,
+            modelExclusionProbe: { marker, excluded, unignoredControl: control },
+          }
+        }),
     )
     const fixture = {
       provenance: {
@@ -1505,5 +1533,163 @@ it.instance("already projected retained original transfers identity before ordin
     expect((yield* queue.admit(input)).id).toBe(original.id)
     expect(yield* MessageV2.stream(session.id)).toHaveLength(1)
     expect(yield* queue.list(session.id)).toEqual([])
+  }),
+)
+
+it.instance("historical projected stable IDs without originals are refused without inventing custody", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    for (const system of [undefined, "native excluded execution controls"]) {
+      const session = yield* sessions.create({})
+      const input = {
+        sessionID: session.id,
+        messageID: MessageID.ascending(),
+        system,
+        delivery: "queue" as const,
+        parts: [{ type: "text" as const, text: "pre-upgrade original native intent" }],
+      }
+      const projected = yield* prepare(input)
+      yield* writer(sessions)(projected)
+      const before = yield* MessageV2.stream(session.id)
+      for (const retry of [input, { ...input, parts: [{ type: "text" as const, text: "conflicting intent" }] }]) {
+        const exit = yield* queue.admit(retry).pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(yield* queue.list(session.id)).toEqual([])
+        expect(yield* MessageV2.stream(session.id)).toEqual(before)
+      }
+      const other = yield* sessions.create({})
+      expect(Exit.isFailure(yield* queue.admit({ ...input, sessionID: other.id }).pipe(Effect.exit))).toBe(true)
+      expect(yield* queue.list(other.id)).toEqual([])
+    }
+  }),
+)
+
+it.instance("peer-only continuation promotion preserves pending compaction custody and deferred inputs", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const human = yield* queue.admit({
+      sessionID: session.id,
+      delivery: "queue",
+      parts: [{ type: "text", text: "explicit human hold" }],
+    })
+    const automation = yield* queue.admit({
+      sessionID: session.id,
+      delivery: "queue",
+      parts: [{ type: "text", text: check("held", "historical observation") }],
+    })
+    const original = yield* queue.admit({
+      sessionID: session.id,
+      delivery: "queue",
+      parts: [{ type: "text", text: peer(997) }],
+    })
+    const root = yield* prepare({
+      sessionID: session.id,
+      messageID: MessageID.ascending(),
+      parts: [{ type: "text", text: "original compaction input" }],
+    })
+    yield* writer(sessions)(root)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      sessionID: session.id,
+      messageID: root.info.id,
+      type: "compaction",
+      auto: false,
+    })
+    const promote = () =>
+      queue.promote({
+        sessionID: session.id,
+        delivery: "queue",
+        peersOnly: true,
+        prepare,
+        write: writer(sessions),
+        rejected: () => Effect.void,
+      })
+    expect(yield* promote()).toBe(false)
+    expect(yield* queue.list(session.id)).toEqual([human, automation, original])
+    // A terminal summary clears pending compaction eligibility through the existing history owner.
+    yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      sessionID: session.id,
+      role: "assistant",
+      parentID: root.info.id,
+      agent: "build",
+      mode: "build",
+      modelID: ModelV2.ID.make("test"),
+      providerID: ProviderV2.ID.make("test"),
+      path: { cwd: "/scratch", root: "/scratch" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      time: { created: Date.now(), completed: Date.now() },
+      finish: "stop",
+      summary: true,
+    })
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
+    const running = yield* queue
+      .whileCompacting(session.id, Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))))
+      .pipe(Effect.forkChild)
+    yield* Deferred.await(entered)
+    expect(yield* promote()).toBe(false)
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(running)
+    expect(yield* promote()).toBe(true)
+    expect(metadata((yield* MessageV2.stream(session.id))[0]).constituents).toEqual([original])
+    expect(yield* queue.list(session.id)).toEqual([human, automation])
+  }),
+)
+
+it.instance("identity preflight keeps represented custody read-only and rejects contradictory owners", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    const session = yield* sessions.create({})
+    const input = {
+      sessionID: session.id,
+      messageID: MessageID.ascending(),
+      delivery: "queue" as const,
+      parts: [{ type: "text" as const, text: "represented native input" }],
+    }
+    const original = yield* queue.admit(input)
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "queue",
+      prepare,
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+    const before = yield* MessageV2.stream(session.id)
+    const retained = yield* database.db
+      .select()
+      .from(SessionPromptQueueTable)
+      .where(eq(SessionPromptQueueTable.id, original.id))
+      .get()
+    if (!retained) throw new Error("expected retained original")
+    yield* queue.assertIdentity(session.id, input.messageID)
+    expect(yield* MessageV2.stream(session.id)).toEqual(before)
+    yield* queue.consume(session.id)
+    yield* queue.assertIdentity(session.id, input.messageID)
+    expect(yield* MessageV2.stream(session.id)).toEqual(before)
+    expect(yield* queue.list(session.id)).toEqual([])
+    // A second durable claim must not reach command expansion, even if one ignored witness remains valid.
+    const contradictory = SessionQueue.ItemID.create()
+    yield* database.db
+      .insert(SessionPromptQueueTable)
+      .values({ ...retained, id: contradictory, seq: retained.seq + 1, time_promoted: null, message_id: null })
+      .run()
+    yield* database.db
+      .insert(SessionPromptQueueAliasTable)
+      .values({ id: before[0].parts.find((part) => part.type === "text" && part.ignored)!.id, item_id: contradictory })
+      .run()
+    const exit = yield* queue.assertIdentity(session.id, input.messageID).pipe(Effect.exit)
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) throw new Error("contradictory identity was accepted")
+    expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+    expect((yield* queue.list(session.id))[0].id).toBe(contradictory)
+    expect(yield* MessageV2.stream(session.id)).toEqual(before)
   }),
 )
