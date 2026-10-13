@@ -113,3 +113,14 @@
 - An exact retry of a still-preparing original waits on `awaitPrepared` without the lock, then strictly reconciles
   under its classified delivery, or is sent anew if the original was dropped.
 - Cross-process ownership of preparing rows stays process-local: swxtchio/swx-opencode#254.
+
+## Round 5 (review round 5 adjudication)
+
+- Admission order is the ascending `ItemID`, never `seq`: `replace` gives a survivor the earliest retired slot, so a
+  newer carrier could look earlier than a late preparation. A row merges only with rows admitted before it and after
+  the newest live-preparing row before it (`barrier`); when a preparation ends (`prepared` or `unprepared`), `readmit`
+  re-runs admission in id order for the rows up to the next live preparation. No carrier holds work newer than a late
+  row, so supersession, identical copies and command steps keep send order.
+- The retry fixtures prove re-admission positively: a second hold on the re-admitted prompt's Session read observes
+  a new item (and, by request, a new pending receipt). A span-entry signal (`spanHold().observe`) on
+  `SessionQueue.awaitPrepared` replaces the two-second wait.

@@ -168,8 +168,9 @@ Newest first. Each entry names the upstream range brought in.
   prompt as its first step, before its config read, as a `time_preparing` row (migration `20261013194721`) that is
   listed and withdrawable but never promoted or merged until its classification, revert cleanup and model selection
   are done, outside the queue lock. Identity reconciliation from #244 runs with that admission, and a retry it matches
-  waits for a still-preparing original, then is held to its configured classification before it follows it. A row
-  that finishes preparing merges only with earlier rows, and later ready rows are readmitted after it. A failed
+  waits for a still-preparing original, then is held to its configured classification before it follows it. Admission
+  order is the ascending item id, not the delivery slot a survivor inherits: no row merges past a still-preparing
+  one, and when a preparation ends the rows after it are readmitted in that order. A failed
   preparation drops the row and its receipt, and a preparing row a stopped process left is swept, except a row
   withdrawn meanwhile, which keeps its `withdrawn` receipt. The TUI's pending row lists the most recently sent pending prompts, each marked `QUEUED`,
   and shows a prompt still being sent under its `requestID` until any list of the queue carries that request. UP on
