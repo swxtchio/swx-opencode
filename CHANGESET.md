@@ -164,7 +164,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Features
 
-- **#249** A sent prompt is never invisible (swxtchio/swx-opencode#249). `SessionPrompt.prompt` admits a queued
+- **#255** A sent prompt is never invisible (swxtchio/swx-opencode#249). `SessionPrompt.prompt` admits a queued
   prompt as its first step, before its config read, as a `time_preparing` row (migration `20261013194721`) that is
   listed and withdrawable but never promoted or merged until its classification, revert cleanup and model selection
   are done, outside the queue lock. Identity reconciliation from #244 runs with that admission, and a retry it matches
