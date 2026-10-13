@@ -62,8 +62,10 @@ async function startSession() {
   const events = createEventSource()
   const requests: string[] = []
   const selections: unknown[] = []
+  const prompts: { requestID?: string; parts: { type: string; text?: string }[] }[] = []
   const calls = createFetch((url) => {
     if (url.pathname === "/config/providers") return json({ providers: [provider], default: { test: "model" } })
+    if (url.pathname === "/agent") return json([{ name: "build", mode: "primary", permission: [], options: {} }])
     if (url.pathname === `/session/${sessionID}`)
       return json({
         id: sessionID,
@@ -85,6 +87,8 @@ async function startSession() {
     const path = new URL(request.url).pathname
     if (path.startsWith(`/session/${sessionID}/queue/`)) requests.push(path.split("/").pop()!)
     if (path === `/session/${sessionID}` && request.method === "PATCH") selections.push(await request.clone().json())
+    if (path === `/session/${sessionID}/message` && request.method === "POST")
+      prompts.push(await request.clone().json())
     return calls.fetch(request)
   }) as typeof globalThis.fetch
   let api: TuiPluginApi | undefined
@@ -118,6 +122,7 @@ async function startSession() {
     renderer: setup,
     requests,
     selections,
+    prompts,
     dispatch: (command: string) => api?.keymap.dispatchCommand(command),
     async stop() {
       try {
@@ -187,6 +192,29 @@ test("an effort the user picks becomes the open session's selection, which its p
     ])
     expect(["low", "high", "default"]).toContain(picked[0]!.model.variant)
     expect(picked[1]!.model.variant).not.toBe(picked[0]!.model.variant)
+  } finally {
+    await app.stop()
+  }
+})
+
+test("each prompt the user sends names its own request", async () => {
+  const app = await startSession()
+  try {
+    await until(async () => {
+      await app.renderer.renderOnce()
+      return app.renderer.captureCharFrame().includes("2 pending")
+    }, "the session")
+    for (const [index, text] of ["check the build", "check the build"].entries()) {
+      await app.renderer.mockInput.typeText(text)
+      app.renderer.mockInput.pressEnter()
+      await until(() => app.prompts.length === index + 1, `prompt ${index + 1}`)
+    }
+    expect(app.prompts.map((prompt) => prompt.parts.at(-1)?.text)).toEqual(["check the build", "check the build"])
+    const [first, second] = app.prompts.map((prompt) => prompt.requestID)
+    expect(first).toMatch(/^[A-Za-z0-9._:-]{1,128}$/)
+    expect(second).toMatch(/^[A-Za-z0-9._:-]{1,128}$/)
+    // The same words sent twice are two requests, not a retry of one.
+    expect(second).not.toBe(first)
   } finally {
     await app.stop()
   }

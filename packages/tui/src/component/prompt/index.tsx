@@ -1124,6 +1124,8 @@ export function Prompt(props: PromptProps) {
         .prompt(
           {
             sessionID,
+            // Names this send, so the server can say what became of it (#212).
+            requestID: crypto.randomUUID(),
             ...selectedModel,
             agent: agent.name,
             model: selectedModel,
