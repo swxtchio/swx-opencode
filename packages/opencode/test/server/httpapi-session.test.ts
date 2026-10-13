@@ -4141,9 +4141,13 @@ describe("session HttpApi submission-time admission", () => {
         const original = yield* post(SessionPaths.prompt, body).pipe(Effect.forkChild)
         const retry = yield* Effect.gen(function* () {
           yield* awaitWithTimeout(hold.reached, "the original never read its config", "30 seconds")
+          const waiting = yield* racingSpans.observe({
+            name: "SessionQueue.awaitPrepared",
+            parent: "SessionPrompt.prompt",
+          })
           const retry = yield* post(SessionPaths.prompt, body).pipe(Effect.forkChild)
-          // A refusal would answer at once; the retry waits on the original instead.
-          yield* Effect.sleep("2 seconds")
+          // The retry waits on the original instead of refusing its provisional delivery.
+          yield* awaitWithTimeout(waiting, "the retry never waited on its original", "30 seconds")
           expect(retry.pollUnsafe()).toBeUndefined()
           return retry
         }).pipe(Effect.ensuring(hold.disarm))
@@ -4187,7 +4191,11 @@ describe("session HttpApi submission-time admission", () => {
         const test = yield* TestInstance
         const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
         // Matched by its transport identity, or by its request's receipt.
-        for (const identity of [{ messageID: MessageID.ascending() }, { requestID: "failed-original" }]) {
+        const identities: { messageID?: MessageID; requestID?: string }[] = [
+          { messageID: MessageID.ascending() },
+          { requestID: "failed-original" },
+        ]
+        for (const identity of identities) {
           const created = yield* createSession({ title: "retry after failed preparation" })
           const params = { sessionID: created.id }
           const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
@@ -4200,19 +4208,44 @@ describe("session HttpApi submission-time admission", () => {
           }
           const send = () =>
             request(pathFor(SessionPaths.prompt, params), { method: "POST", headers, body: JSON.stringify(body) })
-          const hold = yield* racingSpans.arm({ name: "Session.get", parent: "SessionPrompt.prompt" })
+          const first = yield* racingSpans.arm({ name: "Session.get", parent: "SessionPrompt.prompt" })
           const original = yield* send().pipe(Effect.forkChild)
           const retry = yield* Effect.gen(function* () {
-            yield* awaitWithTimeout(hold.reached, "the original never read its Session", "30 seconds")
+            yield* awaitWithTimeout(first.reached, "the original never read its Session", "30 seconds")
+            const admitted = yield* listed()
+            expect(admitted).toHaveLength(1)
+            const waiting = yield* racingSpans.observe({
+              name: "SessionQueue.awaitPrepared",
+              parent: "SessionPrompt.prompt",
+            })
             const retry = yield* send().pipe(Effect.forkChild)
-            yield* Effect.sleep("2 seconds")
-            expect(retry.pollUnsafe()).toBeUndefined()
+            yield* awaitWithTimeout(waiting, "the retry never waited on its original", "30 seconds")
+            // Held where it is admitted again, once the original has failed.
+            const again = yield* racingSpans.arm({ name: "Session.get", parent: "SessionPrompt.prompt" })
+            yield* first.disarm
+            yield* Effect.gen(function* () {
+              expect(
+                (yield* awaitWithTimeout(Fiber.join(original), "the original never answered", "30 seconds")).status,
+              ).toBe(500)
+              yield* awaitWithTimeout(again.reached, "the retry was not admitted again", "30 seconds")
+              const readmitted = yield* listed()
+              expect(readmitted).toHaveLength(1)
+              expect(readmitted[0].id).not.toBe(admitted[0].id)
+              expect(readmitted[0].input.parts).toEqual(admitted[0].input.parts)
+              // A new receipt names the new item.
+              if (identity.requestID)
+                expect(
+                  yield* requestJson<SessionQueue.Receipt>(
+                    pathFor(SessionQueuePaths.receipt, { ...params, requestID: identity.requestID }),
+                    { headers },
+                  ),
+                ).toEqual({ state: "pending", itemID: readmitted[0].id })
+            }).pipe(Effect.ensuring(again.disarm))
             return retry
-          }).pipe(Effect.ensuring(hold.disarm))
-          for (const fiber of [original, retry])
-            expect((yield* awaitWithTimeout(Fiber.join(fiber), "a caller never answered", "30 seconds")).status).toBe(
-              500,
-            )
+          }).pipe(Effect.ensuring(first.disarm))
+          expect((yield* awaitWithTimeout(Fiber.join(retry), "the retry never answered", "30 seconds")).status).toBe(
+            500,
+          )
           expect(yield* listed()).toEqual([])
         }
       }),

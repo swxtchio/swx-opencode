@@ -1199,8 +1199,11 @@ const layer = Layer.effect(
         return yield* drain(input.sessionID, reconciled.own.id)
       }
       const own = early?.own
+      // The configured markers, once read, also order what a failed preparation leaves.
+      const known: { markers?: Parameters<SessionQueue.Interface["unprepared"]>[2] } = {}
       const prepared = yield* Effect.gen(function* () {
         const markers = (yield* config.get()).machine_message_markers
+        known.markers = markers
         const classification = MachineMessage.classify(classificationText, markers)
         const delivery = deliveryOf(classification)
         // A request the session already has is followed, never admitted or applied again (#212).
@@ -1235,7 +1238,7 @@ const layer = Layer.effect(
         return { markers, classification, delivery, retry: undefined, reconciled: undefined }
       }).pipe(
         Effect.onExit((exit) =>
-          own && Exit.isFailure(exit) ? queue.unprepared(input.sessionID, own.id) : Effect.void,
+          own && Exit.isFailure(exit) ? queue.unprepared(input.sessionID, own.id, known.markers) : Effect.void,
         ),
       )
       if (prepared.retry) return yield* followRequest(input, prepared.retry)

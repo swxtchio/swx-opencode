@@ -746,6 +746,98 @@ it.instance(
 )
 
 it.instance(
+  "a late preparation keeps admission order when a later prompt took an earlier delivery slot",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      // Ready A, then B whose sender is still preparing it, then ready C, all
+      // queued under requests; then B is prepared.
+      const late = (title: string, values: readonly [string, string, string], fails = false) =>
+        Effect.gen(function* () {
+          const session = yield* sessions.create({ title })
+          yield* request(session.id, "queue", "a", values[0])
+          const b = yield* queue.request(
+            {
+              sessionID: session.id,
+              delivery: "queue",
+              requestID: SessionQueue.RequestID.make("b"),
+              parts: [{ type: "text", text: values[1] }],
+            },
+            undefined,
+            true,
+          )
+          if (b.kind !== "admitted") throw new Error("B was not admitted")
+          yield* request(session.id, "queue", "c", values[2])
+          yield* fails
+            ? queue.unprepared(session.id, b.own.id)
+            : queue.prepared({ sessionID: session.id, itemID: b.own.id, delivery: "queue" })
+          const receipt = (requestID: string) =>
+            queue.receipt(session.id, SessionQueue.RequestID.make(requestID)).pipe(Effect.map(Option.getOrUndefined))
+          return {
+            session,
+            b: b.own,
+            items: yield* queue.list(session.id),
+            receipts: [yield* receipt("a"), yield* receipt("b"), yield* receipt("c")],
+          }
+        })
+      const status = (text: string) => `[fm-from-firstmate]\x1f[fm-level:nudge:status]\x1f ${text}`
+
+      // The newest notice survives, and each one is superseded by the next.
+      const notices = yield* late("late supersede", [
+        status("status: building"),
+        status("status: compiling"),
+        status("status: tests running"),
+      ])
+      expect(notices.items.map(text)).toEqual([status("status: tests running")])
+      expect(notices.receipts.map((receipt) => receipt && receipt.state)).toEqual([
+        "superseded",
+        "superseded",
+        "pending",
+      ])
+      expect(notices.receipts.slice(0, 2)).toEqual([
+        { state: "superseded", by: "b" },
+        { state: "superseded", by: "c" },
+      ])
+      // B's own caller follows what took it in.
+      expect(Option.isSome(yield* queue.withdraw(notices.session.id, notices.items[0].id))).toBe(true)
+      expect(yield* queue.withdrawn(notices.session.id, notices.b.id)).toBe(true)
+
+      // Had B's preparation failed, C still supersedes A once B is gone.
+      const dropped = yield* late(
+        "late supersede, failed",
+        [status("status: building"), status("status: compiling"), status("status: tests running")],
+        true,
+      )
+      expect(dropped.items.map(text)).toEqual([status("status: tests running")])
+      expect(dropped.receipts).toEqual([
+        { state: "superseded", by: "c" },
+        undefined,
+        { state: "pending", itemID: dropped.items[0].id },
+      ])
+
+      // The newest identical copy takes the earlier ones in.
+      const copies = yield* late("late copies", ["check the build", "check the build", "check the build"])
+      expect(copies.items.map((item) => [text(item), item.requestID])).toEqual([["check the build", "c"]])
+      expect(copies.receipts.slice(1)).toEqual([
+        { state: "merged", into: "c" },
+        { state: "pending", itemID: copies.items[0].id },
+      ])
+
+      // A command's steps stay in the order they were sent.
+      const steps = yield* late("late steps", [
+        "fix auth.ts: handle a null token",
+        "fix auth.ts: add a regression test",
+        "fix auth.ts: update the docs",
+      ])
+      expect(steps.items.map(text)).toEqual([
+        "fix auth.ts:\n1. handle a null token\n2. add a regression test\n3. update the docs",
+      ])
+    }),
+  30_000,
+)
+
+it.instance(
   "a prompt withdrawn while its sender prepares it stays withdrawn whether the preparation succeeds or fails",
   () =>
     Effect.gen(function* () {

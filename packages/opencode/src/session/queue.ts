@@ -194,7 +194,11 @@ export interface Interface {
    * Takes back a `preparing` admission whose sender failed to prepare it: the
    * item and its request go as if never sent, so an exact retry is admitted again.
    */
-  readonly unprepared: (sessionID: SessionID, itemID: ItemID) => Effect.Effect<void>
+  readonly unprepared: (
+    sessionID: SessionID,
+    itemID: ItemID,
+    markers?: ConfigV1.Info["machine_message_markers"],
+  ) => Effect.Effect<void>
   /** Waits, without the session's lock, until a `preparing` item's sender has prepared it or taken it back. */
   readonly awaitPrepared: (itemID: ItemID) => Effect.Effect<void>
   /** What became of a request; None when the session has no such request. */
@@ -367,10 +371,14 @@ const layer = Layer.effect(
     // with them, each with the signal that it has. A preparing row missing here
     // was left by a stopped process.
     const preparing = new Map<ItemID, Deferred.Deferred<void>>()
-    const settlePreparing = (itemID: ItemID) => {
+    // Ends an item's preparation here, so it bounds no admission from now on;
+    // its waiters are told once the change it makes is committed.
+    const endPreparing = (itemID: ItemID) => {
       const done = preparing.get(itemID)
       preparing.delete(itemID)
-      if (done) Deferred.doneUnsafe(done, Effect.void)
+      return Effect.sync(() => {
+        if (done) Deferred.doneUnsafe(done, Effect.void)
+      })
     }
     // Waiting callers' answer channels, by item: the message the item became,
     // then the final reply of the turn that message joined.
@@ -1179,14 +1187,90 @@ const layer = Layer.effect(
     // takes in identical copies and repeated peer requests and retires the
     // notices it supersedes, taking the place of the oldest of them, and then
     // joins a command it continues as that command's next step.
+    // The newest row of the session admitted before `before` whose sender is
+    // still preparing it here: no admission after it may reach past it.
+    const barrier = (tx: DatabaseTransaction, sessionID: SessionID, before: ItemID) =>
+      preparing.size === 0
+        ? Effect.succeed(undefined)
+        : tx
+            .select({ id: SessionPromptQueueTable.id })
+            .from(SessionPromptQueueTable)
+            .where(
+              and(
+                eq(SessionPromptQueueTable.session_id, sessionID),
+                isNotNull(SessionPromptQueueTable.time_preparing),
+                lt(SessionPromptQueueTable.id, before),
+                inArray(SessionPromptQueueTable.id, [...preparing.keys()]),
+              ),
+            )
+            .orderBy(desc(SessionPromptQueueTable.id))
+            .limit(1)
+            .get()
+            .pipe(
+              Effect.orDie,
+              Effect.map((row) => row?.id),
+            )
+
+    // Once a preparation ends, each ready row admitted after it, up to the next
+    // preparation, takes its admission again in admission order: it was bounded
+    // by that preparation and can now reach past it.
+    const readmit = Effect.fnUntraced(function* (
+      tx: DatabaseTransaction,
+      sessionID: SessionID,
+      after: ItemID,
+      markers?: ConfigV1.Info["machine_message_markers"],
+    ) {
+      const next =
+        preparing.size === 0
+          ? undefined
+          : yield* tx
+              .select({ id: SessionPromptQueueTable.id })
+              .from(SessionPromptQueueTable)
+              .where(
+                and(
+                  eq(SessionPromptQueueTable.session_id, sessionID),
+                  isNotNull(SessionPromptQueueTable.time_preparing),
+                  gt(SessionPromptQueueTable.id, after),
+                  inArray(SessionPromptQueueTable.id, [...preparing.keys()]),
+                ),
+              )
+              .orderBy(asc(SessionPromptQueueTable.id))
+              .limit(1)
+              .get()
+              .pipe(Effect.orDie)
+      const later = yield* tx
+        .select({ id: SessionPromptQueueTable.id })
+        .from(SessionPromptQueueTable)
+        .where(
+          and(
+            promotable(sessionID),
+            gt(SessionPromptQueueTable.id, after),
+            next ? lt(SessionPromptQueueTable.id, next.id) : undefined,
+          ),
+        )
+        .orderBy(asc(SessionPromptQueueTable.id))
+        .all()
+        .pipe(Effect.orDie)
+      const readmitted = yield* Effect.forEach(later, (row) =>
+        Effect.gen(function* () {
+          const current = yield* rowOf(tx, row.id)
+          if (!current || current.time_withdrawn !== null || current.time_promoted !== null) return []
+          return [{ id: current.id, ...(yield* replace(tx, sessionID, current, markers)) }]
+        }),
+      )
+      return readmitted.flat()
+    })
+
     const replace = Effect.fnUntraced(function* (
       tx: DatabaseTransaction,
       sessionID: SessionID,
       added: typeof SessionPromptQueueTable.$inferSelect,
       markers?: ConfigV1.Info["machine_message_markers"],
-      // Only rows admitted before it, for a row admitted earlier than others (#249).
-      earlierOnly = false,
     ) {
+      // Admission order is the ascending item id: seq is a delivery slot a
+      // survivor inherits. A row takes in only rows admitted before it, and none
+      // from before a still-preparing row admitted before it (#249).
+      const bound = yield* barrier(tx, sessionID, added.id)
       const pendingOf = () =>
         tx
           .select()
@@ -1195,7 +1279,8 @@ const layer = Layer.effect(
             and(
               promotable(sessionID),
               eq(SessionPromptQueueTable.delivery, added.delivery),
-              earlierOnly ? lt(SessionPromptQueueTable.seq, added.seq) : undefined,
+              lt(SessionPromptQueueTable.id, added.id),
+              bound ? gt(SessionPromptQueueTable.id, bound) : undefined,
             ),
           )
           .orderBy(asc(SessionPromptQueueTable.seq))
@@ -1366,6 +1451,7 @@ const layer = Layer.effect(
       exclusive(
         input.sessionID,
         Effect.gen(function* () {
+          const ended = endPreparing(input.itemID)
           const admitted = yield* writable(input.sessionID, (tx) =>
             Effect.gen(function* () {
               const row = yield* tx
@@ -1383,35 +1469,14 @@ const layer = Layer.effect(
                 .pipe(Effect.orDie)
               if (!row) return undefined
               // A withdrawn one merges with nothing; a restore makes it pending as it is.
-              if (row.time_withdrawn !== null) return []
-              // It was admitted before the rows that arrived while it prepared,
-              // so it takes in only earlier ones; each later one then takes its
-              // admission again, oldest first, now that it can see this one.
-              const own = { id: row.id, ...(yield* replace(tx, input.sessionID, row, input.markers, true)) }
-              const later = yield* tx
-                .select()
-                .from(SessionPromptQueueTable)
-                .where(
-                  and(
-                    promotable(input.sessionID),
-                    eq(SessionPromptQueueTable.delivery, row.delivery),
-                    gt(SessionPromptQueueTable.seq, row.seq),
-                  ),
-                )
-                .orderBy(asc(SessionPromptQueueTable.seq))
-                .all()
-                .pipe(Effect.orDie)
-              const readmitted = yield* Effect.forEach(later, (next) =>
-                Effect.gen(function* () {
-                  const current = yield* rowOf(tx, next.id)
-                  if (!current) return []
-                  return [{ id: current.id, ...(yield* replace(tx, input.sessionID, current, input.markers, true)) }]
-                }),
-              )
-              return [own, ...readmitted.flat()]
+              const own =
+                row.time_withdrawn === null
+                  ? [{ id: row.id, ...(yield* replace(tx, input.sessionID, row, input.markers)) }]
+                  : []
+              return [...own, ...(yield* readmit(tx, input.sessionID, row.id, input.markers))]
             }),
           ).pipe(Effect.orDie)
-          settlePreparing(input.itemID)
+          yield* ended
           if (!admitted) return
           admitted.forEach((admission) => {
             retire(admission.retired, admission.id)
@@ -1425,16 +1490,26 @@ const layer = Layer.effect(
 
     const awaitPrepared: Interface["awaitPrepared"] = (itemID) => {
       const done = preparing.get(itemID)
-      return done ? Deferred.await(done) : Effect.void
+      return done ? Deferred.await(done).pipe(Effect.withSpan("SessionQueue.awaitPrepared")) : Effect.void
     }
 
-    const unprepared: Interface["unprepared"] = (sessionID, itemID) =>
+    const unprepared: Interface["unprepared"] = (sessionID, itemID, markers) =>
       exclusive(
         sessionID,
         Effect.gen(function* () {
+          const ended = endPreparing(itemID)
           const dropped = yield* dropPreparing(sessionID, [itemID])
-          settlePreparing(itemID)
-          if (dropped) yield* publish(sessionID)
+          const readmitted = yield* writable(sessionID, (tx) => readmit(tx, sessionID, itemID, markers)).pipe(
+            Effect.orDie,
+          )
+          yield* ended
+          readmitted.forEach((admission) => {
+            retire(admission.retired, admission.id)
+            if (admission.into) retire([admission.id], admission.into)
+            finish(admission.finished)
+          })
+          if (dropped || readmitted.some((admission) => admission.retired.length > 0 || admission.into))
+            yield* publish(sessionID)
         }),
       )
 
