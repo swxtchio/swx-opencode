@@ -12,8 +12,14 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { afterAll, expect, test } from "bun:test"
 import { Database as Sqlite } from "bun:sqlite"
 import { randomUUID } from "node:crypto"
-import { rm } from "node:fs/promises"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Logger, Option, Schema, Scope, Stream } from "effect"
+import { mkdir, rm, symlink } from "node:fs/promises"
+import { createRequire } from "node:module"
+import { pathToFileURL } from "node:url"
+import { Npm } from "@opencode-ai/core/npm"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
+import { filesystem } from "@opencode-ai/core/effect/app-node-platform"
+import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, FileSystem, Layer, Logger, Option, Schema, Scope, Stream } from "effect"
 import { HttpClient } from "effect/unstable/http"
 import os from "os"
 import path from "path"
@@ -300,6 +306,55 @@ const blockingProcessor = processorWithCreate(() =>
 )
 
 const runtimeFlags = RuntimeFlags.layer({ experimentalEventSystem: true })
+const sdkReadiness = {
+  gate: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+}
+
+// Provider tests load the actual workspace SDK instead of racing external Arborist reify.
+// Config still owns and joins its dependency fiber; readiness requires a resolvable real SDK.
+const npmImplementation = Npm.node.implementation
+if (!npmImplementation) throw new Error("Npm implementation is missing")
+const promptSdk = makeGlobalNode({
+  service: Npm.Service,
+  layer: Layer.effect(
+    Npm.Service,
+    Effect.gen(function* () {
+      const real = yield* Npm.Service
+      const afs = yield* FSUtil.Service
+      return Npm.Service.of({
+        ...real,
+        install: Effect.fn("test.workspacePluginSdk")(function* (dir, input) {
+          if (input?.add.some((item) => item.name !== "@opencode-ai/plugin")) return yield* real.install(dir, input)
+          const gate = sdkReadiness.gate
+          sdkReadiness.gate = undefined
+          if (gate) {
+            yield* Deferred.succeed(gate.entered, undefined)
+            yield* Deferred.await(gate.release)
+          }
+          const entry = path.join(dir, "node_modules", "@opencode-ai", "plugin")
+          if (!(yield* afs.existsSafe(entry))) {
+            yield* Effect.promise(() => mkdir(path.dirname(entry), { recursive: true }))
+            yield* Effect.promise(() => symlink(path.resolve(import.meta.dir, "../../../plugin"), entry, "junction"))
+          }
+          const resolved = createRequire(path.join(dir, "sdk-fixture.cjs")).resolve("@opencode-ai/plugin")
+          const sdk = yield* Effect.promise(() => import(pathToFileURL(resolved).href))
+          if (typeof sdk.tool !== "function") return yield* Effect.die(new Error("workspace plugin SDK is not ready"))
+        }),
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      npmImplementation as Layer.Layer<
+        Npm.Service,
+        never,
+        FSUtil.Service | Global.Service | FileSystem.FileSystem | EffectFlock.Service
+      >,
+    ),
+  ),
+  deps: [FSUtil.node, Global.node, filesystem, EffectFlock.node],
+})
+
+
 
 const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })
 const processorCreateDie = processorWithCreate(() => Effect.die(new Error("processor creation defect")))
@@ -356,6 +411,7 @@ type PromptTestOptions = {
 
 function makePrompt(input?: PromptTestOptions) {
   const replacements = [
+    [Npm.node, promptSdk],
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
@@ -374,6 +430,7 @@ function makePrompt(input?: PromptTestOptions) {
 function makeHttp(input?: PromptTestOptions) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
+    [Npm.node, promptSdk],
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
@@ -391,6 +448,7 @@ function makeHttp(input?: PromptTestOptions) {
 
 function makeHttpWithDatabase(database: Layer.Layer<Database.Service>) {
   return LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
+    [Npm.node, promptSdk],
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp()],
@@ -649,6 +707,7 @@ const it = testEffect(makeHttp())
 const abruptPrompt = testEffect(makeHttp({ llm: abruptAssistantLLM }))
 const gated = testEffect(
   LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
+    [Npm.node, promptSdk],
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp()],
@@ -661,6 +720,7 @@ const gated = testEffect(
 )
 const instructionClearFailureTest = testEffect(
   LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
+    [Npm.node, promptSdk],
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp()],
@@ -672,6 +732,7 @@ const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const processorDies = testEffect(
   LayerNode.compile(promptRoot, [
+    [Npm.node, promptSdk],
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp()],
@@ -4627,6 +4688,7 @@ const finish = <A, E>(...fibers: Fiber.Fiber<A, E>[]) =>
 const startHeld = Effect.fn("test.startHeld")(function* (input?: {
   tool?: boolean | { name: string; args: Record<string, unknown> }
   agent?: string
+  format?: SessionPrompt.PromptInput["format"]
   diagnostic?: (value: {
     sessionID: SessionID
     calls: number
@@ -4655,7 +4717,7 @@ const startHeld = Effect.fn("test.startHeld")(function* (input?: {
       )
     : llm.hold("task done", deferredAsPromise(gate))
   const task = yield* prompt
-    .prompt({ sessionID: chat.id, agent: input?.agent ?? "build", model: ref, parts: said("start the task") })
+    .prompt({ sessionID: chat.id, agent: input?.agent ?? "build", model: ref, format: input?.format, parts: said("start the task") })
     .pipe(Effect.forkChild)
   // A prompt setup failure must retain its cause rather than masquerade as provider readiness.
   yield* awaitWithTimeout(
@@ -7149,7 +7211,8 @@ it.instance(
       yield* llm.text("wake done")
       yield* llm.text("held done")
       const rebuilt = LayerNode.compile(promptRoot, [
-        [SessionSummary.node, summary],
+        [Npm.node, promptSdk],
+    [SessionSummary.node, summary],
         [LSP.node, lsp],
         [MCP.node, makeMcp()],
         [RuntimeFlags.node, runtimeFlags],
@@ -7712,7 +7775,7 @@ gated.instance(
 )
 
 it.instance(
-  "refuses an exact marked noReply messageID retry without custody",
+  "does not rewrite an exact marked noReply messageID retry with direct custody",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
@@ -7732,10 +7795,8 @@ it.instance(
       }
 
       const original = yield* prompt.prompt(input)
-      const retry = yield* prompt.prompt(input).pipe(Effect.exit)
-      expect(Exit.isFailure(retry)).toBe(true)
-      if (!Exit.isFailure(retry)) throw new Error("bare projected identity was accepted")
-      expect(Cause.squash(retry.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+      const retry = yield* prompt.prompt(input)
+      expect(retry).toEqual(original)
       const messages = yield* sessions.messages({ sessionID: session.id })
       expect(messages).toHaveLength(1)
       expect(messages[0]?.parts.filter((part) => part.type === "text" && part.text === markedText)).toHaveLength(1)
@@ -7746,7 +7807,7 @@ it.instance(
 )
 
 it.instance(
-  "refuses an idle changed marked noReply messageID without original custody",
+  "refuses an idle changed marked noReply messageID against its direct original",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
@@ -7779,7 +7840,7 @@ it.instance(
         .pipe(Effect.exit)
       expect(Exit.isFailure(retry)).toBe(true)
       if (!Exit.isFailure(retry)) throw new Error("changed bare identity was accepted")
-      expect(Cause.squash(retry.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+      expect(Cause.pretty(retry.cause)).toContain("Conflicting direct noReply original")
       expect(yield* llm.calls).toBe(0)
       expect(yield* queue.list(session.id)).toEqual([])
       const messages = yield* sessions.messages({ sessionID: session.id })
@@ -7873,7 +7934,7 @@ it.instance(
 )
 
 it.instance(
-  "refuses an initially-busy exact marked same-ID retry without original custody",
+  "preserves an initially-busy exact marked same-ID retry with direct custody",
   () =>
     Effect.gen(function* () {
       const { dir, llm } = yield* useServerConfig(providerCfg)
@@ -7913,10 +7974,8 @@ it.instance(
       const active = yield* prompt.loop({ sessionID: session.id, messageID: root.info.id }).pipe(Effect.forkChild)
       yield* awaitWithTimeout(llm.wait(1), "active root did not reach the provider", "10 seconds")
 
-      const retry = yield* prompt.prompt(input).pipe(Effect.exit)
-      expect(Exit.isFailure(retry)).toBe(true)
-      if (!Exit.isFailure(retry)) throw new Error("unwitnessed projection was accepted")
-      expect(Cause.squash(retry.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+      const retry = yield* prompt.prompt(input)
+      expect(retry).toEqual(original)
       expect(yield* queue.list(session.id)).toEqual([])
       expect(yield* llm.calls).toBe(1)
       yield* Deferred.succeed(toolResponse, undefined)
@@ -7940,7 +7999,7 @@ it.instance(
 )
 
 gated.instance(
-  "ambiguous changed marked identity is refused before idle-write race gates",
+  "represented changed marked identity is refused before idle-write race gates",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
@@ -9973,7 +10032,9 @@ it.instance(
           system,
           parts: said("historical native request"),
         }
-        yield* seedUser(input)
+        // Pre-upgrade bare projection: do not create current-build noReply custody.
+        yield* sessions.updateMessage({ id: input.messageID, sessionID: session.id, role: "user", agent: input.agent, model: input.model, system: input.system, time: { created: Date.now() } })
+        yield* sessions.updatePart({ id: PartID.ascending(), messageID: input.messageID, sessionID: session.id, type: "text", text: "historical native request" })
         const before = yield* sessions.messages({ sessionID: session.id })
         for (const retry of [
           input,
@@ -10044,4 +10105,294 @@ unix(
       expect(yield* config.llm.calls).toBe(0)
     }),
   30000,
+)
+
+it.instance(
+  "round4 represented noReply reconciles full input and delivery without rewriting native history",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Represented noReply" })
+      const input = {
+        sessionID: session.id,
+        messageID: MessageID.ascending(),
+        agent: "build",
+        model: ref,
+        parts: said("native original"),
+      }
+      yield* llm.text("native answer")
+      const answered = yield* prompt.prompt(input)
+      const before = yield* sessions.messages({ sessionID: session.id })
+      const exact = yield* prompt.prompt({ ...input, noReply: true })
+      expect(exact.info.id).toBe(input.messageID)
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+      for (const changed of [
+        { parts: said("conflicting native text") },
+        { delivery: "queue" as const },
+        { system: "different system" },
+        { tools: { read: false } },
+        { variant: "different" },
+      ]) {
+        const exit = yield* Effect.exit(prompt.prompt({ ...input, ...changed, noReply: true }))
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+      }
+      yield* sessions.setRevert({
+        sessionID: session.id,
+        revert: { messageID: input.messageID },
+        summary: session.summary,
+      })
+      const reverted = yield* sessions.get(session.id)
+      const retried = yield* prompt.prompt(input)
+      expect(retried.info.id).toBe(answered.info.id)
+      expect((yield* sessions.get(session.id)).revert).toEqual(reverted.revert)
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+      expect(yield* llm.calls).toBe(1)
+    }),
+  30000,
+)
+
+it.instance(
+  "round4 unmarked direct noReply records an exact original and refuses conflicting reuse",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Direct noReply custody" })
+      const input = {
+        sessionID: session.id,
+        messageID: MessageID.ascending(),
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: said("direct original"),
+      }
+      const first = yield* prompt.prompt(input)
+      expect(yield* prompt.prompt(input)).toEqual(first)
+      const before = yield* sessions.messages({ sessionID: session.id })
+      for (const changed of [{ parts: said("changed") }, { noReply: false }, { delivery: "queue" as const }]) {
+        expect(Exit.isFailure(yield* Effect.exit(prompt.prompt({ ...input, ...changed })))).toBe(true)
+        expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+      }
+      expect(first.parts.filter((part) => part.type === "text" && part.metadata?.sessionQueueNoReply)).toHaveLength(1)
+      expect(yield* llm.calls).toBe(0)
+    }),
+  30000,
+)
+
+for (const custody of ["pending", "retained", "consumed"] as const)
+  unix(
+    `round4 represented command ${custody} retry refuses before executable expansion`,
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const marker = path.join(test.directory, "command-once.txt")
+        const command = { probe: { template: `!\`printf 'execution\\n' >> '${marker}'; printf 'command intent'\`` } }
+        const prompt = yield* SessionPrompt.Service
+        const queue = yield* SessionQueue.Service
+        const sessions = yield* Session.Service
+        const held =
+          custody !== "consumed" ? yield* startHeld({ config: (url) => ({ ...providerCfg(url), command }) }) : undefined
+        const configured = held ? undefined : yield* useServerConfig((url) => ({ ...providerCfg(url), command }))
+        const llm = held?.llm ?? configured!.llm
+        const session = held?.chat ?? (yield* sessions.create({ title: "Consumed command" }))
+        const input = {
+          sessionID: session.id,
+          messageID: MessageID.ascending(),
+          command: "probe",
+          arguments: "",
+          delivery: custody === "consumed" ? ("steer" as const) : ("queue" as const),
+        }
+        if (!held) yield* llm.text("command complete")
+        const original = yield* prompt.command(input).pipe(Effect.forkChild)
+        if (!held) yield* awaitWithTimeout(Fiber.join(original), "original command did not complete", "10 seconds")
+        if (held) {
+          yield* queued(session.id, 1)
+          if (custody === "retained")
+            yield* queue.promote({
+              sessionID: session.id,
+              delivery: "queue",
+              prepare: (input) => Effect.succeed(input),
+              write: (input) =>
+                Effect.gen(function* () {
+                  yield* sessions.updateMessage({
+                    id: input.messageID,
+                    sessionID: session.id,
+                    role: "user",
+                    agent: input.agent ?? "build",
+                    model: input.model ?? ref,
+                    time: { created: Date.now() },
+                  })
+                  yield* Effect.forEach(
+                    input.parts,
+                    (part) =>
+                      part.type === "text"
+                        ? sessions.updatePart({
+                            ...part,
+                            id: part.id ?? PartID.ascending(),
+                            sessionID: session.id,
+                            messageID: input.messageID,
+                          })
+                        : Effect.void,
+                    { discard: true },
+                  )
+                }),
+              rejected: (cause) => Effect.failCause(cause),
+            })
+        }
+        const before = yield* sessions.messages({ sessionID: session.id })
+        const pending = yield* queue.list(session.id)
+        const calls = yield* llm.calls
+        for (const changed of [
+          {},
+          { arguments: "different arguments" },
+          { command: "other-command" },
+          { delivery: "steer" as const },
+        ]) {
+          const exit = yield* Effect.exit(prompt.command({ ...input, ...changed }))
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit))
+            expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+          expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("execution\n")
+          expect(yield* llm.calls).toBe(calls)
+          expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+          expect(yield* queue.list(session.id)).toEqual(pending)
+        }
+        if (held) {
+          yield* llm.text("command complete")
+          yield* held.release
+          yield* finish(held.task, original)
+        }
+      }),
+    30000,
+  )
+
+unix(
+  "round4 shell represented and bare identities refuse before command execution",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const test = yield* TestInstance
+      const marker = path.join(test.directory, "shell-once.txt")
+      const represented = yield* sessions.create({ title: "Represented shell ID" })
+      const messageID = MessageID.ascending()
+      yield* llm.text("original native answer")
+      yield* prompt.prompt({
+        sessionID: represented.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        parts: said("normal original"),
+      })
+      const fresh = yield* sessions.create({ title: "Bare shell ID" })
+      const bareID = MessageID.ascending()
+      const shell = {
+        sessionID: fresh.id,
+        messageID: bareID,
+        agent: "build",
+        model: ref,
+        command: `printf 'execution\\n' >> '${marker}'`,
+      }
+      yield* prompt.shell(shell)
+      for (const input of [
+        shell,
+        { ...shell, command: `printf changed >> '${marker}'` },
+        { ...shell, sessionID: represented.id, messageID },
+      ]) {
+        const before = yield* sessions.messages({ sessionID: input.sessionID })
+        const exit = yield* Effect.exit(prompt.shell(input))
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+        expect(yield* sessions.messages({ sessionID: input.sessionID })).toEqual(before)
+        expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("execution\n")
+      }
+      expect(yield* llm.calls).toBe(1)
+    }),
+  30000,
+)
+
+it.instance(
+  "round4 peer continuation defers while the root structured output contract is unanswered",
+  () =>
+    Effect.gen(function* () {
+      const held = yield* startHeld({
+        tool: { name: "glob", args: { pattern: "*.txt" } },
+        format: Schema.decodeUnknownSync(SessionV1.Format)({
+          type: "json_schema",
+          schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+        }),
+      })
+      const text = "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791854000-401-abcd\x1f [fm-level:request]\x1f Structured root peer\nFull peer tail"
+      const peer = yield* held.send(text, { delivery: "queue" })
+      yield* queued(held.chat.id, 1)
+      yield* held.llm.push(
+        reply().tool("StructuredOutput", { answer: "root contract preserved" }).item(),
+        reply().text("peer answered later").stop().item(),
+      )
+      yield* held.release
+      const root = yield* awaitWithTimeout(Fiber.join(held.task), "structured root did not settle", "10 seconds")
+      yield* awaitWithTimeout(Fiber.join(peer), "deferred peer did not settle", "10 seconds")
+      const requests = yield* held.llm.inputs
+      expect(JSON.stringify(requests[1]?.messages)).not.toContain(JSON.stringify(text).slice(1, -1))
+      expect(JSON.stringify(requests[1]?.tools)).toContain("StructuredOutput")
+      expect(requests[1]?.tool_choice).toBe("required")
+      expect(root.info.role === "assistant" && root.info.structured).toEqual({ answer: "root contract preserved" })
+      expect(root.info.role === "assistant" && root.info.error).toBeUndefined()
+      expect(JSON.stringify(requests[2]?.messages)).toContain(JSON.stringify(text).slice(1, -1))
+      expect(yield* held.llm.calls).toBe(3)
+    }),
+  30000,
+)
+
+it.instance(
+  "round4 held actual SDK dependency remains a no-provider failure under unchanged readiness bound",
+  () =>
+    Effect.gen(function* () {
+      const gate = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      sdkReadiness.gate = gate
+      const observations: Array<{ sessionID: SessionID; calls: number; runner?: { state: string; frame?: string } }> = []
+      const attempt = yield* startHeld({ diagnostic: (value) => observations.push(value) }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(gate.entered), "actual SDK dependency fixture did not enter its owner")
+      const exit = yield* awaitWithTimeout(
+        Fiber.await(attempt),
+        "unchanged first-provider backstop did not fire",
+        "15 seconds",
+      )
+      yield* Deferred.succeed(gate.release, undefined)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("first provider call never started")
+      expect(observations).toHaveLength(1)
+      expect(observations[0]?.calls).toBe(0)
+      expect(observations[0]?.runner?.state).toBe("Running")
+      expect(observations[0]?.runner?.frame).toBe("Config.waitForDependencies")
+    }),
+  30000,
+)
+
+
+it.instance("round4 critical noReply peer preserves original transport identity and exact aliases", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Direct critical peer identity" })
+    const text = "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791854000-402-abcd\x1f [fm-level:critical]\x1f Critical excluded peer\nComplete tail"
+    const input = { sessionID: session.id, agent: "build", model: ref, noReply: true, parts: said(text) }
+    const original = yield* prompt.prompt(input)
+    const exact = yield* prompt.prompt(input)
+    expect(exact.info.id).toBe(original.info.id)
+    const alias = { ...input, messageID: MessageID.ascending() }
+    expect((yield* prompt.prompt(alias)).info.id).toBe(original.info.id)
+    const before = yield* sessions.messages({ sessionID: session.id })
+    expect((yield* prompt.prompt(alias)).info.id).toBe(original.info.id)
+    expect(Exit.isFailure(yield* Effect.exit(prompt.prompt({ ...alias, parts: said(text + " changed") })))).toBe(true)
+    expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+    expect(before).toHaveLength(1)
+    expect(yield* llm.calls).toBe(0)
+  }), 30000,
 )

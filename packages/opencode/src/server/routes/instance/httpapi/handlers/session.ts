@@ -373,7 +373,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof ShellPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      return yield* SessionError.mapBusy(promptSvc.shell({ ...ctx.payload, sessionID: ctx.params.sessionID }))
+      return yield* SessionError.mapBusy(promptSvc.shell({ ...ctx.payload, sessionID: ctx.params.sessionID })).pipe(
+        Effect.catchDefect((error) =>
+          error instanceof SessionQueue.HistoricalIdentityError
+            ? Effect.fail(new HttpApiError.BadRequest({}))
+            : Effect.die(error),
+        ),
+      )
     })
 
     const revert = Effect.fn("SessionHttpApi.revert")(function* (ctx: {

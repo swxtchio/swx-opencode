@@ -1107,22 +1107,29 @@ const layer = Layer.effect(
       return { info, parts: [...message.parts] }
     })
 
-    const createUserMessage = (input: PromptInput) => prepareUserMessage(input).pipe(Effect.flatMap(writeUserMessage))
-
     const prompt: (
       input: PromptInput,
     ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError> = Effect.fn(
       "SessionPrompt.prompt",
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      yield* queue.assertIdentity(input.sessionID, input.messageID)
-      yield* revert.cleanup(session)
       // TUI prepends synthetic editor context; only flattened user text owns marker framing.
       const classificationText = input.parts
         .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
         .join("")
       const classification = MachineMessage.classify(classificationText, (yield* config.get()).machine_message_markers)
       const delivery = classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
+      const reconciled = yield* queue.reconcile({ ...input, ...(delivery ? { delivery } : {}) })
+      if (reconciled?.kind === "direct") return reconciled.message
+      if (reconciled?.kind === "queued") {
+        if (input.noReply) {
+          const projected = yield* queue.message(reconciled.own.id)
+          if (projected) return projected
+          return yield* prepareUserMessage(input)
+        }
+        return yield* drain(input.sessionID, reconciled.own.id)
+      }
+      yield* revert.cleanup(session)
       const markedNoReply = input.noReply === true && classification === "hold"
       const initiallyHeldNoReply =
         markedNoReply && Exit.isFailure(yield* state.assertNotBusy(input.sessionID).pipe(Effect.exit))
@@ -1154,7 +1161,11 @@ const layer = Layer.effect(
         : input.noReply === true
           ? {
               kind: "direct" as const,
-              message: yield* queue.exclusive(input.sessionID, createUserMessage(input)),
+              message: yield* queue.writeDirect({
+                admission: { ...input, ...(delivery ? { delivery } : {}) },
+                prepare: () => prepareUserMessage(input),
+                write: writeUserMessage,
+              }),
             }
           : {
               kind: "queued" as const,
@@ -1394,6 +1405,7 @@ const layer = Layer.effect(
           // Pending tasks keep their original execution custody; overflow waits for another provider boundary.
           if (
             !queuedInputSelected &&
+            (!lastUser.format || lastUser.format.type === "text") &&
             !SessionQueue.openTasks(msgs, selection).length &&
             (yield* promoteInLoop(sessionID, "queue", true))
           ) {
@@ -1757,12 +1769,13 @@ const layer = Layer.effect(
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
+      yield* queue.assertFreshIdentity(input.sessionID, input.messageID)
       const ready = yield* Latch.make()
       return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
-      yield* queue.assertIdentity(input.sessionID, input.messageID)
+      yield* queue.assertFreshIdentity(input.sessionID, input.messageID)
       yield* Effect.logInfo("command", {
         "session.id": input.sessionID,
         command: input.command,
