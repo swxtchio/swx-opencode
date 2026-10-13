@@ -917,6 +917,10 @@ export function Prompt(props: PromptProps) {
               return false
             }
 
+            // While a recall holds a prompt, UP does nothing: its withdrawal may
+            // already have emptied the pending list, and history would copy the
+            // prompt it is taking back.
+            if (recalling) return
             // An empty composer takes back the last pending prompt instead (#249).
             const pending = !input.plainText && store.mode === "normal" ? pendingPrompts(sync, props.sessionID) : []
             if (pending.length > 0) {

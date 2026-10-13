@@ -1171,14 +1171,28 @@ const layer = Layer.effect(
           : yield* queue.request({ ...input, ...(arriving ? { delivery: arriving } : {}) }, undefined, true)
       if (early?.kind === "direct") return early.message
       // A retry is held to the delivery its classification gives it, as the
-      // original was, before it follows what the session already has.
+      // original was, before it follows what the session already has. An
+      // original still being prepared has no such delivery yet, so it waits for
+      // it, and is sent anew if the original's preparation failed.
       if (early?.kind === "reconciled" || early?.kind === "retry") {
+        const original =
+          early.kind === "reconciled"
+            ? early.own.id
+            : early.receipt.state === "pending"
+              ? early.receipt.itemID
+              : undefined
+        if (original) yield* queue.awaitPrepared(original)
+        if (early.kind === "retry" && input.requestID && Option.isNone(yield* queue.receipt(input.sessionID, input.requestID))) {
+          yield* queue.forget(early.own)
+          return yield* prompt(input)
+        }
         const markers = (yield* config.get()).machine_message_markers
         const delivery = deliveryOf(MachineMessage.classify(classificationText, markers))
         const reconciled = yield* queue.reconcile({ ...input, ...(delivery ? { delivery } : {}) })
         if (reconciled?.kind === "direct") return reconciled.message
         if (early.kind === "retry") return yield* followRequest(input, early)
-        return yield* drain(input.sessionID, reconciled?.own.id ?? early.own.id)
+        if (!reconciled) return yield* prompt(input)
+        return yield* drain(input.sessionID, reconciled.own.id)
       }
       const own = early?.own
       const prepared = yield* Effect.gen(function* () {

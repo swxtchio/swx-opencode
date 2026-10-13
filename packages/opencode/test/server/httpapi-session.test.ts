@@ -4117,6 +4117,108 @@ describe("session HttpApi submission-time admission", () => {
     60_000,
   )
 
+  // An exact retry that arrives while its original still prepares waits for
+  // the original's classified delivery rather than refusing the provisional one.
+  itRacing.instance(
+    "an exact retry of a prompt still being prepared follows it",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "retry while preparing" })
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const params = { sessionID: created.id }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+        // Only the configured marker queues it; until its config is read it is a steer.
+        const body = {
+          messageID: MessageID.ascending(),
+          requestID: "held-original",
+          agent: "build",
+          parts: [{ type: "text", text: "CUSTOM-HOLD: wait for the boundary" }],
+        }
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const hold = yield* racingSpans.arm({ name: "Config.get", parent: "SessionPrompt.prompt" })
+        const original = yield* post(SessionPaths.prompt, body).pipe(Effect.forkChild)
+        const retry = yield* Effect.gen(function* () {
+          yield* awaitWithTimeout(hold.reached, "the original never read its config", "30 seconds")
+          const retry = yield* post(SessionPaths.prompt, body).pipe(Effect.forkChild)
+          // A refusal would answer at once; the retry waits on the original instead.
+          yield* Effect.sleep("2 seconds")
+          expect(retry.pollUnsafe()).toBeUndefined()
+          return retry
+        }).pipe(Effect.ensuring(hold.disarm))
+        const items = yield* awaitWithTimeout(
+          Effect.gen(function* () {
+            while (true) {
+              const listed = yield* requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), {
+                headers,
+              })
+              if (listed[0]?.delivery === "queue") return listed
+              yield* Effect.sleep("10 millis")
+            }
+          }),
+          "the original was not prepared",
+        )
+        expect(items).toHaveLength(1)
+        const withdrawn = yield* request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID: items[0].id }), {
+          method: "DELETE",
+          headers,
+        })
+        expect(withdrawn.status).toBe(200)
+        // A new session's first prompt waits for the review to end.
+        expect((yield* post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+        // Both callers followed the one prompt, so both are told it was withdrawn.
+        for (const fiber of [original, retry])
+          expect((yield* awaitWithTimeout(Fiber.join(fiber), "a caller never answered", "30 seconds")).status).toBe(
+            409,
+          )
+      }),
+    {
+      ...options,
+      config: { ...options.config, machine_message_markers: { hold: [{ type: "prefix", value: "CUSTOM-HOLD:" }] } },
+    },
+    60_000,
+  )
+
+  // A retry waiting on an original whose preparation then fails is sent
+  // anew, not told the original was withdrawn.
+  itRacing.instance(
+    "an exact retry of a prompt whose preparation fails is admitted again",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "retry after failed preparation" })
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const params = { sessionID: created.id }
+        const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+        // As below: with only an absent provider configured, a variant has no model to select it on.
+        const body = {
+          messageID: MessageID.ascending(),
+          agent: "build",
+          variant: "high",
+          parts: [{ type: "text", text: "check the build" }],
+        }
+        const send = () =>
+          request(pathFor(SessionPaths.prompt, params), { method: "POST", headers, body: JSON.stringify(body) })
+        const hold = yield* racingSpans.arm({ name: "Session.get", parent: "SessionPrompt.prompt" })
+        const original = yield* send().pipe(Effect.forkChild)
+        const retry = yield* Effect.gen(function* () {
+          yield* awaitWithTimeout(hold.reached, "the original never read its Session", "30 seconds")
+          const retry = yield* send().pipe(Effect.forkChild)
+          yield* Effect.sleep("2 seconds")
+          expect(retry.pollUnsafe()).toBeUndefined()
+          return retry
+        }).pipe(Effect.ensuring(hold.disarm))
+        for (const fiber of [original, retry])
+          expect((yield* awaitWithTimeout(Fiber.join(fiber), "a caller never answered", "30 seconds")).status).toBe(
+            500,
+          )
+        expect(yield* listed()).toEqual([])
+      }),
+    { ...options, config: { ...options.config, provider: { "absent-provider": {} } } },
+    60_000,
+  )
+
   // A send whose preparation fails takes its admission back, so nothing is
   // left pending and an exact retry is admitted again rather than following it.
   itRacing.instance(

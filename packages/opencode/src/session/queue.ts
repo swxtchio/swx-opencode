@@ -13,7 +13,7 @@ import { MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
-import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm"
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm"
 import {
   Cause,
   Clock,
@@ -195,6 +195,8 @@ export interface Interface {
    * item and its request go as if never sent, so an exact retry is admitted again.
    */
   readonly unprepared: (sessionID: SessionID, itemID: ItemID) => Effect.Effect<void>
+  /** Waits, without the session's lock, until a `preparing` item's sender has prepared it or taken it back. */
+  readonly awaitPrepared: (itemID: ItemID) => Effect.Effect<void>
   /** What became of a request; None when the session has no such request. */
   readonly receipt: (sessionID: SessionID, requestID: RequestID) => Effect.Effect<Option.Option<Receipt>>
   /** Fails when the prompt names a request this session has under a different prompt. */
@@ -362,8 +364,14 @@ const layer = Layer.effect(
     const wakes = new Map<SessionID, number>()
     const running = new Set<SessionID>()
     // Items this process admitted as `preparing` whose sender has not finished
-    // with them. A preparing row missing here was left by a stopped process.
-    const preparing = new Set<ItemID>()
+    // with them, each with the signal that it has. A preparing row missing here
+    // was left by a stopped process.
+    const preparing = new Map<ItemID, Deferred.Deferred<void>>()
+    const settlePreparing = (itemID: ItemID) => {
+      const done = preparing.get(itemID)
+      preparing.delete(itemID)
+      if (done) Deferred.doneUnsafe(done, Effect.void)
+    }
     // Waiting callers' answer channels, by item: the message the item became,
     // then the final reply of the turn that message joined.
     const channels = new Map<
@@ -927,7 +935,7 @@ const layer = Layer.effect(
         if (result.replacement.into) retire([item.id], result.replacement.into)
         finish(result.replacement.finished)
       }
-      if (result.row.time_preparing !== null) preparing.add(item.id)
+      if (result.row.time_preparing !== null && !preparing.has(item.id)) preparing.set(item.id, Deferred.makeUnsafe())
       if (!result.row.time_promoted && result.row.time_preparing === null) wake(input.sessionID)
       yield* publish(input.sessionID)
       return item
@@ -1177,12 +1185,20 @@ const layer = Layer.effect(
       sessionID: SessionID,
       added: typeof SessionPromptQueueTable.$inferSelect,
       markers?: ConfigV1.Info["machine_message_markers"],
+      // Only rows admitted before it, for a row admitted earlier than others (#249).
+      earlierOnly = false,
     ) {
       const pendingOf = () =>
         tx
           .select()
           .from(SessionPromptQueueTable)
-          .where(and(promotable(sessionID), eq(SessionPromptQueueTable.delivery, added.delivery)))
+          .where(
+            and(
+              promotable(sessionID),
+              eq(SessionPromptQueueTable.delivery, added.delivery),
+              earlierOnly ? lt(SessionPromptQueueTable.seq, added.seq) : undefined,
+            ),
+          )
           .orderBy(asc(SessionPromptQueueTable.seq))
           .all()
           .pipe(Effect.orDie)
@@ -1351,7 +1367,6 @@ const layer = Layer.effect(
       exclusive(
         input.sessionID,
         Effect.gen(function* () {
-          preparing.delete(input.itemID)
           const admitted = yield* writable(input.sessionID, (tx) =>
             Effect.gen(function* () {
               const row = yield* tx
@@ -1369,30 +1384,64 @@ const layer = Layer.effect(
                 .pipe(Effect.orDie)
               if (!row) return undefined
               // A withdrawn one merges with nothing; a restore makes it pending as it is.
-              if (row.time_withdrawn !== null) return { retired: [] as ItemID[], into: undefined, finished: [] }
-              return yield* replace(tx, input.sessionID, row, input.markers)
+              if (row.time_withdrawn !== null) return []
+              // It was admitted before the rows that arrived while it prepared,
+              // so it takes in only earlier ones; each later one then takes its
+              // admission again, oldest first, now that it can see this one.
+              const own = { id: row.id, ...(yield* replace(tx, input.sessionID, row, input.markers, true)) }
+              const later = yield* tx
+                .select()
+                .from(SessionPromptQueueTable)
+                .where(
+                  and(
+                    promotable(input.sessionID),
+                    eq(SessionPromptQueueTable.delivery, row.delivery),
+                    gt(SessionPromptQueueTable.seq, row.seq),
+                  ),
+                )
+                .orderBy(asc(SessionPromptQueueTable.seq))
+                .all()
+                .pipe(Effect.orDie)
+              const readmitted = yield* Effect.forEach(later, (next) =>
+                Effect.gen(function* () {
+                  const current = yield* rowOf(tx, next.id)
+                  if (!current) return []
+                  return [{ id: current.id, ...(yield* replace(tx, input.sessionID, current, input.markers, true)) }]
+                }),
+              )
+              return [own, ...readmitted.flat()]
             }),
           ).pipe(Effect.orDie)
+          settlePreparing(input.itemID)
           if (!admitted) return
-          retire(admitted.retired, input.itemID)
-          if (admitted.into) retire([input.itemID], admitted.into)
-          finish(admitted.finished)
+          admitted.forEach((admission) => {
+            retire(admission.retired, admission.id)
+            if (admission.into) retire([admission.id], admission.into)
+            finish(admission.finished)
+          })
           wake(input.sessionID)
           yield* publish(input.sessionID)
         }),
       )
 
+    const awaitPrepared: Interface["awaitPrepared"] = (itemID) => {
+      const done = preparing.get(itemID)
+      return done ? Deferred.await(done) : Effect.void
+    }
+
     const unprepared: Interface["unprepared"] = (sessionID, itemID) =>
       exclusive(
         sessionID,
         Effect.gen(function* () {
-          preparing.delete(itemID)
-          if (yield* dropPreparing(sessionID, [itemID])) yield* publish(sessionID)
+          const dropped = yield* dropPreparing(sessionID, [itemID])
+          settlePreparing(itemID)
+          if (dropped) yield* publish(sessionID)
         }),
       )
 
     // Drops preparing rows a stopped process left: their senders are gone, so
-    // they never become ready. Under the session's lock.
+    // they never become ready. Under the session's lock. Process-local, like the
+    // queue's drains (swxtchio/swx-opencode#254).
     const sweep = Effect.fnUntraced(function* (sessionID: SessionID) {
       const left = (yield* db
         .select({ id: SessionPromptQueueTable.id })
@@ -1401,6 +1450,7 @@ const layer = Layer.effect(
           and(
             eq(SessionPromptQueueTable.session_id, sessionID),
             isNotNull(SessionPromptQueueTable.time_preparing),
+            isNull(SessionPromptQueueTable.time_withdrawn),
           ),
         )
         .all()
@@ -1411,6 +1461,8 @@ const layer = Layer.effect(
     })
 
     // Removes preparing rows with their requests' receipts, as if never admitted.
+    // A withdrawn one stays, with its receipt: its text is the user's now, and
+    // its request must still answer as withdrawn rather than be admitted again.
     const dropPreparing = (sessionID: SessionID, itemIDs: readonly ItemID[]) =>
       writable(sessionID, (tx) =>
         Effect.gen(function* () {
@@ -1421,6 +1473,7 @@ const layer = Layer.effect(
                 eq(SessionPromptQueueTable.session_id, sessionID),
                 inArray(SessionPromptQueueTable.id, [...itemIDs]),
                 isNotNull(SessionPromptQueueTable.time_preparing),
+                isNull(SessionPromptQueueTable.time_withdrawn),
               ),
             )
             .returning({ id: SessionPromptQueueTable.id })
@@ -1747,6 +1800,8 @@ const layer = Layer.effect(
                 eq(SessionPromptQueueTable.id, itemID),
                 eq(SessionPromptQueueTable.session_id, sessionID),
                 isNotNull(SessionPromptQueueTable.time_withdrawn),
+                // One whose sender stopped preparing it would never be prepared.
+                preparing.has(itemID) ? undefined : isNull(SessionPromptQueueTable.time_preparing),
               ),
             )
             .returning()
@@ -2716,6 +2771,7 @@ const layer = Layer.effect(
       request,
       prepared: finishPreparing,
       unprepared,
+      awaitPrepared,
       receipt,
       check,
       delivered,

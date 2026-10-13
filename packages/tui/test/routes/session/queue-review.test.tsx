@@ -667,6 +667,44 @@ test("a second UP while a recall is still restoring takes nothing", async () => 
   }
 })
 
+test("a second UP after a withdrawal's list but before its answer copies nothing from history", async () => {
+  let release!: () => void
+  const released = new Promise<void>((resolve) => (release = resolve))
+  const app = await startSession({
+    queue: [],
+    // The withdrawal lands and its list is published; its answer waits.
+    withdraw: (_, apply) => {
+      const answer = apply()
+      return released.then(() => answer)
+    },
+  })
+  try {
+    await until(() => shows(app, "already in the transcript"), "session")
+    // Sent from this composer, so prompt history holds it too.
+    await app.renderer.mockInput.typeText("check the build")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the send")
+    app.publish([pendingItem("que_mine", "check the build", { requestID: app.prompts[0]!.requestID })])
+    await until(async () => queuedLines(await screen(app), "check the build").length === 1, "the listed prompt")
+
+    app.renderer.mockInput.pressArrow("up")
+    await until(async () => deletes(app, "que_mine") === 1 && !(await shows(app, "QUEUED")), "the withdrawal's list")
+    app.renderer.mockInput.pressArrow("up")
+    expect(composerLines(await screen(app), "check the build")).toEqual([])
+
+    release()
+    await until(async () => composerLines(await screen(app), "check the build").length === 1, "the recall")
+    expect(app.restored).toEqual([])
+    expect(queuedIDs(app)).toEqual([])
+    // Sent, the draft is not stashed into the next test's composer.
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 2, "the resend")
+    app.prompts[1].answer(json(transcript))
+  } finally {
+    await app.stop()
+  }
+})
+
 test("a sent steer stays shown and is the one UP takes back, behind older queued prompts", async () => {
   const older = [3, 4, 5, 6].map((at) =>
     pendingItem(`que_older${at}`, `older ${at}`, { delivery: "queue", seq: at, time: { created: at } }),
