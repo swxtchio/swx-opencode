@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { expandTrackedPastedText, stripPromptPartIDs } from "../../src/prompt/part"
+import { displaySlice } from "../../src/prompt/display"
+import { expandTrackedPastedText, recalledPrompt, stripPromptPartIDs } from "../../src/prompt/part"
 
 describe("prompt part", () => {
   test("strips persisted IDs from reused parts", () => {
@@ -49,5 +50,48 @@ describe("prompt part", () => {
         },
       ]),
     ).toBe(`keep ${marker} then alpha\nbeta\ngamma tail`)
+  })
+
+  // swxtchio/swx-opencode#249: a withdrawn prompt returns to the composer as it was typed.
+  test("a recalled prompt keeps its typed text and mentions, not the context the composer added", () => {
+    const marker = "[Pasted ~2 lines]"
+    const typed = `see ${marker} in 你好 @src/app.ts and @explore`
+    // Offsets are the composer's, taken before the paste was expanded for sending.
+    const at = (value: string) => {
+      const start = Bun.stringWidth(typed.slice(0, typed.indexOf(value)))
+      return { value, start, end: start + Bun.stringWidth(value) }
+    }
+    const sent = expandTrackedPastedText(typed, [{ ...at(marker), text: "alpha\nbeta" }])
+    const recalled = recalledPrompt({
+      id: "que_recalled",
+      sessionID: "ses_recalled",
+      seq: 1,
+      delivery: "steer",
+      time: { created: 1 },
+      origins: [{ time: 1 }],
+      input: {
+        parts: [
+          { type: "text", text: "<editor context>", synthetic: true },
+          { type: "text", text: sent },
+          {
+            type: "file",
+            mime: "text/plain",
+            filename: "app.ts",
+            url: "file:///repo/src/app.ts",
+            source: { type: "file", path: "src/app.ts", text: at("@src/app.ts") },
+          },
+          { type: "agent", name: "explore", source: at("@explore") },
+          { type: "file", mime: "text/plain", url: "file:///repo/gone.ts" },
+        ],
+      },
+    })
+
+    expect(recalled.input).toBe("see alpha\nbeta in 你好 @src/app.ts and @explore")
+    expect(recalled.parts.map((part) => part.type)).toEqual(["file", "agent"])
+    // Each mention marks its text where the recalled text now holds it.
+    const [file, agent] = recalled.parts
+    if (file?.type !== "file" || agent?.type !== "agent") throw new Error("mentions were not recalled")
+    expect(displaySlice(recalled.input, file.source!.text.start, file.source!.text.end)).toBe("@src/app.ts")
+    expect(displaySlice(recalled.input, agent.source!.start, agent.source!.end)).toBe("@explore")
   })
 })

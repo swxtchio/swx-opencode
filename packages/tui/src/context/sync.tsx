@@ -58,6 +58,19 @@ function compareMessage(a: Message, b: Message) {
 
 const messageKey = (message: Message) => message.time.created + message.id
 
+export type SendingPrompt = { requestID: string; text: string }
+
+// Whether a queue item delivers a request: as its own, or as one merged or
+// collapsed into it.
+function carries(item: SessionPromptQueueItem, requestID: string) {
+  return (
+    item.requestID === requestID ||
+    item.origins.some(
+      (origin) => origin.requestID === requestID || origin.repeats?.some((repeat) => repeat.requestID === requestID),
+    )
+  )
+}
+
 export const {
   context: SyncContext,
   use: useSync,
@@ -101,6 +114,12 @@ export const {
       session_queue: {
         [sessionID: string]: SessionPromptQueueItem[]
       }
+      // Prompts this client sent that their session's queue has not listed yet
+      // (swxtchio/swx-opencode#249), so a sent prompt is shown from the moment
+      // the composer clears.
+      session_sending: {
+        [sessionID: string]: SendingPrompt[]
+      }
       message: {
         [sessionID: string]: Message[]
       }
@@ -140,6 +159,7 @@ export const {
       session_diff: {},
       todo: {},
       session_queue: {},
+      session_sending: {},
       message: {},
       part: {},
       lsp: [],
@@ -272,6 +292,12 @@ export const {
           const tracker = hydratingSessions.get(event.properties.sessionID)
           if (tracker) tracker.queue = true
           setStore("session_queue", event.properties.sessionID, reconcile(event.properties.items))
+          // Once the queue lists a request, its item shows it instead.
+          const sending = store.session_sending[event.properties.sessionID] ?? []
+          const unlisted = sending.filter(
+            (prompt) => !event.properties.items.some((item) => carries(item, prompt.requestID)),
+          )
+          if (unlisted.length < sending.length) setStore("session_sending", event.properties.sessionID, unlisted)
           break
         }
 
@@ -571,6 +597,17 @@ export const {
     const result = {
       data: store,
       set: setStore,
+      queue: {
+        // Shows a prompt being sent until its session's queue lists it, or
+        // until the returned callback says its send settled.
+        sending(sessionID: string, prompt: SendingPrompt) {
+          setStore("session_sending", sessionID, (list) => [...(list ?? []), prompt])
+          return () => {
+            if (!store.session_sending[sessionID]?.some((item) => item.requestID === prompt.requestID)) return
+            setStore("session_sending", sessionID, (list) => list.filter((item) => item.requestID !== prompt.requestID))
+          }
+        },
+      },
       get status() {
         return store.status
       },

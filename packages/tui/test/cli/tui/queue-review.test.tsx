@@ -237,7 +237,8 @@ test("activating the row opens the pending prompts in delivery order with their 
     ["queued for later", "queue"],
     ["queued after that", "queue"],
   ].map(([text, category]) => {
-    const y = lines.findIndex((line) => line.includes(text!))
+    // The row under the prompt lists them too; the view is drawn below it.
+    const y = lines.findLastIndex((line) => line.includes(text!))
     expect(lines[y]).toContain(category!)
     return y
   })
@@ -455,7 +456,8 @@ test("scrolling the review with the mouse wheel restarts the inactivity interval
   const view = await setup([steer, queued])
   await view.open()
   const lines = (await view.frame()).split("\n")
-  const y = lines.findIndex((line) => line.includes("queued for later"))
+  // The row under the prompt lists it too; the view is drawn below it.
+  const y = lines.findLastIndex((line) => line.includes("queued for later"))
   const x = lines[y]!.indexOf("queued for later")
   view.dialog.clear()
   await wait(() => view.queued("release").length === 1)
@@ -491,7 +493,8 @@ test("each pending prompt shows when it was first queued, how long ago, its repe
   jest.useFakeTimers({ now })
   DialogQueue.show(view.dialog, sessionID)
   await settle(() => view.queued("hold").length === 1)
-  const line = async (text: string) => (await view.frame()).split("\n").find((row) => row.includes(text)) ?? ""
+  // The row under the prompt lists them too; the view is drawn below it.
+  const line = async (text: string) => (await view.frame()).split("\n").findLast((row) => row.includes(text)) ?? ""
   expect(await line("check the build")).toContain("17m ago · sent 2×")
   expect(await line("run lint:")).toContain("40m ago · 2 merged")
 

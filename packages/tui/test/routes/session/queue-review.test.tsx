@@ -2,7 +2,7 @@
 import { expect, test } from "bun:test"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { createTestRenderer } from "@opentui/core/testing"
-import type { Provider, Session, SessionPromptQueueItem } from "@opencode-ai/sdk/v2"
+import type { GlobalEvent, Provider, Session, SessionPromptQueueItem } from "@opencode-ai/sdk/v2"
 import { Effect } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Global } from "@opencode-ai/core/global"
@@ -57,12 +57,39 @@ const items: SessionPromptQueueItem[] = [
   },
 ]
 
-async function startSession() {
+// A send the scripted server has not answered yet: the prompt request runs
+// until the turn that answers it ends.
+type HeldPrompt = { requestID?: string; parts: { type: string; text?: string }[]; answer: (response: Response) => void }
+
+async function startSession(
+  options: {
+    queue?: SessionPromptQueueItem[]
+    // Answers a withdrawal in place of the scripted queue, which hands over any pending item.
+    withdraw?: (itemID: string) => Response | Promise<Response>
+  } = {},
+) {
   const setup = await createTestRenderer({ width: 160, height: 45, useThread: false })
   const events = createEventSource()
+  const queue = { items: options.queue ?? items }
   const requests: string[] = []
   const selections: unknown[] = []
-  const prompts: { requestID?: string; parts: { type: string; text?: string }[] }[] = []
+  const prompts: HeldPrompt[] = []
+  const restored: unknown[] = []
+  // The server publishes every change to the pending list.
+  const publish = (next: SessionPromptQueueItem[]) => {
+    queue.items = next
+    events.emit({
+      directory,
+      project: "proj_test",
+      payload: { id: `evt_${Math.random()}`, type: "session.queue.updated", properties: { sessionID, items: next } },
+    } as GlobalEvent)
+  }
+  const withdraw = (itemID: string) => {
+    const found = queue.items.find((item) => item.id === itemID)
+    if (!found) return json({ _tag: "QueueItemNotPending", sessionID, itemID }, { status: 409 })
+    publish(queue.items.filter((item) => item.id !== itemID))
+    return json(found)
+  }
   const calls = createFetch((url) => {
     if (url.pathname === "/config/providers") return json({ providers: [provider], default: { test: "model" } })
     if (url.pathname === "/agent") return json([{ name: "build", mode: "primary", permission: [], options: {} }])
@@ -77,7 +104,7 @@ async function startSession() {
         time: { created: 1, updated: 1 },
       } as Session)
     if (url.pathname === `/session/${sessionID}/queue/release`) return new Response(null, { status: 204 })
-    if (url.pathname.startsWith(`/session/${sessionID}/queue`)) return json(items)
+    if (url.pathname.startsWith(`/session/${sessionID}/queue`)) return json(queue.items)
     if (url.pathname === `/session/${sessionID}/message`) return json([transcript])
     if ([`/session/${sessionID}/todo`, `/session/${sessionID}/diff`].includes(url.pathname)) return json([])
     return undefined
@@ -87,8 +114,16 @@ async function startSession() {
     const path = new URL(request.url).pathname
     if (path.startsWith(`/session/${sessionID}/queue/`)) requests.push(path.split("/").pop()!)
     if (path === `/session/${sessionID}` && request.method === "PATCH") selections.push(await request.clone().json())
-    if (path === `/session/${sessionID}/message` && request.method === "POST")
-      prompts.push(await request.clone().json())
+    if (path === `/session/${sessionID}/message` && request.method === "POST") {
+      const body = await request.clone().json()
+      return new Promise<Response>((answer) => prompts.push({ ...body, answer }))
+    }
+    if (path === `/session/${sessionID}/queue/restore`) {
+      restored.push(await request.clone().json())
+      return json(queue.items[0])
+    }
+    if (path.startsWith(`/session/${sessionID}/queue/que_`) && request.method === "DELETE")
+      return (options.withdraw ?? withdraw)(path.split("/").pop()!)
     return calls.fetch(request)
   }) as typeof globalThis.fetch
   let api: TuiPluginApi | undefined
@@ -123,6 +158,8 @@ async function startSession() {
     requests,
     selections,
     prompts,
+    restored,
+    publish,
     dispatch: (command: string) => api?.keymap.dispatchCommand(command),
     async stop() {
       try {
@@ -215,6 +252,184 @@ test("each prompt the user sends names its own request", async () => {
     expect(second).toMatch(/^[A-Za-z0-9._:-]{1,128}$/)
     // The same words sent twice are two requests, not a retry of one.
     expect(second).not.toBe(first)
+  } finally {
+    await app.stop()
+  }
+})
+
+// Submission-time visibility and UP recall (swxtchio/swx-opencode#249).
+
+async function screen(app: Awaited<ReturnType<typeof startSession>>) {
+  await app.renderer.renderOnce()
+  return app.renderer.captureCharFrame().split("\n")
+}
+
+// Lines of the pending row mark each prompt QUEUED; any other line holding the
+// text is the composer's.
+const queuedLines = (lines: string[], text: string) =>
+  lines.filter((line) => line.includes("QUEUED") && line.includes(text))
+const composerLines = (lines: string[], text: string) =>
+  lines.filter((line) => !line.includes("QUEUED") && line.includes(text))
+
+function pendingItem(id: string, text: string, extra: Partial<SessionPromptQueueItem> = {}): SessionPromptQueueItem {
+  return {
+    id,
+    sessionID,
+    seq: 10,
+    delivery: "steer",
+    input: { parts: [{ type: "text", text }] },
+    time: { created: 10 },
+    origins: [{ time: 10 }],
+    ...extra,
+  }
+}
+
+test("a prompt sent while its session is busy shows QUEUED from the moment the composer clears", async () => {
+  const app = await startSession({ queue: [] })
+  try {
+    await until(async () => (await screen(app)).some((line) => line.includes("already in the transcript")), "session")
+    await app.renderer.mockInput.typeText("check the build")
+    app.renderer.mockInput.pressEnter()
+    // The server has neither answered the send nor listed it yet.
+    await until(() => app.prompts.length === 1, "the send")
+    await until(async () => queuedLines(await screen(app), "check the build").length === 1, "the QUEUED prompt")
+    expect(composerLines(await screen(app), "check the build")).toEqual([])
+    expect((await screen(app)).some((line) => line.includes("1 pending · 1 steer · 0 queue"))).toBe(true)
+
+    // The queue lists it under the request it was sent as, and shows it once.
+    const requestID = app.prompts[0]!.requestID!
+    app.publish([pendingItem("que_mine", "check the build", { requestID, origins: [{ time: 10, requestID }] })])
+    await until(async () => (await screen(app)).some((line) => line.includes("1 pending")), "the listed prompt")
+    expect(queuedLines(await screen(app), "check the build")).toHaveLength(1)
+
+    // Promoted, it leaves the pending row; nothing brings the sent copy back.
+    app.publish([])
+    await until(async () => !(await screen(app)).some((line) => line.includes("pending")), "the promotion")
+    expect(queuedLines(await screen(app), "check the build")).toEqual([])
+    app.prompts[0]!.answer(json(transcript))
+  } finally {
+    await app.stop()
+  }
+})
+
+test("a prompt the queue merged into an earlier copy shows only as that copy", async () => {
+  const app = await startSession({ queue: [] })
+  try {
+    await until(async () => (await screen(app)).some((line) => line.includes("already in the transcript")), "session")
+    await app.renderer.mockInput.typeText("check the build")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the send")
+    await until(async () => queuedLines(await screen(app), "check the build").length === 1, "the QUEUED prompt")
+
+    // An identical copy was already pending: this request is a repeat of it.
+    const requestID = app.prompts[0]!.requestID!
+    app.publish([
+      pendingItem("que_first", "check the build", {
+        requestID: "first-send",
+        origins: [{ time: 5, requestID: "first-send", repeats: [{ time: 10, requestID }] }],
+      }),
+    ])
+    await until(async () => queuedLines(await screen(app), "check the build").length === 1, "the merged copy")
+    expect((await screen(app)).some((line) => line.includes("1 pending"))).toBe(true)
+    app.prompts[0]!.answer(json(transcript))
+  } finally {
+    await app.stop()
+  }
+})
+
+test("UP on an empty composer takes back the last pending prompt, and its edited resend is a new request", async () => {
+  const app = await startSession({ queue: [items[0]!] })
+  try {
+    await until(async () => (await screen(app)).some((line) => line.includes("1 pending")), "session")
+    await app.renderer.mockInput.typeText("check the build")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the send")
+    // The queue holds the prompt as the composer sent it.
+    const requestID = app.prompts[0]!.requestID!
+    const parts = app.prompts[0]!.parts as SessionPromptQueueItem["input"]["parts"]
+    app.publish([items[0]!, pendingItem("que_mine", "check the build", { requestID, input: { parts } })])
+    await until(async () => (await screen(app)).some((line) => line.includes("2 pending")), "the listed prompt")
+
+    app.renderer.mockInput.pressArrow("up")
+    await until(async () => composerLines(await screen(app), "check the build").length === 1, "the recalled prompt")
+    // Only the last pending prompt was withdrawn; the earlier one stays queued.
+    expect(app.requests).toEqual(["que_mine"])
+    const lines = await screen(app)
+    expect(queuedLines(lines, "check the build")).toEqual([])
+    expect(queuedLines(lines, "steer the running turn")).toHaveLength(1)
+    expect(lines.some((line) => line.includes("1 pending"))).toBe(true)
+
+    // Its first send ends withdrawn, which is not a failure to report.
+    app.prompts[0]!.answer(
+      json({ _tag: "PromptWithdrawn", sessionID, itemID: "que_mine", message: "withdrawn" }, { status: 409 }),
+    )
+    await app.renderer.mockInput.typeText(" again")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 2, "the resend")
+    expect(app.prompts[1]!.parts.at(-1)?.text).toBe("check the build again")
+    expect(app.prompts[1]!.requestID).not.toBe(requestID)
+    expect((await screen(app)).some((line) => line.includes("Failed to send prompt"))).toBe(false)
+    app.prompts[1]!.answer(json(transcript))
+  } finally {
+    await app.stop()
+  }
+})
+
+test("UP copies nothing when the last pending prompt was promoted before its withdrawal", async () => {
+  const app = await startSession({
+    queue: [items[1]!],
+    // Promotion won: the prompt is a message now, so the queue refuses to give it up.
+    withdraw: (itemID) => json({ _tag: "QueueItemNotPending", sessionID, itemID }, { status: 409 }),
+  })
+  try {
+    await until(async () => (await screen(app)).some((line) => line.includes("1 pending")), "session")
+    app.renderer.mockInput.pressArrow("up")
+    await until(async () => (await screen(app)).some((line) => line.includes("no longer pending")), "the notice")
+    expect(app.requests).toEqual(["que_queue"])
+    expect(composerLines(await screen(app), "queued for later")).toEqual([])
+
+    // The composer stayed empty, so sending sends nothing.
+    app.renderer.mockInput.pressEnter()
+    await app.renderer.mockInput.typeText("next")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the next send")
+    expect(app.prompts[0]!.parts.at(-1)?.text).toBe("next")
+    app.prompts[0]!.answer(json(transcript))
+  } finally {
+    await app.stop()
+  }
+})
+
+test("UP in a composer holding text leaves the pending prompts queued", async () => {
+  const app = await startSession({ queue: [items[1]!] })
+  try {
+    await until(async () => (await screen(app)).some((line) => line.includes("1 pending")), "session")
+    await app.renderer.mockInput.typeText("draft")
+    app.renderer.mockInput.pressArrow("up")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the send")
+    expect(app.prompts[0]!.parts.at(-1)?.text).toBe("draft")
+    expect(app.requests).toEqual([])
+    app.prompts[0]!.answer(json(transcript))
+  } finally {
+    await app.stop()
+  }
+})
+
+test("a prompt withdrawn while the composer was typed in goes back to the queue", async () => {
+  let answer!: (response: Response) => void
+  const withdrawal = new Promise<Response>((resolve) => (answer = resolve))
+  const app = await startSession({ queue: [items[1]!], withdraw: () => withdrawal })
+  try {
+    await until(async () => (await screen(app)).some((line) => line.includes("1 pending")), "session")
+    app.renderer.mockInput.pressArrow("up")
+    await until(() => app.requests.includes("que_queue"), "the withdrawal")
+    await app.renderer.mockInput.typeText("draft")
+    answer(json(items[1]))
+    await until(() => app.restored.length === 1, "the restore")
+    expect(app.restored).toEqual([{ id: "que_queue" }])
+    expect(composerLines(await screen(app), "queued for later")).toEqual([])
+    expect(composerLines(await screen(app), "draft")).toHaveLength(1)
   } finally {
     await app.stop()
   }

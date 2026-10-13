@@ -32,7 +32,7 @@ import { promptOffsetWidth } from "../../prompt/display"
 import { createStore, produce, unwrap } from "solid-js/store"
 import { usePromptHistory, type PromptInfo } from "../../prompt/history"
 import { computePromptTraits } from "../../prompt/traits"
-import { expandPastedTextPlaceholders, expandTrackedPastedText } from "../../prompt/part"
+import { expandPastedTextPlaceholders, expandTrackedPastedText, recalledPrompt } from "../../prompt/part"
 import { usePromptStash } from "../../prompt/stash"
 import { DialogStash } from "../dialog-stash"
 import { type AutocompleteRef, Autocomplete } from "./autocomplete"
@@ -40,6 +40,7 @@ import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
 import type { AssistantMessage, FilePart, UserMessage } from "@opencode-ai/sdk/v2"
 import { Locale } from "../../util/locale"
 import { errorMessage } from "../../util/error"
+import { isRecord } from "../../util/record"
 import { formatDuration } from "../../util/format"
 import { createColors, createFrames } from "../../ui/spinner"
 import { useDialog } from "../../ui/dialog"
@@ -54,7 +55,7 @@ import { useArgs } from "../../context/args"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useLeaderActive, useOpencodeKeymap } from "../../keymap"
 import { useTuiConfig } from "../../config"
 import { usePromptWorkspace } from "./workspace"
-import { PromptQueueRow } from "./queue"
+import { pendingPrompts, PromptQueueRow, type PendingPrompt } from "./queue"
 import { usePromptMove } from "./move"
 import { readLocalAttachment } from "./local-attachment"
 import { useLocation } from "../../context/location"
@@ -906,6 +907,13 @@ export function Prompt(props: PromptProps) {
               return false
             }
 
+            // An empty composer takes back the last pending prompt instead (#249).
+            const pending = !input.plainText && store.mode === "normal" ? pendingPrompts(sync, props.sessionID) : []
+            if (pending.length > 0) {
+              void recall(pending.at(-1)!)
+              return
+            }
+
             const item = history.move(-1, input.plainText)
             if (!item) return false
             input.setText(item.input)
@@ -955,6 +963,44 @@ export function Prompt(props: PromptProps) {
       bindings: tuiConfig.keybinds.get("prompt.history.next"),
     }
   })
+
+  // Only a withdrawal the server confirms hands a pending prompt to the
+  // composer, so one promoted meanwhile is never copied, and a withdrawn one is
+  // never delivered too. A prompt the composer cannot take any more, because it
+  // was typed in or left the session meanwhile, goes back to the queue.
+  let recalling = false
+  async function recall(prompt: PendingPrompt) {
+    const sessionID = props.sessionID
+    if (recalling || !sessionID) return
+    if (!prompt.item) {
+      toast.show({ variant: "info", message: "That prompt is still being sent" })
+      return
+    }
+    recalling = true
+    const withdrawn = await sdk.client.session.queue
+      .withdraw({ sessionID, itemID: prompt.item.id })
+      .catch(() => undefined)
+      .finally(() => (recalling = false))
+    if (!withdrawn?.data) {
+      toast.show({ variant: "info", message: "That prompt is no longer pending" })
+      return
+    }
+    // The queue's own update may arrive after its answer.
+    const itemID = withdrawn.data.id
+    sync.set("session_queue", sessionID, (list) => (list ?? []).filter((item) => item.id !== itemID))
+    if (input.isDestroyed || input.plainText || props.sessionID !== sessionID) {
+      const restored = await sdk.client.session.queue.restore({ sessionID, id: itemID }).catch(() => undefined)
+      if (!restored?.data)
+        toast.show({ variant: "error", message: "Could not return the recalled prompt to the queue" })
+      return
+    }
+    const recalled = recalledPrompt(withdrawn.data)
+    input.setText(recalled.input)
+    setStore("prompt", recalled)
+    setStore("mode", "normal")
+    restoreExtmarksFromParts(recalled.parts)
+    input.gotoBufferEnd()
+  }
 
   let submitting = false
   async function submit() {
@@ -1120,12 +1166,15 @@ export function Prompt(props: PromptProps) {
       })
     } else {
       move.startSubmit()
+      // Names this send, so the server can say what became of it (#212), and
+      // so the pending row shows it until the queue lists it (#249).
+      const requestID = crypto.randomUUID()
+      const settled = sync.queue.sending(sessionID, { requestID, text: inputText })
       sdk.client.session
         .prompt(
           {
             sessionID,
-            // Names this send, so the server can say what became of it (#212).
-            requestID: crypto.randomUUID(),
+            requestID,
             ...selectedModel,
             agent: agent.name,
             model: selectedModel,
@@ -1142,12 +1191,21 @@ export function Prompt(props: PromptProps) {
           { throwOnError: true },
         )
         .catch((error) => {
+          // A withdrawn prompt was taken back on purpose, by a recall or a review.
+          if (
+            error instanceof Error &&
+            isRecord(error.cause) &&
+            isRecord(error.cause.body) &&
+            error.cause.body._tag === "PromptWithdrawn"
+          )
+            return
           toast.show({
             title: "Failed to send prompt",
             message: errorMessage(error),
             variant: "error",
           })
         })
+        .finally(settled)
       if (editorParts.length > 0) editor.markSelectionSent()
     }
     history.append({

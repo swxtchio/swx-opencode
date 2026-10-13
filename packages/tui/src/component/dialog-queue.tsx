@@ -221,7 +221,7 @@ function age(ms: number) {
 }
 
 // What a pending item will say: its typed text, or the kinds of its parts.
-function preview(item: SessionPromptQueueItem) {
+export function preview(item: SessionPromptQueueItem) {
   const text = item.input.parts.flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : []))
   if (text.length > 0) return text.join("\n")
   return item.input.parts.map((part) => `[${part.type}]`).join(" ")
