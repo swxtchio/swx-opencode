@@ -405,6 +405,8 @@ test("UP in a composer holding text leaves the pending prompts queued", async ()
   try {
     await until(async () => (await screen(app)).some((line) => line.includes("1 pending")), "session")
     await app.renderer.mockInput.typeText("draft")
+    // The first UP moves the cursor to the start; the second would recall.
+    app.renderer.mockInput.pressArrow("up")
     app.renderer.mockInput.pressArrow("up")
     app.renderer.mockInput.pressEnter()
     await until(() => app.prompts.length === 1, "the send")
