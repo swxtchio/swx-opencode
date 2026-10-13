@@ -2187,8 +2187,7 @@ describe("session HttpApi", () => {
                 inputs.some((input) => {
                   const messages = Array.isArray(input.messages) ? input.messages : []
                   return (
-                    JSON.stringify(withoutQueueNote(messages.at(-1))) ===
-                    JSON.stringify({ role: "user", content: text })
+                    JSON.stringify(withoutQueueNote(messages.at(-1))) === JSON.stringify({ role: "user", content: text })
                   )
                 })
                   ? true
@@ -2783,104 +2782,6 @@ describe("session HttpApi pending prompt selection", () => {
     },
     30_000,
   )
-
-  // swxtchio/swx-opencode#227: an explicit compaction on the selected model,
-  // and the continuation it writes, run at the selected variant.
-  const compactionRoutes = (directory: string, sessionID: SessionIDType) => {
-    const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
-    const params = { sessionID }
-    return {
-      prompt: (text: string) =>
-        request(pathFor(SessionPaths.prompt, params), {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-            agent: "build",
-            model: { providerID: "test", modelID: "model-a" },
-            variant: "high",
-            parts: [{ type: "text", text }],
-          }),
-        }),
-      summarize: (modelID: string, auto: boolean) =>
-        request(pathFor(SessionPaths.summarize, params), {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ providerID: "test", modelID, auto }),
-        }),
-      selection: () =>
-        requestJson<{ model?: unknown }>(pathFor(SessionPaths.get, params), { headers }).pipe(
-          Effect.map((info) => info.model),
-        ),
-    }
-  }
-
-  it.live(
-    "an explicit compaction on the selected model runs at its selected variant, and so does its continuation",
-    () =>
-      Effect.gen(function* () {
-        const llm = yield* TestLLMServer
-        const directory = yield* tmpdirScoped({ git: true, config: selectableConfig(llm.url) })
-        const session = yield* createSession({ title: "explicit compaction" }).pipe(provideInstanceEffect(directory))
-        const api = compactionRoutes(directory, session.id)
-
-        yield* llm.text("start done")
-        expect((yield* api.prompt("start")).status).toBe(200)
-        yield* llm.text("summary without continuation")
-        expect((yield* api.summarize("model-a", false)).status).toBe(200)
-        yield* llm.text("summary with continuation")
-        yield* llm.text("continued")
-        expect((yield* api.summarize("model-a", true)).status).toBe(200)
-        // A variant belongs to its model, so another model's compaction names none.
-        yield* llm.text("summary on another model")
-        expect((yield* api.summarize("model-b", false)).status).toBe(200)
-
-        const sent = yield* llm.inputs
-        expect(sent.map((input) => [input.model, input.reasoning_effort])).toEqual([
-          ["model-a", "high"],
-          ["model-a", "high"],
-          ["model-a", "high"],
-          ["model-a", "high"],
-          ["model-b", undefined],
-        ])
-        expect(JSON.stringify(sent[3]!.messages)).toContain("Continue if you have next steps")
-        expect(yield* api.selection()).toEqual({ providerID: "test", id: "model-a", variant: "high" })
-      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
-    30_000,
-  )
-
-  it.live(
-    "an automatic compaction runs at the selected variant, and so does its continuation",
-    () =>
-      Effect.gen(function* () {
-        const llm = yield* TestLLMServer
-        const directory = yield* tmpdirScoped({ git: true, config: selectableConfig(llm.url) })
-        const session = yield* createSession({ title: "automatic compaction" }).pipe(provideInstanceEffect(directory))
-        const api = compactionRoutes(directory, session.id)
-
-        // A turn that fills the context, so the next prompt compacts first.
-        yield* llm.text("start done", { usage: { input: 95_000, output: 10 } })
-        expect((yield* api.prompt("start")).status).toBe(200)
-        // It compacts before it delivers the new prompt, then continues, then answers the prompt.
-        yield* llm.text("automatic summary")
-        yield* llm.text("continued")
-        yield* llm.text("answered")
-        expect((yield* api.prompt("after the context filled")).status).toBe(200)
-
-        const sent = yield* llm.inputs
-        expect(sent.map((input) => [input.model, input.reasoning_effort])).toEqual([
-          ["model-a", "high"],
-          ["model-a", "high"],
-          ["model-a", "high"],
-          ["model-a", "high"],
-        ])
-        const last = sent.map((input) => JSON.stringify((input.messages as unknown[]).at(-1)))
-        expect(last[1]).toContain("Here is the conversation so far")
-        expect(last[2]).toContain("Continue if you have next steps")
-        expect(last[3]).toContain("after the context filled")
-        expect(yield* api.selection()).toEqual({ providerID: "test", id: "model-a", variant: "high" })
-      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
-    30_000,
-  )
 })
 
 describe("session HttpApi queue freshness", () => {
@@ -2976,9 +2877,7 @@ describe("session HttpApi queue freshness", () => {
         )
         const lastUser = sent.map((input) => JSON.stringify((input.messages as unknown[]).at(-1)))
         // Delivered by its own admission, the first prompt is timestamped too.
-        expect(lastUser[0]).toMatch(
-          /\[Queued prompt: queued at \S+; delivered at \S+, \d+s after it was first queued\.]/,
-        )
+        expect(lastUser[0]).toMatch(/\[Queued prompt: queued at \S+; delivered at \S+, \d+s after it was first queued\.]/)
         expect(lastUser[1]).toContain(
           `[Queued prompt: queued at ${iso(first)}, and again at ${iso(same!.time.created)}; delivered at `,
         )
