@@ -64,7 +64,12 @@ const sharedRun: Runner = (value, layer) =>
     return yield* exit
   }).pipe(Effect.runPromise)
 
-const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, run: Runner = isolatedRun) => {
+const make = <R, E>(
+  testLayer: Layer.Layer<R, E>,
+  liveLayer: Layer.Layer<R, E>,
+  run: Runner = isolatedRun,
+  defaults?: { git?: boolean },
+) => {
   const effect = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
     test(name, () => run(value, testLayer), opts)
 
@@ -92,7 +97,7 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test(
       name,
-      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer),
+      () => run(body(value).pipe(withTmpdirInstance({ ...defaults, ...args.instanceOptions })), liveLayer),
       args.testOptions,
     )
   }
@@ -106,7 +111,7 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test.only(
       name,
-      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer),
+      () => run(body(value).pipe(withTmpdirInstance({ ...defaults, ...args.instanceOptions })), liveLayer),
       args.testOptions,
     )
   }
@@ -120,7 +125,7 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test.skip(
       name,
-      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer),
+      () => run(body(value).pipe(withTmpdirInstance({ ...defaults, ...args.instanceOptions })), liveLayer),
       args.testOptions,
     )
   }
@@ -136,8 +141,8 @@ const liveEnv = TestConsole.layer
 
 export const it = make<never, never>(testEnv, liveEnv)
 
-export const testEffect = <R, E>(layer: Layer.Layer<R, E>) =>
-  make<R, E>(Layer.provideMerge(layer, testEnv), Layer.provideMerge(layer, liveEnv))
+export const testEffect = <R, E>(layer: Layer.Layer<R, E>, defaults?: { git?: boolean }) =>
+  make<R, E>(Layer.provideMerge(layer, testEnv), Layer.provideMerge(layer, liveEnv), isolatedRun, defaults)
 
 // Variant of `testEffect` that builds the test layer through the shared
 // process-wide memoMap so services like Bus/Session resolve to the same

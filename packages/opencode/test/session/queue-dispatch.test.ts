@@ -1693,3 +1693,79 @@ it.instance("identity preflight keeps represented custody read-only and rejects 
     expect(yield* MessageV2.stream(session.id)).toEqual(before)
   }),
 )
+
+it.instance("round5 peer aliases cannot borrow bare projected IDs in pending promoted or consumed custody", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const database = yield* Database.Service
+    for (const custody of ["pending", "promoted", "consumed"] as const) {
+      for (const foreign of [false, true]) {
+        const session = yield* sessions.create({})
+        const input = {
+          sessionID: session.id,
+          messageID: MessageID.ascending(),
+          delivery: "queue" as const,
+          parts: [{ type: "text" as const, text: peer(987) }],
+        }
+        const original = yield* queue.admit(input)
+        if (custody !== "pending")
+          yield* queue.promote({
+            sessionID: session.id,
+            delivery: "queue",
+            prepare,
+            write: writer(sessions),
+            rejected: () => Effect.void,
+          })
+        if (custody === "consumed") yield* queue.consume(session.id)
+        const other = foreign ? yield* sessions.create({}) : session
+        const bare = yield* sessions.updateMessage({
+          id: MessageID.ascending(),
+          sessionID: other.id,
+          role: "user",
+          agent: "build",
+          model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+          time: { created: 123 },
+        })
+        yield* sessions.updatePart({
+          id: PartID.ascending(),
+          sessionID: other.id,
+          messageID: bare.id,
+          type: "text",
+          text: "unrelated bare owner",
+        })
+        const before = yield* sessions.messages({ sessionID: session.id })
+        const bareBefore = yield* MessageV2.get({ sessionID: other.id, messageID: bare.id })
+        const aliases = yield* database.db
+          .select()
+          .from(SessionPromptQueueAliasTable)
+          .where(eq(SessionPromptQueueAliasTable.item_id, original.id))
+          .all()
+          .pipe(Effect.orDie)
+        const retry = { ...input, messageID: bare.id }
+        const admitted = yield* Effect.exit(queue.admit(retry))
+        const direct = yield* Effect.exit(
+          queue.writeOrAdmit({
+            admission: { ...retry, noReply: true },
+            isBusy: Effect.succeed(false),
+            prepare: () => Effect.die(new Error("borrowed alias reached preparation")),
+            write: () => Effect.die(new Error("borrowed alias reached write")),
+            discard: () => Effect.void,
+          }),
+        )
+        expect(Exit.isFailure(admitted)).toBe(true)
+        expect(Exit.isFailure(direct)).toBe(true)
+        expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+        expect(yield* MessageV2.get({ sessionID: other.id, messageID: bare.id })).toEqual(bareBefore)
+        expect(
+          yield* database.db
+            .select()
+            .from(SessionPromptQueueAliasTable)
+            .where(eq(SessionPromptQueueAliasTable.item_id, original.id))
+            .all()
+            .pipe(Effect.orDie),
+        ).toEqual(aliases)
+      }
+    }
+  }),
+)

@@ -103,6 +103,12 @@ export interface Interface {
   >
   /** Executable command/shell input has no retained expansion provenance; existing identity cannot run again. */
   readonly assertFreshIdentity: (sessionID: SessionID, messageID?: MessageID) => Effect.Effect<void>
+  /** Serialize executable preparation through durable admission, without a database transaction across IO. */
+  readonly prepareExecutable: <P extends AdmitInput, E>(input: {
+    readonly sessionID: SessionID
+    readonly messageID?: MessageID
+    readonly prepare: () => Effect.Effect<P, E>
+  }) => Effect.Effect<{ readonly input: P; readonly own: Item }, E>
   readonly message: (itemID: ItemID) => Effect.Effect<SessionV1.WithParts | undefined>
   readonly writeDirect: <P extends SessionV1.WithParts, E>(input: {
     readonly admission: AdmitInput
@@ -551,6 +557,25 @@ const layer = Layer.effect(
                 .all()
             : []
           const rows = [...new Map(matches.map(({ row }) => [row.id, row])).values()]
+          const projected = input.messageID
+            ? yield* tx
+                .select({ id: MessageTable.id, session_id: MessageTable.session_id })
+                .from(MessageTable)
+                .where(eq(MessageTable.id, input.messageID))
+                .get()
+            : undefined
+          if (projected && (originals.length || rows.length)) {
+            const deliveredOwner = originals.every((original) => original.messageID === projected.id)
+            const retainedOwner = rows.every((row) => row.time_promoted !== null && row.message_id === projected.id)
+            if (projected.session_id !== input.sessionID || !deliveredOwner || !retainedOwner)
+              return yield* Effect.die(
+                new HistoricalIdentityError({
+                  sessionID: input.sessionID,
+                  messageID: input.messageID!,
+                  message: `Presented transport ID ${input.messageID} belongs to another projected message`,
+                }),
+              )
+          }
           for (const row of rows) {
             const decoded = Schema.decodeUnknownOption(SessionPromptQueue.QueuedInput)(row.input)
             if (
@@ -757,52 +782,63 @@ const layer = Layer.effect(
     }, (effect) => effect.pipe(Effect.orDie))
     const reconcile: Interface["reconcile"] = (input) => exclusive(input.sessionID, reconcileLocked(input))
 
-    const assertFreshIdentity: Interface["assertFreshIdentity"] = (sessionID, messageID) =>
+    const assertFreshIdentityLocked = (sessionID: SessionID, messageID?: MessageID) =>
       !messageID
         ? Effect.void
-        : exclusive(
-            sessionID,
-            Effect.gen(function* () {
-              const projected = yield* db
-                .select({ id: MessageTable.id })
-                .from(MessageTable)
-                .where(eq(MessageTable.id, messageID))
-                .get()
-              const keys = constituentIDs(sessionID, { messageID, parts: [] })
-              const aliases = yield* db
-                .select({ id: SessionPromptQueueAliasTable.id })
-                .from(SessionPromptQueueAliasTable)
-                .where(inArray(SessionPromptQueueAliasTable.id, keys))
-                .limit(1)
-                .get()
-              const sequence = yield* db
-                .select({ indexed: SessionPromptQueueSequenceTable.aliases_indexed })
-                .from(SessionPromptQueueSequenceTable)
-                .where(eq(SessionPromptQueueSequenceTable.session_id, sessionID))
-                .get()
-              const pending = sequence?.indexed
-                ? undefined
-                : yield* db
-                    .select({ id: SessionPromptQueueTable.id })
-                    .from(SessionPromptQueueTable)
-                    .where(
-                      and(
-                        eq(SessionPromptQueueTable.session_id, sessionID),
-                        sql`CASE WHEN json_valid(${SessionPromptQueueTable.input}) THEN json_extract(${SessionPromptQueueTable.input}, '$.messageID') END = ${messageID}`,
-                      ),
-                    )
-                    .limit(1)
-                    .get()
-              if (projected || aliases || pending)
-                return yield* Effect.die(
-                  new HistoricalIdentityError({
-                    sessionID,
-                    messageID,
-                    message: `Executable retry ${messageID} lacks retained command/shell provenance; refused before expansion`,
-                  }),
-                )
-            }).pipe(Effect.orDie),
-          )
+        : Effect.gen(function* () {
+            const projected = yield* db
+              .select({ id: MessageTable.id })
+              .from(MessageTable)
+              .where(eq(MessageTable.id, messageID))
+              .get()
+            const keys = constituentIDs(sessionID, { messageID, parts: [] })
+            const aliases = yield* db
+              .select({ id: SessionPromptQueueAliasTable.id })
+              .from(SessionPromptQueueAliasTable)
+              .where(inArray(SessionPromptQueueAliasTable.id, keys))
+              .limit(1)
+              .get()
+            const sequence = yield* db
+              .select({ indexed: SessionPromptQueueSequenceTable.aliases_indexed })
+              .from(SessionPromptQueueSequenceTable)
+              .where(eq(SessionPromptQueueSequenceTable.session_id, sessionID))
+              .get()
+            const pending = sequence?.indexed
+              ? undefined
+              : yield* db
+                  .select({ id: SessionPromptQueueTable.id })
+                  .from(SessionPromptQueueTable)
+                  .where(
+                    and(
+                      eq(SessionPromptQueueTable.session_id, sessionID),
+                      sql`CASE WHEN json_valid(${SessionPromptQueueTable.input}) THEN json_extract(${SessionPromptQueueTable.input}, '$.messageID') END = ${messageID}`,
+                    ),
+                  )
+                  .limit(1)
+                  .get()
+            if (projected || aliases || pending)
+              return yield* Effect.die(
+                new HistoricalIdentityError({
+                  sessionID,
+                  messageID,
+                  message: `Executable retry ${messageID} lacks retained command/shell provenance; refused before expansion`,
+                }),
+              )
+          }).pipe(Effect.orDie)
+    const assertFreshIdentity: Interface["assertFreshIdentity"] = (sessionID, messageID) =>
+      exclusive(sessionID, assertFreshIdentityLocked(sessionID, messageID))
+    const prepareExecutable: Interface["prepareExecutable"] = (input) =>
+      exclusive(
+        input.sessionID,
+        Effect.gen(function* () {
+          yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
+          const prepared = yield* input.prepare()
+          // A foreign writer can commit while preparation performs IO; check again before binding its input.
+          yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
+          const own = yield* admitLocked(prepared)
+          return { input: prepared, own }
+        }),
+      )
 
     const writeOriginal = <P extends SessionV1.WithParts>(
       input: { admission: AdmitInput; write: (prepared: P) => Effect.Effect<SessionV1.WithParts> },
@@ -1587,6 +1623,7 @@ const layer = Layer.effect(
       admit,
       reconcile,
       assertFreshIdentity,
+      prepareExecutable,
       writeDirect,
       message,
       assertIdentity,

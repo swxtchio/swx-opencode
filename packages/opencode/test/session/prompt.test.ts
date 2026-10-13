@@ -12,14 +12,28 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { afterAll, expect, test } from "bun:test"
 import { Database as Sqlite } from "bun:sqlite"
 import { randomUUID } from "node:crypto"
-import { mkdir, rm, symlink } from "node:fs/promises"
+import { mkdir, realpath, rm, symlink } from "node:fs/promises"
 import { createRequire } from "node:module"
 import { pathToFileURL } from "node:url"
 import { Npm } from "@opencode-ai/core/npm"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { filesystem } from "@opencode-ai/core/effect/app-node-platform"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, FileSystem, Layer, Logger, Option, Schema, Scope, Stream } from "effect"
+import {
+  Cause,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  FileSystem,
+  Layer,
+  Logger,
+  Option,
+  Schema,
+  Scope,
+  Stream,
+} from "effect"
 import { HttpClient } from "effect/unstable/http"
 import os from "os"
 import path from "path"
@@ -82,6 +96,8 @@ import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/l
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { runImport } from "../../src/cli/cmd/import"
 import { ShareNext } from "../../src/share/share-next"
+
+const promptTests = <R, E>(layer: Layer.Layer<R, E>) => testEffect(layer, { git: true })
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -307,7 +323,7 @@ const blockingProcessor = processorWithCreate(() =>
 
 const runtimeFlags = RuntimeFlags.layer({ experimentalEventSystem: true })
 const sdkReadiness = {
-  gate: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  gate: undefined as undefined | { dir: string; entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
 }
 
 // Provider tests load the actual workspace SDK instead of racing external Arborist reify.
@@ -325,18 +341,30 @@ const promptSdk = makeGlobalNode({
         ...real,
         install: Effect.fn("test.workspacePluginSdk")(function* (dir, input) {
           if (input?.add.some((item) => item.name !== "@opencode-ai/plugin")) return yield* real.install(dir, input)
-          const gate = sdkReadiness.gate
-          sdkReadiness.gate = undefined
+          const gate = sdkReadiness.gate?.dir === dir ? sdkReadiness.gate : undefined
           if (gate) {
+            sdkReadiness.gate = undefined
             yield* Deferred.succeed(gate.entered, undefined)
             yield* Deferred.await(gate.release)
           }
+          const ctx = yield* InstanceRef
+          if (!ctx) return yield* Effect.die(new Error("SDK fixture has no instance owner"))
+          const relative = path.relative(ctx.directory, dir)
+          if (dir !== Global.Path.config && (path.isAbsolute(relative) || relative.startsWith("..")))
+            return yield* Effect.die(new Error(`SDK fixture refused ancestor configuration: ${dir}`))
+          const workspace = path.resolve(import.meta.dir, "../../../plugin")
           const entry = path.join(dir, "node_modules", "@opencode-ai", "plugin")
-          if (!(yield* afs.existsSafe(entry))) {
-            yield* Effect.promise(() => mkdir(path.dirname(entry), { recursive: true }))
-            yield* Effect.promise(() => symlink(path.resolve(import.meta.dir, "../../../plugin"), entry, "junction"))
+          yield* Effect.promise(() => mkdir(path.dirname(entry), { recursive: true }))
+          if (yield* afs.existsSafe(entry)) {
+            const existing = yield* Effect.promise(() => realpath(entry))
+            if (existing !== (yield* Effect.promise(() => realpath(workspace))))
+              yield* Effect.promise(() => rm(entry, { recursive: true, force: true }))
           }
+          if (!(yield* afs.existsSafe(entry))) yield* Effect.promise(() => symlink(workspace, entry, "junction"))
           const resolved = createRequire(path.join(dir, "sdk-fixture.cjs")).resolve("@opencode-ai/plugin")
+          const target = yield* Effect.promise(() => realpath(path.join(workspace, "src/index.ts")))
+          if ((yield* Effect.promise(() => realpath(resolved))) !== target)
+            return yield* Effect.die(new Error("SDK fixture resolved a different plugin package"))
           const sdk = yield* Effect.promise(() => import(pathToFileURL(resolved).href))
           if (typeof sdk.tool !== "function") return yield* Effect.die(new Error("workspace plugin SDK is not ready"))
         }),
@@ -354,12 +382,11 @@ const promptSdk = makeGlobalNode({
   deps: [FSUtil.node, Global.node, filesystem, EffectFlock.node],
 })
 
-
-
 const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })
 const processorCreateDie = processorWithCreate(() => Effect.die(new Error("processor creation defect")))
 
 const promptRoot = LayerNode.group([
+  Npm.node,
   SessionPrompt.node,
   Session.node,
   SessionProjector.node,
@@ -703,9 +730,9 @@ const gatedPlugin = LayerNode.make({
   deps: [EventV2Bridge.node, Config.node, RuntimeFlags.node],
 })
 
-const it = testEffect(makeHttp())
-const abruptPrompt = testEffect(makeHttp({ llm: abruptAssistantLLM }))
-const gated = testEffect(
+const it = promptTests(makeHttp())
+const abruptPrompt = promptTests(makeHttp({ llm: abruptAssistantLLM }))
+const gated = promptTests(
   LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
     [Npm.node, promptSdk],
     [SessionSummary.node, summary],
@@ -718,7 +745,7 @@ const gated = testEffect(
     [Plugin.node, gatedPlugin],
   ]),
 )
-const instructionClearFailureTest = testEffect(
+const instructionClearFailureTest = promptTests(
   LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
     [Npm.node, promptSdk],
     [SessionSummary.node, summary],
@@ -728,9 +755,9 @@ const instructionClearFailureTest = testEffect(
     [Instruction.node, gatedInstruction],
   ]),
 )
-const noLLMServer = testEffect(makeHttpNoLLMServer())
-const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
-const processorDies = testEffect(
+const noLLMServer = promptTests(makeHttpNoLLMServer())
+const raceNoLLMServer = promptTests(makeHttpNoLLMServer({ processor: "blocking" }))
+const processorDies = promptTests(
   LayerNode.compile(promptRoot, [
     [Npm.node, promptSdk],
     [SessionSummary.node, summary],
@@ -740,7 +767,7 @@ const processorDies = testEffect(
     [SessionProcessor.node, processorCreateDie],
   ]),
 )
-const withMcpInstructions = testEffect(
+const withMcpInstructions = promptTests(
   makeHttp({
     mcpInstructions: [
       {
@@ -754,7 +781,7 @@ const withMcpInstructions = testEffect(
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
 const nonOwnerCancelDatabasePath = path.join(os.tmpdir(), `opencode-non-owner-cancel-${randomUUID()}.db`)
-const nonOwnerCancel = testEffect(makeHttpWithDatabase(Database.layerFromPath(nonOwnerCancelDatabasePath)))
+const nonOwnerCancel = promptTests(makeHttpWithDatabase(Database.layerFromPath(nonOwnerCancelDatabasePath)))
 const nonOwnerRunState = LayerNode.compile(
   LayerNode.group([SessionRunState.node, SessionStatus.node, EventV2Bridge.node, Database.node]),
   [[Database.node, Database.layerFromPath(nonOwnerCancelDatabasePath)]],
@@ -917,7 +944,7 @@ function failingChatTransformPlugin() {
 }
 
 const preProviderFailurePlugin = failingChatTransformPlugin()
-const preProviderFailurePrompt = testEffect(makeHttp({ plugin: preProviderFailurePlugin.layer }))
+const preProviderFailurePrompt = promptTests(makeHttp({ plugin: preProviderFailurePlugin.layer }))
 
 function busyStatusGate(skipBusy = 0) {
   const entered = defer<void>()
@@ -952,11 +979,11 @@ function busyStatusGate(skipBusy = 0) {
 }
 
 const firstLoad = busyStatusGate()
-const firstLoadPrompt = testEffect(makeHttp({ status: firstLoad.status }))
+const firstLoadPrompt = promptTests(makeHttp({ status: firstLoad.status }))
 const rootlessLoopGate = busyStatusGate()
-const rootlessLoopPrompt = testEffect(makeHttp({ status: rootlessLoopGate.status }))
+const rootlessLoopPrompt = promptTests(makeHttp({ status: rootlessLoopGate.status }))
 const shellQueuedLoopGate = busyStatusGate(1)
-const shellQueuedLoopPrompt = testEffect(makeHttp({ status: shellQueuedLoopGate.status }))
+const shellQueuedLoopPrompt = promptTests(makeHttp({ status: shellQueuedLoopGate.status }))
 
 const directProjectionEntered = defer<void>()
 const directProjectionRelease = defer<void>()
@@ -975,7 +1002,7 @@ const directProjectionCompaction = Layer.succeed(
     create: () => Effect.succeed(MessageID.ascending()),
   }),
 )
-const directProjectionPrompt = testEffect(makeHttp({ compaction: directProjectionCompaction }))
+const directProjectionPrompt = promptTests(makeHttp({ compaction: directProjectionCompaction }))
 
 const succeedVoid = (deferred: Deferred.Deferred<void>) => {
   Effect.runSync(Deferred.succeed(deferred, void 0).pipe(Effect.ignore))
@@ -1779,7 +1806,11 @@ it.instance(
       expect(lastUserContent(next)).toContain("TUI marked message")
 
       const taskExit = yield* awaitWithTimeout(Fiber.await(task), "task did not finish", "10 seconds")
-      const markedExit = yield* awaitWithTimeout(Fiber.await(marked), "TUI prompt did not receive its reply", "10 seconds")
+      const markedExit = yield* awaitWithTimeout(
+        Fiber.await(marked),
+        "TUI prompt did not receive its reply",
+        "10 seconds",
+      )
       const messages = yield* sessions.messages({ sessionID: session.id })
       const markedUser = messages.find(
         (message) => message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === markedText),
@@ -4717,7 +4748,13 @@ const startHeld = Effect.fn("test.startHeld")(function* (input?: {
       )
     : llm.hold("task done", deferredAsPromise(gate))
   const task = yield* prompt
-    .prompt({ sessionID: chat.id, agent: input?.agent ?? "build", model: ref, format: input?.format, parts: said("start the task") })
+    .prompt({
+      sessionID: chat.id,
+      agent: input?.agent ?? "build",
+      model: ref,
+      format: input?.format,
+      parts: said("start the task"),
+    })
     .pipe(Effect.forkChild)
   // A prompt setup failure must retain its cause rather than masquerade as provider readiness.
   yield* awaitWithTimeout(
@@ -4855,7 +4892,9 @@ registerEnvironmentTest(
           const status = yield* SessionStatus.Service
           const events = yield* EventV2Bridge.Service
           const source = Schema.decodeUnknownSync(Schema.Struct({ messages: Schema.Array(SessionV1.WithParts) }))(
-            Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(yield* Effect.promise(() => Bun.file(sourcePath).text())),
+            Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(
+              yield* Effect.promise(() => Bun.file(sourcePath).text()),
+            ),
           )
           const chat = yield* sessions.create({
             title: "Dangling assistant shell",
@@ -5748,7 +5787,7 @@ nonOwnerCancel.instance(
       if (unfinished.info.role !== "assistant") throw new Error("expected the persisted unfinished assistant")
       expect(unfinished.info.time.completed).toBeUndefined()
 
-      const nonOwnerDirectory = yield* tmpdirScoped()
+      const nonOwnerDirectory = yield* tmpdirScoped({ git: true })
       const nonOwnerStatusEvents: { sessionID: string; status: string }[] = []
       const nonOwnerIdleEvents: string[] = []
       const nonOwner = yield* Effect.gen(function* () {
@@ -6096,7 +6135,7 @@ it.instance(
 // and what the bash tool writes, never from the queue under test.
 
 const consumeLockDbPath = path.join(os.tmpdir(), `opencode-consume-lock-${randomUUID()}.db`)
-const consumeLock = testEffect(makeHttpWithDatabase(Database.layerFromPath(consumeLockDbPath)))
+const consumeLock = promptTests(makeHttpWithDatabase(Database.layerFromPath(consumeLockDbPath)))
 
 // The production consume reports each attempt that could not begin with one of these logs, which the tests capture.
 const consumeLockedLog = "queue consume met a held write lock"
@@ -6159,10 +6198,10 @@ const startConsumeLocked = Effect.fn("test.startConsumeLocked")(function* (hold:
       .query("select time_promoted, message_id, time_withdrawn from session_prompt_queue where session_id = ?")
       .all(chat.id)
     const tools = reader
-      .query<{ id: PartID; status: SessionV1.ToolPart["state"]["status"] }, [string]>(
-        "select id, json_extract(data, '$.state.status') as status from part " +
-          "where session_id = ? and json_extract(data, '$.tool') = 'bash'",
-      )
+      .query<
+        { id: PartID; status: SessionV1.ToolPart["state"]["status"] },
+        [string]
+      >("select id, json_extract(data, '$.state.status') as status from part " + "where session_id = ? and json_extract(data, '$.tool') = 'bash'")
       .all(chat.id)
     return { queue, tools }
   }
@@ -6356,7 +6395,10 @@ consumeLock.instance(
           Effect.gen(function* () {
             const taken = yield* Deferred.make<void>()
             yield* queue
-              .exclusive(sessionID, Deferred.succeed(taken, undefined).pipe(Effect.andThen(Deferred.await(permitRelease))))
+              .exclusive(
+                sessionID,
+                Deferred.succeed(taken, undefined).pipe(Effect.andThen(Deferred.await(permitRelease))),
+              )
               .pipe(Effect.forkIn(scope))
             yield* Deferred.await(taken)
           })
@@ -6400,7 +6442,10 @@ consumeLock.instance(
       const begins = newStatementAttempts()
       yield* patchBunQuery((sql) => sql === "begin immediate", begins)
       const deletes = newStatementAttempts()
-      yield* patchBunQuery((sql) => /^delete from "session_prompt_queue" where .*"time_promoted" is not null/.test(sql), deletes)
+      yield* patchBunQuery(
+        (sql) => /^delete from "session_prompt_queue" where .*"time_promoted" is not null/.test(sql),
+        deletes,
+      )
 
       // An unrelated deferred transaction that keeps the shared connection until released. It starts inside the
       // first failed attempt's log, before the next attempt is made, so it takes the connection ahead of it.
@@ -7526,9 +7571,7 @@ gated.instance(
               message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === markedText),
           )
           if (!user) return undefined
-          return messages.some(
-            (message) => message.info.role === "assistant" && message.info.parentID === user.info.id,
-          )
+          return messages.some((message) => message.info.role === "assistant" && message.info.parentID === user.info.id)
             ? true
             : undefined
         }),
@@ -7561,9 +7604,12 @@ gated.instance(
       const admissionRelease = yield* Deferred.make<void>()
       const toolResponse = yield* Deferred.make<void>()
       yield* Effect.addFinalizer(() =>
-        Effect.all([admissionRelease, toolResponse].map((gate) => Deferred.succeed(gate, undefined).pipe(Effect.ignore)), {
-          discard: true,
-        }).pipe(
+        Effect.all(
+          [admissionRelease, toolResponse].map((gate) => Deferred.succeed(gate, undefined).pipe(Effect.ignore)),
+          {
+            discard: true,
+          },
+        ).pipe(
           Effect.andThen(
             Effect.sync(() => {
               gates.noReplyAdmission = undefined
@@ -7677,9 +7723,12 @@ gated.instance(
       const writeRelease = yield* Deferred.make<void>()
       const toolResponse = yield* Deferred.make<void>()
       yield* Effect.addFinalizer(() =>
-        Effect.all([writeRelease, toolResponse].map((gate) => Deferred.succeed(gate, undefined).pipe(Effect.ignore)), {
-          discard: true,
-        }).pipe(
+        Effect.all(
+          [writeRelease, toolResponse].map((gate) => Deferred.succeed(gate, undefined).pipe(Effect.ignore)),
+          {
+            discard: true,
+          },
+        ).pipe(
           Effect.andThen(
             Effect.sync(() => {
               gates.noReplyWrite = undefined
@@ -8118,14 +8167,13 @@ it.instance(
       expect(Exit.isSuccess(exit)).toBe(true)
 
       const messages = yield* sessions.messages({ sessionID: session.id })
-      const retained = messages.find(
-        (message) => message.info.role === "user" && message.info.id === messageID,
-      )
-      if (!retained || retained.info.role !== "user") throw new Error("expected the idle noReply row to remain persisted")
+      const retained = messages.find((message) => message.info.role === "user" && message.info.id === messageID)
+      if (!retained || retained.info.role !== "user")
+        throw new Error("expected the idle noReply row to remain persisted")
       expect(retained.info.noReply).toBe(true)
-      expect(
-        messages.some((message) => message.info.role === "assistant" && message.info.parentID === messageID),
-      ).toBe(false)
+      expect(messages.some((message) => message.info.role === "assistant" && message.info.parentID === messageID)).toBe(
+        false,
+      )
       expect(yield* queue.list(session.id)).toEqual([])
       expect(yield* llm.calls).toBe(2)
     }),
@@ -8172,11 +8220,13 @@ it.instance("keeps message history and admission order coherent across revert cl
       }).user?.id,
     ).toBe(kept.info.id)
 
-    yield* llm.text("remaining message processed")
-    const result = yield* prompt.loop({ sessionID: session.id })
-    expect(result.info.role).toBe("assistant")
-    expect(result.parts.some((part) => part.type === "text" && part.text === "remaining message processed")).toBe(true)
-  }),
+      yield* llm.text("remaining message processed")
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "remaining message processed")).toBe(
+        true,
+      )
+    }),
   30_000,
 )
 
@@ -9825,7 +9875,6 @@ it.instance(
   20000,
 )
 
-
 it.instance(
   "ordinary peers reach each safe active tool continuation in capped batches without advancing holds",
   () =>
@@ -10033,8 +10082,22 @@ it.instance(
           parts: said("historical native request"),
         }
         // Pre-upgrade bare projection: do not create current-build noReply custody.
-        yield* sessions.updateMessage({ id: input.messageID, sessionID: session.id, role: "user", agent: input.agent, model: input.model, system: input.system, time: { created: Date.now() } })
-        yield* sessions.updatePart({ id: PartID.ascending(), messageID: input.messageID, sessionID: session.id, type: "text", text: "historical native request" })
+        yield* sessions.updateMessage({
+          id: input.messageID,
+          sessionID: session.id,
+          role: "user",
+          agent: input.agent,
+          model: input.model,
+          system: input.system,
+          time: { created: Date.now() },
+        })
+        yield* sessions.updatePart({
+          id: PartID.ascending(),
+          messageID: input.messageID,
+          sessionID: session.id,
+          type: "text",
+          text: "historical native request",
+        })
         const before = yield* sessions.messages({ sessionID: session.id })
         for (const retry of [
           input,
@@ -10353,11 +10416,25 @@ it.instance(
   "round4 held actual SDK dependency remains a no-provider failure under unchanged readiness bound",
   () =>
     Effect.gen(function* () {
-      const gate = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      const instance = yield* TestInstance
+      yield* writeText(
+        path.join(instance.directory, ".opencode/tool/sdk-boundary.ts"),
+        'import { tool } from "@opencode-ai/plugin"; export default tool({ description: "local SDK boundary", args: {}, async execute() { return "unused" } })',
+      )
+      const gate = {
+        dir: path.join(instance.directory, ".opencode"),
+        entered: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      }
       sdkReadiness.gate = gate
       const observations: Array<{ sessionID: SessionID; calls: number; runner?: { state: string; frame?: string } }> = []
       const attempt = yield* startHeld({ diagnostic: (value) => observations.push(value) }).pipe(Effect.forkChild)
       yield* awaitWithTimeout(Deferred.await(gate.entered), "actual SDK dependency fixture did not enter its owner")
+      const cfg = yield* Config.Service
+      const dirs = yield* cfg.directories()
+      expect(
+        dirs.every((dir) => dir === Global.Path.config || dir === path.join(instance.directory, ".opencode")),
+      ).toBe(true)
       const exit = yield* awaitWithTimeout(
         Fiber.await(attempt),
         "unchanged first-provider backstop did not fire",
@@ -10374,25 +10451,157 @@ it.instance(
   30000,
 )
 
+it.instance(
+  "round4 critical noReply peer preserves original transport identity and exact aliases",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Direct critical peer identity" })
+      const text =
+        "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791854000-402-abcd\x1f [fm-level:critical]\x1f Critical excluded peer\nComplete tail"
+      const input = { sessionID: session.id, agent: "build", model: ref, noReply: true, parts: said(text) }
+      const original = yield* prompt.prompt(input)
+      const exact = yield* prompt.prompt(input)
+      expect(exact.info.id).toBe(original.info.id)
+      const alias = { ...input, messageID: MessageID.ascending() }
+      expect((yield* prompt.prompt(alias)).info.id).toBe(original.info.id)
+      const before = yield* sessions.messages({ sessionID: session.id })
+      expect((yield* prompt.prompt(alias)).info.id).toBe(original.info.id)
+      expect(Exit.isFailure(yield* Effect.exit(prompt.prompt({ ...alias, parts: said(text + " changed") })))).toBe(true)
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+      expect(before).toHaveLength(1)
+      expect(yield* llm.calls).toBe(0)
+    }),
+  30000,
+)
 
-it.instance("round4 critical noReply peer preserves original transport identity and exact aliases", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const session = yield* sessions.create({ title: "Direct critical peer identity" })
-    const text = "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791854000-402-abcd\x1f [fm-level:critical]\x1f Critical excluded peer\nComplete tail"
-    const input = { sessionID: session.id, agent: "build", model: ref, noReply: true, parts: said(text) }
-    const original = yield* prompt.prompt(input)
-    const exact = yield* prompt.prompt(input)
-    expect(exact.info.id).toBe(original.info.id)
-    const alias = { ...input, messageID: MessageID.ascending() }
-    expect((yield* prompt.prompt(alias)).info.id).toBe(original.info.id)
-    const before = yield* sessions.messages({ sessionID: session.id })
-    expect((yield* prompt.prompt(alias)).info.id).toBe(original.info.id)
-    expect(Exit.isFailure(yield* Effect.exit(prompt.prompt({ ...alias, parts: said(text + " changed") })))).toBe(true)
-    expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
-    expect(before).toHaveLength(1)
-    expect(yield* llm.calls).toBe(0)
-  }), 30000,
+unix(
+  "round5 overlapping command expansion executes once and binds before a retry enters",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const marker = path.join(instance.directory, "inflight-command.txt")
+      const release = path.join(instance.directory, "release-command")
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: {
+          probe: {
+            template: `!\`printf 'execution\\n' >> '${marker}'; while [ ! -f '${release}' ]; do sleep 0.01; done; printf 'prepared once'\``,
+          },
+        },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Held executable preparation" })
+      const input = { sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" }
+      yield* llm.text("executed once")
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      const first = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        Effect.promise(async () =>
+          (await Bun.file(marker).exists()) ? await Bun.file(marker).text() : undefined,
+        ).pipe(Effect.map((text) => (text === "execution\n" ? true : undefined))),
+        "first executable expansion did not publish its marker",
+        "10 seconds",
+      )
+      const entered = yield* Deferred.make<void>()
+      const second = yield* Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(prompt.command(input)),
+        Effect.forkChild,
+      )
+      yield* Deferred.await(entered)
+      expect(yield* llm.calls).toBe(0)
+      yield* writeText(release, "released")
+      const result = yield* awaitWithTimeout(Fiber.join(first), "first command did not finish", "10 seconds")
+      const retry = yield* awaitWithTimeout(Fiber.await(second), "second command did not refuse", "10 seconds")
+      expect(Exit.isFailure(retry)).toBe(true)
+      expect(result.info.role).toBe("assistant")
+      expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("execution\n")
+      expect(yield* llm.calls).toBe(1)
+      expect(
+        (yield* sessions.messages({ sessionID: session.id })).filter((message) => message.info.role === "user"),
+      ).toHaveLength(1)
+    }),
+  30000,
+)
+
+unix(
+  "round5 foreign projected identity appearing during expansion refuses admission without a DB IO lock",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const marker = path.join(instance.directory, "foreign-command.txt")
+      const release = path.join(instance.directory, "release-foreign-command")
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: {
+          probe: {
+            template: `!\`printf 'execution\\n' >> '${marker}'; while [ ! -f '${release}' ]; do sleep 0.01; done; printf 'prepared once'\``,
+          },
+        },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Foreign identity during IO" })
+      const input = { sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" }
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      const first = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        Effect.promise(async () => ((await Bun.file(marker).exists()) ? true : undefined)),
+        "command did not enter expansion",
+        "10 seconds",
+      )
+      const bare = yield* awaitWithTimeout(
+        sessions.updateMessage({
+          id: input.messageID,
+          sessionID: session.id,
+          role: "user",
+          agent: "build",
+          model: ref,
+          time: { created: 456 },
+        }),
+        "expansion held a DB transaction",
+        "2 seconds",
+      )
+      const before = yield* sessions.messages({ sessionID: session.id })
+      yield* writeText(release, "released")
+      const result = yield* awaitWithTimeout(Fiber.await(first), "foreign identity did not refuse", "10 seconds")
+      expect(Exit.isFailure(result)).toBe(true)
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+      expect((yield* sessions.messages({ sessionID: session.id }))[0]?.info.id).toBe(bare.id)
+      expect(yield* llm.calls).toBe(0)
+    }),
+  30000,
+)
+
+it.instance(
+  "round5 SDK fixture replaces an unrelated installed package with the exact workspace source",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const dir = path.join(instance.directory, ".opencode")
+      const entry = path.join(dir, "node_modules/@opencode-ai/plugin")
+      yield* writeText(
+        path.join(entry, "package.json"),
+        JSON.stringify({ name: "@opencode-ai/plugin", version: "1.19.0", type: "module", exports: "./index.js" }),
+      )
+      yield* writeText(path.join(entry, "index.js"), "export const tool = () => 'wrong SDK'\n")
+      const npm = yield* Npm.Service
+      yield* npm.install(dir, { add: [{ name: "@opencode-ai/plugin" }] })
+      const actual = yield* Effect.promise(() =>
+        realpath(createRequire(path.join(dir, "sdk-fixture.cjs")).resolve("@opencode-ai/plugin")),
+      )
+      const expected = yield* Effect.promise(() =>
+        realpath(path.resolve(import.meta.dir, "../../../plugin/src/index.ts")),
+      )
+      expect(actual).toBe(expected)
+      expect(yield* Effect.promise(() => realpath(entry))).toBe(
+        yield* Effect.promise(() => realpath(path.resolve(import.meta.dir, "../../../plugin"))),
+      )
+      const sdk = yield* Effect.promise(() => import(pathToFileURL(actual).href))
+      expect(typeof sdk.tool).toBe("function")
+    }),
+  30000,
 )
