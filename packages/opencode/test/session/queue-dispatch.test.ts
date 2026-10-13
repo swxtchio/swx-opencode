@@ -1783,7 +1783,6 @@ it.instance("round6 in-flight executable identity refuses competing entries befo
     }
     const entered = yield* Deferred.make<void>()
     const release = yield* Deferred.make<void>()
-    yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
     const first = yield* queue
       .prepareExecutable({
         ...input,
@@ -1791,6 +1790,7 @@ it.instance("round6 in-flight executable identity refuses competing entries befo
           Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.as(input)),
       })
       .pipe(Effect.forkChild)
+    yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
     yield* Deferred.await(entered)
     const forbidden = () => Effect.die(new Error("competing input reached preparation"))
     const exits = yield* Effect.all(
@@ -1831,7 +1831,7 @@ it.instance("round6 in-flight executable identity refuses competing entries befo
   }),
 )
 
-it.instance("round6 executable reservation is released by failure and cancellation before fresh admission", () =>
+it.instance("round6 executable reservation is released after failed or cancelled preparation settles", () =>
   Effect.gen(function* () {
     const queue = yield* SessionQueue.Service
     const sessions = yield* Session.Service
@@ -1848,14 +1848,29 @@ it.instance("round6 executable reservation is released by failure and cancellati
     if (Exit.isFailure(failure)) expect(Cause.squash(failure.cause)).toBe("preparation failed")
     yield* queue.assertFreshIdentity(session.id, input.messageID)
     const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
     const first = yield* queue
       .prepareExecutable({
         ...input,
-        prepare: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        prepare: () =>
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.as(input)),
       })
       .pipe(Effect.forkChild)
+    yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
     yield* Deferred.await(entered)
-    yield* Fiber.interrupt(first)
+    const stopping = yield* Fiber.interrupt(first).pipe(Effect.forkChild({ startImmediately: true }))
+    yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
+    const blocked = yield* Effect.exit(queue.assertFreshIdentity(session.id, input.messageID))
+    const held = first.pollUnsafe()
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(stopping)
+    const interrupted = yield* Fiber.await(first)
+    expect(Exit.isFailure(blocked)).toBe(true)
+    if (Exit.isFailure(blocked))
+      expect(Cause.squash(blocked.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+    expect(held).toBeUndefined()
+    expect(Exit.isFailure(interrupted) && Cause.hasInterrupts(interrupted.cause)).toBe(true)
+    expect(yield* queue.list(session.id)).toEqual([])
     yield* queue.assertFreshIdentity(session.id, input.messageID)
     const admitted = yield* queue.prepareExecutable({ ...input, prepare: () => Effect.succeed(input) })
     expect(admitted.input).toEqual(input)

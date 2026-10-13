@@ -10312,6 +10312,19 @@ for (const custody of ["pending", "retained", "consumed"] as const)
               rejected: (cause) => Effect.failCause(cause),
             })
         }
+        // HTTP request receipt can precede the runner's initial snapshot write; freeze only after that part exists.
+        if (held)
+          yield* pollWithTimeout(
+            sessions.messages({ sessionID: session.id }).pipe(
+              Effect.map((messages) =>
+                messages.some((message) =>
+                  message.info.role === "assistant" && message.parts.some((part) => part.type === "step-start"),
+                ) ? true : undefined,
+              ),
+            ),
+            "held provider did not persist its initial step",
+            "10 seconds",
+          )
         const before = yield* sessions.messages({ sessionID: session.id })
         const pending = yield* queue.list(session.id)
         const calls = yield* llm.calls
@@ -10503,8 +10516,8 @@ unix(
       const session = yield* sessions.create({ title: "Held executable preparation" })
       const input = { sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" }
       yield* llm.text("executed once")
-      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
       const first = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
       yield* pollWithTimeout(
         Effect.promise(async () =>
           (await Bun.file(marker).exists()) ? await Bun.file(marker).text() : undefined,
@@ -10552,8 +10565,8 @@ unix(
       const sessions = yield* Session.Service
       const session = yield* sessions.create({ title: "Foreign identity during IO" })
       const input = { sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" }
-      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
       const first = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
       yield* pollWithTimeout(
         Effect.promise(async () => ((await Bun.file(marker).exists()) ? true : undefined)),
         "command did not enter expansion",
@@ -10629,7 +10642,6 @@ unix(
           },
         }),
       })
-      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
       const expanding = yield* held.prompt
         .command({
           sessionID: held.chat.id,
@@ -10639,6 +10651,7 @@ unix(
           delivery: "queue",
         })
         .pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
       yield* pollWithTimeout(
         Effect.promise(async () => ((await Bun.file(marker).exists()) ? true : undefined)),
         "command never entered external preparation",
@@ -10743,7 +10756,6 @@ unix(
           },
         }),
       })
-      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
       const expanding = yield* held.prompt
         .command({
           sessionID: held.chat.id,
@@ -10753,6 +10765,7 @@ unix(
           delivery: "queue",
         })
         .pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
       yield* pollWithTimeout(
         Effect.promise(async () => ((await Bun.file(marker).exists()) ? true : undefined)),
         "command preparation did not enter",
@@ -10810,34 +10823,61 @@ gated.instance(
       const session = yield* sessions.create({})
       const directID = MessageID.ascending()
       const observed: SessionV1.WithParts[] = []
-      gates.commandBefore = prompt
-        .prompt({
-          sessionID: session.id,
-          messageID: directID,
-          model: ref,
-          agent: "build",
-          noReply: true,
-          parts: said("direct input from awaited hook"),
-        })
-        .pipe(
-          Effect.tap((message) =>
-            Effect.sync(() => {
-              observed.push(message)
-            }),
-          ),
-          Effect.asVoid,
-        )
+      const entered = yield* Deferred.make<void>()
+      const completed = yield* Deferred.make<void>()
+      const providerRelease = yield* Deferred.make<void>()
+      gates.commandBefore = Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(
+          prompt.prompt({
+            sessionID: session.id,
+            messageID: directID,
+            model: ref,
+            agent: "build",
+            noReply: true,
+            parts: said("direct input from awaited hook"),
+          }),
+        ),
+        Effect.tap((message) =>
+          Effect.sync(() => {
+            observed.push(message)
+          }),
+        ),
+        Effect.andThen(Deferred.succeed(completed, undefined)),
+        Effect.asVoid,
+      )
+      yield* llm.hold("command complete", deferredAsPromise(providerRelease))
+      const task = yield* prompt
+        .command({ sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" })
+        .pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => Deferred.succeed(providerRelease, undefined).pipe(Effect.asVoid))
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           gates.commandBefore = undefined
         }),
       )
-      yield* llm.text("command complete")
-      const result = yield* awaitWithTimeout(
-        prompt.command({ sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" }),
-        "awaited hook deadlocked on session permit",
-        "2 seconds",
+      yield* awaitWithTimeout(Deferred.await(entered), "command setup never reached pre-execution hook", "10 seconds")
+      yield* awaitWithTimeout(Deferred.await(completed), "awaited hook direct input did not complete", "2 seconds")
+      yield* awaitWithTimeout(
+        Effect.raceFirst(
+          llm.wait(1),
+          Fiber.join(task).pipe(Effect.andThen(Effect.fail(new Error("command ended before provider request")))),
+        ),
+        "command provider never started",
+        "10 seconds",
       )
+      // The actual hook is complete. Holding provider completion past its bound must not fail that phase.
+      yield* Effect.sleep("2100 millis")
+      const held = task.pollUnsafe()
+      if (held)
+        yield* Effect.sync(() =>
+          console.error("command ended after hook completion", {
+            observed: observed.length,
+            cause: Exit.isFailure(held) ? Cause.pretty(held.cause) : "Success",
+          }),
+        )
+      yield* Deferred.succeed(providerRelease, undefined)
+      const result = yield* Fiber.join(task)
+      expect(held).toBeUndefined()
       expect(observed).toHaveLength(1)
       expect(observed[0]?.info.id).toBe(directID)
       expect(result.info.role).toBe("assistant")
@@ -10845,6 +10885,221 @@ gated.instance(
       expect(
         (yield* sessions.messages({ sessionID: session.id })).filter((message) => message.info.role === "user"),
       ).toHaveLength(2)
+    }),
+  30000,
+)
+
+unix(
+  "round7 interrupted real expansion keeps its identity until external termination",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const marker = path.join(instance.directory, "round7-native-entered")
+      const ended = path.join(instance.directory, "round7-native-ended")
+      const release = path.join(instance.directory, "round7-native-release")
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: {
+          probe: {
+            template: `!\`printf 'execution\\n' >> '${marker}'; while [ ! -f '${release}' ]; do sleep 0.01; done; printf 'terminated\\n' >> '${ended}'; printf 'cancelled intent'\``,
+          },
+        },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({})
+      const input = { sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" }
+      const lines = () =>
+        Effect.promise(async () =>
+          (await Bun.file(marker).exists()) ? (await Bun.file(marker).text()).trim().split("\n").length : 0,
+        )
+      yield* llm.text("unexpected retry answer")
+      const first = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      yield* pollWithTimeout(
+        lines().pipe(Effect.map((count) => (count === 1 ? true : undefined))),
+        "native expansion did not enter",
+      )
+      const stopping = yield* Fiber.interrupt(first).pipe(Effect.forkChild({ startImmediately: true }))
+      const second = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      const outcome = yield* Effect.raceFirst(
+        Fiber.await(second).pipe(
+          Effect.map((exit) =>
+            Exit.isFailure(exit) && Cause.squash(exit.cause) instanceof SessionQueue.HistoricalIdentityError
+              ? "refused"
+              : "unexpected terminal",
+          ),
+        ),
+        pollWithTimeout(
+          lines().pipe(Effect.map((count) => (count === 2 ? true : undefined))),
+          "retry did not expand",
+          "2 seconds",
+        ).pipe(Effect.as("expanded")),
+      )
+      const beforeRelease = {
+        outcome,
+        markers: yield* lines(),
+        released: yield* Effect.promise(() => Bun.file(release).exists()),
+        firstExit: first.pollUnsafe()?._tag,
+        calls: yield* llm.calls,
+      }
+      const direct = yield* awaitWithTimeout(
+        prompt.prompt({
+          sessionID: session.id,
+          messageID: MessageID.ascending(),
+          noReply: true,
+          agent: "build",
+          model: ref,
+          parts: said("distinct input during interrupted expansion"),
+        }),
+        "unrelated input blocked by interrupted preparation",
+        "2 seconds",
+      )
+      yield* writeText(release, "released")
+      const firstExit = yield* awaitWithTimeout(
+        Fiber.await(first),
+        "interrupted expansion did not settle after native termination",
+        "10 seconds",
+      )
+      yield* Fiber.join(stopping)
+      yield* awaitWithTimeout(Fiber.await(second), "retry did not settle", "10 seconds")
+      expect(beforeRelease).toEqual({ outcome: "refused", markers: 1, released: false, firstExit: undefined, calls: 0 })
+      expect(direct.info.role).toBe("user")
+      expect(Exit.isFailure(firstExit) && Cause.hasInterrupts(firstExit.cause)).toBe(true)
+      expect(yield* Effect.promise(() => Bun.file(ended).text())).toBe("terminated\n")
+      expect(yield* lines()).toBe(1)
+      expect(yield* llm.calls).toBe(0)
+      expect(
+        (yield* sessions.messages({ sessionID: session.id })).filter((message) => message.info.role === "user"),
+      ).toHaveLength(1)
+    }),
+  30000,
+)
+
+unix(
+  "round7 failed parallel expansion keeps custody until its surviving native child exits",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const marker = path.join(instance.directory, "round7-parallel-entered")
+      const ended = path.join(instance.directory, "round7-parallel-ended")
+      const release = path.join(instance.directory, "round7-parallel-release")
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: {
+          probe: {
+            template: `!\`printf 'execution\\n' >> '${marker}'; while [ ! -f '${release}' ]; do sleep 0.01; done; printf 'terminated\\n' >> '${ended}'\` !\`printf 'invalid\0argument'\``,
+          },
+        },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({})
+      const input = { sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" }
+      const first = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      yield* pollWithTimeout(
+        Effect.promise(async () => ((await Bun.file(marker).exists()) ? true : undefined)),
+        "parallel surviving child did not enter",
+      )
+      const second = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      const retry = yield* awaitWithTimeout(
+        Fiber.await(second),
+        "parallel failure released or stalled identity before surviving IO ended",
+        "2 seconds",
+      )
+      const pending = first.pollUnsafe()
+      const before = yield* Effect.promise(() => Bun.file(marker).text())
+      const stillRunning = !(yield* Effect.promise(() => Bun.file(ended).exists()))
+      yield* writeText(release, "released")
+      const failed = yield* Fiber.await(first)
+      expect(Exit.isFailure(retry) && Cause.squash(retry.cause) instanceof SessionQueue.HistoricalIdentityError).toBe(
+        true,
+      )
+      expect(pending).toBeUndefined()
+      expect(before).toBe("execution\n")
+      expect(stillRunning).toBe(true)
+      expect(Exit.isFailure(failed)).toBe(true)
+      if (Exit.isFailure(failed)) expect(Cause.pretty(failed.cause)).toContain("null bytes")
+      expect(yield* Effect.promise(() => Bun.file(ended).text())).toBe("terminated\n")
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual([])
+      expect(yield* llm.calls).toBe(0)
+    }),
+  30000,
+)
+
+gated.instance(
+  "round7 interrupted promise hook keeps custody until its returned work settles",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: { probe: { template: "promise hook intent" } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({})
+      const entered = defer<void>()
+      const release = defer<void>()
+      const markers: string[] = []
+      const hook = Effect.promise(() => {
+        markers.push("entered")
+        entered.resolve()
+        return release.promise.then(() => {
+          markers.push("terminated")
+        })
+      })
+      gates.commandBefore = hook
+      const input = { sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" }
+      yield* llm.text("unexpected retry answer")
+      const first = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          release.resolve()
+          gates.commandBefore = undefined
+        }),
+      )
+      yield* awaitWithTimeout(
+        Effect.promise(() => entered.promise),
+        "command did not enter its native promise hook",
+        "10 seconds",
+      )
+      gates.commandBefore = hook
+      const stopping = yield* Fiber.interrupt(first).pipe(Effect.forkChild({ startImmediately: true }))
+      const second = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          release.resolve()
+          gates.commandBefore = undefined
+        }),
+      )
+      const outcome = yield* Effect.raceFirst(
+        Fiber.await(second).pipe(
+          Effect.map((exit) =>
+            Exit.isFailure(exit) && Cause.squash(exit.cause) instanceof SessionQueue.HistoricalIdentityError
+              ? "refused"
+              : "unexpected terminal",
+          ),
+        ),
+        pollWithTimeout(
+          Effect.sync(() => (markers.filter((marker) => marker === "entered").length === 2 ? true : undefined)),
+          "retry did not enter native hook",
+          "2 seconds",
+        ).pipe(Effect.as("entered twice")),
+      )
+      const before = { outcome, markers: [...markers], firstExit: first.pollUnsafe()?._tag, calls: yield* llm.calls }
+      release.resolve()
+      yield* Fiber.join(stopping)
+      const firstExit = yield* Fiber.await(first)
+      yield* Fiber.await(second)
+      gates.commandBefore = undefined
+      expect(before).toEqual({ outcome: "refused", markers: ["entered"], firstExit: undefined, calls: 0 })
+      expect(markers).toEqual(["entered", "terminated"])
+      expect(Exit.isFailure(firstExit) && Cause.hasInterrupts(firstExit.cause)).toBe(true)
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual([])
+      expect(yield* llm.calls).toBe(0)
     }),
   30000,
 )

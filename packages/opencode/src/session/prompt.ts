@@ -1827,11 +1827,15 @@ const layer = Layer.effect(
             if (shellMatches.length > 0) {
               const cfg = yield* config.get()
               const sh = Shell.preferred(cfg.shell)
-              const results = yield* Effect.promise(() =>
-                Promise.all(
+              const results = yield* Effect.promise(async () => {
+                // One rejected expansion must not release custody while another child is still running.
+                const settled = await Promise.allSettled(
                   shellMatches.map(async ([, cmd]) => (await Process.text([cmd], { shell: sh, nothrow: true })).text),
-                ),
-              )
+                )
+                const failed = settled.find((result) => result.status === "rejected")
+                if (failed?.status === "rejected") throw failed.reason
+                return settled.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []))
+              })
               let index = 0
               template = template.replace(bashRegex, () => results[index++])
             }

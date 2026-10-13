@@ -860,7 +860,8 @@ const layer = Layer.effect(
         ),
         (owner) =>
           Effect.gen(function* () {
-            const prepared = yield* input.prepare()
+            // A caller interrupt must not abandon native IO or hook promises and reopen the identity.
+            const prepared = yield* input.prepare().pipe(Effect.uninterruptible)
             return yield* exclusive(
               input.sessionID,
               Effect.gen(function* () {
