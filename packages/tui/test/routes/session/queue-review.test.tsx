@@ -688,7 +688,7 @@ test("a second UP after a withdrawal's list but before its answer copies nothing
     await app.renderer.mockInput.typeText("check the build")
     app.renderer.mockInput.pressEnter()
     await until(() => app.prompts.length === 1, "the send")
-    app.publish([pendingItem("que_mine", "check the build", { requestID: app.prompts[0]!.requestID })])
+    app.publish([pendingItem("que_mine", "check the build", { requestID: app.prompts[0].requestID })])
     await until(async () => queuedLines(await screen(app), "check the build").length === 1, "the listed prompt")
 
     app.renderer.mockInput.pressArrow("up")
