@@ -28,7 +28,9 @@ export function DialogQueue(props: { sessionID: string }) {
   const toast = useToast()
   const holder = `tui_${crypto.randomUUID()}`
   const items = createMemo(() => sync.data.session_queue[props.sessionID] ?? [])
-  // Delivery is paused only once the server confirms the hold.
+  // Delivery is paused only while the server confirms the hold: a renewal it
+  // refuses may let the lease lapse, so the view says so and locks its edits
+  // until a later renewal is confirmed.
   const [hold, setHold] = createSignal<"pending" | "held" | "failed">("pending")
   let closed = false
   let renewed = Date.now()
@@ -65,7 +67,7 @@ export function DialogQueue(props: { sessionID: string }) {
       })
       .catch((error) => {
         if (closed) return
-        if (!renewal) setHold("failed")
+        setHold("failed")
         failed(renewal ? "keep pausing delivery of" : "pause delivery of")(error)
       })
       .finally(() => {

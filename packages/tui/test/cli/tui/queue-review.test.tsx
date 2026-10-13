@@ -384,6 +384,44 @@ test("a hold the server refuses says delivery is not paused", async () => {
   expect(await view.frame()).toContain("Could not pause delivery")
 })
 
+test("a renewal the server refuses says delivery is not paused and locks edits until one is confirmed", async () => {
+  let holds = 0
+  const view = await setup([steer, queued], (path) =>
+    path.endsWith("/queue/hold") && holds++ === 1
+      ? Promise.resolve(json({ name: "Unavailable" }, { status: 503 }))
+      : undefined,
+  )
+  const shows = async (text: string) => {
+    for (let turn = 0; turn < 1000; turn++) {
+      if ((await view.frame()).includes(text)) return
+      await new Promise<void>((resolve) => queueMicrotask(resolve))
+    }
+    expect(await view.frame()).toContain(text)
+  }
+  jest.useFakeTimers()
+  DialogQueue.show(view.dialog, sessionID)
+  await settle(() => view.queued("hold").length === 1)
+  await shows("(delivery paused)")
+
+  // Activity a minute later renews the hold, and the server refuses.
+  jest.advanceTimersByTime(60_000)
+  view.app.mockInput.pressKey("x")
+  await settle(() => view.queued("hold").length === 2)
+  await shows("delivery NOT paused")
+  view.app.mockInput.pressKey("d", { ctrl: true })
+  view.app.mockInput.pressKey("o", { ctrl: true })
+  expect(view.queued("remove")).toEqual([])
+  expect(view.queued("consolidate")).toEqual([])
+
+  // The next renewal it confirms pauses delivery again, and edits with it.
+  jest.advanceTimersByTime(60_000)
+  view.app.mockInput.pressKey("x")
+  await settle(() => view.queued("hold").length === 3)
+  await shows("(delivery paused)")
+  view.app.mockInput.pressKey("o", { ctrl: true })
+  await settle(() => view.queued("consolidate").length === 1)
+})
+
 test("a close while the hold is unanswered releases at once, and again when the hold lands", async () => {
   const pending = later()
   const view = await setup([steer], (path) => (path.endsWith("/queue/hold") ? pending.response : undefined))

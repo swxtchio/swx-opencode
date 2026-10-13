@@ -239,15 +239,19 @@ it.live(
 
       // Delete the second row; its durable row is gone, not withdrawn.
       // The selection follows its item as the list changes, so each move starts from the top.
+      const doomed = (yield* tui.rows).find((row) => texts([row])[0] === "drop this one")!
       tui.renderer.mockInput.pressKey("HOME")
       tui.renderer.mockInput.pressArrow("down")
       tui.renderer.mockInput.pressKey("d", { ctrl: true })
       yield* pollWithTimeout(
-        tui.rows.pipe(
-          Effect.map((rows) => (rows.some((row) => texts([row])[0] === "drop this one") ? undefined : true)),
-        ),
+        tui.rows.pipe(Effect.map((rows) => (rows.some((row) => row.id === doomed.id) ? undefined : true))),
         "the deleted prompt's row was never removed",
       )
+      // Nothing is left to restore, as there would be for a withdrawn prompt.
+      const restored = yield* Effect.promise(() =>
+        tui.sdk.session.queue.restore({ sessionID: tui.sessionID, id: doomed.id }),
+      )
+      expect(restored.response.status).toBe(404)
 
       // Consolidate: the two lint commands as one with steps.
       tui.renderer.mockInput.pressKey("o", { ctrl: true })

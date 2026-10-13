@@ -4,7 +4,7 @@ import { rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { eq } from "drizzle-orm"
-import { Deferred, Effect, Exit, Fiber, Layer, Option } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
@@ -118,6 +118,166 @@ const gated = (sessionID: SessionID, delivery: SessionQueue.Delivery, written: s
       ),
     }
   })
+
+// Like `gated`, but the first preparation then ends as `outcome` says: it fails,
+// or it is interrupted. `finish` returns how the promotion ended.
+const stale = (
+  sessionID: SessionID,
+  delivery: SessionQueue.Delivery,
+  written: string[],
+  outcome: "fail" | "interrupt",
+) =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const preparing = yield* Deferred.make<void>()
+    const gate = yield* Deferred.make<void>()
+    const fiber = yield* queue
+      .promote({
+        sessionID,
+        delivery,
+        prepare: (input) =>
+          Deferred.isDone(preparing).pipe(
+            Effect.flatMap((again) =>
+              again
+                ? Effect.succeed(input)
+                : Deferred.succeed(preparing, undefined).pipe(
+                    Effect.andThen(Deferred.await(gate)),
+                    Effect.andThen(outcome === "fail" ? Effect.fail("stale failure") : Effect.interrupt),
+                  ),
+            ),
+          ),
+        write: (input) =>
+          Effect.sync(() =>
+            written.push(input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")),
+          ),
+        rejected: () => Effect.sync(() => written.push("rejected")),
+      })
+      .pipe(Effect.forkChild)
+    yield* awaitWithTimeout(Deferred.await(preparing), "the gated promotion never began preparing")
+    return Deferred.succeed(gate, undefined).pipe(
+      Effect.andThen(awaitWithTimeout(Fiber.await(fiber), "the gated promotion never returned")),
+    )
+  })
+
+const request = (sessionID: SessionID, delivery: SessionQueue.Delivery, requestID: string, value: string) =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    return yield* queue.request({ sessionID, delivery, requestID, parts: [{ type: "text", text: value }] })
+  })
+
+it.instance(
+  "a preparation that fails or is interrupted after a merge made its reservation stale removes nothing",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const cases = (["fail", "interrupt"] as const).flatMap((outcome) =>
+        (["steer", "queue"] as const).flatMap((delivery) =>
+          (["consolidated", "admitted"] as const).map((merge) => ({ outcome, delivery, merge })),
+        ),
+      )
+      yield* Effect.forEach(cases, ({ outcome, delivery, merge }) =>
+        Effect.gen(function* () {
+          const session = yield* sessions.create({ title: `${merge} while preparing, then ${outcome}, ${delivery}` })
+          const written: string[] = []
+          const named = merge === "admitted"
+          yield* named ? request(session.id, delivery, "req-a", "run lint") : admit(session.id, delivery, "run lint")
+          const finish = yield* stale(session.id, delivery, written, outcome)
+          // The merge takes the second command into the row being prepared.
+          if (named) yield* request(session.id, delivery, "req-b", "run lint --fix")
+          if (!named) yield* admit(session.id, delivery, "run lint --fix")
+          if (!named) yield* queue.consolidate(session.id)
+          expect((yield* queue.list(session.id)).map(text)).toEqual(["run lint:\n1. run lint\n2. --fix"])
+          const exit = yield* finish
+          expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(outcome === "interrupt")
+          yield* promoter(session.id, written)(delivery)
+          expect(written).toEqual(["run lint:\n1. run lint\n2. --fix"])
+          expect(yield* queue.list(session.id)).toEqual([])
+          if (named)
+            expect(Option.getOrThrow(yield* queue.receipt(session.id, "req-b"))).toMatchObject({
+              state: "merged",
+              into: "req-a",
+            })
+        }),
+      )
+    }),
+  60_000,
+)
+
+it.instance(
+  "a copy consolidated into a prompt that then joins a command follows it to the command",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "copy, then command" })
+      yield* admit(session.id, "steer", "run lint")
+      yield* request(session.id, "steer", "req-b", "run lint --fix")
+      yield* request(session.id, "queue", "req-c", "run lint --fix")
+      const [merged, ...rest] = yield* queue.consolidate(session.id)
+      expect([text(merged!), rest]).toEqual(["run lint:\n1. run lint\n2. --fix", []])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "req-b"))).toEqual({
+        state: "pending",
+        itemID: merged!.id,
+      })
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "req-c"))).toEqual({ state: "merged", into: "req-b" })
+      yield* promoter(session.id, [])("steer")
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "req-c"))).toMatchObject({
+        state: "merged",
+        into: "req-b",
+        messageID: expect.any(String),
+      })
+    }),
+  30_000,
+)
+
+it.instance(
+  "a keyed notice never supersedes a reply, nor a reply one",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "keyed replies" })
+      const status = (text: string) => `[fm-from-firstmate]\x1f[fm-level:nudge:status]\x1f ${text}`
+      const notices = [
+        ["r1", status("re:p1760000000-1-aaaa done")],
+        ["r2", status("re:p1760000000-2-bbbb done")],
+        ["s1", status("status: building")],
+        ["r3", status("re:p1760000000-3-cccc done")],
+        ["s2", status("status: tests running")],
+      ] as const
+      for (const [requestID, value] of notices) yield* request(session.id, "queue", requestID, value)
+      expect((yield* queue.list(session.id)).map(text)).toEqual([
+        status("re:p1760000000-1-aaaa done"),
+        status("re:p1760000000-2-bbbb done"),
+        status("status: tests running"),
+        status("re:p1760000000-3-cccc done"),
+      ])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "s1"))).toEqual({ state: "superseded", by: "s2" })
+      for (const requestID of ["r1", "r2", "r3"])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, requestID))).toMatchObject({ state: "pending" })
+    }),
+  30_000,
+)
+
+it.instance(
+  "a prompt whose delivery changes while it is being prepared is not committed under the old one",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "delivery changed in preparation" })
+      const written: string[] = []
+      const item = yield* admit(session.id, "steer", "steer, then queue")
+      const racing = yield* gated(session.id, "steer", written)
+      yield* queue.update({ sessionID: session.id, itemID: item.id, delivery: "queue" })
+      yield* racing.finish
+      expect(written).toEqual([])
+      yield* promoter(session.id, written)("queue")
+      expect(written).toEqual(["steer, then queue"])
+    }),
+  30_000,
+)
 
 it.instance(
   "a promotion prepared before a hold or a reorder never commits its stale reservation",

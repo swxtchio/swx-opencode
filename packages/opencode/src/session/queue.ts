@@ -791,15 +791,23 @@ const layer = Layer.effect(
       readonly itemID: ItemID
       readonly delivery: Delivery
     }) {
-      const row = yield* writable(input.sessionID, (tx) =>
-        tx
-          .update(SessionPromptQueueTable)
-          .set({ delivery: input.delivery })
-          .where(and(eq(SessionPromptQueueTable.id, input.itemID), pending(input.sessionID)))
-          .returning()
-          .get()
-          .pipe(Effect.orDie),
+      // A promotion prepared under the old delivery must not commit under it (#240).
+      const updated = yield* writable(input.sessionID, (tx) =>
+        Effect.gen(function* () {
+          const finished = yield* invalidate(tx, input.sessionID)
+          const row = yield* tx
+            .update(SessionPromptQueueTable)
+            .set({ delivery: input.delivery })
+            .where(and(eq(SessionPromptQueueTable.id, input.itemID), pending(input.sessionID)))
+            .returning()
+            .get()
+            .pipe(Effect.orDie)
+          return { row, finished }
+        }),
       ).pipe(Effect.orDie)
+      finish(updated.finished)
+      const row = updated.row
+      if (!row && updated.finished.length > 0) yield* publish(input.sessionID)
       if (!row) return Option.none()
       wake(input.sessionID)
       yield* publish(input.sessionID)
@@ -991,6 +999,14 @@ const layer = Layer.effect(
                 ].map(fromRow),
                 markers,
               )
+              // Receipts settle while every carrier still exists, copies before the
+              // command they then join, so a request follows each hop to the last.
+              yield* Effect.forEach(plan.into, (merge) =>
+                Effect.gen(function* () {
+                  const into = yield* rowOf(tx, merge.into)
+                  if (into) yield* settleReceipts(tx, sessionID, merge.items, { kind: "merged", into })
+                }),
+              )
               if (plan.removed.length > 0)
                 yield* tx
                   .delete(SessionPromptQueueTable)
@@ -1008,17 +1024,6 @@ const layer = Layer.effect(
                   .where(eq(SessionPromptQueueTable.id, changed.id))
                   .run()
                   .pipe(Effect.orDie),
-              )
-              yield* Effect.forEach(plan.into, (merge) =>
-                Effect.gen(function* () {
-                  const into = yield* tx
-                    .select()
-                    .from(SessionPromptQueueTable)
-                    .where(eq(SessionPromptQueueTable.id, merge.into))
-                    .get()
-                    .pipe(Effect.orDie)
-                  if (into) yield* settleReceipts(tx, sessionID, merge.items, { kind: "merged", into })
-                }),
               )
               finish(finished)
               return { changed: plan.removed.length > 0 || finished.length > 0, into: plan.into }
@@ -1145,22 +1150,39 @@ const layer = Layer.effect(
         Effect.tap(() => Effect.sync(() => deliver(itemID, id))),
       )
 
-    const drop = (sessionID: SessionID, itemID: ItemID) =>
+    // Both act only on the reservation `id` they were given, and say whether it
+    // was still current: a hold, reorder, consolidation or admission merge that
+    // invalidated it meanwhile owns the row now, which may carry more work.
+    const drop = (sessionID: SessionID, itemID: ItemID, id: MessageID) =>
       writable(sessionID, (tx) =>
         Effect.gen(function* () {
-          yield* tx.delete(SessionPromptQueueTable).where(eq(SessionPromptQueueTable.id, itemID)).run()
-          yield* settleReceipts(tx, sessionID, [itemID], { kind: "deleted" })
+          const row = yield* tx
+            .delete(SessionPromptQueueTable)
+            .where(reserved(sessionID, itemID, id))
+            .returning({ id: SessionPromptQueueTable.id })
+            .get()
+            .pipe(Effect.orDie)
+          if (row) yield* settleReceipts(tx, sessionID, [itemID], { kind: "deleted" })
+          return row !== undefined
         }),
       ).pipe(Effect.orDie)
 
-    const unreserve = (sessionID: SessionID, itemID: ItemID) =>
+    const unreserve = (sessionID: SessionID, itemID: ItemID, id: MessageID) =>
       writable(sessionID, (tx) =>
         tx
           .update(SessionPromptQueueTable)
           .set({ message_id: null })
-          .where(eq(SessionPromptQueueTable.id, itemID))
-          .run(),
+          .where(reserved(sessionID, itemID, id))
+          .returning({ id: SessionPromptQueueTable.id })
+          .get()
+          .pipe(
+            Effect.orDie,
+            Effect.map((row) => row !== undefined),
+          ),
       ).pipe(Effect.orDie)
+
+    const reserved = (sessionID: SessionID, itemID: ItemID, id: MessageID) =>
+      and(eq(SessionPromptQueueTable.id, itemID), pending(sessionID), eq(SessionPromptQueueTable.message_id, id))
 
     // Picks the oldest eligible row and reserves its message id, under the lock.
     // A reservation whose message already landed (a process stopped between the
@@ -1256,7 +1278,7 @@ const layer = Layer.effect(
           if (!current) return false
           // A hold that began while this message was being prepared wins too.
           if ((yield* held(sessionID)) || (delivery === "steer" && (yield* compacting(sessionID)))) {
-            yield* unreserve(sessionID, itemID)
+            yield* unreserve(sessionID, itemID, id)
             return false
           }
           yield* write(prepared).pipe(
@@ -1265,7 +1287,7 @@ const layer = Layer.effect(
                 ? markPromoted(sessionID, itemID, id)
                 : landed(db, id).pipe(
                     Effect.flatMap((exists) =>
-                      exists ? markPromoted(sessionID, itemID, id) : unreserve(sessionID, itemID),
+                      exists ? markPromoted(sessionID, itemID, id) : unreserve(sessionID, itemID, id),
                     ),
                   ),
             ),
@@ -1307,15 +1329,17 @@ const layer = Layer.effect(
                 .pipe(Effect.exit)
               if (Exit.isFailure(prepared)) {
                 // A prompt that cannot become a message is consumed, as a failed prompt was before the queue.
-                yield* exclusive(
+                // A failure of a reservation no longer current is no one's: the row is prepared again.
+                const current = yield* exclusive(
                   input.sessionID,
                   (Cause.hasInterruptsOnly(prepared.cause)
-                    ? unreserve(input.sessionID, next.row.id)
-                    : drop(input.sessionID, next.row.id)
-                  ).pipe(Effect.andThen(publish(input.sessionID))),
+                    ? unreserve(input.sessionID, next.row.id, next.id)
+                    : drop(input.sessionID, next.row.id, next.id)
+                  ).pipe(Effect.tap((changed) => (changed ? publish(input.sessionID) : Effect.void))),
                 )
-                if (Cause.hasInterruptsOnly(prepared.cause) || next.row.id === input.own)
-                  return yield* Effect.failCause(prepared.cause)
+                if (Cause.hasInterruptsOnly(prepared.cause)) return yield* Effect.failCause(prepared.cause)
+                if (!current) continue
+                if (next.row.id === input.own) return yield* Effect.failCause(prepared.cause)
                 yield* input.rejected(prepared.cause)
                 continue
               }
@@ -1793,11 +1817,11 @@ export function admission(pending: readonly Item[], added: Item, markers?: Confi
     )
   })
   const superseded =
-    own?.level === "nudge" && own.key && added.requestID
+    own?.level === "nudge" && own.key && !own.reply && added.requestID
       ? others.filter((item) => {
           if (!item.requestID || absorbed.includes(item)) return false
           const other = envelopeOf(item)
-          return other?.sender === own.sender && other.level === "nudge" && other.key === own.key
+          return other?.sender === own.sender && other.level === "nudge" && other.key === own.key && !other.reply
         })
       : []
   const command = added.requestID && !marked(added.input, markers) ? parseCommand(added.input) : undefined
