@@ -163,15 +163,19 @@ Newest first. Each entry names the upstream range brought in.
 ### Features
 
 - **#249** A sent prompt is never invisible (swxtchio/swx-opencode#249). `SessionPrompt.prompt` admits a queued
-  prompt before its revert cleanup and model selection, which run under the queue lock before any promotion can take
-  it. The TUI's pending row lists the most recently sent pending prompts, each marked `QUEUED`, and shows a prompt
-  still being sent under its `requestID` until any list of the queue carries that request. UP on an empty composer
-  withdraws the most recently sent pending prompt, waiting for one still being sent to be admitted, and puts its text,
-  mentions and attachments back in the composer. A prompt promoted first is never copied, one recall runs at a time
-  through any restore, and a withdrawal that cannot be confirmed is restored and read back, its text going to the
-  prompt stash if nothing shows it queued. Withdrawing an item makes its request's receipt `withdrawn` (a new receipt
-  state), restoring makes it `pending` again, and an exact retry of a withdrawn request answers `PromptWithdrawn`.
-  Mentions are sent at their offsets in the expanded text. _Fork-only._
+  prompt as its first step, before its config read, as a `time_preparing` row (migration `20261013194721`) that is
+  listed and withdrawable but never promoted or merged until its classification, revert cleanup and model selection
+  are done, outside the queue lock. A failed preparation drops the row and its receipt, and a preparing row a stopped
+  process left is swept. The TUI's pending row lists the most recently sent pending prompts, each marked `QUEUED`,
+  and shows a prompt still being sent under its `requestID` until any list of the queue carries that request. UP on
+  an empty composer withdraws the most recently sent pending prompt, waiting for one still being sent to be admitted
+  and following merged receipts to the request that carries it, and puts its text, mentions and attachments back in
+  the composer. A prompt promoted first is never copied, and one recall runs at a time through any restore. A prompt
+  the composer cannot take is restored once, and the notice reports only what the queue's list or receipt confirms;
+  its text goes to the prompt stash only when its receipt confirms it is still withdrawn. Withdrawing an item makes
+  its request's receipt `withdrawn` (a new receipt state), restoring makes it `pending` again, and an exact retry of
+  a withdrawn request answers `PromptWithdrawn`. Mentions are sent at their offsets in the expanded text.
+  _Fork-only._
 - **#245** Review and freshen pending queued prompts (swxtchio/swx-opencode#212). The TUI lists a session's pending
   prompts under the prompt box; reviewing them holds promotion (`hold`/`release` in `session/queue.ts`) while they are
   deleted, reordered or consolidated. A pending prompt runs at the session's current model and variant when it is

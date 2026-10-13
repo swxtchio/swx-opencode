@@ -520,7 +520,7 @@ test("a withdrawal whose answer is lost copies nothing and returns the prompt to
 
 test("a prompt the server confirms is still withdrawn after a failed restore is kept in the prompt stash", async () => {
   const app = await startSession({
-    queue: [{ ...items[1]!, requestID: "queued-request" }],
+    queue: [{ ...items[1], requestID: "queued-request" }],
     withdraw: (_, apply) => {
       apply()
       throw new TypeError("fetch failed")
@@ -554,7 +554,7 @@ test("a prompt the server confirms is still withdrawn after a failed restore is 
 test("a restore whose answer is lost, while the queue's list is refused, copies nothing", async () => {
   let refused = false
   const app = await startSession({
-    queue: [{ ...items[1]!, requestID: "queued-request" }],
+    queue: [{ ...items[1], requestID: "queued-request" }],
     // Both changes land and both answers are lost; the list is refused.
     withdraw: (_, apply) => {
       apply()
@@ -583,7 +583,7 @@ test("a restore whose answer is lost, while the queue's list is refused, copies 
 
 test("a prompt its restore put back and the queue then delivered is not said to stay queued", async () => {
   const app = await startSession({
-    queue: [{ ...items[1]!, requestID: "queued-request" }],
+    queue: [{ ...items[1], requestID: "queued-request" }],
     withdraw: (_, apply) => {
       apply()
       throw new TypeError("fetch failed")
@@ -613,7 +613,7 @@ test("UP takes back a prompt still being sent that the queue merged into another
     await app.renderer.mockInput.typeText("check the build")
     app.renderer.mockInput.pressEnter()
     await until(() => app.prompts.length === 1, "the send")
-    const requestID = app.prompts[0]!.requestID!
+    const requestID = app.prompts[0].requestID!
     // Merged twice over into a carrier whose listing this client missed.
     app.queue.items = [
       pendingItem("que_carrier", "check the lint, then check the build", {
@@ -632,7 +632,7 @@ test("UP takes back a prompt still being sent that the queue merged into another
     // Sent, the draft is not stashed into the next test's composer.
     app.renderer.mockInput.pressEnter()
     await until(() => app.prompts.length === 2, "the resend")
-    app.prompts[1]!.answer(json(transcript))
+    app.prompts[1].answer(json(transcript))
   } finally {
     await app.stop()
   }

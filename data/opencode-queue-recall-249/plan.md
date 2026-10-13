@@ -78,3 +78,16 @@
 - Recall keeps unmentioned attachments and repeated mentions; the composer sends mention offsets into the expanded
   text.
 - Slash commands remain swxtchio/swx-opencode#250, the captain's scope call.
+
+## Round 3 (review round 2 adjudication)
+
+- Admission is the first step of `SessionPrompt.prompt`, before the config read. The row is `time_preparing`
+  (migration `20261013194721`) until `SessionQueue.prepared`: listed and withdrawable, never promoted or merged.
+  Classification, revert cleanup and model selection run outside the queue lock, so a slow preparation delays neither
+  a later send's admission nor a withdrawal.
+- A failed or interrupted preparation calls `unprepared`, dropping the row and its receipt, so an exact retry is
+  admitted again. A preparing row a stopped process left is swept at the session's next admission or promotion.
+- `giveBack` restores once, then reports only what the list or the receipt confirms after it. The prompt stash
+  receives the text only when the receipt says the item is still withdrawn; otherwise it polls to a backstop and
+  copies nothing.
+- UP on a prompt still being sent follows merged receipts, chained, to the carrier and withdraws that.

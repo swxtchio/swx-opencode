@@ -4056,7 +4056,7 @@ describe("session HttpApi submission-time admission", () => {
               pathFor(SessionQueuePaths.receipt, { ...params, requestID: "first" }),
               { headers },
             ),
-          ).toEqual({ state: "pending", itemID: items[0]!.id })
+          ).toEqual({ state: "pending", itemID: items[0].id })
           const second = yield* send("second", "check the lint").pipe(Effect.forkChild)
           yield* awaitWithTimeout(
             Effect.gen(function* () {
@@ -4064,7 +4064,7 @@ describe("session HttpApi submission-time admission", () => {
             }),
             "a later send was not admitted while the first prepared",
           )
-          const withdrawn = yield* request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID: items[0]!.id }), {
+          const withdrawn = yield* request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID: items[0].id }), {
             method: "DELETE",
             headers,
           }).pipe(Effect.timeoutOption("5 seconds"))

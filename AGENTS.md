@@ -187,13 +187,17 @@ const table = sqliteTable("session", {
   (`settleReceipts` in `queue.ts`), so any new path that deletes, merges or promotes a pending row must settle them, or
   the sender sees its request pending forever. Rules that hide a sender's text (`admission`) apply only when every item
   involved names a request.
-- A queued prompt is admitted before any other work on it: session work its delivery depends on runs as the `ready`
-  of `SessionQueue.request`, under the queue lock, so no promotion takes the item first (#249). Keep new pre-delivery
-  work there, not ahead of admission.
+- A queued prompt is admitted as the first step of `SessionPrompt.prompt`, before even its config read (#249). Its row
+  is `time_preparing` until the sender calls `SessionQueue.prepared`: listed and withdrawable, but never promoted or
+  merged, so pre-delivery work (classification, revert cleanup, model selection) runs outside the queue lock. A
+  failed preparation calls `unprepared`, which drops the row and its receipt. Put new pre-delivery work in that
+  preparation, never ahead of admission, and keep `promotable` on any new promotion or merge query.
 - The TUI never copies a pending prompt into the composer: UP recall takes custody only through
-  `session.queue.withdraw`, holds its lock through any restore, and restores the item if the composer cannot take it
-  (#249). A withdrawn item's request is `withdrawn` until a restore. A prompt the TUI is still sending shows from
-  `session_sending` in `context/sync.tsx`; every list of the queue it reads goes through `sync.queue.listed`.
+  `session.queue.withdraw`, holds its lock through any restore, and restores the item once if the composer cannot take
+  it (#249). It then reports only what the list or the receipt confirms, and stashes the text only when the receipt
+  says the item is still `withdrawn`, so the queue and the user never both hold it. A prompt the TUI is still sending
+  shows from `session_sending` in `context/sync.tsx`; every list of the queue it reads goes through
+  `sync.queue.listed`.
 
 ## Session Retention (fork)
 
