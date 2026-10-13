@@ -45,6 +45,8 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+  /** Told what each request sends once plugins have adjusted it, as a summary records (#227). */
+  prepared?: (request: { readonly options: Record<string, any>; readonly variant?: string }) => void
 }
 
 export type StreamRequest = StreamInput & {
@@ -111,6 +113,7 @@ const live: Layer.Layer<
         flags,
         isWorkflow,
       })
+      input.prepared?.({ options: prepared.params.options, variant: prepared.variant })
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system

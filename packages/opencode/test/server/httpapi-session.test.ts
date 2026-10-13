@@ -4,6 +4,7 @@ import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
+import { pathToFileURL } from "node:url"
 import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer, Queue, Schema, Stream, Tracer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { Sse } from "effect/unstable/encoding"
@@ -2876,6 +2877,129 @@ describe("session HttpApi summary records what it sent", () => {
           { modelID: "model-a", variant: undefined, effort: "high" },
         ])
       }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
+    "a summary records the effort a plugin's chat.params left its request with",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const plugin = path.join(yield* tmpdirScoped(), "summary-effort.ts")
+        yield* Effect.promise(() =>
+          Bun.write(
+            plugin,
+            [
+              "export default async () => ({",
+              '  "chat.params": async (input, output) => {',
+              '    if (input.agent === "compaction") output.options.reasoningEffort = "low"',
+              "  },",
+              "})",
+              "",
+            ].join("\n"),
+          ),
+        )
+        const directory = yield* tmpdirScoped({
+          git: true,
+          config: { ...effortConfig(llm.url), plugin: [pathToFileURL(plugin).href] },
+        })
+        const api = routes(
+          directory,
+          (yield* createSession({ title: "plugin-adjusted summary" }).pipe(provideInstanceEffect(directory))).id,
+        )
+        yield* llm.text("start done")
+        expect((yield* api.prompt("start")).status).toBe(200)
+        yield* llm.text("summary")
+        expect((yield* api.summarize()).status).toBe(200)
+
+        expect((yield* llm.inputs).map((input) => input.reasoning_effort)).toEqual(["high", "low"])
+        expect(yield* api.summaries()).toEqual([{ modelID: "model-a", variant: undefined, effort: "low" }])
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
+    "a Gemini summary records the thinking level its request sent by default",
+    () =>
+      Effect.gen(function* () {
+        // A Gemini endpoint that answers every request with one finished reply.
+        const bodies: { generationConfig?: { thinkingConfig?: { thinkingLevel?: string } } }[] = []
+        const server = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            Bun.serve({
+              port: 0,
+              async fetch(request) {
+                bodies.push(await request.json())
+                const chunk = {
+                  candidates: [
+                    { content: { parts: [{ text: "done" }], role: "model" }, finishReason: "STOP", index: 0 },
+                  ],
+                  usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+                }
+                return new Response(`data: ${JSON.stringify(chunk)}\n\n`, {
+                  headers: { "content-type": "text/event-stream" },
+                })
+              },
+            }),
+          ),
+          (server) => Effect.promise(() => server.stop(true)),
+        )
+        const directory = yield* tmpdirScoped({
+          git: true,
+          config: {
+            formatter: false,
+            lsp: false,
+            provider: {
+              gemini: {
+                name: "Gemini",
+                id: "gemini",
+                env: [],
+                npm: "@ai-sdk/google",
+                options: { apiKey: "test-key", baseURL: server.url.href.replace(/\/$/, "") },
+                models: {
+                  "gemini-3-pro-preview": {
+                    id: "gemini-3-pro-preview",
+                    name: "Gemini 3 Pro",
+                    attachment: false,
+                    reasoning: true,
+                    temperature: false,
+                    tool_call: true,
+                    release_date: "2025-01-01",
+                    limit: { context: 100_000, output: 10_000 },
+                    cost: { input: 0, output: 0 },
+                    options: {},
+                  },
+                },
+              },
+            },
+          },
+        })
+        const sessionID = (yield* createSession({ title: "gemini summary" }).pipe(provideInstanceEffect(directory))).id
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const model = { providerID: "gemini", modelID: "gemini-3-pro-preview" }
+        const prompted = yield* request(pathFor(SessionPaths.prompt, { sessionID }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ agent: "build", model, parts: [{ type: "text", text: "start" }] }),
+        })
+        expect(prompted.status).toBe(200)
+        const summarized = yield* request(pathFor(SessionPaths.summarize, { sessionID }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ...model, auto: false }),
+        })
+        expect(summarized.status).toBe(200)
+
+        expect(bodies.map((body) => body.generationConfig?.thinkingConfig?.thinkingLevel)).toEqual(["high", "high"])
+        const messages = yield* requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, { sessionID }), {
+          headers,
+        })
+        expect(
+          messages.flatMap((message) =>
+            message.info.role === "assistant" && message.info.summary ? [message.info.effort] : [],
+          ),
+        ).toEqual(["high"])
+      }).pipe(Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
     30_000,
   )
 
