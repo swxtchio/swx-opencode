@@ -76,6 +76,7 @@ export type ScenarioContext = {
   worktreeTerminal: (directory: string) => Effect.Effect<GlobalEvent>
   llmText: (value: string) => Effect.Effect<void>
   llmWait: (count: number) => Effect.Effect<void>
+  llmCalls: () => Effect.Effect<number>
   tuiRequest: (request: { path: string; body: unknown }) => Effect.Effect<void>
 }
 

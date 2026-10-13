@@ -1,17 +1,19 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
+import { DatabaseTransaction } from "@opencode-ai/core/database/transaction"
 import {
+  SessionPromptQueueAliasTable,
   SessionPromptProvenanceTable,
+  SessionPromptReceiptTable,
   SessionPromptQueueSequenceTable,
   SessionPromptQueueTable,
-  SessionPromptReceiptTable,
 } from "@opencode-ai/core/session/prompt-queue.sql"
-import { MessageTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
-import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, sql } from "drizzle-orm"
+import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm"
 import {
   Cause,
   Clock,
@@ -29,6 +31,7 @@ import {
   Struct,
 } from "effect"
 import { isDeepStrictEqual } from "node:util"
+import { createHash } from "node:crypto"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { sqliteLockMessage } from "@/util/sqlite-error"
 import { MachineMessage } from "./machine-message"
@@ -39,10 +42,24 @@ type DatabaseService = Database.Interface["db"]
 type DatabaseTransaction = Parameters<Parameters<DatabaseService["transaction"]>[0]>[0]
 type DatabaseAccess = DatabaseService | DatabaseTransaction
 
+// Direct noReply writes need their own original before preparation can ever run again.
+const NoReplyOriginal = Schema.Struct({
+  version: Schema.Literal(1),
+  sessionID: SessionID,
+  input: Schema.Struct({ ...SessionPromptQueue.Input.fields, noReply: Schema.Literal(true) }),
+})
+const NoReplyWitness = Schema.Struct({
+  type: Schema.Literal("text"),
+  text: Schema.Literal(""),
+  ignored: Schema.Literal(true),
+  synthetic: Schema.Literal(true),
+  metadata: Schema.Struct({ sessionQueueNoReply: NoReplyOriginal }),
+})
+
 // Durable V1 prompt queue (swxtchio/swx-opencode#68). Every prompt except noReply
 // is admitted here before it becomes a V1 user message, so the loop decides when
 // it reaches the model: a steer at the next safe step, a queued item only when
-// the run would otherwise go idle.
+// the run would otherwise go idle, with compatible queued peers also eligible at safe provider continuation.
 
 export const Item = SessionPromptQueue.Item
 export type Item = SessionPromptQueue.Item
@@ -60,6 +77,7 @@ export type AdmitInput = SessionPromptQueue.Input & { readonly sessionID: Sessio
 export type PromotedInput = SessionPromptQueue.QueuedInput & {
   readonly sessionID: SessionID
   readonly messageID: MessageID
+  readonly group?: SessionPromptQueue.Group
 }
 
 /** A prompt's own item was withdrawn, by an editor, before it could be delivered. */
@@ -91,6 +109,11 @@ export class ConsumeLockedError extends Schema.TaggedErrorClass<ConsumeLockedErr
   },
 ) {}
 
+export class HistoricalIdentityError extends Schema.TaggedErrorClass<HistoricalIdentityError>()(
+  "SessionQueueHistoricalIdentityError",
+  { sessionID: SessionID, messageID: MessageID, message: Schema.String },
+) {}
+
 // Each consume attempt waits out the statement lock window, so a lock released
 // within about this many windows lets the run go on.
 const consumeAttempts = 5
@@ -106,6 +129,30 @@ export type HoldEnd = "released" | "lapsed"
 
 export interface Interface {
   readonly admit: (input: AdmitInput) => Effect.Effect<Item>
+  /** Reconcile represented input before preparation, hooks or other side effects. */
+  readonly reconcile: (
+    input: AdmitInput,
+  ) => Effect.Effect<
+    | { readonly kind: "direct"; readonly message: SessionV1.WithParts }
+    | { readonly kind: "queued"; readonly own: Item }
+    | undefined
+  >
+  /** Executable command/shell input has no retained expansion provenance; existing identity cannot run again. */
+  readonly assertFreshIdentity: (sessionID: SessionID, messageID?: MessageID) => Effect.Effect<void>
+  /** Reserve only the executable identity across unlocked IO, then recheck and admit under the session lock. */
+  readonly prepareExecutable: <P extends AdmitInput, E>(input: {
+    readonly sessionID: SessionID
+    readonly messageID?: MessageID
+    readonly prepare: () => Effect.Effect<P, E>
+  }) => Effect.Effect<{ readonly input: P; readonly own: Item }, E>
+  readonly message: (itemID: ItemID) => Effect.Effect<SessionV1.WithParts | undefined>
+  readonly writeDirect: <P extends SessionV1.WithParts, E>(input: {
+    readonly admission: AdmitInput
+    readonly prepare: () => Effect.Effect<P, E>
+    readonly write: (prepared: P) => Effect.Effect<SessionV1.WithParts>
+  }) => Effect.Effect<SessionV1.WithParts, E>
+  /** Reject ambiguous projected identity before command template execution; admission validates known originals. */
+  readonly assertIdentity: (sessionID: SessionID, messageID?: MessageID) => Effect.Effect<void>
   /**
    * Admits a prompt, unless it names a request this session already has (#212).
    * The same prompt again is a retry: nothing is admitted, and `own` is a new
@@ -162,21 +209,24 @@ export interface Interface {
    * changed. `prepare` resolves a message with no lock held, since it may read
    * files or MCP resources; `write` then stores it under the session lock, and
    * only while the item is still reserved, so a withdraw that lands meanwhile
-   * wins. Steers wait while a compaction is pending or running, so they never
-   * become its parent or input, and queued items go one per call so the loop
-   * reevaluates between their turns. An item that cannot become a message is
-   * dropped: the caller's `own` item fails the call, any other goes to
-   * `rejected`, so one prompt's failure never lands on another.
+   * wins. Steers and peer continuations wait while a compaction is pending or running, so they never
+   * become its parent or input. Delivery boundaries reevaluate continuation.
+   * Native rejection retains its existing behavior. A failed machine group is
+   * isolated to individual originals; a failing original is preserved in a
+   * reported withdrawn hold for explicit restore, without failing unrelated callers.
    */
   readonly promote: <P, E>(input: {
     readonly sessionID: SessionID
     readonly delivery: Delivery
     readonly prepare: (input: PromotedInput) => Effect.Effect<P, E>
     readonly write: (prepared: P) => Effect.Effect<unknown>
+    readonly valid?: (prepared: P) => Effect.Effect<boolean>
     readonly rejected: (cause: Cause.Cause<E>) => Effect.Effect<void>
     readonly own?: ItemID
     /** Stops once the session has any message, for a new session's first promotion. */
     readonly untilStarted?: boolean
+    /** Safe active continuation selects peers only; native holds and automation remain queued. */
+    readonly peersOnly?: boolean
   }) => Effect.Effect<boolean, E>
   /**
    * Called by a drain before it reads history; returns the wake count that read
@@ -209,9 +259,9 @@ export interface Interface {
    */
   readonly answer: (sessionID: SessionID, turn: MessageID, reply: SessionV1.WithParts) => Effect.Effect<void>
   /**
-   * The answer to an item's prompt, once. Each caller's answer channel is opened
-   * at admission and closed when the caller `forget`s it, however it returns, so
-   * an interrupted one leaves nothing behind.
+   * Exact retry callers share the recorded answer, with one owner per admission.
+   * Reading does not consume another caller's answer; each caller forgets only
+   * its own ownership when its scope ends.
    */
   readonly reply: (itemID: ItemID) => Effect.Effect<SessionV1.WithParts | undefined>
   readonly forget: (itemID: ItemID) => Effect.Effect<void>
@@ -281,6 +331,7 @@ const layer = Layer.effect(
     // across their unlocked preparation; nothing else waits on it.
     const locks = new Map<SessionID, Semaphore.Semaphore>()
     const order = new Map<SessionID, Semaphore.Semaphore>()
+    const preparations = new Map<string, symbol>()
     const parked = new Set<SessionID>()
     const wakes = new Map<SessionID, number>()
     const running = new Set<SessionID>()
@@ -288,7 +339,12 @@ const layer = Layer.effect(
     // then the final reply of the turn that message joined.
     const channels = new Map<
       ItemID,
-      { readonly sessionID: SessionID; message?: MessageID; reply?: SessionV1.WithParts }
+      {
+        readonly sessionID: SessionID
+        owners: Map<symbol, Scope.Scope | undefined>
+        message?: MessageID
+        reply?: SessionV1.WithParts
+      }
     >()
     // A waiter whose item was merged or superseded, or a retry's waiter, follows
     // the item that now carries its request (#212): waiter id to that item.
@@ -370,16 +426,370 @@ const layer = Layer.effect(
       return admitted.own
     })
 
-    const admitLocked = Effect.fnUntraced(function* (
+    const openChannel = (item: Item, message: MessageID | undefined, callerScope: Scope.Scope | undefined) =>
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          const existing = channels.get(item.id)
+          const channel = existing ?? {
+            sessionID: item.sessionID,
+            owners: new Map<symbol, Scope.Scope | undefined>(),
+            message,
+            reply: undefined as SessionV1.WithParts | undefined,
+          }
+          if (!existing) channels.set(item.id, channel)
+          channel.message ??= message
+          const owner = Symbol()
+          channel.owners.set(owner, callerScope)
+          if (callerScope)
+            yield* Scope.addFinalizer(
+              callerScope,
+              Effect.sync(() => {
+                if (!channel.owners.delete(owner)) return
+                if (!channel.owners.size && channels.get(item.id) === channel) channels.delete(item.id)
+              }),
+            )
+        }),
+      )
+
+    const indexAliases = (tx: DatabaseTransaction, sessionID: SessionID) =>
+      Effect.gen(function* () {
+        const sequence = yield* tx
+          .select()
+          .from(SessionPromptQueueSequenceTable)
+          .where(eq(SessionPromptQueueSequenceTable.session_id, sessionID))
+          .get()
+        if (sequence?.aliases_indexed) return
+        const rows = yield* tx
+          .select({
+            id: SessionPromptQueueTable.id,
+            seq: SessionPromptQueueTable.seq,
+            input: sql<string>`${SessionPromptQueueTable.input}`,
+          })
+          .from(SessionPromptQueueTable)
+          .where(eq(SessionPromptQueueTable.session_id, sessionID))
+          .all()
+        const aliases = rows.flatMap((row) => {
+          const raw = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)(row.input)
+          const decoded = Schema.decodeUnknownOption(SessionPromptQueue.QueuedInput)(Option.getOrUndefined(raw))
+          const supplied = Schema.decodeUnknownOption(Schema.Struct({ messageID: MessageID }))(
+            Option.getOrUndefined(raw),
+          )
+          const keys = Option.isSome(decoded)
+            ? [
+                ...constituentIDs(sessionID, decoded.value),
+                ...decoded.value.parts.flatMap((part) => (pendingOriginal(part) && part.id ? [part.id] : [])),
+              ]
+            : Option.isSome(supplied)
+              ? constituentIDs(sessionID, { messageID: supplied.value.messageID, parts: [] })
+              : []
+          return keys.map((id) => ({ id, item_id: row.id }))
+        })
+        // Backfill batches stay below SQLite's parameter bound; subsequent admissions use only indexed keys.
+        yield* Effect.forEach(
+          Array.from({ length: Math.ceil(aliases.length / 500) }, (_, index) =>
+            aliases.slice(index * 500, (index + 1) * 500),
+          ),
+          (batch) => tx.insert(SessionPromptQueueAliasTable).values(batch).onConflictDoNothing().run(),
+          { discard: true },
+        )
+        yield* tx
+          .insert(SessionPromptQueueSequenceTable)
+          .values({
+            session_id: sessionID,
+            seq: sequence?.seq ?? rows.reduce((seq, row) => Math.max(seq, row.seq), 0),
+            aliases_indexed: true,
+          })
+          .onConflictDoUpdate({ target: SessionPromptQueueSequenceTable.session_id, set: { aliases_indexed: true } })
+          .run()
+      })
+
+    const rememberAliases = (
+      tx: DatabaseTransaction,
+      item: Item,
+      messageID: MessageID,
+      kind: string,
+      keys: readonly string[],
+    ) =>
+      Effect.gen(function* () {
+        if (!keys.length) return
+        const existing = yield* tx
+          .select({ id: PartTable.id })
+          .from(PartTable)
+          .where(
+            inArray(
+              PartTable.id,
+              keys.map((id) => PartID.make(id)),
+            ),
+          )
+          .all()
+        yield* Effect.forEach(
+          keys.filter((id) => !existing.some((part) => part.id === id)),
+          (id) =>
+            events.publish(SessionV1.Event.PartUpdated, {
+              sessionID: item.sessionID,
+              part: {
+                type: "text",
+                id: PartID.make(id),
+                sessionID: item.sessionID,
+                messageID,
+                text: "",
+                ignored: true,
+                synthetic: true,
+                metadata: {
+                  sessionQueue: Schema.encodeSync(SessionPromptQueue.Group)({
+                    version: 1,
+                    sessionID: item.sessionID,
+                    kind,
+                    constituents: [item],
+                  }),
+                },
+              },
+              time: Date.now(),
+            }),
+          { discard: true },
+        )
+      })
+
+    const assertNotPreparing = (sessionID: SessionID, messageID?: MessageID) =>
+      Effect.sync(() => {
+        if (messageID && preparations.has(JSON.stringify([sessionID, messageID])))
+          throw new HistoricalIdentityError({
+            sessionID,
+            messageID,
+            message: `Executable identity ${messageID} is still preparing; competing admission refused before side effects`,
+          })
+      })
+
+    const assertIdentityIn = (
+      query: DatabaseAccess,
+      sessionID: SessionID,
+      messageID?: MessageID,
+      checkCustody = true,
+    ) =>
+      Effect.gen(function* () {
+        yield* assertNotPreparing(sessionID, messageID)
+        if (!messageID) return
+        const projected = yield* query
+          .select({ id: MessageTable.id })
+          .from(MessageTable)
+          .where(eq(MessageTable.id, messageID))
+          .get()
+        if (!projected) return
+        if (checkCustody) {
+          const keys = constituentIDs(sessionID, { messageID, parts: [] })
+          const witnesses = yield* query
+            .select({
+              id: PartTable.id,
+              session_id: PartTable.session_id,
+              message_id: PartTable.message_id,
+              data: sql<string>`${PartTable.data}`,
+            })
+            .from(PartTable)
+            .where(inArray(PartTable.id, keys))
+            .all()
+          const owners = witnesses.flatMap((row) => {
+            const raw = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)(row.data)
+            const original = deliveredOriginal({ ...row, data: Option.getOrUndefined(raw) }, sessionID)
+            return original ? [original.item.id] : []
+          })
+          const sequence = yield* query
+            .select({ indexed: SessionPromptQueueSequenceTable.aliases_indexed })
+            .from(SessionPromptQueueSequenceTable)
+            .where(eq(SessionPromptQueueSequenceTable.session_id, sessionID))
+            .get()
+          const retained = yield* query
+            .select({ id: SessionPromptQueueTable.id, input: sql<string>`${SessionPromptQueueTable.input}` })
+            .from(SessionPromptQueueTable)
+            .where(
+              and(
+                eq(SessionPromptQueueTable.session_id, sessionID),
+                or(
+                  inArray(
+                    SessionPromptQueueTable.id,
+                    query
+                      .select({ id: SessionPromptQueueAliasTable.item_id })
+                      .from(SessionPromptQueueAliasTable)
+                      .where(inArray(SessionPromptQueueAliasTable.id, keys)),
+                  ),
+                  // Only an unindexed legacy Session needs canonical-input fallback; warm checks use custody indexes.
+                  ...(!sequence?.indexed
+                    ? [
+                        sql`CASE WHEN json_valid(${SessionPromptQueueTable.input}) THEN json_extract(${SessionPromptQueueTable.input}, '$.messageID') END = ${messageID}`,
+                      ]
+                    : []),
+                ),
+              ),
+            )
+            .limit(2)
+            .all()
+          const originals = retained.flatMap((row) => {
+            const raw = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)(row.input)
+            return Option.isSome(Schema.decodeUnknownOption(SessionPromptQueue.QueuedInput)(Option.getOrUndefined(raw)))
+              ? [row.id]
+              : []
+          })
+          if (
+            owners.length === witnesses.length &&
+            originals.length === retained.length &&
+            new Set([...owners, ...originals]).size === 1
+          )
+            return
+        }
+        return yield* Effect.die(
+          new HistoricalIdentityError({
+            sessionID,
+            messageID,
+            message: `Existing projected message ${messageID} lacks unambiguous queue original or transport-witness custody; stable-ID admission refused without replay`,
+          }),
+        )
+      }).pipe(Effect.orDie)
+
+    const assertIdentity: Interface["assertIdentity"] = (sessionID, messageID) =>
+      !messageID
+        ? Effect.void
+        : exclusive(
+            sessionID,
+            db
+              .transaction((tx) =>
+                EventV2.assertReplayableIn(tx, sessionID).pipe(
+                  Effect.andThen(assertIdentityIn(tx, sessionID, messageID)),
+                ),
+              )
+              .pipe(Effect.orDie),
+          )
+
+    const reconcileAdmission = Effect.fnUntraced(function* (
       input: AdmitInput,
+      existingOnly = false,
       markers?: ConfigV1.Info["machine_message_markers"],
     ) {
       const now = Date.now()
-      const admitted = yield* writable(input.sessionID, (tx) =>
+      if (input.parts.some((part) => part.type === "text" && part.metadata?.sessionQueuePendingOriginal))
+        return yield* Effect.die(new Error("Pending peer custody metadata is queue-owned"))
+      yield* assertNotPreparing(input.sessionID, input.messageID)
+      const callerScope = Option.getOrUndefined(yield* Effect.serviceOption(Scope.Scope))
+      const result = yield* writable(input.sessionID, (tx) =>
         Effect.gen(function* () {
+          const keys = constituentIDs(input.sessionID, input)
+          if (keys.length) yield* indexAliases(tx, input.sessionID)
+          const delivered = keys.length
+            ? yield* tx.select().from(PartTable).where(inArray(PartTable.id, keys)).all()
+            : []
+          const originals = delivered.map((row) => {
+            const original = deliveredOriginal(row, input.sessionID)
+            if (
+              !original ||
+              !sameQueuedInput(original.item.input, input) ||
+              original.item.delivery !== (input.delivery ?? "steer")
+            )
+              throw new Error(`Conflicting delivered constituent: ${row.id}`)
+            return original
+          })
+          const matches = keys.length
+            ? yield* tx
+                .select({ row: SessionPromptQueueTable })
+                .from(SessionPromptQueueAliasTable)
+                .innerJoin(
+                  SessionPromptQueueTable,
+                  eq(SessionPromptQueueAliasTable.item_id, SessionPromptQueueTable.id),
+                )
+                .where(inArray(SessionPromptQueueAliasTable.id, keys))
+                .all()
+            : []
+          const rows = [...new Map(matches.map(({ row }) => [row.id, row])).values()]
+          const projected = input.messageID
+            ? yield* tx
+                .select({ id: MessageTable.id, session_id: MessageTable.session_id })
+                .from(MessageTable)
+                .where(eq(MessageTable.id, input.messageID))
+                .get()
+            : undefined
+          if (projected && (originals.length || rows.length)) {
+            const deliveredOwner = originals.every((original) => original.messageID === projected.id)
+            const retainedOwner = rows.every((row) => row.time_promoted !== null && row.message_id === projected.id)
+            if (projected.session_id !== input.sessionID || !deliveredOwner || !retainedOwner)
+              return yield* Effect.die(
+                new HistoricalIdentityError({
+                  sessionID: input.sessionID,
+                  messageID: input.messageID!,
+                  message: `Presented transport ID ${input.messageID} belongs to another projected message`,
+                }),
+              )
+          }
+          for (const row of rows) {
+            const decoded = Schema.decodeUnknownOption(SessionPromptQueue.QueuedInput)(row.input)
+            if (
+              row.session_id !== input.sessionID ||
+              Option.isNone(decoded) ||
+              !originalsOf(row).some((original) => sameQueuedInput(original.input, input)) ||
+              row.delivery !== (input.delivery ?? "steer")
+            )
+              return yield* Effect.die(new Error(`Conflicting prompt message ID: ${input.messageID ?? keys[0]}`))
+          }
+          if (originals.length) {
+            const original = originals[0]
+            if (
+              originals.some((item) => item.item.id !== original.item.id || item.messageID !== original.messageID) ||
+              rows.some((row) => row.id !== original.item.id)
+            )
+              return yield* Effect.die(new Error(`Conflicting prompt identity owners: ${input.messageID ?? keys[0]}`))
+            yield* rememberAliases(tx, original.item, original.messageID, original.groupKind, keys)
+            return { kind: "delivered" as const, ...original }
+          }
+          if (rows.length) {
+            const row = rows[0]
+            const aliases = yield* tx
+              .select()
+              .from(SessionPromptQueueAliasTable)
+              .where(eq(SessionPromptQueueAliasTable.item_id, row.id))
+              .all()
+            const added = keys.filter((id) => !aliases.some((alias) => alias.id === id))
+            if (added.length)
+              yield* tx
+                .insert(SessionPromptQueueAliasTable)
+                .values(added.map((id) => ({ id, item_id: row.id })))
+                .run()
+            if (added.length && decodeInput(row.input).parts.some(pendingOriginal)) {
+              const original = originalsOf(row).find((original) => sameQueuedInput(original.input, input))!
+              yield* tx
+                .update(SessionPromptQueueTable)
+                .set({
+                  input: encodeInput({
+                    ...decodeInput(row.input),
+                    parts: [
+                      ...decodeInput(row.input).parts,
+                      ...added.map((id) => originalWitness(original, PartID.make(id), true)),
+                    ],
+                  }),
+                })
+                .where(eq(SessionPromptQueueTable.id, row.id))
+                .run()
+            }
+            // A new alias accepted during preparation must be included in the eventual committed witness parts.
+            if (row.message_id && !row.time_promoted && added.length)
+              yield* tx
+                .update(SessionPromptQueueTable)
+                .set({ message_id: null })
+                .where(and(eq(SessionPromptQueueTable.message_id, row.message_id), pending(input.sessionID)))
+                .run()
+            if (row.time_promoted && row.message_id) {
+              const machine = dispatch(decodeInput(row.input))
+              yield* rememberAliases(
+                tx,
+                fromRow(row),
+                row.message_id,
+                machine?.kind === "peer" ? "peer" : (machine?.type ?? "individual"),
+                keys,
+              )
+            }
+            return { kind: "row" as const, row }
+          }
+          // Known originals have already reconciled above; a bare projection is never executed again.
+          yield* assertIdentityIn(tx, input.sessionID, input.messageID, false)
+          if (existingOnly) return { kind: "absent" as const }
           const allocated = yield* tx
             .insert(SessionPromptQueueSequenceTable)
-            .values({ session_id: input.sessionID, seq: 1 })
+            .values({ session_id: input.sessionID, seq: 1, aliases_indexed: true })
             .onConflictDoUpdate({
               target: SessionPromptQueueSequenceTable.session_id,
               set: { seq: sql`${SessionPromptQueueSequenceTable.seq} + 1` },
@@ -401,7 +811,13 @@ const layer = Layer.effect(
             })
             .returning()
             .get()
-          if (row && input.requestID)
+          if (!row) return yield* Effect.die(new Error(`Queue admission for ${input.sessionID} stored nothing`))
+          if (keys.length)
+            yield* tx
+              .insert(SessionPromptQueueAliasTable)
+              .values(keys.map((id) => ({ id, item_id: row.id })))
+              .run()
+          if (input.requestID)
             yield* tx
               .insert(SessionPromptReceiptTable)
               .values({
@@ -414,19 +830,303 @@ const layer = Layer.effect(
                 time_updated: now,
               })
               .run()
-          if (!row) return undefined
-          return { row, ...(yield* replace(tx, input.sessionID, row, markers)) }
-        }),
+          return { kind: "row" as const, row, replacement: yield* replace(tx, input.sessionID, row, markers) }
+        }).pipe(
+          Effect.tap((accepted) => {
+            if (!input.requestID || accepted.kind === "absent") return Effect.void
+            const delivered = accepted.kind === "delivered" || accepted.row.time_promoted !== null
+            const original = accepted.kind === "row" ? accepted.row.request_id : undefined
+            return tx
+              .insert(SessionPromptReceiptTable)
+              .values({
+                session_id: input.sessionID,
+                request_id: input.requestID,
+                state: original && original !== input.requestID ? "merged" : delivered ? "delivered" : "pending",
+                item_id: accepted.kind === "row" && !delivered ? accepted.row.id : null,
+                message_id:
+                  accepted.kind === "delivered" ? accepted.messageID : delivered ? accepted.row.message_id : null,
+                into_request_id: original && original !== input.requestID ? original : null,
+                fingerprint: fingerprint(input),
+                time_created: now,
+                time_updated: now,
+              })
+              .onConflictDoNothing()
+              .run()
+          }),
+          Effect.tap((accepted) =>
+            accepted.kind === "absent"
+              ? Effect.void
+              : // The retry owns the existing answer once committed, before alias observers can suspend admission.
+                DatabaseTransaction.afterCommit(
+                  accepted.kind === "delivered"
+                    ? openChannel(accepted.item, accepted.messageID, callerScope)
+                    : openChannel(
+                        fromRow(accepted.row),
+                        accepted.row.time_promoted && accepted.row.message_id ? accepted.row.message_id : undefined,
+                        callerScope,
+                      ).pipe(
+                        Effect.andThen(
+                          Effect.sync(() => {
+                            if ("replacement" in accepted && accepted.replacement) {
+                              retire(accepted.replacement.retired, accepted.row.id)
+                              if (accepted.replacement.into) retire([accepted.row.id], accepted.replacement.into)
+                              finish(accepted.replacement.finished)
+                            }
+                          }),
+                        ),
+                      ),
+                  true,
+                ),
+          ),
+        ),
       ).pipe(Effect.orDie)
-      if (!admitted) return yield* Effect.die(new Error(`Queue admission for ${input.sessionID} stored nothing`))
-      channels.set(admitted.row.id, { sessionID: input.sessionID })
-      retire(admitted.retired, admitted.row.id)
-      if (admitted.into) retire([admitted.row.id], admitted.into)
-      finish(admitted.finished)
-      wake(input.sessionID)
+      if (result.kind === "absent") return undefined
+      if (result.kind === "delivered") return result.item
+      const item = fromRow(result.row)
+      if ("replacement" in result && result.replacement) {
+        retire(result.replacement.retired, item.id)
+        if (result.replacement.into) retire([item.id], result.replacement.into)
+        finish(result.replacement.finished)
+      }
+      if (!result.row.time_promoted) wake(input.sessionID)
       yield* publish(input.sessionID)
-      return fromRow(admitted.row)
+      return item
     })
+
+    const admitLocked = (input: AdmitInput, markers?: ConfigV1.Info["machine_message_markers"]) =>
+      reconcileAdmission(input, false, markers).pipe(
+        Effect.flatMap((item) =>
+          item ? Effect.succeed(item) : Effect.die(new Error("admission did not allocate an original")),
+        ),
+      )
+
+    const reconcileLocked = Effect.fnUntraced(
+      function* (input: AdmitInput) {
+        yield* assertNotPreparing(input.sessionID, input.messageID)
+        const keys = constituentIDs(input.sessionID, input)
+        if (!keys.length) return undefined
+        const parts = yield* db.select().from(PartTable).where(inArray(PartTable.id, keys)).all().pipe(Effect.orDie)
+        const direct = parts.flatMap((part) => {
+          const decoded = Schema.decodeUnknownOption(NoReplyWitness)(part.data)
+          return Option.isSome(decoded) ? [{ part, original: decoded.value.metadata.sessionQueueNoReply }] : []
+        })
+        if (direct.length) {
+          if (
+            direct.length !== parts.length ||
+            direct.some(
+              ({ part, original }) =>
+                part.session_id !== input.sessionID ||
+                part.message_id !== direct[0].part.message_id ||
+                original.sessionID !== input.sessionID ||
+                original.input.messageID !== part.message_id ||
+                !isDeepStrictEqual(
+                  withoutUndefined({
+                    ...Struct.omit(original.input, ["messageID"]),
+                    delivery: original.input.delivery ?? "steer",
+                  }),
+                  withoutUndefined({
+                    ...Struct.omit(input, ["sessionID", "messageID"]),
+                    delivery: input.delivery ?? "steer",
+                  }),
+                ),
+            )
+          )
+            return yield* Effect.die(
+              new HistoricalIdentityError({
+                sessionID: input.sessionID,
+                messageID: input.messageID ?? MessageID.make(direct[0].part.message_id),
+                message: `Conflicting direct noReply original: ${input.messageID}`,
+              }),
+            )
+          const aliases = yield* db
+            .select({ id: SessionPromptQueueAliasTable.id })
+            .from(SessionPromptQueueAliasTable)
+            .where(inArray(SessionPromptQueueAliasTable.id, keys))
+            .limit(1)
+            .get()
+          const collision = input.messageID
+            ? yield* db
+                .select({ id: MessageTable.id })
+                .from(MessageTable)
+                .where(eq(MessageTable.id, input.messageID))
+                .get()
+            : undefined
+          if (aliases || (collision && collision.id !== direct[0].part.message_id))
+            return yield* Effect.die(
+              new HistoricalIdentityError({
+                sessionID: input.sessionID,
+                messageID: input.messageID ?? MessageID.make(direct[0].part.message_id),
+                message: "Conflicting direct noReply identity owner",
+              }),
+            )
+          const missing = keys.filter((id) => !parts.some((part) => part.id === id))
+          if (missing.length)
+            yield* writable(input.sessionID, () =>
+              Effect.forEach(
+                missing,
+                (id) =>
+                  events.publish(SessionV1.Event.PartUpdated, {
+                    sessionID: input.sessionID,
+                    part: {
+                      ...direct[0].part.data,
+                      id,
+                      sessionID: input.sessionID,
+                      messageID: MessageID.make(direct[0].part.message_id),
+                    } as SessionV1.TextPart,
+                    time: Date.now(),
+                  }),
+                { discard: true },
+              ),
+            )
+          return {
+            kind: "direct" as const,
+            message: yield* MessageV2.get({ sessionID: input.sessionID, messageID: direct[0].part.message_id }).pipe(
+              Effect.provideService(Database.Service, database),
+              Effect.orDie,
+            ),
+          }
+        }
+        const own = yield* reconcileAdmission(input, true)
+        return own ? { kind: "queued" as const, own } : undefined
+      },
+      (effect) => effect.pipe(Effect.orDie),
+    )
+    const reconcile: Interface["reconcile"] = (input) => exclusive(input.sessionID, reconcileLocked(input))
+
+    const assertFreshIdentityLocked = (sessionID: SessionID, messageID?: MessageID) =>
+      !messageID
+        ? Effect.void
+        : Effect.gen(function* () {
+            yield* assertNotPreparing(sessionID, messageID)
+            const projected = yield* db
+              .select({ id: MessageTable.id })
+              .from(MessageTable)
+              .where(eq(MessageTable.id, messageID))
+              .get()
+            const keys = constituentIDs(sessionID, { messageID, parts: [] })
+            const aliases = yield* db
+              .select({ id: SessionPromptQueueAliasTable.id })
+              .from(SessionPromptQueueAliasTable)
+              .where(inArray(SessionPromptQueueAliasTable.id, keys))
+              .limit(1)
+              .get()
+            const sequence = yield* db
+              .select({ indexed: SessionPromptQueueSequenceTable.aliases_indexed })
+              .from(SessionPromptQueueSequenceTable)
+              .where(eq(SessionPromptQueueSequenceTable.session_id, sessionID))
+              .get()
+            const pending = sequence?.indexed
+              ? undefined
+              : yield* db
+                  .select({ id: SessionPromptQueueTable.id })
+                  .from(SessionPromptQueueTable)
+                  .where(
+                    and(
+                      eq(SessionPromptQueueTable.session_id, sessionID),
+                      sql`CASE WHEN json_valid(${SessionPromptQueueTable.input}) THEN json_extract(${SessionPromptQueueTable.input}, '$.messageID') END = ${messageID}`,
+                    ),
+                  )
+                  .limit(1)
+                  .get()
+            if (projected || aliases || pending)
+              return yield* Effect.die(
+                new HistoricalIdentityError({
+                  sessionID,
+                  messageID,
+                  message: `Executable retry ${messageID} lacks retained command/shell provenance; refused before expansion`,
+                }),
+              )
+          }).pipe(Effect.orDie)
+    const assertFreshIdentity: Interface["assertFreshIdentity"] = (sessionID, messageID) =>
+      exclusive(sessionID, assertFreshIdentityLocked(sessionID, messageID))
+    const prepareExecutable: Interface["prepareExecutable"] = (input) => {
+      const key = input.messageID ? JSON.stringify([input.sessionID, input.messageID]) : undefined
+      const release = (owner: symbol) =>
+        Effect.sync(() => {
+          if (key && preparations.get(key) === owner) preparations.delete(key)
+        })
+      return Effect.acquireUseRelease(
+        exclusive(
+          input.sessionID,
+          Effect.gen(function* () {
+            yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
+            const owner = Symbol()
+            if (key) preparations.set(key, owner)
+            return owner
+          }),
+        ),
+        (owner) =>
+          Effect.gen(function* () {
+            // A caller interrupt must not abandon native IO or hook promises and reopen the identity.
+            const prepared = yield* input.prepare().pipe(Effect.uninterruptible)
+            return yield* exclusive(
+              input.sessionID,
+              Effect.gen(function* () {
+                // Handoff to durable custody is serialized, but shell and hook IO never hold the session permit.
+                yield* release(owner)
+                yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
+                const own = yield* admitLocked(prepared)
+                return { input: prepared, own }
+              }),
+            )
+          }),
+        release,
+      )
+    }
+
+    const writeOriginal = <P extends SessionV1.WithParts>(
+      input: { admission: AdmitInput; write: (prepared: P) => Effect.Effect<SessionV1.WithParts> },
+      prepared: P,
+    ) =>
+      Effect.gen(function* () {
+        const message = yield* input.write(prepared)
+        if (input.admission.noReply !== true) return message
+        const original = { ...input.admission, messageID: message.info.id }
+        const parts: SessionV1.TextPart[] = constituentIDs(input.admission.sessionID, original).map((id) => ({
+          type: "text",
+          id,
+          sessionID: input.admission.sessionID,
+          messageID: message.info.id,
+          text: "",
+          ignored: true,
+          synthetic: true,
+          metadata: {
+            sessionQueueNoReply: Schema.encodeSync(NoReplyOriginal)({
+              version: 1,
+              sessionID: input.admission.sessionID,
+              input: { ...original, noReply: true },
+            }),
+          },
+        }))
+        yield* writable(input.admission.sessionID, () =>
+          Effect.forEach(
+            parts,
+            (part) =>
+              events.publish(SessionV1.Event.PartUpdated, {
+                sessionID: input.admission.sessionID,
+                part,
+                time: Date.now(),
+              }),
+            { discard: true },
+          ),
+        )
+        return { ...message, parts: [...message.parts, ...parts] }
+      }).pipe(Effect.orDie)
+
+    const writeDirect: Interface["writeDirect"] = (input) =>
+      exclusive(
+        input.admission.sessionID,
+        Effect.gen(function* () {
+          const retry = yield* reconcileLocked(input.admission)
+          if (retry?.kind === "direct") return retry.message
+          if (retry?.kind === "queued") {
+            const projected = yield* message(retry.own.id)
+            if (projected) return projected
+            return yield* Effect.die(new Error("noReply retry has no projected original"))
+          }
+          return yield* writeOriginal(input, yield* input.prepare())
+        }),
+      )
 
     // Applies `admission` for a just-admitted row, in its transaction: the row
     // takes in identical copies and repeated peer requests and retires the
@@ -456,9 +1156,25 @@ const layer = Layer.effect(
       // A promotion being prepared for any of them must prepare again.
       const finished = yield* invalidate(tx, sessionID)
       const rows = yield* pendingOf()
-      const plan = admission(rows.map(fromRow), fromRow(added), markers)
+      const proposed = admission(rows.map(fromRow), fromRow(added), markers)
+      const peer = dispatch(decodeInput(added.input))?.kind === "peer"
+      const bounded = proposed.absorbed.reduce(
+        (kept, id) => {
+          const row = rows.find((row) => row.id === id)!
+          const size = originalsOf(row).length
+          return !peer || kept.size + size <= 10 ? { size: kept.size + size, ids: [...kept.ids, id] } : kept
+        },
+        { size: originalsOf(added).length, ids: [] as ItemID[] },
+      )
+      const plan = { ...proposed, absorbed: bounded.ids }
       const retired = [...plan.absorbed, ...plan.superseded]
       if (retired.length > 0) {
+        if (plan.absorbed.length)
+          yield* retainOriginals(
+            tx,
+            added,
+            rows.filter((row) => plan.absorbed.includes(row.id)),
+          )
         yield* tx
           .delete(SessionPromptQueueTable)
           .where(inArray(SessionPromptQueueTable.id, retired))
@@ -485,9 +1201,18 @@ const layer = Layer.effect(
       const merged = consolidation([fromRow(head), fromRow(survivor)], markers).changed.find(
         (item) => item.id === head.id,
       )!
+      yield* retainOriginals(tx, head, [survivor])
+      const retained = (yield* rowOf(tx, head.id))!
       yield* tx
         .update(SessionPromptQueueTable)
-        .set({ input: encodeInput(merged.input), origins: [...merged.origins], time_created: merged.time.created })
+        .set({
+          input: encodeInput({
+            ...merged.input,
+            parts: [...merged.input.parts, ...decodeInput(retained.input).parts.filter(pendingOriginal)],
+          }),
+          origins: [...merged.origins],
+          time_created: merged.time.created,
+        })
         .where(eq(SessionPromptQueueTable.id, head.id))
         .run()
         .pipe(Effect.orDie)
@@ -498,6 +1223,52 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
       yield* settleReceipts(tx, sessionID, [survivor.id], { kind: "merged", into: (yield* rowOf(tx, head.id))! })
       return { retired, into: head.id, finished, row: survivor }
+    })
+
+    // Retired carriers move their exact original/alias custody into the survivor before cascade deletion.
+    const retainOriginals = Effect.fnUntraced(function* (
+      tx: DatabaseTransaction,
+      target: typeof SessionPromptQueueTable.$inferSelect,
+      sources: readonly (typeof SessionPromptQueueTable.$inferSelect)[],
+    ) {
+      const carriers = [...sources, target]
+      const aliases = yield* tx
+        .select()
+        .from(SessionPromptQueueAliasTable)
+        .where(
+          inArray(
+            SessionPromptQueueAliasTable.item_id,
+            carriers.map((row) => row.id),
+          ),
+        )
+        .all()
+      const parts = carriers.flatMap((row) =>
+        originalWitnesses(
+          row,
+          aliases.filter((alias) => alias.item_id === row.id),
+          true,
+        ),
+      )
+      yield* tx
+        .update(SessionPromptQueueTable)
+        .set({
+          input: encodeInput({
+            ...decodeInput(target.input),
+            parts: [...decodeInput(target.input).parts.filter((part) => !pendingOriginal(part)), ...parts],
+          }),
+        })
+        .where(eq(SessionPromptQueueTable.id, target.id))
+        .run()
+      yield* tx
+        .update(SessionPromptQueueAliasTable)
+        .set({ item_id: target.id })
+        .where(
+          inArray(
+            SessionPromptQueueAliasTable.item_id,
+            sources.map((row) => row.id),
+          ),
+        )
+        .run()
     })
 
     const rowOf = (tx: DatabaseTransaction, itemID: ItemID) =>
@@ -524,6 +1295,8 @@ const layer = Layer.effect(
           if (!prior) return { kind: "admitted" as const, own: yield* admitLocked(input, markers) }
           if (prior.fingerprint !== fingerprint(input))
             return yield* new RequestConflictError({ sessionID: input.sessionID, requestID: prior.request_id })
+          // A receipt never grants ownership of a foreign or conflicting native/peer transport identity.
+          yield* reconcileLocked(input)
           return { kind: "retry" as const, own: yield* follow(prior), receipt: toReceipt(prior) }
         }),
       )
@@ -532,8 +1305,27 @@ const layer = Layer.effect(
     // request that superseded it, or takes the message the request became.
     const follow = Effect.fnUntraced(function* (start: typeof SessionPromptReceiptTable.$inferSelect) {
       const own = ItemID.create()
-      const channel: { readonly sessionID: SessionID; message?: MessageID } = { sessionID: start.session_id }
+      const channel = {
+        sessionID: start.session_id,
+        owners: new Map<symbol, Scope.Scope | undefined>(),
+        message: undefined as MessageID | undefined,
+        reply: undefined as SessionV1.WithParts | undefined,
+      }
       channels.set(own, channel)
+      const callerScope = Option.getOrUndefined(yield* Effect.serviceOption(Scope.Scope))
+      const owner = Symbol()
+      channel.owners.set(owner, callerScope)
+      if (callerScope)
+        yield* Scope.addFinalizer(
+          callerScope,
+          Effect.sync(() => {
+            channel.owners.delete(owner)
+            if (!channel.owners.size) {
+              channels.delete(own)
+              follows.delete(own)
+            }
+          }),
+        )
       const seen = new Set<string>()
       let row: typeof SessionPromptReceiptTable.$inferSelect | undefined = start
       while (row && !seen.has(row.request_id)) {
@@ -659,6 +1451,20 @@ const layer = Layer.effect(
       exclusive(
         input.admission.sessionID,
         Effect.gen(function* () {
+          const retry = yield* reconcileLocked(input.admission)
+          if (retry) return retry
+          yield* assertIdentityIn(db, input.admission.sessionID, input.admission.messageID)
+          const keys = constituentIDs(input.admission.sessionID, input.admission)
+          const witnessed = keys.length
+            ? yield* db
+                .select({ id: PartTable.id })
+                .from(PartTable)
+                .where(inArray(PartTable.id, keys))
+                .limit(1)
+                .get()
+                .pipe(Effect.orDie)
+            : undefined
+          if (witnessed) return { kind: "queued" as const, own: yield* admitLocked(input.admission) }
           const busy = input.forceQueue === true || (yield* input.isBusy)
           const existingRow = input.admission.messageID
             ? yield* db
@@ -687,7 +1493,11 @@ const layer = Layer.effect(
                     item.input.messageID === input.admission.messageID && sameQueuedInput(item.input, input.admission),
                 )
               : undefined
-            if (duplicate) return { kind: "queued" as const, own: duplicate, prepared }
+            if (duplicate) {
+              const callerScope = Option.getOrUndefined(yield* Effect.serviceOption(Scope.Scope))
+              yield* openChannel(duplicate, undefined, callerScope)
+              return { kind: "queued" as const, own: duplicate, prepared }
+            }
             const active = busy || (yield* input.isBusy)
             if (existing && !active) return { kind: "direct" as const, message: existing }
             if (existing && active)
@@ -700,13 +1510,14 @@ const layer = Layer.effect(
             const admission = { ...input.admission, messageID }
             const rekeyed = rekeyMessage(prepared, messageID)
             if (active) return { kind: "queued" as const, own: yield* admitLocked(admission), prepared: rekeyed }
-            const message = yield* input.write(rekeyed)
+            const message = yield* writeOriginal({ ...input, admission }, rekeyed)
             if (yield* input.isBusy) {
               yield* input.discard(message)
               return { kind: "queued" as const, own: yield* admitLocked(admission), prepared: rekeyed }
             }
             return { kind: "direct" as const, message }
           }
+          if (dispatch(input.admission)) return { kind: "queued" as const, own: yield* admitLocked(input.admission) }
           if (busy)
             return {
               kind: "queued" as const,
@@ -719,7 +1530,7 @@ const layer = Layer.effect(
               own: yield* admitLocked(input.admission),
               prepared,
             }
-          const message = yield* input.write(prepared)
+          const message = yield* writeOriginal(input, prepared)
           if (yield* input.isBusy) {
             yield* input.discard(message)
             return {
@@ -1004,7 +1815,15 @@ const layer = Layer.effect(
               yield* Effect.forEach(plan.into, (merge) =>
                 Effect.gen(function* () {
                   const into = yield* rowOf(tx, merge.into)
-                  if (into) yield* settleReceipts(tx, sessionID, merge.items, { kind: "merged", into })
+                  if (into) {
+                    const sources = yield* tx
+                      .select()
+                      .from(SessionPromptQueueTable)
+                      .where(inArray(SessionPromptQueueTable.id, merge.items))
+                      .all()
+                    yield* retainOriginals(tx, into, sources)
+                    yield* settleReceipts(tx, sessionID, merge.items, { kind: "merged", into })
+                  }
                 }),
               )
               if (plan.removed.length > 0)
@@ -1014,16 +1833,25 @@ const layer = Layer.effect(
                   .run()
                   .pipe(Effect.orDie)
               yield* Effect.forEach(plan.changed, (changed) =>
-                tx
-                  .update(SessionPromptQueueTable)
-                  .set({
-                    input: encodeInput(changed.input),
-                    origins: [...changed.origins],
-                    time_created: changed.time.created,
-                  })
-                  .where(eq(SessionPromptQueueTable.id, changed.id))
-                  .run()
-                  .pipe(Effect.orDie),
+                Effect.gen(function* () {
+                  const current = (yield* rowOf(tx, changed.id))!
+                  return yield* tx
+                    .update(SessionPromptQueueTable)
+                    .set({
+                      input: encodeInput({
+                        ...changed.input,
+                        parts: [
+                          ...changed.input.parts.filter((part) => !pendingOriginal(part)),
+                          ...decodeInput(current.input).parts.filter(pendingOriginal),
+                        ],
+                      }),
+                      origins: [...changed.origins],
+                      time_created: changed.time.created,
+                    })
+                    .where(eq(SessionPromptQueueTable.id, changed.id))
+                    .run()
+                    .pipe(Effect.orDie)
+                }),
               )
               finish(finished)
               return { changed: plan.removed.length > 0 || finished.length > 0, into: plan.into }
@@ -1061,15 +1889,24 @@ const layer = Layer.effect(
         ),
       )
 
-    const oldest = (query: DatabaseAccess, sessionID: SessionID, delivery: Delivery) =>
+    const eligible = (query: DatabaseAccess, sessionID: SessionID, delivery: Delivery, peersOnly = false) =>
       query
         .select()
         .from(SessionPromptQueueTable)
         .where(and(pending(sessionID), eq(SessionPromptQueueTable.delivery, delivery)))
         .orderBy(asc(SessionPromptQueueTable.seq))
-        .limit(1)
-        .get()
-        .pipe(Effect.orDie)
+        .all()
+        .pipe(
+          Effect.orDie,
+          Effect.map((rows) =>
+            peersOnly
+              ? rows.filter((row) => {
+                  const decoded = Schema.decodeUnknownOption(SessionPromptQueue.QueuedInput)(row.input)
+                  return Option.isSome(decoded) && dispatch(decoded.value, row.delivery)?.kind === "peer"
+                })
+              : rows,
+          ),
+        )
 
     // A promoted message sorts after the session's history: V1 clients order
     // messages by id, so a supplied id is kept only while it is still the newest.
@@ -1110,10 +1947,22 @@ const layer = Layer.effect(
           .where(eq(SessionPromptQueueTable.id, row.id))
           .run()
           .pipe(Effect.orDie)
+        const prior = yield* tx
+          .select()
+          .from(SessionPromptProvenanceTable)
+          .where(eq(SessionPromptProvenanceTable.message_id, message))
+          .get()
         yield* tx
           .insert(SessionPromptProvenanceTable)
-          .values({ message_id: message, session_id: row.session_id, origins: origins(row) })
-          .onConflictDoNothing()
+          .values({
+            message_id: message,
+            session_id: row.session_id,
+            origins: [...(prior?.origins ?? []), ...origins(row)],
+          })
+          .onConflictDoUpdate({
+            target: SessionPromptProvenanceTable.message_id,
+            set: { origins: [...(prior?.origins ?? []), ...origins(row)] },
+          })
           .run()
           .pipe(Effect.orDie)
         const riding = and(
@@ -1134,167 +1983,193 @@ const layer = Layer.effect(
           .pipe(Effect.orDie)
       })
 
-    const markPromoted = (sessionID: SessionID, itemID: ItemID, id: MessageID) =>
-      writable(sessionID, (tx) =>
-        Effect.gen(function* () {
-          const row = yield* tx
-            .select()
-            .from(SessionPromptQueueTable)
-            .where(eq(SessionPromptQueueTable.id, itemID))
-            .get()
-            .pipe(Effect.orDie)
-          if (row) yield* promoted(tx, row, id)
-        }),
-      ).pipe(
-        Effect.orDie,
-        Effect.tap(() => Effect.sync(() => deliver(itemID, id))),
-      )
-
-    // Both act only on the reservation `id` they were given, and say whether it
-    // was still current: a hold, reorder, consolidation or admission merge that
-    // invalidated it meanwhile owns the row now, which may carry more work.
-    const drop = (sessionID: SessionID, itemID: ItemID, id: MessageID) =>
-      writable(sessionID, (tx) =>
-        Effect.gen(function* () {
-          const row = yield* tx
-            .delete(SessionPromptQueueTable)
-            .where(reserved(sessionID, itemID, id))
-            .returning({ id: SessionPromptQueueTable.id })
-            .get()
-            .pipe(Effect.orDie)
-          if (row) yield* settleReceipts(tx, sessionID, [itemID], { kind: "deleted" })
-          return row !== undefined
-        }),
-      ).pipe(Effect.orDie)
-
-    const unreserve = (sessionID: SessionID, itemID: ItemID, id: MessageID) =>
-      writable(sessionID, (tx) =>
-        tx
-          .update(SessionPromptQueueTable)
-          .set({ message_id: null })
-          .where(reserved(sessionID, itemID, id))
-          .returning({ id: SessionPromptQueueTable.id })
-          .get()
-          .pipe(
-            Effect.orDie,
-            Effect.map((row) => row !== undefined),
-          ),
-      ).pipe(Effect.orDie)
-
-    const reserved = (sessionID: SessionID, itemID: ItemID, id: MessageID) =>
-      and(eq(SessionPromptQueueTable.id, itemID), pending(sessionID), eq(SessionPromptQueueTable.message_id, id))
-
-    // Picks the oldest eligible row and reserves its message id, under the lock.
-    // A reservation whose message already landed (a process stopped between the
-    // write and the mark) is finished instead of prepared again.
-    const reserve = (sessionID: SessionID, delivery: Delivery) =>
+    // A shared reservation ID fixes membership across process restart. Preparation holds no DB/session lock.
+    const reserve = (sessionID: SessionID, delivery: Delivery, isolate = new Set<ItemID>(), peersOnly = false) =>
       exclusive(
         sessionID,
         Effect.gen(function* () {
           if (yield* held(sessionID)) return undefined
-          if (delivery === "steer") {
-            const hasPendingSteer = yield* db
-              .transaction((tx) =>
-                Effect.gen(function* () {
-                  return yield* tx
-                    .select({ id: SessionPromptQueueTable.id })
-                    .from(SessionPromptQueueTable)
-                    .where(pending(sessionID))
-                    .orderBy(asc(SessionPromptQueueTable.seq))
-                    .limit(1)
-                    .get()
-                    .pipe(
-                      Effect.map((row) => row !== undefined),
-                      Effect.orDie,
-                    )
-                }),
-              )
-              .pipe(Effect.orDie)
-            if (!hasPendingSteer || (yield* compacting(sessionID))) return undefined
-          }
+          if ((delivery === "steer" || peersOnly) && (yield* compacting(sessionID))) return undefined
           const result = yield* writable(sessionID, (tx) =>
             Effect.gen(function* () {
-              const row = yield* oldest(tx, sessionID, delivery)
-              if (!row) return undefined
-              if (row.message_id && (yield* landed(tx, row.message_id))) {
-                yield* promoted(tx, row, row.message_id)
-                return { kind: "finished" as const, row }
-              }
+              yield* indexAliases(tx, sessionID)
+              const rows = yield* eligible(tx, sessionID, delivery, peersOnly)
+              if (!rows.length) return undefined
+              const picked = selection(rows)
+              const selected = picked.some((row) => isolate.has(row.id)) ? [picked[0]] : picked
+              const row = selected[0]
               const decoded = Schema.decodeUnknownExit(SessionPromptQueue.QueuedInput)(row.input)
               if (Exit.isFailure(decoded)) {
                 yield* tx.delete(SessionPromptQueueTable).where(eq(SessionPromptQueueTable.id, row.id)).run()
                 yield* settleReceipts(tx, sessionID, [row.id], { kind: "deleted" })
                 return { kind: "invalid" as const, row, cause: decoded.cause }
               }
-              const id = yield* messageID(tx, sessionID, decoded.value.messageID)
+              const id =
+                row.message_id ??
+                (yield* messageID(tx, sessionID, selected.length === 1 ? decoded.value.messageID : undefined))
+              const ids = selected.map((item) => item.id)
+              const aliases = yield* tx
+                .select()
+                .from(SessionPromptQueueAliasTable)
+                .where(inArray(SessionPromptQueueAliasTable.item_id, ids))
+                .all()
+              if (yield* landed(tx, id)) {
+                for (const original of selected) {
+                  const item = fromRow(original)
+                  const machine = dispatch(item.input)
+                  yield* rememberAliases(
+                    tx,
+                    item,
+                    id,
+                    machine?.kind === "peer" ? "peer" : (machine?.type ?? "individual"),
+                    aliases.filter((alias) => alias.item_id === item.id).map((alias) => alias.id),
+                  )
+                }
+                yield* Effect.forEach(selected, (row) => promoted(tx, row, id))
+                return { kind: "finished" as const, rows: selected, id }
+              }
               yield* tx
                 .update(SessionPromptQueueTable)
                 .set({ message_id: id })
-                .where(eq(SessionPromptQueueTable.id, row.id))
+                .where(inArray(SessionPromptQueueTable.id, ids))
                 .run()
-                .pipe(Effect.orDie)
-              return { kind: "reserved" as const, row, input: decoded.value, id }
+              return { kind: "reserved" as const, rows: selected, input: grouped(selected, aliases), id }
             }),
           ).pipe(Effect.orDie)
           if (!result) return undefined
-          if (result.kind === "finished") {
-            deliver(result.row.id, result.row.message_id!)
-            yield* publish(sessionID)
-            return result
-          }
-          if (result.kind === "invalid") {
-            yield* publish(sessionID)
-            return result
-          }
+          if (result.kind === "finished")
+            result.rows.forEach((row) => {
+              deliver(row.id, result.id)
+            })
+          if (result.kind !== "reserved") yield* publish(sessionID)
           return result
         }),
       )
 
-    // Writes the prepared message only while its item is still pending with this
-    // reservation; a withdraw or a compaction that began meanwhile wins.
+    const releaseReservation = (
+      sessionID: SessionID,
+      rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[],
+      id: MessageID,
+    ) =>
+      writable(sessionID, (tx) =>
+        tx
+          .update(SessionPromptQueueTable)
+          .set({ message_id: null })
+          .where(
+            and(
+              inArray(
+                SessionPromptQueueTable.id,
+                rows.map((row) => row.id),
+              ),
+              eq(SessionPromptQueueTable.message_id, id),
+              pending(sessionID),
+            ),
+          )
+          .run(),
+      ).pipe(Effect.orDie)
+
+    // The prepared message, all its parts and every constituent's promotion commit together.
     const commit = <P>(
       sessionID: SessionID,
       delivery: Delivery,
-      itemID: ItemID,
+      rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[],
       id: MessageID,
       prepared: P,
       write: (prepared: P) => Effect.Effect<unknown>,
+      valid?: (prepared: P) => Effect.Effect<boolean>,
+      peersOnly = false,
     ) =>
       exclusive(
         sessionID,
         Effect.gen(function* () {
-          const current = yield* db
-            .select({ id: SessionPromptQueueTable.id })
-            .from(SessionPromptQueueTable)
-            .where(
-              and(
-                eq(SessionPromptQueueTable.id, itemID),
-                pending(sessionID),
-                eq(SessionPromptQueueTable.message_id, id),
-              ),
-            )
-            .get()
-            .pipe(Effect.orDie)
-          if (!current) return false
-          // A hold that began while this message was being prepared wins too.
-          if ((yield* held(sessionID)) || (delivery === "steer" && (yield* compacting(sessionID)))) {
-            yield* unreserve(sessionID, itemID, id)
+          if ((yield* held(sessionID)) || ((delivery === "steer" || peersOnly) && (yield* compacting(sessionID)))) {
+            yield* releaseReservation(sessionID, rows, id)
             return false
           }
-          yield* write(prepared).pipe(
-            Effect.onExit((exit) =>
-              Exit.isSuccess(exit)
-                ? markPromoted(sessionID, itemID, id)
-                : landed(db, id).pipe(
-                    Effect.flatMap((exists) =>
-                      exists ? markPromoted(sessionID, itemID, id) : unreserve(sessionID, itemID, id),
+          const written = yield* writable(sessionID, (tx) =>
+            Effect.gen(function* () {
+              const current = yield* eligible(tx, sessionID, delivery, peersOnly)
+              const members = current.filter((row) => row.message_id === id)
+              // A withdrawn/edited constituent cancels the whole preparation. Concurrent arrivals stay outside it.
+              if (
+                members.length !== rows.length ||
+                rows.some(
+                  (row) =>
+                    !members.some(
+                      (member) =>
+                        member.id === row.id && member.seq === row.seq && isDeepStrictEqual(member.input, row.input),
                     ),
-                  ),
-            ),
-            Effect.ensuring(publish(sessionID)),
+                )
+              ) {
+                yield* tx
+                  .update(SessionPromptQueueTable)
+                  .set({ message_id: null })
+                  .where(and(eq(SessionPromptQueueTable.message_id, id), pending(sessionID)))
+                  .run()
+                return false
+              }
+              const picked = selection(current)
+              if (picked[0].message_id !== id) {
+                yield* tx
+                  .update(SessionPromptQueueTable)
+                  .set({ message_id: null })
+                  .where(and(eq(SessionPromptQueueTable.message_id, id), pending(sessionID)))
+                  .run()
+                return false
+              }
+              if (valid && !(yield* valid(prepared))) {
+                yield* tx
+                  .update(SessionPromptQueueTable)
+                  .set({ message_id: null })
+                  .where(and(eq(SessionPromptQueueTable.message_id, id), pending(sessionID)))
+                  .run()
+                return false
+              }
+              yield* write(prepared)
+              yield* Effect.forEach(rows, (row) => promoted(tx, row, id))
+              yield* DatabaseTransaction.afterCommit(
+                Effect.sync(() => {
+                  rows.forEach((row) => {
+                    deliver(row.id, id)
+                  })
+                }),
+                true,
+              )
+              yield* DatabaseTransaction.afterCommit(publish(sessionID))
+              return true
+            }),
+          ).pipe(
+            Effect.orDie,
+            Effect.onError(() => releaseReservation(sessionID, rows, id)),
           )
-          return true
+          if (!written) yield* publish(sessionID)
+          return written
         }),
+      )
+
+    const holdFailedOriginal = (
+      sessionID: SessionID,
+      rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[],
+      id: MessageID,
+    ) =>
+      exclusive(
+        sessionID,
+        writable(sessionID, (tx) =>
+          tx
+            .update(SessionPromptQueueTable)
+            .set({ message_id: null, time_withdrawn: Date.now() })
+            .where(
+              and(
+                inArray(
+                  SessionPromptQueueTable.id,
+                  rows.map((row) => row.id),
+                ),
+                or(eq(SessionPromptQueueTable.message_id, id), isNull(SessionPromptQueueTable.message_id)),
+                pending(sessionID),
+              ),
+            )
+            .run(),
+        ).pipe(Effect.orDie, Effect.andThen(publish(sessionID))),
       )
 
     const promote: Interface["promote"] = <P, E>(input: {
@@ -1302,17 +2177,20 @@ const layer = Layer.effect(
       readonly delivery: Delivery
       readonly prepare: (input: PromotedInput) => Effect.Effect<P, E>
       readonly write: (prepared: P) => Effect.Effect<unknown>
+      readonly valid?: (prepared: P) => Effect.Effect<boolean>
       readonly rejected: (cause: Cause.Cause<E>) => Effect.Effect<void>
       readonly own?: ItemID
       readonly untilStarted?: boolean
+      readonly peersOnly?: boolean
     }) =>
       semaphore(order, input.sessionID)
         .withPermit(
           Effect.gen(function* () {
             let changed = false
+            const isolate = new Set<ItemID>()
             while (true) {
               if (input.untilStarted && !(yield* empty(input.sessionID))) return changed
-              const next = yield* reserve(input.sessionID, input.delivery)
+              const next = yield* reserve(input.sessionID, input.delivery, isolate, input.peersOnly)
               if (!next) return changed
               changed = true
               if (next.kind === "finished") {
@@ -1327,39 +2205,96 @@ const layer = Layer.effect(
               const prepared = yield* input
                 .prepare({ ...next.input, sessionID: input.sessionID, messageID: next.id })
                 .pipe(Effect.exit)
-              if (Exit.isFailure(prepared)) {
-                // A prompt that cannot become a message is consumed, as a failed prompt was before the queue.
-                // A failure of a reservation no longer current is no one's: the row is prepared again.
+              const attempt: Exit.Exit<boolean, E> = Exit.isFailure(prepared)
+                ? Exit.failCause(prepared.cause)
+                : yield* commit(
+                    input.sessionID,
+                    input.delivery,
+                    next.rows,
+                    next.id,
+                    prepared.value,
+                    input.write,
+                    input.valid,
+                    input.peersOnly,
+                  ).pipe(Effect.exit)
+              if (Exit.isFailure(attempt)) {
                 const current = yield* exclusive(
                   input.sessionID,
-                  (Cause.hasInterruptsOnly(prepared.cause)
-                    ? unreserve(input.sessionID, next.row.id, next.id)
-                    : drop(input.sessionID, next.row.id, next.id)
-                  ).pipe(Effect.tap((changed) => (changed ? publish(input.sessionID) : Effect.void))),
+                  db
+                    .select({ id: SessionPromptQueueTable.id })
+                    .from(SessionPromptQueueTable)
+                    .where(
+                      and(
+                        pending(input.sessionID),
+                        eq(SessionPromptQueueTable.message_id, next.id),
+                        inArray(
+                          SessionPromptQueueTable.id,
+                          next.rows.map((row) => row.id),
+                        ),
+                      ),
+                    )
+                    .all()
+                    .pipe(Effect.orDie),
                 )
-                if (Cause.hasInterruptsOnly(prepared.cause)) return yield* Effect.failCause(prepared.cause)
-                if (!current) continue
-                if (next.row.id === input.own) return yield* Effect.failCause(prepared.cause)
-                yield* input.rejected(prepared.cause)
+                // A review or receipt merge owns the changed carrier; a stale preparation cannot drop or hold it.
+                if (
+                  Exit.isFailure(prepared) &&
+                  current.length !== next.rows.length &&
+                  !Cause.hasInterrupts(attempt.cause)
+                )
+                  continue
+                // A committed message must never be retried because one of its observers interrupted.
+                if (
+                  Cause.hasInterrupts(attempt.cause) ||
+                  (yield* landed(db, next.id)) ||
+                  (Exit.isSuccess(prepared) && sqliteLockMessage(Cause.squash(attempt.cause)))
+                ) {
+                  yield* exclusive(input.sessionID, releaseReservation(input.sessionID, next.rows, next.id))
+                  return yield* Effect.failCause(attempt.cause)
+                }
+                if (Exit.isSuccess(prepared) && !("group" in next.input)) return yield* Effect.failCause(attempt.cause)
+                if ("group" in next.input) {
+                  if (next.rows.length > 1) {
+                    yield* exclusive(input.sessionID, releaseReservation(input.sessionID, next.rows, next.id))
+                    next.rows.forEach((row) => isolate.add(row.id))
+                    continue
+                  }
+                  // Keep the failed original in an explicit, reported hold. Only the existing restore control retries it.
+                  yield* holdFailedOriginal(input.sessionID, next.rows, next.id)
+                  yield* input.rejected(
+                    Cause.die(
+                      new Error(
+                        `Queue original ${next.rows[0].id} retained in withdrawn hold; restore after resolving failure: ${Cause.pretty(attempt.cause)}`,
+                      ),
+                    ),
+                  )
+                  if (next.rows[0].id === input.own) return yield* Effect.failCause(attempt.cause)
+                  continue
+                }
+                yield* exclusive(
+                  input.sessionID,
+                  writable(input.sessionID, (tx) =>
+                    Effect.gen(function* () {
+                      yield* tx
+                        .delete(SessionPromptQueueTable)
+                        .where(eq(SessionPromptQueueTable.id, next.rows[0].id))
+                        .run()
+                      yield* settleReceipts(tx, input.sessionID, [next.rows[0].id], { kind: "deleted" })
+                    }),
+                  ).pipe(Effect.orDie, Effect.andThen(publish(input.sessionID))),
+                )
+                if (next.rows[0].id === input.own) return yield* Effect.failCause(attempt.cause)
+                yield* input.rejected(attempt.cause)
                 continue
               }
-              const written = yield* commit(
-                input.sessionID,
-                input.delivery,
-                next.row.id,
-                next.id,
-                prepared.value,
-                input.write,
-              )
-              // Queued items run one per turn; the loop reevaluates before the next.
-              if (written && input.delivery === "queue") return true
-              if (!written && input.delivery === "steer" && (yield* compacting(input.sessionID))) return changed
+              if (attempt.value && input.delivery === "queue") return true
+              if (!attempt.value && input.delivery === "steer" && (yield* compacting(input.sessionID))) return changed
             }
           }),
         )
         .pipe(Effect.withSpan("SessionQueue.promote"))
 
-    // Only an attempt whose delete never ran is made again, so no executed
+    // Only an attempt whose consume never ran is made again, so no executed
     // transaction body is replayed. Success is the attempt's own commit.
     const consume = Effect.fn("SessionQueue.consume")(function* (sessionID: SessionID) {
       for (let attempts = 1; ; attempts++) {
@@ -1528,16 +2463,36 @@ const layer = Layer.effect(
       })
 
     const forget = (itemID: ItemID) =>
-      Effect.sync(() => {
-        channels.delete(itemID)
-        follows.delete(itemID)
+      Effect.gen(function* () {
+        const callerScope = Option.getOrUndefined(yield* Effect.serviceOption(Scope.Scope))
+        yield* Effect.sync(() => {
+          const channel = channels.get(itemID)
+          if (!channel) return
+          const owned = [...channel.owners].find(([, scope]) => scope === callerScope)
+          if (!owned) return
+          channel.owners.delete(owned[0])
+          if (!channel.owners.size) {
+            channels.delete(itemID)
+            follows.delete(itemID)
+          }
+        })
       })
 
     const reply = (itemID: ItemID) =>
       Effect.sync(() => {
-        const answered = channels.get(itemID)?.reply
-        channels.delete(itemID)
+        const answered = channels.get(itemID)?.reply ?? channels.get(carrier(itemID))?.reply
         return answered
+      })
+
+    const message: Interface["message"] = (itemID) =>
+      Effect.gen(function* () {
+        const messageID = channels.get(itemID)?.message ?? channels.get(carrier(itemID))?.message
+        const sessionID = channels.get(itemID)?.sessionID
+        if (!messageID || !sessionID) return undefined
+        return yield* MessageV2.get({ sessionID, messageID }).pipe(
+          Effect.provideService(Database.Service, database),
+          Effect.orDie,
+        )
       })
 
     const annotate: Interface["annotate"] = (sessionID, messages) =>
@@ -1558,7 +2513,15 @@ const layer = Layer.effect(
                 sessionID,
                 messageID: message.info.id,
                 type: "text",
-                text: deliveryNote(found, message.info.time.created),
+                text: deliveryNote(
+                  found,
+                  message.info.time.created,
+                  !message.parts.some((part) => {
+                    if (part.type !== "text" || part.ignored) return false
+                    const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueue)
+                    return Option.isSome(group) && group.value.kind !== "individual"
+                  }),
+                ),
                 synthetic: true,
               }
               return { ...message, parts: [note, ...message.parts] }
@@ -1568,6 +2531,12 @@ const layer = Layer.effect(
 
     return Service.of({
       admit,
+      reconcile,
+      assertFreshIdentity,
+      prepareExecutable,
+      writeDirect,
+      message,
+      assertIdentity,
       request,
       receipt,
       check,
@@ -1639,6 +2608,226 @@ function fromRow(row: typeof SessionPromptQueueTable.$inferSelect): Item {
   }
 }
 
+function deliveredOriginal(
+  row: Pick<typeof PartTable.$inferSelect, "id" | "session_id" | "message_id"> & { data: unknown },
+  sessionID: SessionID,
+) {
+  const part = Schema.decodeUnknownOption(SessionV1.TextPart)({
+    ...(row.data !== null && typeof row.data === "object" ? row.data : {}),
+    id: row.id,
+    sessionID: row.session_id,
+    messageID: row.message_id,
+  })
+  const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(
+    Option.getOrUndefined(part)?.metadata?.sessionQueue,
+  )
+  if (
+    Option.isNone(part) ||
+    !part.value.ignored ||
+    !part.value.synthetic ||
+    Option.isNone(group) ||
+    group.value.sessionID !== sessionID ||
+    row.session_id !== sessionID ||
+    group.value.constituents.length !== 1 ||
+    group.value.constituents[0].sessionID !== sessionID
+  )
+    return
+  return {
+    item: { ...group.value.constituents[0], origins: [{ time: group.value.constituents[0].time.created }] },
+    messageID: MessageID.make(row.message_id),
+    groupKind: group.value.kind,
+  }
+}
+
+function constituentIDs(sessionID: SessionID, input: SessionPromptQueue.QueuedInput) {
+  const machine = dispatch(input)
+  const identities = [
+    ...(input.messageID ? [["message", input.messageID]] : []),
+    ...(machine?.kind === "peer" ? [["peer", machine.sender, machine.home, machine.messageID]] : []),
+  ]
+  return identities.map((identity) =>
+    PartID.make(
+      "prt_queue_" +
+        createHash("sha256")
+          .update(JSON.stringify([sessionID, identity]))
+          .digest("hex"),
+    ),
+  )
+}
+
+function pendingOriginal(part: SessionPromptQueue.QueuedInput["parts"][number]) {
+  if (part.type !== "text" || !part.ignored || !part.synthetic) return
+  const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueuePendingOriginal)
+  if (Option.isSome(group) && group.value.constituents.length === 1) return group.value.constituents[0]
+}
+
+function originalsOf(row: typeof SessionPromptQueueTable.$inferSelect) {
+  const stored = decodeInput(row.input).parts.flatMap((part) => pendingOriginal(part) ?? [])
+  return stored.length ? [...new Map(stored.map((original) => [original.id, original])).values()] : [fromRow(row)]
+}
+
+function originalWitness(original: SessionPromptQueue.Group["constituents"][number], id: PartID, pending = false) {
+  return {
+    type: "text" as const,
+    id,
+    text: "",
+    ignored: true,
+    synthetic: true,
+    metadata: {
+      [pending ? "sessionQueuePendingOriginal" : "sessionQueue"]: Schema.encodeSync(SessionPromptQueue.Group)({
+        version: 1,
+        sessionID: original.sessionID,
+        kind: dispatch(original.input)?.kind === "peer" ? "peer" : "individual",
+        constituents: [original],
+      }),
+    },
+  }
+}
+
+function originalWitnesses(
+  row: typeof SessionPromptQueueTable.$inferSelect,
+  aliases: readonly (typeof SessionPromptQueueAliasTable.$inferSelect)[],
+  pending = false,
+) {
+  const parts = decodeInput(row.input).parts
+  const originals = originalsOf(row)
+  return aliases.flatMap((alias) => {
+    const recorded = parts.find((part) => part.id === alias.id && pendingOriginal(part))
+    const original = recorded
+      ? pendingOriginal(recorded)
+      : (originals.find((original) =>
+          constituentIDs(original.sessionID, original.input).includes(PartID.make(alias.id)),
+        ) ?? (originals.length === 1 ? originals[0] : undefined))
+    if (!original) throw new Error(`Peer alias ${alias.id} lacks original custody in ${row.id}`)
+    return [originalWitness(original, PartID.make(alias.id), pending)]
+  })
+}
+
+function dispatch(input: SessionPromptQueue.QueuedInput, delivery?: Delivery) {
+  input = { ...input, parts: input.parts.filter((part) => !pendingOriginal(part)) }
+  if (!input.parts.length || input.parts.some((part) => part.type === "text" && (part.synthetic || part.ignored)))
+    return
+  // Incompatible execution controls cannot be absorbed into another sender's prompt.
+  if (input.format || input.system || input.tools) return
+  const kind = MachineMessage.dispatch(
+    input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
+  )
+  if (input.parts.some((part) => part.type !== "text" && (kind?.kind !== "peer" || part.type !== "file"))) return
+  // Configured critical markers and an editor's send-now keep their immediate, individual meaning.
+  return kind?.kind === "automation" && delivery === "steer" ? undefined : kind
+}
+
+function selection(rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[]) {
+  const classified = rows.map((row) => {
+    const decoded = Schema.decodeUnknownOption(SessionPromptQueue.QueuedInput)(row.input)
+    return { row, kind: Option.isSome(decoded) ? dispatch(decoded.value, row.delivery) : undefined }
+  })
+  // Native/unknown work remains individual and keeps human authority. Peers precede every automation type.
+  const first =
+    classified.find((item) => !item.kind) ?? classified.find((item) => item.kind?.kind === "peer") ?? classified[0]
+  if (first.row.message_id) return rows.filter((row) => row.message_id === first.row.message_id)
+  if (!first.kind) return [first.row]
+  if (first.kind.kind === "peer")
+    return classified
+      .filter((item) => item.kind?.kind === "peer" && !item.row.message_id)
+      .reduce(
+        (picked, item) => {
+          const size = originalsOf(item.row).length
+          return !picked.blocked && picked.size + size <= 10
+            ? { size: picked.size + size, rows: [...picked.rows, item.row], blocked: false }
+            : { ...picked, blocked: true }
+        },
+        { size: 0, rows: [] as (typeof SessionPromptQueueTable.$inferSelect)[], blocked: false },
+      ).rows
+  const type = first.kind.type
+  return classified
+    .filter((item) => item.kind?.kind === "automation" && item.kind.type === type && !item.row.message_id)
+    .map((item) => item.row)
+}
+
+function grouped(
+  rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[],
+  aliases: readonly (typeof SessionPromptQueueAliasTable.$inferSelect)[] = [],
+) {
+  const items = rows.flatMap(originalsOf)
+  const kind = dispatch(items[0].input)
+  const group: SessionPromptQueue.Group = {
+    version: 1,
+    sessionID: items[0].sessionID,
+    kind: !kind ? "individual" : kind.kind === "peer" ? "peer" : kind.type,
+    constituents: items,
+  }
+  const witnesses = rows.some((row) => decodeInput(row.input).parts.some(pendingOriginal))
+    ? rows.flatMap((row) =>
+        originalWitnesses(
+          row,
+          aliases.filter((alias) => alias.item_id === row.id),
+        ),
+      )
+    : items.flatMap((item) => {
+        const recorded = aliases.filter((alias) => alias.item_id === item.id).map((alias) => PartID.make(alias.id))
+        return (recorded.length ? recorded : constituentIDs(item.sessionID, item.input)).map((id) => ({
+          type: "text" as const,
+          id,
+          text: "",
+          ignored: true,
+          synthetic: true,
+          metadata: { sessionQueue: Schema.encodeSync(SessionPromptQueue.Group)({ ...group, constituents: [item] }) },
+        }))
+      })
+  if (!kind) {
+    const visible = decodeInput(rows[0].input)
+    return { ...visible, parts: [...visible.parts.filter((part) => !pendingOriginal(part)), ...witnesses] }
+  }
+  const latest = new Map<string, ItemID>()
+  items.forEach((item) => {
+    const machine = dispatch(item.input)
+    if (machine?.kind === "automation" && machine.episode) latest.set(machine.episode, item.id)
+  })
+  const shown =
+    kind.kind === "peer"
+      ? items
+      : items.filter((item) => {
+          const machine = dispatch(item.input)
+          return machine?.kind !== "automation" || !machine.episode || latest.get(machine.episode) === item.id
+        })
+  const heading =
+    kind.kind === "peer"
+      ? "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation."
+      : `Queued automation: ${kind.type}. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.`
+  return {
+    ...items[0].input,
+    model: undefined,
+    variant: undefined,
+    group,
+    parts: [
+      {
+        type: "text" as const,
+        text:
+          heading +
+          "\n\n" +
+          shown
+            .map(
+              (item, index) =>
+                `${index + 1}. [Admitted ${new Date(item.time.created).toISOString()}; queue ${item.id}]\n${item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")}`,
+            )
+            .join("\n\n"),
+        metadata: { sessionQueue: Schema.encodeSync(SessionPromptQueue.Group)(group) },
+      },
+      ...shown.flatMap((item, index) => {
+        const files = item.input.parts.filter((part) => part.type === "file")
+        return files.length
+          ? [
+              { type: "text" as const, synthetic: true, text: `Files for numbered peer ${index + 1} (${item.id}):` },
+              ...files,
+            ]
+          : []
+      }),
+      ...witnesses,
+    ],
+  }
+}
+
 function toReceipt(row: typeof SessionPromptReceiptTable.$inferSelect): Receipt {
   if (row.state === "pending") return { state: "pending", itemID: row.item_id! }
   if (row.state === "delivered") return { state: "delivered", messageID: row.message_id! }
@@ -1670,7 +2859,7 @@ function origins(row: typeof SessionPromptQueueTable.$inferSelect): SessionPromp
  * and when it was delivered. Built from stored times only, so the request for a
  * turn reads the same every time it is sent.
  */
-export function deliveryNote(origins: readonly SessionPromptQueue.Origin[], delivered: number) {
+export function deliveryNote(origins: readonly SessionPromptQueue.Origin[], delivered: number, owesReplies = true) {
   const at = (time: number) => new Date(time).toISOString().replace(/\.\d{3}Z$/, "Z")
   const again = (origin: SessionPromptQueue.Origin) =>
     origin.repeats?.length ? `, and again at ${origin.repeats.map((repeat) => at(repeat.time)).join(", ")}` : ""
@@ -1683,7 +2872,7 @@ export function deliveryNote(origins: readonly SessionPromptQueue.Origin[], deli
     ),
   ]
   const owed =
-    requests.length > 1
+    owesReplies && requests.length > 1
       ? ` It carries ${requests.length} requests, each owed its own reply: ${requests.join(", ")}.`
       : ""
   if (origins.length === 1)
@@ -1879,6 +3068,7 @@ function combine(left: SessionPromptQueue.Origin, right: SessionPromptQueue.Orig
 }
 
 function parseCommand(input: SessionPromptQueue.QueuedInput) {
+  input = { ...input, parts: input.parts.filter((part) => !pendingOriginal(part)) }
   const part = input.parts[0]
   if (input.parts.length !== 1 || part?.type !== "text" || part.synthetic) return undefined
   const match = /^\s*(\S+)\s+(\S+?)[:,]?(?:\s+(\S[\s\S]*?))?\s*$/.exec(part.text)
@@ -1896,7 +3086,10 @@ function parseCommand(input: SessionPromptQueue.QueuedInput) {
 }
 
 function withoutIDs(input: SessionPromptQueue.QueuedInput) {
-  return { ...Struct.omit(input, ["messageID"]), parts: input.parts.map((part) => Struct.omit(part, ["id"])) }
+  return {
+    ...Struct.omit(input, ["messageID"]),
+    parts: input.parts.filter((part) => !pendingOriginal(part)).map((part) => Struct.omit(part, ["id"])),
+  }
 }
 
 function sameMessage(left: SessionV1.WithParts, right: SessionV1.WithParts) {
@@ -1914,9 +3107,10 @@ function sameMessage(left: SessionV1.WithParts, right: SessionV1.WithParts) {
 }
 
 function sameQueuedInput(left: SessionPromptQueue.QueuedInput, right: AdmitInput) {
+  left = { ...left, parts: left.parts.filter((part) => !pendingOriginal(part)) }
   return isDeepStrictEqual(
     withoutUndefined(Struct.omit(left, ["messageID"])),
-    withoutUndefined(Struct.omit(right, ["sessionID", "messageID", "noReply", "delivery"])),
+    withoutUndefined(Struct.omit(right, ["sessionID", "messageID", "noReply", "delivery", "requestID"])),
   )
 }
 

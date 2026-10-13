@@ -353,7 +353,8 @@ const requiredRetentionTables = new Set([
   // Request receipts (#212): sender request IDs, states, message IDs and a prompt digest; no prompt text.
   "session_prompt_receipt",
 ])
-const classifiedSessionTables = new Set([...requiredRetentionTables])
+// Alias hashes contain no input copy; their queue foreign key owns lifecycle and normal consume removes them.
+const classifiedSessionTables = new Set([...requiredRetentionTables, "session_prompt_queue_alias"])
 
 // Every producer timestamp a Session tree carries. Event rows have no timestamp, so appends are
 // timed by event_aggregate_writer, which the EventV2 commit writes with each append.

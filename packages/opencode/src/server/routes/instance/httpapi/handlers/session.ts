@@ -256,7 +256,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           command: Command.Default.INIT,
           arguments: "",
         })
-        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+        .pipe(
+          Effect.catchDefect(historicalRefusal),
+          Effect.mapError(() => new HttpApiError.BadRequest({})),
+        )
       return true
     })
 
@@ -315,7 +318,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           ...ctx.payload,
           sessionID: ctx.params.sessionID,
         })
-        .pipe(Effect.mapError(promptError))
+        .pipe(Effect.catchDefect(historicalRefusal), Effect.mapError(promptError))
       return HttpServerResponse.stream(Stream.make(JSON.stringify(message)).pipe(Stream.encodeText), {
         contentType: "application/json",
       })
@@ -334,6 +337,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           })
         : new HttpApiError.BadRequest({})
 
+    // Ambiguous historical input is a native admission refusal, not an internal server failure.
+    const historicalRefusal = (error: unknown) =>
+      error instanceof SessionQueue.HistoricalIdentityError ? Effect.fail(error) : Effect.die(error)
     const requestConflict = (error: SessionQueue.RequestConflictError) =>
       new PromptRequestConflictError({
         sessionID: error.sessionID,
@@ -377,7 +383,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       yield* requireSession(ctx.params.sessionID)
       return yield* promptSvc
         .command({ ...ctx.payload, sessionID: ctx.params.sessionID })
-        .pipe(Effect.mapError(commandError))
+        .pipe(Effect.catchDefect(historicalRefusal), Effect.mapError(commandError))
     })
 
     const shell = Effect.fn("SessionHttpApi.shell")(function* (ctx: {
@@ -385,7 +391,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof ShellPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      return yield* SessionError.mapBusy(promptSvc.shell({ ...ctx.payload, sessionID: ctx.params.sessionID }))
+      return yield* SessionError.mapBusy(promptSvc.shell({ ...ctx.payload, sessionID: ctx.params.sessionID })).pipe(
+        Effect.catchDefect((error) =>
+          error instanceof SessionQueue.HistoricalIdentityError
+            ? Effect.fail(new HttpApiError.BadRequest({}))
+            : Effect.die(error),
+        ),
+      )
     })
 
     const revert = Effect.fn("SessionHttpApi.revert")(function* (ctx: {
