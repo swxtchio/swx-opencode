@@ -191,6 +191,8 @@ export interface Interface {
    * decision never saw is not parked by it.
    */
   readonly park: (sessionID: SessionID, seen?: number) => Effect.Effect<void>
+  /** Whether a stopped run parked the session and nothing has woken it since. */
+  readonly isParked: (sessionID: SessionID) => Effect.Effect<boolean>
   /** The joiner re-check's signal: admitted work no drain has read yet, on a session that is not parked. */
   readonly awaitingDrain: (sessionID: SessionID) => Effect.Effect<boolean>
   readonly withdrawn: (sessionID: SessionID, itemID: ItemID) => Effect.Effect<boolean>
@@ -1323,6 +1325,8 @@ const layer = Layer.effect(
         }),
       )
 
+    const isParked: Interface["isParked"] = (sessionID) => Effect.sync(() => parked.has(sessionID))
+
     // A held pending item is not awaiting a drain: none could promote it, and the
     // hold's end wakes the session instead.
     const awaitingDrain = Effect.fn("SessionQueue.awaitingDrain")(function* (sessionID: SessionID) {
@@ -1467,6 +1471,7 @@ const layer = Layer.effect(
       promote,
       consume,
       park,
+      isParked,
       awaitingDrain,
       withdrawn,
       unread,

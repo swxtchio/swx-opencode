@@ -1741,6 +1741,14 @@ const layer = Layer.effect(
           return yield* new SessionQueue.WithdrawnError({ sessionID, itemID: own })
         if (yield* queue.empty(sessionID)) return yield* withdrawn.pipe(Effect.andThen(lastAssistant(sessionID)))
       }
+      // A cancel that parked the session after this prompt was admitted leaves it
+      // pending, as it would have had this caller joined the run the cancel stopped.
+      if (
+        own &&
+        Exit.isSuccess(yield* state.assertNotBusy(sessionID).pipe(Effect.exit)) &&
+        (yield* queue.isParked(sessionID))
+      )
+        return yield* withdrawn.pipe(Effect.andThen(lastAssistant(sessionID)))
       const result = yield* state.ensureRunning(
         sessionID,
         lastAssistant(sessionID),

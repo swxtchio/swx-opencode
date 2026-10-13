@@ -7064,6 +7064,34 @@ it.instance(
 )
 
 it.instance(
+  "a prompt still pending when a cancel parks its idle session is not run by its caller's drain",
+  () =>
+    Effect.gen(function* () {
+      const { llm, prompt, chat, task, send } = yield* startHeld()
+      const queue = yield* SessionQueue.Service
+      const held = yield* send("held over the cancel", { delivery: "queue", requestID: "held-over" })
+      const [pending] = yield* queued(chat.id, 1)
+      yield* prompt.cancel(chat.id)
+      yield* finish(task, held)
+      expect(yield* llm.calls).toBe(1)
+
+      // Its retry waits on the same item, after the cancel and with nothing
+      // admitted since, so the session is idle and still parked.
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: said("held over the cancel"),
+        delivery: "queue",
+        requestID: "held-over",
+      })
+      expect(yield* queue.list(chat.id)).toEqual([pending])
+      expect(yield* llm.calls).toBe(1)
+    }),
+  15_000,
+)
+
+it.instance(
   "queued prompts survive a rebuild of the session services over the same database",
   () =>
     Effect.gen(function* () {
