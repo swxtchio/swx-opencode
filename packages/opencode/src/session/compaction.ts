@@ -1,5 +1,4 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { ProviderTransform } from "@/provider/transform"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Session } from "./session"
@@ -434,14 +433,16 @@ const layer = Layer.effect(
           ),
         )
       // The summary records the variant and effort its request actually sent,
-      // plugins' adjustments included; how they are chosen is unchanged (#227).
-      const sent: { request?: { readonly options: Record<string, any>; readonly variant?: string } } = {}
+      // plugins' adjustments and the runtime's lowering included; how they are
+      // chosen is unchanged (#227). They land on the message before it streams,
+      // so a summary interrupted after sending still persists them.
       const result = yield* processor.process({
         user: userMessage,
         agent,
         sessionID: input.sessionID,
-        prepared: (request) => {
-          sent.request = request
+        sent: (request) => {
+          processor.message.variant = request.variant
+          processor.message.effort = request.effort
         },
         tools: {},
         system: [],
@@ -463,13 +464,6 @@ const layer = Layer.effect(
         ],
         model,
       })
-
-      if (sent.request) {
-        const effort = ProviderTransform.effort(sent.request.options)
-        processor.message.variant = sent.request.variant
-        if (effort) processor.message.effort = effort
-        yield* session.updateMessage(processor.message)
-      }
 
       if (result === "compact") {
         processor.message.error = new SessionV1.ContextOverflowError({

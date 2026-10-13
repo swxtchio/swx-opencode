@@ -153,6 +153,18 @@ const expectOpenAIResponsesRequest = (input: {
     })
   })
 
+describe("session.llm-native.sentEffort", () => {
+  test("reads the effort each native protocol puts on the wire, and nothing else", () => {
+    expect(LLMNativeRuntime.sentEffort({ reasoning_effort: "high" })).toBe("high")
+    expect(LLMNativeRuntime.sentEffort({ reasoning: { effort: "low", summary: "auto" } })).toBe("low")
+    expect(LLMNativeRuntime.sentEffort({ output_config: { effort: "max" } })).toBe("max")
+    // Options the body never carried, or a budget, are not a sent effort.
+    expect(LLMNativeRuntime.sentEffort({ providerOptions: { reasoningEffort: "high" } })).toBe(undefined)
+    expect(LLMNativeRuntime.sentEffort({ thinking: { type: "enabled", budget_tokens: 1024 } })).toBe(undefined)
+    expect(LLMNativeRuntime.sentEffort(undefined)).toBe(undefined)
+  })
+})
+
 describe("session.llm-native.request", () => {
   test("maps normalized stream inputs to a native LLM request", () => {
     const messages: ModelMessage[] = [

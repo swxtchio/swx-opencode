@@ -3004,6 +3004,56 @@ describe("session HttpApi summary records what it sent", () => {
   )
 
   it.live(
+    "a summary interrupted after its request was sent still records what it sent",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: effortConfig(llm.url) })
+        const sessionID = (yield* createSession({ title: "interrupted summary" }).pipe(
+          provideInstanceEffect(directory),
+        )).id
+        const api = routes(directory, sessionID)
+        yield* llm.text("start done")
+        expect((yield* api.prompt("start")).status).toBe(200)
+        yield* llm.hold("summary", Effect.runPromise(Deferred.await(gate)))
+        const summarizing = yield* api.summarize().pipe(Effect.forkChild)
+        yield* awaitWithTimeout(llm.wait(2), "the summary never reached the provider", "10 seconds")
+        expect((yield* llm.inputs)[1]?.reasoning_effort).toBe("high")
+        const aborted = yield* request(pathFor(SessionPaths.abort, { sessionID }), {
+          method: "POST",
+          headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+          body: "{}",
+        })
+        expect(aborted.status).toBe(200)
+        yield* awaitWithTimeout(Fiber.await(summarizing), "the summary request never returned", "10 seconds")
+        const stopped = yield* pollWithTimeout(
+          requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, { sessionID }), {
+            headers: { "x-opencode-directory": directory },
+          }).pipe(
+            Effect.map((messages) =>
+              messages.find(
+                (message) =>
+                  message.info.role === "assistant" &&
+                  message.info.summary &&
+                  message.info.time.completed !== undefined,
+              ),
+            ),
+          ),
+          "the interrupted summary never ended",
+          "10 seconds",
+        )
+        expect(stopped.info.role === "assistant" ? stopped.info.effort : undefined).toBe("high")
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
     "an automatic summary runs at the last prompt's variant, as it always has, and records it",
     () =>
       Effect.gen(function* () {

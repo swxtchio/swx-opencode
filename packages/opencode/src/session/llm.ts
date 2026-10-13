@@ -45,8 +45,12 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
-  /** Told what each request sends once plugins have adjusted it, as a summary records (#227). */
-  prepared?: (request: { readonly options: Record<string, any>; readonly variant?: string }) => void
+  /**
+   * Told what each request sends, as a summary records it (#227): the variant
+   * it applied and the effort that reaches the wire, once plugins have
+   * adjusted the options and the chosen runtime has lowered them.
+   */
+  sent?: (request: { readonly variant?: string; readonly effort?: string }) => void
 }
 
 export type StreamRequest = StreamInput & {
@@ -113,7 +117,6 @@ const live: Layer.Layer<
         flags,
         isWorkflow,
       })
-      input.prepared?.({ options: prepared.params.options, variant: prepared.variant })
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system
@@ -244,6 +247,12 @@ const live: Layer.Layer<
           abort: input.abort,
         })
         if (native.type === "supported") {
+          // The native runtime sends only what its protocol lowers, so the body says what was sent.
+          const body = yield* llmClient.prepare(native.request).pipe(
+            Effect.map((compiled) => compiled.body),
+            Effect.catch(() => Effect.succeed(undefined)),
+          )
+          input.sent?.({ variant: prepared.variant, effort: LLMNativeRuntime.sentEffort(body) })
           yield* Effect.logInfo("llm runtime selected", {
             "llm.runtime": "native",
             "llm.provider": input.model.providerID,
@@ -276,6 +285,7 @@ const live: Layer.Layer<
         "llm.provider": input.model.providerID,
         "llm.model": input.model.id,
       })
+      input.sent?.({ variant: prepared.variant, effort: ProviderTransform.effort(prepared.params.options) })
       // Default runtime path: AI SDK owns provider execution and tool dispatch;
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
       return {

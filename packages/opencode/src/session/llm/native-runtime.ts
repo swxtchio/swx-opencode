@@ -23,7 +23,12 @@ export type RuntimeStatus =
   | { readonly type: "supported"; readonly apiKey: string; readonly baseURL?: string }
   | { readonly type: "unsupported"; readonly reason: string }
 export type StreamResult =
-  | { readonly type: "supported"; readonly stream: Stream.Stream<LLMEvent, unknown> }
+  | {
+      readonly type: "supported"
+      readonly stream: Stream.Stream<LLMEvent, unknown>
+      /** The request the stream sends, for compiling to the body on the wire. */
+      readonly request: LLMRequest
+    }
   | { readonly type: "unsupported"; readonly reason: string }
 
 type StreamInput = {
@@ -141,8 +146,25 @@ export function stream(input: StreamInput): StreamResult {
 
   return {
     ...current,
+    // The same request the stream sends, its tools included.
+    request: LLMRequest.update(request, { tools: [...request.tools, ...toDefinitions(tools)] }),
     stream: fetch ? stream.pipe(Stream.provideService(FetchHttpClient.Fetch, fetch)) : stream,
   }
+}
+
+/**
+ * The reasoning effort a compiled native body carries, where each native
+ * protocol puts it: OpenAI Chat's reasoning_effort, OpenAI Responses'
+ * reasoning.effort, Anthropic Messages' output_config.effort. A summary
+ * records it, so it never claims an effort lowering dropped (#227).
+ */
+export function sentEffort(body: unknown): string | undefined {
+  if (!isRecord(body)) return undefined
+  return [
+    body.reasoning_effort,
+    isRecord(body.reasoning) ? body.reasoning.effort : undefined,
+    isRecord(body.output_config) ? body.output_config.effort : undefined,
+  ].find((value): value is string => typeof value === "string")
 }
 
 function providerFetch(input: Pick<StreamInput, "provider" | "auth">): typeof globalThis.fetch | undefined {
