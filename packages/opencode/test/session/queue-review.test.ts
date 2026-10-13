@@ -682,6 +682,8 @@ it.instance(
       if (first.kind !== "admitted") throw new Error("the prompt was not admitted")
       expect((yield* queue.list(session.id)).map(text)).toEqual(["go"])
       expect(yield* receipt("first")).toEqual({ state: "pending", itemID: first.own.id })
+      // No drain could promote it yet; its `prepared` wakes the session.
+      expect(yield* queue.awaitingDrain(session.id)).toBe(false)
       // Nothing waits on its preparation: another prompt is admitted and
       // promoted past it, and an identical copy is not merged into it.
       yield* request(session.id, "steer", "second", "lint")
