@@ -20,11 +20,21 @@ type Hold = {
 export function spanHold() {
   const state = {
     armed: undefined as Hold | undefined,
+    observed: [] as { readonly name: string; readonly parent: string; readonly entered: Deferred.Deferred<void> }[],
     held: undefined as { readonly fiber: Fiber.Fiber<unknown, unknown>; readonly hold: Hold } | undefined,
   }
   const tracer = Tracer.make({
     span(options) {
       const span = new Tracer.NativeSpan(options)
+      state.observed = state.observed.filter((observed) => {
+        if (
+          options.name !== observed.name ||
+          !Option.exists(options.parent, (parent) => parent._tag === "Span" && parent.name === observed.parent)
+        )
+          return true
+        Deferred.doneUnsafe(observed.entered, Effect.void)
+        return false
+      })
       const hold = state.armed
       if (
         hold === undefined ||
@@ -68,5 +78,13 @@ export function spanHold() {
         }).pipe(Effect.andThen(release), Effect.asVoid),
       }
     })
-  return { tracer, arm }
+  // Signals the first time a span `name` under parent span `parent` starts, without holding it: positive evidence
+  // that a fiber has entered a step such as a wait.
+  const observe = (input: { readonly name: string; readonly parent: string }) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>()
+      state.observed = [...state.observed, { ...input, entered }]
+      return Deferred.await(entered)
+    })
+  return { tracer, arm, observe }
 }

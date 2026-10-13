@@ -48,5 +48,6 @@ export const migrations = (
     import("./migration/20261012124815_message-history-order"),
     import("./migration/20261012161249_queue-alias-custody"),
     import("./migration/20261013020615_session_prompt_receipt"),
+    import("./migration/20261013194721_session_prompt_queue_preparing"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

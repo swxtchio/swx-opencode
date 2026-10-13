@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "5048c540-67ab-4585-90e3-6cd9948d0114",
+  "id": "f7b94b68-077f-43ec-862c-af9717d0cef6",
   "prevIds": [
-    "d0278ae1-bc57-4fd9-9c2c-8b0f42060068"
+    "5048c540-67ab-4585-90e3-6cd9948d0114"
   ],
   "ddl": [
     {
@@ -481,6 +481,16 @@
       "default": null,
       "generated": null,
       "name": "time_withdrawn",
+      "entityType": "columns",
+      "table": "session_prompt_queue"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_preparing",
       "entityType": "columns",
       "table": "session_prompt_queue"
     },

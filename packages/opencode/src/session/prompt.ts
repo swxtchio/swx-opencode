@@ -1125,15 +1125,16 @@ const layer = Layer.effect(
         : prepareUserMessage(input)
 
     // A retried request waits on whatever carries it now, as its first send did.
-    // A deleted one was withdrawn; a noReply one answers with its message.
+    // A deleted or withdrawn one answers as withdrawn; a noReply one answers with its message.
     const followRequest = Effect.fnUntraced(function* (
       input: PromptInput,
       followed: Effect.Success<ReturnType<SessionQueue.Interface["request"]>>,
     ) {
+      if (followed.kind === "direct") return followed.message
       const own = followed.kind === "retry" ? followed.own : followed.own.id
       yield* Effect.addFinalizer(() => queue.forget(own))
       const receipt = followed.kind === "retry" ? followed.receipt : undefined
-      if (receipt?.state === "deleted")
+      if (receipt?.state === "deleted" || receipt?.state === "withdrawn")
         return yield* new SessionQueue.WithdrawnError({ sessionID: input.sessionID, itemID: own })
       if (input.noReply !== true) return yield* drain(input.sessionID, own)
       const messageID = receipt && "messageID" in receipt ? receipt.messageID : undefined
@@ -1151,49 +1152,110 @@ const layer = Layer.effect(
       SessionV1.WithParts,
       Image.Error | SessionQueue.WithdrawnError | SessionQueue.RequestConflictError
     > = Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput, admitted?: SessionQueue.Item) {
-      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       // TUI prepends synthetic editor context; only flattened user text owns marker framing.
       const classificationText = input.parts
         .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
         .join("")
-      const markers = (yield* config.get()).machine_message_markers
-      const classification = MachineMessage.classify(classificationText, markers)
-      const delivery = classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
-      // A request the session already has is followed, never admitted or applied again (#212).
-      if (input.requestID && Option.isSome(yield* queue.receipt(input.sessionID, input.requestID)))
-        return yield* followRequest(
-          input,
-          yield* queue.request({ ...input, ...(delivery ? { delivery } : {}) }, markers),
-        )
-      const reconciled = admitted ? undefined : yield* queue.reconcile({ ...input, ...(delivery ? { delivery } : {}) })
-      if (reconciled?.kind === "direct") return reconciled.message
-      if (reconciled?.kind === "queued") {
+      const deliveryOf = (classification: ReturnType<typeof MachineMessage.classify>) =>
+        classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
+      // A queued prompt is admitted before any other work on it, so it is
+      // pending from the moment it arrives (swxtchio/swx-opencode#249). Until
+      // its config is read only the built-in markers classify it. Nothing
+      // promotes or merges it until the work below has prepared the session for
+      // it; when that work fails the admission is taken back, so a failed send
+      // leaves nothing pending and its exact retry is admitted again.
+      const arriving = deliveryOf(MachineMessage.classify(classificationText))
+      const early =
+        admitted || input.noReply === true
+          ? undefined
+          : yield* queue.request({ ...input, ...(arriving ? { delivery: arriving } : {}) }, undefined, true)
+      if (early?.kind === "direct") return early.message
+      // A retry is held to the delivery its classification gives it, as the
+      // original was, before it follows what the session already has. An
+      // original still being prepared has no such delivery yet, so it waits for
+      // it, and is sent anew if the original's preparation failed.
+      if (early?.kind === "reconciled" || early?.kind === "retry") {
+        const original =
+          early.kind === "reconciled"
+            ? early.own.id
+            : early.receipt.state === "pending"
+              ? early.receipt.itemID
+              : undefined
+        if (original) yield* queue.awaitPrepared(original)
+        if (
+          early.kind === "retry" &&
+          input.requestID &&
+          Option.isNone(yield* queue.receipt(input.sessionID, input.requestID))
+        ) {
+          yield* queue.forget(early.own)
+          return yield* prompt(input)
+        }
+        const markers = (yield* config.get()).machine_message_markers
+        const delivery = deliveryOf(MachineMessage.classify(classificationText, markers))
+        const reconciled = yield* queue.reconcile({ ...input, ...(delivery ? { delivery } : {}) })
+        if (reconciled?.kind === "direct") return reconciled.message
+        if (early.kind === "retry") return yield* followRequest(input, early)
+        if (!reconciled) return yield* prompt(input)
+        return yield* drain(input.sessionID, reconciled.own.id)
+      }
+      const own = early?.own
+      // The configured markers, once read, also order what a failed preparation leaves.
+      const known: { markers?: Parameters<SessionQueue.Interface["unprepared"]>[2] } = {}
+      const prepared = yield* Effect.gen(function* () {
+        const markers = (yield* config.get()).machine_message_markers
+        known.markers = markers
+        const classification = MachineMessage.classify(classificationText, markers)
+        const delivery = deliveryOf(classification)
+        // A request the session already has is followed, never admitted or applied again (#212).
+        if (!own && input.requestID && Option.isSome(yield* queue.receipt(input.sessionID, input.requestID)))
+          return {
+            markers,
+            classification,
+            delivery,
+            retry: yield* queue.request({ ...input, ...(delivery ? { delivery: delivery } : {}) }, markers),
+            reconciled: undefined,
+          }
+        const reconciled =
+          own || admitted
+            ? undefined
+            : yield* queue.reconcile({ ...input, ...(delivery ? { delivery: delivery } : {}) })
+        if (reconciled) return { markers, classification, delivery, retry: undefined, reconciled }
+        yield* revert.cleanup(yield* sessions.get(input.sessionID).pipe(Effect.orDie))
+        // A prompt's model and variant become the session's selection now, and a
+        // pending prompt runs at whichever selection is current when it is
+        // delivered (swxtchio/swx-opencode#212).
+        if (
+          (input.model || input.variant) &&
+          (classification === "critical" || !MachineMessage.dispatch(classificationText))
+        ) {
+          const model = input.model ?? (yield* currentModel(input.sessionID))
+          yield* sessions.setModel({
+            sessionID: input.sessionID,
+            model: { id: model.modelID, providerID: model.providerID, variant: input.variant ?? "default" },
+          })
+        }
+        if (own) yield* queue.prepared({ sessionID: input.sessionID, itemID: own.id, delivery, markers })
+        return { markers, classification, delivery, retry: undefined, reconciled: undefined }
+      }).pipe(
+        Effect.onExit((exit) =>
+          own && Exit.isFailure(exit) ? queue.unprepared(input.sessionID, own.id, known.markers) : Effect.void,
+        ),
+      )
+      if (prepared.retry) return yield* followRequest(input, prepared.retry)
+      if (prepared.reconciled?.kind === "direct") return prepared.reconciled.message
+      if (prepared.reconciled?.kind === "queued") {
         if (input.noReply) {
-          const projected = yield* queue.message(reconciled.own.id)
+          const projected = yield* queue.message(prepared.reconciled.own.id)
           if (projected) return projected
           return yield* prepareUserMessage(input)
         }
-        return yield* drain(input.sessionID, reconciled.own.id)
+        return yield* drain(input.sessionID, prepared.reconciled.own.id)
       }
-      yield* revert.cleanup(session)
-      // A prompt's model and variant become the session's selection now, and a
-      // pending prompt runs at whichever selection is current when it is
-      // delivered (swxtchio/swx-opencode#212).
-      if (
-        (input.model || input.variant) &&
-        (classification === "critical" || !MachineMessage.dispatch(classificationText))
-      ) {
-        const model = input.model ?? (yield* currentModel(input.sessionID))
-        yield* sessions.setModel({
-          sessionID: input.sessionID,
-          model: { id: model.modelID, providerID: model.providerID, variant: input.variant ?? "default" },
-        })
-      }
-      const markedNoReply = input.noReply === true && classification === "hold"
+      const markedNoReply = input.noReply === true && prepared.classification === "hold"
       const initiallyHeldNoReply =
         markedNoReply && Exit.isFailure(yield* state.assertNotBusy(input.sessionID).pipe(Effect.exit))
       const queuedInput = markedNoReply && !input.messageID ? { ...input, messageID: MessageID.ascending() } : input
-      const admission = { ...queuedInput, ...(delivery ? { delivery } : {}) }
+      const admission = { ...queuedInput, ...(prepared.delivery ? { delivery: prepared.delivery } : {}) }
       // Preparation can yield while another prompt starts a run. Revalidate at
       // the write boundary so a newly active run receives the marked message as
       // queued input instead of seeing it in its next history reload. The queue
@@ -1211,34 +1273,24 @@ const layer = Layer.effect(
           : undefined
       const heldNoReply = markedNoReply && (initiallyHeldNoReply || noReplyDecision?.kind === "queued")
       const requested =
-        admitted || noReplyDecision || (input.noReply === true && !markedNoReply)
+        own || admitted || noReplyDecision || !markedNoReply
           ? undefined
-          : yield* queue.request(admission, markers)
+          : yield* queue.request(admission, prepared.markers)
+      // Another caller admitted the same request first.
       if (requested?.kind === "retry") return yield* followRequest(input, requested)
-      const entry = admitted
-        ? { kind: "queued" as const, own: admitted, prepared: undefined }
-        : markedNoReply
+      const queued = own ?? admitted ?? (requested?.kind === "admitted" ? requested.own : undefined)
+      const entry = queued
+        ? { kind: "queued" as const, own: queued, prepared: undefined }
+        : noReplyDecision
           ? noReplyDecision
-            ? noReplyDecision
-            : {
-                kind: "queued" as const,
-                own: requested!.own,
-                prepared: undefined,
-              }
-          : input.noReply === true
-            ? {
-                kind: "direct" as const,
-                message: yield* queue.writeDirect({
-                  admission: { ...input, ...(delivery ? { delivery } : {}) },
-                  prepare: () => prepareUserMessage(input),
-                  write: writeUserMessage,
-                }),
-              }
-            : {
-                kind: "queued" as const,
-                own: requested!.own,
-                prepared: undefined,
-              }
+          : {
+              kind: "direct" as const,
+              message: yield* queue.writeDirect({
+                admission: { ...input, ...(prepared.delivery ? { delivery: prepared.delivery } : {}) },
+                prepare: () => prepareUserMessage(input),
+                write: writeUserMessage,
+              }),
+            }
       if (entry.kind === "direct") yield* queue.delivered(admission, entry.message.info.id)
       // Only this prompt's own failure is this caller's error; an older steer
       // promoted alongside it is reported on its own.
@@ -1258,10 +1310,7 @@ const layer = Layer.effect(
       for (const [t, enabled] of Object.entries(input.tools ?? {})) {
         permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
       }
-      if (permissions.length > 0) {
-        session.permission = permissions
-        yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
-      }
+      if (permissions.length > 0) yield* sessions.setPermission({ sessionID: input.sessionID, permission: permissions })
 
       if (entry.kind === "direct") return entry.message
       if (input.noReply === true)

@@ -58,6 +58,24 @@ function compareMessage(a: Message, b: Message) {
 
 const messageKey = (message: Message) => message.time.created + message.id
 
+export type SendingPrompt = { requestID: string; text: string }
+
+// The prompts being sent that a list of queue items does not carry yet.
+function unlisted(sending: SendingPrompt[], items: SessionPromptQueueItem[]) {
+  return sending.filter((prompt) => !items.some((item) => carries(item, prompt.requestID)))
+}
+
+// Whether a queue item delivers a request: as its own, or as one merged or
+// collapsed into it.
+export function carries(item: SessionPromptQueueItem, requestID: string) {
+  return (
+    item.requestID === requestID ||
+    item.origins.some(
+      (origin) => origin.requestID === requestID || origin.repeats?.some((repeat) => repeat.requestID === requestID),
+    )
+  )
+}
+
 export const {
   context: SyncContext,
   use: useSync,
@@ -101,6 +119,12 @@ export const {
       session_queue: {
         [sessionID: string]: SessionPromptQueueItem[]
       }
+      // Prompts this client sent that their session's queue has not listed yet
+      // (swxtchio/swx-opencode#249), so a sent prompt is shown from the moment
+      // the composer clears.
+      session_sending: {
+        [sessionID: string]: SendingPrompt[]
+      }
       message: {
         [sessionID: string]: Message[]
       }
@@ -140,6 +164,7 @@ export const {
       session_diff: {},
       todo: {},
       session_queue: {},
+      session_sending: {},
       message: {},
       part: {},
       lsp: [],
@@ -271,7 +296,7 @@ export const {
         case "session.queue.updated": {
           const tracker = hydratingSessions.get(event.properties.sessionID)
           if (tracker) tracker.queue = true
-          setStore("session_queue", event.properties.sessionID, reconcile(event.properties.items))
+          result.queue.listed(event.properties.sessionID, event.properties.items)
           break
         }
 
@@ -571,6 +596,33 @@ export const {
     const result = {
       data: store,
       set: setStore,
+      queue: {
+        // Every authoritative list of a session's queue comes through here:
+        // once it lists a request, its item shows that prompt instead.
+        listed(sessionID: string, items: SessionPromptQueueItem[]) {
+          setStore("session_queue", sessionID, reconcile(items))
+          const sending = store.session_sending[sessionID] ?? []
+          const remaining = unlisted(sending, items)
+          if (remaining.length < sending.length) setStore("session_sending", sessionID, remaining)
+        },
+        // An item taken out of the queue, and any send it carried, are not
+        // pending, whether or not the queue's own update has arrived yet.
+        withdrawn(sessionID: string, taken: SessionPromptQueueItem) {
+          setStore("session_queue", sessionID, (list) => (list ?? []).filter((item) => item.id !== taken.id))
+          setStore("session_sending", sessionID, (list) =>
+            (list ?? []).filter((prompt) => !carries(taken, prompt.requestID)),
+          )
+        },
+        // Shows a prompt being sent until its session's queue lists it, or
+        // until the returned callback says its send settled.
+        sending(sessionID: string, prompt: SendingPrompt) {
+          setStore("session_sending", sessionID, (list) => [...(list ?? []), prompt])
+          return () => {
+            if (!store.session_sending[sessionID]?.some((item) => item.requestID === prompt.requestID)) return
+            setStore("session_sending", sessionID, (list) => list.filter((item) => item.requestID !== prompt.requestID))
+          }
+        },
+      },
       get status() {
         return store.status
       },
@@ -629,7 +681,10 @@ export const {
                 if (!match.found) draft.session.splice(match.index, 0, session.data!)
                 draft.todo[sessionID] = todo.data ?? []
                 // A live update carries the whole list and is newer than this read.
-                if (!tracker.queue) draft.session_queue[sessionID] = queue.data ?? []
+                if (!tracker.queue) {
+                  draft.session_queue[sessionID] = queue.data ?? []
+                  draft.session_sending[sessionID] = unlisted(draft.session_sending[sessionID] ?? [], queue.data ?? [])
+                }
                 const currentMessages = draft.message[sessionID] ?? []
                 const infos = (messages.data ?? []).flatMap((message) => {
                   if (!tracker.messages.has(message.info.id)) return [message.info]

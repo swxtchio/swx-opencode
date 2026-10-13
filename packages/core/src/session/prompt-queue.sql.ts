@@ -16,6 +16,9 @@ import { SessionTable } from "./sql"
 // (#212); a row stored before it existed has one origin, time_created, which is
 // when the row's own copy was last admitted. request_id is the sender's request
 // the row delivers, whose receipt is kept in session_prompt_receipt.
+// time_preparing is set while the sender that admitted the row still prepares
+// the session for it (#249); such a row is listed and can be withdrawn, but is
+// never promoted or merged until its sender clears it.
 export const SessionPromptQueueTable = sqliteTable(
   "session_prompt_queue",
   {
@@ -33,6 +36,7 @@ export const SessionPromptQueueTable = sqliteTable(
     origins: text({ mode: "json" }).$type<SessionPromptQueue.Origin[]>(),
     time_promoted: integer(),
     time_withdrawn: integer(),
+    time_preparing: integer(),
   },
   (table) => [
     uniqueIndex("session_prompt_queue_session_seq_idx").on(table.session_id, table.seq),

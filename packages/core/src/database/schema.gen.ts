@@ -77,6 +77,7 @@ export default {
           \`origins\` text,
           \`time_promoted\` integer,
           \`time_withdrawn\` integer,
+          \`time_preparing\` integer,
           CONSTRAINT \`fk_session_prompt_queue_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)

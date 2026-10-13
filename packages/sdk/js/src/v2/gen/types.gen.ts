@@ -2722,6 +2722,10 @@ export type SessionPromptQueueReceipt =
       itemID: string
     }
   | {
+      state: "withdrawn"
+      itemID: string
+    }
+  | {
       state: "delivered"
       messageID: string
     }

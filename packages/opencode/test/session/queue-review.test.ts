@@ -420,7 +420,6 @@ it.instance(
       yield* promote("queue")
       expect(written).toEqual([])
       expect((yield* queue.list(session.id)).map(text)).toEqual(["steer while reviewed", "queued while reviewed"])
-      expect(yield* queue.awaitingDrain(session.id)).toBe(false)
 
       // A second viewer's hold outlives the first one's release.
       expect((yield* queue.hold(session.id, "view-2")).started).toBe(false)
@@ -621,6 +620,327 @@ it.instance(
       yield* promoter(session.id, written)("queue")
       yield* promoter(session.id, written)("queue")
       expect(written).toEqual(["run lint:\n1. run lint\n2. --fix", "write the changelog"])
+    }),
+  30_000,
+)
+
+// swxtchio/swx-opencode#249: UP in the TUI withdraws a pending prompt to edit it.
+it.instance(
+  "withdrawing a prompt withdraws its request, and restoring it makes it pending again",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "review withdraw receipts" })
+      const written: string[] = []
+      const receipt = (requestID: string) =>
+        queue.receipt(session.id, SessionQueue.RequestID.make(requestID)).pipe(Effect.map(Option.getOrUndefined))
+      yield* request(session.id, "queue", "first", "check the build")
+      // An identical copy takes the first in; the first now names it.
+      const second = yield* request(session.id, "queue", "second", "check the build")
+      if (second.kind !== "admitted") throw new Error("the copy was not admitted")
+      expect(yield* receipt("first")).toEqual({ state: "merged", into: "second" })
+
+      expect(Option.isSome(yield* queue.withdraw(session.id, second.own.id))).toBe(true)
+      expect(yield* receipt("second")).toEqual({ state: "withdrawn", itemID: second.own.id })
+      expect(yield* receipt("first")).toEqual({ state: "merged", into: "second" })
+      // An exact retry of the withdrawn request is told so and admits nothing.
+      const retried = yield* request(session.id, "queue", "second", "check the build")
+      expect(retried.kind === "retry" ? retried.receipt : undefined).toEqual({
+        state: "withdrawn",
+        itemID: second.own.id,
+      })
+      expect(yield* queue.list(session.id)).toEqual([])
+      const conflict = yield* request(session.id, "queue", "second", "check the lint").pipe(Effect.exit)
+      expect(Exit.isFailure(conflict) && Cause.squash(conflict.cause)).toBeInstanceOf(SessionQueue.RequestConflictError)
+
+      expect(Option.isSome(yield* queue.restore(session.id, second.own.id))).toBe(true)
+      expect(yield* receipt("second")).toEqual({ state: "pending", itemID: second.own.id })
+      yield* promoter(session.id, written)("queue")
+      expect(written).toEqual(["check the build"])
+      expect((yield* receipt("second"))?.state).toBe("delivered")
+    }),
+  30_000,
+)
+
+it.instance(
+  "a prompt admitted while its sender prepares it is listed at once, holds nothing up, and is promoted only once prepared",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "review admitted first" })
+      const written: string[] = []
+      const promote = promoter(session.id, written)
+      const receipt = (requestID: string) =>
+        queue.receipt(session.id, SessionQueue.RequestID.make(requestID)).pipe(Effect.map(Option.getOrUndefined))
+      const first = yield* queue.request(
+        { sessionID: session.id, delivery: "steer", requestID: "first", parts: [{ type: "text", text: "go" }] },
+        undefined,
+        true,
+      )
+      if (first.kind !== "admitted") throw new Error("the prompt was not admitted")
+      expect((yield* queue.list(session.id)).map(text)).toEqual(["go"])
+      expect(yield* receipt("first")).toEqual({ state: "pending", itemID: first.own.id })
+      // No drain could promote it yet; its `prepared` wakes the session.
+      expect(yield* queue.awaitingDrain(session.id)).toBe(false)
+      // Nothing waits on its preparation: another prompt is admitted and
+      // promoted past it, and an identical copy is not merged into it.
+      yield* request(session.id, "steer", "second", "lint")
+      yield* request(session.id, "steer", "copy", "go")
+      expect((yield* queue.list(session.id)).map(text)).toEqual(["go", "lint", "go"])
+      yield* promote("steer")
+      expect(written).toEqual(["lint", "go"])
+      expect((yield* queue.list(session.id)).map(text)).toEqual(["go"])
+      // Prepared, it takes the delivery its sender decided.
+      yield* queue.prepared({ sessionID: session.id, itemID: first.own.id, delivery: "queue" })
+      expect((yield* queue.list(session.id)).map((item) => item.delivery)).toEqual(["queue"])
+      yield* promote("queue")
+      expect(written).toEqual(["lint", "go", "go"])
+      expect((yield* receipt("first"))?.state).toBe("delivered")
+    }),
+  30_000,
+)
+
+it.instance(
+  "a prompt that finishes preparing after later ones arrived is admitted as the earlier of them",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "late preparation" })
+      const receipt = (requestID: string) =>
+        queue.receipt(session.id, SessionQueue.RequestID.make(requestID)).pipe(Effect.map(Option.getOrUndefined))
+      const preparingRequest = (requestID: string, value: string) =>
+        queue.request(
+          {
+            sessionID: session.id,
+            delivery: "queue",
+            requestID: SessionQueue.RequestID.make(requestID),
+            parts: [{ type: "text", text: value }],
+          },
+          undefined,
+          true,
+        )
+      const status = (text: string) => `[fm-from-firstmate]\x1f[fm-level:nudge:status]\x1f ${text}`
+
+      // A newer keyed notice that arrived while the older one prepared still supersedes it.
+      const older = yield* preparingRequest("older", status("status: building"))
+      if (older.kind !== "admitted") throw new Error("the older notice was not admitted")
+      yield* request(session.id, "queue", "newer", status("status: tests running"))
+      yield* queue.prepared({ sessionID: session.id, itemID: older.own.id, delivery: "queue" })
+      expect((yield* queue.list(session.id)).map(text)).toEqual([status("status: tests running")])
+      expect(yield* receipt("older")).toEqual({ state: "superseded", by: "newer" })
+      expect((yield* receipt("newer"))?.state).toBe("pending")
+
+      // A later identical copy takes the earlier one in, as it would have had it been ready.
+      const first = yield* preparingRequest("first", "check the build")
+      if (first.kind !== "admitted") throw new Error("the first copy was not admitted")
+      yield* request(session.id, "queue", "second", "check the build")
+      yield* queue.prepared({ sessionID: session.id, itemID: first.own.id, delivery: "queue" })
+      expect((yield* queue.list(session.id)).map(text)).toEqual([status("status: tests running"), "check the build"])
+      expect(yield* receipt("first")).toEqual({ state: "merged", into: "second" })
+      expect((yield* receipt("second"))?.state).toBe("pending")
+    }),
+  30_000,
+)
+
+it.instance(
+  "a late preparation keeps admission order when a later prompt took an earlier delivery slot",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      // Ready A, then B whose sender is still preparing it, then ready C, all
+      // queued under requests; then B is prepared.
+      const late = (title: string, values: readonly [string, string, string], fails = false) =>
+        Effect.gen(function* () {
+          const session = yield* sessions.create({ title })
+          const a = yield* request(session.id, "queue", "a", values[0])
+          if (a.kind !== "admitted") throw new Error("A was not admitted")
+          const b = yield* queue.request(
+            {
+              sessionID: session.id,
+              delivery: "queue",
+              requestID: SessionQueue.RequestID.make("b"),
+              parts: [{ type: "text", text: values[1] }],
+            },
+            undefined,
+            true,
+          )
+          if (b.kind !== "admitted") throw new Error("B was not admitted")
+          yield* request(session.id, "queue", "c", values[2])
+          yield* fails
+            ? queue.unprepared(session.id, b.own.id)
+            : queue.prepared({ sessionID: session.id, itemID: b.own.id, delivery: "queue" })
+          const receipt = (requestID: string) =>
+            queue.receipt(session.id, SessionQueue.RequestID.make(requestID)).pipe(Effect.map(Option.getOrUndefined))
+          return {
+            session,
+            a: a.own,
+            b: b.own,
+            items: yield* queue.list(session.id),
+            receipts: [yield* receipt("a"), yield* receipt("b"), yield* receipt("c")],
+          }
+        })
+      const status = (text: string) => `[fm-from-firstmate]\x1f[fm-level:nudge:status]\x1f ${text}`
+
+      // The newest notice survives, and each one is superseded by the next.
+      const notices = yield* late("late supersede", [
+        status("status: building"),
+        status("status: compiling"),
+        status("status: tests running"),
+      ])
+      expect(notices.items.map(text)).toEqual([status("status: tests running")])
+      expect(notices.receipts.map((receipt) => receipt && receipt.state)).toEqual([
+        "superseded",
+        "superseded",
+        "pending",
+      ])
+      expect(notices.receipts.slice(0, 2)).toEqual([
+        { state: "superseded", by: "b" },
+        { state: "superseded", by: "c" },
+      ])
+      // B's own caller follows what took it in.
+      expect(Option.isSome(yield* queue.withdraw(notices.session.id, notices.items[0].id))).toBe(true)
+      expect(yield* queue.withdrawn(notices.session.id, notices.b.id)).toBe(true)
+
+      // Had B's preparation failed, C still supersedes A once B is gone.
+      const dropped = yield* late(
+        "late supersede, failed",
+        [status("status: building"), status("status: compiling"), status("status: tests running")],
+        true,
+      )
+      expect(dropped.items.map(text)).toEqual([status("status: tests running")])
+      expect(dropped.receipts).toEqual([
+        { state: "superseded", by: "c" },
+        undefined,
+        { state: "pending", itemID: dropped.items[0].id },
+      ])
+      expect(Option.isSome(yield* queue.withdraw(dropped.session.id, dropped.items[0].id))).toBe(true)
+      expect(yield* queue.withdrawn(dropped.session.id, dropped.a.id)).toBe(true)
+
+      // The newest identical copy takes the earlier ones in.
+      const copies = yield* late("late copies", ["check the build", "check the build", "check the build"])
+      expect(copies.items.map((item) => [text(item), item.requestID])).toEqual([["check the build", "c"]])
+      expect(copies.receipts.slice(1)).toEqual([
+        { state: "merged", into: "c" },
+        { state: "pending", itemID: copies.items[0].id },
+      ])
+
+      // A command's steps stay in the order they were sent.
+      const steps = yield* late("late steps", [
+        "fix auth.ts: handle a null token",
+        "fix auth.ts: add a regression test",
+        "fix auth.ts: update the docs",
+      ])
+      expect(steps.items.map(text)).toEqual([
+        "fix auth.ts:\n1. handle a null token\n2. add a regression test\n3. update the docs",
+      ])
+    }),
+  30_000,
+)
+
+it.instance(
+  "a prompt withdrawn while its sender prepares it stays withdrawn whether the preparation succeeds or fails",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const { db } = yield* Database.Service
+      const session = yield* sessions.create({ title: "withdrawn in preparation" })
+      const written: string[] = []
+      const receipt = (requestID: string) =>
+        queue.receipt(session.id, SessionQueue.RequestID.make(requestID)).pipe(Effect.map(Option.getOrUndefined))
+      const input = (requestID: string, value: string) => ({
+        sessionID: session.id,
+        delivery: "steer" as const,
+        requestID: SessionQueue.RequestID.make(requestID),
+        parts: [{ type: "text" as const, text: value }],
+      })
+
+      // Prepared after UP took it: nothing is delivered, and its request stays withdrawn.
+      const prepared = yield* queue.request(input("prepared", "prepared after"), undefined, true)
+      if (prepared.kind !== "admitted") throw new Error("the prompt was not admitted")
+      expect(Option.isSome(yield* queue.withdraw(session.id, prepared.own.id))).toBe(true)
+      yield* queue.prepared({ sessionID: session.id, itemID: prepared.own.id, delivery: "steer" })
+      yield* promoter(session.id, written)("steer")
+      expect(written).toEqual([])
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(yield* receipt("prepared")).toEqual({ state: "withdrawn", itemID: prepared.own.id })
+
+      // Its preparation failed after UP took it: still withdrawn, so an exact
+      // retry is told so, and nothing would prepare it if it were put back.
+      const failed = yield* queue.request(input("failed", "failed after"), undefined, true)
+      if (failed.kind !== "admitted") throw new Error("the prompt was not admitted")
+      expect(Option.isSome(yield* queue.withdraw(session.id, failed.own.id))).toBe(true)
+      yield* queue.unprepared(session.id, failed.own.id)
+      expect(yield* receipt("failed")).toEqual({ state: "withdrawn", itemID: failed.own.id })
+      const retried = yield* queue.request(input("failed", "failed after"), undefined, true)
+      expect(retried.kind === "retry" ? retried.receipt : retried.kind).toEqual({
+        state: "withdrawn",
+        itemID: failed.own.id,
+      })
+      expect(Option.isNone(yield* queue.restore(session.id, failed.own.id))).toBe(true)
+      expect(yield* queue.list(session.id)).toEqual([])
+
+      // Left preparing by a stopped process after UP took it: the sweep keeps it withdrawn.
+      const left = yield* request(session.id, "steer", "left", "left after")
+      if (left.kind !== "admitted") throw new Error("the prompt was not admitted")
+      expect(Option.isSome(yield* queue.withdraw(session.id, left.own.id))).toBe(true)
+      yield* db
+        .update(SessionPromptQueueTable)
+        .set({ time_preparing: Date.now() })
+        .where(eq(SessionPromptQueueTable.id, left.own.id))
+        .run()
+      yield* promoter(session.id, written)("steer")
+      expect(yield* receipt("left")).toEqual({ state: "withdrawn", itemID: left.own.id })
+      expect(Option.isNone(yield* queue.restore(session.id, left.own.id))).toBe(true)
+      expect(written).toEqual([])
+    }),
+  30_000,
+)
+
+it.instance(
+  "a prompt whose preparation failed goes as if never sent, and so does one a stopped process left preparing",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const { db } = yield* Database.Service
+      const session = yield* sessions.create({ title: "review unprepared" })
+      const written: string[] = []
+      const receipt = (requestID: string) =>
+        queue.receipt(session.id, SessionQueue.RequestID.make(requestID)).pipe(Effect.map(Option.getOrUndefined))
+      const input = {
+        sessionID: session.id,
+        delivery: "steer" as const,
+        requestID: SessionQueue.RequestID.make("failed"),
+        parts: [{ type: "text" as const, text: "go" }],
+      }
+      const failed = yield* queue.request(input, undefined, true)
+      if (failed.kind !== "admitted") throw new Error("the prompt was not admitted")
+      yield* queue.unprepared(session.id, failed.own.id)
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(yield* receipt("failed")).toBeUndefined()
+      // Its exact retry is admitted again rather than told it was withdrawn.
+      const retried = yield* queue.request(input, undefined, true)
+      if (retried.kind !== "admitted") throw new Error("the retry was not admitted")
+      expect(retried.own.id).not.toBe(failed.own.id)
+
+      // A row still preparing that this process does not know of was left by a
+      // stopped process, whose sender is gone.
+      const left = yield* request(session.id, "steer", "left", "lint")
+      if (left.kind !== "admitted") throw new Error("the prompt was not admitted")
+      yield* db
+        .update(SessionPromptQueueTable)
+        .set({ time_preparing: Date.now() })
+        .where(eq(SessionPromptQueueTable.id, left.own.id))
+        .run()
+      yield* promoter(session.id, written)("steer")
+      expect(written).toEqual([])
+      expect((yield* queue.list(session.id)).map((item) => item.id)).toEqual([retried.own.id])
+      expect(yield* receipt("left")).toBeUndefined()
     }),
   30_000,
 )

@@ -185,6 +185,24 @@ const table = sqliteTable("session", {
   (`settleReceipts` in `queue.ts`), so any new path that deletes, merges or promotes a pending row must settle them, or
   the sender sees its request pending forever. Rules that hide a sender's text (`admission`) apply only when every item
   involved names a request.
+- A queued prompt is admitted as the first step of `SessionPrompt.prompt`, before even its config read (#249). Its row
+  is `time_preparing` until the sender calls `SessionQueue.prepared`: listed and withdrawable, but never promoted or
+  merged, so pre-delivery work (classification, revert cleanup, model selection) runs outside the queue lock. A failed
+  preparation calls `unprepared`, which drops the row and its receipt unless it was withdrawn meanwhile (a withdrawn one
+  keeps its `withdrawn` receipt, and cannot be restored once its sender is gone). Admission order is the ascending item
+  id, never `seq`, which a survivor inherits as a delivery slot: a row merges only with rows admitted before it and
+  after the newest still-preparing row before it, and when a preparation ends the rows up to the next one are readmitted
+  in id order, so completion order never outranks admission order. Put new pre-delivery work in that preparation, never
+  ahead of admission, and keep `promotable` on any new promotion or merge query. The preparing admission runs #244's
+  identity reconciliation in the same locked section, classified by built-in markers only and without comparing
+  delivery; a retry it matches waits for a still-preparing original (`awaitPrepared`), then reconciles again with its
+  configured classification, or is sent anew if the original was dropped.
+- The TUI never copies a pending prompt into the composer: UP recall takes custody only through
+  `session.queue.withdraw`, holds its lock through any restore, and restores the item once if the composer cannot take
+  it (#249). UP does nothing at all while a recall is outstanding, since history could otherwise copy the prompt. It
+  then reports only what the list or the receipt confirms, and stashes the text only when the receipt says the item is
+  still `withdrawn`, so the queue and the user never both hold it. A prompt the TUI is still sending shows from
+  `session_sending` in `context/sync.tsx`; every list of the queue it reads goes through `sync.queue.listed`.
 
 - At eligible V1 delivery boundaries, deliver validated peers before automation, at most ten complete numbered constituents per batch. Coalesce validated automation by type and latest admitted text for an identified episode, explicitly as historical provenance rather than a current measurement, preserving distinct duties and original text-part constituent metadata. Keep native/unknown requests individual, critical steers immediate, and model/variant selection recipient-owned at committed promotion. See `docs/v1-queue-dispatch.md`.
 

@@ -5,7 +5,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
-import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer, Queue, Schema, Stream, Tracer } from "effect"
+import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Schema, Stream, Tracer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { Sse } from "effect/unstable/encoding"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
@@ -2070,6 +2070,97 @@ describe("session HttpApi", () => {
   )
 
   it.live(
+    "a recalled prompt resent with edits is a new request, and only the edits reach the model",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        yield* llm.text("lint done")
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue recall" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const model = { providerID: "test", modelID: "test-model" }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+        // As the TUI sends: a steer naming its own request.
+        const send = (requestID: string, text: string) =>
+          post(SessionPaths.prompt, { requestID, agent: "build", model, parts: [{ type: "text", text }] })
+        const withdraw = (itemID: string) =>
+          request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID }), { method: "DELETE", headers })
+
+        yield* post(SessionPaths.promptAsync, { agent: "build", model, parts: [{ type: "text", text: "start" }] })
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        // Held, the steer stays pending as one a busy session cannot take yet.
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const first = yield* send("recall-first", "check the build").pipe(Effect.forkChild)
+        const [pending] = yield* pollWithTimeout(
+          requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }).pipe(
+            Effect.map((items) => (items.length === 1 ? items : undefined)),
+          ),
+          "the sent prompt was never listed",
+        )
+        expect(pending!.requestID).toBe("recall-first")
+
+        // UP takes it back: the withdrawn item carries the prompt as sent.
+        const recalled = yield* withdraw(pending!.id)
+        expect(recalled.status).toBe(200)
+        expect((yield* json<SessionQueue.Item>(recalled)).input.parts).toEqual([
+          { type: "text", text: "check the build" },
+        ])
+        // Its request says it was withdrawn, so a sender reading its receipt is not left waiting.
+        const receiptOf = (requestID: string) =>
+          requestJson<SessionQueue.Receipt>(pathFor(SessionQueuePaths.receipt, { ...params, requestID }), { headers })
+        expect(yield* receiptOf("recall-first")).toEqual({ state: "withdrawn", itemID: pending!.id })
+        // A second recall from a stale list gets nothing.
+        const stale = yield* withdraw(pending!.id)
+        expect(stale.status).toBe(404)
+        expect(yield* responseJson(stale)).toMatchObject({ _tag: "QueueItemNotPending", itemID: pending!.id })
+
+        // Sent again unchanged, the withdrawn request is told so and admits nothing.
+        const retried = yield* awaitWithTimeout(
+          send("recall-first", "check the build"),
+          "the retry of a withdrawn request never answered",
+          "10 seconds",
+        )
+        expect(retried.status).toBe(409)
+        expect(yield* responseJson(retried)).toMatchObject({ _tag: "PromptWithdrawn" })
+        expect(yield* requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })).toEqual(
+          [],
+        )
+
+        const resent = yield* send("recall-resend", "check the lint").pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }).pipe(
+            Effect.map((items) => (items.some((item) => item.requestID === "recall-resend") ? true : undefined)),
+          ),
+          "the resend was never listed",
+        )
+        expect((yield* post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+        yield* Deferred.succeed(gate, undefined)
+        // The first send's caller learns at the run's next boundary that it was withdrawn.
+        const answered = yield* awaitWithTimeout(Fiber.join(first), "withdrawn send never answered", "10 seconds")
+        expect(answered.status).toBe(409)
+        expect(yield* responseJson(answered)).toMatchObject({ _tag: "PromptWithdrawn", itemID: pending!.id })
+        expect((yield* awaitWithTimeout(Fiber.join(resent), "resend never answered", "10 seconds")).status).toBe(200)
+
+        expect((yield* receiptOf("recall-resend")).state).toBe("delivered")
+        // The edited resend is a new request; the original stays withdrawn.
+        expect(yield* receiptOf("recall-first")).toEqual({ state: "withdrawn", itemID: pending!.id })
+        const sent = JSON.stringify(yield* llm.inputs)
+        expect(sent).toContain("check the lint")
+        expect(sent).not.toContain("check the build")
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
     "a withdrawn prompt_async prompt ends without a session error",
     () => {
       const gate = Deferred.makeUnsafe<void>()
@@ -2570,7 +2661,9 @@ describe("session HttpApi", () => {
         })
         expect(start.status).toBe(204)
         yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
-        // The start prompt's own admission and promotion publish first; skip to the held one.
+        // The start prompt's own admission, preparation and promotion publish
+        // first; skip to the held one.
+        yield* nextQueueUpdate
         yield* nextQueueUpdate
         yield* nextQueueUpdate
         yield* request(pathFor(SessionPaths.promptAsync, params), {
@@ -2578,7 +2671,9 @@ describe("session HttpApi", () => {
           headers,
           body: JSON.stringify({ agent: "build", model, delivery: "queue", parts: [{ type: "text", text: "held" }] }),
         })
+        // Listed on arrival, and again once its sender has prepared it (#249).
         const admittedList = yield* nextQueueUpdate
+        expect(yield* nextQueueUpdate).toEqual(admittedList)
         const listed = yield* requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
         expect(admittedList).toEqual(listed)
         expect(listed.map((entry) => entry.input.parts)).toEqual([[{ type: "text", text: "held" }]])
@@ -3964,6 +4059,280 @@ describe("session HttpApi writes racing removal", () => {
       }),
     options,
     racing,
+  )
+})
+
+describe("session HttpApi submission-time admission", () => {
+  const options = { git: true, config: { formatter: false, lsp: false, share: "disabled" as const } }
+
+  // swxtchio/swx-opencode#249: admission is the first thing a prompt does. Even
+  // held at its first config read it is listed, and it holds up neither a
+  // later send's admission nor its own withdrawal.
+  itRacing.instance(
+    "a sent prompt is pending before any other work on it, and its preparation holds up nothing",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "admitted before config" })
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const params = { sessionID: created.id }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+        const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+        const send = (requestID: string, text: string) =>
+          post(SessionPaths.prompt, { requestID, agent: "build", parts: [{ type: "text", text }] })
+        // Held for review, so nothing is delivered and no provider is called.
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const hold = yield* racingSpans.arm({ name: "Config.get", parent: "SessionPrompt.prompt" })
+        const first = yield* send("first", "check the build").pipe(Effect.forkChild)
+        const second = yield* Effect.gen(function* () {
+          yield* awaitWithTimeout(hold.reached, "the prompt never read its config", "30 seconds")
+          const items = yield* listed()
+          expect(items.map((item) => item.requestID)).toEqual(["first"])
+          expect(
+            yield* requestJson<SessionQueue.Receipt>(
+              pathFor(SessionQueuePaths.receipt, { ...params, requestID: "first" }),
+              { headers },
+            ),
+          ).toEqual({ state: "pending", itemID: items[0].id })
+          const second = yield* send("second", "check the lint").pipe(Effect.forkChild)
+          yield* awaitWithTimeout(
+            Effect.gen(function* () {
+              while ((yield* listed()).length < 2) yield* Effect.sleep("10 millis")
+            }),
+            "a later send was not admitted while the first prepared",
+          )
+          const withdrawn = yield* request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID: items[0].id }), {
+            method: "DELETE",
+            headers,
+          }).pipe(Effect.timeoutOption("5 seconds"))
+          expect(Option.map(withdrawn, (response) => response.status)).toEqual(Option.some(200))
+          expect((yield* listed()).map((item) => item.requestID)).toEqual(["second"])
+          return second
+        }).pipe(Effect.ensuring(hold.disarm))
+        yield* Fiber.interrupt(second)
+        yield* Fiber.interrupt(first)
+      }),
+    options,
+    60_000,
+  )
+
+  // An exact retry that arrives while its original still prepares waits for
+  // the original's classified delivery rather than refusing the provisional one.
+  itRacing.instance(
+    "an exact retry of a prompt still being prepared follows it",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "retry while preparing" })
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const params = { sessionID: created.id }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+        // Only the configured marker queues it; until its config is read it is a steer.
+        const body = {
+          messageID: MessageID.ascending(),
+          requestID: "held-original",
+          agent: "build",
+          parts: [{ type: "text", text: "CUSTOM-HOLD: wait for the boundary" }],
+        }
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const hold = yield* racingSpans.arm({ name: "Config.get", parent: "SessionPrompt.prompt" })
+        const original = yield* post(SessionPaths.prompt, body).pipe(Effect.forkChild)
+        const retry = yield* Effect.gen(function* () {
+          yield* awaitWithTimeout(hold.reached, "the original never read its config", "30 seconds")
+          const waiting = yield* racingSpans.observe({
+            name: "SessionQueue.awaitPrepared",
+            parent: "SessionPrompt.prompt",
+          })
+          const retry = yield* post(SessionPaths.prompt, body).pipe(Effect.forkChild)
+          // The retry waits on the original instead of refusing its provisional delivery.
+          yield* awaitWithTimeout(waiting, "the retry never waited on its original", "30 seconds")
+          expect(retry.pollUnsafe()).toBeUndefined()
+          return retry
+        }).pipe(Effect.ensuring(hold.disarm))
+        const items = yield* awaitWithTimeout(
+          Effect.gen(function* () {
+            while (true) {
+              const listed = yield* requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), {
+                headers,
+              })
+              if (listed[0]?.delivery === "queue") return listed
+              yield* Effect.sleep("10 millis")
+            }
+          }),
+          "the original was not prepared",
+        )
+        expect(items).toHaveLength(1)
+        const withdrawn = yield* request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID: items[0].id }), {
+          method: "DELETE",
+          headers,
+        })
+        expect(withdrawn.status).toBe(200)
+        // A new session's first prompt waits for the review to end.
+        expect((yield* post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+        // Both callers followed the one prompt, so both are told it was withdrawn.
+        for (const fiber of [original, retry])
+          expect((yield* awaitWithTimeout(Fiber.join(fiber), "a caller never answered", "30 seconds")).status).toBe(409)
+      }),
+    {
+      ...options,
+      config: { ...options.config, machine_message_markers: { hold: [{ type: "prefix", value: "CUSTOM-HOLD:" }] } },
+    },
+    60_000,
+  )
+
+  // A retry waiting on an original whose preparation then fails is sent
+  // anew, not told the original was withdrawn.
+  itRacing.instance(
+    "an exact retry of a prompt whose preparation fails is admitted again",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        // Matched by its transport identity, or by its request's receipt.
+        const identities: { messageID?: MessageID; requestID?: string }[] = [
+          { messageID: MessageID.ascending() },
+          { requestID: "failed-original" },
+        ]
+        for (const identity of identities) {
+          const created = yield* createSession({ title: "retry after failed preparation" })
+          const params = { sessionID: created.id }
+          const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+          // As below: with only an absent provider configured, a variant has no model to select it on.
+          const body = {
+            ...identity,
+            agent: "build",
+            variant: "high",
+            parts: [{ type: "text", text: "check the build" }],
+          }
+          const send = () =>
+            request(pathFor(SessionPaths.prompt, params), { method: "POST", headers, body: JSON.stringify(body) })
+          const first = yield* racingSpans.arm({ name: "Session.get", parent: "SessionPrompt.prompt" })
+          const original = yield* send().pipe(Effect.forkChild)
+          const retry = yield* Effect.gen(function* () {
+            yield* awaitWithTimeout(first.reached, "the original never read its Session", "30 seconds")
+            const admitted = yield* listed()
+            expect(admitted).toHaveLength(1)
+            const waiting = yield* racingSpans.observe({
+              name: "SessionQueue.awaitPrepared",
+              parent: "SessionPrompt.prompt",
+            })
+            const retry = yield* send().pipe(Effect.forkChild)
+            yield* awaitWithTimeout(waiting, "the retry never waited on its original", "30 seconds")
+            // Held where it is admitted again, once the original has failed.
+            const again = yield* racingSpans.arm({ name: "Session.get", parent: "SessionPrompt.prompt" })
+            yield* first.disarm
+            yield* Effect.gen(function* () {
+              expect(
+                (yield* awaitWithTimeout(Fiber.join(original), "the original never answered", "30 seconds")).status,
+              ).toBe(500)
+              yield* awaitWithTimeout(again.reached, "the retry was not admitted again", "30 seconds")
+              const readmitted = yield* listed()
+              expect(readmitted).toHaveLength(1)
+              expect(readmitted[0].id).not.toBe(admitted[0].id)
+              expect(readmitted[0].input.parts).toEqual(admitted[0].input.parts)
+              // A new receipt names the new item.
+              if (identity.requestID)
+                expect(
+                  yield* requestJson<SessionQueue.Receipt>(
+                    pathFor(SessionQueuePaths.receipt, { ...params, requestID: identity.requestID }),
+                    { headers },
+                  ),
+                ).toEqual({ state: "pending", itemID: readmitted[0].id })
+            }).pipe(Effect.ensuring(again.disarm))
+            return retry
+          }).pipe(Effect.ensuring(first.disarm))
+          expect((yield* awaitWithTimeout(Fiber.join(retry), "the retry never answered", "30 seconds")).status).toBe(
+            500,
+          )
+          expect(yield* listed()).toEqual([])
+        }
+      }),
+    { ...options, config: { ...options.config, provider: { "absent-provider": {} } } },
+    60_000,
+  )
+
+  // A send whose preparation fails takes its admission back, so nothing is
+  // left pending and an exact retry is admitted again rather than following it.
+  itRacing.instance(
+    "a send whose preparation fails leaves nothing pending, and its exact retry is admitted again",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "unprepared" })
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const params = { sessionID: created.id }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+        const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+        // A variant with no model selects it on the session's model, and with
+        // only an absent provider configured there is none, so preparing fails.
+        const send = () =>
+          post(SessionPaths.prompt, {
+            requestID: "unprepared",
+            agent: "build",
+            variant: "high",
+            parts: [{ type: "text", text: "check the build" }],
+          }).pipe(Effect.timeoutOption("20 seconds"))
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const hold = yield* racingSpans.arm({ name: "Session.get", parent: "SessionPrompt.prompt" })
+        const sent = yield* send().pipe(Effect.forkChild)
+        yield* Effect.gen(function* () {
+          yield* awaitWithTimeout(hold.reached, "the prompt never read its Session", "30 seconds")
+          expect((yield* listed()).map((item) => item.requestID)).toEqual(["unprepared"])
+        }).pipe(Effect.ensuring(hold.disarm))
+        const failed = yield* Fiber.join(sent)
+        expect(Option.map(failed, (response) => response.status)).toEqual(Option.some(500))
+        expect(yield* listed()).toEqual([])
+        const receipt = yield* request(pathFor(SessionQueuePaths.receipt, { ...params, requestID: "unprepared" }), {
+          headers,
+        })
+        expect(receipt.status).toBe(404)
+        // Admitted and failed again, where following a stale admission would
+        // have waited on a prompt the held session never delivers.
+        expect(Option.map(yield* send(), (response) => response.status)).toEqual(Option.some(500))
+        expect(yield* listed()).toEqual([])
+      }),
+    { ...options, config: { ...options.config, provider: { "absent-provider": {} } } },
+    60_000,
+  )
+
+  // swxtchio/swx-opencode#249: the prompt is pending before the session work
+  // its delivery waits on (revert cleanup and model selection) has run.
+  itRacing.instance(
+    "a sent prompt is pending before the session work its delivery waits on",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "admitted first" })
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const params = { sessionID: created.id }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+        // Held for review, so nothing is delivered and no provider is called.
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const hold = yield* racingSpans.arm({ name: "Session.get", parent: "SessionPrompt.prompt" })
+        const sent = yield* post(SessionPaths.prompt, {
+          requestID: "admitted-first",
+          agent: "build",
+          model: { providerID: "test", modelID: "test-model" },
+          parts: [{ type: "text", text: "check the build" }],
+        }).pipe(Effect.forkChild)
+        yield* Effect.gen(function* () {
+          yield* awaitWithTimeout(hold.reached, "the prompt never read its Session", "30 seconds")
+          const items = yield* requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+          expect(items.map((item) => item.requestID)).toEqual(["admitted-first"])
+          expect(
+            yield* requestJson<SessionQueue.Receipt>(
+              pathFor(SessionQueuePaths.receipt, { ...params, requestID: "admitted-first" }),
+              { headers },
+            ),
+          ).toEqual({ state: "pending", itemID: items[0]!.id })
+        }).pipe(Effect.ensuring(hold.disarm.pipe(Effect.andThen(Fiber.interrupt(sent)))))
+      }),
+    options,
+    60_000,
   )
 })
 

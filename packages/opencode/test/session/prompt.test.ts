@@ -2017,8 +2017,13 @@ it.instance(
           parts: [{ type: "text", text: heldText }],
         })
         .pipe(Effect.forkChild)
+      // Listed on arrival (#249), it takes the configured classification once prepared.
       const queued = yield* pollWithTimeout(
-        queue.list(session.id).pipe(Effect.map((items) => items.find((item) => item.input.messageID === heldID))),
+        queue
+          .list(session.id)
+          .pipe(
+            Effect.map((items) => items.find((item) => item.input.messageID === heldID && item.delivery === "queue")),
+          ),
         "configured hold marker did not queue the prompt",
         "30 seconds",
       )
@@ -2082,6 +2087,78 @@ it.instance(
       ).toBe(true)
       expect(yield* queue.list(session.id)).toEqual([])
       expect(yield* llm.calls).toBe(3)
+    }),
+  60_000,
+)
+
+// swxtchio/swx-opencode#249: a prompt is admitted before its config is read,
+// so its first identity check cannot hold it to a delivery; it is held to its
+// classified delivery once it has one, as the original was.
+it.instance(
+  "a retry admitted before classification follows its original, and one under another delivery conflicts",
+  () =>
+    Effect.gen(function* () {
+      const markers = { hold: [{ type: "prefix" as const, value: "CUSTOM-HOLD:" }] }
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), machine_message_markers: markers }))
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Classified retry" })
+      yield* queue.hold(session.id, "review")
+      const send = (messageID: MessageID, delivery: SessionQueue.Delivery, text: string) =>
+        prompt
+          .prompt({
+            sessionID: session.id,
+            messageID,
+            agent: "build",
+            model: ref,
+            delivery,
+            parts: [{ type: "text", text }],
+          })
+          .pipe(Effect.forkChild)
+      const listed = (messageID: MessageID, delivery: SessionQueue.Delivery) =>
+        pollWithTimeout(
+          queue
+            .list(session.id)
+            .pipe(
+              Effect.map((items) =>
+                items.find((item) => item.input.messageID === messageID && item.delivery === delivery),
+              ),
+            ),
+          `${messageID} was not queued as ${delivery}`,
+          "30 seconds",
+        )
+
+      // Only the configured marker makes this one queued; its exact retry presents steer again.
+      const heldID = MessageID.ascending()
+      const held = yield* send(heldID, "steer", "CUSTOM-HOLD: wait for the boundary")
+      yield* listed(heldID, "queue")
+      const retried = yield* send(heldID, "steer", "CUSTOM-HOLD: wait for the boundary")
+
+      // The same ID with the same words under another delivery is another prompt.
+      const plainID = MessageID.ascending()
+      const plain = yield* send(plainID, "queue", "check the build")
+      yield* listed(plainID, "queue")
+      const conflict = yield* awaitWithTimeout(
+        Fiber.await(yield* send(plainID, "steer", "check the build")),
+        "a retry under another delivery was not refused",
+        "30 seconds",
+      )
+      expect(Exit.isFailure(conflict) && String(Cause.squash(conflict.cause))).toContain(
+        "Conflicting prompt message ID",
+      )
+
+      yield* llm.push(reply().text("held handled").stop().item(), reply().text("plain handled").stop().item())
+      expect(yield* queue.release(session.id, "review")).toBe(true)
+      for (const [fiber, what] of [
+        [held, "the held prompt"],
+        [retried, "its retry"],
+        [plain, "the plain prompt"],
+      ] as const)
+        expect(
+          Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(fiber), `${what} did not finish`, "30 seconds")),
+        ).toBe(true)
+      expect(yield* queue.list(session.id)).toEqual([])
     }),
   60_000,
 )
