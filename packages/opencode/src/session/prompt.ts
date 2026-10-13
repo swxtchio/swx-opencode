@@ -1110,7 +1110,7 @@ const layer = Layer.effect(
         : prepareUserMessage(input)
 
     // A retried request waits on whatever carries it now, as its first send did.
-    // A deleted one was withdrawn; a noReply one answers with its message.
+    // A deleted or withdrawn one answers as withdrawn; a noReply one answers with its message.
     const followRequest = Effect.fnUntraced(function* (
       input: PromptInput,
       followed: Effect.Success<ReturnType<SessionQueue.Interface["request"]>>,
@@ -1118,7 +1118,7 @@ const layer = Layer.effect(
       const own = followed.kind === "retry" ? followed.own : followed.own.id
       yield* Effect.addFinalizer(() => queue.forget(own))
       const receipt = followed.kind === "retry" ? followed.receipt : undefined
-      if (receipt?.state === "deleted")
+      if (receipt?.state === "deleted" || receipt?.state === "withdrawn")
         return yield* new SessionQueue.WithdrawnError({ sessionID: input.sessionID, itemID: own })
       if (input.noReply !== true) return yield* drain(input.sessionID, own)
       const messageID = receipt && "messageID" in receipt ? receipt.messageID : undefined
@@ -1135,8 +1135,6 @@ const layer = Layer.effect(
       SessionV1.WithParts,
       Image.Error | SessionQueue.WithdrawnError | SessionQueue.RequestConflictError
     > = Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput) {
-      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      yield* revert.cleanup(session)
       // TUI prepends synthetic editor context; only flattened user text owns marker framing.
       const classificationText = input.parts
         .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
@@ -1146,21 +1144,29 @@ const layer = Layer.effect(
       const delivery = classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
       // A request the session already has is followed, never admitted or applied again (#212).
       if (input.requestID && Option.isSome(yield* queue.receipt(input.sessionID, input.requestID)))
-        return yield* followRequest(input, yield* queue.request({ ...input, ...(delivery ? { delivery } : {}) }, markers))
-      // A prompt's model and variant become the session's selection now, and a
-      // pending prompt runs at whichever selection is current when it is
-      // delivered (swxtchio/swx-opencode#212).
-      if (input.model || input.variant) {
+        return yield* followRequest(
+          input,
+          yield* queue.request({ ...input, ...(delivery ? { delivery } : {}) }, markers),
+        )
+      // Session work this prompt's delivery depends on. A prompt that is
+      // queued is admitted first and this runs after, so the prompt is pending
+      // from the moment it arrives (swxtchio/swx-opencode#249).
+      const ready = Effect.gen(function* () {
+        yield* revert.cleanup(yield* sessions.get(input.sessionID).pipe(Effect.orDie))
+        // A prompt's model and variant become the session's selection now, and
+        // a pending prompt runs at whichever selection is current when it is
+        // delivered (swxtchio/swx-opencode#212).
+        if (!input.model && !input.variant) return
         const model = input.model ?? (yield* currentModel(input.sessionID))
         yield* sessions.setModel({
           sessionID: input.sessionID,
           model: { id: model.modelID, providerID: model.providerID, variant: input.variant ?? "default" },
         })
-      }
+      })
+      if (input.noReply === true) yield* ready
       const markedNoReply = input.noReply === true && classification === "hold"
       const initiallyHeldNoReply =
-        markedNoReply &&
-        Exit.isFailure(yield* state.assertNotBusy(input.sessionID).pipe(Effect.exit))
+        markedNoReply && Exit.isFailure(yield* state.assertNotBusy(input.sessionID).pipe(Effect.exit))
       const queuedInput = markedNoReply && !input.messageID ? { ...input, messageID: MessageID.ascending() } : input
       const admission = { ...queuedInput, ...(delivery ? { delivery } : {}) }
       // Preparation can yield while another prompt starts a run. Revalidate at
@@ -1178,10 +1184,11 @@ const layer = Layer.effect(
               discard: (message) => sessions.removeMessage({ sessionID: input.sessionID, messageID: message.info.id }),
             })
           : undefined
-      const heldNoReply =
-        markedNoReply && (initiallyHeldNoReply || noReplyDecision?.kind === "queued")
+      const heldNoReply = markedNoReply && (initiallyHeldNoReply || noReplyDecision?.kind === "queued")
       const requested =
-        noReplyDecision || (input.noReply === true && !markedNoReply) ? undefined : yield* queue.request(admission, markers)
+        noReplyDecision || (input.noReply === true && !markedNoReply)
+          ? undefined
+          : yield* queue.request(admission, markers, input.noReply === true ? undefined : ready)
       // Another caller admitted the same request first.
       if (requested?.kind === "retry") return yield* followRequest(input, requested)
       const entry = noReplyDecision
@@ -1211,10 +1218,7 @@ const layer = Layer.effect(
       for (const [t, enabled] of Object.entries(input.tools ?? {})) {
         permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
       }
-      if (permissions.length > 0) {
-        session.permission = permissions
-        yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
-      }
+      if (permissions.length > 0) yield* sessions.setPermission({ sessionID: input.sessionID, permission: permissions })
 
       if (entry.kind === "direct") return entry.message
       if (input.noReply === true)
@@ -1287,9 +1291,7 @@ const layer = Layer.effect(
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
           seen = yield* queue.consume(sessionID)
-          const history = yield* MessageV2.snapshot(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
+          const history = yield* MessageV2.snapshot(sessionID).pipe(Effect.provideService(Database.Service, database))
           let msgs = history.messages
           const selection = { admissionOrder: history.admissionOrder, excludeNoReply: true }
           const root =

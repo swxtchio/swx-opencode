@@ -2109,10 +2109,26 @@ describe("session HttpApi", () => {
         expect((yield* json<SessionQueue.Item>(recalled)).input.parts).toEqual([
           { type: "text", text: "check the build" },
         ])
+        // Its request says it was withdrawn, so a sender reading its receipt is not left waiting.
+        const receiptOf = (requestID: string) =>
+          requestJson<SessionQueue.Receipt>(pathFor(SessionQueuePaths.receipt, { ...params, requestID }), { headers })
+        expect(yield* receiptOf("recall-first")).toEqual({ state: "withdrawn", itemID: pending!.id })
         // A second recall from a stale list gets nothing.
         const stale = yield* withdraw(pending!.id)
         expect(stale.status).toBe(404)
         expect(yield* responseJson(stale)).toMatchObject({ _tag: "QueueItemNotPending", itemID: pending!.id })
+
+        // Sent again unchanged, the withdrawn request is told so and admits nothing.
+        const retried = yield* awaitWithTimeout(
+          send("recall-first", "check the build"),
+          "the retry of a withdrawn request never answered",
+          "10 seconds",
+        )
+        expect(retried.status).toBe(409)
+        expect(yield* responseJson(retried)).toMatchObject({ _tag: "PromptWithdrawn" })
+        expect(yield* requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })).toEqual(
+          [],
+        )
 
         const resent = yield* send("recall-resend", "check the lint").pipe(Effect.forkChild)
         yield* pollWithTimeout(
@@ -2129,11 +2145,9 @@ describe("session HttpApi", () => {
         expect(yield* responseJson(answered)).toMatchObject({ _tag: "PromptWithdrawn", itemID: pending!.id })
         expect((yield* awaitWithTimeout(Fiber.join(resent), "resend never answered", "10 seconds")).status).toBe(200)
 
-        const receipt = yield* requestJson<SessionQueue.Receipt>(
-          pathFor(SessionQueuePaths.receipt, { ...params, requestID: "recall-resend" }),
-          { headers },
-        )
-        expect(receipt.state).toBe("delivered")
+        expect((yield* receiptOf("recall-resend")).state).toBe("delivered")
+        // The edited resend is a new request; the original stays withdrawn.
+        expect(yield* receiptOf("recall-first")).toEqual({ state: "withdrawn", itemID: pending!.id })
         const sent = JSON.stringify(yield* llm.inputs)
         expect(sent).toContain("check the lint")
         expect(sent).not.toContain("check the build")
@@ -4003,5 +4017,46 @@ describe("session HttpApi writes racing removal", () => {
       }),
     options,
     racing,
+  )
+})
+
+describe("session HttpApi submission-time admission", () => {
+  const options = { git: true, config: { formatter: false, lsp: false, share: "disabled" as const } }
+
+  // swxtchio/swx-opencode#249: the prompt is pending before the session work
+  // its delivery waits on (revert cleanup and model selection) has run.
+  itRacing.instance(
+    "a sent prompt is pending before the session work its delivery waits on",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "admitted first" })
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const params = { sessionID: created.id }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+        // Held for review, so nothing is delivered and no provider is called.
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const hold = yield* racingSpans.arm({ name: "Session.get", parent: "SessionPrompt.prompt" })
+        const sent = yield* post(SessionPaths.prompt, {
+          requestID: "admitted-first",
+          agent: "build",
+          model: { providerID: "test", modelID: "test-model" },
+          parts: [{ type: "text", text: "check the build" }],
+        }).pipe(Effect.forkChild)
+        yield* Effect.gen(function* () {
+          yield* awaitWithTimeout(hold.reached, "the prompt never read its Session", "30 seconds")
+          const items = yield* requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+          expect(items.map((item) => item.requestID)).toEqual(["admitted-first"])
+          expect(
+            yield* requestJson<SessionQueue.Receipt>(
+              pathFor(SessionQueuePaths.receipt, { ...params, requestID: "admitted-first" }),
+              { headers },
+            ),
+          ).toEqual({ state: "pending", itemID: items[0]!.id })
+        }).pipe(Effect.ensuring(hold.disarm.pipe(Effect.andThen(Fiber.interrupt(sent)))))
+      }),
+    options,
+    60_000,
   )
 })

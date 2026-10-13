@@ -624,3 +624,73 @@ it.instance(
     }),
   30_000,
 )
+
+// swxtchio/swx-opencode#249: UP in the TUI withdraws a pending prompt to edit it.
+it.instance(
+  "withdrawing a prompt withdraws its request, and restoring it makes it pending again",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "review withdraw receipts" })
+      const written: string[] = []
+      const receipt = (requestID: string) =>
+        queue.receipt(session.id, SessionQueue.RequestID.make(requestID)).pipe(Effect.map(Option.getOrUndefined))
+      yield* request(session.id, "queue", "first", "check the build")
+      // An identical copy takes the first in; the first now names it.
+      const second = yield* request(session.id, "queue", "second", "check the build")
+      if (second.kind !== "admitted") throw new Error("the copy was not admitted")
+      expect(yield* receipt("first")).toEqual({ state: "merged", into: "second" })
+
+      expect(Option.isSome(yield* queue.withdraw(session.id, second.own.id))).toBe(true)
+      expect(yield* receipt("second")).toEqual({ state: "withdrawn", itemID: second.own.id })
+      expect(yield* receipt("first")).toEqual({ state: "merged", into: "second" })
+      // An exact retry of the withdrawn request is told so and admits nothing.
+      const retried = yield* request(session.id, "queue", "second", "check the build")
+      expect(retried.kind === "retry" ? retried.receipt : undefined).toEqual({
+        state: "withdrawn",
+        itemID: second.own.id,
+      })
+      expect(yield* queue.list(session.id)).toEqual([])
+      const conflict = yield* request(session.id, "queue", "second", "check the lint").pipe(Effect.exit)
+      expect(Exit.isFailure(conflict) && Cause.squash(conflict.cause)).toBeInstanceOf(SessionQueue.RequestConflictError)
+
+      expect(Option.isSome(yield* queue.restore(session.id, second.own.id))).toBe(true)
+      expect(yield* receipt("second")).toEqual({ state: "pending", itemID: second.own.id })
+      yield* promoter(session.id, written)("queue")
+      expect(written).toEqual(["check the build"])
+      expect((yield* receipt("second"))?.state).toBe("delivered")
+    }),
+  30_000,
+)
+
+it.instance(
+  "a prompt is pending before the session work its delivery waits on, and no promotion takes it until that is done",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "review admitted first" })
+      const written: string[] = []
+      const entered = yield* Deferred.make<void>()
+      const gate = yield* Deferred.make<void>()
+      const sent = yield* queue
+        .request(
+          { sessionID: session.id, delivery: "steer", requestID: "first", parts: [{ type: "text", text: "go" }] },
+          undefined,
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(gate))),
+        )
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(entered), "the session work never began")
+      expect((yield* queue.list(session.id)).map(text)).toEqual(["go"])
+      const promotion = yield* promoter(session.id, written)("steer").pipe(Effect.forkChild)
+      // The promotion waits on the session's lock, which the session work holds.
+      expect(yield* Fiber.join(promotion).pipe(Effect.timeoutOption("100 millis"))).toEqual(Option.none())
+      expect(written).toEqual([])
+      yield* Deferred.succeed(gate, undefined)
+      yield* awaitWithTimeout(Fiber.join(sent), "the request never returned")
+      yield* awaitWithTimeout(Fiber.join(promotion), "the promotion never returned")
+      expect(written).toEqual(["go"])
+    }),
+  30_000,
+)
