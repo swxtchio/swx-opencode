@@ -91,3 +91,13 @@
   receives the text only when the receipt says the item is still withdrawn; otherwise it polls to a backstop and
   copies nothing.
 - UP on a prompt still being sent follows merged receipts, chained, to the carrier and withdraws that.
+
+## Base merge (#244)
+
+- `origin/swxtch` 61e797c551 (#244) merged in, not rebased. #244 replaced `admitLocked` with `reconcileAdmission`,
+  which reconciles transport identity (`messageID`, peer envelopes) before any preparation.
+- The preparing admission runs `reconcileLocked` and the admission in one queue-locked section, before any config
+  read. It classifies by built-in markers only, so it compares no delivery there; a matched retry or receipt retry
+  then reads config and runs the strict `reconcile` with its configured classification, so #244's conflict check
+  holds. Reconciled and retried prompts skip revert cleanup and model selection, as in #244.
+- `eligible` (#244's promotion selection) keeps `promotable`; `reserve` sweeps orphaned preparing rows.

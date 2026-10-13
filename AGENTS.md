@@ -189,7 +189,10 @@ const table = sqliteTable("session", {
   is `time_preparing` until the sender calls `SessionQueue.prepared`: listed and withdrawable, but never promoted or
   merged, so pre-delivery work (classification, revert cleanup, model selection) runs outside the queue lock. A
   failed preparation calls `unprepared`, which drops the row and its receipt. Put new pre-delivery work in that
-  preparation, never ahead of admission, and keep `promotable` on any new promotion or merge query.
+  preparation, never ahead of admission, and keep `promotable` on any new promotion or merge query. The preparing
+  admission runs #244's identity reconciliation in the same locked section, classified by built-in markers only and
+  without comparing delivery; a retry it matches reconciles again with its configured classification before it
+  follows the original.
 - The TUI never copies a pending prompt into the composer: UP recall takes custody only through
   `session.queue.withdraw`, holds its lock through any restore, and restores the item once if the composer cannot take
   it (#249). It then reports only what the list or the receipt confirms, and stashes the text only when the receipt
