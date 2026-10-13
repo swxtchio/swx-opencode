@@ -756,7 +756,8 @@ it.instance(
       const late = (title: string, values: readonly [string, string, string], fails = false) =>
         Effect.gen(function* () {
           const session = yield* sessions.create({ title })
-          yield* request(session.id, "queue", "a", values[0])
+          const a = yield* request(session.id, "queue", "a", values[0])
+          if (a.kind !== "admitted") throw new Error("A was not admitted")
           const b = yield* queue.request(
             {
               sessionID: session.id,
@@ -776,6 +777,7 @@ it.instance(
             queue.receipt(session.id, SessionQueue.RequestID.make(requestID)).pipe(Effect.map(Option.getOrUndefined))
           return {
             session,
+            a: a.own,
             b: b.own,
             items: yield* queue.list(session.id),
             receipts: [yield* receipt("a"), yield* receipt("b"), yield* receipt("c")],
@@ -815,6 +817,8 @@ it.instance(
         undefined,
         { state: "pending", itemID: dropped.items[0].id },
       ])
+      expect(Option.isSome(yield* queue.withdraw(dropped.session.id, dropped.items[0].id))).toBe(true)
+      expect(yield* queue.withdrawn(dropped.session.id, dropped.a.id)).toBe(true)
 
       // The newest identical copy takes the earlier ones in.
       const copies = yield* late("late copies", ["check the build", "check the build", "check the build"])
