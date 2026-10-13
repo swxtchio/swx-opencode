@@ -56,3 +56,10 @@
   real queue: a held prompt is listed, withdrawn, its caller answers 409, the edited resend is
   delivered under its new request, and only the edited text reaches the model.
 - Red proofs by reverting each TUI behaviour; package typechecks for `tui` and `opencode`.
+
+## Follow-ups filed
+
+- swxtchio/swx-opencode#250: slash commands are expanded before admission, so a sent command is not shown yet.
+- swxtchio/swx-opencode#251: a withdrawn item's receipt stays `pending`; UP recall makes withdrawal a one-key action.
+- swxtchio/swx-opencode#252: "last" is the bottom row in delivery order, not the most recent admission.
+- swxtchio/swx-opencode#253: other rendered-app TUI tests write to the user's real state directory.
