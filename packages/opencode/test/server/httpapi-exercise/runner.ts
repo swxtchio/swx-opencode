@@ -241,6 +241,7 @@ function withContext<A, E>(
           },
           llmText: (value) => Effect.suspend(() => llm().text(value)),
           llmWait: (count) => Effect.suspend(() => llm().wait(count)),
+          llmCalls: () => Effect.suspend(() => llm().calls),
           tuiRequest: (request) => Effect.sync(() => modules.Tui.submitTuiRequest(request)),
         }
         yield* trace(options, scenario, `${label} seed start`)

@@ -49,9 +49,18 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`session_prompt_queue_alias\` (
+          \`id\` text NOT NULL,
+          \`item_id\` text NOT NULL,
+          CONSTRAINT \`session_prompt_queue_alias_pk\` PRIMARY KEY(\`id\`, \`item_id\`),
+          CONSTRAINT \`fk_session_prompt_queue_alias_item_id_session_prompt_queue_id_fk\` FOREIGN KEY (\`item_id\`) REFERENCES \`session_prompt_queue\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`session_prompt_queue_sequence\` (
           \`session_id\` text PRIMARY KEY,
           \`seq\` integer NOT NULL,
+          \`aliases_indexed\` integer DEFAULT false NOT NULL,
           CONSTRAINT \`fk_session_prompt_queue_sequence_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
@@ -317,6 +326,9 @@ export default {
         `CREATE INDEX \`session_prompt_provenance_session_idx\` ON \`session_prompt_provenance\` (\`session_id\`);`,
       )
       yield* tx.run(
+        `CREATE INDEX \`session_prompt_queue_alias_item_idx\` ON \`session_prompt_queue_alias\` (\`item_id\`);`,
+      )
+      yield* tx.run(
         `CREATE UNIQUE INDEX \`session_prompt_queue_session_seq_idx\` ON \`session_prompt_queue\` (\`session_id\`,\`seq\`);`,
       )
       yield* tx.run(
@@ -332,6 +344,9 @@ export default {
       )
       yield* tx.run(
         `CREATE UNIQUE INDEX \`message_session_admission_seq_idx\` ON \`message\` (\`session_id\`,\`admission_seq\`) WHERE "message"."admission_seq" > 0;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`message_session_admission_order_idx\` ON \`message\` (\`session_id\`,\`admission_seq\`);`,
       )
       yield* tx.run(
         `CREATE INDEX \`message_session_time_created_id_idx\` ON \`message\` (\`session_id\`,\`time_created\`,\`id\`);`,

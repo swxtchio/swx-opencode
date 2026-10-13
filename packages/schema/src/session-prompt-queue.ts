@@ -54,7 +54,7 @@ export const Input = Schema.Struct({
   variant: Schema.optional(Schema.String),
   delivery: Schema.optional(Delivery).annotate({
     description:
-      "steer (the default) reaches the next step of an active run; queue waits until the run would otherwise go idle and then runs as its own turn",
+      "steer (the default) reaches the next step of an active run; queue waits until the run would otherwise go idle; validated compatible peer envelopes also reach a safe provider-continuation boundary",
   }),
   parts: Schema.Array(
     Schema.Union([TextPartInput, FilePartInput, AgentPartInput, SubtaskPartInput]).annotate({
@@ -112,6 +112,25 @@ export const Item = Schema.Struct({
   }),
 }).annotate({ identifier: "SessionPromptQueueItem" })
 export type Item = Schema.Schema.Type<typeof Item>
+
+// Stored on the delivered text part, so consume does not erase exact original inputs.
+// This is constituent introspection, not an admission or acknowledgment receipt.
+// Keep v1 fields independent of the pending editor Item's future additions (for example origins).
+const Constituent = Schema.Struct({
+  id: ItemID,
+  sessionID: SessionID,
+  seq: NonNegativeInt,
+  delivery: Delivery,
+  input: QueuedInput,
+  time: Schema.Struct({ created: NonNegativeInt }),
+})
+export const Group = Schema.Struct({
+  version: Schema.Literal(1),
+  sessionID: SessionID,
+  kind: Schema.String,
+  constituents: Schema.Array(Constituent),
+})
+export type Group = Schema.Schema.Type<typeof Group>
 
 // What became of a request (#212). Merged: its instruction is delivered as part
 // of the survivor `into`, once that has a message. Superseded: a newer request

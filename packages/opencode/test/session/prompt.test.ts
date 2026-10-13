@@ -1,5 +1,6 @@
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -11,8 +12,28 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { afterAll, expect, test } from "bun:test"
 import { Database as Sqlite } from "bun:sqlite"
 import { randomUUID } from "node:crypto"
-import { rm } from "node:fs/promises"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Logger, Option, Schema, Scope, Stream } from "effect"
+import { mkdir, realpath, rm, symlink } from "node:fs/promises"
+import { createRequire } from "node:module"
+import { pathToFileURL } from "node:url"
+import { Npm } from "@opencode-ai/core/npm"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
+import { filesystem } from "@opencode-ai/core/effect/app-node-platform"
+import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
+import {
+  Cause,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  FileSystem,
+  Layer,
+  Logger,
+  Option,
+  Schema,
+  Scope,
+  Stream,
+} from "effect"
 import { HttpClient } from "effect/unstable/http"
 import os from "os"
 import path from "path"
@@ -75,6 +96,8 @@ import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/l
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { runImport } from "../../src/cli/cmd/import"
 import { ShareNext } from "../../src/share/share-next"
+
+const promptTests = <R, E>(layer: Layer.Layer<R, E>) => testEffect(layer, { git: true })
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -299,11 +322,71 @@ const blockingProcessor = processorWithCreate(() =>
 )
 
 const runtimeFlags = RuntimeFlags.layer({ experimentalEventSystem: true })
+const sdkReadiness = {
+  gate: undefined as undefined | { dir: string; entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+}
+
+// Provider tests load the actual workspace SDK instead of racing external Arborist reify.
+// Config still owns and joins its dependency fiber; readiness requires a resolvable real SDK.
+const npmImplementation = Npm.node.implementation
+if (!npmImplementation) throw new Error("Npm implementation is missing")
+const promptSdk = makeGlobalNode({
+  service: Npm.Service,
+  layer: Layer.effect(
+    Npm.Service,
+    Effect.gen(function* () {
+      const real = yield* Npm.Service
+      const afs = yield* FSUtil.Service
+      return Npm.Service.of({
+        ...real,
+        install: Effect.fn("test.workspacePluginSdk")(function* (dir, input) {
+          if (input?.add.some((item) => item.name !== "@opencode-ai/plugin")) return yield* real.install(dir, input)
+          const gate = sdkReadiness.gate?.dir === dir ? sdkReadiness.gate : undefined
+          if (gate) {
+            sdkReadiness.gate = undefined
+            yield* Deferred.succeed(gate.entered, undefined)
+            yield* Deferred.await(gate.release)
+          }
+          const ctx = yield* InstanceRef
+          if (!ctx) return yield* Effect.die(new Error("SDK fixture has no instance owner"))
+          const relative = path.relative(ctx.directory, dir)
+          if (dir !== Global.Path.config && (path.isAbsolute(relative) || relative.startsWith("..")))
+            return yield* Effect.die(new Error(`SDK fixture refused ancestor configuration: ${dir}`))
+          const workspace = path.resolve(import.meta.dir, "../../../plugin")
+          const entry = path.join(dir, "node_modules", "@opencode-ai", "plugin")
+          yield* Effect.promise(() => mkdir(path.dirname(entry), { recursive: true }))
+          if (yield* afs.existsSafe(entry)) {
+            const existing = yield* Effect.promise(() => realpath(entry))
+            if (existing !== (yield* Effect.promise(() => realpath(workspace))))
+              yield* Effect.promise(() => rm(entry, { recursive: true, force: true }))
+          }
+          if (!(yield* afs.existsSafe(entry))) yield* Effect.promise(() => symlink(workspace, entry, "junction"))
+          const resolved = createRequire(path.join(dir, "sdk-fixture.cjs")).resolve("@opencode-ai/plugin")
+          const target = yield* Effect.promise(() => realpath(path.join(workspace, "src/index.ts")))
+          if ((yield* Effect.promise(() => realpath(resolved))) !== target)
+            return yield* Effect.die(new Error("SDK fixture resolved a different plugin package"))
+          const sdk = yield* Effect.promise(() => import(pathToFileURL(resolved).href))
+          if (typeof sdk.tool !== "function") return yield* Effect.die(new Error("workspace plugin SDK is not ready"))
+        }),
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      npmImplementation as Layer.Layer<
+        Npm.Service,
+        never,
+        FSUtil.Service | Global.Service | FileSystem.FileSystem | EffectFlock.Service
+      >,
+    ),
+  ),
+  deps: [FSUtil.node, Global.node, filesystem, EffectFlock.node],
+})
 
 const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })
 const processorCreateDie = processorWithCreate(() => Effect.die(new Error("processor creation defect")))
 
 const promptRoot = LayerNode.group([
+  Npm.node,
   SessionPrompt.node,
   Session.node,
   SessionProjector.node,
@@ -355,6 +438,7 @@ type PromptTestOptions = {
 
 function makePrompt(input?: PromptTestOptions) {
   const replacements = [
+    [Npm.node, promptSdk],
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
@@ -373,6 +457,7 @@ function makePrompt(input?: PromptTestOptions) {
 function makeHttp(input?: PromptTestOptions) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
+    [Npm.node, promptSdk],
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
@@ -390,6 +475,7 @@ function makeHttp(input?: PromptTestOptions) {
 
 function makeHttpWithDatabase(database: Layer.Layer<Database.Service>) {
   return LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
+    [Npm.node, promptSdk],
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp()],
@@ -408,6 +494,9 @@ function makeHttpNoLLMServer(input?: PromptTestOptions) {
 // SessionRunState.ensureRunning has joined or started a run, and records which.
 // With `hold`, that caller also waits after its run ends, as a slow one would.
 const gates = {
+  commandBefore: undefined as undefined | Effect.Effect<void, unknown>,
+  messagesTransform: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  queueSelection: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   finishingRead: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   nextEnsureRunning: undefined as
     | undefined
@@ -602,6 +691,23 @@ const gatedPlugin = LayerNode.make({
       const real = yield* Plugin.Service
       const trigger = ((name, input, output) =>
         Effect.gen(function* () {
+          const command = name === "command.execute.before" ? gates.commandBefore : undefined
+          if (command) {
+            gates.commandBefore = undefined
+            yield* command
+          }
+          const selection = name === "chat.message" ? gates.queueSelection : undefined
+          if (selection) {
+            gates.queueSelection = undefined
+            yield* Deferred.succeed(selection.entered, undefined)
+            yield* Deferred.await(selection.release)
+          }
+          const transform = name === "experimental.chat.messages.transform" ? gates.messagesTransform : undefined
+          if (transform)
+            yield* Effect.fn("test.experimental.chat.messages.transform")(function* () {
+              yield* Deferred.succeed(transform.entered, undefined)
+              yield* Deferred.await(transform.release)
+            })()
           const failure = gates.outcomeFailure
           if (name === "experimental.chat.messages.transform" && failure && !failure.triggered) {
             failure.triggered = true
@@ -630,10 +736,11 @@ const gatedPlugin = LayerNode.make({
   deps: [EventV2Bridge.node, Config.node, RuntimeFlags.node],
 })
 
-const it = testEffect(makeHttp())
-const abruptPrompt = testEffect(makeHttp({ llm: abruptAssistantLLM }))
-const gated = testEffect(
+const it = promptTests(makeHttp())
+const abruptPrompt = promptTests(makeHttp({ llm: abruptAssistantLLM }))
+const gated = promptTests(
   LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
+    [Npm.node, promptSdk],
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp()],
@@ -644,8 +751,9 @@ const gated = testEffect(
     [Plugin.node, gatedPlugin],
   ]),
 )
-const instructionClearFailureTest = testEffect(
+const instructionClearFailureTest = promptTests(
   LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
+    [Npm.node, promptSdk],
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp()],
@@ -653,10 +761,11 @@ const instructionClearFailureTest = testEffect(
     [Instruction.node, gatedInstruction],
   ]),
 )
-const noLLMServer = testEffect(makeHttpNoLLMServer())
-const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
-const processorDies = testEffect(
+const noLLMServer = promptTests(makeHttpNoLLMServer())
+const raceNoLLMServer = promptTests(makeHttpNoLLMServer({ processor: "blocking" }))
+const processorDies = promptTests(
   LayerNode.compile(promptRoot, [
+    [Npm.node, promptSdk],
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp()],
@@ -664,7 +773,7 @@ const processorDies = testEffect(
     [SessionProcessor.node, processorCreateDie],
   ]),
 )
-const withMcpInstructions = testEffect(
+const withMcpInstructions = promptTests(
   makeHttp({
     mcpInstructions: [
       {
@@ -678,7 +787,7 @@ const withMcpInstructions = testEffect(
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
 const nonOwnerCancelDatabasePath = path.join(os.tmpdir(), `opencode-non-owner-cancel-${randomUUID()}.db`)
-const nonOwnerCancel = testEffect(makeHttpWithDatabase(Database.layerFromPath(nonOwnerCancelDatabasePath)))
+const nonOwnerCancel = promptTests(makeHttpWithDatabase(Database.layerFromPath(nonOwnerCancelDatabasePath)))
 const nonOwnerRunState = LayerNode.compile(
   LayerNode.group([SessionRunState.node, SessionStatus.node, EventV2Bridge.node, Database.node]),
   [[Database.node, Database.layerFromPath(nonOwnerCancelDatabasePath)]],
@@ -841,7 +950,7 @@ function failingChatTransformPlugin() {
 }
 
 const preProviderFailurePlugin = failingChatTransformPlugin()
-const preProviderFailurePrompt = testEffect(makeHttp({ plugin: preProviderFailurePlugin.layer }))
+const preProviderFailurePrompt = promptTests(makeHttp({ plugin: preProviderFailurePlugin.layer }))
 
 function busyStatusGate(skipBusy = 0) {
   const entered = defer<void>()
@@ -876,11 +985,11 @@ function busyStatusGate(skipBusy = 0) {
 }
 
 const firstLoad = busyStatusGate()
-const firstLoadPrompt = testEffect(makeHttp({ status: firstLoad.status }))
+const firstLoadPrompt = promptTests(makeHttp({ status: firstLoad.status }))
 const rootlessLoopGate = busyStatusGate()
-const rootlessLoopPrompt = testEffect(makeHttp({ status: rootlessLoopGate.status }))
+const rootlessLoopPrompt = promptTests(makeHttp({ status: rootlessLoopGate.status }))
 const shellQueuedLoopGate = busyStatusGate(1)
-const shellQueuedLoopPrompt = testEffect(makeHttp({ status: shellQueuedLoopGate.status }))
+const shellQueuedLoopPrompt = promptTests(makeHttp({ status: shellQueuedLoopGate.status }))
 
 const directProjectionEntered = defer<void>()
 const directProjectionRelease = defer<void>()
@@ -899,7 +1008,7 @@ const directProjectionCompaction = Layer.succeed(
     create: () => Effect.succeed(MessageID.ascending()),
   }),
 )
-const directProjectionPrompt = testEffect(makeHttp({ compaction: directProjectionCompaction }))
+const directProjectionPrompt = promptTests(makeHttp({ compaction: directProjectionCompaction }))
 
 const succeedVoid = (deferred: Deferred.Deferred<void>) => {
   Effect.runSync(Deferred.succeed(deferred, void 0).pipe(Effect.ignore))
@@ -1703,7 +1812,11 @@ it.instance(
       expect(lastUserContent(next)).toContain("TUI marked message")
 
       const taskExit = yield* awaitWithTimeout(Fiber.await(task), "task did not finish", "10 seconds")
-      const markedExit = yield* awaitWithTimeout(Fiber.await(marked), "TUI prompt did not receive its reply", "10 seconds")
+      const markedExit = yield* awaitWithTimeout(
+        Fiber.await(marked),
+        "TUI prompt did not receive its reply",
+        "10 seconds",
+      )
       const messages = yield* sessions.messages({ sessionID: session.id })
       const markedUser = messages.find(
         (message) => message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === markedText),
@@ -1904,8 +2017,15 @@ it.instance(
           parts: [{ type: "text", text: heldText }],
         })
         .pipe(Effect.forkChild)
+      // Listed on arrival (#249), it takes the configured classification once prepared.
       const queued = yield* pollWithTimeout(
-        queue.list(session.id).pipe(Effect.map((items) => items.find((item) => item.input.messageID === heldID))),
+        queue
+          .list(session.id)
+          .pipe(
+            Effect.map((items) =>
+              items.find((item) => item.input.messageID === heldID && item.delivery === "queue"),
+            ),
+          ),
         "configured hold marker did not queue the prompt",
         "30 seconds",
       )
@@ -1969,6 +2089,65 @@ it.instance(
       ).toBe(true)
       expect(yield* queue.list(session.id)).toEqual([])
       expect(yield* llm.calls).toBe(3)
+    }),
+  60_000,
+)
+
+// swxtchio/swx-opencode#249: a prompt is admitted before its config is read,
+// so its first identity check cannot hold it to a delivery; it is held to its
+// classified delivery once it has one, as the original was.
+it.instance(
+  "a retry admitted before classification follows its original, and one under another delivery conflicts",
+  () =>
+    Effect.gen(function* () {
+      const markers = { hold: [{ type: "prefix" as const, value: "CUSTOM-HOLD:" }] }
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), machine_message_markers: markers }))
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Classified retry" })
+      yield* queue.hold(session.id, "review")
+      const send = (messageID: MessageID, delivery: SessionQueue.Delivery, text: string) =>
+        prompt
+          .prompt({ sessionID: session.id, messageID, agent: "build", model: ref, delivery, parts: [{ type: "text", text }] })
+          .pipe(Effect.forkChild)
+      const listed = (messageID: MessageID, delivery: SessionQueue.Delivery) =>
+        pollWithTimeout(
+          queue
+            .list(session.id)
+            .pipe(
+              Effect.map((items) =>
+                items.find((item) => item.input.messageID === messageID && item.delivery === delivery),
+              ),
+            ),
+          `${messageID} was not queued as ${delivery}`,
+          "30 seconds",
+        )
+
+      // Only the configured marker makes this one queued; its exact retry presents steer again.
+      const heldID = MessageID.ascending()
+      const held = yield* send(heldID, "steer", "CUSTOM-HOLD: wait for the boundary")
+      yield* listed(heldID, "queue")
+      const retried = yield* send(heldID, "steer", "CUSTOM-HOLD: wait for the boundary")
+
+      // The same ID with the same words under another delivery is another prompt.
+      const plainID = MessageID.ascending()
+      const plain = yield* send(plainID, "queue", "check the build")
+      yield* listed(plainID, "queue")
+      const conflict = yield* Fiber.await(yield* send(plainID, "steer", "check the build"))
+      expect(Exit.isFailure(conflict) && String(Cause.squash(conflict.cause))).toContain("Conflicting prompt message ID")
+
+      yield* llm.push(reply().text("held handled").stop().item(), reply().text("plain handled").stop().item())
+      expect(yield* queue.release(session.id, "review")).toBe(true)
+      for (const [fiber, what] of [
+        [held, "the held prompt"],
+        [retried, "its retry"],
+        [plain, "the plain prompt"],
+      ] as const)
+        expect(Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(fiber), `${what} did not finish`, "30 seconds"))).toBe(
+          true,
+        )
+      expect(yield* queue.list(session.id)).toEqual([])
     }),
   60_000,
 )
@@ -4615,25 +4794,94 @@ const finish = <A, E>(...fibers: Fiber.Fiber<A, E>[]) =>
   awaitWithTimeout(Effect.all(fibers.map((fiber) => Fiber.join(fiber))), "prompts never finished", "10 seconds")
 
 const startHeld = Effect.fn("test.startHeld")(function* (input?: {
-  tool?: boolean
+  tool?: boolean | { name: string; args: Record<string, unknown> }
+  agent?: string
+  format?: SessionPrompt.PromptInput["format"]
+  diagnostic?: (value: {
+    sessionID: SessionID
+    calls: number
+    runner?: { state: string; frame?: string; fiberID?: number }
+  }) => void
   config?: (url: string) => Partial<ConfigV1.Info>
 }) {
   const { llm } = yield* useServerConfig(input?.config ?? providerCfg)
   const prompt = yield* SessionPrompt.Service
   const sessions = yield* Session.Service
   const queue = yield* SessionQueue.Service
+  const runState = yield* SessionRunState.Service
   const chat = yield* sessions.create({
     title: "Pinned",
     permission: [{ permission: "*", pattern: "*", action: "allow" }],
   })
   const gate = yield* Deferred.make<void>()
   yield* input?.tool
-    ? llm.push(reply().wait(deferredAsPromise(gate)).tool("first", { value: "first" }))
+    ? llm.push(
+        reply()
+          .wait(deferredAsPromise(gate))
+          .tool(
+            input.tool === true ? "first" : input.tool.name,
+            input.tool === true ? { value: "first" } : input.tool.args,
+          ),
+      )
     : llm.hold("task done", deferredAsPromise(gate))
   const task = yield* prompt
-    .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("start the task") })
+    .prompt({
+      sessionID: chat.id,
+      agent: input?.agent ?? "build",
+      model: ref,
+      format: input?.format,
+      parts: said("start the task"),
+    })
     .pipe(Effect.forkChild)
-  yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+  // A prompt setup failure must retain its cause rather than masquerade as provider readiness.
+  yield* awaitWithTimeout(
+    Effect.raceFirst(
+      llm.wait(1),
+      Fiber.join(task).pipe(Effect.andThen(Effect.fail(new Error("prompt finished before first provider call")))),
+    ),
+    "first provider call never started",
+    "10 seconds",
+  ).pipe(
+    Effect.onError((cause) =>
+      Effect.gen(function* () {
+        const pending = yield* queue.list(chat.id).pipe(Effect.timeoutOption("100 millis"), Effect.exit)
+        const history = yield* sessions.messages({ sessionID: chat.id }).pipe(
+          Effect.map((messages) =>
+            messages.map((message) => ({ id: message.info.id, role: message.info.role, parts: message.parts.length })),
+          ),
+          Effect.timeoutOption("100 millis"),
+          Effect.exit,
+        )
+        const calls = yield* llm.calls
+        const promptExit = task.pollUnsafe()
+        const active = yield* runState.current(chat.id)
+        const running =
+          active?._tag === "Running"
+            ? active.run.fiber
+            : active?._tag === "Shell" || active?._tag === "ShellThenRun"
+              ? active.shell.fiber
+              : undefined
+        const runner = active && { state: active._tag, frame: running?.currentStackFrame?.name, fiberID: running?.id }
+        input?.diagnostic?.({ sessionID: chat.id, calls, runner })
+        yield* Effect.sync(() =>
+          console.error("first provider boundary failed", {
+            cause: Cause.pretty(cause),
+            error: Cause.squash(cause),
+            promptExit: promptExit && (Exit.isFailure(promptExit) ? Cause.pretty(promptExit.cause) : "success"),
+            promptFrame: task.currentStackFrame,
+            runner,
+            runnerExit: running?.pollUnsafe(),
+            calls,
+            pending:
+              Exit.isSuccess(pending) && Option.isSome(pending.value)
+                ? pending.value.value.map((item) => ({ id: item.id, delivery: item.delivery }))
+                : pending,
+            history,
+          }),
+        )
+      }),
+    ),
+  )
   const send = (text: string, extra?: Partial<SessionPrompt.PromptInput>) =>
     prompt
       .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said(text), ...extra })
@@ -4721,7 +4969,9 @@ registerEnvironmentTest(
           const status = yield* SessionStatus.Service
           const events = yield* EventV2Bridge.Service
           const source = Schema.decodeUnknownSync(Schema.Struct({ messages: Schema.Array(SessionV1.WithParts) }))(
-            Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(yield* Effect.promise(() => Bun.file(sourcePath).text())),
+            Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(
+              yield* Effect.promise(() => Bun.file(sourcePath).text()),
+            ),
           )
           const chat = yield* sessions.create({
             title: "Dangling assistant shell",
@@ -5614,7 +5864,7 @@ nonOwnerCancel.instance(
       if (unfinished.info.role !== "assistant") throw new Error("expected the persisted unfinished assistant")
       expect(unfinished.info.time.completed).toBeUndefined()
 
-      const nonOwnerDirectory = yield* tmpdirScoped()
+      const nonOwnerDirectory = yield* tmpdirScoped({ git: true })
       const nonOwnerStatusEvents: { sessionID: string; status: string }[] = []
       const nonOwnerIdleEvents: string[] = []
       const nonOwner = yield* Effect.gen(function* () {
@@ -5962,7 +6212,7 @@ it.instance(
 // and what the bash tool writes, never from the queue under test.
 
 const consumeLockDbPath = path.join(os.tmpdir(), `opencode-consume-lock-${randomUUID()}.db`)
-const consumeLock = testEffect(makeHttpWithDatabase(Database.layerFromPath(consumeLockDbPath)))
+const consumeLock = promptTests(makeHttpWithDatabase(Database.layerFromPath(consumeLockDbPath)))
 
 // The production consume reports each attempt that could not begin with one of these logs, which the tests capture.
 const consumeLockedLog = "queue consume met a held write lock"
@@ -6025,10 +6275,10 @@ const startConsumeLocked = Effect.fn("test.startConsumeLocked")(function* (hold:
       .query("select time_promoted, message_id, time_withdrawn from session_prompt_queue where session_id = ?")
       .all(chat.id)
     const tools = reader
-      .query<{ id: PartID; status: SessionV1.ToolPart["state"]["status"] }, [string]>(
-        "select id, json_extract(data, '$.state.status') as status from part " +
-          "where session_id = ? and json_extract(data, '$.tool') = 'bash'",
-      )
+      .query<
+        { id: PartID; status: SessionV1.ToolPart["state"]["status"] },
+        [string]
+      >("select id, json_extract(data, '$.state.status') as status from part " + "where session_id = ? and json_extract(data, '$.tool') = 'bash'")
       .all(chat.id)
     return { queue, tools }
   }
@@ -6222,7 +6472,10 @@ consumeLock.instance(
           Effect.gen(function* () {
             const taken = yield* Deferred.make<void>()
             yield* queue
-              .exclusive(sessionID, Deferred.succeed(taken, undefined).pipe(Effect.andThen(Deferred.await(permitRelease))))
+              .exclusive(
+                sessionID,
+                Deferred.succeed(taken, undefined).pipe(Effect.andThen(Deferred.await(permitRelease))),
+              )
               .pipe(Effect.forkIn(scope))
             yield* Deferred.await(taken)
           })
@@ -6266,7 +6519,10 @@ consumeLock.instance(
       const begins = newStatementAttempts()
       yield* patchBunQuery((sql) => sql === "begin immediate", begins)
       const deletes = newStatementAttempts()
-      yield* patchBunQuery((sql) => /^delete from "session_prompt_queue" where .*"time_promoted" is not null/.test(sql), deletes)
+      yield* patchBunQuery(
+        (sql) => /^delete from "session_prompt_queue" where .*"time_promoted" is not null/.test(sql),
+        deletes,
+      )
 
       // An unrelated deferred transaction that keeps the shared connection until released. It starts inside the
       // first failed attempt's log, before the next attempt is made, so it takes the connection ahead of it.
@@ -7105,7 +7361,8 @@ it.instance(
       yield* llm.text("wake done")
       yield* llm.text("held done")
       const rebuilt = LayerNode.compile(promptRoot, [
-        [SessionSummary.node, summary],
+        [Npm.node, promptSdk],
+    [SessionSummary.node, summary],
         [LSP.node, lsp],
         [MCP.node, makeMcp()],
         [RuntimeFlags.node, runtimeFlags],
@@ -7419,9 +7676,7 @@ gated.instance(
               message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === markedText),
           )
           if (!user) return undefined
-          return messages.some(
-            (message) => message.info.role === "assistant" && message.info.parentID === user.info.id,
-          )
+          return messages.some((message) => message.info.role === "assistant" && message.info.parentID === user.info.id)
             ? true
             : undefined
         }),
@@ -7454,9 +7709,12 @@ gated.instance(
       const admissionRelease = yield* Deferred.make<void>()
       const toolResponse = yield* Deferred.make<void>()
       yield* Effect.addFinalizer(() =>
-        Effect.all([admissionRelease, toolResponse].map((gate) => Deferred.succeed(gate, undefined).pipe(Effect.ignore)), {
-          discard: true,
-        }).pipe(
+        Effect.all(
+          [admissionRelease, toolResponse].map((gate) => Deferred.succeed(gate, undefined).pipe(Effect.ignore)),
+          {
+            discard: true,
+          },
+        ).pipe(
           Effect.andThen(
             Effect.sync(() => {
               gates.noReplyAdmission = undefined
@@ -7570,9 +7828,12 @@ gated.instance(
       const writeRelease = yield* Deferred.make<void>()
       const toolResponse = yield* Deferred.make<void>()
       yield* Effect.addFinalizer(() =>
-        Effect.all([writeRelease, toolResponse].map((gate) => Deferred.succeed(gate, undefined).pipe(Effect.ignore)), {
-          discard: true,
-        }).pipe(
+        Effect.all(
+          [writeRelease, toolResponse].map((gate) => Deferred.succeed(gate, undefined).pipe(Effect.ignore)),
+          {
+            discard: true,
+          },
+        ).pipe(
           Effect.andThen(
             Effect.sync(() => {
               gates.noReplyWrite = undefined
@@ -7668,7 +7929,7 @@ gated.instance(
 )
 
 it.instance(
-  "does not rewrite an exact marked noReply messageID retry",
+  "does not rewrite an exact marked noReply messageID retry with direct custody",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
@@ -7689,9 +7950,7 @@ it.instance(
 
       const original = yield* prompt.prompt(input)
       const retry = yield* prompt.prompt(input)
-      if (original.info.role !== "user" || retry.info.role !== "user")
-        throw new Error("expected both exact retry results to be user messages")
-      expect(retry.info.id).toBe(original.info.id)
+      expect(retry).toEqual(original)
       const messages = yield* sessions.messages({ sessionID: session.id })
       expect(messages).toHaveLength(1)
       expect(messages[0]?.parts.filter((part) => part.type === "text" && part.text === markedText)).toHaveLength(1)
@@ -7702,7 +7961,7 @@ it.instance(
 )
 
 it.instance(
-  "keeps an idle changed marked noReply messageID retry from starting a provider turn",
+  "refuses an idle changed marked noReply messageID against its direct original",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
@@ -7723,16 +7982,19 @@ it.instance(
       })
       if (original.info.role !== "user") throw new Error("expected the original marked message")
 
-      const retry = yield* prompt.prompt({
-        sessionID: session.id,
-        messageID,
-        agent: "build",
-        model: ref,
-        noReply: true,
-        parts: said(changedText),
-      })
-      if (retry.info.role !== "user") throw new Error("expected the idle retry result")
-      expect(retry.info.id).toBe(messageID)
+      const retry = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          messageID,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: said(changedText),
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(retry)).toBe(true)
+      if (!Exit.isFailure(retry)) throw new Error("changed bare identity was accepted")
+      expect(Cause.pretty(retry.cause)).toContain("Conflicting direct noReply original")
       expect(yield* llm.calls).toBe(0)
       expect(yield* queue.list(session.id)).toEqual([])
       const messages = yield* sessions.messages({ sessionID: session.id })
@@ -7745,7 +8007,7 @@ it.instance(
 )
 
 it.instance(
-  "deduplicates repeated changed marked same-ID retries during a busy multi-step run",
+  "refuses repeated changed marked same-ID retries while preserving a busy multi-step run",
   () =>
     Effect.gen(function* () {
       const { dir, llm } = yield* useServerConfig(providerCfg)
@@ -7794,18 +8056,13 @@ it.instance(
         noReply: true,
         parts: said(changedText),
       }
-      yield* prompt.prompt(retryInput)
-      const firstQueue = yield* pollWithTimeout(
-        queue.list(session.id).pipe(Effect.map((items) => items.find((item) => item.input.messageID === messageID))),
-        "first changed same-ID retry was not held",
-        "10 seconds",
-      )
-      yield* prompt.prompt(retryInput)
-      const pending = yield* queue.list(session.id)
-      expect(pending).toHaveLength(1)
-      expect(pending[0]?.id).toBe(firstQueue.id)
-      expect(pending[0]?.seq).toBe(firstQueue.seq)
-      expect(pending[0]?.delivery).toBe("queue")
+      for (const attempt of [1, 2, 3]) {
+        const exit = yield* prompt.prompt(retryInput).pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (!Exit.isFailure(exit)) throw new Error(`ambiguous retry ${attempt} was accepted`)
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+        expect(yield* queue.list(session.id)).toEqual([])
+      }
       expect(yield* llm.calls).toBe(1)
 
       yield* Deferred.succeed(toolResponse, undefined)
@@ -7813,10 +8070,6 @@ it.instance(
       const continuation = (yield* llm.inputs)[1]
       if (!continuation) throw new Error("expected the active root continuation")
       expect(JSON.stringify(continuation.messages)).not.toContain("repeated busy machine mail")
-      yield* awaitWithTimeout(llm.wait(3), "held same-ID retry did not reach its turn", "10 seconds")
-      const held = (yield* llm.inputs)[2]
-      if (!held) throw new Error("expected the single held retry request")
-      expect(JSON.stringify(held.messages).split("repeated busy machine mail").length - 1).toBe(1)
       const exit = yield* awaitWithTimeout(Fiber.await(active), "active root did not finish", "10 seconds")
       expect(Exit.isSuccess(exit)).toBe(true)
 
@@ -7825,20 +8078,17 @@ it.instance(
       if (!originalRow || originalRow.info.role !== "user") throw new Error("expected the old row to remain")
       expect(originalRow.parts.some((part) => part.type === "text" && part.text === originalText)).toBe(true)
       expect(originalRow.parts.some((part) => part.type === "text" && part.text === changedText)).toBe(false)
-      const promoted = messages.find(
-        (message) => message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === changedText),
-      )
-      if (!promoted || promoted.info.role !== "user") throw new Error("expected the retry to promote exactly once")
-      expect(promoted.info.id).not.toBe(messageID)
-      expect(messages.filter((message) => message.parts.some((part) => part.type === "text" && part.text === changedText))).toHaveLength(1)
+      expect(
+        messages.some((message) => message.parts.some((part) => part.type === "text" && part.text === changedText)),
+      ).toBe(false)
       expect(yield* queue.list(session.id)).toEqual([])
-      expect(yield* llm.calls).toBe(3)
+      expect(yield* llm.calls).toBe(2)
     }),
   60_000,
 )
 
 it.instance(
-  "does not queue an initially-busy exact marked same-ID retry of a persisted message",
+  "preserves an initially-busy exact marked same-ID retry with direct custody",
   () =>
     Effect.gen(function* () {
       const { dir, llm } = yield* useServerConfig(providerCfg)
@@ -7879,8 +8129,7 @@ it.instance(
       yield* awaitWithTimeout(llm.wait(1), "active root did not reach the provider", "10 seconds")
 
       const retry = yield* prompt.prompt(input)
-      if (retry.info.role !== "user") throw new Error("expected the exact retry result")
-      expect(retry.info.id).toBe(messageID)
+      expect(retry).toEqual(original)
       expect(yield* queue.list(session.id)).toEqual([])
       expect(yield* llm.calls).toBe(1)
       yield* Deferred.succeed(toolResponse, undefined)
@@ -7893,151 +8142,64 @@ it.instance(
       expect(yield* queue.list(session.id)).toEqual([])
       expect(yield* llm.calls).toBe(2)
       const messages = yield* sessions.messages({ sessionID: session.id })
-      expect(messages.filter((message) => message.info.role === "user" && message.info.id === messageID)).toHaveLength(1)
-      expect(messages.filter((message) => message.info.role === "assistant" && message.info.parentID === messageID)).toHaveLength(0)
+      expect(messages.filter((message) => message.info.role === "user" && message.info.id === messageID)).toHaveLength(
+        1,
+      )
+      expect(
+        messages.filter((message) => message.info.role === "assistant" && message.info.parentID === messageID),
+      ).toHaveLength(0)
     }),
   60_000,
 )
 
 gated.instance(
-  "holds a changed marked noReply messageID retry out of an older rootful run and promotes it once",
+  "represented changed marked identity is refused before idle-write race gates",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
       const prompt = yield* SessionPrompt.Service
       const queue = yield* SessionQueue.Service
-      const run = yield* SessionRunState.Service
       const sessions = yield* Session.Service
-      const session = yield* sessions.create({
-        title: "Same-ID marked retry race",
-        permission: [{ permission: "*", pattern: "*", action: "allow" }],
-      })
+      const session = yield* sessions.create({ title: "Ambiguous identity before write race" })
       const messageID = MessageID.ascending()
-      const originalText = "[fm-from-firstmate]\x1f same-ID original machine mail"
-      const changedText = "[fm-from-firstmate]\x1f changed during active task"
-      const original = yield* prompt.prompt({
+      const originalText = "[fm-from-firstmate]\x1f original marker without custody"
+      const input = {
         sessionID: session.id,
         messageID,
         agent: "build",
         model: ref,
         noReply: true,
         parts: said(originalText),
-      })
-      if (original.info.role !== "user") throw new Error("expected the original marked message")
-      const root = yield* seedUser({
-        sessionID: session.id,
-        agent: "build",
-        model: ref,
-        parts: said("same-ID active task"),
-      })
-      const admissionEntered = yield* Deferred.make<void>()
-      const admissionRelease = yield* Deferred.make<void>()
-      const writeEntered = yield* Deferred.make<void>()
-      const writeRelease = yield* Deferred.make<void>()
+      }
+      yield* prompt.prompt(input)
+      const before = yield* sessions.messages({ sessionID: session.id })
+      const admission = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      const write = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      gates.noReplyAdmission = admission
+      gates.noReplyWrite = write
       yield* Effect.addFinalizer(() =>
-        Effect.all(
-          [admissionRelease, writeRelease].map((gate) => Deferred.succeed(gate, undefined).pipe(Effect.ignore)),
-          { discard: true },
-        ).pipe(
-          Effect.andThen(
-            Effect.sync(() => {
-              gates.noReplyAdmission = undefined
-              gates.noReplyWrite = undefined
-            }),
-          ),
+        Effect.sync(() => {
+          gates.noReplyAdmission = undefined
+          gates.noReplyWrite = undefined
+        }).pipe(
+          Effect.andThen(Deferred.succeed(admission.release, undefined)),
+          Effect.andThen(Deferred.succeed(write.release, undefined)),
+          Effect.asVoid,
         ),
       )
-      yield* llm.push(
-        reply().text("root task finished").stop().item(),
-        reply().text("held retry handled").stop().item(),
-      )
-
-      gates.noReplyAdmission = { entered: admissionEntered, release: admissionRelease, skip: 1 }
-      gates.noReplyWrite = { entered: writeEntered, release: writeRelease }
-      const retry = yield* prompt
-        .prompt({
-          sessionID: session.id,
-          messageID,
-          agent: "build",
-          model: ref,
-          noReply: true,
-          parts: said(changedText),
-        })
-        .pipe(Effect.forkChild)
-      yield* awaitWithTimeout(
-        Deferred.await(admissionEntered),
-        "same-ID retry did not pause after its idle write-boundary sample",
-        "10 seconds",
-      )
-
-      const active = yield* prompt.loop({ sessionID: session.id, messageID: root.info.id }).pipe(Effect.forkChild)
-      yield* pollWithTimeout(
-        run.assertNotBusy(session.id).pipe(
-          Effect.exit,
-          Effect.map((exit) => (Exit.isFailure(exit) ? true : undefined)),
-        ),
-        "rootful run did not start between the retry check and its write",
-        "10 seconds",
-      )
-      expect(yield* llm.calls).toBe(0)
-      yield* Deferred.succeed(admissionRelease, undefined)
-
-      const outcome = yield* Effect.raceFirst(
-        Deferred.await(writeEntered).pipe(Effect.as("writing" as const)),
-        pollWithTimeout(
-          queue.list(session.id).pipe(
-            Effect.map((items) =>
-              items.find((item) => item.input.parts.some((part) => part.type === "text" && part.text === changedText)),
-            ),
-          ),
-          "same-ID retry was neither written nor held",
-          "10 seconds",
-        ).pipe(Effect.as("held" as const)),
-      )
-      if (outcome === "writing") yield* Deferred.succeed(writeRelease, undefined)
-      const retryExit = yield* awaitWithTimeout(Fiber.await(retry), "same-ID retry did not finish", "10 seconds")
-      expect(Exit.isSuccess(retryExit)).toBe(true)
-      const pending = (yield* queue.list(session.id)).find((item) =>
-        item.input.parts.some((part) => part.type === "text" && part.text === changedText),
-      )
-      if (!pending) throw new Error("changed same-ID retry was not held for later promotion")
-      expect(pending.delivery).toBe("queue")
-
-      yield* awaitWithTimeout(llm.wait(1), "rootful run did not reach the provider", "10 seconds")
-      const first = (yield* llm.inputs)[0]
-      if (!first) throw new Error("expected the rootful first provider request")
-      const firstHistory = JSON.stringify(first.messages)
-      expect(firstHistory).toContain("same-ID original machine mail")
-      expect(firstHistory).not.toContain("changed during active task")
-
-      yield* awaitWithTimeout(llm.wait(2), "held same-ID retry did not reach its own turn", "10 seconds")
-      const held = (yield* llm.inputs)[1]
-      if (!held) throw new Error("expected the promoted same-ID retry request")
-      const heldHistory = JSON.stringify(held.messages)
-      expect(heldHistory.split("changed during active task").length - 1).toBe(1)
-      const activeExit = yield* awaitWithTimeout(Fiber.await(active), "rootful run did not finish", "10 seconds")
-      expect(Exit.isSuccess(activeExit)).toBe(true)
-
-      const messages = yield* sessions.messages({ sessionID: session.id })
-      const persistedOriginal = messages.find((message) => message.info.id === messageID)
-      if (!persistedOriginal || persistedOriginal.info.role !== "user")
-        throw new Error("expected the original historical row to remain persisted")
-      expect(persistedOriginal.parts.filter((part) => part.type === "text" && part.text === originalText)).toHaveLength(1)
-      expect(persistedOriginal.parts.some((part) => part.type === "text" && part.text === changedText)).toBe(false)
-      const promoted = messages.find(
-        (message) => message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === changedText),
-      )
-      if (!promoted || promoted.info.role !== "user") throw new Error("expected the held retry to be promoted once")
-      expect(promoted.info.id).not.toBe(messageID)
-      expect(promoted.info.noReply).toBeUndefined()
-      expect(messages.filter((message) => message.parts.some((part) => part.type === "text" && part.text === changedText))).toHaveLength(1)
-      expect(
-        messages.filter((message) => message.info.role === "assistant" && message.info.parentID === promoted.info.id),
-      ).toHaveLength(1)
+      const exit = yield* prompt
+        .prompt({ ...input, parts: said("[fm-from-firstmate]\x1f conflicting retry") })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) throw new Error("ambiguous changed identity was written")
+      expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+      expect(yield* Deferred.isDone(admission.entered)).toBe(false)
+      expect(yield* Deferred.isDone(write.entered)).toBe(false)
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
       expect(yield* queue.list(session.id)).toEqual([])
-      expect(yield* llm.calls).toBe(2)
+      expect(yield* llm.calls).toBe(0)
     }),
-  60_000,
+  30000,
 )
 
 it.instance(
@@ -8110,14 +8272,13 @@ it.instance(
       expect(Exit.isSuccess(exit)).toBe(true)
 
       const messages = yield* sessions.messages({ sessionID: session.id })
-      const retained = messages.find(
-        (message) => message.info.role === "user" && message.info.id === messageID,
-      )
-      if (!retained || retained.info.role !== "user") throw new Error("expected the idle noReply row to remain persisted")
+      const retained = messages.find((message) => message.info.role === "user" && message.info.id === messageID)
+      if (!retained || retained.info.role !== "user")
+        throw new Error("expected the idle noReply row to remain persisted")
       expect(retained.info.noReply).toBe(true)
-      expect(
-        messages.some((message) => message.info.role === "assistant" && message.info.parentID === messageID),
-      ).toBe(false)
+      expect(messages.some((message) => message.info.role === "assistant" && message.info.parentID === messageID)).toBe(
+        false,
+      )
       expect(yield* queue.list(session.id)).toEqual([])
       expect(yield* llm.calls).toBe(2)
     }),
@@ -8164,11 +8325,13 @@ it.instance("keeps message history and admission order coherent across revert cl
       }).user?.id,
     ).toBe(kept.info.id)
 
-    yield* llm.text("remaining message processed")
-    const result = yield* prompt.loop({ sessionID: session.id })
-    expect(result.info.role).toBe("assistant")
-    expect(result.parts.some((part) => part.type === "text" && part.text === "remaining message processed")).toBe(true)
-  }),
+      yield* llm.text("remaining message processed")
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "remaining message processed")).toBe(
+        true,
+      )
+    }),
   30_000,
 )
 
@@ -9524,4 +9687,1518 @@ it.instance("lists the available efforts when the model declares some", () =>
     expect(error.data.message).toContain("high")
     expect(error.data.message).toContain("low")
   }),
+)
+
+it.instance(
+  "captain peer batches reach the actual provider before coalesced automation using recipient model and effort",
+  () =>
+    Effect.gen(function* () {
+      const held = yield* startHeld({
+        config: (url) => {
+          const base = providerCfg(url)
+          return {
+            ...base,
+            agent: { build: { model: "test/test-model", variant: "low" } },
+            provider: {
+              ...base.provider,
+              test: {
+                ...base.provider.test,
+                models: {
+                  ...base.provider.test.models,
+                  "test-model": {
+                    ...base.provider.test.models["test-model"],
+                    variants: { low: { reasoningEffort: "low" } },
+                  },
+                  "selected-model": {
+                    ...base.provider.test.models["test-model"],
+                    id: "selected-model",
+                    name: "Selected model",
+                    variants: { high: { reasoningEffort: "high" } },
+                  },
+                },
+              },
+            },
+          }
+        },
+      })
+      const automation =
+        "[fm-level:nudge:watcher.wake]\x1f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/task.check.sh: still actionable"
+      yield* held.queue.admit({ sessionID: held.chat.id, delivery: "queue", model: ref, parts: said(automation) })
+      const peers = Array.from(
+        { length: 11 },
+        (_, index) =>
+          `[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791809000-${index + 1}-abcd\x1f [fm-level:request]\x1f provider peer ${index + 1}\ncomplete tail ${index + 1}`,
+      )
+      yield* Effect.forEach(peers, (value, index) =>
+        held.queue.admit({
+          sessionID: held.chat.id,
+          delivery: "queue",
+          model: ref,
+          parts: [
+            ...said(value),
+            ...(index === 0
+              ? [
+                  {
+                    type: "file" as const,
+                    mime: "text/plain",
+                    filename: "peer-evidence.txt",
+                    url: "data:text/plain;base64,Y29tcGxldGUgZXZpZGVuY2U=",
+                  },
+                ]
+              : []),
+          ],
+        }),
+      )
+      yield* held.sessions.setAgentModel({
+        sessionID: held.chat.id,
+        agent: "build",
+        model: { providerID: ref.providerID, id: ModelV2.ID.make("selected-model"), variant: "high" },
+        time: Date.now(),
+      })
+      yield* held.llm.text("first ten handled")
+      yield* held.llm.text("overflow handled")
+      yield* held.llm.text("automation handled")
+      yield* held.release
+      yield* finish(held.task)
+      const inputs = yield* held.llm.inputs
+      expect(inputs).toHaveLength(4)
+      peers
+        .slice(0, 10)
+        .forEach((value) =>
+          expect(lastUserContent(inputs[1])).toContain(value.replaceAll("\x1f", "\\u001f").replaceAll("\n", "\\n")),
+        )
+      expect(lastUserContent(inputs[1])).toContain("complete evidence")
+      expect(lastUserContent(inputs[1])).not.toContain("provider peer 11")
+      expect(lastUserContent(inputs[2])).toContain("provider peer 11")
+      expect(lastUserContent(inputs[3])).toContain("still actionable")
+      expect(inputs[1]?.model).toBe("selected-model")
+      expect(inputs[1]?.reasoning_effort).toBe("high")
+      expect(yield* held.queue.list(held.chat.id)).toEqual([])
+    }),
+)
+
+it.instance("held provider setup exposes the actual prompt failure before any model call", () =>
+  Effect.gen(function* () {
+    const exit = yield* startHeld({ agent: "missing-provider-boundary-agent" }).pipe(Effect.exit)
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) throw new Error("expected actual preparation failure")
+    const error = Cause.squash(exit.cause)
+    expect(NamedError.Unknown.isInstance(error)).toBe(true)
+    if (!NamedError.Unknown.isInstance(error)) throw new Error("expected unknown-agent cause")
+    expect(error.data.message).toContain('Agent not found: "missing-provider-boundary-agent"')
+    const llm = yield* TestLLMServer
+    expect(yield* llm.calls).toBe(0)
+  }),
+)
+
+gated.instance(
+  "first-provider diagnostic identifies the held actual runner under its unchanged bound",
+  () =>
+    Effect.gen(function* () {
+      const gate = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      const observed: {
+        sessionID?: SessionID
+        calls?: number
+        runner?: { state: string; frame?: string; fiberID?: number }
+      } = {}
+      gates.messagesTransform = gate
+      yield* Effect.addFinalizer(() =>
+        Deferred.succeed(gate.release, undefined).pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              gates.messagesTransform = undefined
+            }),
+          ),
+          Effect.asVoid,
+        ),
+      )
+      const started = yield* startHeld({ diagnostic: (value) => Object.assign(observed, value) }).pipe(
+        Effect.exit,
+        Effect.forkChild,
+      )
+      yield* awaitWithTimeout(
+        Deferred.await(gate.entered),
+        "valid runner never reached its real transform hook",
+        "10 seconds",
+      )
+      const exit = yield* Fiber.join(started)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) throw new Error("held runner unexpectedly reached the provider")
+      expect(Cause.squash(exit.cause)).toMatchObject({ message: "first provider call never started" })
+      expect(observed.calls).toBe(0)
+      expect(observed.runner?.state).toBe("Running")
+      expect(observed.runner?.frame).toBe("test.experimental.chat.messages.transform")
+      expect(observed.runner?.fiberID).toBeGreaterThan(0)
+      if (!observed.sessionID) throw new Error("expected inspected session owner")
+      const prompt = yield* SessionPrompt.Service
+      yield* prompt.cancel(observed.sessionID)
+    }),
+  20000,
+)
+
+it.instance("captain critical peer remains an immediate steer during active provider work", () =>
+  Effect.gen(function* () {
+    const held = yield* startHeld({ tool: true })
+    const critical =
+      "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791809000-1-abcd\x1f [fm-level:critical]\x1f urgent peer direction"
+    const sent = yield* held.send(critical)
+    yield* pollWithTimeout(
+      held.sessions
+        .messages({ sessionID: held.chat.id })
+        .pipe(
+          Effect.map((messages) =>
+            messages.some((message) =>
+              message.parts.some((part) => part.type === "text" && part.text.includes(critical)),
+            )
+              ? true
+              : undefined,
+          ),
+        ),
+      "critical peer was not immediately promoted",
+    )
+    expect(yield* held.queue.list(held.chat.id)).toEqual([])
+    yield* held.llm.text("critical handled")
+    yield* held.release
+    yield* finish(held.task, sent)
+    expect(JSON.stringify((yield* held.llm.inputs)[1]?.messages)).toContain("urgent peer direction")
+  }),
+)
+
+gated.instance("captain grouped preparation cannot restore model selection changed before commit", () =>
+  Effect.gen(function* () {
+    const held = yield* startHeld({
+      config: (url) => {
+        const base = providerCfg(url)
+        return {
+          ...base,
+          provider: {
+            ...base.provider,
+            test: {
+              ...base.provider.test,
+              models: {
+                ...base.provider.test.models,
+                "picked-later": {
+                  ...base.provider.test.models["test-model"],
+                  id: "picked-later",
+                  name: "Picked later",
+                },
+              },
+            },
+          },
+        }
+      },
+    })
+    yield* held.queue.admit({
+      sessionID: held.chat.id,
+      delivery: "queue",
+      model: ref,
+      parts: said(
+        "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791809000-1-abcd\x1f [fm-level:request]\x1f select at committed promotion",
+      ),
+    })
+    const gate = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+    gates.queueSelection = gate
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        gates.queueSelection = undefined
+      }),
+    )
+    yield* held.llm.text("peer handled on later selection")
+    yield* held.release
+    yield* awaitWithTimeout(Deferred.await(gate.entered), "group never paused during preparation")
+    yield* held.sessions.setAgentModel({
+      sessionID: held.chat.id,
+      agent: "build",
+      model: { providerID: ref.providerID, id: ModelV2.ID.make("picked-later") },
+      time: Date.now(),
+    })
+    yield* Deferred.succeed(gate.release, undefined)
+    yield* finish(held.task)
+    expect((yield* held.llm.inputs)[1]?.model).toBe("picked-later")
+    expect((yield* held.sessions.get(held.chat.id)).model?.id).toBe(ModelV2.ID.make("picked-later"))
+  }),
+)
+
+it.instance(
+  "exact peer retry callers survive one cancelled lifetime and receive their own turn once",
+  () =>
+    Effect.gen(function* () {
+      const held = yield* startHeld()
+      yield* held.llm.text("peer original answer")
+      const content =
+        "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791809000-999-abcd\x1f [fm-level:request]\x1f Exact retry caller obligation"
+      const messageID = MessageID.ascending()
+      const manual = yield* held.queue.admit({
+        sessionID: held.chat.id,
+        messageID,
+        delivery: "queue",
+        agent: "build",
+        model: ref,
+        parts: said(content),
+      })
+      const admittedAll = yield* Deferred.make<void>()
+      const events = yield* EventV2Bridge.Service
+      let admissions = 0
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === SessionQueue.Event.Updated.type
+          ? Effect.sync(() => {
+              admissions++
+            }).pipe(
+              Effect.andThen(
+                Effect.suspend(() =>
+                  admissions === 3 ? Deferred.succeed(admittedAll, undefined).pipe(Effect.asVoid) : Effect.void,
+                ),
+              ),
+            )
+          : Effect.void,
+      )
+      const first = yield* held.send(content, { messageID, delivery: "queue" })
+      const second = yield* held.send(content, { messageID, delivery: "queue" })
+      const cancelled = yield* held.send(content, { messageID, delivery: "queue" })
+      yield* Deferred.await(admittedAll)
+      yield* unsubscribe
+      yield* Fiber.interrupt(cancelled)
+      yield* held.release
+      const [root, one, two] = yield* finish(held.task, first, second)
+      expect(answered(root)?.texts).toEqual(["task done"])
+      expect(answered(one)?.texts).toEqual(["peer original answer"])
+      expect(answered(two)).toEqual(answered(one))
+      const recorded = yield* held.prompt.prompt({
+        sessionID: held.chat.id,
+        messageID,
+        delivery: "queue",
+        agent: "build",
+        model: ref,
+        parts: said(content),
+      })
+      expect(answered(recorded)).toEqual(answered(one))
+      expect(yield* held.llm.calls).toBe(2)
+      expect(yield* held.queue.list(held.chat.id)).toEqual([])
+      yield* held.queue.forget(manual.id)
+      expect(yield* held.queue.reply(manual.id)).toBeUndefined()
+    }),
+  20000,
+)
+
+it.instance(
+  "ordinary peers reach each safe active tool continuation in capped batches without advancing holds",
+  () =>
+    Effect.gen(function* () {
+      const directory = yield* TestInstance
+      const file = path.join(directory.directory, "peer-continuation.txt")
+      yield* writeText(file, "real tool result retained")
+      const held = yield* startHeld({ tool: { name: "read", args: { filePath: file } } })
+      const lastGate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(lastGate, undefined).pipe(Effect.asVoid))
+      yield* held.llm.tool("read", { filePath: file })
+      yield* held.llm.hold("active peers handled", deferredAsPromise(lastGate))
+      yield* held.llm.text("held human handled")
+      yield* held.llm.text("automation handled")
+      const automationText =
+        "[fm-level:nudge:watcher.wake]\x1f WATCHER FIRED [active-1] - handle wake.\n\ncheck: /scratch/active.check.sh: historical notice"
+      const automation = yield* held.send(automationText)
+      const human = yield* held.send("held human must wait", { delivery: "queue" })
+      const inputs = Array.from({ length: 11 }, (_, index) => ({
+        messageID: MessageID.ascending(),
+        text: `[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791900000-${index + 1}-abcd\x1f [fm-level:request]\x1f Active peer ${index + 1}\nFull original tail ${index + 1}`,
+      }))
+      const peers = yield* Effect.forEach(inputs, (input) => held.send(input.text, { messageID: input.messageID }))
+      const pending = yield* queued(held.chat.id, 13)
+      expect(pending.every((item) => item.delivery === "queue")).toBe(true)
+      const originals = inputs.map((input) => pending.find((item) => item.input.messageID === input.messageID)!)
+      expect(yield* held.llm.calls).toBe(1)
+      expect(
+        (yield* held.sessions.messages({ sessionID: held.chat.id })).filter((message) => message.info.role === "user"),
+      ).toHaveLength(1)
+      yield* held.release
+      yield* awaitWithTimeout(held.llm.wait(3), "active overflow never reached the continuing provider", "10 seconds")
+      const requests = yield* held.llm.inputs
+      if (!requests[1] || !requests[2]) throw new Error("expected both peer provider continuations")
+      inputs
+        .slice(0, 10)
+        .forEach((input) =>
+          expect(lastUserContent(requests[1])).toContain(
+            input.text.replaceAll("\x1f", "\\u001f").replaceAll("\n", "\\n"),
+          ),
+        )
+      expect(lastUserContent(requests[1])).not.toContain("Active peer 11")
+      expect(lastUserContent(requests[2])).toContain("Active peer 11")
+      expect(JSON.stringify(requests[1]?.messages)).toContain("real tool result retained")
+      expect(JSON.stringify(requests[2]?.messages)).toContain("real tool result retained")
+      expect(JSON.stringify(requests[2]?.messages)).not.toContain(automationText)
+      expect(JSON.stringify(requests[2]?.messages)).not.toContain("held human must wait")
+      expect((yield* held.queue.list(held.chat.id)).map((item) => item.input.parts[0])).toEqual([
+        said(automationText)[0],
+        said("held human must wait")[0],
+      ])
+      const messages = yield* held.sessions.messages({ sessionID: held.chat.id })
+      const groups = messages.flatMap((message) =>
+        message.parts.flatMap((part) =>
+          part.type === "text" && !part.ignored && part.metadata?.sessionQueue
+            ? [Schema.decodeUnknownSync(SessionPromptQueue.Group)(part.metadata.sessionQueue)]
+            : [],
+        ),
+      )
+      expect(groups.map((group) => group.constituents.map((item) => item.id))).toEqual([
+        originals.slice(0, 10).map((item) => item.id),
+        [originals[10].id],
+      ])
+      const retry = yield* held.queue.admit({
+        sessionID: held.chat.id,
+        messageID: MessageID.ascending(),
+        delivery: "queue",
+        agent: "build",
+        model: ref,
+        parts: said(inputs[0].text),
+      })
+      expect(retry.id).toBe(originals[0].id)
+      yield* Deferred.succeed(lastGate, undefined)
+      const replies = yield* finish(held.task, ...peers, human, automation)
+      expect(replies.slice(0, 12).map((reply) => answered(reply)?.texts)).toEqual(
+        Array.from({ length: 12 }, () => ["active peers handled"]),
+      )
+      expect(answered(replies[12])?.texts).toEqual(["held human handled"])
+      expect(answered(replies[13])?.texts).toEqual(["automation handled"])
+      expect(answered(yield* held.queue.reply(retry.id))?.texts).toEqual(["active peers handled"])
+      expect(yield* held.llm.calls).toBe(5)
+      expect(yield* held.queue.list(held.chat.id)).toEqual([])
+    }),
+  30000,
+)
+
+it.instance(
+  "ordinary peer arriving during a long tool waits for its completion before model visibility",
+  () =>
+    Effect.gen(function* () {
+      const directory = yield* TestInstance
+      const file = path.join(directory.directory, "long-peer-tool.txt")
+      yield* writeText(file, "completed long tool evidence")
+      const held = yield* startHeld({ tool: { name: "read", args: { filePath: file } } })
+      const registry = yield* ToolRegistry.Service
+      const named = yield* registry.named()
+      const original = named.read.execute
+      const toolEntered = yield* Deferred.make<void>()
+      const toolRelease = yield* Deferred.make<void>()
+      const providerRelease = yield* Deferred.make<void>()
+      const executed: string[] = []
+      const interrupted: boolean[] = []
+      named.read.execute = (args, ctx) =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(toolEntered, undefined)
+          yield* Deferred.await(toolRelease)
+          expect(ctx.abort.aborted).toBe(false)
+          executed.push(args.filePath)
+          return yield* original(args, ctx)
+        }).pipe(
+          Effect.onInterrupt(() =>
+            Effect.sync(() => {
+              interrupted.push(true)
+            }),
+          ),
+        )
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          named.read.execute = original
+        }).pipe(
+          Effect.andThen(Deferred.succeed(toolRelease, undefined)),
+          Effect.andThen(Deferred.succeed(providerRelease, undefined)),
+          Effect.asVoid,
+        ),
+      )
+      yield* held.llm.tool("read", { filePath: file })
+      yield* held.llm.hold("long-tool peers answered", deferredAsPromise(providerRelease))
+      yield* held.llm.text("long-tool human answered")
+      yield* held.llm.text("long-tool automation answered")
+      const firstText =
+        "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791900001-1-abcd\x1f [fm-level:request]\x1f Peer before tool\nOriginal first obligation"
+      const first = yield* held.send(firstText)
+      yield* queued(held.chat.id, 1)
+      yield* held.release
+      yield* awaitWithTimeout(Deferred.await(toolEntered), "real long read tool did not start", "10 seconds")
+      const secondText =
+        "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791900001-2-abcd\x1f [fm-level:info]\x1f Peer during tool\nOriginal second tail"
+      const automationText =
+        "[fm-level:nudge:watcher.wake]\x1f WATCHER FIRED [wake-2] - handle wake.\n\ncheck: /scratch/long.check.sh: historical observation"
+      const second = yield* held.send(secondText)
+      const human = yield* held.send("long-tool held human", { delivery: "queue" })
+      const automation = yield* held.send(automationText)
+      yield* queued(held.chat.id, 3)
+      expect(yield* held.llm.calls).toBe(2)
+      expect(executed).toEqual([])
+      expect(interrupted).toEqual([])
+      const during = yield* held.sessions.messages({ sessionID: held.chat.id })
+      expect(
+        during
+          .flatMap((message) => message.parts)
+          .some((part) => part.type === "tool" && part.state.status === "running"),
+      ).toBe(true)
+      expect(
+        during
+          .flatMap((message) => message.parts)
+          .some((part) => part.type === "text" && part.text.includes(secondText)),
+      ).toBe(false)
+      yield* Deferred.succeed(toolRelease, undefined)
+      yield* awaitWithTimeout(held.llm.wait(3), "long-tool peer never reached the next provider request", "10 seconds")
+      const requests = yield* held.llm.inputs
+      if (!requests[1] || !requests[2]) throw new Error("expected actual tool continuations")
+      expect(lastUserContent(requests[1])).toContain("Peer before tool")
+      expect(lastUserContent(requests[1])).not.toContain("Peer during tool")
+      expect(lastUserContent(requests[2])).toContain("Peer during tool")
+      expect(lastUserContent(requests[2])).toContain("Original second tail")
+      expect(JSON.stringify(requests[2].messages)).toContain("completed long tool evidence")
+      expect(JSON.stringify(requests[2].messages)).not.toContain("long-tool held human")
+      expect(JSON.stringify(requests[2].messages)).not.toContain("historical observation")
+      expect(executed).toEqual([file])
+      expect(interrupted).toEqual([])
+      const after = yield* held.sessions.messages({ sessionID: held.chat.id })
+      expect(
+        after
+          .flatMap((message) => message.parts)
+          .filter((part) => part.type === "tool" && part.state.status === "completed"),
+      ).toHaveLength(2)
+      yield* Deferred.succeed(providerRelease, undefined)
+      const replies = yield* finish(held.task, first, second, human, automation)
+      expect(replies.slice(0, 3).map((reply) => answered(reply)?.texts)).toEqual(
+        Array.from({ length: 3 }, () => ["long-tool peers answered"]),
+      )
+      expect(answered(replies[3])?.texts).toEqual(["long-tool human answered"])
+      expect(answered(replies[4])?.texts).toEqual(["long-tool automation answered"])
+      expect(yield* held.llm.calls).toBe(5)
+    }),
+  30000,
+)
+
+it.instance(
+  "historical native stable-ID admission refuses uncertainty with zero provider execution",
+  () =>
+    Effect.gen(function* () {
+      const config = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      for (const system of [undefined, "excluded original execution controls"]) {
+        const session = yield* sessions.create({ title: "Historical stable original" })
+        const input = {
+          sessionID: session.id,
+          messageID: MessageID.ascending(),
+          agent: "build",
+          model: ref,
+          system,
+          parts: said("historical native request"),
+        }
+        // Pre-upgrade bare projection: do not create current-build noReply custody.
+        yield* sessions.updateMessage({
+          id: input.messageID,
+          sessionID: session.id,
+          role: "user",
+          agent: input.agent,
+          model: input.model,
+          system: input.system,
+          time: { created: Date.now() },
+        })
+        yield* sessions.updatePart({
+          id: PartID.ascending(),
+          messageID: input.messageID,
+          sessionID: session.id,
+          type: "text",
+          text: "historical native request",
+        })
+        const before = yield* sessions.messages({ sessionID: session.id })
+        for (const retry of [
+          input,
+          { ...input, delivery: "queue" as const },
+          { ...input, parts: said("changed historical intent") },
+          { ...input, system: "conflicting execution controls" },
+          { ...input, noReply: true },
+        ]) {
+          const exit = yield* prompt.prompt(retry).pipe(Effect.exit)
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (!Exit.isFailure(exit)) throw new Error("historical identity was silently replayed")
+          expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+          expect(yield* queue.list(session.id)).toEqual([])
+          expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+        }
+      }
+      expect(yield* config.llm.calls).toBe(0)
+    }),
+  30000,
+)
+
+unix(
+  "historical command stable-ID refusal occurs before shell expansion and provider execution",
+  () =>
+    Effect.gen(function* () {
+      const directory = yield* TestInstance
+      const marker = path.join(directory.directory, "old-command-executions.txt")
+      yield* writeText(marker, "original execution retained\n")
+      const config = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: {
+          historical: {
+            template: `!\`printf 'second execution\\n' >> '${marker}'; printf 'historical command intent'\``,
+          },
+        },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "Historical command original" })
+      const messageID = MessageID.ascending()
+      yield* seedUser({
+        sessionID: session.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        parts: said("historical command intent"),
+      })
+      const before = yield* sessions.messages({ sessionID: session.id })
+      for (const args of ["", "changed arguments"]) {
+        const exit = yield* prompt
+          .command({
+            sessionID: session.id,
+            messageID,
+            command: "historical",
+            arguments: args,
+            agent: "build",
+            model: "test/test-model",
+          })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (!Exit.isFailure(exit)) throw new Error("historical command was replayed")
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+        expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("original execution retained\n")
+        expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+        expect(yield* queue.list(session.id)).toEqual([])
+      }
+      expect(yield* config.llm.calls).toBe(0)
+    }),
+  30000,
+)
+
+it.instance(
+  "round4 represented noReply reconciles full input and delivery without rewriting native history",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Represented noReply" })
+      const input = {
+        sessionID: session.id,
+        messageID: MessageID.ascending(),
+        agent: "build",
+        model: ref,
+        parts: said("native original"),
+      }
+      yield* llm.text("native answer")
+      const answered = yield* prompt.prompt(input)
+      const before = yield* sessions.messages({ sessionID: session.id })
+      const exact = yield* prompt.prompt({ ...input, noReply: true })
+      expect(exact.info.id).toBe(input.messageID)
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+      for (const changed of [
+        { parts: said("conflicting native text") },
+        { delivery: "queue" as const },
+        { system: "different system" },
+        { tools: { read: false } },
+        { variant: "different" },
+      ]) {
+        const exit = yield* Effect.exit(prompt.prompt({ ...input, ...changed, noReply: true }))
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+      }
+      yield* sessions.setRevert({
+        sessionID: session.id,
+        revert: { messageID: input.messageID },
+        summary: session.summary,
+      })
+      const reverted = yield* sessions.get(session.id)
+      const retried = yield* prompt.prompt(input)
+      expect(retried.info.id).toBe(answered.info.id)
+      expect((yield* sessions.get(session.id)).revert).toEqual(reverted.revert)
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+      expect(yield* llm.calls).toBe(1)
+    }),
+  30000,
+)
+
+it.instance(
+  "round4 unmarked direct noReply records an exact original and refuses conflicting reuse",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Direct noReply custody" })
+      const input = {
+        sessionID: session.id,
+        messageID: MessageID.ascending(),
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: said("direct original"),
+      }
+      const first = yield* prompt.prompt(input)
+      expect(yield* prompt.prompt(input)).toEqual(first)
+      const before = yield* sessions.messages({ sessionID: session.id })
+      for (const changed of [{ parts: said("changed") }, { noReply: false }, { delivery: "queue" as const }]) {
+        expect(Exit.isFailure(yield* Effect.exit(prompt.prompt({ ...input, ...changed })))).toBe(true)
+        expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+      }
+      expect(first.parts.filter((part) => part.type === "text" && part.metadata?.sessionQueueNoReply)).toHaveLength(1)
+      expect(yield* llm.calls).toBe(0)
+    }),
+  30000,
+)
+
+for (const custody of ["pending", "retained", "consumed"] as const)
+  unix(
+    `round4 represented command ${custody} retry refuses before executable expansion`,
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const marker = path.join(test.directory, "command-once.txt")
+        const command = { probe: { template: `!\`printf 'execution\\n' >> '${marker}'; printf 'command intent'\`` } }
+        const prompt = yield* SessionPrompt.Service
+        const queue = yield* SessionQueue.Service
+        const sessions = yield* Session.Service
+        const held =
+          custody !== "consumed" ? yield* startHeld({ config: (url) => ({ ...providerCfg(url), command }) }) : undefined
+        const configured = held ? undefined : yield* useServerConfig((url) => ({ ...providerCfg(url), command }))
+        const llm = held?.llm ?? configured!.llm
+        const session = held?.chat ?? (yield* sessions.create({ title: "Consumed command" }))
+        const input = {
+          sessionID: session.id,
+          messageID: MessageID.ascending(),
+          command: "probe",
+          arguments: "",
+          delivery: custody === "consumed" ? ("steer" as const) : ("queue" as const),
+        }
+        if (!held) yield* llm.text("command complete")
+        const original = yield* prompt.command(input).pipe(Effect.forkChild)
+        if (!held) yield* awaitWithTimeout(Fiber.join(original), "original command did not complete", "10 seconds")
+        if (held) {
+          yield* queued(session.id, 1)
+          if (custody === "retained")
+            yield* queue.promote({
+              sessionID: session.id,
+              delivery: "queue",
+              prepare: (input) => Effect.succeed(input),
+              write: (input) =>
+                Effect.gen(function* () {
+                  yield* sessions.updateMessage({
+                    id: input.messageID,
+                    sessionID: session.id,
+                    role: "user",
+                    agent: input.agent ?? "build",
+                    model: input.model ?? ref,
+                    time: { created: Date.now() },
+                  })
+                  yield* Effect.forEach(
+                    input.parts,
+                    (part) =>
+                      part.type === "text"
+                        ? sessions.updatePart({
+                            ...part,
+                            id: part.id ?? PartID.ascending(),
+                            sessionID: session.id,
+                            messageID: input.messageID,
+                          })
+                        : Effect.void,
+                    { discard: true },
+                  )
+                }),
+              rejected: (cause) => Effect.failCause(cause),
+            })
+        }
+        // HTTP request receipt can precede the runner's initial snapshot write; freeze only after that part exists.
+        if (held)
+          yield* pollWithTimeout(
+            sessions.messages({ sessionID: session.id }).pipe(
+              Effect.map((messages) =>
+                messages.some((message) =>
+                  message.info.role === "assistant" && message.parts.some((part) => part.type === "step-start"),
+                ) ? true : undefined,
+              ),
+            ),
+            "held provider did not persist its initial step",
+            "10 seconds",
+          )
+        const before = yield* sessions.messages({ sessionID: session.id })
+        const pending = yield* queue.list(session.id)
+        const calls = yield* llm.calls
+        for (const changed of [
+          {},
+          { arguments: "different arguments" },
+          { command: "other-command" },
+          { delivery: "steer" as const },
+        ]) {
+          const exit = yield* Effect.exit(prompt.command({ ...input, ...changed }))
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit))
+            expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+          expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("execution\n")
+          expect(yield* llm.calls).toBe(calls)
+          expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+          expect(yield* queue.list(session.id)).toEqual(pending)
+        }
+        if (held) {
+          yield* llm.text("command complete")
+          yield* held.release
+          yield* finish(held.task, original)
+        }
+      }),
+    30000,
+  )
+
+unix(
+  "round4 shell represented and bare identities refuse before command execution",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const test = yield* TestInstance
+      const marker = path.join(test.directory, "shell-once.txt")
+      const represented = yield* sessions.create({ title: "Represented shell ID" })
+      const messageID = MessageID.ascending()
+      yield* llm.text("original native answer")
+      yield* prompt.prompt({
+        sessionID: represented.id,
+        messageID,
+        agent: "build",
+        model: ref,
+        parts: said("normal original"),
+      })
+      const fresh = yield* sessions.create({ title: "Bare shell ID" })
+      const bareID = MessageID.ascending()
+      const shell = {
+        sessionID: fresh.id,
+        messageID: bareID,
+        agent: "build",
+        model: ref,
+        command: `printf 'execution\\n' >> '${marker}'`,
+      }
+      yield* prompt.shell(shell)
+      for (const input of [
+        shell,
+        { ...shell, command: `printf changed >> '${marker}'` },
+        { ...shell, sessionID: represented.id, messageID },
+      ]) {
+        const before = yield* sessions.messages({ sessionID: input.sessionID })
+        const exit = yield* Effect.exit(prompt.shell(input))
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionQueue.HistoricalIdentityError)
+        expect(yield* sessions.messages({ sessionID: input.sessionID })).toEqual(before)
+        expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("execution\n")
+      }
+      expect(yield* llm.calls).toBe(1)
+    }),
+  30000,
+)
+
+it.instance(
+  "round4 peer continuation defers while the root structured output contract is unanswered",
+  () =>
+    Effect.gen(function* () {
+      const held = yield* startHeld({
+        tool: { name: "glob", args: { pattern: "*.txt" } },
+        format: Schema.decodeUnknownSync(SessionV1.Format)({
+          type: "json_schema",
+          schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+        }),
+      })
+      const text = "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791854000-401-abcd\x1f [fm-level:request]\x1f Structured root peer\nFull peer tail"
+      const peer = yield* held.send(text, { delivery: "queue" })
+      yield* queued(held.chat.id, 1)
+      yield* held.llm.push(
+        reply().tool("StructuredOutput", { answer: "root contract preserved" }).item(),
+        reply().text("peer answered later").stop().item(),
+      )
+      yield* held.release
+      const root = yield* awaitWithTimeout(Fiber.join(held.task), "structured root did not settle", "10 seconds")
+      yield* awaitWithTimeout(Fiber.join(peer), "deferred peer did not settle", "10 seconds")
+      const requests = yield* held.llm.inputs
+      expect(JSON.stringify(requests[1]?.messages)).not.toContain(JSON.stringify(text).slice(1, -1))
+      expect(JSON.stringify(requests[1]?.tools)).toContain("StructuredOutput")
+      expect(requests[1]?.tool_choice).toBe("required")
+      expect(root.info.role === "assistant" && root.info.structured).toEqual({ answer: "root contract preserved" })
+      expect(root.info.role === "assistant" && root.info.error).toBeUndefined()
+      expect(JSON.stringify(requests[2]?.messages)).toContain(JSON.stringify(text).slice(1, -1))
+      expect(yield* held.llm.calls).toBe(3)
+    }),
+  30000,
+)
+
+it.instance(
+  "round4 held actual SDK dependency remains a no-provider failure under unchanged readiness bound",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      yield* writeText(
+        path.join(instance.directory, ".opencode/tool/sdk-boundary.ts"),
+        'import { tool } from "@opencode-ai/plugin"; export default tool({ description: "local SDK boundary", args: {}, async execute() { return "unused" } })',
+      )
+      const gate = {
+        dir: path.join(instance.directory, ".opencode"),
+        entered: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      }
+      sdkReadiness.gate = gate
+      const observations: Array<{ sessionID: SessionID; calls: number; runner?: { state: string; frame?: string } }> = []
+      const attempt = yield* startHeld({ diagnostic: (value) => observations.push(value) }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(gate.entered), "actual SDK dependency fixture did not enter its owner")
+      const cfg = yield* Config.Service
+      const dirs = yield* cfg.directories()
+      expect(
+        dirs.every((dir) => dir === Global.Path.config || dir === path.join(instance.directory, ".opencode")),
+      ).toBe(true)
+      const exit = yield* awaitWithTimeout(
+        Fiber.await(attempt),
+        "unchanged first-provider backstop did not fire",
+        "15 seconds",
+      )
+      yield* Deferred.succeed(gate.release, undefined)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("first provider call never started")
+      expect(observations).toHaveLength(1)
+      expect(observations[0]?.calls).toBe(0)
+      expect(observations[0]?.runner?.state).toBe("Running")
+      expect(observations[0]?.runner?.frame).toBe("Config.waitForDependencies")
+    }),
+  30000,
+)
+
+it.instance(
+  "round4 critical noReply peer preserves original transport identity and exact aliases",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Direct critical peer identity" })
+      const text =
+        "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791854000-402-abcd\x1f [fm-level:critical]\x1f Critical excluded peer\nComplete tail"
+      const input = { sessionID: session.id, agent: "build", model: ref, noReply: true, parts: said(text) }
+      const original = yield* prompt.prompt(input)
+      const exact = yield* prompt.prompt(input)
+      expect(exact.info.id).toBe(original.info.id)
+      const alias = { ...input, messageID: MessageID.ascending() }
+      expect((yield* prompt.prompt(alias)).info.id).toBe(original.info.id)
+      const before = yield* sessions.messages({ sessionID: session.id })
+      expect((yield* prompt.prompt(alias)).info.id).toBe(original.info.id)
+      expect(Exit.isFailure(yield* Effect.exit(prompt.prompt({ ...alias, parts: said(text + " changed") })))).toBe(true)
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+      expect(before).toHaveLength(1)
+      expect(yield* llm.calls).toBe(0)
+    }),
+  30000,
+)
+
+unix(
+  "round5 overlapping command expansion executes once and binds before a retry enters",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const marker = path.join(instance.directory, "inflight-command.txt")
+      const release = path.join(instance.directory, "release-command")
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: {
+          probe: {
+            template: `!\`printf 'execution\\n' >> '${marker}'; while [ ! -f '${release}' ]; do sleep 0.01; done; printf 'prepared once'\``,
+          },
+        },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Held executable preparation" })
+      const input = { sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" }
+      yield* llm.text("executed once")
+      const first = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      yield* pollWithTimeout(
+        Effect.promise(async () =>
+          (await Bun.file(marker).exists()) ? await Bun.file(marker).text() : undefined,
+        ).pipe(Effect.map((text) => (text === "execution\n" ? true : undefined))),
+        "first executable expansion did not publish its marker",
+        "10 seconds",
+      )
+      const entered = yield* Deferred.make<void>()
+      const second = yield* Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(prompt.command(input)),
+        Effect.forkChild,
+      )
+      yield* Deferred.await(entered)
+      expect(yield* llm.calls).toBe(0)
+      yield* writeText(release, "released")
+      const result = yield* awaitWithTimeout(Fiber.join(first), "first command did not finish", "10 seconds")
+      const retry = yield* awaitWithTimeout(Fiber.await(second), "second command did not refuse", "10 seconds")
+      expect(Exit.isFailure(retry)).toBe(true)
+      expect(result.info.role).toBe("assistant")
+      expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("execution\n")
+      expect(yield* llm.calls).toBe(1)
+      expect(
+        (yield* sessions.messages({ sessionID: session.id })).filter((message) => message.info.role === "user"),
+      ).toHaveLength(1)
+    }),
+  30000,
+)
+
+unix(
+  "round5 foreign projected identity appearing during expansion refuses admission without a DB IO lock",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const marker = path.join(instance.directory, "foreign-command.txt")
+      const release = path.join(instance.directory, "release-foreign-command")
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: {
+          probe: {
+            template: `!\`printf 'execution\\n' >> '${marker}'; while [ ! -f '${release}' ]; do sleep 0.01; done; printf 'prepared once'\``,
+          },
+        },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ title: "Foreign identity during IO" })
+      const input = { sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" }
+      const first = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      yield* pollWithTimeout(
+        Effect.promise(async () => ((await Bun.file(marker).exists()) ? true : undefined)),
+        "command did not enter expansion",
+        "10 seconds",
+      )
+      const bare = yield* awaitWithTimeout(
+        sessions.updateMessage({
+          id: input.messageID,
+          sessionID: session.id,
+          role: "user",
+          agent: "build",
+          model: ref,
+          time: { created: 456 },
+        }),
+        "expansion held a DB transaction",
+        "2 seconds",
+      )
+      const before = yield* sessions.messages({ sessionID: session.id })
+      yield* writeText(release, "released")
+      const result = yield* awaitWithTimeout(Fiber.await(first), "foreign identity did not refuse", "10 seconds")
+      expect(Exit.isFailure(result)).toBe(true)
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual(before)
+      expect((yield* sessions.messages({ sessionID: session.id }))[0]?.info.id).toBe(bare.id)
+      expect(yield* llm.calls).toBe(0)
+    }),
+  30000,
+)
+
+it.instance(
+  "round5 SDK fixture replaces an unrelated installed package with the exact workspace source",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const dir = path.join(instance.directory, ".opencode")
+      const entry = path.join(dir, "node_modules/@opencode-ai/plugin")
+      yield* writeText(
+        path.join(entry, "package.json"),
+        JSON.stringify({ name: "@opencode-ai/plugin", version: "1.19.0", type: "module", exports: "./index.js" }),
+      )
+      yield* writeText(path.join(entry, "index.js"), "export const tool = () => 'wrong SDK'\n")
+      const npm = yield* Npm.Service
+      yield* npm.install(dir, { add: [{ name: "@opencode-ai/plugin" }] })
+      const actual = yield* Effect.promise(() =>
+        realpath(createRequire(path.join(dir, "sdk-fixture.cjs")).resolve("@opencode-ai/plugin")),
+      )
+      const expected = yield* Effect.promise(() =>
+        realpath(path.resolve(import.meta.dir, "../../../plugin/src/index.ts")),
+      )
+      expect(actual).toBe(expected)
+      expect(yield* Effect.promise(() => realpath(entry))).toBe(
+        yield* Effect.promise(() => realpath(path.resolve(import.meta.dir, "../../../plugin"))),
+      )
+      const sdk = yield* Effect.promise(() => import(pathToFileURL(actual).href))
+      expect(typeof sdk.tool).toBe("function")
+    }),
+  30000,
+)
+
+unix(
+  "round6 held executable IO allows critical steer direct prompt and active cancellation",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const marker = path.join(instance.directory, "round6-control-entered")
+      const release = path.join(instance.directory, "round6-control-release")
+      const held = yield* startHeld({
+        config: (url) => ({
+          ...providerCfg(url),
+          command: {
+            probe: {
+              template: `!\`printf 'execution\\n' >> '${marker}'; while [ ! -f '${release}' ]; do sleep 0.01; done; printf 'held command intent'\``,
+            },
+          },
+        }),
+      })
+      const expanding = yield* held.prompt
+        .command({
+          sessionID: held.chat.id,
+          messageID: MessageID.ascending(),
+          command: "probe",
+          arguments: "",
+          delivery: "queue",
+        })
+        .pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      yield* pollWithTimeout(
+        Effect.promise(async () => ((await Bun.file(marker).exists()) ? true : undefined)),
+        "command never entered external preparation",
+      )
+      const critical =
+        "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791854000-998-abcd\x1f [fm-level:critical]\x1f Critical full envelope while expansion is held"
+      const criticalID = MessageID.ascending()
+      const sent = yield* held.send(critical, { messageID: criticalID })
+      const visible = yield* pollWithTimeout(
+        held.sessions
+          .messages({ sessionID: held.chat.id })
+          .pipe(
+            Effect.map((messages) =>
+              messages.some((message) =>
+                message.parts.some((part) => part.type === "text" && part.text.includes(critical)),
+              )
+                ? true
+                : undefined,
+            ),
+          ),
+        "critical steer blocked by expansion",
+        "2 seconds",
+      ).pipe(Effect.exit)
+      const criticalProjection = (yield* held.sessions.messages({ sessionID: held.chat.id })).find((message) =>
+        message.parts.some((part) => part.type === "text" && part.text.includes(critical)),
+      )
+      const directID = MessageID.ascending()
+      const direct = yield* awaitWithTimeout(
+        held.prompt.prompt({
+          sessionID: held.chat.id,
+          messageID: directID,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: said("independent direct original"),
+        }),
+        "direct prompt blocked by expansion",
+        "2 seconds",
+      ).pipe(Effect.exit)
+      const cancellation = yield* awaitWithTimeout(
+        held.prompt.cancel(held.chat.id),
+        "active cancel blocked by expansion",
+        "2 seconds",
+      ).pipe(Effect.exit)
+      const terminal = yield* awaitWithTimeout(
+        Fiber.await(held.task),
+        "active provider remained running after cancellation",
+        "2 seconds",
+      ).pipe(Effect.exit)
+      if (Exit.isFailure(visible) || Exit.isFailure(direct) || Exit.isFailure(cancellation) || Exit.isFailure(terminal))
+        yield* Effect.sync(() =>
+          console.error("held executable progress failures", {
+            critical: Exit.isFailure(visible) ? Cause.pretty(visible.cause) : "Success",
+            direct: Exit.isFailure(direct) ? Cause.pretty(direct.cause) : "Success",
+            cancel: Exit.isFailure(cancellation) ? Cause.pretty(cancellation.cause) : "Success",
+            providerTerminal: Exit.isFailure(terminal) ? Cause.pretty(terminal.cause) : "Success",
+          }),
+        )
+      const callsBeforeRelease = yield* held.llm.calls
+      const stillHeld = !(yield* Effect.promise(() => Bun.file(release).exists()))
+      yield* held.llm.text("critical answered")
+      yield* held.llm.text("command answered")
+      yield* writeText(release, "released")
+      yield* held.release
+      yield* finish(held.task, sent, expanding)
+      expect(Exit.isSuccess(visible)).toBe(true)
+      const witness = criticalProjection?.parts.flatMap((part) =>
+        part.type === "text" && !part.ignored && part.metadata?.sessionQueue ? [part.metadata.sessionQueue] : [],
+      )[0]
+      const original = Schema.decodeUnknownSync(SessionPromptQueue.Group)(witness).constituents[0]
+      expect(original?.delivery).toBe("steer")
+      expect(original?.input.messageID).toBe(criticalID)
+      expect(original?.input.parts).toEqual(said(critical))
+      expect(Exit.isSuccess(direct)).toBe(true)
+      if (Exit.isSuccess(direct)) expect(direct.value.info.id).toBe(directID)
+      expect(Exit.isSuccess(cancellation)).toBe(true)
+      expect(Exit.isSuccess(terminal)).toBe(true)
+      expect(callsBeforeRelease).toBe(1)
+      expect(stillHeld).toBe(true)
+      expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("execution\n")
+    }),
+  30000,
+)
+
+unix(
+  "round6 ordinary peer provider continuation completes while command expansion remains held",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const file = path.join(instance.directory, "round6-real-read.txt")
+      const marker = path.join(instance.directory, "round6-continuation-entered")
+      const release = path.join(instance.directory, "round6-continuation-release")
+      yield* writeText(file, "retained real read result")
+      const held = yield* startHeld({
+        tool: { name: "read", args: { filePath: file } },
+        config: (url) => ({
+          ...providerCfg(url),
+          command: {
+            probe: {
+              template: `!\`printf 'execution\\n' >> '${marker}'; while [ ! -f '${release}' ]; do sleep 0.01; done; printf 'deferred command intent'\``,
+            },
+          },
+        }),
+      })
+      const expanding = yield* held.prompt
+        .command({
+          sessionID: held.chat.id,
+          messageID: MessageID.ascending(),
+          command: "probe",
+          arguments: "",
+          delivery: "queue",
+        })
+        .pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      yield* pollWithTimeout(
+        Effect.promise(async () => ((await Bun.file(marker).exists()) ? true : undefined)),
+        "command preparation did not enter",
+      )
+      const input = {
+        messageID: MessageID.ascending(),
+        text: "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791854000-999-abcd\x1f [fm-level:request]\x1f Ordinary peer during expansion\nComplete original tail",
+      }
+      const sent = yield* held.send(input.text, { messageID: input.messageID })
+      const original = (yield* awaitWithTimeout(
+        queued(held.chat.id, 1),
+        "ordinary peer admission blocked by expansion",
+        "2 seconds",
+      ))[0]
+      if (!original) throw new Error("missing admitted peer")
+      expect(original.input.messageID).toBe(input.messageID)
+      // Retain a caller in this scope so reply custody remains readable after child callers finish.
+      const custody = yield* held.queue.admit({
+        ...original.input,
+        sessionID: held.chat.id,
+        delivery: original.delivery,
+      })
+      expect(custody.id).toBe(original.id)
+      yield* held.llm.text("peer continuation complete")
+      yield* held.release
+      yield* awaitWithTimeout(held.llm.wait(2), "continuation blocked by command expansion", "2 seconds")
+      const replies = yield* finish(held.task, sent)
+      expect(replies[0]?.info.id).toBe(replies[1]?.info.id)
+      expect((yield* held.queue.reply(original.id))?.info.id).toBe(replies[1]?.info.id)
+      const requests = yield* held.llm.inputs
+      expect(JSON.stringify(requests[1]?.messages)).toContain("retained real read result")
+      expect(JSON.stringify(requests[1]?.messages)).toContain("Complete original tail")
+      expect(yield* held.queue.list(held.chat.id)).toEqual([])
+      expect(yield* held.llm.calls).toBe(2)
+      expect(yield* Effect.promise(() => Bun.file(release).exists())).toBe(false)
+      yield* held.llm.text("command complete")
+      yield* writeText(release, "released")
+      yield* finish(expanding)
+      expect(yield* held.llm.calls).toBe(3)
+      expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("execution\n")
+    }),
+  30000,
+)
+
+gated.instance(
+  "round6 command pre-execution hook can await a distinct same-session direct prompt",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: { probe: { template: "plain command intent" } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({})
+      const directID = MessageID.ascending()
+      const observed: SessionV1.WithParts[] = []
+      const entered = yield* Deferred.make<void>()
+      const completed = yield* Deferred.make<void>()
+      const providerRelease = yield* Deferred.make<void>()
+      gates.commandBefore = Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(
+          prompt.prompt({
+            sessionID: session.id,
+            messageID: directID,
+            model: ref,
+            agent: "build",
+            noReply: true,
+            parts: said("direct input from awaited hook"),
+          }),
+        ),
+        Effect.tap((message) =>
+          Effect.sync(() => {
+            observed.push(message)
+          }),
+        ),
+        Effect.andThen(Deferred.succeed(completed, undefined)),
+        Effect.asVoid,
+      )
+      yield* llm.hold("command complete", deferredAsPromise(providerRelease))
+      const task = yield* prompt
+        .command({ sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" })
+        .pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => Deferred.succeed(providerRelease, undefined).pipe(Effect.asVoid))
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          gates.commandBefore = undefined
+        }),
+      )
+      yield* awaitWithTimeout(Deferred.await(entered), "command setup never reached pre-execution hook", "10 seconds")
+      yield* awaitWithTimeout(Deferred.await(completed), "awaited hook direct input did not complete", "2 seconds")
+      yield* awaitWithTimeout(
+        Effect.raceFirst(
+          llm.wait(1),
+          Fiber.join(task).pipe(Effect.andThen(Effect.fail(new Error("command ended before provider request")))),
+        ),
+        "command provider never started",
+        "10 seconds",
+      )
+      // The actual hook is complete. Holding provider completion past its bound must not fail that phase.
+      yield* Effect.sleep("2100 millis")
+      const held = task.pollUnsafe()
+      if (held)
+        yield* Effect.sync(() =>
+          console.error("command ended after hook completion", {
+            observed: observed.length,
+            cause: Exit.isFailure(held) ? Cause.pretty(held.cause) : "Success",
+          }),
+        )
+      yield* Deferred.succeed(providerRelease, undefined)
+      const result = yield* Fiber.join(task)
+      expect(held).toBeUndefined()
+      expect(observed).toHaveLength(1)
+      expect(observed[0]?.info.id).toBe(directID)
+      expect(result.info.role).toBe("assistant")
+      expect(yield* llm.calls).toBe(1)
+      expect(
+        (yield* sessions.messages({ sessionID: session.id })).filter((message) => message.info.role === "user"),
+      ).toHaveLength(2)
+    }),
+  30000,
+)
+
+unix(
+  "round7 interrupted real expansion keeps its identity until external termination",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const marker = path.join(instance.directory, "round7-native-entered")
+      const ended = path.join(instance.directory, "round7-native-ended")
+      const release = path.join(instance.directory, "round7-native-release")
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: {
+          probe: {
+            template: `!\`printf 'execution\\n' >> '${marker}'; while [ ! -f '${release}' ]; do sleep 0.01; done; printf 'terminated\\n' >> '${ended}'; printf 'cancelled intent'\``,
+          },
+        },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({})
+      const input = { sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" }
+      const lines = () =>
+        Effect.promise(async () =>
+          (await Bun.file(marker).exists()) ? (await Bun.file(marker).text()).trim().split("\n").length : 0,
+        )
+      yield* llm.text("unexpected retry answer")
+      const first = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      yield* pollWithTimeout(
+        lines().pipe(Effect.map((count) => (count === 1 ? true : undefined))),
+        "native expansion did not enter",
+      )
+      const stopping = yield* Fiber.interrupt(first).pipe(Effect.forkChild({ startImmediately: true }))
+      const second = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      const outcome = yield* Effect.raceFirst(
+        Fiber.await(second).pipe(
+          Effect.map((exit) =>
+            Exit.isFailure(exit) && Cause.squash(exit.cause) instanceof SessionQueue.HistoricalIdentityError
+              ? "refused"
+              : "unexpected terminal",
+          ),
+        ),
+        pollWithTimeout(
+          lines().pipe(Effect.map((count) => (count === 2 ? true : undefined))),
+          "retry did not expand",
+          "2 seconds",
+        ).pipe(Effect.as("expanded")),
+      )
+      const beforeRelease = {
+        outcome,
+        markers: yield* lines(),
+        released: yield* Effect.promise(() => Bun.file(release).exists()),
+        firstExit: first.pollUnsafe()?._tag,
+        calls: yield* llm.calls,
+      }
+      const direct = yield* awaitWithTimeout(
+        prompt.prompt({
+          sessionID: session.id,
+          messageID: MessageID.ascending(),
+          noReply: true,
+          agent: "build",
+          model: ref,
+          parts: said("distinct input during interrupted expansion"),
+        }),
+        "unrelated input blocked by interrupted preparation",
+        "2 seconds",
+      )
+      yield* writeText(release, "released")
+      const firstExit = yield* awaitWithTimeout(
+        Fiber.await(first),
+        "interrupted expansion did not settle after native termination",
+        "10 seconds",
+      )
+      yield* Fiber.join(stopping)
+      yield* awaitWithTimeout(Fiber.await(second), "retry did not settle", "10 seconds")
+      expect(beforeRelease).toEqual({ outcome: "refused", markers: 1, released: false, firstExit: undefined, calls: 0 })
+      expect(direct.info.role).toBe("user")
+      expect(Exit.isFailure(firstExit) && Cause.hasInterrupts(firstExit.cause)).toBe(true)
+      expect(yield* Effect.promise(() => Bun.file(ended).text())).toBe("terminated\n")
+      expect(yield* lines()).toBe(1)
+      expect(yield* llm.calls).toBe(0)
+      expect(
+        (yield* sessions.messages({ sessionID: session.id })).filter((message) => message.info.role === "user"),
+      ).toHaveLength(1)
+    }),
+  30000,
+)
+
+unix(
+  "round7 failed parallel expansion keeps custody until its surviving native child exits",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const marker = path.join(instance.directory, "round7-parallel-entered")
+      const ended = path.join(instance.directory, "round7-parallel-ended")
+      const release = path.join(instance.directory, "round7-parallel-release")
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: {
+          probe: {
+            template: `!\`printf 'execution\\n' >> '${marker}'; while [ ! -f '${release}' ]; do sleep 0.01; done; printf 'terminated\\n' >> '${ended}'\` !\`printf 'invalid\0argument'\``,
+          },
+        },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({})
+      const input = { sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" }
+      const first = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      yield* pollWithTimeout(
+        Effect.promise(async () => ((await Bun.file(marker).exists()) ? true : undefined)),
+        "parallel surviving child did not enter",
+      )
+      const second = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      const retry = yield* awaitWithTimeout(
+        Fiber.await(second),
+        "parallel failure released or stalled identity before surviving IO ended",
+        "2 seconds",
+      )
+      const pending = first.pollUnsafe()
+      const before = yield* Effect.promise(() => Bun.file(marker).text())
+      const stillRunning = !(yield* Effect.promise(() => Bun.file(ended).exists()))
+      yield* writeText(release, "released")
+      const failed = yield* Fiber.await(first)
+      expect(Exit.isFailure(retry) && Cause.squash(retry.cause) instanceof SessionQueue.HistoricalIdentityError).toBe(
+        true,
+      )
+      expect(pending).toBeUndefined()
+      expect(before).toBe("execution\n")
+      expect(stillRunning).toBe(true)
+      expect(Exit.isFailure(failed)).toBe(true)
+      if (Exit.isFailure(failed)) expect(Cause.pretty(failed.cause)).toContain("null bytes")
+      expect(yield* Effect.promise(() => Bun.file(ended).text())).toBe("terminated\n")
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual([])
+      expect(yield* llm.calls).toBe(0)
+    }),
+  30000,
+)
+
+gated.instance(
+  "round7 interrupted promise hook keeps custody until its returned work settles",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: { probe: { template: "promise hook intent" } },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({})
+      const entered = defer<void>()
+      const release = defer<void>()
+      const markers: string[] = []
+      const hook = Effect.promise(() => {
+        markers.push("entered")
+        entered.resolve()
+        return release.promise.then(() => {
+          markers.push("terminated")
+        })
+      })
+      gates.commandBefore = hook
+      const input = { sessionID: session.id, messageID: MessageID.ascending(), command: "probe", arguments: "" }
+      yield* llm.text("unexpected retry answer")
+      const first = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          release.resolve()
+          gates.commandBefore = undefined
+        }),
+      )
+      yield* awaitWithTimeout(
+        Effect.promise(() => entered.promise),
+        "command did not enter its native promise hook",
+        "10 seconds",
+      )
+      gates.commandBefore = hook
+      const stopping = yield* Fiber.interrupt(first).pipe(Effect.forkChild({ startImmediately: true }))
+      const second = yield* prompt.command(input).pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          release.resolve()
+          gates.commandBefore = undefined
+        }),
+      )
+      const outcome = yield* Effect.raceFirst(
+        Fiber.await(second).pipe(
+          Effect.map((exit) =>
+            Exit.isFailure(exit) && Cause.squash(exit.cause) instanceof SessionQueue.HistoricalIdentityError
+              ? "refused"
+              : "unexpected terminal",
+          ),
+        ),
+        pollWithTimeout(
+          Effect.sync(() => (markers.filter((marker) => marker === "entered").length === 2 ? true : undefined)),
+          "retry did not enter native hook",
+          "2 seconds",
+        ).pipe(Effect.as("entered twice")),
+      )
+      const before = { outcome, markers: [...markers], firstExit: first.pollUnsafe()?._tag, calls: yield* llm.calls }
+      release.resolve()
+      yield* Fiber.join(stopping)
+      const firstExit = yield* Fiber.await(first)
+      yield* Fiber.await(second)
+      gates.commandBefore = undefined
+      expect(before).toEqual({ outcome: "refused", markers: ["entered"], firstExit: undefined, calls: 0 })
+      expect(markers).toEqual(["entered", "terminated"])
+      expect(Exit.isFailure(firstExit) && Cause.hasInterrupts(firstExit.cause)).toBe(true)
+      expect(yield* sessions.messages({ sessionID: session.id })).toEqual([])
+      expect(yield* llm.calls).toBe(0)
+    }),
+  30000,
 )

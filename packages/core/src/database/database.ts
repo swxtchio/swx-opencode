@@ -2,7 +2,7 @@ export * as Database from "./database"
 
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { layer as sqliteLayer } from "#sqlite"
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Layer, Scope } from "effect"
 import { Global } from "../global"
 import { Flag } from "../flag/flag"
 import { DatabaseMigration } from "./migration"
@@ -10,6 +10,7 @@ import { resolvePath } from "./resolve-path"
 import { InstallationChannel } from "../installation/version"
 import { makeGlobalNode } from "../effect/app-node"
 import { EventWriter } from "../event/writer"
+import { DatabaseTransaction } from "./transaction"
 
 const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
 const nativeBusyTimeoutMs = 5
@@ -24,7 +25,8 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const db = yield* makeDatabase
+    const scope = yield* Scope.Scope
+    const db = DatabaseTransaction.wrap(yield* makeDatabase, scope)
 
     yield* db.run(`PRAGMA busy_timeout = ${nativeBusyTimeoutMs}`)
     yield* db.run("PRAGMA cache_size = -64000")

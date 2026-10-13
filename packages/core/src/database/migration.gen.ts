@@ -45,6 +45,8 @@ export const migrations = (
     import("./migration/20261003165428_session_event_retention"),
     import("./migration/20261011200343_event_writer_record"),
     import("./migration/20261012010120_session_prompt_provenance"),
+    import("./migration/20261012124815_message-history-order"),
+    import("./migration/20261012161249_queue-alias-custody"),
     import("./migration/20261013020615_session_prompt_receipt"),
     import("./migration/20261013194721_session_prompt_queue_preparing"),
   ])

@@ -1645,10 +1645,49 @@ const scenarios: Scenario[] = [
     .seeded((ctx) =>
       Effect.gen(function* () {
         const session = yield* ctx.session({ title: "Init session" })
-        const message = yield* ctx.message(session.id, { text: "initialize" })
+        yield* ctx.message(session.id, { text: "initialize" })
+        const before = yield* ctx.messages(session.id)
+        const { MessageID } = yield* Effect.promise(() => import("../../../src/session/schema"))
+        const messageID = MessageID.ascending()
         yield* ctx.llmText("initialized")
         yield* ctx.llmText("initialized")
-        return { session, message }
+        return { session, messageID, before }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/init", { sessionID: ctx.state.session.id }),
+      headers: ctx.headers(),
+      body: { providerID: "test", modelID: "test-model", messageID: ctx.state.messageID },
+    }))
+    .jsonEffect(200, (body, ctx) =>
+      Effect.gen(function* () {
+        check(body === true, "init should return true")
+        yield* ctx.llmWait(1)
+        check((yield* ctx.llmCalls()) === 1, "fresh init must execute one provider turn")
+        const after = yield* ctx.messages(ctx.state.session.id)
+        check(
+          after.some((message) => message.info.role === "user" && message.info.id === ctx.state.messageID),
+          "init must admit its fresh supplied identity",
+        )
+        check(
+          stable(
+            after.filter((message) => ctx.state.before.some((original) => original.info.id === message.info.id)),
+          ) === stable(ctx.state.before),
+          "init must preserve existing context messages",
+        )
+      }),
+    ),
+  http.protected
+    .post("/session/{sessionID}/init", "session.init.historical.identity")
+    .preserveDatabase()
+    .withLlm()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Ambiguous init identity" })
+        const message = yield* ctx.message(session.id, { text: "original initialize context" })
+        const before = yield* ctx.messages(session.id)
+        yield* ctx.llmText("must not execute")
+        return { session, message, before }
       }),
     )
     .at((ctx) => ({
@@ -1656,10 +1695,13 @@ const scenarios: Scenario[] = [
       headers: ctx.headers(),
       body: { providerID: "test", modelID: "test-model", messageID: ctx.state.message.info.id },
     }))
-    .jsonEffect(200, (body, ctx) =>
+    .status(400, (ctx) =>
       Effect.gen(function* () {
-        check(body === true, "init should return true")
-        yield* ctx.llmWait(1)
+        check((yield* ctx.llmCalls()) === 0, "ambiguous init must not execute provider work")
+        check(
+          stable(yield* ctx.messages(ctx.state.session.id)) === stable(ctx.state.before),
+          "ambiguous init must preserve original history",
+        )
       }),
     ),
   http.protected

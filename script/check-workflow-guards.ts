@@ -35,8 +35,8 @@ const GUARD = "github.repository == 'anomalyco/opencode'"
 const ALLOWED = new Map([
   ["fff-platform-validation.yml::windows-fff", "f04bf8aa6b7a6845"],
   ["fff-platform-validation.yml::nix-node-modules", "454365e67a9a2ffe"],
-  ["test.yml::unit", "fd0a927305590ae6"],
-  ["test.yml::e2e", "9f89116be327fa02"],
+  ["test.yml::unit", "efc8efcc30bcf9e7"],
+  ["test.yml::e2e", "3c465d9522c227c8"],
   ["typecheck.yml::typecheck", "276be38badce0802"],
 ])
 

@@ -52,7 +52,24 @@ export const SessionPromptQueueSequenceTable = sqliteTable("session_prompt_queue
     .primaryKey()
     .references(() => SessionTable.id, { onDelete: "cascade" }),
   seq: integer().notNull(),
+  aliases_indexed: integer({ mode: "boolean" }).notNull().default(false),
 })
+
+// Pending identity custody moves to the existing ignored text-part witnesses at promotion/consume.
+export const SessionPromptQueueAliasTable = sqliteTable(
+  "session_prompt_queue_alias",
+  {
+    id: text().notNull(),
+    item_id: text()
+      .$type<SessionPromptQueue.ItemID>()
+      .notNull()
+      .references(() => SessionPromptQueueTable.id, { onDelete: "cascade" }),
+  },
+  (table) => [
+    primaryKey({ columns: [table.id, table.item_id] }),
+    index("session_prompt_queue_alias_item_idx").on(table.item_id),
+  ],
+)
 
 // The queue times of a message promoted from the queue (#212), kept as long as
 // the message, so the model request can say when its prompt was queued and

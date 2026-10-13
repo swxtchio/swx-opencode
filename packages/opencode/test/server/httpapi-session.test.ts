@@ -3259,10 +3259,10 @@ describe("session HttpApi queue freshness", () => {
         expect(consolidated[4]!.origins).toEqual([{ time: old }])
 
         yield* Deferred.succeed(gate, undefined)
-        for (const reply of ["same done", "lint done", "build done", "deploy done", "old done"]) yield* llm.text(reply)
+        for (const reply of ["same done", "lint done", "old done", "peers done"]) yield* llm.text(reply)
         expect((yield* post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
         const sent = yield* pollWithTimeout(
-          llm.inputs.pipe(Effect.map((inputs) => (inputs.length === 6 ? inputs : undefined))),
+          llm.inputs.pipe(Effect.map((inputs) => (inputs.length === 5 ? inputs : undefined))),
           "the model never received every queued prompt",
           "10 seconds",
         )
@@ -3277,27 +3277,54 @@ describe("session HttpApi queue freshness", () => {
         expect(lastUser[2]).toContain(
           `[Queued prompt merged from 2 queued instructions: step 1 at ${iso(lint!.time.created)}; step 2 at ${iso(fix!.time.created)}; delivered at `,
         )
-        expect(lastUser[3]).toContain("please check the build")
-        expect(lastUser[3]).toContain("[Queued prompt: queued at ")
-        expect(lastUser[4]).toContain("please check the deploy")
-        expect(lastUser[5]).toContain(`[Queued prompt: queued at ${iso(old)}; delivered at `)
-        expect(lastUser[5]).toMatch(/, 2h(\d+m)?(\d+s)? after it was first queued\.]/)
+        // Native human input remains individual and precedes the complete peer batch.
+        expect(lastUser[3]).toContain(`[Queued prompt: queued at ${iso(old)}; delivered at `)
+        expect(lastUser[3]).toMatch(/, 2h(\d+m)?(\d+s)? after it was first queued\.]/)
+        expect(lastUser[4]).toContain(JSON.stringify(peerOne).slice(1, -1))
+        expect(lastUser[4]).toContain(JSON.stringify(peerTwo).slice(1, -1))
+        expect(lastUser[4]).toContain(
+          `[Queued prompt merged from 2 queued instructions: step 1 at ${iso(admitted[3]!.time.created)}; step 2 at ${iso(admitted[4]!.time.created)}; delivered at `,
+        )
+        expect(sent.every((input) => input.model === "test-model")).toBe(true)
+        expect(yield* llm.pending).toBe(0)
 
-        // The stored messages hold exactly what was sent, with no note.
-        const messages = yield* requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, params), {
-          headers,
-        })
-        const stored = messages
-          .filter((message) => message.info.role === "user")
-          .map((message) => message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""))
-        expect(stored).toEqual([
-          "start",
-          "same request",
-          "run lint:\n1. run lint\n2. --fix",
-          peerOne,
-          peerTwo,
-          "left by a stopped process",
+        // Freshness notes belong to model requests. Native text stays as sent;
+        // grouped peers retain their exact originals in the established constituent metadata.
+        const messages = yield* requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, params), { headers })
+        const stored = messages.filter((message) => message.info.role === "user")
+        expect(stored).toHaveLength(5)
+        stored.forEach((message) =>
+          message.parts.forEach((part) => {
+            if (part.type === "text") expect(part.text).not.toContain("[Queued prompt")
+          }),
+        )
+        const peerMessage = stored.find((message) =>
+          message.parts.some((part) => part.type === "text" && !part.ignored && part.metadata?.sessionQueue),
+        )!
+        const aggregate = peerMessage.parts.find(
+          (part) => part.type === "text" && !part.ignored && part.metadata?.sessionQueue,
+        )!
+        if (aggregate.type !== "text") throw new Error("Expected the actual peer aggregate")
+        const group = Schema.decodeUnknownSync(SessionPromptQueue.Group)(aggregate.metadata?.sessionQueue)
+        expect(group.kind).toBe("peer")
+        expect(group.constituents.map((item) => item.input.parts)).toEqual([
+          [{ type: "text", text: peerOne }],
+          [{ type: "text", text: peerTwo }],
         ])
+        expect(group.constituents.map((item) => item.time.created)).toEqual(
+          admitted.slice(3).map((item) => item.time.created),
+        )
+        const witnesses = peerMessage.parts.flatMap((part) =>
+          part.type === "text" && part.ignored && part.metadata?.sessionQueue
+            ? Schema.decodeUnknownSync(SessionPromptQueue.Group)(part.metadata.sessionQueue).constituents
+            : [],
+        )
+        expect(witnesses.toSorted((a, b) => a.seq - b.seq)).toEqual([...group.constituents])
+        expect(
+          stored
+            .filter((message) => message.info.id !== peerMessage.info.id)
+            .map((message) => message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")),
+        ).toEqual(["start", "same request", "run lint:\n1. run lint\n2. --fix", "left by a stopped process"])
       }).pipe(
         Effect.ensuring(Deferred.succeed(gate, undefined)),
         Effect.provide(TestLLMServer.layer),
@@ -3592,12 +3619,16 @@ describe("session HttpApi queue replacement at admission", () => {
 
         yield* Deferred.succeed(gate, undefined)
         const inputs = yield* pollWithTimeout(
-          llm.inputs.pipe(Effect.map((inputs) => (inputs.length === survivors.length + 1 ? inputs : undefined))),
+          llm.inputs.pipe(Effect.map((inputs) => (inputs.length === 4 ? inputs : undefined))),
           "the survivors were never all delivered",
           "20 seconds",
         )
         const last = inputs.map((input) => JSON.stringify((input.messages as unknown[]).at(-1)))
-        survivors.forEach((survivor, index) => expect(last[index + 1]).toContain(JSON.stringify(survivor).slice(1, -1)))
+        survivors.forEach((survivor) =>
+          expect(last.slice(1).some((message) => message.includes(JSON.stringify(survivor).slice(1, -1)))).toBe(true),
+        )
+        expect(last[1]).toContain(JSON.stringify(notices.ask1).slice(1, -1))
+        expect(last[1]).toContain("informational entries create no reply obligation")
         const sent = JSON.stringify(inputs)
         for (const retired of ["convergence approved", "completed round 1", "idle for 10m", 'since 10:00"'])
           expect(sent).not.toContain(retired)
@@ -3606,11 +3637,10 @@ describe("session HttpApi queue replacement at admission", () => {
           (message) => message.includes("p1760000000-2-bbbb") && message.includes("[Queued prompt"),
         )!
         expect(askNote).toContain(
-          `[Queued prompt: queued at ${iso(merged.origins[0]!.time)}, and again at ${iso(merged.origins[0]!.repeats![0]!.time)}; delivered at `,
+          `step 1 at ${iso(merged.origins[0]!.time)}, and again at ${iso(merged.origins[0]!.repeats![0]!.time)}`,
         )
-        expect(askNote).toContain(
-          "It carries 2 requests, each owed its own reply: p1760000000-1-aaaa, p1760000000-2-bbbb.",
-        )
+        expect(askNote).not.toContain("each owed its own reply")
+        expect(askNote).toContain("Reply only to each response-owed original msgid")
         const delivered = yield* routes.receipt("p1760000000-2-bbbb")
         expect(delivered.state).toBe("delivered")
         expect(yield* routes.receipt("p1760000000-1-aaaa")).toEqual({
@@ -3666,11 +3696,19 @@ describe("session HttpApi queue replacement at admission", () => {
         expect(yield* routes.receipt("tui-fix")).toEqual({ state: "merged", into: "tui-lint" })
         expect(yield* routes.receipt("p1760000000-5-eeee")).toEqual({ state: "merged", into: "p1760000000-6-ffff" })
 
+        // Held human/native commands keep their individual precedence; the peer batch follows them.
+        yield* llm.text("lint checked")
+        yield* llm.text("app checked")
+        yield* llm.text("app now checked")
         yield* llm.text("deploy check rerun")
         yield* Deferred.succeed(gate, undefined)
         const reply = yield* Fiber.join(waiting).pipe(Effect.flatMap(json<SessionV1.WithParts>))
         expect(reply.info.role).toBe("assistant")
         expect(reply.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual(["deploy check rerun"])
+        const delivered = yield* routes.receipt("p1760000000-6-ffff")
+        expect(delivered.state).toBe("delivered")
+        if (delivered.state === "delivered" && reply.info.role === "assistant")
+          expect(reply.info.parentID).toBe(delivered.messageID)
       }).pipe(
         Effect.ensuring(Deferred.succeed(gate, undefined)),
         Effect.provide(TestLLMServer.layer),
@@ -4161,3 +4199,77 @@ describe("session HttpApi submission-time admission", () => {
     60_000,
   )
 })
+
+it.live(
+  "historical executable prompt and command IDs are refused over HTTP before side effects",
+  () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      const directory = yield* tmpdirScoped({ git: true })
+      const marker = path.join(directory, "command-executions.txt")
+      yield* Effect.promise(() => Bun.write(marker, "retained original\n"))
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(directory, "opencode.json"),
+          JSON.stringify({
+            ...testProviderConfig(llm.url),
+            command: {
+              historical: { template: `!\`printf replay >> '${marker}'; printf historical\`` },
+              init: { template: `!\`printf init-replay >> '${marker}'; printf initialize\`` },
+            },
+          }),
+        ),
+      )
+      const session = yield* createSession({ title: "Historical HTTP original" }).pipe(provideInstanceEffect(directory))
+      const original = yield* createTextMessage(session.id, "historical").pipe(provideInstanceEffect(directory))
+      const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+      const params = { sessionID: session.id }
+      const before = yield* Session.Service.use((svc) => svc.messages({ sessionID: session.id })).pipe(
+        provideInstanceEffect(directory),
+      )
+      for (const [route, body] of [
+        [
+          SessionPaths.prompt,
+          {
+            messageID: original.info.id,
+            agent: "build",
+            model: { providerID: "test", modelID: "test" },
+            parts: [{ type: "text", text: "historical" }],
+          },
+        ],
+        [
+          SessionPaths.prompt,
+          {
+            messageID: original.info.id,
+            agent: "build",
+            model: { providerID: "test", modelID: "test" },
+            system: "excluded controls",
+            parts: [{ type: "text", text: "changed" }],
+          },
+        ],
+        [
+          SessionPaths.prompt,
+          {
+            messageID: original.info.id,
+            noReply: true,
+            agent: "build",
+            model: { providerID: "test", modelID: "test" },
+            parts: [{ type: "text", text: "historical" }],
+          },
+        ],
+        [SessionPaths.command, { messageID: original.info.id, command: "historical", arguments: "" }],
+        [SessionPaths.init, { messageID: original.info.id, providerID: "test", modelID: "test" }],
+      ] as const) {
+        const response = yield* request(pathFor(route, params), { method: "POST", headers, body: JSON.stringify(body) })
+        expect(response.status).toBe(400)
+        expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("retained original\n")
+        expect(
+          yield* Session.Service.use((svc) => svc.messages({ sessionID: session.id })).pipe(
+            provideInstanceEffect(directory),
+          ),
+        ).toEqual(before)
+      }
+      expect(yield* llm.calls).toBe(0)
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  30000,
+)

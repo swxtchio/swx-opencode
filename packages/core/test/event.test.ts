@@ -1160,6 +1160,36 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("caught savepoint rollback publishes only events that survived the transaction", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const database = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const seen: unknown[] = []
+      const unsubscribe = yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type === SyncMessage.type) seen.push(event.data)
+        }),
+      )
+      yield* database.db.transaction((tx) =>
+        Effect.gen(function* () {
+          yield* tx
+            .transaction(() =>
+              events
+                .publish(SyncMessage, { id: aggregateID, text: "rolled back" })
+                .pipe(Effect.andThen(Effect.die("inner failed"))),
+            )
+            .pipe(Effect.catchCause(() => Effect.void))
+          yield* events.publish(SyncMessage, { id: aggregateID, text: "committed" })
+        }),
+      )
+      expect(seen).toEqual([{ id: aggregateID, text: "committed" }])
+      const stored = yield* database.db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()
+      expect(stored).toHaveLength(1)
+      yield* unsubscribe
+    }),
+  )
+
   it.effect("records this process as the writer of every committed durable append, and nothing for a fenced one", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
@@ -1264,4 +1294,3 @@ describe("EventV2", () => {
 function identityColumns(identity: EventWriter.ProcessIdentity) {
   return { boot_id: identity.bootID, start_ticks: identity.startTicks }
 }
-

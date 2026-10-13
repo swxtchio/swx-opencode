@@ -648,8 +648,10 @@ const layer = Layer.effect(
 
     // Resolves a prompt into its user message without storing it, so a queue
     // promotion can drop the result when a withdraw wins meanwhile.
-    const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (input: PromptInput) {
-      const agentName = input.agent
+    const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (
+      input: PromptInput & { readonly group?: SessionPromptQueue.Group },
+    ) {
+      const agentName = input.group ? (yield* sessions.get(input.sessionID).pipe(Effect.orDie)).agent : input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
         const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
@@ -659,8 +661,8 @@ const layer = Layer.effect(
         throw error
       }
 
-      const selected = input.model || ag.model ? undefined : yield* currentModel(input.sessionID)
-      const model = input.model ?? ag.model ?? selected!
+      const selected = input.group || !(input.model || ag.model) ? yield* currentModel(input.sessionID) : undefined
+      const model = selected ?? input.model ?? ag.model!
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       // Also fetched when a variant was requested explicitly, so it can be
       // validated. Without this an unknown name reached request.ts, where
@@ -684,9 +686,9 @@ const layer = Layer.effect(
         throw error
       }
 
-      // The session's own model runs at the session's variant.
-      const variant =
-        input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined) ?? selected?.variant
+      const variant = input.group
+        ? selected?.variant
+        : (input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined) ?? selected?.variant)
 
       const info: SessionV1.User = {
         id: input.messageID ?? MessageID.ascending(),
@@ -1060,8 +1062,23 @@ const layer = Layer.effect(
         })
       }
 
-      return { info, parts }
+      return { info, parts, ...(input.group ? { group: input.group } : {}) }
     }, Effect.scoped)
+
+    const currentSelection = Effect.fnUntraced(function* (message: {
+      readonly info: SessionV1.User
+      readonly group?: SessionPromptQueue.Group
+    }) {
+      if (!message.group) return true
+      const session = yield* sessions.get(message.info.sessionID).pipe(Effect.orDie)
+      const selected = yield* currentModel(message.info.sessionID)
+      return (
+        (session.agent ?? message.info.agent) === message.info.agent &&
+        selected.providerID === message.info.model.providerID &&
+        selected.modelID === message.info.model.modelID &&
+        selected.variant === message.info.model.variant
+      )
+    })
 
     // Stores a prepared user message; the session follows its agent and model.
     const writeUserMessage = Effect.fnUntraced(function* (message: {
@@ -1092,8 +1109,6 @@ const layer = Layer.effect(
       return { info, parts: [...message.parts] }
     })
 
-    const createUserMessage = (input: PromptInput) => prepareUserMessage(input).pipe(Effect.flatMap(writeUserMessage))
-
     // A pending prompt that named a model or variant is delivered at the
     // session's selection then current, never the one it was admitted with.
     const prepareQueued = (input: SessionQueue.PromotedInput) =>
@@ -1115,6 +1130,7 @@ const layer = Layer.effect(
       input: PromptInput,
       followed: Effect.Success<ReturnType<SessionQueue.Interface["request"]>>,
     ) {
+      if (followed.kind === "direct") return followed.message
       const own = followed.kind === "retry" ? followed.own : followed.own.id
       yield* Effect.addFinalizer(() => queue.forget(own))
       const receipt = followed.kind === "retry" ? followed.receipt : undefined
@@ -1131,39 +1147,63 @@ const layer = Layer.effect(
 
     const prompt: (
       input: PromptInput,
+      admitted?: SessionQueue.Item,
     ) => Effect.Effect<
       SessionV1.WithParts,
       Image.Error | SessionQueue.WithdrawnError | SessionQueue.RequestConflictError
-    > = Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput) {
+    > = Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput, admitted?: SessionQueue.Item) {
+      // TUI prepends synthetic editor context; only flattened user text owns marker framing.
+      const classificationText = input.parts
+        .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
+        .join("")
+      const deliveryOf = (classification: ReturnType<typeof MachineMessage.classify>) =>
+        classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
       // A queued prompt is admitted before any other work on it, so it is
-      // pending from the moment it arrives (swxtchio/swx-opencode#249). Nothing
+      // pending from the moment it arrives (swxtchio/swx-opencode#249). Until
+      // its config is read only the built-in markers classify it. Nothing
       // promotes or merges it until the work below has prepared the session for
       // it; when that work fails the admission is taken back, so a failed send
       // leaves nothing pending and its exact retry is admitted again.
-      const admitted = input.noReply === true ? undefined : yield* queue.request(input, undefined, true)
-      if (admitted?.kind === "retry") return yield* followRequest(input, admitted)
-      const own = admitted?.own
+      const arriving = deliveryOf(MachineMessage.classify(classificationText))
+      const early =
+        admitted || input.noReply === true
+          ? undefined
+          : yield* queue.request({ ...input, ...(arriving ? { delivery: arriving } : {}) }, undefined, true)
+      if (early?.kind === "direct") return early.message
+      // A retry is held to the delivery its classification gives it, as the
+      // original was, before it follows what the session already has.
+      if (early?.kind === "reconciled" || early?.kind === "retry") {
+        const markers = (yield* config.get()).machine_message_markers
+        const delivery = deliveryOf(MachineMessage.classify(classificationText, markers))
+        const reconciled = yield* queue.reconcile({ ...input, ...(delivery ? { delivery } : {}) })
+        if (reconciled?.kind === "direct") return reconciled.message
+        if (early.kind === "retry") return yield* followRequest(input, early)
+        return yield* drain(input.sessionID, reconciled?.own.id ?? early.own.id)
+      }
+      const own = early?.own
       const prepared = yield* Effect.gen(function* () {
-        // TUI prepends synthetic editor context; only flattened user text owns marker framing.
-        const classificationText = input.parts
-          .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
-          .join("")
         const markers = (yield* config.get()).machine_message_markers
         const classification = MachineMessage.classify(classificationText, markers)
-        const delivery = classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
-        // A request the session already has is followed, never applied again (#212).
+        const delivery = deliveryOf(classification)
+        // A request the session already has is followed, never admitted or applied again (#212).
         if (!own && input.requestID && Option.isSome(yield* queue.receipt(input.sessionID, input.requestID)))
           return {
             markers,
             classification,
             delivery,
-            retry: yield* queue.request({ ...input, ...(delivery ? { delivery } : {}) }, markers),
+            retry: yield* queue.request({ ...input, ...(delivery ? { delivery: delivery } : {}) }, markers),
+            reconciled: undefined,
           }
+        const reconciled = own || admitted ? undefined : yield* queue.reconcile({ ...input, ...(delivery ? { delivery: delivery } : {}) })
+        if (reconciled) return { markers, classification, delivery, retry: undefined, reconciled }
         yield* revert.cleanup(yield* sessions.get(input.sessionID).pipe(Effect.orDie))
-        // A prompt's model and variant become the session's selection now, and
-        // a pending prompt runs at whichever selection is current when it is
+        // A prompt's model and variant become the session's selection now, and a
+        // pending prompt runs at whichever selection is current when it is
         // delivered (swxtchio/swx-opencode#212).
-        if (input.model || input.variant) {
+        if (
+          (input.model || input.variant) &&
+          (classification === "critical" || !MachineMessage.dispatch(classificationText))
+        ) {
           const model = input.model ?? (yield* currentModel(input.sessionID))
           yield* sessions.setModel({
             sessionID: input.sessionID,
@@ -1171,11 +1211,20 @@ const layer = Layer.effect(
           })
         }
         if (own) yield* queue.prepared({ sessionID: input.sessionID, itemID: own.id, delivery, markers })
-        return { markers, classification, delivery, retry: undefined }
+        return { markers, classification, delivery, retry: undefined, reconciled: undefined }
       }).pipe(
         Effect.onExit((exit) => (own && Exit.isFailure(exit) ? queue.unprepared(input.sessionID, own.id) : Effect.void)),
       )
       if (prepared.retry) return yield* followRequest(input, prepared.retry)
+      if (prepared.reconciled?.kind === "direct") return prepared.reconciled.message
+      if (prepared.reconciled?.kind === "queued") {
+        if (input.noReply) {
+          const projected = yield* queue.message(prepared.reconciled.own.id)
+          if (projected) return projected
+          return yield* prepareUserMessage(input)
+        }
+        return yield* drain(input.sessionID, prepared.reconciled.own.id)
+      }
       const markedNoReply = input.noReply === true && prepared.classification === "hold"
       const initiallyHeldNoReply =
         markedNoReply && Exit.isFailure(yield* state.assertNotBusy(input.sessionID).pipe(Effect.exit))
@@ -1198,20 +1247,23 @@ const layer = Layer.effect(
           : undefined
       const heldNoReply = markedNoReply && (initiallyHeldNoReply || noReplyDecision?.kind === "queued")
       const requested =
-        own || noReplyDecision || !markedNoReply ? undefined : yield* queue.request(admission, prepared.markers)
+        own || admitted || noReplyDecision || !markedNoReply ? undefined : yield* queue.request(admission, prepared.markers)
       // Another caller admitted the same request first.
       if (requested?.kind === "retry") return yield* followRequest(input, requested)
-      const queued = own ?? requested?.own
+      const queued = own ?? admitted ?? (requested?.kind === "admitted" ? requested.own : undefined)
       const entry = queued
         ? { kind: "queued" as const, own: queued, prepared: undefined }
         : noReplyDecision
           ? noReplyDecision
           : {
               kind: "direct" as const,
-              message: yield* queue.exclusive(input.sessionID, createUserMessage(input)),
+              message: yield* queue.writeDirect({
+                admission: { ...input, ...(prepared.delivery ? { delivery: prepared.delivery } : {}) },
+                prepare: () => prepareUserMessage(input),
+                write: writeUserMessage,
+              }),
             }
       if (entry.kind === "direct") yield* queue.delivered(admission, entry.message.info.id)
-      if (entry.kind === "queued") yield* Effect.addFinalizer(() => queue.forget(entry.own.id))
       // Only this prompt's own failure is this caller's error; an older steer
       // promoted alongside it is reported on its own.
       if (entry.kind === "queued")
@@ -1220,6 +1272,7 @@ const layer = Layer.effect(
           delivery: "steer",
           prepare: prepareQueued,
           write: writeUserMessage,
+          valid: currentSelection,
           rejected: rejected(input.sessionID),
           own: entry.own.id,
         })
@@ -1250,8 +1303,7 @@ const layer = Layer.effect(
       return yield* drain(input.sessionID, entry.own.id)
     }, Effect.scoped)
 
-    // A queued prompt that cannot become a message is dropped by the queue;
-    // report it the way prompt_async reports a failed prompt.
+    // Failed originals are reported through the existing session error channel.
     const rejected = (sessionID: SessionID) => (cause: Cause.Cause<unknown>) =>
       events
         .publish(Session.Event.Error, {
@@ -1260,14 +1312,16 @@ const layer = Layer.effect(
         })
         .pipe(Effect.asVoid)
 
-    // Inside a drain no item is the caller's own, so only an interrupt can fail this.
-    const promoteInLoop = (sessionID: SessionID, delivery: SessionQueue.Delivery) =>
+    // The queue isolates preparation failures; infrastructure and interruption can still stop a drain.
+    const promoteInLoop = (sessionID: SessionID, delivery: SessionQueue.Delivery, peersOnly = false) =>
       queue
         .promote({
           sessionID,
           delivery,
+          peersOnly,
           prepare: prepareQueued,
           write: writeUserMessage,
+          valid: currentSelection,
           rejected: rejected(sessionID),
         })
         .pipe(Effect.orDie)
@@ -1292,6 +1346,8 @@ const layer = Layer.effect(
         let step = 0
         let settled = false
         let seen = 0
+        // The drain already selected its initial input. Each provider completion opens one new queue boundary.
+        let queuedInputSelected = true
         let initialRootSelected = false
         let pinnedRootOrder: number | undefined
         const retriedAssistantIDs = new Set<MessageID>()
@@ -1371,6 +1427,7 @@ const layer = Layer.effect(
           if (yield* promoteInLoop(sessionID, "steer")) continue
           if (!lastUser) {
             if (yield* promoteInLoop(sessionID, "queue")) {
+              queuedInputSelected = true
               step = 0
               continue
             }
@@ -1419,7 +1476,12 @@ const layer = Layer.effect(
             // Queued prompts wait for this point and run one turn each, so a steer
             // or another admission arriving meanwhile is weighed before the next.
             // Each such turn is new user input and gets a fresh step allowance.
-            if ((yield* promoteInLoop(sessionID, "steer")) || (yield* promoteInLoop(sessionID, "queue"))) {
+            if (yield* promoteInLoop(sessionID, "steer")) {
+              step = 0
+              continue
+            }
+            if (yield* promoteInLoop(sessionID, "queue")) {
+              queuedInputSelected = true
               step = 0
               continue
             }
@@ -1428,6 +1490,18 @@ const layer = Layer.effect(
             break
           }
 
+          // Prior provider/tools have settled. Select one peer batch for the next request, then reload history.
+          // Pending tasks keep their original execution custody; overflow waits for another provider boundary.
+          if (
+            !queuedInputSelected &&
+            (!lastUser.format || lastUser.format.type === "text") &&
+            !SessionQueue.openTasks(msgs, selection).length &&
+            (yield* promoteInLoop(sessionID, "queue", true))
+          ) {
+            queuedInputSelected = true
+            step = 0
+            continue
+          }
           step++
           if (step === 1)
             yield* title({
@@ -1658,6 +1732,7 @@ const layer = Layer.effect(
                 : Effect.void,
             ),
           )
+          queuedInputSelected = false
           if (outcome === "break") break
           continue
         }
@@ -1718,6 +1793,8 @@ const layer = Layer.effect(
       rootMessageID?: MessageID,
       retryFailedRoot?: boolean,
     ) {
+      const recorded = own ? yield* queue.reply(own) : undefined
+      if (recorded) return recorded
       const withdrawn = own
         ? queue
             .withdrawn(sessionID, own)
@@ -1741,6 +1818,7 @@ const layer = Layer.effect(
             delivery,
             prepare: prepareQueued,
             write: writeUserMessage,
+            valid: currentSelection,
             rejected: rejected(sessionID),
             own,
             untilStarted: true,
@@ -1795,130 +1873,155 @@ const layer = Layer.effect(
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
+      yield* queue.assertFreshIdentity(input.sessionID, input.messageID)
       const ready = yield* Latch.make()
       return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
-      yield* Effect.logInfo("command", {
-        "session.id": input.sessionID,
-        command: input.command,
-        agent: input.agent,
-      })
-      const cmd = yield* commands.get(input.command)
-      if (!cmd) {
-        const available = (yield* commands.list()).map((c) => c.name)
-        const hint = available.length ? ` Available commands: ${available.join(", ")}` : ""
-        const error = new NamedError.Unknown({ message: `Command not found: "${input.command}".${hint}` })
-        yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
-        throw error
-      }
-      const agentName = cmd.agent ?? input.agent
-
-      const raw = input.arguments.match(argsRegex) ?? []
-      const args = raw.map((arg) => arg.replace(quoteTrimRegex, ""))
-      const templateCommand = yield* Effect.promise(async () => cmd.template)
-
-      const placeholders = templateCommand.match(placeholderRegex) ?? []
-      let last = 0
-      for (const item of placeholders) {
-        const value = Number(item.slice(1))
-        if (value > last) last = value
-      }
-
-      const withArgs = templateCommand.replaceAll(placeholderRegex, (_, index) => {
-        const position = Number(index)
-        const argIndex = position - 1
-        if (argIndex >= args.length) return ""
-        if (position === last) return args.slice(argIndex).join(" ")
-        return args[argIndex]
-      })
-      const usesArgumentsPlaceholder = templateCommand.includes("$ARGUMENTS")
-      let template = withArgs.replaceAll("$ARGUMENTS", input.arguments)
-
-      if (placeholders.length === 0 && !usesArgumentsPlaceholder && input.arguments.trim()) {
-        template = template + "\n\n" + input.arguments
-      }
-
-      const shellMatches = ConfigMarkdown.shell(template)
-      if (shellMatches.length > 0) {
-        const cfg = yield* config.get()
-        const sh = Shell.preferred(cfg.shell)
-        const results = yield* Effect.promise(() =>
-          Promise.all(
-            shellMatches.map(async ([, cmd]) => (await Process.text([cmd], { shell: sh, nothrow: true })).text),
-          ),
-        )
-        let index = 0
-        template = template.replace(bashRegex, () => results[index++])
-      }
-      template = template.trim()
-
-      const taskModel = yield* Effect.gen(function* () {
-        if (cmd.model) return Provider.parseModel(cmd.model)
-        if (cmd.agent) {
-          const cmdAgent = yield* agents.get(cmd.agent)
-          if (cmdAgent?.model) return cmdAgent.model
-        }
-        if (input.model) return Provider.parseModel(input.model)
-        return yield* currentModel(input.sessionID)
-      })
-
-      yield* getModel(taskModel.providerID, taskModel.modelID, input.sessionID)
-
-      const agent = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
-      if (!agent) {
-        const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-        const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-        const error = new NamedError.Unknown({ message: `Agent not found: "${agentName}".${hint}` })
-        yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
-        throw error
-      }
-
-      const templateParts = yield* resolvePromptParts(template)
-      const inputFiles = new Set(
-        input.parts?.filter((part) => new URL(part.url).protocol === "file:").map((part) => fileURLToPath(part.url)),
-      )
-      const uniqueTemplateParts = templateParts.filter(
-        (part) => part.type !== "file" || !inputFiles.has(fileURLToPath(part.url)),
-      )
-      const isSubtask = (agent.mode === "subagent" && cmd.subtask !== false) || cmd.subtask === true
-      const parts = isSubtask
-        ? [
-            {
-              type: "subtask" as const,
-              agent: agent.name,
-              description: cmd.description ?? "",
-              command: input.command,
-              model: { providerID: taskModel.providerID, modelID: taskModel.modelID },
-              prompt: templateParts.find((y) => y.type === "text")?.text ?? "",
-            },
-          ]
-        : [...uniqueTemplateParts, ...(input.parts ?? [])]
-
-      const userAgent = isSubtask ? (input.agent ?? (yield* agents.defaultInfo()).name) : agent.name
-      const userModel = isSubtask
-        ? input.model
-          ? Provider.parseModel(input.model)
-          : yield* currentModel(input.sessionID)
-        : taskModel
-
-      yield* plugin.trigger(
-        "command.execute.before",
-        { command: input.command, sessionID: input.sessionID, arguments: input.arguments },
-        { parts },
-      )
-
-      const result = yield* prompt({
+      const prepared = yield* queue.prepareExecutable({
         sessionID: input.sessionID,
         messageID: input.messageID,
-        model: userModel,
-        agent: userAgent,
-        parts,
-        variant: input.variant,
-        delivery: input.delivery,
-        // A command names no request, so it cannot conflict with one.
-      }).pipe(Effect.catchTag("SessionQueueRequestConflictError", Effect.die))
+        prepare: () =>
+          Effect.gen(function* () {
+            yield* Effect.logInfo("command", {
+              "session.id": input.sessionID,
+              command: input.command,
+              agent: input.agent,
+            })
+            const cmd = yield* commands.get(input.command)
+            if (!cmd) {
+              const available = (yield* commands.list()).map((c) => c.name)
+              const hint = available.length ? ` Available commands: ${available.join(", ")}` : ""
+              const error = new NamedError.Unknown({ message: `Command not found: "${input.command}".${hint}` })
+              yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
+              throw error
+            }
+            const agentName = cmd.agent ?? input.agent
+
+            const raw = input.arguments.match(argsRegex) ?? []
+            const args = raw.map((arg) => arg.replace(quoteTrimRegex, ""))
+            const templateCommand = yield* Effect.promise(async () => cmd.template)
+
+            const placeholders = templateCommand.match(placeholderRegex) ?? []
+            let last = 0
+            for (const item of placeholders) {
+              const value = Number(item.slice(1))
+              if (value > last) last = value
+            }
+
+            const withArgs = templateCommand.replaceAll(placeholderRegex, (_, index) => {
+              const position = Number(index)
+              const argIndex = position - 1
+              if (argIndex >= args.length) return ""
+              if (position === last) return args.slice(argIndex).join(" ")
+              return args[argIndex]
+            })
+            const usesArgumentsPlaceholder = templateCommand.includes("$ARGUMENTS")
+            let template = withArgs.replaceAll("$ARGUMENTS", input.arguments)
+
+            if (placeholders.length === 0 && !usesArgumentsPlaceholder && input.arguments.trim()) {
+              template = template + "\n\n" + input.arguments
+            }
+
+            const shellMatches = ConfigMarkdown.shell(template)
+            if (shellMatches.length > 0) {
+              const cfg = yield* config.get()
+              const sh = Shell.preferred(cfg.shell)
+              const results = yield* Effect.promise(async () => {
+                // One rejected expansion must not release custody while another child is still running.
+                const settled = await Promise.allSettled(
+                  shellMatches.map(async ([, cmd]) => (await Process.text([cmd], { shell: sh, nothrow: true })).text),
+                )
+                const failed = settled.find((result) => result.status === "rejected")
+                if (failed?.status === "rejected") throw failed.reason
+                return settled.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []))
+              })
+              let index = 0
+              template = template.replace(bashRegex, () => results[index++])
+            }
+            template = template.trim()
+
+            const taskModel = yield* Effect.gen(function* () {
+              if (cmd.model) return Provider.parseModel(cmd.model)
+              if (cmd.agent) {
+                const cmdAgent = yield* agents.get(cmd.agent)
+                if (cmdAgent?.model) return cmdAgent.model
+              }
+              if (input.model) return Provider.parseModel(input.model)
+              return yield* currentModel(input.sessionID)
+            })
+
+            yield* getModel(taskModel.providerID, taskModel.modelID, input.sessionID)
+
+            const agent = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
+            if (!agent) {
+              const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
+              const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
+              const error = new NamedError.Unknown({ message: `Agent not found: "${agentName}".${hint}` })
+              yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
+              throw error
+            }
+
+            const templateParts = yield* resolvePromptParts(template)
+            const inputFiles = new Set(
+              input.parts
+                ?.filter((part) => new URL(part.url).protocol === "file:")
+                .map((part) => fileURLToPath(part.url)),
+            )
+            const uniqueTemplateParts = templateParts.filter(
+              (part) => part.type !== "file" || !inputFiles.has(fileURLToPath(part.url)),
+            )
+            const isSubtask = (agent.mode === "subagent" && cmd.subtask !== false) || cmd.subtask === true
+            const parts = isSubtask
+              ? [
+                  {
+                    type: "subtask" as const,
+                    agent: agent.name,
+                    description: cmd.description ?? "",
+                    command: input.command,
+                    model: { providerID: taskModel.providerID, modelID: taskModel.modelID },
+                    prompt: templateParts.find((y) => y.type === "text")?.text ?? "",
+                  },
+                ]
+              : [...uniqueTemplateParts, ...(input.parts ?? [])]
+
+            const userAgent = isSubtask ? (input.agent ?? (yield* agents.defaultInfo()).name) : agent.name
+            const userModel = isSubtask
+              ? input.model
+                ? Provider.parseModel(input.model)
+                : yield* currentModel(input.sessionID)
+              : taskModel
+
+            yield* plugin.trigger(
+              "command.execute.before",
+              { command: input.command, sessionID: input.sessionID, arguments: input.arguments },
+              { parts },
+            )
+
+            const classificationText = parts
+              .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
+              .join("")
+            const classification = MachineMessage.classify(
+              classificationText,
+              (yield* config.get()).machine_message_markers,
+            )
+            const delivery =
+              classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
+            return {
+              sessionID: input.sessionID,
+              messageID: input.messageID,
+              model: userModel,
+              agent: userAgent,
+              parts,
+              variant: input.variant,
+              delivery,
+            }
+          }),
+      })
+      const result = yield* prompt(prepared.input, prepared.own).pipe(
+        Effect.catchTag("SessionQueueRequestConflictError", Effect.die),
+      )
       yield* events.publish(Command.Event.Executed, {
         name: input.command,
         sessionID: input.sessionID,
@@ -1926,7 +2029,7 @@ const layer = Layer.effect(
         messageID: result.info.id,
       })
       return result
-    })
+    }, Effect.scoped)
 
     return Service.of({
       cancel,

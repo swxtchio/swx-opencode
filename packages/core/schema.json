@@ -3,7 +3,7 @@
   "dialect": "sqlite",
   "id": "f7b94b68-077f-43ec-862c-af9717d0cef6",
   "prevIds": [
-    "22b13cd2-0f74-4758-8cd1-3d43e23f99c2"
+    "5048c540-67ab-4585-90e3-6cd9948d0114"
   ],
   "ddl": [
     {
@@ -24,6 +24,10 @@
     },
     {
       "name": "session_prompt_provenance",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_prompt_queue_alias",
       "entityType": "tables"
     },
     {
@@ -322,6 +326,26 @@
     },
     {
       "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "session_prompt_queue_alias"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "item_id",
+      "entityType": "columns",
+      "table": "session_prompt_queue_alias"
+    },
+    {
+      "type": "text",
       "notNull": false,
       "autoincrement": false,
       "default": null,
@@ -337,6 +361,16 @@
       "default": null,
       "generated": null,
       "name": "seq",
+      "entityType": "columns",
+      "table": "session_prompt_queue_sequence"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "aliases_indexed",
       "entityType": "columns",
       "table": "session_prompt_queue_sequence"
     },
@@ -1972,6 +2006,21 @@
     },
     {
       "columns": [
+        "item_id"
+      ],
+      "tableTo": "session_prompt_queue",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_prompt_queue_alias_item_id_session_prompt_queue_id_fk",
+      "entityType": "fks",
+      "table": "session_prompt_queue_alias"
+    },
+    {
+      "columns": [
         "session_id"
       ],
       "tableTo": "session",
@@ -2204,6 +2253,16 @@
       "name": "event_aggregate_writer_pk",
       "entityType": "pks",
       "table": "event_aggregate_writer"
+    },
+    {
+      "columns": [
+        "id",
+        "item_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_prompt_queue_alias_pk",
+      "entityType": "pks",
+      "table": "session_prompt_queue_alias"
     },
     {
       "columns": [
@@ -2451,6 +2510,20 @@
     {
       "columns": [
         {
+          "value": "item_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_prompt_queue_alias_item_idx",
+      "entityType": "indexes",
+      "table": "session_prompt_queue_alias"
+    },
+    {
+      "columns": [
+        {
           "value": "session_id",
           "isExpression": false
         },
@@ -2583,6 +2656,24 @@
       "where": "\"message\".\"admission_seq\" > 0",
       "origin": "manual",
       "name": "message_session_admission_seq_idx",
+      "entityType": "indexes",
+      "table": "message"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        },
+        {
+          "value": "admission_seq",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "message_session_admission_order_idx",
       "entityType": "indexes",
       "table": "message"
     },
