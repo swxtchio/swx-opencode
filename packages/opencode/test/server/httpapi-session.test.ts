@@ -4187,33 +4187,31 @@ describe("session HttpApi submission-time admission", () => {
     () =>
       Effect.gen(function* () {
         const test = yield* TestInstance
-        const created = yield* createSession({ title: "retry after failed preparation" })
         const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
-        const params = { sessionID: created.id }
-        const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
-        // As below: with only an absent provider configured, a variant has no model to select it on.
-        const body = {
-          messageID: MessageID.ascending(),
-          agent: "build",
-          variant: "high",
-          parts: [{ type: "text", text: "check the build" }],
+        // Matched by its transport identity, or by its request's receipt.
+        for (const identity of [{ messageID: MessageID.ascending() }, { requestID: "failed-original" }]) {
+          const created = yield* createSession({ title: "retry after failed preparation" })
+          const params = { sessionID: created.id }
+          const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+          // As below: with only an absent provider configured, a variant has no model to select it on.
+          const body = { ...identity, agent: "build", variant: "high", parts: [{ type: "text", text: "check the build" }] }
+          const send = () =>
+            request(pathFor(SessionPaths.prompt, params), { method: "POST", headers, body: JSON.stringify(body) })
+          const hold = yield* racingSpans.arm({ name: "Session.get", parent: "SessionPrompt.prompt" })
+          const original = yield* send().pipe(Effect.forkChild)
+          const retry = yield* Effect.gen(function* () {
+            yield* awaitWithTimeout(hold.reached, "the original never read its Session", "30 seconds")
+            const retry = yield* send().pipe(Effect.forkChild)
+            yield* Effect.sleep("2 seconds")
+            expect(retry.pollUnsafe()).toBeUndefined()
+            return retry
+          }).pipe(Effect.ensuring(hold.disarm))
+          for (const fiber of [original, retry])
+            expect((yield* awaitWithTimeout(Fiber.join(fiber), "a caller never answered", "30 seconds")).status).toBe(
+              500,
+            )
+          expect(yield* listed()).toEqual([])
         }
-        const send = () =>
-          request(pathFor(SessionPaths.prompt, params), { method: "POST", headers, body: JSON.stringify(body) })
-        const hold = yield* racingSpans.arm({ name: "Session.get", parent: "SessionPrompt.prompt" })
-        const original = yield* send().pipe(Effect.forkChild)
-        const retry = yield* Effect.gen(function* () {
-          yield* awaitWithTimeout(hold.reached, "the original never read its Session", "30 seconds")
-          const retry = yield* send().pipe(Effect.forkChild)
-          yield* Effect.sleep("2 seconds")
-          expect(retry.pollUnsafe()).toBeUndefined()
-          return retry
-        }).pipe(Effect.ensuring(hold.disarm))
-        for (const fiber of [original, retry])
-          expect((yield* awaitWithTimeout(Fiber.join(fiber), "a caller never answered", "30 seconds")).status).toBe(
-            500,
-          )
-        expect(yield* listed()).toEqual([])
       }),
     { ...options, config: { ...options.config, provider: { "absent-provider": {} } } },
     60_000,
