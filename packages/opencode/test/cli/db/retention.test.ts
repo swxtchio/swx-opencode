@@ -91,6 +91,7 @@ function createReducedSchema(db: Database) {
     CREATE TABLE session_prompt_queue (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, input TEXT NOT NULL, time_created INTEGER NOT NULL DEFAULT 10, time_promoted INTEGER, time_withdrawn INTEGER);
     CREATE TABLE session_prompt_queue_sequence (session_id TEXT PRIMARY KEY, seq INTEGER NOT NULL);
     CREATE TABLE session_prompt_provenance (message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, origins TEXT NOT NULL);
+    CREATE TABLE session_prompt_receipt (session_id TEXT NOT NULL, request_id TEXT NOT NULL, state TEXT NOT NULL, fingerprint TEXT NOT NULL, PRIMARY KEY (session_id, request_id));
     CREATE TABLE todo (session_id TEXT NOT NULL, position INTEGER NOT NULL, content TEXT NOT NULL, time_created INTEGER NOT NULL DEFAULT 10, time_updated INTEGER NOT NULL DEFAULT 10);
     CREATE TABLE session_share (session_id TEXT PRIMARY KEY, id TEXT NOT NULL, secret TEXT NOT NULL, url TEXT NOT NULL, time_created INTEGER NOT NULL DEFAULT 10, time_updated INTEGER NOT NULL DEFAULT 10);
     CREATE TABLE event_writer_process (writer_id TEXT PRIMARY KEY, pid INTEGER NOT NULL, boot_id TEXT, start_ticks TEXT, time_registered INTEGER NOT NULL);

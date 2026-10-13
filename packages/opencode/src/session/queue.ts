@@ -5,12 +5,13 @@ import {
   SessionPromptProvenanceTable,
   SessionPromptQueueSequenceTable,
   SessionPromptQueueTable,
+  SessionPromptReceiptTable,
 } from "@opencode-ai/core/session/prompt-queue.sql"
 import { MessageTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
-import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm"
+import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, sql } from "drizzle-orm"
 import {
   Cause,
   Clock,
@@ -50,6 +51,10 @@ export type ItemID = SessionPromptQueue.ItemID
 export const Delivery = SessionPromptQueue.Delivery
 export type Delivery = SessionPromptQueue.Delivery
 export const Event = SessionPromptQueue.Event
+export const Receipt = SessionPromptQueue.Receipt
+export type Receipt = SessionPromptQueue.Receipt
+export const RequestID = SessionPromptQueue.RequestID
+export type RequestID = SessionPromptQueue.RequestID
 
 export type AdmitInput = SessionPromptQueue.Input & { readonly sessionID: SessionID }
 export type PromotedInput = SessionPromptQueue.QueuedInput & {
@@ -62,6 +67,15 @@ export class WithdrawnError extends Schema.TaggedErrorClass<WithdrawnError>()("S
   sessionID: Schema.String,
   itemID: Schema.String,
 }) {}
+
+/** A request admitted before was sent again with a different prompt (#212). */
+export class RequestConflictError extends Schema.TaggedErrorClass<RequestConflictError>()(
+  "SessionQueueRequestConflictError",
+  {
+    sessionID: Schema.String,
+    requestID: Schema.String,
+  },
+) {}
 
 /**
  * A consume whose write could not begin in any of its attempts, on another
@@ -92,6 +106,25 @@ export type HoldEnd = "released" | "lapsed"
 
 export interface Interface {
   readonly admit: (input: AdmitInput) => Effect.Effect<Item>
+  /**
+   * Admits a prompt, unless it names a request this session already has (#212).
+   * The same prompt again is a retry: nothing is admitted, and `own` is a new
+   * waiter's id that follows whatever carries the request now. A different
+   * prompt under that request fails with RequestConflictError.
+   */
+  readonly request: (
+    input: AdmitInput,
+  ) => Effect.Effect<
+    | { readonly kind: "admitted"; readonly own: Item }
+    | { readonly kind: "retry"; readonly own: ItemID; readonly receipt: Receipt },
+    RequestConflictError
+  >
+  /** What became of a request; None when the session has no such request. */
+  readonly receipt: (sessionID: SessionID, requestID: RequestID) => Effect.Effect<Option.Option<Receipt>>
+  /** Fails when the prompt names a request this session has under a different prompt. */
+  readonly check: (input: AdmitInput) => Effect.Effect<void, RequestConflictError>
+  /** Records a request whose prompt became a message without being queued, as a noReply prompt does. */
+  readonly delivered: (input: AdmitInput, messageID: MessageID) => Effect.Effect<void>
   /**
    * Prepare under the session lock, recheck run state around a direct write,
    * and queue it if a run starts while the message is being persisted.
@@ -252,6 +285,10 @@ const layer = Layer.effect(
       ItemID,
       { readonly sessionID: SessionID; message?: MessageID; reply?: SessionV1.WithParts }
     >()
+    // A waiter whose item was merged or superseded, or a retry's waiter, follows
+    // the item that now carries its request (#212): waiter id to that item.
+    const follows = new Map<ItemID, ItemID>()
+    const carrier = (itemID: ItemID) => follows.get(itemID) ?? itemID
     // Review holds by session (#212), process-local like the drains they hold:
     // each holder's lease deadline, and the signal that the hold ended.
     const holds = new Map<
@@ -322,10 +359,14 @@ const layer = Layer.effect(
     // Every mutation publishes its resulting list under the session's lock, so
     // listeners see the lists in the order the mutations happened.
     const admit = Effect.fn("SessionQueue.admit")(function* (input: AdmitInput) {
-      return yield* exclusive(input.sessionID, admitLocked(input))
+      const admitted = yield* request(input).pipe(Effect.orDie)
+      if (admitted.kind === "retry")
+        return yield* Effect.die(new Error(`Request ${input.requestID} was already admitted to ${input.sessionID}`))
+      return admitted.own
     })
 
     const admitLocked = Effect.fnUntraced(function* (input: AdmitInput) {
+      const now = Date.now()
       const row = yield* writable(input.sessionID, (tx) =>
         Effect.gen(function* () {
           const allocated = yield* tx
@@ -338,18 +379,34 @@ const layer = Layer.effect(
             .returning({ seq: SessionPromptQueueSequenceTable.seq })
             .get()
           if (!allocated) return yield* Effect.die(new Error(`No queue seq allocated for ${input.sessionID}`))
-          return yield* tx
+          const row = yield* tx
             .insert(SessionPromptQueueTable)
             .values({
               id: ItemID.create(),
               session_id: input.sessionID,
               seq: allocated.seq,
               delivery: input.delivery ?? "steer",
-              input: encodeInput(Struct.omit(input, ["sessionID", "noReply", "delivery"])),
-              time_created: Date.now(),
+              request_id: input.requestID,
+              input: encodeInput(Struct.omit(input, ["sessionID", "noReply", "delivery", "requestID"])),
+              time_created: now,
+              origins: [input.requestID ? { time: now, requestID: input.requestID } : { time: now }],
             })
             .returning()
             .get()
+          if (row && input.requestID)
+            yield* tx
+              .insert(SessionPromptReceiptTable)
+              .values({
+                session_id: input.sessionID,
+                request_id: input.requestID,
+                state: "pending",
+                item_id: row.id,
+                fingerprint: fingerprint(input),
+                time_created: now,
+                time_updated: now,
+              })
+              .run()
+          return row
         }),
       ).pipe(Effect.orDie)
       if (!row) return yield* Effect.die(new Error(`Queue admission for ${input.sessionID} stored nothing`))
@@ -358,6 +415,158 @@ const layer = Layer.effect(
       yield* publish(input.sessionID)
       return fromRow(row)
     })
+
+    const receiptRow = (sessionID: SessionID, requestID: RequestID) =>
+      db
+        .select()
+        .from(SessionPromptReceiptTable)
+        .where(
+          and(eq(SessionPromptReceiptTable.session_id, sessionID), eq(SessionPromptReceiptTable.request_id, requestID)),
+        )
+        .get()
+        .pipe(Effect.orDie)
+
+    const receipt: Interface["receipt"] = (sessionID, requestID) =>
+      receiptRow(sessionID, requestID).pipe(Effect.map((row) => Option.fromNullishOr(row).pipe(Option.map(toReceipt))))
+
+    const request: Interface["request"] = (input) =>
+      exclusive(
+        input.sessionID,
+        Effect.gen(function* () {
+          const prior = input.requestID ? yield* receiptRow(input.sessionID, input.requestID) : undefined
+          if (!prior) return { kind: "admitted" as const, own: yield* admitLocked(input) }
+          if (prior.fingerprint !== fingerprint(input))
+            return yield* new RequestConflictError({ sessionID: input.sessionID, requestID: prior.request_id })
+          return { kind: "retry" as const, own: yield* follow(prior), receipt: toReceipt(prior) }
+        }),
+      )
+
+    // A retry's waiter: it follows the item carrying the request, or a newer
+    // request that superseded it, or takes the message the request became.
+    const follow = Effect.fnUntraced(function* (start: typeof SessionPromptReceiptTable.$inferSelect) {
+      const own = ItemID.create()
+      const channel: { readonly sessionID: SessionID; message?: MessageID } = { sessionID: start.session_id }
+      channels.set(own, channel)
+      const seen = new Set<string>()
+      let row: typeof SessionPromptReceiptTable.$inferSelect | undefined = start
+      while (row && !seen.has(row.request_id)) {
+        seen.add(row.request_id)
+        if (row.message_id) channel.message = row.message_id
+        if (!row.message_id && row.item_id && (row.state === "pending" || row.state === "merged"))
+          follows.set(own, row.item_id)
+        if (row.state !== "superseded" || !row.by_request_id) return own
+        row = yield* receiptRow(start.session_id, row.by_request_id)
+      }
+      return own
+    })
+
+    const check: Interface["check"] = (input) =>
+      input.requestID
+        ? receiptRow(input.sessionID, input.requestID).pipe(
+            Effect.flatMap((prior) =>
+              prior && prior.fingerprint !== fingerprint(input)
+                ? Effect.fail(new RequestConflictError({ sessionID: input.sessionID, requestID: prior.request_id }))
+                : Effect.void,
+            ),
+          )
+        : Effect.void
+
+    const delivered: Interface["delivered"] = (input, messageID) =>
+      input.requestID
+        ? writable(input.sessionID, (tx) =>
+            tx
+              .insert(SessionPromptReceiptTable)
+              .values({
+                session_id: input.sessionID,
+                request_id: input.requestID!,
+                state: "delivered",
+                message_id: messageID,
+                fingerprint: fingerprint(input),
+                time_created: Date.now(),
+                time_updated: Date.now(),
+              })
+              .onConflictDoNothing()
+              .run(),
+          ).pipe(Effect.orDie, Effect.asVoid)
+        : Effect.void
+
+    // Every receipt riding on an item takes its fate. A merge makes the
+    // survivor's request the one they were merged into; a survivor that has none
+    // takes over the first request merged into it, so it still has a receipt.
+    const settleReceipts = Effect.fnUntraced(function* (
+      tx: DatabaseTransaction,
+      sessionID: SessionID,
+      items: readonly ItemID[],
+      fate:
+        | { readonly kind: "merged"; readonly into: typeof SessionPromptQueueTable.$inferSelect }
+        | { readonly kind: "superseded"; readonly by: RequestID }
+        | { readonly kind: "deleted" },
+    ) {
+      if (items.length === 0) return
+      const now = Date.now()
+      const riding = and(
+        eq(SessionPromptReceiptTable.session_id, sessionID),
+        inArray(SessionPromptReceiptTable.item_id, [...items]),
+      )
+      if (fate.kind === "deleted") {
+        yield* tx
+          .update(SessionPromptReceiptTable)
+          .set({ state: "deleted", item_id: null, time_updated: now })
+          .where(riding)
+          .run()
+          .pipe(Effect.orDie)
+        return
+      }
+      if (fate.kind === "superseded") {
+        yield* tx
+          .update(SessionPromptReceiptTable)
+          .set({ state: "superseded", by_request_id: fate.by, item_id: null, time_updated: now })
+          .where(riding)
+          .run()
+          .pipe(Effect.orDie)
+        return
+      }
+      const own =
+        fate.into.request_id ??
+        (yield* tx
+          .select({ request_id: SessionPromptReceiptTable.request_id })
+          .from(SessionPromptReceiptTable)
+          .where(and(riding, eq(SessionPromptReceiptTable.state, "pending")))
+          .orderBy(asc(SessionPromptReceiptTable.time_created))
+          .limit(1)
+          .get()
+          .pipe(Effect.orDie))?.request_id
+      if (!own) return
+      if (!fate.into.request_id)
+        yield* tx
+          .update(SessionPromptQueueTable)
+          .set({ request_id: own })
+          .where(eq(SessionPromptQueueTable.id, fate.into.id))
+          .run()
+          .pipe(Effect.orDie)
+      yield* tx
+        .update(SessionPromptReceiptTable)
+        .set({ state: "pending", item_id: fate.into.id, into_request_id: null, time_updated: now })
+        .where(and(eq(SessionPromptReceiptTable.session_id, sessionID), eq(SessionPromptReceiptTable.request_id, own)))
+        .run()
+        .pipe(Effect.orDie)
+      yield* tx
+        .update(SessionPromptReceiptTable)
+        .set({ state: "merged", into_request_id: own, item_id: fate.into.id, time_updated: now })
+        .where(and(riding, ne(SessionPromptReceiptTable.request_id, own)))
+        .run()
+        .pipe(Effect.orDie)
+    })
+
+    // A waiter on a retired item now waits on its survivor, and so does anyone
+    // already following it.
+    const retire = (items: readonly ItemID[], survivor: ItemID) =>
+      items.forEach((item) => {
+        follows.forEach((target, waiter) => {
+          if (target === item) follows.set(waiter, survivor)
+        })
+        if (channels.has(item)) follows.set(item, survivor)
+      })
 
     const writeOrAdmit: Interface["writeOrAdmit"] = (input) =>
       exclusive(
@@ -557,9 +766,12 @@ const layer = Layer.effect(
     })
 
     const finish = (finished: readonly { readonly id: ItemID; readonly message: MessageID }[]) =>
-      finished.forEach((row) => {
-        const channel = channels.get(row.id)
-        if (channel) channel.message = row.message
+      finished.forEach((row) => deliver(row.id, row.message))
+
+    // The message an item became answers its own waiter and every waiter following it.
+    const deliver = (itemID: ItemID, message: MessageID) =>
+      channels.forEach((channel, waiter) => {
+        if (carrier(waiter) === itemID) channel.message = message
       })
 
     const hold: Interface["hold"] = (sessionID, holder) =>
@@ -605,12 +817,16 @@ const layer = Layer.effect(
         sessionID,
         Effect.gen(function* () {
           const row = yield* writable(sessionID, (tx) =>
-            tx
-              .delete(SessionPromptQueueTable)
-              .where(and(eq(SessionPromptQueueTable.id, itemID), pending(sessionID)))
-              .returning()
-              .get()
-              .pipe(Effect.orDie),
+            Effect.gen(function* () {
+              const row = yield* tx
+                .delete(SessionPromptQueueTable)
+                .where(and(eq(SessionPromptQueueTable.id, itemID), pending(sessionID)))
+                .returning()
+                .get()
+                .pipe(Effect.orDie)
+              if (row) yield* settleReceipts(tx, sessionID, [row.id], { kind: "deleted" })
+              return row
+            }),
           ).pipe(Effect.orDie)
           if (!row) return Option.none()
           yield* publish(sessionID)
@@ -706,11 +922,23 @@ const layer = Layer.effect(
                   .run()
                   .pipe(Effect.orDie),
               )
+              yield* Effect.forEach(plan.into, (merge) =>
+                Effect.gen(function* () {
+                  const into = yield* tx
+                    .select()
+                    .from(SessionPromptQueueTable)
+                    .where(eq(SessionPromptQueueTable.id, merge.into))
+                    .get()
+                    .pipe(Effect.orDie)
+                  if (into) yield* settleReceipts(tx, sessionID, merge.items, { kind: "merged", into })
+                }),
+              )
               finish(finished)
-              return plan.removed.length > 0 || finished.length > 0
+              return { changed: plan.removed.length > 0 || finished.length > 0, into: plan.into }
             }),
           ).pipe(Effect.orDie)
-          if (changed) yield* publish(sessionID)
+          changed.into.forEach((merge) => retire(merge.items, merge.into))
+          if (changed.changed) yield* publish(sessionID)
           return yield* list(sessionID)
         }),
       )
@@ -796,6 +1024,22 @@ const layer = Layer.effect(
           .onConflictDoNothing()
           .run()
           .pipe(Effect.orDie)
+        const riding = and(
+          eq(SessionPromptReceiptTable.session_id, row.session_id),
+          eq(SessionPromptReceiptTable.item_id, row.id),
+        )
+        yield* tx
+          .update(SessionPromptReceiptTable)
+          .set({ message_id: message, time_updated: Date.now() })
+          .where(riding)
+          .run()
+          .pipe(Effect.orDie)
+        yield* tx
+          .update(SessionPromptReceiptTable)
+          .set({ state: "delivered" })
+          .where(and(riding, eq(SessionPromptReceiptTable.state, "pending")))
+          .run()
+          .pipe(Effect.orDie)
       })
 
     const markPromoted = (sessionID: SessionID, itemID: ItemID, id: MessageID) =>
@@ -811,17 +1055,15 @@ const layer = Layer.effect(
         }),
       ).pipe(
         Effect.orDie,
-        Effect.tap(() =>
-          Effect.sync(() => {
-            const channel = channels.get(itemID)
-            if (channel) channel.message = id
-          }),
-        ),
+        Effect.tap(() => Effect.sync(() => deliver(itemID, id))),
       )
 
     const drop = (sessionID: SessionID, itemID: ItemID) =>
       writable(sessionID, (tx) =>
-        tx.delete(SessionPromptQueueTable).where(eq(SessionPromptQueueTable.id, itemID)).run(),
+        Effect.gen(function* () {
+          yield* tx.delete(SessionPromptQueueTable).where(eq(SessionPromptQueueTable.id, itemID)).run()
+          yield* settleReceipts(tx, sessionID, [itemID], { kind: "deleted" })
+        }),
       ).pipe(Effect.orDie)
 
     const unreserve = (sessionID: SessionID, itemID: ItemID) =>
@@ -872,6 +1114,7 @@ const layer = Layer.effect(
               const decoded = Schema.decodeUnknownExit(SessionPromptQueue.QueuedInput)(row.input)
               if (Exit.isFailure(decoded)) {
                 yield* tx.delete(SessionPromptQueueTable).where(eq(SessionPromptQueueTable.id, row.id)).run()
+                yield* settleReceipts(tx, sessionID, [row.id], { kind: "deleted" })
                 return { kind: "invalid" as const, row, cause: decoded.cause }
               }
               const id = yield* messageID(tx, sessionID, decoded.value.messageID)
@@ -886,8 +1129,7 @@ const layer = Layer.effect(
           ).pipe(Effect.orDie)
           if (!result) return undefined
           if (result.kind === "finished") {
-            const channel = channels.get(result.row.id)
-            if (channel) channel.message = result.row.message_id!
+            deliver(result.row.id, result.row.message_id!)
             yield* publish(sessionID)
             return result
           }
@@ -1107,7 +1349,7 @@ const layer = Layer.effect(
         .from(SessionPromptQueueTable)
         .where(
           and(
-            eq(SessionPromptQueueTable.id, itemID),
+            eq(SessionPromptQueueTable.id, carrier(itemID)),
             eq(SessionPromptQueueTable.session_id, sessionID),
             isNull(SessionPromptQueueTable.time_withdrawn),
           ),
@@ -1123,7 +1365,7 @@ const layer = Layer.effect(
         .from(SessionPromptQueueTable)
         .where(
           and(
-            eq(SessionPromptQueueTable.id, itemID),
+            eq(SessionPromptQueueTable.id, carrier(itemID)),
             eq(SessionPromptQueueTable.session_id, sessionID),
             isNotNull(SessionPromptQueueTable.time_withdrawn),
           ),
@@ -1172,7 +1414,11 @@ const layer = Layer.effect(
         })
       })
 
-    const forget = (itemID: ItemID) => Effect.sync(() => void channels.delete(itemID))
+    const forget = (itemID: ItemID) =>
+      Effect.sync(() => {
+        channels.delete(itemID)
+        follows.delete(itemID)
+      })
 
     const reply = (itemID: ItemID) =>
       Effect.sync(() => {
@@ -1209,6 +1455,10 @@ const layer = Layer.effect(
 
     return Service.of({
       admit,
+      request,
+      receipt,
+      check,
+      delivered,
       writeOrAdmit,
       list,
       withdraw,
@@ -1268,10 +1518,31 @@ function fromRow(row: typeof SessionPromptQueueTable.$inferSelect): Item {
     sessionID: row.session_id,
     seq: row.seq,
     delivery: row.delivery,
+    ...(row.request_id ? { requestID: row.request_id } : {}),
     input: decodeInput(row.input),
     time: { created: row.time_created },
     origins: origins(row),
   }
+}
+
+function toReceipt(row: typeof SessionPromptReceiptTable.$inferSelect): Receipt {
+  if (row.state === "pending") return { state: "pending", itemID: row.item_id! }
+  if (row.state === "delivered") return { state: "delivered", messageID: row.message_id! }
+  if (row.state === "merged")
+    return { state: "merged", into: row.into_request_id!, ...(row.message_id ? { messageID: row.message_id } : {}) }
+  if (row.state === "superseded") return { state: "superseded", by: row.by_request_id! }
+  return { state: "deleted" }
+}
+
+// What makes a prompt the same prompt, as a digest: not its transport IDs, the
+// model and variant it selected, how it was delivered, nor the request it names.
+function fingerprint(input: AdmitInput) {
+  const prompt = Struct.omit(input, ["sessionID", "requestID", "messageID", "model", "variant", "delivery"])
+  return new Bun.CryptoHasher("sha256")
+    .update(
+      JSON.stringify(withoutUndefined({ ...prompt, parts: prompt.parts.map((part) => Struct.omit(part, ["id"])) })),
+    )
+    .digest("hex")
 }
 
 // A row stored before origins were kept has one: the time it was admitted.
@@ -1288,13 +1559,23 @@ function origins(row: typeof SessionPromptQueueTable.$inferSelect): SessionPromp
 export function deliveryNote(origins: readonly SessionPromptQueue.Origin[], delivered: number) {
   const at = (time: number) => new Date(time).toISOString().replace(/\.\d{3}Z$/, "Z")
   const again = (origin: SessionPromptQueue.Origin) =>
-    origin.repeats?.length ? `, and again at ${origin.repeats.map(at).join(", ")}` : ""
+    origin.repeats?.length ? `, and again at ${origin.repeats.map((repeat) => at(repeat.time)).join(", ")}` : ""
   const first = Math.min(...origins.map((origin) => origin.time))
   const waited = `${elapsed(delivered - first)} after it was first queued`
+  // Each request it carries is still owed its own reply (#212).
+  const requests = [
+    ...new Set(
+      origins.flatMap((origin) => [origin, ...(origin.repeats ?? [])].flatMap((copy) => copy.requestID ?? [])),
+    ),
+  ]
+  const owed =
+    requests.length > 1
+      ? ` It carries ${requests.length} requests, each owed its own reply: ${requests.join(", ")}.`
+      : ""
   if (origins.length === 1)
-    return `[Queued prompt: queued at ${at(origins[0]!.time)}${again(origins[0]!)}; delivered at ${at(delivered)}, ${waited}.]`
+    return `[Queued prompt: queued at ${at(origins[0]!.time)}${again(origins[0]!)}; delivered at ${at(delivered)}, ${waited}.${owed}]`
   const steps = origins.map((origin, index) => `step ${index + 1} at ${at(origin.time)}${again(origin)}`)
-  return `[Queued prompt merged from ${origins.length} queued instructions: ${steps.join("; ")}; delivered at ${at(delivered)}, ${waited}.]`
+  return `[Queued prompt merged from ${origins.length} queued instructions: ${steps.join("; ")}; delivered at ${at(delivered)}, ${waited}.${owed}]`
 }
 
 function elapsed(ms: number) {
@@ -1379,6 +1660,13 @@ export function consolidation(items: readonly Item[], markers?: ConfigV1.Info["m
   )
   const survivors = new Set(kept.map((entry) => entry.item.id))
   return {
+    // Which items each survivor took in, copies first, then merged commands.
+    into: [
+      ...[...copies.values()]
+        .filter((group) => group.length > 1)
+        .map((group) => ({ into: group[0]!.id, items: group.slice(1).map((copy) => copy.id) })),
+      ...merges.map((group) => ({ into: group[0]!.item.id, items: group.slice(1).map((entry) => entry.item.id) })),
+    ],
     removed: items.filter((item) => !survivors.has(item.id) || mergedAway.has(item.id)).map((item) => item.id),
     changed: kept.flatMap((entry) => {
       const head = heads.get(entry.item.id)
@@ -1407,8 +1695,10 @@ function repeated(origins: readonly SessionPromptQueue.Origin[], copy: readonly 
 }
 
 function combine(left: SessionPromptQueue.Origin, right: SessionPromptQueue.Origin): SessionPromptQueue.Origin {
-  const times = [left.time, ...(left.repeats ?? []), right.time, ...(right.repeats ?? [])].sort((a, b) => a - b)
-  return { time: times[0]!, repeats: times.slice(1) }
+  const copies = [left, ...(left.repeats ?? []), right, ...(right.repeats ?? [])]
+    .map((copy) => (copy.requestID ? { time: copy.time, requestID: copy.requestID } : { time: copy.time }))
+    .sort((a, b) => a.time - b.time)
+  return { ...copies[0]!, repeats: copies.slice(1) }
 }
 
 function parseCommand(input: SessionPromptQueue.QueuedInput) {

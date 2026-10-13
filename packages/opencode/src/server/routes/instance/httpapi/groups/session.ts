@@ -20,7 +20,13 @@ import {
   WorkspaceRoutingQuery,
   WorkspaceRoutingQueryFields,
 } from "../middleware/workspace-routing"
-import { ApiNotFoundError, PermissionNotFoundError, PromptWithdrawnError, SessionBusyError } from "../errors"
+import {
+  ApiNotFoundError,
+  PermissionNotFoundError,
+  PromptRequestConflictError,
+  PromptWithdrawnError,
+  SessionBusyError,
+} from "../errors"
 import { described } from "./metadata"
 import { QueryBoolean } from "./query"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -321,7 +327,7 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: PromptPayload,
           success: described(SessionV1.WithParts, "Created message"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError, PromptWithdrawnError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, PromptWithdrawnError, PromptRequestConflictError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.prompt",
@@ -334,13 +340,13 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: PromptPayload,
           success: described(HttpApiSchema.NoContent, "Prompt accepted"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, PromptRequestConflictError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.prompt_async",
             summary: "Send async message",
             description:
-              "Create and send a new message to a session asynchronously, starting the session if needed and returning immediately.",
+              "Create and send a new message to a session asynchronously, starting the session if needed and returning immediately. Sending a request ID the session already has is a retry when the prompt is the same, and fails with PromptRequestConflict when it is not.",
           }),
         ),
         HttpApiEndpoint.post("command", SessionPaths.command, {

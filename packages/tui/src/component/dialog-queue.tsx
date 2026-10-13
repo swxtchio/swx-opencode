@@ -200,9 +200,8 @@ DialogQueue.show = (dialog: DialogContext, sessionID: string) =>
 // When the item's oldest instruction was queued and how long ago, how often
 // identical copies were sent, and how many queued instructions it merges.
 function freshness(item: SessionPromptQueueItem, now: number) {
-  const times = item.origins.flatMap((origin) => [origin.time, ...(origin.repeats ?? [])])
   const first = Math.min(...item.origins.map((origin) => origin.time))
-  const sent = item.origins.length === 1 ? times.length : 0
+  const sent = item.origins.length === 1 ? 1 + (item.origins[0]!.repeats?.length ?? 0) : 0
   return [
     `queued ${Locale.todayTimeOrDateTime(first)}`,
     `${age(now - first)} ago`,

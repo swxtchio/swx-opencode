@@ -61,6 +61,7 @@ export default {
           \`session_id\` text NOT NULL,
           \`seq\` integer NOT NULL,
           \`delivery\` text NOT NULL,
+          \`request_id\` text,
           \`input\` text NOT NULL,
           \`message_id\` text,
           \`time_created\` integer NOT NULL,
@@ -68,6 +69,22 @@ export default {
           \`time_promoted\` integer,
           \`time_withdrawn\` integer,
           CONSTRAINT \`fk_session_prompt_queue_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_prompt_receipt\` (
+          \`session_id\` text NOT NULL,
+          \`request_id\` text NOT NULL,
+          \`state\` text NOT NULL,
+          \`item_id\` text,
+          \`message_id\` text,
+          \`into_request_id\` text,
+          \`by_request_id\` text,
+          \`fingerprint\` text NOT NULL,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          CONSTRAINT \`session_prompt_receipt_pk\` PRIMARY KEY(\`session_id\`, \`request_id\`),
+          CONSTRAINT \`fk_session_prompt_receipt_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
       yield* tx.run(`
@@ -303,6 +320,9 @@ export default {
       )
       yield* tx.run(
         `CREATE INDEX \`session_prompt_queue_session_delivery_seq_idx\` ON \`session_prompt_queue\` (\`session_id\`,\`delivery\`,\`seq\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_prompt_receipt_session_item_idx\` ON \`session_prompt_receipt\` (\`session_id\`,\`item_id\`);`,
       )
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)

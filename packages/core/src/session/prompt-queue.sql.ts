@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, uniqueIndex, index } from "drizzle-orm/sqlite-core"
+import { sqliteTable, text, integer, uniqueIndex, index, primaryKey } from "drizzle-orm/sqlite-core"
 import type { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import type { SessionSchema } from "./schema"
 import type { MessageID } from "../v1/session"
@@ -14,7 +14,8 @@ import { SessionTable } from "./sql"
 // it can be restored. `origins` keeps when each instruction the row carries was
 // first queued, and when its identical copies were, through consolidation
 // (#212); a row stored before it existed has one origin, time_created, which is
-// when the row's own copy was last admitted.
+// when the row's own copy was last admitted. request_id is the sender's request
+// the row delivers, whose receipt is kept in session_prompt_receipt.
 export const SessionPromptQueueTable = sqliteTable(
   "session_prompt_queue",
   {
@@ -25,6 +26,7 @@ export const SessionPromptQueueTable = sqliteTable(
       .references(() => SessionTable.id, { onDelete: "cascade" }),
     seq: integer().notNull(),
     delivery: text().$type<SessionPromptQueue.Delivery>().notNull(),
+    request_id: text().$type<SessionPromptQueue.RequestID>(),
     input: text({ mode: "json" }).notNull().$type<SessionPromptQueue.QueuedInputEncoded>(),
     message_id: text().$type<MessageID>(),
     time_created: integer().notNull(),
@@ -62,4 +64,33 @@ export const SessionPromptProvenanceTable = sqliteTable(
     origins: text({ mode: "json" }).notNull().$type<SessionPromptQueue.Origin[]>(),
   },
   (table) => [index("session_prompt_provenance_session_idx").on(table.session_id)],
+)
+
+// What became of each request a sender named (#212), kept as long as the session
+// so the sender can confirm it by receipt rather than by finding its text. A
+// pending or merged request follows the item that carries it (item_id); a
+// request merged into a survivor names the survivor's request (into_request_id)
+// and gets its message once the survivor has one. fingerprint is a digest of the
+// prompt, so a retry is told from a reuse; no prompt text is kept here.
+export const SessionPromptReceiptTable = sqliteTable(
+  "session_prompt_receipt",
+  {
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    request_id: text().$type<SessionPromptQueue.RequestID>().notNull(),
+    state: text().$type<SessionPromptQueue.Receipt["state"]>().notNull(),
+    item_id: text().$type<SessionPromptQueue.ItemID>(),
+    message_id: text().$type<MessageID>(),
+    into_request_id: text().$type<SessionPromptQueue.RequestID>(),
+    by_request_id: text().$type<SessionPromptQueue.RequestID>(),
+    fingerprint: text().notNull(),
+    time_created: integer().notNull(),
+    time_updated: integer().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.session_id, table.request_id] }),
+    index("session_prompt_receipt_session_item_idx").on(table.session_id, table.item_id),
+  ],
 )

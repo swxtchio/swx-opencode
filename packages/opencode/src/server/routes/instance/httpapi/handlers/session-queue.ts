@@ -8,7 +8,7 @@ import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Effect, Option, Scope } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { QueueItemNotPendingError, QueueItemNotWithdrawnError } from "../errors"
+import { notFound, QueueItemNotPendingError, QueueItemNotWithdrawnError } from "../errors"
 import { HoldPayload, RemovePayload, ReorderPayload, RestorePayload, UpdatePayload } from "../groups/session-queue"
 import * as SessionError from "./session-errors"
 
@@ -45,6 +45,15 @@ export const sessionQueueHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
     const list = Effect.fn("SessionQueueHttpApi.list")(function* (ctx: { params: { sessionID: SessionID } }) {
       yield* requireSession(ctx.params.sessionID)
       return yield* queue.list(ctx.params.sessionID)
+    })
+
+    const receipt = Effect.fn("SessionQueueHttpApi.receipt")(function* (ctx: {
+      params: { sessionID: SessionID; requestID: SessionQueue.RequestID }
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      const found = yield* queue.receipt(ctx.params.sessionID, ctx.params.requestID)
+      if (Option.isNone(found)) return yield* notFound(`No request ${ctx.params.requestID} in this session`)
+      return found.value
     })
 
     const withdraw = Effect.fn("SessionQueueHttpApi.withdraw")(function* (ctx: {
@@ -158,5 +167,6 @@ export const sessionQueueHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       .handle("remove", remove)
       .handle("reorder", reorder)
       .handle("consolidate", consolidate)
+      .handle("receipt", receipt)
   }),
 )

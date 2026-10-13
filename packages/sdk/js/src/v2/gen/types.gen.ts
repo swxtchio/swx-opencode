@@ -698,6 +698,8 @@ export type SessionStatus =
       activeAssistantMessageID?: string | null
     }
 
+export type SessionPromptQueueRequestId = string
+
 export type TextPartInput = {
   id?: string
   type: "text"
@@ -762,9 +764,15 @@ export type SessionPromptQueueInput = {
   parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
 }
 
+export type SessionPromptQueueRepeat = {
+  time: number
+  requestID?: SessionPromptQueueRequestId
+}
+
 export type SessionPromptQueueOrigin = {
   time: number
-  repeats?: Array<number>
+  requestID?: SessionPromptQueueRequestId
+  repeats?: Array<SessionPromptQueueRepeat>
 }
 
 export type SessionPromptQueueItem = {
@@ -775,6 +783,7 @@ export type SessionPromptQueueItem = {
    */
   seq: number
   delivery: "steer" | "queue"
+  requestID?: SessionPromptQueueRequestId
   input: SessionPromptQueueInput
   time: {
     /**
@@ -783,7 +792,7 @@ export type SessionPromptQueueItem = {
     created: number
   }
   /**
-   * One per instruction the item carries, in order: a merged command has one per step; repeats are identical copies collapsed into it
+   * One per instruction the item carries, in order: a merged command has one per step; repeats are copies of it collapsed into it
    */
   origins: Array<SessionPromptQueueOrigin>
 }
@@ -2679,6 +2688,13 @@ export type PromptWithdrawn = {
   message: string
 }
 
+export type PromptRequestConflict = {
+  _tag: "PromptRequestConflict"
+  sessionID: string
+  requestID: string
+  message: string
+}
+
 export type SessionBusyError = {
   _tag: "SessionBusyError"
   sessionID: string
@@ -2698,6 +2714,28 @@ export type QueueItemNotWithdrawn = {
   itemID: string
   message: string
 }
+
+export type SessionPromptQueueReceipt =
+  | {
+      state: "pending"
+      itemID: string
+    }
+  | {
+      state: "delivered"
+      messageID: string
+    }
+  | {
+      state: "merged"
+      into: SessionPromptQueueRequestId
+      messageID?: string
+    }
+  | {
+      state: "superseded"
+      by: SessionPromptQueueRequestId
+    }
+  | {
+      state: "deleted"
+    }
 
 export type EventTuiPromptAppend = {
   type: "tui.prompt.append"
@@ -9958,6 +9996,7 @@ export type SessionMessagesResponse2 = SessionMessagesResponses[keyof SessionMes
 
 export type SessionPromptData = {
   body?: {
+    requestID?: SessionPromptQueueRequestId
     messageID?: string
     model?: {
       providerID: string
@@ -9994,9 +10033,9 @@ export type SessionPromptErrors = {
    */
   404: NotFoundError
   /**
-   * PromptWithdrawn
+   * PromptWithdrawn | PromptRequestConflict
    */
-  409: PromptWithdrawn
+  409: PromptWithdrawn | PromptRequestConflict
 }
 
 export type SessionPromptError = SessionPromptErrors[keyof SessionPromptErrors]
@@ -10310,6 +10349,7 @@ export type SessionSummarizeResponse = SessionSummarizeResponses[keyof SessionSu
 
 export type SessionPromptAsyncData = {
   body?: {
+    requestID?: SessionPromptQueueRequestId
     messageID?: string
     model?: {
       providerID: string
@@ -10345,6 +10385,10 @@ export type SessionPromptAsyncErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * PromptRequestConflict
+   */
+  409: PromptRequestConflict
 }
 
 export type SessionPromptAsyncError = SessionPromptAsyncErrors[keyof SessionPromptAsyncErrors]
@@ -10971,6 +11015,41 @@ export type SessionQueueConsolidateResponses = {
 }
 
 export type SessionQueueConsolidateResponse = SessionQueueConsolidateResponses[keyof SessionQueueConsolidateResponses]
+
+export type SessionQueueReceiptData = {
+  body?: never
+  path: {
+    sessionID: string
+    requestID: SessionPromptQueueRequestId
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/receipt/{requestID}"
+}
+
+export type SessionQueueReceiptErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionQueueReceiptError = SessionQueueReceiptErrors[keyof SessionQueueReceiptErrors]
+
+export type SessionQueueReceiptResponses = {
+  /**
+   * What became of the request
+   */
+  200: SessionPromptQueueReceipt
+}
+
+export type SessionQueueReceiptResponse = SessionQueueReceiptResponses[keyof SessionQueueReceiptResponses]
 
 export type SyncStartData = {
   body?: never

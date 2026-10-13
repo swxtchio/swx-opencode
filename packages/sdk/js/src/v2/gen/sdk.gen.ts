@@ -204,6 +204,7 @@ import type {
   SessionPromptAsyncErrors,
   SessionPromptAsyncResponses,
   SessionPromptErrors,
+  SessionPromptQueueRequestId,
   SessionPromptResponses,
   SessionQueueConsolidateErrors,
   SessionQueueConsolidateResponses,
@@ -211,6 +212,8 @@ import type {
   SessionQueueHoldResponses,
   SessionQueueListErrors,
   SessionQueueListResponses,
+  SessionQueueReceiptErrors,
+  SessionQueueReceiptResponses,
   SessionQueueReleaseErrors,
   SessionQueueReleaseResponses,
   SessionQueueRemoveErrors,
@@ -3725,6 +3728,40 @@ export class Queue extends HeyApiClient {
       ...params,
     })
   }
+
+  /**
+   * Get a request's receipt
+   *
+   * Say what became of a prompt sent with this request ID: pending in the queue, delivered as a message, merged into another request's prompt, superseded by a newer request, or deleted undelivered. Receipts last as long as the session. Fails with NotFound when the session has no such request.
+   */
+  public receipt<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      requestID: SessionPromptQueueRequestId
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "requestID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SessionQueueReceiptResponses, SessionQueueReceiptErrors, ThrowOnError>({
+      url: "/session/{sessionID}/queue/receipt/{requestID}",
+      ...options,
+      ...params,
+    })
+  }
 }
 
 export class Session2 extends HeyApiClient {
@@ -4118,6 +4155,7 @@ export class Session2 extends HeyApiClient {
       sessionID: string
       directory?: string
       workspace?: string
+      requestID?: SessionPromptQueueRequestId
       messageID?: string
       model?: {
         providerID: string
@@ -4144,6 +4182,7 @@ export class Session2 extends HeyApiClient {
             { in: "path", key: "sessionID" },
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
+            { in: "body", key: "requestID" },
             { in: "body", key: "messageID" },
             { in: "body", key: "model" },
             { in: "body", key: "agent" },
@@ -4466,13 +4505,14 @@ export class Session2 extends HeyApiClient {
   /**
    * Send async message
    *
-   * Create and send a new message to a session asynchronously, starting the session if needed and returning immediately.
+   * Create and send a new message to a session asynchronously, starting the session if needed and returning immediately. Sending a request ID the session already has is a retry when the prompt is the same, and fails with PromptRequestConflict when it is not.
    */
   public promptAsync<ThrowOnError extends boolean = false>(
     parameters: {
       sessionID: string
       directory?: string
       workspace?: string
+      requestID?: SessionPromptQueueRequestId
       messageID?: string
       model?: {
         providerID: string
@@ -4499,6 +4539,7 @@ export class Session2 extends HeyApiClient {
             { in: "path", key: "sessionID" },
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
+            { in: "body", key: "requestID" },
             { in: "body", key: "messageID" },
             { in: "body", key: "model" },
             { in: "body", key: "agent" },

@@ -21,6 +21,7 @@ export const SessionQueuePaths = {
   remove: `${root}/remove`,
   reorder: `${root}/reorder`,
   consolidate: `${root}/consolidate`,
+  receipt: `${root}/receipt/:requestID`,
 } as const
 
 export const RestorePayload = Schema.Struct({ id: SessionQueue.ItemID })
@@ -153,6 +154,19 @@ export const SessionQueueApi = HttpApi.make("sessionQueue").add(
           summary: "Consolidate queued prompts",
           description:
             "Keep one of identical pending prompts, and merge pending commands of one delivery that share their leading verb and target into one command with numbered steps, in delivery order.",
+        }),
+      ),
+      HttpApiEndpoint.get("receipt", SessionQueuePaths.receipt, {
+        params: { sessionID: SessionID, requestID: SessionQueue.RequestID },
+        query: WorkspaceRoutingQuery,
+        success: described(SessionQueue.Receipt, "What became of the request"),
+        error: [HttpApiError.BadRequest, ApiNotFoundError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "session.queue.receipt",
+          summary: "Get a request's receipt",
+          description:
+            "Say what became of a prompt sent with this request ID: pending in the queue, delivered as a message, merged into another request's prompt, superseded by a newer request, or deleted undelivered. Receipts last as long as the session. Fails with NotFound when the session has no such request.",
         }),
       ),
     )

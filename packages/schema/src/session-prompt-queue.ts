@@ -23,8 +23,19 @@ export type ItemID = typeof ItemID.Type
 export const Delivery = SessionDelivery.Delivery
 export type Delivery = SessionDelivery.Delivery
 
+// A sender's name for one logical request, unique within its session (#212).
+// A peer send uses its msgid. Its receipt says what became of the request.
+export const RequestID = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9._:-]{1,128}$/)).annotate({
+  identifier: "SessionPromptQueueRequestID",
+})
+export type RequestID = typeof RequestID.Type
+
 // The V1 prompt payload. SessionPrompt.PromptInput is this plus the sessionID.
 export const Input = Schema.Struct({
+  requestID: Schema.optional(RequestID).annotate({
+    description:
+      "The sender's name for this request, unique within the session. Sending it again with an identical prompt is a retry of the same request, and with a different prompt a conflict; GET /session/:id/queue/receipt/:requestID says what became of it",
+  }),
   messageID: Schema.optional(MessageID),
   model: Schema.optional(
     Schema.Struct({
@@ -56,18 +67,25 @@ export type Input = Schema.Schema.Type<typeof Input>
 // What a pending item delivers. noReply controls the admission call; a held
 // noReply can be queued and becomes a normal turn when promoted. The item's own
 // delivery supersedes the one it was admitted with.
-export const QueuedInput = Schema.Struct(Struct.omit(Input.fields, ["noReply", "delivery"])).annotate({
+export const QueuedInput = Schema.Struct(Struct.omit(Input.fields, ["noReply", "delivery", "requestID"])).annotate({
   identifier: "SessionPromptQueueInput",
 })
 export type QueuedInput = Schema.Schema.Type<typeof QueuedInput>
 // The stored form; `format` holds class instances only once decoded.
 export type QueuedInputEncoded = typeof QueuedInput.Encoded
 
-// When an instruction was first queued, and when identical copies of it were
-// queued after it and collapsed into it (#212).
+// When an instruction was first queued, and when copies of it were queued
+// after it and collapsed into it (#212), each with the request that sent it.
+export const Repeat = Schema.Struct({
+  time: NonNegativeInt,
+  requestID: Schema.optional(RequestID),
+}).annotate({ identifier: "SessionPromptQueueRepeat" })
+export type Repeat = Schema.Schema.Type<typeof Repeat>
+
 export const Origin = Schema.Struct({
   time: NonNegativeInt,
-  repeats: Schema.optional(Schema.Array(NonNegativeInt)),
+  requestID: Schema.optional(RequestID),
+  repeats: Schema.optional(Schema.Array(Repeat)),
 }).annotate({ identifier: "SessionPromptQueueOrigin" })
 export type Origin = Schema.Schema.Type<typeof Origin>
 
@@ -79,6 +97,9 @@ export const Item = Schema.Struct({
       "Delivery order within the session: admission order until a reorder trades it between pending items; never reused",
   }),
   delivery: Delivery,
+  requestID: Schema.optional(RequestID).annotate({
+    description: "The request this item delivers; a request merged into it names it as its survivor",
+  }),
   input: QueuedInput,
   time: Schema.Struct({
     created: NonNegativeInt.annotate({
@@ -87,10 +108,23 @@ export const Item = Schema.Struct({
   }),
   origins: Schema.Array(Origin).annotate({
     description:
-      "One per instruction the item carries, in order: a merged command has one per step; repeats are identical copies collapsed into it",
+      "One per instruction the item carries, in order: a merged command has one per step; repeats are copies of it collapsed into it",
   }),
 }).annotate({ identifier: "SessionPromptQueueItem" })
 export type Item = Schema.Schema.Type<typeof Item>
+
+// What became of a request (#212). Merged: its instruction is delivered as part
+// of the survivor `into`, once that has a message. Superseded: a newer request
+// of the same kind, `by`, retired it undelivered. Deleted: removed from the
+// queue undelivered, by its reviewer or because it could not become a message.
+export const Receipt = Schema.Union([
+  Schema.Struct({ state: Schema.Literal("pending"), itemID: ItemID }),
+  Schema.Struct({ state: Schema.Literal("delivered"), messageID: MessageID }),
+  Schema.Struct({ state: Schema.Literal("merged"), into: RequestID, messageID: Schema.optional(MessageID) }),
+  Schema.Struct({ state: Schema.Literal("superseded"), by: RequestID }),
+  Schema.Struct({ state: Schema.Literal("deleted") }),
+]).annotate({ identifier: "SessionPromptQueueReceipt", discriminator: "state" })
+export type Receipt = Schema.Schema.Type<typeof Receipt>
 
 const Updated = define({
   type: "session.queue.updated",

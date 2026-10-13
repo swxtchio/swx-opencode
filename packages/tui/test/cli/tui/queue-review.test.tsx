@@ -442,7 +442,7 @@ test("each pending prompt shows when it was first queued, how long ago, its repe
   const repeated = {
     ...item("que_4", "queue", "check the build", 5),
     time: { created: minutes(5) },
-    origins: [{ time: minutes(17), repeats: [minutes(5)] }],
+    origins: [{ time: minutes(17), repeats: [{ time: minutes(5) }] }],
   }
   const merged = {
     ...item("que_5", "queue", "run lint:\n1. run lint\n2. --fix", 6),
