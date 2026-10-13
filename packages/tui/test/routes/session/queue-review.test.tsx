@@ -6,6 +6,7 @@ import type { GlobalEvent, Provider, Session, SessionPromptQueueItem } from "@op
 import { Effect } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Global } from "@opencode-ai/core/global"
+import { tmpdir } from "../../fixture/fixture"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 
@@ -69,6 +70,9 @@ async function startSession(
   } = {},
 ) {
   const setup = await createTestRenderer({ width: 160, height: 45, useThread: false })
+  // Sent prompts are appended to the prompt history under state; keep it out
+  // of the user's own and of the next test's.
+  const state = await tmpdir()
   const events = createEventSource()
   const queue = { items: options.queue ?? items }
   const requests: string[] = []
@@ -149,7 +153,9 @@ async function startSession(
           async dispose() {},
         },
       })
-      .pipe(Effect.provide(AppNodeBuilder.build(Global.node))),
+      .pipe(
+        Effect.provide(AppNodeBuilder.build(Global.node, [[Global.node, Global.layerWith({ state: state.path })]])),
+      ),
   )
   await ready
 
@@ -167,6 +173,7 @@ async function startSession(
         await task
       } finally {
         if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+        await state[Symbol.asyncDispose]()
       }
     },
   }
@@ -432,6 +439,32 @@ test("a prompt withdrawn while the composer was typed in goes back to the queue"
     expect(app.restored).toEqual([{ id: "que_queue" }])
     expect(composerLines(await screen(app), "queued for later")).toEqual([])
     expect(composerLines(await screen(app), "draft")).toHaveLength(1)
+    // Sent, the draft is not stashed into the next test's composer.
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the draft")
+    app.prompts[0]!.answer(json(transcript))
+  } finally {
+    await app.stop()
+  }
+})
+
+test("a withdrawal whose answer is lost copies nothing and returns the prompt to the queue", async () => {
+  let landed = false
+  const app = await startSession({
+    queue: [items[1]!],
+    // The server withdrew it, but the answer never arrived.
+    withdraw: () => {
+      landed = true
+      throw new TypeError("fetch failed")
+    },
+  })
+  try {
+    await until(async () => (await screen(app)).some((line) => line.includes("1 pending")), "session")
+    app.renderer.mockInput.pressArrow("up")
+    await until(() => app.restored.length === 1, "the restore")
+    expect(landed).toBe(true)
+    expect(app.restored).toEqual([{ id: "que_queue" }])
+    expect(composerLines(await screen(app), "queued for later")).toEqual([])
   } finally {
     await app.stop()
   }

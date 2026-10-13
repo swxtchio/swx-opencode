@@ -981,8 +981,15 @@ export function Prompt(props: PromptProps) {
       .withdraw({ sessionID, itemID: prompt.item.id })
       .catch(() => undefined)
       .finally(() => (recalling = false))
-    if (!withdrawn?.data) {
+    if (withdrawn?.response?.status === 404) {
       toast.show({ variant: "info", message: "That prompt is no longer pending" })
+      return
+    }
+    // Any other failure may still have withdrawn it. Restoring puts it back
+    // if so, and is refused if not.
+    if (!withdrawn?.data) {
+      await sdk.client.session.queue.restore({ sessionID, id: prompt.item.id }).catch(() => undefined)
+      toast.show({ variant: "error", message: "Could not take that prompt back; it stays queued" })
       return
     }
     // The queue's own update may arrive after its answer.
