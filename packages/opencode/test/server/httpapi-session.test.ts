@@ -2070,6 +2070,83 @@ describe("session HttpApi", () => {
   )
 
   it.live(
+    "a recalled prompt resent with edits is a new request, and only the edits reach the model",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hold("task done", Effect.runPromise(Deferred.await(gate)))
+        yield* llm.text("lint done")
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue recall" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const model = { providerID: "test", modelID: "test-model" }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+        // As the TUI sends: a steer naming its own request.
+        const send = (requestID: string, text: string) =>
+          post(SessionPaths.prompt, { requestID, agent: "build", model, parts: [{ type: "text", text }] })
+        const withdraw = (itemID: string) =>
+          request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID }), { method: "DELETE", headers })
+
+        yield* post(SessionPaths.promptAsync, { agent: "build", model, parts: [{ type: "text", text: "start" }] })
+        yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
+        // Held, the steer stays pending as one a busy session cannot take yet.
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const first = yield* send("recall-first", "check the build").pipe(Effect.forkChild)
+        const [pending] = yield* pollWithTimeout(
+          requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }).pipe(
+            Effect.map((items) => (items.length === 1 ? items : undefined)),
+          ),
+          "the sent prompt was never listed",
+        )
+        expect(pending!.requestID).toBe("recall-first")
+
+        // UP takes it back: the withdrawn item carries the prompt as sent.
+        const recalled = yield* withdraw(pending!.id)
+        expect(recalled.status).toBe(200)
+        expect((yield* json<SessionQueue.Item>(recalled)).input.parts).toEqual([
+          { type: "text", text: "check the build" },
+        ])
+        // A second recall from a stale list gets nothing.
+        const stale = yield* withdraw(pending!.id)
+        expect(stale.status).toBe(404)
+        expect(yield* responseJson(stale)).toMatchObject({ _tag: "QueueItemNotPending", itemID: pending!.id })
+
+        const resent = yield* send("recall-resend", "check the lint").pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }).pipe(
+            Effect.map((items) => (items.some((item) => item.requestID === "recall-resend") ? true : undefined)),
+          ),
+          "the resend was never listed",
+        )
+        expect((yield* post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+        yield* Deferred.succeed(gate, undefined)
+        // The first send's caller learns at the run's next boundary that it was withdrawn.
+        const answered = yield* awaitWithTimeout(Fiber.join(first), "withdrawn send never answered", "10 seconds")
+        expect(answered.status).toBe(409)
+        expect(yield* responseJson(answered)).toMatchObject({ _tag: "PromptWithdrawn", itemID: pending!.id })
+        expect((yield* awaitWithTimeout(Fiber.join(resent), "resend never answered", "10 seconds")).status).toBe(200)
+
+        const receipt = yield* requestJson<SessionQueue.Receipt>(
+          pathFor(SessionQueuePaths.receipt, { ...params, requestID: "recall-resend" }),
+          { headers },
+        )
+        expect(receipt.state).toBe("delivered")
+        const sent = JSON.stringify(yield* llm.inputs)
+        expect(sent).toContain("check the lint")
+        expect(sent).not.toContain("check the build")
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
+    30_000,
+  )
+
+  it.live(
     "a withdrawn prompt_async prompt ends without a session error",
     () => {
       const gate = Deferred.makeUnsafe<void>()

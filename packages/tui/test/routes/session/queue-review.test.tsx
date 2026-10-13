@@ -86,7 +86,7 @@ async function startSession(
   }
   const withdraw = (itemID: string) => {
     const found = queue.items.find((item) => item.id === itemID)
-    if (!found) return json({ _tag: "QueueItemNotPending", sessionID, itemID }, { status: 409 })
+    if (!found) return json({ _tag: "QueueItemNotPending", sessionID, itemID }, { status: 404 })
     publish(queue.items.filter((item) => item.id !== itemID))
     return json(found)
   }
@@ -379,7 +379,7 @@ test("UP copies nothing when the last pending prompt was promoted before its wit
   const app = await startSession({
     queue: [items[1]!],
     // Promotion won: the prompt is a message now, so the queue refuses to give it up.
-    withdraw: (itemID) => json({ _tag: "QueueItemNotPending", sessionID, itemID }, { status: 409 }),
+    withdraw: (itemID) => json({ _tag: "QueueItemNotPending", sessionID, itemID }, { status: 404 }),
   })
   try {
     await until(async () => (await screen(app)).some((line) => line.includes("1 pending")), "session")
