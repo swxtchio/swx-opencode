@@ -5,7 +5,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
-import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer, Queue, Schema, Stream, Tracer } from "effect"
+import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Schema, Stream, Tracer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { Sse } from "effect/unstable/encoding"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
@@ -2661,7 +2661,9 @@ describe("session HttpApi", () => {
         })
         expect(start.status).toBe(204)
         yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
-        // The start prompt's own admission and promotion publish first; skip to the held one.
+        // The start prompt's own admission, preparation and promotion publish
+        // first; skip to the held one.
+        yield* nextQueueUpdate
         yield* nextQueueUpdate
         yield* nextQueueUpdate
         yield* request(pathFor(SessionPaths.promptAsync, params), {
@@ -2669,7 +2671,9 @@ describe("session HttpApi", () => {
           headers,
           body: JSON.stringify({ agent: "build", model, delivery: "queue", parts: [{ type: "text", text: "held" }] }),
         })
+        // Listed on arrival, and again once its sender has prepared it (#249).
         const admittedList = yield* nextQueueUpdate
+        expect(yield* nextQueueUpdate).toEqual(admittedList)
         const listed = yield* requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
         expect(admittedList).toEqual(listed)
         expect(listed.map((entry) => entry.input.parts)).toEqual([[{ type: "text", text: "held" }]])
@@ -4022,6 +4026,103 @@ describe("session HttpApi writes racing removal", () => {
 
 describe("session HttpApi submission-time admission", () => {
   const options = { git: true, config: { formatter: false, lsp: false, share: "disabled" as const } }
+
+  // swxtchio/swx-opencode#249: admission is the first thing a prompt does. Even
+  // held at its first config read it is listed, and it holds up neither a
+  // later send's admission nor its own withdrawal.
+  itRacing.instance(
+    "a sent prompt is pending before any other work on it, and its preparation holds up nothing",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "admitted before config" })
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const params = { sessionID: created.id }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+        const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+        const send = (requestID: string, text: string) =>
+          post(SessionPaths.prompt, { requestID, agent: "build", parts: [{ type: "text", text }] })
+        // Held for review, so nothing is delivered and no provider is called.
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const hold = yield* racingSpans.arm({ name: "Config.get", parent: "SessionPrompt.prompt" })
+        const first = yield* send("first", "check the build").pipe(Effect.forkChild)
+        const second = yield* Effect.gen(function* () {
+          yield* awaitWithTimeout(hold.reached, "the prompt never read its config", "30 seconds")
+          const items = yield* listed()
+          expect(items.map((item) => item.requestID)).toEqual(["first"])
+          expect(
+            yield* requestJson<SessionQueue.Receipt>(
+              pathFor(SessionQueuePaths.receipt, { ...params, requestID: "first" }),
+              { headers },
+            ),
+          ).toEqual({ state: "pending", itemID: items[0]!.id })
+          const second = yield* send("second", "check the lint").pipe(Effect.forkChild)
+          yield* awaitWithTimeout(
+            Effect.gen(function* () {
+              while ((yield* listed()).length < 2) yield* Effect.sleep("10 millis")
+            }),
+            "a later send was not admitted while the first prepared",
+          )
+          const withdrawn = yield* request(pathFor(SessionQueuePaths.withdraw, { ...params, itemID: items[0]!.id }), {
+            method: "DELETE",
+            headers,
+          }).pipe(Effect.timeoutOption("5 seconds"))
+          expect(Option.map(withdrawn, (response) => response.status)).toEqual(Option.some(200))
+          expect((yield* listed()).map((item) => item.requestID)).toEqual(["second"])
+          return second
+        }).pipe(Effect.ensuring(hold.disarm))
+        yield* Fiber.interrupt(second)
+        yield* Fiber.interrupt(first)
+      }),
+    options,
+    60_000,
+  )
+
+  // A send whose preparation fails takes its admission back, so nothing is
+  // left pending and an exact retry is admitted again rather than following it.
+  itRacing.instance(
+    "a send whose preparation fails leaves nothing pending, and its exact retry is admitted again",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const created = yield* createSession({ title: "unprepared" })
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const params = { sessionID: created.id }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+        const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+        // A variant with no model selects it on the session's model, and with
+        // only an absent provider configured there is none, so preparing fails.
+        const send = () =>
+          post(SessionPaths.prompt, {
+            requestID: "unprepared",
+            agent: "build",
+            variant: "high",
+            parts: [{ type: "text", text: "check the build" }],
+          }).pipe(Effect.timeoutOption("20 seconds"))
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+        const hold = yield* racingSpans.arm({ name: "Session.get", parent: "SessionPrompt.prompt" })
+        const sent = yield* send().pipe(Effect.forkChild)
+        yield* Effect.gen(function* () {
+          yield* awaitWithTimeout(hold.reached, "the prompt never read its Session", "30 seconds")
+          expect((yield* listed()).map((item) => item.requestID)).toEqual(["unprepared"])
+        }).pipe(Effect.ensuring(hold.disarm))
+        const failed = yield* Fiber.join(sent)
+        expect(Option.map(failed, (response) => response.status)).toEqual(Option.some(500))
+        expect(yield* listed()).toEqual([])
+        const receipt = yield* request(pathFor(SessionQueuePaths.receipt, { ...params, requestID: "unprepared" }), {
+          headers,
+        })
+        expect(receipt.status).toBe(404)
+        // Admitted and failed again, where following a stale admission would
+        // have waited on a prompt the held session never delivers.
+        expect(Option.map(yield* send(), (response) => response.status)).toEqual(Option.some(500))
+        expect(yield* listed()).toEqual([])
+      }),
+    { ...options, config: { ...options.config, provider: { "absent-provider": {} } } },
+    60_000,
+  )
 
   // swxtchio/swx-opencode#249: the prompt is pending before the session work
   // its delivery waits on (revert cleanup and model selection) has run.

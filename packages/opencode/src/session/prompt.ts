@@ -1135,40 +1135,52 @@ const layer = Layer.effect(
       SessionV1.WithParts,
       Image.Error | SessionQueue.WithdrawnError | SessionQueue.RequestConflictError
     > = Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput) {
-      // TUI prepends synthetic editor context; only flattened user text owns marker framing.
-      const classificationText = input.parts
-        .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
-        .join("")
-      const markers = (yield* config.get()).machine_message_markers
-      const classification = MachineMessage.classify(classificationText, markers)
-      const delivery = classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
-      // A request the session already has is followed, never admitted or applied again (#212).
-      if (input.requestID && Option.isSome(yield* queue.receipt(input.sessionID, input.requestID)))
-        return yield* followRequest(
-          input,
-          yield* queue.request({ ...input, ...(delivery ? { delivery } : {}) }, markers),
-        )
-      // Session work this prompt's delivery depends on. A prompt that is
-      // queued is admitted first and this runs after, so the prompt is pending
-      // from the moment it arrives (swxtchio/swx-opencode#249).
-      const ready = Effect.gen(function* () {
+      // A queued prompt is admitted before any other work on it, so it is
+      // pending from the moment it arrives (swxtchio/swx-opencode#249). Nothing
+      // promotes or merges it until the work below has prepared the session for
+      // it; when that work fails the admission is taken back, so a failed send
+      // leaves nothing pending and its exact retry is admitted again.
+      const admitted = input.noReply === true ? undefined : yield* queue.request(input, undefined, true)
+      if (admitted?.kind === "retry") return yield* followRequest(input, admitted)
+      const own = admitted?.own
+      const prepared = yield* Effect.gen(function* () {
+        // TUI prepends synthetic editor context; only flattened user text owns marker framing.
+        const classificationText = input.parts
+          .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
+          .join("")
+        const markers = (yield* config.get()).machine_message_markers
+        const classification = MachineMessage.classify(classificationText, markers)
+        const delivery = classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
+        // A request the session already has is followed, never applied again (#212).
+        if (!own && input.requestID && Option.isSome(yield* queue.receipt(input.sessionID, input.requestID)))
+          return {
+            markers,
+            classification,
+            delivery,
+            retry: yield* queue.request({ ...input, ...(delivery ? { delivery } : {}) }, markers),
+          }
         yield* revert.cleanup(yield* sessions.get(input.sessionID).pipe(Effect.orDie))
         // A prompt's model and variant become the session's selection now, and
         // a pending prompt runs at whichever selection is current when it is
         // delivered (swxtchio/swx-opencode#212).
-        if (!input.model && !input.variant) return
-        const model = input.model ?? (yield* currentModel(input.sessionID))
-        yield* sessions.setModel({
-          sessionID: input.sessionID,
-          model: { id: model.modelID, providerID: model.providerID, variant: input.variant ?? "default" },
-        })
-      })
-      if (input.noReply === true) yield* ready
-      const markedNoReply = input.noReply === true && classification === "hold"
+        if (input.model || input.variant) {
+          const model = input.model ?? (yield* currentModel(input.sessionID))
+          yield* sessions.setModel({
+            sessionID: input.sessionID,
+            model: { id: model.modelID, providerID: model.providerID, variant: input.variant ?? "default" },
+          })
+        }
+        if (own) yield* queue.prepared({ sessionID: input.sessionID, itemID: own.id, delivery, markers })
+        return { markers, classification, delivery, retry: undefined }
+      }).pipe(
+        Effect.onExit((exit) => (own && Exit.isFailure(exit) ? queue.unprepared(input.sessionID, own.id) : Effect.void)),
+      )
+      if (prepared.retry) return yield* followRequest(input, prepared.retry)
+      const markedNoReply = input.noReply === true && prepared.classification === "hold"
       const initiallyHeldNoReply =
         markedNoReply && Exit.isFailure(yield* state.assertNotBusy(input.sessionID).pipe(Effect.exit))
       const queuedInput = markedNoReply && !input.messageID ? { ...input, messageID: MessageID.ascending() } : input
-      const admission = { ...queuedInput, ...(delivery ? { delivery } : {}) }
+      const admission = { ...queuedInput, ...(prepared.delivery ? { delivery: prepared.delivery } : {}) }
       // Preparation can yield while another prompt starts a run. Revalidate at
       // the write boundary so a newly active run receives the marked message as
       // queued input instead of seeing it in its next history reload. The queue
@@ -1186,15 +1198,14 @@ const layer = Layer.effect(
           : undefined
       const heldNoReply = markedNoReply && (initiallyHeldNoReply || noReplyDecision?.kind === "queued")
       const requested =
-        noReplyDecision || (input.noReply === true && !markedNoReply)
-          ? undefined
-          : yield* queue.request(admission, markers, input.noReply === true ? undefined : ready)
+        own || noReplyDecision || !markedNoReply ? undefined : yield* queue.request(admission, prepared.markers)
       // Another caller admitted the same request first.
       if (requested?.kind === "retry") return yield* followRequest(input, requested)
-      const entry = noReplyDecision
-        ? noReplyDecision
-        : requested
-          ? { kind: "queued" as const, own: requested.own, prepared: undefined }
+      const queued = own ?? requested?.own
+      const entry = queued
+        ? { kind: "queued" as const, own: queued, prepared: undefined }
+        : noReplyDecision
+          ? noReplyDecision
           : {
               kind: "direct" as const,
               message: yield* queue.exclusive(input.sessionID, createUserMessage(input)),

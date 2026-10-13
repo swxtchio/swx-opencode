@@ -367,7 +367,7 @@ const activityColumns = [
     table: "session_prompt_queue",
     scope: "session_id",
     required: ["time_created"],
-    optional: ["time_promoted", "time_withdrawn"],
+    optional: ["time_promoted", "time_withdrawn", "time_preparing"],
   },
   { table: "todo", scope: "session_id", required: ["time_created", "time_updated"], optional: [] },
   { table: "session_share", scope: "session_id", required: ["time_created", "time_updated"], optional: [] },
