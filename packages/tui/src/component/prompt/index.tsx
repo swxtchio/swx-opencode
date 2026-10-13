@@ -42,7 +42,7 @@ import { usePromptStash } from "../../prompt/stash"
 import { DialogStash } from "../dialog-stash"
 import { type AutocompleteRef, Autocomplete } from "./autocomplete"
 import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
-import type { AssistantMessage, FilePart, UserMessage } from "@opencode-ai/sdk/v2"
+import type { AssistantMessage, FilePart, SessionPromptQueueReceipt, UserMessage } from "@opencode-ai/sdk/v2"
 import { Locale } from "../../util/locale"
 import { errorMessage } from "../../util/error"
 import { isRecord } from "../../util/record"
@@ -109,10 +109,11 @@ const money = new Intl.NumberFormat("en-US", {
 })
 
 const DRAFT_RETENTION_MIN_CHARS = 20
-// A recall of a prompt still being sent asks the server whether it is queued
-// yet this often, until this backstop; the server admits it on arrival.
-const ADMISSION_POLL_MS = 50
-const ADMISSION_BACKSTOP_MS = 10_000
+// A recall asks the server where a prompt is this often, until this backstop:
+// whether one still being sent is queued yet, which the server does on
+// arrival, and where one it could not keep went.
+const RECALL_POLL_MS = 50
+const RECALL_BACKSTOP_MS = 10_000
 
 function randomIndex(count: number) {
   if (count <= 0) return 0
@@ -993,18 +994,18 @@ export function Prompt(props: PromptProps) {
     const withdrawn = await sdk.client.session.queue.withdraw({ sessionID, itemID }).catch(() => undefined)
     if (withdrawn?.response?.status === 404)
       return toast.show({ variant: "info", message: "That prompt is no longer pending" })
+    const requestID = prompt.item?.requestID ?? prompt.requestID
     // Any other failure may still have withdrawn it.
     if (!withdrawn?.data)
       return giveBack(
-        sessionID,
-        itemID,
+        { sessionID, itemID, requestID },
         prompt.item ? recalledPrompt(prompt.item) : { input: prompt.text, parts: [] },
         "Could not take that prompt back",
       )
     sync.queue.withdrawn(sessionID, withdrawn.data)
     const recalled = recalledPrompt(withdrawn.data)
     if (input.isDestroyed || input.plainText || props.sessionID !== sessionID)
-      return giveBack(sessionID, itemID, recalled, "The composer was in use")
+      return giveBack({ sessionID, itemID, requestID }, recalled, "The composer was in use")
     input.setText(recalled.input)
     setStore("prompt", recalled)
     setStore("mode", "normal")
@@ -1017,35 +1018,86 @@ export function Prompt(props: PromptProps) {
   // without leaving one pending.
   async function admitted(sessionID: string, requestID: string | undefined) {
     if (!requestID) return undefined
-    const deadline = Date.now() + ADMISSION_BACKSTOP_MS
+    const deadline = Date.now() + RECALL_BACKSTOP_MS
     while (Date.now() < deadline) {
       const listed = sync.data.session_queue[sessionID]?.find((item) => carries(item, requestID))
       if (listed) return { itemID: listed.id }
-      const receipt = await sdk.client.session.queue.receipt({ sessionID, requestID }).catch(() => undefined)
-      if (receipt?.data) return receipt.data.state === "pending" ? { itemID: receipt.data.itemID } : undefined
+      const receipt = await carried(sessionID, requestID)
+      if (receipt) return receipt.state === "pending" ? { itemID: receipt.itemID } : undefined
       if (!sync.data.session_sending[sessionID]?.some((sending) => sending.requestID === requestID)) return undefined
-      await Bun.sleep(ADMISSION_POLL_MS)
+      await Bun.sleep(RECALL_POLL_MS)
     }
     return "sending" as const
   }
 
-  // Puts a prompt this recall may have withdrawn back in the queue, then reads
-  // the queue to say truthfully where it is. When nothing shows it pending,
-  // its text goes to the prompt stash rather than being lost.
-  async function giveBack(sessionID: string, itemID: string, prompt: PromptInfo, reason: string) {
-    const restored = await sdk.client.session.queue.restore({ sessionID, id: itemID }).catch(() => undefined)
-    const listed = await sdk.client.session.queue.list({ sessionID }).catch(() => undefined)
-    if (listed?.data) sync.queue.listed(sessionID, listed.data)
-    if (restored?.data || listed?.data?.some((item) => item.id === itemID))
-      return toast.show({ variant: "info", message: `${reason}; it stays queued` })
-    // Refused because it was never withdrawn, and no longer listed: it was delivered.
-    if (restored?.response?.status === 404 && listed?.data)
-      return toast.show({ variant: "info", message: "That prompt is no longer pending" })
-    stash.push({ input: prompt.input, parts: prompt.parts })
+  // A request's receipt, following any merge to the request that now carries
+  // it (#228): null when the server has no such request, undefined when it
+  // could not be read.
+  async function carried(
+    sessionID: string,
+    requestID: string,
+    seen = new Set<string>(),
+  ): Promise<SessionPromptQueueReceipt | null | undefined> {
+    const read = await sdk.client.session.queue.receipt({ sessionID, requestID }).catch(() => undefined)
+    if (!read?.data) return read?.response?.status === 404 ? null : undefined
+    if (read.data.state !== "merged" || read.data.messageID || seen.has(read.data.into)) return read.data
+    return carried(sessionID, read.data.into, seen.add(requestID))
+  }
+
+  // Puts back a prompt this recall may have withdrawn, with one restore, then
+  // says where it is only once the server confirms it. Its text becomes the
+  // user's to resend only when the server confirms it is still withdrawn, so
+  // the queue and the user never both hold it to send.
+  async function giveBack(
+    taken: { sessionID: string; itemID: string; requestID?: string },
+    prompt: PromptInfo,
+    reason: string,
+  ) {
+    const restored = await sdk.client.session.queue
+      .restore({ sessionID: taken.sessionID, id: taken.itemID })
+      .catch(() => undefined)
+    // Answered either way, the queue holds it: put back, or never withdrawn.
+    const answered = restored?.data !== undefined || restored?.response?.status === 404
+    const deadline = Date.now() + RECALL_BACKSTOP_MS
+    while (Date.now() < deadline) {
+      const where = await custody(taken, answered)
+      if (where === "pending") return toast.show({ variant: "info", message: `${reason}; it stays queued` })
+      if (where === "gone")
+        return toast.show({
+          variant: "info",
+          message: restored?.data
+            ? `${reason}; it went back to the queue and is no longer pending`
+            : "That prompt is no longer pending",
+        })
+      if (where === "withdrawn") {
+        stash.push({ input: prompt.input, parts: prompt.parts })
+        return toast.show({
+          variant: "error",
+          message: `${reason}, and it could not be put back in the queue; its text is in the prompt stash`,
+        })
+      }
+      await Bun.sleep(RECALL_POLL_MS)
+    }
     toast.show({
       variant: "error",
-      message: `${reason}, and could not confirm it is still queued; its text is in the prompt stash`,
+      message: `${reason}, and could not confirm where it is; nothing was copied`,
     })
+  }
+
+  // Where a taken prompt is now, from what the server says after the restore:
+  // the queue's list, then its request's receipt. undefined while neither can
+  // tell.
+  async function custody(taken: { sessionID: string; itemID: string; requestID?: string }, answered: boolean) {
+    const listed = await sdk.client.session.queue.list({ sessionID: taken.sessionID }).catch(() => undefined)
+    if (listed?.data) sync.queue.listed(taken.sessionID, listed.data)
+    if (listed?.data?.some((item) => item.id === taken.itemID)) return "pending" as const
+    const receipt = taken.requestID ? await carried(taken.sessionID, taken.requestID) : undefined
+    if (receipt?.state === "pending") return "pending" as const
+    if (receipt?.state === "withdrawn" && receipt.itemID === taken.itemID) return "withdrawn" as const
+    if (receipt || receipt === null) return "gone" as const
+    // Not listed, and the restore's answer says the queue held it after.
+    if (listed?.data && answered) return "gone" as const
+    return undefined
   }
 
   let submitting = false

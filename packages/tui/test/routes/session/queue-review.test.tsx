@@ -73,6 +73,7 @@ async function startSession(
     queue?: SessionPromptQueueItem[]
     withdraw?: (itemID: string, apply: Apply) => Response | Promise<Response>
     restore?: (itemID: string, apply: Apply) => Response | Promise<Response>
+    list?: (apply: Apply) => Response | Promise<Response>
   } = {},
 ) {
   const setup = await createTestRenderer({ width: 160, height: 45, useThread: false })
@@ -80,7 +81,12 @@ async function startSession(
   // of the user's own and of the next test's.
   const state = await tmpdir()
   const events = createEventSource()
-  const queue = { items: options.queue ?? items, withdrawn: [] as SessionPromptQueueItem[] }
+  // `merged` maps a request the queue merged to the request it went into.
+  const queue = {
+    items: options.queue ?? items,
+    withdrawn: [] as SessionPromptQueueItem[],
+    merged: {} as Record<string, string>,
+  }
   const requests: string[] = []
   const selections: unknown[] = []
   const prompts: HeldPrompt[] = []
@@ -109,6 +115,8 @@ async function startSession(
     return json(found)
   }
   const receipt = (requestID: string) => {
+    const into = queue.merged[requestID]
+    if (into) return json({ state: "merged", into })
     const pending = queue.items.find((item) => item.requestID === requestID)
     if (pending) return json({ state: "pending", itemID: pending.id })
     const withdrawn = queue.withdrawn.find((item) => item.requestID === requestID)
@@ -149,6 +157,8 @@ async function startSession(
       return options.restore ? options.restore(body.id, restore(body.id)) : restore(body.id)()
     }
     if (path.startsWith(`/session/${sessionID}/queue/receipt/`)) return receipt(path.split("/").pop()!)
+    if (path === `/session/${sessionID}/queue` && request.method === "GET" && options.list)
+      return options.list(() => json(queue.items))
     if (path.startsWith(`/session/${sessionID}/queue/que_`) && request.method === "DELETE") {
       const itemID = path.split("/").pop()!
       return options.withdraw ? options.withdraw(itemID, withdraw(itemID)) : withdraw(itemID)()
@@ -508,9 +518,9 @@ test("a withdrawal whose answer is lost copies nothing and returns the prompt to
   }
 })
 
-test("a prompt withdrawn and then not restored is kept in the prompt stash, and the notice says so", async () => {
+test("a prompt the server confirms is still withdrawn after a failed restore is kept in the prompt stash", async () => {
   const app = await startSession({
-    queue: [items[1]!],
+    queue: [{ ...items[1]!, requestID: "queued-request" }],
     withdraw: (_, apply) => {
       apply()
       throw new TypeError("fetch failed")
@@ -536,6 +546,93 @@ test("a prompt withdrawn and then not restored is kept in the prompt stash, and 
         .split("\n")
         .map((line) => JSON.parse(line).input),
     ).toEqual(["queued for later"])
+  } finally {
+    await app.stop()
+  }
+})
+
+test("a restore whose answer is lost, while the queue's list is refused, copies nothing", async () => {
+  let refused = false
+  const app = await startSession({
+    queue: [{ ...items[1]!, requestID: "queued-request" }],
+    // Both changes land and both answers are lost; the list is refused.
+    withdraw: (_, apply) => {
+      apply()
+      throw new TypeError("fetch failed")
+    },
+    restore: (_, apply) => {
+      apply()
+      throw new TypeError("fetch failed")
+    },
+    list: (apply) =>
+      refused ? json({ name: "UnknownError", data: { message: "list failed" } }, { status: 500 }) : apply(),
+  })
+  try {
+    await until(() => shows(app, "1 pending"), "session")
+    refused = true
+    app.renderer.mockInput.pressArrow("up")
+    // Its receipt says the restore landed, so it is queued and nowhere else.
+    await until(() => said(app, "it stays queued"), "the notice")
+    expect(queuedIDs(app)).toEqual(["que_queue"])
+    expect(await Bun.file(path.join(app.state, "prompt-stash.jsonl")).exists()).toBe(false)
+    expect(composerLines(await screen(app), "queued for later")).toEqual([])
+  } finally {
+    await app.stop()
+  }
+})
+
+test("a prompt its restore put back and the queue then delivered is not said to stay queued", async () => {
+  const app = await startSession({
+    queue: [{ ...items[1]!, requestID: "queued-request" }],
+    withdraw: (_, apply) => {
+      apply()
+      throw new TypeError("fetch failed")
+    },
+    // The restore wakes the session, which delivers it at once.
+    restore: (_, apply) => {
+      const answer = apply()
+      app.publish([])
+      return answer
+    },
+  })
+  try {
+    await until(() => shows(app, "1 pending"), "session")
+    app.renderer.mockInput.pressArrow("up")
+    await until(() => said(app, "is no longer pending"), "the notice")
+    expect(await said(app, "it stays queued")).toBe(false)
+    expect(await Bun.file(path.join(app.state, "prompt-stash.jsonl")).exists()).toBe(false)
+  } finally {
+    await app.stop()
+  }
+})
+
+test("UP takes back a prompt still being sent that the queue merged into another, through each merge", async () => {
+  const app = await startSession({ queue: [] })
+  try {
+    await until(() => shows(app, "already in the transcript"), "session")
+    await app.renderer.mockInput.typeText("check the build")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the send")
+    const requestID = app.prompts[0]!.requestID!
+    // Merged twice over into a carrier whose listing this client missed.
+    app.queue.items = [
+      pendingItem("que_carrier", "check the lint, then check the build", {
+        requestID: "carrier",
+        origins: [{ time: 10, requestID: "carrier" }, { time: 11, requestID: "middle" }, { time: 12, requestID }],
+      }),
+    ]
+    app.queue.merged = { [requestID]: "middle", middle: "carrier" }
+    app.renderer.mockInput.pressArrow("up")
+    await until(
+      async () => composerLines(await screen(app), "check the lint, then check the build").length === 1,
+      "the recall",
+    )
+    expect(app.requests.filter((request) => request.startsWith("que_"))).toEqual(["que_carrier"])
+    expect(await said(app, "no longer pending")).toBe(false)
+    // Sent, the draft is not stashed into the next test's composer.
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 2, "the resend")
+    app.prompts[1]!.answer(json(transcript))
   } finally {
     await app.stop()
   }
