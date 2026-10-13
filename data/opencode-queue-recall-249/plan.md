@@ -63,3 +63,18 @@
 - swxtchio/swx-opencode#251: a withdrawn item's receipt stays `pending`; UP recall makes withdrawal a one-key action.
 - swxtchio/swx-opencode#252: "last" is the bottom row in delivery order, not the most recent admission.
 - swxtchio/swx-opencode#253: other rendered-app TUI tests write to the user's real state directory.
+
+## Round 2 (review round 1 adjudication)
+
+- Admission first: `SessionPrompt.prompt` admits a queued prompt before revert cleanup and model selection, which
+  run as `SessionQueue.request`'s `ready` under the queue lock.
+- `withdraw` settles the carried request to a new `withdrawn` receipt state and `restore` makes it pending again,
+  so swxtchio/swx-opencode#251 is fixed here.
+- The pending row and UP recall order by when a prompt was sent (`time.created`), which settles
+  swxtchio/swx-opencode#252 for this change. UP waits for a still-sending prompt's admission via its receipt.
+- One recall at a time through any restore; an unconfirmed withdrawal is restored, the queue is read back, and the
+  text goes to the prompt stash if nothing shows it queued.
+- Every authoritative queue list reconciles `session_sending` (`sync.queue.listed`).
+- Recall keeps unmentioned attachments and repeated mentions; the composer sends mention offsets into the expanded
+  text.
+- Slash commands remain swxtchio/swx-opencode#250, the captain's scope call.

@@ -162,12 +162,16 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Features
 
-- **#249** The TUI shows a sent prompt the moment the composer clears (swxtchio/swx-opencode#249). The pending row
-  under the prompt box lists the most recent pending prompts, each marked `QUEUED`, and a prompt still being sent
-  shows under the `requestID` it is sent as until the queue lists that request. UP on an empty composer withdraws the
-  last pending prompt and puts its typed text and mentions back in the composer; a prompt promoted before the
-  withdrawal is never copied, and one the composer can no longer take is restored to the queue. A send that ends
-  withdrawn is not reported as a failure. Server queue handling is unchanged. _Fork-only._
+- **#249** A sent prompt is never invisible (swxtchio/swx-opencode#249). `SessionPrompt.prompt` admits a queued
+  prompt before its revert cleanup and model selection, which run under the queue lock before any promotion can take
+  it. The TUI's pending row lists the most recently sent pending prompts, each marked `QUEUED`, and shows a prompt
+  still being sent under its `requestID` until any list of the queue carries that request. UP on an empty composer
+  withdraws the most recently sent pending prompt, waiting for one still being sent to be admitted, and puts its text,
+  mentions and attachments back in the composer. A prompt promoted first is never copied, one recall runs at a time
+  through any restore, and a withdrawal that cannot be confirmed is restored and read back, its text going to the
+  prompt stash if nothing shows it queued. Withdrawing an item makes its request's receipt `withdrawn` (a new receipt
+  state), restoring makes it `pending` again, and an exact retry of a withdrawn request answers `PromptWithdrawn`.
+  Mentions are sent at their offsets in the expanded text. _Fork-only._
 - **#245** Review and freshen pending queued prompts (swxtchio/swx-opencode#212). The TUI lists a session's pending
   prompts under the prompt box; reviewing them holds promotion (`hold`/`release` in `session/queue.ts`) while they are
   deleted, reordered or consolidated. A pending prompt runs at the session's current model and variant when it is

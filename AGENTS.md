@@ -187,9 +187,13 @@ const table = sqliteTable("session", {
   (`settleReceipts` in `queue.ts`), so any new path that deletes, merges or promotes a pending row must settle them, or
   the sender sees its request pending forever. Rules that hide a sender's text (`admission`) apply only when every item
   involved names a request.
+- A queued prompt is admitted before any other work on it: session work its delivery depends on runs as the `ready`
+  of `SessionQueue.request`, under the queue lock, so no promotion takes the item first (#249). Keep new pre-delivery
+  work there, not ahead of admission.
 - The TUI never copies a pending prompt into the composer: UP recall takes custody only through
-  `session.queue.withdraw`, and restores the item if the composer cannot take it (#249). A prompt the TUI is still
-  sending shows from `session_sending` in `context/sync.tsx` until a queue list carries its `requestID`.
+  `session.queue.withdraw`, holds its lock through any restore, and restores the item if the composer cannot take it
+  (#249). A withdrawn item's request is `withdrawn` until a restore. A prompt the TUI is still sending shows from
+  `session_sending` in `context/sync.tsx`; every list of the queue it reads goes through `sync.queue.listed`.
 
 ## Session Retention (fork)
 
