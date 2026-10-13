@@ -1,6 +1,6 @@
 {
   "provenance": {
-    "producerSHA": "511cc0ce204e573f5a35171615d059678fe71bcd",
+    "producerSHA": "b9ac365fbc2f885570adc5a918d345d83499ae24",
     "generator": "packages/opencode/test/session/queue-dispatch.test.ts",
     "test": "emits grouped consumer checkpoint through admission promotion and message reads",
     "runtime": "Bun 1.4.2",
@@ -12,7 +12,7 @@
       "name": "peer",
       "originalCalls": [
         {
-          "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+          "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
           "delivery": "queue",
           "noReply": true,
           "messageID": "msg_checkpoint_peer_request",
@@ -30,7 +30,7 @@
           ]
         },
         {
-          "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+          "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
           "delivery": "queue",
           "parts": [
             {
@@ -42,7 +42,7 @@
       ],
       "retryCalls": [
         {
-          "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+          "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
           "delivery": "queue",
           "noReply": true,
           "messageID": "msg_checkpoint_peer_retry_alias",
@@ -62,7 +62,7 @@
       ],
       "afterConsumeRetryCalls": [
         {
-          "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+          "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
           "delivery": "queue",
           "noReply": true,
           "messageID": "msg_checkpoint_peer_late_alias",
@@ -84,29 +84,29 @@
         "info": {
           "role": "user",
           "time": {
-            "created": 1791863724399
+            "created": 1791867033929
           },
           "agent": "build",
           "model": {
             "providerID": "test",
             "modelID": "test"
           },
-          "id": "msg_1336699660011y7cxSa27J6bSn",
-          "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw"
+          "id": "msg_133991948001E2R3FA6Oa3MLTV",
+          "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b"
         },
         "parts": [
           {
             "type": "text",
-            "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T03:55:24.359Z; queue que_133669946001T510PeyCRuk2sH]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T03:55:24.371Z; queue que_133669953001hbDX4EypEDQkkf]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2",
+            "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T04:50:33.915Z; queue que_13399193a001GwIzohU2VneEpv]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T04:50:33.919Z; queue que_13399193e001s2zQKOSIiUw1Br]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2",
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669946001T510PeyCRuk2sH",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193a001GwIzohU2VneEpv",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -125,12 +125,12 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724359
+                      "created": 1791867033915
                     }
                   },
                   {
-                    "id": "que_133669953001hbDX4EypEDQkkf",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193e001s2zQKOSIiUw1Br",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -142,15 +142,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724371
+                      "created": 1791867033919
                     }
                   }
                 ]
               }
             },
-            "id": "prt_133669970001tVJ41cvMYEyhTq",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_133991949001LG0dzrxoK01rq4",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           },
           {
             "type": "text",
@@ -160,12 +160,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669946001T510PeyCRuk2sH",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193a001GwIzohU2VneEpv",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -184,15 +184,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724359
+                      "created": 1791867033915
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_05a4fccda97cc3b54a982fc1b6858c0dc57ab72cf0d64b60b8af2b9c7865296b",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_queue_89ec4ccd3361371c17cc7f6c66a1de839f6cdafc6601629e4624ef286049f442",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           },
           {
             "type": "text",
@@ -202,12 +202,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669946001T510PeyCRuk2sH",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193a001GwIzohU2VneEpv",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -226,15 +226,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724359
+                      "created": 1791867033915
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_9378af7c2f72756d53e225addb025fb91a4b7822df6d5a425908e465997aa9f9",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_queue_8c9619e16d495a2a273c2509758926cb62e0cee7043010799c89b812367a480b",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           },
           {
             "type": "text",
@@ -244,12 +244,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669946001T510PeyCRuk2sH",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193a001GwIzohU2VneEpv",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -268,15 +268,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724359
+                      "created": 1791867033915
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_961c5db9fffa5cb64719576f27570b75815c5333b1bdc5b6ad88775aa8161c9d",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_queue_96c02e2fc27b862971b4d9dc83d2d34a5d4fd84d7eb96e89441b79f86902b790",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           },
           {
             "type": "text",
@@ -286,12 +286,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669953001hbDX4EypEDQkkf",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193e001s2zQKOSIiUw1Br",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -303,15 +303,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724371
+                      "created": 1791867033919
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_9a1b3de67f754c1f06b0ed795bbae70c2c866d7273fe841e226a1cf03a315ad9",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_queue_9b0677aa9463643a66a31b92dcf45191733ef7917cac885ffeefe7d70da5cf1b",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           },
           {
             "type": "text",
@@ -321,12 +321,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669946001T510PeyCRuk2sH",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193a001GwIzohU2VneEpv",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -345,15 +345,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724359
+                      "created": 1791867033915
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_aef4a3fabc3ffad3b4d8bec463ca20c368d8871615f179d9335a90d4f16220de",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_queue_d8245e41d702da2ef1feb0df1d6afb900c03072e24a0e660c57a225055e7e913",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           }
         ]
       },
@@ -363,15 +363,15 @@
           "content": [
             {
               "type": "text",
-              "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T03:55:24.359Z; queue que_133669946001T510PeyCRuk2sH]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T03:55:24.371Z; queue que_133669953001hbDX4EypEDQkkf]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+              "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T04:50:33.915Z; queue que_13399193a001GwIzohU2VneEpv]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T04:50:33.919Z; queue que_13399193e001s2zQKOSIiUw1Br]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
             }
           ]
         }
       ],
       "originals": [
         {
-          "id": "que_133669946001T510PeyCRuk2sH",
-          "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+          "id": "que_13399193a001GwIzohU2VneEpv",
+          "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
           "seq": 1,
           "delivery": "queue",
           "input": {
@@ -390,12 +390,12 @@
             ]
           },
           "time": {
-            "created": 1791863724359
+            "created": 1791867033915
           }
         },
         {
-          "id": "que_133669953001hbDX4EypEDQkkf",
-          "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+          "id": "que_13399193e001s2zQKOSIiUw1Br",
+          "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
           "seq": 2,
           "delivery": "queue",
           "input": {
@@ -407,7 +407,7 @@
             ]
           },
           "time": {
-            "created": 1791863724371
+            "created": 1791867033919
           }
         }
       ],
@@ -438,8 +438,8 @@
       ],
       "pendingBeforePromotion": [
         {
-          "id": "que_133669946001T510PeyCRuk2sH",
-          "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+          "id": "que_13399193a001GwIzohU2VneEpv",
+          "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
           "seq": 1,
           "delivery": "queue",
           "input": {
@@ -458,12 +458,12 @@
             ]
           },
           "time": {
-            "created": 1791863724359
+            "created": 1791867033915
           }
         },
         {
-          "id": "que_133669953001hbDX4EypEDQkkf",
-          "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+          "id": "que_13399193e001s2zQKOSIiUw1Br",
+          "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
           "seq": 2,
           "delivery": "queue",
           "input": {
@@ -475,7 +475,7 @@
             ]
           },
           "time": {
-            "created": 1791863724371
+            "created": 1791867033919
           }
         }
       ],
@@ -484,37 +484,37 @@
         "peersOnly": false
       },
       "deliveredOriginalIDs": [
-        "que_133669946001T510PeyCRuk2sH",
-        "que_133669953001hbDX4EypEDQkkf"
+        "que_13399193a001GwIzohU2VneEpv",
+        "que_13399193e001s2zQKOSIiUw1Br"
       ],
       "pendingAfterPromotion": [],
       "returnedMessage": {
         "info": {
           "role": "user",
           "time": {
-            "created": 1791863724399
+            "created": 1791867033929
           },
           "agent": "build",
           "model": {
             "providerID": "test",
             "modelID": "test"
           },
-          "id": "msg_1336699660011y7cxSa27J6bSn",
-          "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw"
+          "id": "msg_133991948001E2R3FA6Oa3MLTV",
+          "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b"
         },
         "parts": [
           {
             "type": "text",
-            "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T03:55:24.359Z; queue que_133669946001T510PeyCRuk2sH]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T03:55:24.371Z; queue que_133669953001hbDX4EypEDQkkf]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2",
+            "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T04:50:33.915Z; queue que_13399193a001GwIzohU2VneEpv]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T04:50:33.919Z; queue que_13399193e001s2zQKOSIiUw1Br]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2",
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669946001T510PeyCRuk2sH",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193a001GwIzohU2VneEpv",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -533,12 +533,12 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724359
+                      "created": 1791867033915
                     }
                   },
                   {
-                    "id": "que_133669953001hbDX4EypEDQkkf",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193e001s2zQKOSIiUw1Br",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -550,15 +550,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724371
+                      "created": 1791867033919
                     }
                   }
                 ]
               }
             },
-            "id": "prt_133669970001tVJ41cvMYEyhTq",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_133991949001LG0dzrxoK01rq4",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           },
           {
             "type": "text",
@@ -568,12 +568,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669946001T510PeyCRuk2sH",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193a001GwIzohU2VneEpv",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -592,15 +592,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724359
+                      "created": 1791867033915
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_9378af7c2f72756d53e225addb025fb91a4b7822df6d5a425908e465997aa9f9",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_queue_8c9619e16d495a2a273c2509758926cb62e0cee7043010799c89b812367a480b",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           },
           {
             "type": "text",
@@ -610,12 +610,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669946001T510PeyCRuk2sH",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193a001GwIzohU2VneEpv",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -634,15 +634,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724359
+                      "created": 1791867033915
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_961c5db9fffa5cb64719576f27570b75815c5333b1bdc5b6ad88775aa8161c9d",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_queue_96c02e2fc27b862971b4d9dc83d2d34a5d4fd84d7eb96e89441b79f86902b790",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           },
           {
             "type": "text",
@@ -652,12 +652,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669953001hbDX4EypEDQkkf",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193e001s2zQKOSIiUw1Br",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -669,15 +669,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724371
+                      "created": 1791867033919
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_9a1b3de67f754c1f06b0ed795bbae70c2c866d7273fe841e226a1cf03a315ad9",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_queue_9b0677aa9463643a66a31b92dcf45191733ef7917cac885ffeefe7d70da5cf1b",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           },
           {
             "type": "text",
@@ -687,12 +687,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669946001T510PeyCRuk2sH",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193a001GwIzohU2VneEpv",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -711,15 +711,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724359
+                      "created": 1791867033915
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_aef4a3fabc3ffad3b4d8bec463ca20c368d8871615f179d9335a90d4f16220de",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_queue_d8245e41d702da2ef1feb0df1d6afb900c03072e24a0e660c57a225055e7e913",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           }
         ]
       },
@@ -727,29 +727,29 @@
         "info": {
           "role": "user",
           "time": {
-            "created": 1791863724399
+            "created": 1791867033929
           },
           "agent": "build",
           "model": {
             "providerID": "test",
             "modelID": "test"
           },
-          "id": "msg_1336699660011y7cxSa27J6bSn",
-          "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw"
+          "id": "msg_133991948001E2R3FA6Oa3MLTV",
+          "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b"
         },
         "parts": [
           {
             "type": "text",
-            "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T03:55:24.359Z; queue que_133669946001T510PeyCRuk2sH]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T03:55:24.371Z; queue que_133669953001hbDX4EypEDQkkf]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2",
+            "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T04:50:33.915Z; queue que_13399193a001GwIzohU2VneEpv]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T04:50:33.919Z; queue que_13399193e001s2zQKOSIiUw1Br]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2",
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669946001T510PeyCRuk2sH",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193a001GwIzohU2VneEpv",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -768,12 +768,12 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724359
+                      "created": 1791867033915
                     }
                   },
                   {
-                    "id": "que_133669953001hbDX4EypEDQkkf",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193e001s2zQKOSIiUw1Br",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -785,15 +785,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724371
+                      "created": 1791867033919
                     }
                   }
                 ]
               }
             },
-            "id": "prt_133669970001tVJ41cvMYEyhTq",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_133991949001LG0dzrxoK01rq4",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           },
           {
             "type": "text",
@@ -803,12 +803,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669946001T510PeyCRuk2sH",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193a001GwIzohU2VneEpv",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -827,15 +827,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724359
+                      "created": 1791867033915
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_9378af7c2f72756d53e225addb025fb91a4b7822df6d5a425908e465997aa9f9",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_queue_8c9619e16d495a2a273c2509758926cb62e0cee7043010799c89b812367a480b",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           },
           {
             "type": "text",
@@ -845,12 +845,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669946001T510PeyCRuk2sH",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193a001GwIzohU2VneEpv",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -869,15 +869,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724359
+                      "created": 1791867033915
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_961c5db9fffa5cb64719576f27570b75815c5333b1bdc5b6ad88775aa8161c9d",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_queue_96c02e2fc27b862971b4d9dc83d2d34a5d4fd84d7eb96e89441b79f86902b790",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           },
           {
             "type": "text",
@@ -887,12 +887,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669953001hbDX4EypEDQkkf",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193e001s2zQKOSIiUw1Br",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -904,15 +904,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724371
+                      "created": 1791867033919
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_9a1b3de67f754c1f06b0ed795bbae70c2c866d7273fe841e226a1cf03a315ad9",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_queue_9b0677aa9463643a66a31b92dcf45191733ef7917cac885ffeefe7d70da5cf1b",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           },
           {
             "type": "text",
@@ -922,12 +922,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669946001T510PeyCRuk2sH",
-                    "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
+                    "id": "que_13399193a001GwIzohU2VneEpv",
+                    "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -946,63 +946,63 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724359
+                      "created": 1791867033915
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_aef4a3fabc3ffad3b4d8bec463ca20c368d8871615f179d9335a90d4f16220de",
-            "sessionID": "ses_ecc9966d8ffeRQ9cSW6GGtddIw",
-            "messageID": "msg_1336699660011y7cxSa27J6bSn"
+            "id": "prt_queue_d8245e41d702da2ef1feb0df1d6afb900c03072e24a0e660c57a225055e7e913",
+            "sessionID": "ses_ecc66e6d0ffeEH4m52nxoLm38b",
+            "messageID": "msg_133991948001E2R3FA6Oa3MLTV"
           }
         ]
       },
       "witnesses": [
         {
-          "partID": "prt_133669970001tVJ41cvMYEyhTq",
-          "messageID": "msg_1336699660011y7cxSa27J6bSn",
+          "partID": "prt_133991949001LG0dzrxoK01rq4",
+          "messageID": "msg_133991948001E2R3FA6Oa3MLTV",
           "ignored": false,
           "synthetic": false,
           "constituentIDs": [
-            "que_133669946001T510PeyCRuk2sH",
-            "que_133669953001hbDX4EypEDQkkf"
+            "que_13399193a001GwIzohU2VneEpv",
+            "que_13399193e001s2zQKOSIiUw1Br"
           ]
         },
         {
-          "partID": "prt_queue_9378af7c2f72756d53e225addb025fb91a4b7822df6d5a425908e465997aa9f9",
-          "messageID": "msg_1336699660011y7cxSa27J6bSn",
+          "partID": "prt_queue_8c9619e16d495a2a273c2509758926cb62e0cee7043010799c89b812367a480b",
+          "messageID": "msg_133991948001E2R3FA6Oa3MLTV",
           "ignored": true,
           "synthetic": true,
           "constituentIDs": [
-            "que_133669946001T510PeyCRuk2sH"
+            "que_13399193a001GwIzohU2VneEpv"
           ]
         },
         {
-          "partID": "prt_queue_961c5db9fffa5cb64719576f27570b75815c5333b1bdc5b6ad88775aa8161c9d",
-          "messageID": "msg_1336699660011y7cxSa27J6bSn",
+          "partID": "prt_queue_96c02e2fc27b862971b4d9dc83d2d34a5d4fd84d7eb96e89441b79f86902b790",
+          "messageID": "msg_133991948001E2R3FA6Oa3MLTV",
           "ignored": true,
           "synthetic": true,
           "constituentIDs": [
-            "que_133669946001T510PeyCRuk2sH"
+            "que_13399193a001GwIzohU2VneEpv"
           ]
         },
         {
-          "partID": "prt_queue_9a1b3de67f754c1f06b0ed795bbae70c2c866d7273fe841e226a1cf03a315ad9",
-          "messageID": "msg_1336699660011y7cxSa27J6bSn",
+          "partID": "prt_queue_9b0677aa9463643a66a31b92dcf45191733ef7917cac885ffeefe7d70da5cf1b",
+          "messageID": "msg_133991948001E2R3FA6Oa3MLTV",
           "ignored": true,
           "synthetic": true,
           "constituentIDs": [
-            "que_133669953001hbDX4EypEDQkkf"
+            "que_13399193e001s2zQKOSIiUw1Br"
           ]
         },
         {
-          "partID": "prt_queue_aef4a3fabc3ffad3b4d8bec463ca20c368d8871615f179d9335a90d4f16220de",
-          "messageID": "msg_1336699660011y7cxSa27J6bSn",
+          "partID": "prt_queue_d8245e41d702da2ef1feb0df1d6afb900c03072e24a0e660c57a225055e7e913",
+          "messageID": "msg_133991948001E2R3FA6Oa3MLTV",
           "ignored": true,
           "synthetic": true,
           "constituentIDs": [
-            "que_133669946001T510PeyCRuk2sH"
+            "que_13399193a001GwIzohU2VneEpv"
           ]
         }
       ],
@@ -1012,7 +1012,7 @@
           "content": [
             {
               "type": "text",
-              "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T03:55:24.359Z; queue que_133669946001T510PeyCRuk2sH]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T03:55:24.371Z; queue que_133669953001hbDX4EypEDQkkf]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+              "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T04:50:33.915Z; queue que_13399193a001GwIzohU2VneEpv]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T04:50:33.919Z; queue que_13399193e001s2zQKOSIiUw1Br]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
             }
           ]
         }
@@ -1025,7 +1025,7 @@
             "content": [
               {
                 "type": "text",
-                "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T03:55:24.359Z; queue que_133669946001T510PeyCRuk2sH]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T03:55:24.371Z; queue que_133669953001hbDX4EypEDQkkf]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+                "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T04:50:33.915Z; queue que_13399193a001GwIzohU2VneEpv]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T04:50:33.919Z; queue que_13399193e001s2zQKOSIiUw1Br]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
               }
             ]
           }
@@ -1036,7 +1036,7 @@
             "content": [
               {
                 "type": "text",
-                "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T03:55:24.359Z; queue que_133669946001T510PeyCRuk2sH]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T03:55:24.371Z; queue que_133669953001hbDX4EypEDQkkf]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+                "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T04:50:33.915Z; queue que_13399193a001GwIzohU2VneEpv]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T04:50:33.919Z; queue que_13399193e001s2zQKOSIiUw1Br]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
               },
               {
                 "type": "text",
@@ -1063,7 +1063,7 @@
       "name": "automation",
       "originalCalls": [
         {
-          "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+          "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
           "delivery": "queue",
           "messageID": "msg_checkpoint_notice_old",
           "parts": [
@@ -1074,7 +1074,7 @@
           ]
         },
         {
-          "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+          "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
           "delivery": "queue",
           "messageID": "msg_checkpoint_notice_distinct",
           "parts": [
@@ -1085,7 +1085,7 @@
           ]
         },
         {
-          "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+          "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
           "delivery": "queue",
           "messageID": "msg_checkpoint_notice_later",
           "parts": [
@@ -1102,29 +1102,29 @@
         "info": {
           "role": "user",
           "time": {
-            "created": 1791863724538
+            "created": 1791867033977
           },
           "agent": "build",
           "model": {
             "providerID": "test",
             "modelID": "test"
           },
-          "id": "msg_1336699f7001Ovz1UUg8NLgTfA",
-          "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0"
+          "id": "msg_133991979001gwv9nNXHVeknBf",
+          "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId"
         },
         "parts": [
           {
             "type": "text",
-            "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T03:55:24.522Z; queue que_1336699ea001jvQIBWBhsBrbZ7]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-13T03:55:24.532Z; queue que_1336699f4001AEXnWfGhmwRC6q]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation",
+            "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T04:50:33.957Z; queue que_133991965001vSiQ8KU8YgoDJk]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-13T04:50:33.973Z; queue que_133991973001qbtM55a4GqsO8u]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation",
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                 "kind": "watcher.check",
                 "constituents": [
                   {
-                    "id": "que_1336699e5001A1eH67xRTD0bwY",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                    "id": "que_133991964001MoFQv3qX1Kcs6J",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -1137,12 +1137,12 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724517
+                      "created": 1791867033956
                     }
                   },
                   {
-                    "id": "que_1336699ea001jvQIBWBhsBrbZ7",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                    "id": "que_133991965001vSiQ8KU8YgoDJk",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -1155,12 +1155,12 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724522
+                      "created": 1791867033957
                     }
                   },
                   {
-                    "id": "que_1336699f4001AEXnWfGhmwRC6q",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                    "id": "que_133991973001qbtM55a4GqsO8u",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                     "seq": 3,
                     "delivery": "queue",
                     "input": {
@@ -1173,15 +1173,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724532
+                      "created": 1791867033973
                     }
                   }
                 ]
               }
             },
-            "id": "prt_1336699fa001Hfq790gKcbbaw9",
-            "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-            "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA"
+            "id": "prt_1339919790022iGQMd0w6kcI3R",
+            "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+            "messageID": "msg_133991979001gwv9nNXHVeknBf"
           },
           {
             "type": "text",
@@ -1191,84 +1191,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                 "kind": "watcher.check",
                 "constituents": [
                   {
-                    "id": "que_1336699f4001AEXnWfGhmwRC6q",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-                    "seq": 3,
-                    "delivery": "queue",
-                    "input": {
-                      "messageID": "msg_checkpoint_notice_later",
-                      "parts": [
-                        {
-                          "type": "text",
-                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
-                        }
-                      ]
-                    },
-                    "time": {
-                      "created": 1791863724532
-                    }
-                  }
-                ]
-              }
-            },
-            "id": "prt_queue_3fb196264f92276ca37af470f050a5741069c21a35369ed45814e87cba76c42d",
-            "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-            "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA"
-          },
-          {
-            "type": "text",
-            "text": "",
-            "ignored": true,
-            "synthetic": true,
-            "metadata": {
-              "sessionQueue": {
-                "version": 1,
-                "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-                "kind": "watcher.check",
-                "constituents": [
-                  {
-                    "id": "que_1336699ea001jvQIBWBhsBrbZ7",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-                    "seq": 2,
-                    "delivery": "queue",
-                    "input": {
-                      "messageID": "msg_checkpoint_notice_distinct",
-                      "parts": [
-                        {
-                          "type": "text",
-                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation"
-                        }
-                      ]
-                    },
-                    "time": {
-                      "created": 1791863724522
-                    }
-                  }
-                ]
-              }
-            },
-            "id": "prt_queue_b53b8fa2ef4ce6ed4405248011029f04466b3aac37907e549705b41eda5fd532",
-            "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-            "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA"
-          },
-          {
-            "type": "text",
-            "text": "",
-            "ignored": true,
-            "synthetic": true,
-            "metadata": {
-              "sessionQueue": {
-                "version": 1,
-                "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-                "kind": "watcher.check",
-                "constituents": [
-                  {
-                    "id": "que_1336699e5001A1eH67xRTD0bwY",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                    "id": "que_133991964001MoFQv3qX1Kcs6J",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -1281,15 +1209,87 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724517
+                      "created": 1791867033956
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_eb2cceee99baac4ab0ee427a786700a7cbe6be0534f5c39f76d8becf0a878f95",
-            "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-            "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA"
+            "id": "prt_queue_3beac0dae2f75c52e21666321c821d6e16e371fb165b49d9be4fd7441e8aee78",
+            "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+            "messageID": "msg_133991979001gwv9nNXHVeknBf"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+                "kind": "watcher.check",
+                "constituents": [
+                  {
+                    "id": "que_133991965001vSiQ8KU8YgoDJk",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+                    "seq": 2,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_distinct",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791867033957
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_6c732095e74d3b4376bcc4d062f5f599848a76d42c2d1443620ff7337ec330b5",
+            "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+            "messageID": "msg_133991979001gwv9nNXHVeknBf"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+                "kind": "watcher.check",
+                "constituents": [
+                  {
+                    "id": "que_133991973001qbtM55a4GqsO8u",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+                    "seq": 3,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_later",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791867033973
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_acb2372f4611e595a773c6e98c8303fdea47ebb8b03603e215e696ee9ead0327",
+            "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+            "messageID": "msg_133991979001gwv9nNXHVeknBf"
           }
         ]
       },
@@ -1299,15 +1299,15 @@
           "content": [
             {
               "type": "text",
-              "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T03:55:24.522Z; queue que_1336699ea001jvQIBWBhsBrbZ7]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-13T03:55:24.532Z; queue que_1336699f4001AEXnWfGhmwRC6q]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+              "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T04:50:33.957Z; queue que_133991965001vSiQ8KU8YgoDJk]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-13T04:50:33.973Z; queue que_133991973001qbtM55a4GqsO8u]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
             }
           ]
         }
       ],
       "originals": [
         {
-          "id": "que_1336699e5001A1eH67xRTD0bwY",
-          "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+          "id": "que_133991964001MoFQv3qX1Kcs6J",
+          "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
           "seq": 1,
           "delivery": "queue",
           "input": {
@@ -1320,12 +1320,12 @@
             ]
           },
           "time": {
-            "created": 1791863724517
+            "created": 1791867033956
           }
         },
         {
-          "id": "que_1336699ea001jvQIBWBhsBrbZ7",
-          "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+          "id": "que_133991965001vSiQ8KU8YgoDJk",
+          "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
           "seq": 2,
           "delivery": "queue",
           "input": {
@@ -1338,12 +1338,12 @@
             ]
           },
           "time": {
-            "created": 1791863724522
+            "created": 1791867033957
           }
         },
         {
-          "id": "que_1336699f4001AEXnWfGhmwRC6q",
-          "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+          "id": "que_133991973001qbtM55a4GqsO8u",
+          "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
           "seq": 3,
           "delivery": "queue",
           "input": {
@@ -1356,7 +1356,7 @@
             ]
           },
           "time": {
-            "created": 1791863724532
+            "created": 1791867033973
           }
         }
       ],
@@ -1391,8 +1391,8 @@
       ],
       "pendingBeforePromotion": [
         {
-          "id": "que_1336699e5001A1eH67xRTD0bwY",
-          "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+          "id": "que_133991964001MoFQv3qX1Kcs6J",
+          "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
           "seq": 1,
           "delivery": "queue",
           "input": {
@@ -1405,12 +1405,12 @@
             ]
           },
           "time": {
-            "created": 1791863724517
+            "created": 1791867033956
           }
         },
         {
-          "id": "que_1336699ea001jvQIBWBhsBrbZ7",
-          "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+          "id": "que_133991965001vSiQ8KU8YgoDJk",
+          "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
           "seq": 2,
           "delivery": "queue",
           "input": {
@@ -1423,12 +1423,12 @@
             ]
           },
           "time": {
-            "created": 1791863724522
+            "created": 1791867033957
           }
         },
         {
-          "id": "que_1336699f4001AEXnWfGhmwRC6q",
-          "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+          "id": "que_133991973001qbtM55a4GqsO8u",
+          "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
           "seq": 3,
           "delivery": "queue",
           "input": {
@@ -1441,7 +1441,7 @@
             ]
           },
           "time": {
-            "created": 1791863724532
+            "created": 1791867033973
           }
         }
       ],
@@ -1450,38 +1450,38 @@
         "peersOnly": false
       },
       "deliveredOriginalIDs": [
-        "que_1336699e5001A1eH67xRTD0bwY",
-        "que_1336699ea001jvQIBWBhsBrbZ7",
-        "que_1336699f4001AEXnWfGhmwRC6q"
+        "que_133991964001MoFQv3qX1Kcs6J",
+        "que_133991965001vSiQ8KU8YgoDJk",
+        "que_133991973001qbtM55a4GqsO8u"
       ],
       "pendingAfterPromotion": [],
       "returnedMessage": {
         "info": {
           "role": "user",
           "time": {
-            "created": 1791863724538
+            "created": 1791867033977
           },
           "agent": "build",
           "model": {
             "providerID": "test",
             "modelID": "test"
           },
-          "id": "msg_1336699f7001Ovz1UUg8NLgTfA",
-          "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0"
+          "id": "msg_133991979001gwv9nNXHVeknBf",
+          "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId"
         },
         "parts": [
           {
             "type": "text",
-            "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T03:55:24.522Z; queue que_1336699ea001jvQIBWBhsBrbZ7]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-13T03:55:24.532Z; queue que_1336699f4001AEXnWfGhmwRC6q]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation",
+            "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T04:50:33.957Z; queue que_133991965001vSiQ8KU8YgoDJk]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-13T04:50:33.973Z; queue que_133991973001qbtM55a4GqsO8u]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation",
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                 "kind": "watcher.check",
                 "constituents": [
                   {
-                    "id": "que_1336699e5001A1eH67xRTD0bwY",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                    "id": "que_133991964001MoFQv3qX1Kcs6J",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -1494,12 +1494,12 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724517
+                      "created": 1791867033956
                     }
                   },
                   {
-                    "id": "que_1336699ea001jvQIBWBhsBrbZ7",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                    "id": "que_133991965001vSiQ8KU8YgoDJk",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -1512,12 +1512,12 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724522
+                      "created": 1791867033957
                     }
                   },
                   {
-                    "id": "que_1336699f4001AEXnWfGhmwRC6q",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                    "id": "que_133991973001qbtM55a4GqsO8u",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                     "seq": 3,
                     "delivery": "queue",
                     "input": {
@@ -1530,15 +1530,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724532
+                      "created": 1791867033973
                     }
                   }
                 ]
               }
             },
-            "id": "prt_1336699fa001Hfq790gKcbbaw9",
-            "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-            "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA"
+            "id": "prt_1339919790022iGQMd0w6kcI3R",
+            "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+            "messageID": "msg_133991979001gwv9nNXHVeknBf"
           },
           {
             "type": "text",
@@ -1548,84 +1548,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                 "kind": "watcher.check",
                 "constituents": [
                   {
-                    "id": "que_1336699f4001AEXnWfGhmwRC6q",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-                    "seq": 3,
-                    "delivery": "queue",
-                    "input": {
-                      "messageID": "msg_checkpoint_notice_later",
-                      "parts": [
-                        {
-                          "type": "text",
-                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
-                        }
-                      ]
-                    },
-                    "time": {
-                      "created": 1791863724532
-                    }
-                  }
-                ]
-              }
-            },
-            "id": "prt_queue_3fb196264f92276ca37af470f050a5741069c21a35369ed45814e87cba76c42d",
-            "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-            "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA"
-          },
-          {
-            "type": "text",
-            "text": "",
-            "ignored": true,
-            "synthetic": true,
-            "metadata": {
-              "sessionQueue": {
-                "version": 1,
-                "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-                "kind": "watcher.check",
-                "constituents": [
-                  {
-                    "id": "que_1336699ea001jvQIBWBhsBrbZ7",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-                    "seq": 2,
-                    "delivery": "queue",
-                    "input": {
-                      "messageID": "msg_checkpoint_notice_distinct",
-                      "parts": [
-                        {
-                          "type": "text",
-                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation"
-                        }
-                      ]
-                    },
-                    "time": {
-                      "created": 1791863724522
-                    }
-                  }
-                ]
-              }
-            },
-            "id": "prt_queue_b53b8fa2ef4ce6ed4405248011029f04466b3aac37907e549705b41eda5fd532",
-            "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-            "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA"
-          },
-          {
-            "type": "text",
-            "text": "",
-            "ignored": true,
-            "synthetic": true,
-            "metadata": {
-              "sessionQueue": {
-                "version": 1,
-                "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-                "kind": "watcher.check",
-                "constituents": [
-                  {
-                    "id": "que_1336699e5001A1eH67xRTD0bwY",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                    "id": "que_133991964001MoFQv3qX1Kcs6J",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -1638,15 +1566,87 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724517
+                      "created": 1791867033956
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_eb2cceee99baac4ab0ee427a786700a7cbe6be0534f5c39f76d8becf0a878f95",
-            "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-            "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA"
+            "id": "prt_queue_3beac0dae2f75c52e21666321c821d6e16e371fb165b49d9be4fd7441e8aee78",
+            "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+            "messageID": "msg_133991979001gwv9nNXHVeknBf"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+                "kind": "watcher.check",
+                "constituents": [
+                  {
+                    "id": "que_133991965001vSiQ8KU8YgoDJk",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+                    "seq": 2,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_distinct",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791867033957
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_6c732095e74d3b4376bcc4d062f5f599848a76d42c2d1443620ff7337ec330b5",
+            "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+            "messageID": "msg_133991979001gwv9nNXHVeknBf"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+                "kind": "watcher.check",
+                "constituents": [
+                  {
+                    "id": "que_133991973001qbtM55a4GqsO8u",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+                    "seq": 3,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_later",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791867033973
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_acb2372f4611e595a773c6e98c8303fdea47ebb8b03603e215e696ee9ead0327",
+            "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+            "messageID": "msg_133991979001gwv9nNXHVeknBf"
           }
         ]
       },
@@ -1654,29 +1654,29 @@
         "info": {
           "role": "user",
           "time": {
-            "created": 1791863724538
+            "created": 1791867033977
           },
           "agent": "build",
           "model": {
             "providerID": "test",
             "modelID": "test"
           },
-          "id": "msg_1336699f7001Ovz1UUg8NLgTfA",
-          "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0"
+          "id": "msg_133991979001gwv9nNXHVeknBf",
+          "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId"
         },
         "parts": [
           {
             "type": "text",
-            "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T03:55:24.522Z; queue que_1336699ea001jvQIBWBhsBrbZ7]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-13T03:55:24.532Z; queue que_1336699f4001AEXnWfGhmwRC6q]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation",
+            "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T04:50:33.957Z; queue que_133991965001vSiQ8KU8YgoDJk]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-13T04:50:33.973Z; queue que_133991973001qbtM55a4GqsO8u]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation",
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                 "kind": "watcher.check",
                 "constituents": [
                   {
-                    "id": "que_1336699e5001A1eH67xRTD0bwY",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                    "id": "que_133991964001MoFQv3qX1Kcs6J",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -1689,12 +1689,12 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724517
+                      "created": 1791867033956
                     }
                   },
                   {
-                    "id": "que_1336699ea001jvQIBWBhsBrbZ7",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                    "id": "que_133991965001vSiQ8KU8YgoDJk",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -1707,12 +1707,12 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724522
+                      "created": 1791867033957
                     }
                   },
                   {
-                    "id": "que_1336699f4001AEXnWfGhmwRC6q",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                    "id": "que_133991973001qbtM55a4GqsO8u",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                     "seq": 3,
                     "delivery": "queue",
                     "input": {
@@ -1725,15 +1725,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724532
+                      "created": 1791867033973
                     }
                   }
                 ]
               }
             },
-            "id": "prt_1336699fa001Hfq790gKcbbaw9",
-            "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-            "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA"
+            "id": "prt_1339919790022iGQMd0w6kcI3R",
+            "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+            "messageID": "msg_133991979001gwv9nNXHVeknBf"
           },
           {
             "type": "text",
@@ -1743,84 +1743,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                 "kind": "watcher.check",
                 "constituents": [
                   {
-                    "id": "que_1336699f4001AEXnWfGhmwRC6q",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-                    "seq": 3,
-                    "delivery": "queue",
-                    "input": {
-                      "messageID": "msg_checkpoint_notice_later",
-                      "parts": [
-                        {
-                          "type": "text",
-                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
-                        }
-                      ]
-                    },
-                    "time": {
-                      "created": 1791863724532
-                    }
-                  }
-                ]
-              }
-            },
-            "id": "prt_queue_3fb196264f92276ca37af470f050a5741069c21a35369ed45814e87cba76c42d",
-            "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-            "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA"
-          },
-          {
-            "type": "text",
-            "text": "",
-            "ignored": true,
-            "synthetic": true,
-            "metadata": {
-              "sessionQueue": {
-                "version": 1,
-                "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-                "kind": "watcher.check",
-                "constituents": [
-                  {
-                    "id": "que_1336699ea001jvQIBWBhsBrbZ7",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-                    "seq": 2,
-                    "delivery": "queue",
-                    "input": {
-                      "messageID": "msg_checkpoint_notice_distinct",
-                      "parts": [
-                        {
-                          "type": "text",
-                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation"
-                        }
-                      ]
-                    },
-                    "time": {
-                      "created": 1791863724522
-                    }
-                  }
-                ]
-              }
-            },
-            "id": "prt_queue_b53b8fa2ef4ce6ed4405248011029f04466b3aac37907e549705b41eda5fd532",
-            "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-            "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA"
-          },
-          {
-            "type": "text",
-            "text": "",
-            "ignored": true,
-            "synthetic": true,
-            "metadata": {
-              "sessionQueue": {
-                "version": 1,
-                "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-                "kind": "watcher.check",
-                "constituents": [
-                  {
-                    "id": "que_1336699e5001A1eH67xRTD0bwY",
-                    "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
+                    "id": "que_133991964001MoFQv3qX1Kcs6J",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -1833,55 +1761,127 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724517
+                      "created": 1791867033956
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_eb2cceee99baac4ab0ee427a786700a7cbe6be0534f5c39f76d8becf0a878f95",
-            "sessionID": "ses_ecc996622ffeKJcUAhxZJHp8d0",
-            "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA"
+            "id": "prt_queue_3beac0dae2f75c52e21666321c821d6e16e371fb165b49d9be4fd7441e8aee78",
+            "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+            "messageID": "msg_133991979001gwv9nNXHVeknBf"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+                "kind": "watcher.check",
+                "constituents": [
+                  {
+                    "id": "que_133991965001vSiQ8KU8YgoDJk",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+                    "seq": 2,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_distinct",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791867033957
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_6c732095e74d3b4376bcc4d062f5f599848a76d42c2d1443620ff7337ec330b5",
+            "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+            "messageID": "msg_133991979001gwv9nNXHVeknBf"
+          },
+          {
+            "type": "text",
+            "text": "",
+            "ignored": true,
+            "synthetic": true,
+            "metadata": {
+              "sessionQueue": {
+                "version": 1,
+                "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+                "kind": "watcher.check",
+                "constituents": [
+                  {
+                    "id": "que_133991973001qbtM55a4GqsO8u",
+                    "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+                    "seq": 3,
+                    "delivery": "queue",
+                    "input": {
+                      "messageID": "msg_checkpoint_notice_later",
+                      "parts": [
+                        {
+                          "type": "text",
+                          "text": "[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+                        }
+                      ]
+                    },
+                    "time": {
+                      "created": 1791867033973
+                    }
+                  }
+                ]
+              }
+            },
+            "id": "prt_queue_acb2372f4611e595a773c6e98c8303fdea47ebb8b03603e215e696ee9ead0327",
+            "sessionID": "ses_ecc66e69effeDA2AwDEjD1DXId",
+            "messageID": "msg_133991979001gwv9nNXHVeknBf"
           }
         ]
       },
       "witnesses": [
         {
-          "partID": "prt_1336699fa001Hfq790gKcbbaw9",
-          "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA",
+          "partID": "prt_1339919790022iGQMd0w6kcI3R",
+          "messageID": "msg_133991979001gwv9nNXHVeknBf",
           "ignored": false,
           "synthetic": false,
           "constituentIDs": [
-            "que_1336699e5001A1eH67xRTD0bwY",
-            "que_1336699ea001jvQIBWBhsBrbZ7",
-            "que_1336699f4001AEXnWfGhmwRC6q"
+            "que_133991964001MoFQv3qX1Kcs6J",
+            "que_133991965001vSiQ8KU8YgoDJk",
+            "que_133991973001qbtM55a4GqsO8u"
           ]
         },
         {
-          "partID": "prt_queue_3fb196264f92276ca37af470f050a5741069c21a35369ed45814e87cba76c42d",
-          "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA",
+          "partID": "prt_queue_3beac0dae2f75c52e21666321c821d6e16e371fb165b49d9be4fd7441e8aee78",
+          "messageID": "msg_133991979001gwv9nNXHVeknBf",
           "ignored": true,
           "synthetic": true,
           "constituentIDs": [
-            "que_1336699f4001AEXnWfGhmwRC6q"
+            "que_133991964001MoFQv3qX1Kcs6J"
           ]
         },
         {
-          "partID": "prt_queue_b53b8fa2ef4ce6ed4405248011029f04466b3aac37907e549705b41eda5fd532",
-          "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA",
+          "partID": "prt_queue_6c732095e74d3b4376bcc4d062f5f599848a76d42c2d1443620ff7337ec330b5",
+          "messageID": "msg_133991979001gwv9nNXHVeknBf",
           "ignored": true,
           "synthetic": true,
           "constituentIDs": [
-            "que_1336699ea001jvQIBWBhsBrbZ7"
+            "que_133991965001vSiQ8KU8YgoDJk"
           ]
         },
         {
-          "partID": "prt_queue_eb2cceee99baac4ab0ee427a786700a7cbe6be0534f5c39f76d8becf0a878f95",
-          "messageID": "msg_1336699f7001Ovz1UUg8NLgTfA",
+          "partID": "prt_queue_acb2372f4611e595a773c6e98c8303fdea47ebb8b03603e215e696ee9ead0327",
+          "messageID": "msg_133991979001gwv9nNXHVeknBf",
           "ignored": true,
           "synthetic": true,
           "constituentIDs": [
-            "que_1336699e5001A1eH67xRTD0bwY"
+            "que_133991973001qbtM55a4GqsO8u"
           ]
         }
       ],
@@ -1891,7 +1891,7 @@
           "content": [
             {
               "type": "text",
-              "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T03:55:24.522Z; queue que_1336699ea001jvQIBWBhsBrbZ7]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-13T03:55:24.532Z; queue que_1336699f4001AEXnWfGhmwRC6q]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+              "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T04:50:33.957Z; queue que_133991965001vSiQ8KU8YgoDJk]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-13T04:50:33.973Z; queue que_133991973001qbtM55a4GqsO8u]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
             }
           ]
         }
@@ -1904,7 +1904,7 @@
             "content": [
               {
                 "type": "text",
-                "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T03:55:24.522Z; queue que_1336699ea001jvQIBWBhsBrbZ7]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-13T03:55:24.532Z; queue que_1336699f4001AEXnWfGhmwRC6q]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+                "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T04:50:33.957Z; queue que_133991965001vSiQ8KU8YgoDJk]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-13T04:50:33.973Z; queue que_133991973001qbtM55a4GqsO8u]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
               }
             ]
           }
@@ -1915,7 +1915,7 @@
             "content": [
               {
                 "type": "text",
-                "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T03:55:24.522Z; queue que_1336699ea001jvQIBWBhsBrbZ7]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-13T03:55:24.532Z; queue que_1336699f4001AEXnWfGhmwRC6q]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
+                "text": "Queued automation: watcher.check. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T04:50:33.957Z; queue que_133991965001vSiQ8KU8YgoDJk]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/two.check.sh: historical pending decision observation\n\n2. [Admitted 2026-10-13T04:50:33.973Z; queue que_133991973001qbtM55a4GqsO8u]\n[fm-level:nudge:watcher.wake]\u001f WATCHER FIRED [wake-1] - handle wake.\n\ncheck: /scratch/state/one.check.sh: historical converged observation"
               },
               {
                 "type": "text",
@@ -1938,7 +1938,7 @@
       "name": "heartbeat",
       "originalCalls": [
         {
-          "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+          "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
           "delivery": "queue",
           "messageID": "msg_checkpoint_heartbeat_one",
           "parts": [
@@ -1949,7 +1949,7 @@
           ]
         },
         {
-          "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+          "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
           "delivery": "queue",
           "messageID": "msg_checkpoint_heartbeat_two",
           "parts": [
@@ -1966,29 +1966,29 @@
         "info": {
           "role": "user",
           "time": {
-            "created": 1791863724635
+            "created": 1791867033998
           },
           "agent": "build",
           "model": {
             "providerID": "test",
             "modelID": "test"
           },
-          "id": "msg_133669a59001NvpZr3wXAPC0yI",
-          "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj"
+          "id": "msg_13399198d001oTGxt1AEF6Z4M8",
+          "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS"
         },
         "parts": [
           {
             "type": "text",
-            "text": "Queued automation: heartbeat. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T03:55:24.619Z; queue que_133669a4b001Y7wLBKiiCtwSc2]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-one.txt [fm-heartbeat-receipt:one]\n\n2. [Admitted 2026-10-13T03:55:24.628Z; queue que_133669a53001tVB6Yh41nry7tb]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-two.txt [fm-heartbeat-receipt:two]",
+            "text": "Queued automation: heartbeat. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T04:50:33.993Z; queue que_133991989001I8yX4e05CpsnLM]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-one.txt [fm-heartbeat-receipt:one]\n\n2. [Admitted 2026-10-13T04:50:33.995Z; queue que_13399198b001VbFKGpdAcu7aH0]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-two.txt [fm-heartbeat-receipt:two]",
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                 "kind": "heartbeat",
                 "constituents": [
                   {
-                    "id": "que_133669a4b001Y7wLBKiiCtwSc2",
-                    "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                    "id": "que_133991989001I8yX4e05CpsnLM",
+                    "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -2001,12 +2001,12 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724619
+                      "created": 1791867033993
                     }
                   },
                   {
-                    "id": "que_133669a53001tVB6Yh41nry7tb",
-                    "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                    "id": "que_13399198b001VbFKGpdAcu7aH0",
+                    "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -2019,15 +2019,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724628
+                      "created": 1791867033995
                     }
                   }
                 ]
               }
             },
-            "id": "prt_133669a5b001bRzR2sZNtbPTKz",
-            "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
-            "messageID": "msg_133669a59001NvpZr3wXAPC0yI"
+            "id": "prt_13399198e001DrSnTKIKI9ozdU",
+            "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
+            "messageID": "msg_13399198d001oTGxt1AEF6Z4M8"
           },
           {
             "type": "text",
@@ -2037,12 +2037,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                 "kind": "heartbeat",
                 "constituents": [
                   {
-                    "id": "que_133669a53001tVB6Yh41nry7tb",
-                    "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                    "id": "que_13399198b001VbFKGpdAcu7aH0",
+                    "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -2055,15 +2055,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724628
+                      "created": 1791867033995
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_76000d292bd32f883b17b3877f3b1112356abfc4fd06cd9cf08d824bf933d4b6",
-            "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
-            "messageID": "msg_133669a59001NvpZr3wXAPC0yI"
+            "id": "prt_queue_b12e6b7172eaba58a79ef97915197699f227797bc2d03449c1e28a88b23a6264",
+            "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
+            "messageID": "msg_13399198d001oTGxt1AEF6Z4M8"
           },
           {
             "type": "text",
@@ -2073,12 +2073,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                 "kind": "heartbeat",
                 "constituents": [
                   {
-                    "id": "que_133669a4b001Y7wLBKiiCtwSc2",
-                    "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                    "id": "que_133991989001I8yX4e05CpsnLM",
+                    "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -2091,15 +2091,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724619
+                      "created": 1791867033993
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_f4935bb74acaa5d04016eca5fb223aa02a29af92d0afa090f85ba6aecd8fe6b4",
-            "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
-            "messageID": "msg_133669a59001NvpZr3wXAPC0yI"
+            "id": "prt_queue_de4681d77260dc980cc3cdd8c3f4b360dbd9d95670e8ad7a60f8744a8c2d42ca",
+            "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
+            "messageID": "msg_13399198d001oTGxt1AEF6Z4M8"
           }
         ]
       },
@@ -2109,15 +2109,15 @@
           "content": [
             {
               "type": "text",
-              "text": "Queued automation: heartbeat. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T03:55:24.619Z; queue que_133669a4b001Y7wLBKiiCtwSc2]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-one.txt [fm-heartbeat-receipt:one]\n\n2. [Admitted 2026-10-13T03:55:24.628Z; queue que_133669a53001tVB6Yh41nry7tb]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-two.txt [fm-heartbeat-receipt:two]"
+              "text": "Queued automation: heartbeat. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T04:50:33.993Z; queue que_133991989001I8yX4e05CpsnLM]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-one.txt [fm-heartbeat-receipt:one]\n\n2. [Admitted 2026-10-13T04:50:33.995Z; queue que_13399198b001VbFKGpdAcu7aH0]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-two.txt [fm-heartbeat-receipt:two]"
             }
           ]
         }
       ],
       "originals": [
         {
-          "id": "que_133669a4b001Y7wLBKiiCtwSc2",
-          "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+          "id": "que_133991989001I8yX4e05CpsnLM",
+          "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
           "seq": 1,
           "delivery": "queue",
           "input": {
@@ -2130,12 +2130,12 @@
             ]
           },
           "time": {
-            "created": 1791863724619
+            "created": 1791867033993
           }
         },
         {
-          "id": "que_133669a53001tVB6Yh41nry7tb",
-          "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+          "id": "que_13399198b001VbFKGpdAcu7aH0",
+          "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
           "seq": 2,
           "delivery": "queue",
           "input": {
@@ -2148,7 +2148,7 @@
             ]
           },
           "time": {
-            "created": 1791863724628
+            "created": 1791867033995
           }
         }
       ],
@@ -2174,8 +2174,8 @@
       ],
       "pendingBeforePromotion": [
         {
-          "id": "que_133669a4b001Y7wLBKiiCtwSc2",
-          "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+          "id": "que_133991989001I8yX4e05CpsnLM",
+          "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
           "seq": 1,
           "delivery": "queue",
           "input": {
@@ -2188,12 +2188,12 @@
             ]
           },
           "time": {
-            "created": 1791863724619
+            "created": 1791867033993
           }
         },
         {
-          "id": "que_133669a53001tVB6Yh41nry7tb",
-          "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+          "id": "que_13399198b001VbFKGpdAcu7aH0",
+          "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
           "seq": 2,
           "delivery": "queue",
           "input": {
@@ -2206,7 +2206,7 @@
             ]
           },
           "time": {
-            "created": 1791863724628
+            "created": 1791867033995
           }
         }
       ],
@@ -2215,37 +2215,37 @@
         "peersOnly": false
       },
       "deliveredOriginalIDs": [
-        "que_133669a4b001Y7wLBKiiCtwSc2",
-        "que_133669a53001tVB6Yh41nry7tb"
+        "que_133991989001I8yX4e05CpsnLM",
+        "que_13399198b001VbFKGpdAcu7aH0"
       ],
       "pendingAfterPromotion": [],
       "returnedMessage": {
         "info": {
           "role": "user",
           "time": {
-            "created": 1791863724635
+            "created": 1791867033998
           },
           "agent": "build",
           "model": {
             "providerID": "test",
             "modelID": "test"
           },
-          "id": "msg_133669a59001NvpZr3wXAPC0yI",
-          "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj"
+          "id": "msg_13399198d001oTGxt1AEF6Z4M8",
+          "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS"
         },
         "parts": [
           {
             "type": "text",
-            "text": "Queued automation: heartbeat. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T03:55:24.619Z; queue que_133669a4b001Y7wLBKiiCtwSc2]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-one.txt [fm-heartbeat-receipt:one]\n\n2. [Admitted 2026-10-13T03:55:24.628Z; queue que_133669a53001tVB6Yh41nry7tb]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-two.txt [fm-heartbeat-receipt:two]",
+            "text": "Queued automation: heartbeat. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T04:50:33.993Z; queue que_133991989001I8yX4e05CpsnLM]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-one.txt [fm-heartbeat-receipt:one]\n\n2. [Admitted 2026-10-13T04:50:33.995Z; queue que_13399198b001VbFKGpdAcu7aH0]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-two.txt [fm-heartbeat-receipt:two]",
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                 "kind": "heartbeat",
                 "constituents": [
                   {
-                    "id": "que_133669a4b001Y7wLBKiiCtwSc2",
-                    "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                    "id": "que_133991989001I8yX4e05CpsnLM",
+                    "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -2258,12 +2258,12 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724619
+                      "created": 1791867033993
                     }
                   },
                   {
-                    "id": "que_133669a53001tVB6Yh41nry7tb",
-                    "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                    "id": "que_13399198b001VbFKGpdAcu7aH0",
+                    "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -2276,15 +2276,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724628
+                      "created": 1791867033995
                     }
                   }
                 ]
               }
             },
-            "id": "prt_133669a5b001bRzR2sZNtbPTKz",
-            "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
-            "messageID": "msg_133669a59001NvpZr3wXAPC0yI"
+            "id": "prt_13399198e001DrSnTKIKI9ozdU",
+            "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
+            "messageID": "msg_13399198d001oTGxt1AEF6Z4M8"
           },
           {
             "type": "text",
@@ -2294,12 +2294,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                 "kind": "heartbeat",
                 "constituents": [
                   {
-                    "id": "que_133669a53001tVB6Yh41nry7tb",
-                    "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                    "id": "que_13399198b001VbFKGpdAcu7aH0",
+                    "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -2312,15 +2312,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724628
+                      "created": 1791867033995
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_76000d292bd32f883b17b3877f3b1112356abfc4fd06cd9cf08d824bf933d4b6",
-            "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
-            "messageID": "msg_133669a59001NvpZr3wXAPC0yI"
+            "id": "prt_queue_b12e6b7172eaba58a79ef97915197699f227797bc2d03449c1e28a88b23a6264",
+            "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
+            "messageID": "msg_13399198d001oTGxt1AEF6Z4M8"
           },
           {
             "type": "text",
@@ -2330,12 +2330,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                 "kind": "heartbeat",
                 "constituents": [
                   {
-                    "id": "que_133669a4b001Y7wLBKiiCtwSc2",
-                    "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                    "id": "que_133991989001I8yX4e05CpsnLM",
+                    "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -2348,15 +2348,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724619
+                      "created": 1791867033993
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_f4935bb74acaa5d04016eca5fb223aa02a29af92d0afa090f85ba6aecd8fe6b4",
-            "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
-            "messageID": "msg_133669a59001NvpZr3wXAPC0yI"
+            "id": "prt_queue_de4681d77260dc980cc3cdd8c3f4b360dbd9d95670e8ad7a60f8744a8c2d42ca",
+            "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
+            "messageID": "msg_13399198d001oTGxt1AEF6Z4M8"
           }
         ]
       },
@@ -2364,29 +2364,29 @@
         "info": {
           "role": "user",
           "time": {
-            "created": 1791863724635
+            "created": 1791867033998
           },
           "agent": "build",
           "model": {
             "providerID": "test",
             "modelID": "test"
           },
-          "id": "msg_133669a59001NvpZr3wXAPC0yI",
-          "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj"
+          "id": "msg_13399198d001oTGxt1AEF6Z4M8",
+          "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS"
         },
         "parts": [
           {
             "type": "text",
-            "text": "Queued automation: heartbeat. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T03:55:24.619Z; queue que_133669a4b001Y7wLBKiiCtwSc2]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-one.txt [fm-heartbeat-receipt:one]\n\n2. [Admitted 2026-10-13T03:55:24.628Z; queue que_133669a53001tVB6Yh41nry7tb]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-two.txt [fm-heartbeat-receipt:two]",
+            "text": "Queued automation: heartbeat. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T04:50:33.993Z; queue que_133991989001I8yX4e05CpsnLM]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-one.txt [fm-heartbeat-receipt:one]\n\n2. [Admitted 2026-10-13T04:50:33.995Z; queue que_13399198b001VbFKGpdAcu7aH0]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-two.txt [fm-heartbeat-receipt:two]",
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                 "kind": "heartbeat",
                 "constituents": [
                   {
-                    "id": "que_133669a4b001Y7wLBKiiCtwSc2",
-                    "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                    "id": "que_133991989001I8yX4e05CpsnLM",
+                    "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -2399,12 +2399,12 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724619
+                      "created": 1791867033993
                     }
                   },
                   {
-                    "id": "que_133669a53001tVB6Yh41nry7tb",
-                    "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                    "id": "que_13399198b001VbFKGpdAcu7aH0",
+                    "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -2417,15 +2417,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724628
+                      "created": 1791867033995
                     }
                   }
                 ]
               }
             },
-            "id": "prt_133669a5b001bRzR2sZNtbPTKz",
-            "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
-            "messageID": "msg_133669a59001NvpZr3wXAPC0yI"
+            "id": "prt_13399198e001DrSnTKIKI9ozdU",
+            "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
+            "messageID": "msg_13399198d001oTGxt1AEF6Z4M8"
           },
           {
             "type": "text",
@@ -2435,12 +2435,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                 "kind": "heartbeat",
                 "constituents": [
                   {
-                    "id": "que_133669a53001tVB6Yh41nry7tb",
-                    "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                    "id": "que_13399198b001VbFKGpdAcu7aH0",
+                    "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -2453,15 +2453,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724628
+                      "created": 1791867033995
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_76000d292bd32f883b17b3877f3b1112356abfc4fd06cd9cf08d824bf933d4b6",
-            "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
-            "messageID": "msg_133669a59001NvpZr3wXAPC0yI"
+            "id": "prt_queue_b12e6b7172eaba58a79ef97915197699f227797bc2d03449c1e28a88b23a6264",
+            "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
+            "messageID": "msg_13399198d001oTGxt1AEF6Z4M8"
           },
           {
             "type": "text",
@@ -2471,12 +2471,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                 "kind": "heartbeat",
                 "constituents": [
                   {
-                    "id": "que_133669a4b001Y7wLBKiiCtwSc2",
-                    "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
+                    "id": "que_133991989001I8yX4e05CpsnLM",
+                    "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -2489,45 +2489,45 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724619
+                      "created": 1791867033993
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_f4935bb74acaa5d04016eca5fb223aa02a29af92d0afa090f85ba6aecd8fe6b4",
-            "sessionID": "ses_ecc9965bfffebyTn3M8DLqJJOj",
-            "messageID": "msg_133669a59001NvpZr3wXAPC0yI"
+            "id": "prt_queue_de4681d77260dc980cc3cdd8c3f4b360dbd9d95670e8ad7a60f8744a8c2d42ca",
+            "sessionID": "ses_ecc66e678ffexI1Jx7Xz0AUoWS",
+            "messageID": "msg_13399198d001oTGxt1AEF6Z4M8"
           }
         ]
       },
       "witnesses": [
         {
-          "partID": "prt_133669a5b001bRzR2sZNtbPTKz",
-          "messageID": "msg_133669a59001NvpZr3wXAPC0yI",
+          "partID": "prt_13399198e001DrSnTKIKI9ozdU",
+          "messageID": "msg_13399198d001oTGxt1AEF6Z4M8",
           "ignored": false,
           "synthetic": false,
           "constituentIDs": [
-            "que_133669a4b001Y7wLBKiiCtwSc2",
-            "que_133669a53001tVB6Yh41nry7tb"
+            "que_133991989001I8yX4e05CpsnLM",
+            "que_13399198b001VbFKGpdAcu7aH0"
           ]
         },
         {
-          "partID": "prt_queue_76000d292bd32f883b17b3877f3b1112356abfc4fd06cd9cf08d824bf933d4b6",
-          "messageID": "msg_133669a59001NvpZr3wXAPC0yI",
+          "partID": "prt_queue_b12e6b7172eaba58a79ef97915197699f227797bc2d03449c1e28a88b23a6264",
+          "messageID": "msg_13399198d001oTGxt1AEF6Z4M8",
           "ignored": true,
           "synthetic": true,
           "constituentIDs": [
-            "que_133669a53001tVB6Yh41nry7tb"
+            "que_13399198b001VbFKGpdAcu7aH0"
           ]
         },
         {
-          "partID": "prt_queue_f4935bb74acaa5d04016eca5fb223aa02a29af92d0afa090f85ba6aecd8fe6b4",
-          "messageID": "msg_133669a59001NvpZr3wXAPC0yI",
+          "partID": "prt_queue_de4681d77260dc980cc3cdd8c3f4b360dbd9d95670e8ad7a60f8744a8c2d42ca",
+          "messageID": "msg_13399198d001oTGxt1AEF6Z4M8",
           "ignored": true,
           "synthetic": true,
           "constituentIDs": [
-            "que_133669a4b001Y7wLBKiiCtwSc2"
+            "que_133991989001I8yX4e05CpsnLM"
           ]
         }
       ],
@@ -2537,7 +2537,7 @@
           "content": [
             {
               "type": "text",
-              "text": "Queued automation: heartbeat. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T03:55:24.619Z; queue que_133669a4b001Y7wLBKiiCtwSc2]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-one.txt [fm-heartbeat-receipt:one]\n\n2. [Admitted 2026-10-13T03:55:24.628Z; queue que_133669a53001tVB6Yh41nry7tb]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-two.txt [fm-heartbeat-receipt:two]"
+              "text": "Queued automation: heartbeat. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T04:50:33.993Z; queue que_133991989001I8yX4e05CpsnLM]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-one.txt [fm-heartbeat-receipt:one]\n\n2. [Admitted 2026-10-13T04:50:33.995Z; queue que_13399198b001VbFKGpdAcu7aH0]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-two.txt [fm-heartbeat-receipt:two]"
             }
           ]
         }
@@ -2550,7 +2550,7 @@
             "content": [
               {
                 "type": "text",
-                "text": "Queued automation: heartbeat. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T03:55:24.619Z; queue que_133669a4b001Y7wLBKiiCtwSc2]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-one.txt [fm-heartbeat-receipt:one]\n\n2. [Admitted 2026-10-13T03:55:24.628Z; queue que_133669a53001tVB6Yh41nry7tb]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-two.txt [fm-heartbeat-receipt:two]"
+                "text": "Queued automation: heartbeat. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T04:50:33.993Z; queue que_133991989001I8yX4e05CpsnLM]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-one.txt [fm-heartbeat-receipt:one]\n\n2. [Admitted 2026-10-13T04:50:33.995Z; queue que_13399198b001VbFKGpdAcu7aH0]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-two.txt [fm-heartbeat-receipt:two]"
               }
             ]
           }
@@ -2561,7 +2561,7 @@
             "content": [
               {
                 "type": "text",
-                "text": "Queued automation: heartbeat. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T03:55:24.619Z; queue que_133669a4b001Y7wLBKiiCtwSc2]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-one.txt [fm-heartbeat-receipt:one]\n\n2. [Admitted 2026-10-13T03:55:24.628Z; queue que_133669a53001tVB6Yh41nry7tb]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-two.txt [fm-heartbeat-receipt:two]"
+                "text": "Queued automation: heartbeat. Historical producer observations, not current measurements. Latest admitted text per identified episode is shown; the producer owns fresh measurements and pacing. Original constituents remain in sessionQueue metadata.\n\n1. [Admitted 2026-10-13T04:50:33.993Z; queue que_133991989001I8yX4e05CpsnLM]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-one.txt [fm-heartbeat-receipt:one]\n\n2. [Admitted 2026-10-13T04:50:33.995Z; queue que_13399198b001VbFKGpdAcu7aH0]\n[fm-level:nudge:heartbeat]\u001f Heartbeat summary: Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Esca… Full message: /scratch/duty-two.txt [fm-heartbeat-receipt:two]"
               },
               {
                 "type": "text",
@@ -2580,7 +2580,7 @@
       "name": "individual",
       "originalCalls": [
         {
-          "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz",
+          "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36",
           "delivery": "queue",
           "messageID": "msg_checkpoint_individual",
           "parts": [
@@ -2597,7 +2597,7 @@
         "info": {
           "role": "user",
           "time": {
-            "created": 1791863724705
+            "created": 1791867034009
           },
           "agent": "build",
           "model": {
@@ -2605,14 +2605,14 @@
             "modelID": "test"
           },
           "id": "msg_checkpoint_individual",
-          "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz"
+          "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36"
         },
         "parts": [
           {
             "type": "text",
             "text": "Synthetic individual original with stable transport identity",
-            "id": "prt_133669aa1001j3oplFN1aGw8im",
-            "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz",
+            "id": "prt_133991999001XcSauaovUiqCNj",
+            "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36",
             "messageID": "msg_checkpoint_individual"
           },
           {
@@ -2623,12 +2623,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz",
+                "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36",
                 "kind": "individual",
                 "constituents": [
                   {
-                    "id": "que_133669a9a001fmU38fGyoQhY0J",
-                    "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz",
+                    "id": "que_133991998001A9izQ8cVC8iXgO",
+                    "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -2641,14 +2641,14 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724698
+                      "created": 1791867034008
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_debaadad8c1bd790f9440cc19db41dba4b70fe754c680083441530b19c03a8e3",
-            "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz",
+            "id": "prt_queue_232f67dd929e3dc9bcb5d866e4cc9853b52fd79633d550560733e7976887fc55",
+            "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36",
             "messageID": "msg_checkpoint_individual"
           }
         ]
@@ -2666,8 +2666,8 @@
       ],
       "originals": [
         {
-          "id": "que_133669a9a001fmU38fGyoQhY0J",
-          "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz",
+          "id": "que_133991998001A9izQ8cVC8iXgO",
+          "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36",
           "seq": 1,
           "delivery": "queue",
           "input": {
@@ -2680,7 +2680,7 @@
             ]
           },
           "time": {
-            "created": 1791863724698
+            "created": 1791867034008
           }
         }
       ],
@@ -2697,8 +2697,8 @@
       ],
       "pendingBeforePromotion": [
         {
-          "id": "que_133669a9a001fmU38fGyoQhY0J",
-          "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz",
+          "id": "que_133991998001A9izQ8cVC8iXgO",
+          "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36",
           "seq": 1,
           "delivery": "queue",
           "input": {
@@ -2711,7 +2711,7 @@
             ]
           },
           "time": {
-            "created": 1791863724698
+            "created": 1791867034008
           }
         }
       ],
@@ -2720,14 +2720,14 @@
         "peersOnly": false
       },
       "deliveredOriginalIDs": [
-        "que_133669a9a001fmU38fGyoQhY0J"
+        "que_133991998001A9izQ8cVC8iXgO"
       ],
       "pendingAfterPromotion": [],
       "returnedMessage": {
         "info": {
           "role": "user",
           "time": {
-            "created": 1791863724705
+            "created": 1791867034009
           },
           "agent": "build",
           "model": {
@@ -2735,14 +2735,14 @@
             "modelID": "test"
           },
           "id": "msg_checkpoint_individual",
-          "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz"
+          "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36"
         },
         "parts": [
           {
             "type": "text",
             "text": "Synthetic individual original with stable transport identity",
-            "id": "prt_133669aa1001j3oplFN1aGw8im",
-            "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz",
+            "id": "prt_133991999001XcSauaovUiqCNj",
+            "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36",
             "messageID": "msg_checkpoint_individual"
           },
           {
@@ -2753,12 +2753,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz",
+                "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36",
                 "kind": "individual",
                 "constituents": [
                   {
-                    "id": "que_133669a9a001fmU38fGyoQhY0J",
-                    "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz",
+                    "id": "que_133991998001A9izQ8cVC8iXgO",
+                    "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -2771,14 +2771,14 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724698
+                      "created": 1791867034008
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_debaadad8c1bd790f9440cc19db41dba4b70fe754c680083441530b19c03a8e3",
-            "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz",
+            "id": "prt_queue_232f67dd929e3dc9bcb5d866e4cc9853b52fd79633d550560733e7976887fc55",
+            "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36",
             "messageID": "msg_checkpoint_individual"
           }
         ]
@@ -2787,7 +2787,7 @@
         "info": {
           "role": "user",
           "time": {
-            "created": 1791863724705
+            "created": 1791867034009
           },
           "agent": "build",
           "model": {
@@ -2795,14 +2795,14 @@
             "modelID": "test"
           },
           "id": "msg_checkpoint_individual",
-          "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz"
+          "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36"
         },
         "parts": [
           {
             "type": "text",
             "text": "Synthetic individual original with stable transport identity",
-            "id": "prt_133669aa1001j3oplFN1aGw8im",
-            "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz",
+            "id": "prt_133991999001XcSauaovUiqCNj",
+            "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36",
             "messageID": "msg_checkpoint_individual"
           },
           {
@@ -2813,12 +2813,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz",
+                "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36",
                 "kind": "individual",
                 "constituents": [
                   {
-                    "id": "que_133669a9a001fmU38fGyoQhY0J",
-                    "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz",
+                    "id": "que_133991998001A9izQ8cVC8iXgO",
+                    "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -2831,26 +2831,26 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724698
+                      "created": 1791867034008
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_debaadad8c1bd790f9440cc19db41dba4b70fe754c680083441530b19c03a8e3",
-            "sessionID": "ses_ecc99657bffeCGYE2Y51kCb4sz",
+            "id": "prt_queue_232f67dd929e3dc9bcb5d866e4cc9853b52fd79633d550560733e7976887fc55",
+            "sessionID": "ses_ecc66e669ffeb4tbIX15AOOD36",
             "messageID": "msg_checkpoint_individual"
           }
         ]
       },
       "witnesses": [
         {
-          "partID": "prt_queue_debaadad8c1bd790f9440cc19db41dba4b70fe754c680083441530b19c03a8e3",
+          "partID": "prt_queue_232f67dd929e3dc9bcb5d866e4cc9853b52fd79633d550560733e7976887fc55",
           "messageID": "msg_checkpoint_individual",
           "ignored": true,
           "synthetic": true,
           "constituentIDs": [
-            "que_133669a9a001fmU38fGyoQhY0J"
+            "que_133991998001A9izQ8cVC8iXgO"
           ]
         }
       ],
@@ -2899,7 +2899,7 @@
       "name": "peerContinuation",
       "originalCalls": [
         {
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "delivery": "queue",
           "noReply": true,
           "messageID": "msg_checkpoint_peer_request",
@@ -2917,7 +2917,7 @@
           ]
         },
         {
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "delivery": "queue",
           "parts": [
             {
@@ -2927,7 +2927,7 @@
           ]
         },
         {
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "delivery": "queue",
           "parts": [
             {
@@ -2937,7 +2937,7 @@
           ]
         },
         {
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "delivery": "queue",
           "parts": [
             {
@@ -2949,7 +2949,7 @@
       ],
       "retryCalls": [
         {
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "delivery": "queue",
           "noReply": true,
           "messageID": "msg_checkpoint_peer_retry_alias",
@@ -2969,7 +2969,7 @@
       ],
       "afterConsumeRetryCalls": [
         {
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "delivery": "queue",
           "noReply": true,
           "messageID": "msg_checkpoint_peer_late_alias",
@@ -2991,29 +2991,29 @@
         "info": {
           "role": "user",
           "time": {
-            "created": 1791863724796
+            "created": 1791867034025
           },
           "agent": "build",
           "model": {
             "providerID": "test",
             "modelID": "test"
           },
-          "id": "msg_133669aec001RNO8WoPeIuHvTz",
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN"
+          "id": "msg_1339919a8001M4pYNC0LleONfd",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G"
         },
         "parts": [
           {
             "type": "text",
-            "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T03:55:24.735Z; queue que_133669abe001QE8ZZxo9WUxrPJ]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T03:55:24.739Z; queue que_133669ac3001t1dqYZ5ITnHZ36]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2",
+            "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T04:50:34.018Z; queue que_1339919a2001p0jTEf9IreoW0K]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T04:50:34.019Z; queue que_1339919a3002R1s67HskRuiSnK]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2",
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669abe001QE8ZZxo9WUxrPJ",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a2001p0jTEf9IreoW0K",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -3032,12 +3032,12 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724735
+                      "created": 1791867034018
                     }
                   },
                   {
-                    "id": "que_133669ac3001t1dqYZ5ITnHZ36",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a3002R1s67HskRuiSnK",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -3049,15 +3049,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724739
+                      "created": 1791867034019
                     }
                   }
                 ]
               }
             },
-            "id": "prt_133669afc0018DvymxvqOrM0qn",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_1339919a90014r5XUUXxKXtJ9y",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           },
           {
             "type": "text",
@@ -3067,12 +3067,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669abe001QE8ZZxo9WUxrPJ",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a2001p0jTEf9IreoW0K",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -3091,15 +3091,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724735
+                      "created": 1791867034018
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_100137fce6adc890272bb18e783350c0776881b909ad49838a67f51e8c781098",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_queue_33cd71ebeef4b498343f090b1789629f9948796fa0f631fb9be1289e1ef9849d",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           },
           {
             "type": "text",
@@ -3109,12 +3109,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669abe001QE8ZZxo9WUxrPJ",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a2001p0jTEf9IreoW0K",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -3133,15 +3133,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724735
+                      "created": 1791867034018
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_895d467bed9d325bc03432aaae100adc46044ec639324d5976bac6240e268c38",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_queue_6bdccc76704e4d504cdae0a8c5f01454991d861e20555c85c2571838b4c7a50c",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           },
           {
             "type": "text",
@@ -3151,12 +3151,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669abe001QE8ZZxo9WUxrPJ",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a2001p0jTEf9IreoW0K",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -3175,15 +3175,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724735
+                      "created": 1791867034018
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_bc45cc07e633c49020a98ec5828a9426be6ca8a861826ef4f7cd051b284409ee",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_queue_96b0dc31064fec5fff88a3cffd5406e7b61c34ed57133223275c2bbc358a6255",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           },
           {
             "type": "text",
@@ -3193,12 +3193,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669ac3001t1dqYZ5ITnHZ36",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a3002R1s67HskRuiSnK",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -3210,15 +3210,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724739
+                      "created": 1791867034019
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_cf7b099f1c28f0307a81045955d8fb4059f4db8f7f26dfcd153b968ebcb6ee47",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_queue_f67f121e33df9447e79b482f778b44a4eeb86989baf31102047025fc3ecc80f5",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           },
           {
             "type": "text",
@@ -3228,12 +3228,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669abe001QE8ZZxo9WUxrPJ",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a2001p0jTEf9IreoW0K",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -3252,15 +3252,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724735
+                      "created": 1791867034018
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_cfcf7088d728db98cb42081a96eba8cb5693c46c90f25e5ee5d5e9c4399977fa",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_queue_fbbd5d387a7043cd3ff885a156fdd3ade320af3fb2ba637e984487d492e58738",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           }
         ]
       },
@@ -3270,15 +3270,15 @@
           "content": [
             {
               "type": "text",
-              "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T03:55:24.735Z; queue que_133669abe001QE8ZZxo9WUxrPJ]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T03:55:24.739Z; queue que_133669ac3001t1dqYZ5ITnHZ36]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+              "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T04:50:34.018Z; queue que_1339919a2001p0jTEf9IreoW0K]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T04:50:34.019Z; queue que_1339919a3002R1s67HskRuiSnK]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
             }
           ]
         }
       ],
       "originals": [
         {
-          "id": "que_133669abe001QE8ZZxo9WUxrPJ",
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "id": "que_1339919a2001p0jTEf9IreoW0K",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "seq": 1,
           "delivery": "queue",
           "input": {
@@ -3297,12 +3297,12 @@
             ]
           },
           "time": {
-            "created": 1791863724735
+            "created": 1791867034018
           }
         },
         {
-          "id": "que_133669ac3001t1dqYZ5ITnHZ36",
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "id": "que_1339919a3002R1s67HskRuiSnK",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "seq": 2,
           "delivery": "queue",
           "input": {
@@ -3314,12 +3314,12 @@
             ]
           },
           "time": {
-            "created": 1791863724739
+            "created": 1791867034019
           }
         },
         {
-          "id": "que_133669ac60018FXyVWfir0hGzQ",
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "id": "que_1339919a4002marWK30Kiq5exs",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "seq": 3,
           "delivery": "queue",
           "input": {
@@ -3331,12 +3331,12 @@
             ]
           },
           "time": {
-            "created": 1791863724742
+            "created": 1791867034020
           }
         },
         {
-          "id": "que_133669ac8001X21CedUkrdBPu2",
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "id": "que_1339919a4004pRnF9j6iR48o82",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "seq": 4,
           "delivery": "queue",
           "input": {
@@ -3348,7 +3348,7 @@
             ]
           },
           "time": {
-            "created": 1791863724744
+            "created": 1791867034020
           }
         }
       ],
@@ -3395,8 +3395,8 @@
       ],
       "pendingBeforePromotion": [
         {
-          "id": "que_133669abe001QE8ZZxo9WUxrPJ",
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "id": "que_1339919a2001p0jTEf9IreoW0K",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "seq": 1,
           "delivery": "queue",
           "input": {
@@ -3415,12 +3415,12 @@
             ]
           },
           "time": {
-            "created": 1791863724735
+            "created": 1791867034018
           }
         },
         {
-          "id": "que_133669ac3001t1dqYZ5ITnHZ36",
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "id": "que_1339919a3002R1s67HskRuiSnK",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "seq": 2,
           "delivery": "queue",
           "input": {
@@ -3432,12 +3432,12 @@
             ]
           },
           "time": {
-            "created": 1791863724739
+            "created": 1791867034019
           }
         },
         {
-          "id": "que_133669ac60018FXyVWfir0hGzQ",
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "id": "que_1339919a4002marWK30Kiq5exs",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "seq": 3,
           "delivery": "queue",
           "input": {
@@ -3449,12 +3449,12 @@
             ]
           },
           "time": {
-            "created": 1791863724742
+            "created": 1791867034020
           }
         },
         {
-          "id": "que_133669ac8001X21CedUkrdBPu2",
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "id": "que_1339919a4004pRnF9j6iR48o82",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "seq": 4,
           "delivery": "queue",
           "input": {
@@ -3466,7 +3466,7 @@
             ]
           },
           "time": {
-            "created": 1791863724744
+            "created": 1791867034020
           }
         }
       ],
@@ -3475,13 +3475,13 @@
         "peersOnly": true
       },
       "deliveredOriginalIDs": [
-        "que_133669abe001QE8ZZxo9WUxrPJ",
-        "que_133669ac3001t1dqYZ5ITnHZ36"
+        "que_1339919a2001p0jTEf9IreoW0K",
+        "que_1339919a3002R1s67HskRuiSnK"
       ],
       "pendingAfterPromotion": [
         {
-          "id": "que_133669ac60018FXyVWfir0hGzQ",
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "id": "que_1339919a4002marWK30Kiq5exs",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "seq": 3,
           "delivery": "queue",
           "input": {
@@ -3493,12 +3493,12 @@
             ]
           },
           "time": {
-            "created": 1791863724742
+            "created": 1791867034020
           }
         },
         {
-          "id": "que_133669ac8001X21CedUkrdBPu2",
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+          "id": "que_1339919a4004pRnF9j6iR48o82",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
           "seq": 4,
           "delivery": "queue",
           "input": {
@@ -3510,7 +3510,7 @@
             ]
           },
           "time": {
-            "created": 1791863724744
+            "created": 1791867034020
           }
         }
       ],
@@ -3518,29 +3518,29 @@
         "info": {
           "role": "user",
           "time": {
-            "created": 1791863724796
+            "created": 1791867034025
           },
           "agent": "build",
           "model": {
             "providerID": "test",
             "modelID": "test"
           },
-          "id": "msg_133669aec001RNO8WoPeIuHvTz",
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN"
+          "id": "msg_1339919a8001M4pYNC0LleONfd",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G"
         },
         "parts": [
           {
             "type": "text",
-            "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T03:55:24.735Z; queue que_133669abe001QE8ZZxo9WUxrPJ]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T03:55:24.739Z; queue que_133669ac3001t1dqYZ5ITnHZ36]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2",
+            "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T04:50:34.018Z; queue que_1339919a2001p0jTEf9IreoW0K]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T04:50:34.019Z; queue que_1339919a3002R1s67HskRuiSnK]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2",
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669abe001QE8ZZxo9WUxrPJ",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a2001p0jTEf9IreoW0K",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -3559,12 +3559,12 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724735
+                      "created": 1791867034018
                     }
                   },
                   {
-                    "id": "que_133669ac3001t1dqYZ5ITnHZ36",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a3002R1s67HskRuiSnK",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -3576,15 +3576,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724739
+                      "created": 1791867034019
                     }
                   }
                 ]
               }
             },
-            "id": "prt_133669afc0018DvymxvqOrM0qn",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_1339919a90014r5XUUXxKXtJ9y",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           },
           {
             "type": "text",
@@ -3594,12 +3594,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669abe001QE8ZZxo9WUxrPJ",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a2001p0jTEf9IreoW0K",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -3618,15 +3618,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724735
+                      "created": 1791867034018
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_100137fce6adc890272bb18e783350c0776881b909ad49838a67f51e8c781098",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_queue_6bdccc76704e4d504cdae0a8c5f01454991d861e20555c85c2571838b4c7a50c",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           },
           {
             "type": "text",
@@ -3636,12 +3636,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669abe001QE8ZZxo9WUxrPJ",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a2001p0jTEf9IreoW0K",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -3660,15 +3660,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724735
+                      "created": 1791867034018
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_bc45cc07e633c49020a98ec5828a9426be6ca8a861826ef4f7cd051b284409ee",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_queue_96b0dc31064fec5fff88a3cffd5406e7b61c34ed57133223275c2bbc358a6255",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           },
           {
             "type": "text",
@@ -3678,12 +3678,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669ac3001t1dqYZ5ITnHZ36",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a3002R1s67HskRuiSnK",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -3695,15 +3695,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724739
+                      "created": 1791867034019
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_cf7b099f1c28f0307a81045955d8fb4059f4db8f7f26dfcd153b968ebcb6ee47",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_queue_f67f121e33df9447e79b482f778b44a4eeb86989baf31102047025fc3ecc80f5",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           },
           {
             "type": "text",
@@ -3713,12 +3713,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669abe001QE8ZZxo9WUxrPJ",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a2001p0jTEf9IreoW0K",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -3737,15 +3737,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724735
+                      "created": 1791867034018
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_cfcf7088d728db98cb42081a96eba8cb5693c46c90f25e5ee5d5e9c4399977fa",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_queue_fbbd5d387a7043cd3ff885a156fdd3ade320af3fb2ba637e984487d492e58738",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           }
         ]
       },
@@ -3753,29 +3753,29 @@
         "info": {
           "role": "user",
           "time": {
-            "created": 1791863724796
+            "created": 1791867034025
           },
           "agent": "build",
           "model": {
             "providerID": "test",
             "modelID": "test"
           },
-          "id": "msg_133669aec001RNO8WoPeIuHvTz",
-          "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN"
+          "id": "msg_1339919a8001M4pYNC0LleONfd",
+          "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G"
         },
         "parts": [
           {
             "type": "text",
-            "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T03:55:24.735Z; queue que_133669abe001QE8ZZxo9WUxrPJ]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T03:55:24.739Z; queue que_133669ac3001t1dqYZ5ITnHZ36]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2",
+            "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T04:50:34.018Z; queue que_1339919a2001p0jTEf9IreoW0K]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T04:50:34.019Z; queue que_1339919a3002R1s67HskRuiSnK]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2",
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669abe001QE8ZZxo9WUxrPJ",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a2001p0jTEf9IreoW0K",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -3794,12 +3794,12 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724735
+                      "created": 1791867034018
                     }
                   },
                   {
-                    "id": "que_133669ac3001t1dqYZ5ITnHZ36",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a3002R1s67HskRuiSnK",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -3811,15 +3811,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724739
+                      "created": 1791867034019
                     }
                   }
                 ]
               }
             },
-            "id": "prt_133669afc0018DvymxvqOrM0qn",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_1339919a90014r5XUUXxKXtJ9y",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           },
           {
             "type": "text",
@@ -3829,12 +3829,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669abe001QE8ZZxo9WUxrPJ",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a2001p0jTEf9IreoW0K",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -3853,15 +3853,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724735
+                      "created": 1791867034018
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_100137fce6adc890272bb18e783350c0776881b909ad49838a67f51e8c781098",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_queue_6bdccc76704e4d504cdae0a8c5f01454991d861e20555c85c2571838b4c7a50c",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           },
           {
             "type": "text",
@@ -3871,12 +3871,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669abe001QE8ZZxo9WUxrPJ",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a2001p0jTEf9IreoW0K",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -3895,15 +3895,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724735
+                      "created": 1791867034018
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_bc45cc07e633c49020a98ec5828a9426be6ca8a861826ef4f7cd051b284409ee",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_queue_96b0dc31064fec5fff88a3cffd5406e7b61c34ed57133223275c2bbc358a6255",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           },
           {
             "type": "text",
@@ -3913,12 +3913,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669ac3001t1dqYZ5ITnHZ36",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a3002R1s67HskRuiSnK",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 2,
                     "delivery": "queue",
                     "input": {
@@ -3930,15 +3930,15 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724739
+                      "created": 1791867034019
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_cf7b099f1c28f0307a81045955d8fb4059f4db8f7f26dfcd153b968ebcb6ee47",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_queue_f67f121e33df9447e79b482f778b44a4eeb86989baf31102047025fc3ecc80f5",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           },
           {
             "type": "text",
@@ -3948,12 +3948,12 @@
             "metadata": {
               "sessionQueue": {
                 "version": 1,
-                "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                 "kind": "peer",
                 "constituents": [
                   {
-                    "id": "que_133669abe001QE8ZZxo9WUxrPJ",
-                    "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
+                    "id": "que_1339919a2001p0jTEf9IreoW0K",
+                    "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
                     "seq": 1,
                     "delivery": "queue",
                     "input": {
@@ -3972,63 +3972,63 @@
                       ]
                     },
                     "time": {
-                      "created": 1791863724735
+                      "created": 1791867034018
                     }
                   }
                 ]
               }
             },
-            "id": "prt_queue_cfcf7088d728db98cb42081a96eba8cb5693c46c90f25e5ee5d5e9c4399977fa",
-            "sessionID": "ses_ecc996547ffep7UqTV9sInVbEN",
-            "messageID": "msg_133669aec001RNO8WoPeIuHvTz"
+            "id": "prt_queue_fbbd5d387a7043cd3ff885a156fdd3ade320af3fb2ba637e984487d492e58738",
+            "sessionID": "ses_ecc66e660ffeSkBGx52rbLTD9G",
+            "messageID": "msg_1339919a8001M4pYNC0LleONfd"
           }
         ]
       },
       "witnesses": [
         {
-          "partID": "prt_133669afc0018DvymxvqOrM0qn",
-          "messageID": "msg_133669aec001RNO8WoPeIuHvTz",
+          "partID": "prt_1339919a90014r5XUUXxKXtJ9y",
+          "messageID": "msg_1339919a8001M4pYNC0LleONfd",
           "ignored": false,
           "synthetic": false,
           "constituentIDs": [
-            "que_133669abe001QE8ZZxo9WUxrPJ",
-            "que_133669ac3001t1dqYZ5ITnHZ36"
+            "que_1339919a2001p0jTEf9IreoW0K",
+            "que_1339919a3002R1s67HskRuiSnK"
           ]
         },
         {
-          "partID": "prt_queue_100137fce6adc890272bb18e783350c0776881b909ad49838a67f51e8c781098",
-          "messageID": "msg_133669aec001RNO8WoPeIuHvTz",
+          "partID": "prt_queue_6bdccc76704e4d504cdae0a8c5f01454991d861e20555c85c2571838b4c7a50c",
+          "messageID": "msg_1339919a8001M4pYNC0LleONfd",
           "ignored": true,
           "synthetic": true,
           "constituentIDs": [
-            "que_133669abe001QE8ZZxo9WUxrPJ"
+            "que_1339919a2001p0jTEf9IreoW0K"
           ]
         },
         {
-          "partID": "prt_queue_bc45cc07e633c49020a98ec5828a9426be6ca8a861826ef4f7cd051b284409ee",
-          "messageID": "msg_133669aec001RNO8WoPeIuHvTz",
+          "partID": "prt_queue_96b0dc31064fec5fff88a3cffd5406e7b61c34ed57133223275c2bbc358a6255",
+          "messageID": "msg_1339919a8001M4pYNC0LleONfd",
           "ignored": true,
           "synthetic": true,
           "constituentIDs": [
-            "que_133669abe001QE8ZZxo9WUxrPJ"
+            "que_1339919a2001p0jTEf9IreoW0K"
           ]
         },
         {
-          "partID": "prt_queue_cf7b099f1c28f0307a81045955d8fb4059f4db8f7f26dfcd153b968ebcb6ee47",
-          "messageID": "msg_133669aec001RNO8WoPeIuHvTz",
+          "partID": "prt_queue_f67f121e33df9447e79b482f778b44a4eeb86989baf31102047025fc3ecc80f5",
+          "messageID": "msg_1339919a8001M4pYNC0LleONfd",
           "ignored": true,
           "synthetic": true,
           "constituentIDs": [
-            "que_133669ac3001t1dqYZ5ITnHZ36"
+            "que_1339919a3002R1s67HskRuiSnK"
           ]
         },
         {
-          "partID": "prt_queue_cfcf7088d728db98cb42081a96eba8cb5693c46c90f25e5ee5d5e9c4399977fa",
-          "messageID": "msg_133669aec001RNO8WoPeIuHvTz",
+          "partID": "prt_queue_fbbd5d387a7043cd3ff885a156fdd3ade320af3fb2ba637e984487d492e58738",
+          "messageID": "msg_1339919a8001M4pYNC0LleONfd",
           "ignored": true,
           "synthetic": true,
           "constituentIDs": [
-            "que_133669abe001QE8ZZxo9WUxrPJ"
+            "que_1339919a2001p0jTEf9IreoW0K"
           ]
         }
       ],
@@ -4038,7 +4038,7 @@
           "content": [
             {
               "type": "text",
-              "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T03:55:24.735Z; queue que_133669abe001QE8ZZxo9WUxrPJ]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T03:55:24.739Z; queue que_133669ac3001t1dqYZ5ITnHZ36]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+              "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T04:50:34.018Z; queue que_1339919a2001p0jTEf9IreoW0K]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T04:50:34.019Z; queue que_1339919a3002R1s67HskRuiSnK]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
             }
           ]
         }
@@ -4051,7 +4051,7 @@
             "content": [
               {
                 "type": "text",
-                "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T03:55:24.735Z; queue que_133669abe001QE8ZZxo9WUxrPJ]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T03:55:24.739Z; queue que_133669ac3001t1dqYZ5ITnHZ36]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+                "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T04:50:34.018Z; queue que_1339919a2001p0jTEf9IreoW0K]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T04:50:34.019Z; queue que_1339919a3002R1s67HskRuiSnK]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
               }
             ]
           }
@@ -4062,7 +4062,7 @@
             "content": [
               {
                 "type": "text",
-                "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T03:55:24.735Z; queue que_133669abe001QE8ZZxo9WUxrPJ]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T03:55:24.739Z; queue que_133669ac3001t1dqYZ5ITnHZ36]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
+                "text": "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation.\n\n1. [Admitted 2026-10-13T04:50:34.018Z; queue que_1339919a2001p0jTEf9IreoW0K]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-1-abcd\u001f [fm-level:request]\u001f Complete peer 1\nre:p1791800000-1-def0\nDo not omit this last line 1\n\n2. [Admitted 2026-10-13T04:50:34.019Z; queue que_1339919a3002R1s67HskRuiSnK]\n[fm-from-peer]\u001f saas\u001f /scratch/saas\u001f p1791809000-2-abcd\u001f [fm-level:info]\u001f Complete peer 2\nre:p1791800000-2-def0\nDo not omit this last line 2"
               },
               {
                 "type": "text",
