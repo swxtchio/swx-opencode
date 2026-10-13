@@ -115,7 +115,9 @@ describe("prompt part", () => {
     }
     const first = occurrence(0)
     const second = occurrence(typed.indexOf("@src/app.ts") + 1)
-    const pasted = [{ start: 4, end: 4 + marker.length, text: "a paste naming @src/app.ts\nover\nlines" }]
+    const pasted = [
+      { start: 4, end: 4 + marker.length, text: "a paste of three lines\nthat runs on and on\nfor long enough" },
+    ]
     const sent = expandTrackedPastedText(typed, pasted)
     // As the composer sends them: each mention shifted past the expanded paste.
     const shifted = (at: typeof first) => ({
@@ -123,15 +125,15 @@ describe("prompt part", () => {
       start: expandedOffset(at.start, pasted),
       end: expandedOffset(at.end, pasted),
     })
-    const expected = [...sent.matchAll(/@src\/app\.ts/g)].slice(1).map((match) => [match.index, "@src/app.ts"])
+    const expected = [...sent.matchAll(/@src\/app\.ts/g)].map((match) => [match.index, "@src/app.ts"])
 
     const recalled = recalledPrompt(
       queued([{ type: "text", text: sent }, fileAt(shifted(first)), fileAt(shifted(second))]),
     )
     expect(marked(recalled)).toEqual(expected)
-    // Sent unshifted, as an older client did, each still takes its own copy.
+    // Sent unshifted, as an older client did, both are nearest the first copy;
+    // each still takes its own.
     const relocated = recalledPrompt(queued([{ type: "text", text: sent }, fileAt(first), fileAt(second)]))
-    expect(new Set(marked(relocated).map((mark) => mark?.[0])).size).toBe(2)
-    expect(marked(relocated).map((mark) => mark?.[1])).toEqual(["@src/app.ts", "@src/app.ts"])
+    expect(marked(relocated)).toEqual(expected)
   })
 })
