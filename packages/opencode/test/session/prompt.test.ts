@@ -2134,7 +2134,11 @@ it.instance(
       const plainID = MessageID.ascending()
       const plain = yield* send(plainID, "queue", "check the build")
       yield* listed(plainID, "queue")
-      const conflict = yield* Fiber.await(yield* send(plainID, "steer", "check the build"))
+      const conflict = yield* awaitWithTimeout(
+        Fiber.await(yield* send(plainID, "steer", "check the build")),
+        "a retry under another delivery was not refused",
+        "30 seconds",
+      )
       expect(Exit.isFailure(conflict) && String(Cause.squash(conflict.cause))).toContain("Conflicting prompt message ID")
 
       yield* llm.push(reply().text("held handled").stop().item(), reply().text("plain handled").stop().item())
