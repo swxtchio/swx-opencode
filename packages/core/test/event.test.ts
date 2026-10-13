@@ -9,6 +9,8 @@ import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventRetentionTable, EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { EventAggregateWriterTable, EventWriterProcessTable } from "@opencode-ai/core/event/writer.sql"
+import { EventWriter } from "@opencode-ai/core/event/writer"
 import { Location } from "@opencode-ai/core/location"
 import { SessionDurable } from "@opencode-ai/schema/durable-event-manifest"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -1158,6 +1160,54 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("records this process as the writer of every committed durable append, and nothing for a fenced one", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const process = yield* db
+        .select()
+        .from(EventWriterProcessTable)
+        .where(eq(EventWriterProcessTable.writer_id, EventWriter.id()))
+        .get()
+      expect(process).toMatchObject({ pid: globalThis.process.pid, ...identityColumns(EventWriter.self()) })
+      expect(process?.start_ticks).toMatch(/^\d+$/)
+
+      const aggregateID = Session.ID.create()
+      const before = Date.now()
+      yield* events.publish(DurableMessage, durableData(aggregateID, "first"))
+      const first = yield* db
+        .select()
+        .from(EventAggregateWriterTable)
+        .where(eq(EventAggregateWriterTable.aggregate_id, aggregateID))
+        .all()
+      expect(first).toEqual([
+        { aggregate_id: aggregateID, writer_id: EventWriter.id(), time_last_append: expect.any(Number) },
+      ])
+      expect(first[0]!.time_last_append).toBeGreaterThanOrEqual(before)
+
+      yield* db.insert(EventRetentionTable).values({
+        aggregate_id: aggregateID,
+        state: "complete",
+        evidence: {},
+        time_started: 1,
+        time_updated: 1,
+      })
+      yield* db
+        .update(EventAggregateWriterTable)
+        .set({ time_last_append: 1 })
+        .where(eq(EventAggregateWriterTable.aggregate_id, aggregateID))
+      const fenced = yield* events.publish(DurableMessage, durableData(aggregateID, "fenced")).pipe(Effect.exit)
+      expect(Exit.isFailure(fenced)).toBe(true)
+      expect(
+        yield* db
+          .select({ time: EventAggregateWriterTable.time_last_append })
+          .from(EventAggregateWriterTable)
+          .where(eq(EventAggregateWriterTable.aggregate_id, aggregateID))
+          .all(),
+      ).toEqual([{ time: 1 }])
+    }),
+  )
+
   it.effect("refuses redacted aggregate reads and writes before decoding or committing", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
@@ -1210,3 +1260,8 @@ describe("EventV2", () => {
     }),
   )
 })
+
+function identityColumns(identity: EventWriter.ProcessIdentity) {
+  return { boot_id: identity.bootID, start_ticks: identity.startTicks }
+}
+

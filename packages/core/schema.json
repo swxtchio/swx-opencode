@@ -3,7 +3,7 @@
   "dialect": "sqlite",
   "id": "0138d55a-77b4-4957-8b04-f5989335e610",
   "prevIds": [
-    "f28ff033-4d20-49ab-adb6-fbf1a96a3a7d"
+    "c669c271-ac65-4dce-bdce-16c8ce897432"
   ],
   "ddl": [
     {
@@ -12,6 +12,14 @@
     },
     {
       "name": "data_migration",
+      "entityType": "tables"
+    },
+    {
+      "name": "event_aggregate_writer",
+      "entityType": "tables"
+    },
+    {
+      "name": "event_writer_process",
       "entityType": "tables"
     },
     {
@@ -197,6 +205,86 @@
       "name": "time_completed",
       "entityType": "columns",
       "table": "data_migration"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "aggregate_id",
+      "entityType": "columns",
+      "table": "event_aggregate_writer"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "writer_id",
+      "entityType": "columns",
+      "table": "event_aggregate_writer"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_last_append",
+      "entityType": "columns",
+      "table": "event_aggregate_writer"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "writer_id",
+      "entityType": "columns",
+      "table": "event_writer_process"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "pid",
+      "entityType": "columns",
+      "table": "event_writer_process"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "boot_id",
+      "entityType": "columns",
+      "table": "event_writer_process"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "start_ticks",
+      "entityType": "columns",
+      "table": "event_writer_process"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_registered",
+      "entityType": "columns",
+      "table": "event_writer_process"
     },
     {
       "type": "text",
@@ -1970,6 +2058,16 @@
     },
     {
       "columns": [
+        "aggregate_id",
+        "writer_id"
+      ],
+      "nameExplicit": false,
+      "name": "event_aggregate_writer_pk",
+      "entityType": "pks",
+      "table": "event_aggregate_writer"
+    },
+    {
+      "columns": [
         "email",
         "url"
       ],
@@ -2014,6 +2112,15 @@
       "nameExplicit": false,
       "name": "data_migration_pk",
       "table": "data_migration",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "writer_id"
+      ],
+      "nameExplicit": false,
+      "name": "event_writer_process_pk",
+      "table": "event_writer_process",
       "entityType": "pks"
     },
     {

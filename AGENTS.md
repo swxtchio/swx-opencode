@@ -184,6 +184,11 @@ const table = sqliteTable("session", {
   (`prepareQueued` in `prompt.ts`), never the ones it was admitted with.
 - The TUI review view holds a session's promotion (`hold`/`release` in `queue.ts`, #212). Both `reserve` and `commit` check `held()`: without the `reserve` check a promotion loop re-reserves forever against a `commit` that refuses. A new promotion path needs the same checks, and `awaitingDrain` must keep ignoring held pending rows or a drain caller re-drains in a loop.
 
+## Session Retention (fork)
+
+- `opencode db retention` (`packages/opencode/src/cli/cmd/db-retention.ts`) redacts inactive Session trees only when every gate in `candidateFailures` passes, re-checked inside each batch's write lock.
+- Its cross-process liveness relies on `packages/core/src/event/writer.ts`: the Database layer registers each process, and `EventV2` records the writing process in the same transaction as every durable append. Keep Session writes on that path, and classify any new Session-owned table in the retention tool, or it refuses every tree.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

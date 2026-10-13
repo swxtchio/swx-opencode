@@ -9,6 +9,7 @@ import { DatabaseMigration } from "./migration"
 import { resolvePath } from "./resolve-path"
 import { InstallationChannel } from "../installation/version"
 import { makeGlobalNode } from "../effect/app-node"
+import { EventWriter } from "../event/writer"
 
 const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
 const nativeBusyTimeoutMs = 5
@@ -33,6 +34,11 @@ const layer = Layer.effect(
     yield* db.run("PRAGMA journal_mode = WAL")
     yield* db.run("PRAGMA synchronous = NORMAL")
     yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
+    // Retention refuses every Session while an unregistered process holds the file, so a failed
+    // registration fails closed and must not stop this process from starting.
+    yield* EventWriter.register(db).pipe(
+      Effect.catchCause((cause) => Effect.logWarning("event writer registration failed", cause)),
+    )
 
     return { db }
   }).pipe(Effect.orDie),

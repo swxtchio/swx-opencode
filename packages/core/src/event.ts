@@ -8,6 +8,8 @@ import { Database } from "./database/database"
 import { TransactionPurpose } from "@opencode-ai/effect-drizzle-sqlite"
 import { FailureOrigin } from "./observability/failure-origin"
 import { EventRetentionTable, EventSequenceTable, EventTable } from "./event/sql"
+import { EventWriter } from "./event/writer"
+import { EventAggregateWriterTable } from "./event/writer.sql"
 import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
 import { isDeepStrictEqual } from "node:util"
@@ -69,6 +71,9 @@ export class RetentionWriteRefusedError extends Schema.TaggedErrorClass<Retentio
   },
 ) {}
 
+// Retention states in which an aggregate's history has been, or is being, redacted and can no longer be replayed.
+export const unreplayableRetentionStates = ["redacting", "complete"] as const
+
 function requireReplayable(db: DatabaseAccess, aggregateID: string) {
   return db
     .select({ aggregateID: EventRetentionTable.aggregate_id })
@@ -76,7 +81,7 @@ function requireReplayable(db: DatabaseAccess, aggregateID: string) {
     .where(
       and(
         eq(EventRetentionTable.aggregate_id, aggregateID),
-        inArray(EventRetentionTable.state, ["redacting", "complete"]),
+        inArray(EventRetentionTable.state, [...unreplayableRetentionStates]),
       ),
     )
     .get()
@@ -464,6 +469,7 @@ export const layerWith = (options?: LayerOptions) =>
                             ])
                             .run()
                             .pipe(Effect.orDie)
+                          yield* EventWriter.recordAppend(db, aggregateID)
                           return { aggregateID, seq }
                         }),
                       { behavior: "immediate" },
@@ -655,6 +661,10 @@ export const layerWith = (options?: LayerOptions) =>
             Effect.gen(function* () {
               yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).run()
               yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
+              yield* db
+                .delete(EventAggregateWriterTable)
+                .where(eq(EventAggregateWriterTable.aggregate_id, aggregateID))
+                .run()
             }),
           )
           .pipe(Effect.orDie)
