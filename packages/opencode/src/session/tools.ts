@@ -85,7 +85,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           Effect.flatMap((part) =>
             part?.state.status === "running"
               ? Effect.void
-              : Effect.die(new Error(`Tool call ${options.toolCallId} is no longer running under its processor`)),
+              : Effect.die(new Tool.CallNotOwnedError({ callID: options.toolCallId })),
           ),
         ),
     ask: (req) =>
