@@ -99,12 +99,14 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         .pipe(Effect.orDie),
   })
 
-  // Nothing a call runs, its plugin hooks included, may start before its processor has durably admitted it.
+  // Nothing a call runs, its plugin hooks included, may start before its processor has durably admitted it. A call
+  // whose stream attempt has already ended is refused before it can reach that attempt's processor.
   const admit = (args: unknown, options: ToolExecutionOptions) =>
     Effect.gen(function* () {
+      const aborted = Effect.die(new Error(`Tool call ${options.toolCallId} was aborted before execution`))
+      if (options.abortSignal?.aborted) return yield* aborted
       yield* input.processor.admitToolCall(options.toolCallId, args)
-      if (options.abortSignal?.aborted)
-        return yield* Effect.die(new Error(`Tool call ${options.toolCallId} was aborted before execution`))
+      if (options.abortSignal?.aborted) return yield* aborted
     })
 
   for (const item of yield* registry.tools({

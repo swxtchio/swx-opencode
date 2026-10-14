@@ -2,7 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Deferred, Duration, Effect, Exit, Layer, Context, Schedule, Scope, Schema, Semaphore } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Layer, Context, Schedule, Scope, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
@@ -98,12 +98,14 @@ type ToolCall = {
   messageID: SessionV1.ToolPart["messageID"]
   sessionID: SessionV1.ToolPart["sessionID"]
   done: Deferred.Deferred<void>
-  // Completes once the pending part's write has finished, committed or not. The call is owned from before that
-  // write, so cleanup still finds a part whose commit landed while its publication was interrupted.
-  written: Deferred.Deferred<void>
-  // Serializes every read-modify-write of the part, so the consumer, the executing tool and cleanup cannot
-  // overwrite each other's state.
-  lock: Semaphore.Semaphore
+}
+
+// One stream attempt's admissions. A retry starts a fresh one, so a call a failed attempt dispatched can never be
+// admitted against the record of a retry that reuses its call ID.
+type Attempt = {
+  closed: boolean
+  // Completes when the consumer has persisted a call's part in this attempt, or when the attempt closes.
+  registrations: Record<string, Deferred.Deferred<void>>
 }
 
 type FinalizationState = {
@@ -116,10 +118,7 @@ type FinalizationState = {
 
 interface ProcessorContext extends Input {
   toolcalls: Record<string, ToolCall>
-  // Completes when the consumer has persisted a call's pending part, or when the processor closes.
-  registrations: Record<string, Deferred.Deferred<void>>
-  // Set by cleanup: no call may be admitted for execution after this attempt has ended.
-  closed: boolean
+  attempt: Attempt
   shouldBreak: boolean
   snapshot: string | undefined
   blocked: boolean
@@ -286,8 +285,8 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         model: input.model,
         toolcalls: {},
-        registrations: {},
-        closed: false,
+        // Nothing is admitted before a stream attempt opens.
+        attempt: { closed: true, registrations: {} },
         shouldBreak: false,
         snapshot: initialSnapshot,
         blocked: false,
@@ -313,7 +312,6 @@ const layer = Layer.effect(
       const readToolCall = Effect.fn("SessionProcessor.readToolCall")(function* (toolCallID: string) {
         const call = ctx.toolcalls[toolCallID]
         if (!call) return undefined
-        yield* Deferred.await(call.written)
         const part = yield* session.getPart({
           partID: call.partID,
           messageID: call.messageID,
@@ -326,25 +324,33 @@ const layer = Layer.effect(
         return { call, part }
       })
 
-      const withToolCall = <A, E, R>(toolCallID: string, self: Effect.Effect<A, E, R>) => {
-        const call = ctx.toolcalls[toolCallID]
-        return call ? call.lock.withPermit(self) : self
-      }
+      // Runs a read-modify-write of a call's part in one immediate transaction, so the consumer, the executing tool and
+      // cleanup cannot overwrite each other's state. The database forks a committed write's publication, so no writer
+      // waits on the listeners of another's.
+      const withToolCall = <A, R>(self: Effect.Effect<A, never, R>) =>
+        database.db.transaction(() => self, { behavior: "immediate" }).pipe(Effect.orDie)
 
-      const registration = (toolCallID: string) => {
-        const existing = ctx.registrations[toolCallID]
+      const registration = (attempt: Attempt, toolCallID: string) => {
+        const existing = attempt.registrations[toolCallID]
         if (existing) return existing
         const next = Deferred.makeUnsafe<void>()
-        ctx.registrations[toolCallID] = next
+        attempt.registrations[toolCallID] = next
         return next
       }
+
+      const closeAttempt = (attempt: Attempt) =>
+        Effect.suspend(() => {
+          attempt.closed = true
+          return Effect.forEach(Object.values(attempt.registrations), (registered) =>
+            Deferred.succeed(registered, undefined),
+          )
+        })
 
       const updateToolCall = Effect.fn("SessionProcessor.updateToolCall")(function* (
         toolCallID: string,
         update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
       ) {
         return yield* withToolCall(
-          toolCallID,
           Effect.gen(function* () {
             const match = yield* readToolCall(toolCallID)
             if (!match) return undefined
@@ -358,14 +364,14 @@ const layer = Layer.effect(
       // consumer to persist the call rather than creating the part out of stream order. The running state records
       // admission only: it does not show that the tool went on to produce an effect.
       const admitToolCall = Effect.fn("SessionProcessor.admitToolCall")(function* (toolCallID: string, input: unknown) {
-        if (!ctx.closed) yield* Deferred.await(registration(toolCallID))
+        const attempt = ctx.attempt
+        if (!attempt.closed) yield* Deferred.await(registration(attempt, toolCallID))
         const refuse = (reason: string) =>
           Effect.die(new Error(`Tool call ${toolCallID} was not admitted for execution: ${reason}`))
-        if (ctx.closed) return yield* refuse("the assistant turn has ended")
+        if (attempt.closed) return yield* refuse("its stream attempt has ended")
         return yield* withToolCall(
-          toolCallID,
           Effect.gen(function* () {
-            if (ctx.closed) return yield* refuse("the assistant turn has ended")
+            if (attempt.closed) return yield* refuse("its stream attempt has ended")
             const match = yield* readToolCall(toolCallID)
             if (!match) return yield* refuse("this processor does not own it")
             if (match.part.state.status !== "pending" && match.part.state.status !== "running")
@@ -394,11 +400,10 @@ const layer = Layer.effect(
           attachments?: SessionV1.FilePart[]
         },
       ) {
-        yield* withToolCall(
-          toolCallID,
+        const completed = yield* withToolCall(
           Effect.gen(function* () {
             const match = yield* readToolCall(toolCallID)
-            if (!match || match.part.state.status !== "running") return
+            if (!match || match.part.state.status !== "running") return false
             yield* session.updatePart({
               ...match.part,
               state: {
@@ -411,14 +416,15 @@ const layer = Layer.effect(
                 attachments: output.attachments,
               },
             })
-            yield* settleToolCall(toolCallID)
+            return true
           }),
         )
+        // Settled only once the outcome has committed: a write that fails leaves the call for cleanup to settle.
+        if (completed) yield* settleToolCall(toolCallID)
       })
 
       const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
-        return yield* withToolCall(
-          toolCallID,
+        const failed = yield* withToolCall(
           Effect.gen(function* () {
             const match = yield* readToolCall(toolCallID)
             if (!match || match.part.state.status !== "running") return false
@@ -433,13 +439,15 @@ const layer = Layer.effect(
                 time: { start: match.part.state.time.start, end: Date.now() },
               },
             })
-            if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
-              ctx.blocked = ctx.shouldBreak
-            }
-            yield* settleToolCall(toolCallID)
             return true
           }),
         )
+        if (!failed) return false
+        if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
+          ctx.blocked = ctx.shouldBreak
+        }
+        yield* settleToolCall(toolCallID)
+        return true
       })
 
       const finishReasoning = Effect.fn("SessionProcessor.finishReasoning")(function* (reasoningID: string) {
@@ -458,6 +466,8 @@ const layer = Layer.effect(
       }) {
         const existing = yield* readToolCall(input.id)
         if (existing) {
+          // A retry that reuses a call ID resumes the part an earlier attempt registered.
+          yield* Deferred.succeed(registration(ctx.attempt, input.id), undefined)
           if (!input.providerExecuted || existing.part.metadata?.providerExecuted) return existing
           const part = yield* updateToolCall(input.id, (match) => ({
             ...match,
@@ -466,29 +476,26 @@ const layer = Layer.effect(
           return part ? { call: existing.call, part } : undefined
         }
         // Own the call before writing its pending part: a cancellation that lands after the commit but before this
-        // write returns must still find the part to settle.
+        // write returns must still find the part to settle. Every other reader of the part runs after this write has
+        // exited: an admission waits for the registration below, and cleanup runs once this consumer has stopped.
         const call: ToolCall = {
           partID: PartID.ascending(),
           messageID: ctx.assistantMessage.id,
           sessionID: ctx.assistantMessage.sessionID,
           done: Deferred.makeUnsafe<void>(),
-          written: Deferred.makeUnsafe<void>(),
-          lock: Semaphore.makeUnsafe(1),
         }
         ctx.toolcalls[input.id] = call
-        const part = yield* session
-          .updatePart({
-            id: call.partID,
-            messageID: call.messageID,
-            sessionID: call.sessionID,
-            type: "tool",
-            tool: input.name,
-            callID: input.id,
-            state: { status: "pending", input: {}, raw: "" },
-            metadata: input.providerExecuted ? { providerExecuted: true } : undefined,
-          } satisfies SessionV1.ToolPart)
-          .pipe(Effect.onExit(() => Deferred.succeed(call.written, undefined)))
-        yield* Deferred.succeed(registration(input.id), undefined)
+        const part = yield* session.updatePart({
+          id: call.partID,
+          messageID: call.messageID,
+          sessionID: call.sessionID,
+          type: "tool",
+          tool: input.name,
+          callID: input.id,
+          state: { status: "pending", input: {}, raw: "" },
+          metadata: input.providerExecuted ? { providerExecuted: true } : undefined,
+        } satisfies SessionV1.ToolPart)
+        yield* Deferred.succeed(registration(ctx.attempt, input.id), undefined)
         return { call, part }
       })
 
@@ -866,9 +873,8 @@ const layer = Layer.effect(
           if (Exit.isSuccess(exit)) delete ctx.reasoningMap[id]
         }
 
-        // Refuse every later admission, including ones still waiting for a call this attempt never registered.
-        ctx.closed = true
-        yield* Effect.forEach(Object.values(ctx.registrations), (registered) => Deferred.succeed(registered, undefined))
+        // Refuse every later admission, including ones still waiting for a call the attempt never registered.
+        yield* closeAttempt(ctx.attempt)
 
         yield* attempt(
           Effect.forEach(
@@ -879,35 +885,36 @@ const layer = Layer.effect(
         )
 
         for (const toolCallID of Object.keys(ctx.toolcalls)) {
-          yield* withToolCall(
-            toolCallID,
-            Effect.gen(function* () {
-              const readExit = yield* attempt(readToolCall(toolCallID))
-              if (Exit.isFailure(readExit)) return
-              const match = readExit.value
-              if (!match) return
-              const part = match.part
-              // A settled outcome is the tool's own record; only an unsettled part takes the interrupted disposition.
-              if (part.state.status !== "pending" && part.state.status !== "running") {
-                delete ctx.toolcalls[toolCallID]
-                return
-              }
-              const end = Date.now()
-              const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
-              const exit = yield* attempt(
-                session.updatePart({
-                  ...part,
-                  state: {
-                    ...part.state,
-                    status: "error",
-                    error: "Tool execution aborted",
-                    metadata: { ...metadata, interrupted: true },
-                    time: { start: "time" in part.state ? part.state.time.start : end, end },
-                  },
-                }),
-              )
-              if (Exit.isSuccess(exit)) delete ctx.toolcalls[toolCallID]
-            }),
+          yield* attempt(
+            withToolCall(
+              Effect.gen(function* () {
+                const readExit = yield* attempt(readToolCall(toolCallID))
+                if (Exit.isFailure(readExit)) return
+                const match = readExit.value
+                if (!match) return
+                const part = match.part
+                // A settled outcome is the tool's own record; only an unsettled part takes the interrupted disposition.
+                if (part.state.status !== "pending" && part.state.status !== "running") {
+                  delete ctx.toolcalls[toolCallID]
+                  return
+                }
+                const end = Date.now()
+                const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
+                const exit = yield* attempt(
+                  session.updatePart({
+                    ...part,
+                    state: {
+                      ...part.state,
+                      status: "error",
+                      error: "Tool execution aborted",
+                      metadata: { ...metadata, interrupted: true },
+                      time: { start: "time" in part.state ? part.state.time.start : end, end },
+                    },
+                  }),
+                )
+                if (Exit.isSuccess(exit)) delete ctx.toolcalls[toolCallID]
+              }),
+            ),
           )
         }
         ctx.toolcalls = {}
@@ -962,30 +969,33 @@ const layer = Layer.effect(
             messageID: input.assistantMessage.id,
           })
           ctx.needsCompaction = false
-          ctx.closed = false
-          ctx.registrations = {}
           ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
-          yield* Effect.gen(function* () {
-            ctx.currentText = undefined
-            ctx.reasoningMap = {}
-            yield* status.set(ctx.sessionID, {
-              type: "busy",
-              activeAssistantMessageID: ctx.assistantMessage.id,
-            })
-            const stream = llm.stream(streamInput).pipe(
-              Stream.tapCause((cause) => FailureOrigin.record(cause, { stage: "stream" })),
-            )
+          yield* Effect.suspend(() => {
+            // Each stream attempt admits only the calls it dispatches itself.
+            const attempt: Attempt = { closed: false, registrations: {} }
+            ctx.attempt = attempt
+            return Effect.gen(function* () {
+              ctx.currentText = undefined
+              ctx.reasoningMap = {}
+              yield* status.set(ctx.sessionID, {
+                type: "busy",
+                activeAssistantMessageID: ctx.assistantMessage.id,
+              })
+              const stream = llm
+                .stream(streamInput)
+                .pipe(Stream.tapCause((cause) => FailureOrigin.record(cause, { stage: "stream" })))
 
-            yield* stream.pipe(
-              Stream.tap((event) =>
-                handleEvent(event).pipe(
-                  Effect.tapCause((cause) => FailureOrigin.record(cause, { stage: "handler", case: event.type })),
+              yield* stream.pipe(
+                Stream.tap((event) =>
+                  handleEvent(event).pipe(
+                    Effect.tapCause((cause) => FailureOrigin.record(cause, { stage: "handler", case: event.type })),
+                  ),
                 ),
-              ),
-              Stream.takeUntil(() => ctx.needsCompaction),
-              Stream.runDrain,
-            )
+                Stream.takeUntil(() => ctx.needsCompaction),
+                Stream.runDrain,
+              )
+            }).pipe(Effect.ensuring(closeAttempt(attempt)))
           }).pipe(
             Effect.onInterrupt(() =>
               Effect.gen(function* () {
