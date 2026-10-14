@@ -2414,7 +2414,7 @@ describe("session.llm.stream", () => {
   )
 
   it.instance(
-    "sends Gemini 3.8 medium thinking and tools through the native Google SDK",
+    "selected Gemini variant overrides legacy agent effort while sending tools through the native Google SDK",
     () =>
       Effect.gen(function* () {
         const modelID = "gemini-3.8-flash"
@@ -2433,7 +2433,7 @@ describe("session.llm.stream", () => {
         const agent = {
           name: "test",
           mode: "primary",
-          options: {},
+          options: { reasoningEffort: "low" },
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
         } satisfies Agent.Info
 
