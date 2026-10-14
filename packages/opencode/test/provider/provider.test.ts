@@ -153,6 +153,36 @@ it.instance(
     expect(model.variants?.medium?.reasoningEffort).toBeUndefined()
     expect(publicModel?.api.npm).toBe("@ai-sdk/google")
     expect(publicModel?.variants?.medium?.thinkingConfig).toEqual({ includeThoughts: true, thinkingLevel: "medium" })
+    expect(
+      ["gemini-3.6-flash", "gemini-3.7-flash"].map((id) => {
+        const older = provider.models[id]
+        return {
+          id: String(older.id),
+          npm: older.api.npm,
+          context: older.limit.context,
+          output: older.limit.output,
+          reasoning: older.capabilities.reasoning,
+          toolcall: older.capabilities.toolcall,
+        }
+      }),
+    ).toEqual([
+      {
+        id: "gemini-3.6-flash",
+        npm: "@ai-sdk/openai-compatible",
+        context: 1_048_576,
+        output: 65_536,
+        reasoning: true,
+        toolcall: true,
+      },
+      {
+        id: "gemini-3.7-flash",
+        npm: "@ai-sdk/openai-compatible",
+        context: 1_048_576,
+        output: 65_536,
+        reasoning: true,
+        toolcall: true,
+      },
+    ])
   }),
   { config: googleGeminiConfig },
 )
