@@ -70,6 +70,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#262** Route configured Google Gemini 3.8+ models through native Google generation so their registered thinking level and tools reach the API while preserving model identity and limits (swxtchio/swx-opencode#259). _Fork-only._
 - **#258** Keep a synchronous V1 prompt that a review hold leaves pending on an existing session waiting for its own
   delivery (swxtchio/swx-opencode#215): it no longer returns the previous turn's reply. After its run the caller
   decides from its own item's `SessionQueue.disposition`, observed after the hold ends by release or lease lapse, and

@@ -1262,6 +1262,12 @@ function cloudflareGatewayNpm(providerID: string, modelID: string) {
   return undefined
 }
 
+function isGemini38OrLater(modelID: string) {
+  const version = modelID.toLowerCase().match(/gemini-(\d+)[.-](\d+)/)
+  if (!version) return false
+  return Number(version[1]) > 3 || (Number(version[1]) === 3 && Number(version[2]) >= 8)
+}
+
 function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model): Model {
   const base: Model = {
     id: ModelV2.ID.make(model.id),
@@ -1493,7 +1499,7 @@ const layer = Layer.effect(
           for (const [modelID, model] of Object.entries(provider.models ?? {})) {
             const existingModel = parsed.models[model.id ?? modelID]
             const apiID = model.id ?? existingModel?.api.id ?? modelID
-            const apiNpm =
+            const configuredApiNpm =
               model.provider?.npm ??
               provider.npm ??
               existingModel?.api.npm ??
@@ -1502,6 +1508,12 @@ const layer = Layer.effect(
               cloudflareGatewayNpm(providerID, apiID) ??
               modelsDev[providerID]?.npm ??
               "@ai-sdk/openai-compatible"
+            const apiNpm =
+              providerID === "google" &&
+              configuredApiNpm === "@ai-sdk/openai-compatible" &&
+              isGemini38OrLater(apiID)
+                ? "@ai-sdk/google"
+                : configuredApiNpm
             const name = iife(() => {
               if (model.name) return model.name
               if (model.id && model.id !== modelID) return modelID
@@ -1707,7 +1719,20 @@ const layer = Layer.effect(
               const merged = mergeDeep(model.variants, configVariants)
               model.variants = mapValues(
                 pickBy(merged, (v) => !v.disabled),
-                (v) => omit(v, ["disabled"]),
+                (variant) => {
+                  const effort =
+                    model.providerID === "google" && model.api.npm === "@ai-sdk/google"
+                      ? variant.reasoningEffort
+                      : undefined
+                  if (typeof effort !== "string") return omit(variant, ["disabled"])
+                  return {
+                    ...omit(variant, ["disabled", "reasoningEffort"]),
+                    thinkingConfig: mergeDeep(variant.thinkingConfig ?? {}, {
+                      includeThoughts: true,
+                      thinkingLevel: effort,
+                    }),
+                  }
+                },
               )
             }
           }
@@ -1777,7 +1802,15 @@ const layer = Layer.effect(
           return url
         })
 
-        if (baseURL !== undefined) options["baseURL"] = baseURL
+        // Google configurations can point at the OpenAI facade, but the native SDK needs the base API path.
+        const resolvedBaseURL =
+          model.providerID === "google" &&
+          model.api.npm === "@ai-sdk/google" &&
+          isGemini38OrLater(model.api.id) &&
+          typeof baseURL === "string"
+            ? baseURL.replace(/\/openai\/?$/, "")
+            : baseURL
+        if (resolvedBaseURL !== undefined) options["baseURL"] = resolvedBaseURL
         if (options["apiKey"] === undefined && provider.key) options["apiKey"] = provider.key
         if (model.headers)
           options["headers"] = {
