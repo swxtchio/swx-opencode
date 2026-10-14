@@ -44,8 +44,8 @@ The one change outside holds: an item deleted while its caller waits now ends th
 ## Regression
 
 All of these are in `test/server/httpapi-session.test.ts`, over the production HTTP routes and a real
-provider server, on an existing session whose prior turn answered "prior done". Each runs once with
-the default steer and once with `delivery: "queue"`:
+provider server, on an existing session whose prior turn answered "prior done". The release and lapse
+tests each run the default steer and `delivery: "queue"`; the race test runs one ordering with each:
 
 - **Release.** While held, the sync request stays unresolved. Its item is listed, the model sees none
   of it, and the provider call count is unchanged. After release, the response is the new turn's reply.
@@ -53,8 +53,8 @@ the default steer and once with `delivery: "queue"`:
   minutes in, and gets the new turn's reply once the lease lapses at 6. No release route is called.
 - **Hold ending during the caller's checks.** This uses `itRacing`/`spanHold`. The caller is held
   after `awaitingDrain` and after its idle check. The release ends the hold, and then the caller
-  decides. One ordering holds the release's promotion before it commits; the other lets it commit and
-  holds the provider. In both, the request stays unresolved and gets its own turn's reply.
+  decides. The steer holds the release's promotion before it commits; the queued prompt lets it commit
+  and holds the provider. In both, the request stays unresolved and gets its own turn's reply.
 
 `test/session/queue-review.test.ts` covers `disposition` directly: it waits through a renewed lease and
 returns `pending` at lapse, and fails `WithdrawnError` for an item deleted while held.
