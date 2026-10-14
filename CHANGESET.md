@@ -70,6 +70,12 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#258** Keep a synchronous V1 prompt that a review hold leaves pending on an existing session waiting for its own
+  delivery (swxtchio/swx-opencode#215): it no longer returns the previous turn's reply. After its run the caller
+  decides from its own item's `SessionQueue.disposition`, observed after the hold ends by release or lease lapse, and
+  gets the reply of the turn that consumed it; an item withdrawn or deleted meanwhile ends it with `PromptWithdrawn`.
+  _Fork-only._
+
 - **#244** Repair pending-work starvation, active-turn peer invisibility, history-read stalls, retry identity loss and failure coupling across independent originals. Reconcile represented prompt input before side effects, retain current direct noReply originals for exact retries, and refuse ambiguous historical or executable identity reuse before admission/expansion. Report init identity refusals as BadRequest while fresh init requests still succeed. Use two isolated Bun workers for OpenCode unit files to reduce CI runtime, and bound queue/provider SDK fixtures to their own project configuration. Reserve command identity through unlocked preparation, deferred interruption through actual settlement and short locked admission, preserving unrelated session progress; reject peer transport IDs owned by unrelated projections, and verify provider readiness against an isolated exact workspace SDK fixture. Defer peer continuation while a structured root remains unanswered. Queue/caller custody belongs to `session/queue.ts`, transaction publication to Core Database, and additive lookup/alias migrations to the core generator. See `docs/v1-queue-dispatch.md` and the dated task plan for policy and companion owners. _Fork-only._
 
 - **#202** Recover a consume that meets a held write lock (swxtchio/swx-opencode#167, #180): `SessionQueue.consume` re-attempts a consume whose write never began, up to 5 attempts, each with a 10 s acquisition backstop, then ends the run with `SessionQueueConsumeLockedError` and keeps the queued prompts for the next one. No transaction body is replayed. _Fork-only._
