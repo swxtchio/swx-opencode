@@ -8,9 +8,10 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { afterAll, expect } from "bun:test"
 import { Database as Sqlite } from "bun:sqlite"
 import { tool } from "ai"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, Schema, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, Scheduler, Schema, Stream } from "effect"
 import { isSqlError } from "effect/unstable/sql/SqlError"
-import { rm } from "node:fs/promises"
+import { mkdtemp, rm } from "node:fs/promises"
+import os from "node:os"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -2870,8 +2871,20 @@ function storedRows(dbPath: string, sql: string, id: string) {
 }
 
 function storedToolPart(dbPath: string, messageID: string, callID: string) {
-  return storedRows(dbPath, "select id, session_id, message_id, data from part where message_id = ? order by id", messageID)
-    .map((row) => ({ ...JSON.parse(row.data), id: row.id, sessionID: row.session_id, messageID: row.message_id }) as StoredToolPart)
+  return storedRows(
+    dbPath,
+    "select id, session_id, message_id, data from part where message_id = ? order by id",
+    messageID,
+  )
+    .map(
+      (row) =>
+        ({
+          ...JSON.parse(row.data),
+          id: row.id,
+          sessionID: row.session_id,
+          messageID: row.message_id,
+        }) as StoredToolPart,
+    )
     .find((part) => part.type === "tool" && part.callID === callID)
 }
 
@@ -3006,9 +3019,12 @@ const custodyTurn = Effect.fn("test.custodyTurn")(function* (input: {
   return { chat, msg, tools, plugin, body, executions, dispatched, process }
 })
 
-// Holds the post-commit publication of a call's pending part: the part is committed, but the processor has not yet
-// returned from writing it, which is the window the AI SDK's independent dispatch can run in.
-const holdPendingCommit = Effect.fn("test.holdPendingCommit")(function* (callID: string) {
+// Holds the post-commit publication of the first tool part update that matches: the part is committed, but its writer
+// has not yet returned from writing it.
+type PublishedToolPart = Extract<typeof SessionV1.Event.PartUpdated.data.Type.part, { type: "tool" }>
+const holdPartPublication = Effect.fn("test.holdPartPublication")(function* (
+  matches: (part: PublishedToolPart) => boolean,
+) {
   const events = yield* EventV2Bridge.Service
   const committed = Deferred.makeUnsafe<string>()
   const release = Deferred.makeUnsafe<void>()
@@ -3016,12 +3032,19 @@ const holdPendingCommit = Effect.fn("test.holdPendingCommit")(function* (callID:
   const off = yield* events.listen((event) => {
     if (held || event.type !== SessionV1.Event.PartUpdated.type) return Effect.void
     const part = (event.data as typeof SessionV1.Event.PartUpdated.data.Type).part
-    if (part.type !== "tool" || part.callID !== callID || part.state.status !== "pending") return Effect.void
+    if (part.type !== "tool" || !matches(part)) return Effect.void
     held = true
     return Deferred.succeed(committed, part.id).pipe(Effect.andThen(Deferred.await(release)))
   })
+  // A failed assertion must not leave the writer held.
+  yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.andThen(off)))
   return { committed, release, off }
 })
+
+// Holds the post-commit publication of a call's pending part: the part is committed, but the processor has not yet
+// returned from writing it, which is the window the AI SDK's independent dispatch can run in.
+const holdPendingCommit = (callID: string) =>
+  holdPartPublication((part) => part.callID === callID && part.state.status === "pending")
 
 const writeMarker = (file: string, text: string) => Effect.promise(() => Bun.write(file, text)).pipe(Effect.asVoid)
 
@@ -3077,7 +3100,10 @@ itCustody.live("admits an AI SDK-dispatched tool durably before its plugin hook 
         yield* awaitWithTimeout(Deferred.await(effectWritten), "probe effect was never written")
         expect(existsSync(marker)).toBe(true)
         expect(storedToolPart(custodyDbPath, turn.msg.id, "call_1")).toEqual(beforeEffect!)
-        const reopened = yield* MessageV2.parts(turn.msg.id).pipe(Effect.provide(Database.layerFromPath(custodyDbPath)))
+        // Built locally: a shared build would hand back the processor's own Database.
+        const reopened = yield* MessageV2.parts(turn.msg.id).pipe(
+          Effect.provide(Database.layerFromPath(custodyDbPath), { local: true }),
+        )
         expect(reopened.find((part) => part.type === "tool" && part.callID === "call_1")).toMatchObject({
           id: pendingID,
           state: beforeEffect!.state,
@@ -3230,16 +3256,19 @@ itCustody.live("refuses a tool dispatched after its turn ended, though the same 
           state: { status: "completed", output: "probe:5" },
         })
 
-        const late = yield* Effect.promise(() =>
-          Promise.resolve(
-            turn.tools.probe!.execute!(
-              { value: 6 },
-              { toolCallId: "call_late", messages: [], abortSignal: new AbortController().signal },
-            ) as PromiseLike<unknown>,
-          ).then(
-            () => "fulfilled",
-            () => "rejected",
+        const late = yield* awaitWithTimeout(
+          Effect.promise(() =>
+            Promise.resolve(
+              turn.tools.probe!.execute!(
+                { value: 6 },
+                { toolCallId: "call_late", messages: [], abortSignal: new AbortController().signal },
+              ) as PromiseLike<unknown>,
+            ).then(
+              () => "fulfilled",
+              () => "rejected",
+            ),
           ),
+          "a call dispatched after its turn ended was left waiting for admission",
         )
         expect(late).toBe("rejected")
         expect(turn.plugin.map((entry) => entry.callID)).toEqual(["call_1"])
@@ -3249,6 +3278,364 @@ itCustody.live("refuses a tool dispatched after its turn ended, though the same 
       }),
     { config: (url) => providerCfg(url) },
   ),
+)
+
+itCustody.live("settles a cancelled turn without waiting on a running tool's held publication", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        yield* llm.tool("probe", { value: 10 })
+        const hold = yield* holdPartPublication(
+          (part) =>
+            part.callID === "call_1" && part.state.status === "running" && part.state.metadata?.phase === "held",
+        )
+        const turn = yield* custodyTurn({
+          dir,
+          dbPath: custodyDbPath,
+          body: (_args, ctx) => ctx.metadata({ metadata: { phase: "held" } }),
+        })
+        const run = yield* turn.process.pipe(Effect.forkChild)
+
+        // The executing tool's progress is committed, and its own publication of it is held.
+        const partID = yield* awaitWithTimeout(Deferred.await(hold.committed), "the tool's progress never committed")
+        yield* awaitWithTimeout(Fiber.interrupt(run), "cancellation waited on the executing tool's publication")
+        const settled = storedToolPart(custodyDbPath, turn.msg.id, "call_1")
+        expect(settled).toMatchObject({
+          id: partID,
+          state: {
+            status: "error",
+            error: "Tool execution aborted",
+            input: { value: 10 },
+            metadata: { phase: "held", interrupted: true },
+          },
+        })
+
+        yield* Deferred.succeed(hold.release, undefined)
+        yield* awaitWithTimeout(
+          Effect.promise(() => turn.executions[0]!),
+          "the released tool never finished",
+        )
+        expect(storedToolPart(custodyDbPath, turn.msg.id, "call_1")).toEqual(settled!)
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itCustody.live("preserves an outcome committed before cancellation interrupts its settlement", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        yield* llm.tool("probe", { value: 11 })
+        const hold = yield* holdPartPublication((part) => part.callID === "call_1" && part.state.status === "completed")
+        const turn = yield* custodyTurn({ dir, dbPath: custodyDbPath, body: () => Effect.void })
+        const run = yield* turn.process.pipe(Effect.forkChild)
+
+        // The outcome is committed, but the consumer has not returned from writing it, so the call is still unsettled.
+        yield* awaitWithTimeout(Deferred.await(hold.committed), "the tool's outcome never committed")
+        const completed = storedToolPart(custodyDbPath, turn.msg.id, "call_1")
+        expect(completed).toMatchObject({ state: { status: "completed", input: { value: 11 }, output: "probe:11" } })
+        yield* awaitWithTimeout(Fiber.interrupt(run), "the interrupted turn never finished settling")
+        expect(storedToolPart(custodyDbPath, turn.msg.id, "call_1")).toEqual(completed!)
+        expect(storedAssistant(custodyDbPath, turn.msg.id)?.error?.name).toBe("MessageAbortedError")
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+// A worker process runs an admitted tool, records what is stored, then loses its owner abruptly, before or after the
+// tool's private effect. The test process reopens the store afterwards.
+const ownerLoss = {
+  db: process.env.OPENCODE_CUSTODY_OWNER_LOSS_DB,
+  phase: process.env.OPENCODE_CUSTODY_OWNER_LOSS_PHASE,
+  output: process.env.OPENCODE_CUSTODY_OWNER_LOSS_OUTPUT ?? "",
+  marker: process.env.OPENCODE_CUSTODY_OWNER_LOSS_MARKER ?? "",
+}
+const ownerLossWorker = "custody-owner-loss-worker kills its process while an admitted tool runs"
+
+if (ownerLoss.db) {
+  const db = ownerLoss.db
+  testEffect(
+    LayerNode.compile(
+      LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
+      [...replacements, [Database.node, Database.layerFromPath(db)]],
+    ),
+  ).live(
+    ownerLossWorker,
+    () =>
+      provideTmpdirServer(
+        ({ dir, llm }) =>
+          Effect.gen(function* () {
+            yield* llm.tool("probe", { value: 1 })
+            const owner = { sessionID: "", messageID: "", plugin: [] as CustodyEntry[], body: [] as CustodyEntry[] }
+            const turn = yield* custodyTurn({
+              dir,
+              dbPath: db,
+              body: (args) =>
+                Effect.gen(function* () {
+                  if (ownerLoss.phase === "after") yield* writeMarker(ownerLoss.marker, `effect:${args.value}`)
+                  const record = { ...owner, dir, stored: storedToolPart(db, owner.messageID, "call_1") }
+                  yield* Effect.promise(() => Bun.write(ownerLoss.output, JSON.stringify(record)))
+                  process.kill(process.pid, "SIGKILL")
+                  yield* Effect.never
+                }),
+            })
+            Object.assign(owner, {
+              sessionID: turn.chat.id,
+              messageID: turn.msg.id,
+              plugin: turn.plugin,
+              body: turn.body,
+            })
+            yield* turn.process
+          }),
+        { config: (url) => providerCfg(url) },
+      ),
+    30_000,
+  )
+}
+
+it.live(
+  "keeps an admitted tool's record unchanged when its owner is lost before or after its effect",
+  () =>
+    Effect.gen(function* () {
+      const dir = yield* Effect.acquireRelease(
+        Effect.promise(() => mkdtemp(path.join(os.tmpdir(), "opencode-owner-loss-"))),
+        (dir) => Effect.promise(() => rm(dir, { recursive: true, force: true })),
+      )
+      for (const phase of ["before", "after"] as const) {
+        const db = path.join(dir, `${phase}.db`)
+        const output = path.join(dir, `${phase}.json`)
+        const marker = path.join(dir, `${phase}-effect`)
+        const worker = Bun.spawn(
+          [process.execPath, "test", "test/session/processor-effect.test.ts", `--test-name-pattern=${ownerLossWorker}`],
+          {
+            cwd: path.join(import.meta.dir, "../.."),
+            env: {
+              ...process.env,
+              OPENCODE_CUSTODY_OWNER_LOSS_DB: db,
+              OPENCODE_CUSTODY_OWNER_LOSS_PHASE: phase,
+              OPENCODE_CUSTODY_OWNER_LOSS_OUTPUT: output,
+              OPENCODE_CUSTODY_OWNER_LOSS_MARKER: marker,
+            },
+            stdout: "ignore",
+            stderr: "ignore",
+          },
+        )
+        yield* Effect.addFinalizer(() => Effect.sync(() => worker.kill()))
+        yield* awaitWithTimeout(
+          Effect.promise(() => worker.exited),
+          `the ${phase}-effect worker never lost its owner`,
+          "60 seconds",
+        )
+        expect(worker.signalCode).toBe("SIGKILL")
+        const record = JSON.parse(yield* Effect.promise(() => Bun.file(output).text())) as {
+          dir: string
+          sessionID: string
+          messageID: string
+          stored: StoredToolPart
+          plugin: CustodyEntry[]
+          body: CustodyEntry[]
+        }
+        yield* Effect.addFinalizer(() => Effect.promise(() => rm(record.dir, { recursive: true, force: true })))
+
+        // The owner admitted the call before its plugin hook and body ran, and was lost while it still held it.
+        const admitted = {
+          sessionID: record.sessionID,
+          messageID: record.messageID,
+          callID: "call_1",
+          tool: "probe",
+          state: { status: "running", input: { value: 1 } },
+        }
+        expect(record.stored).toMatchObject(admitted)
+        expect(record.plugin).toEqual([{ callID: "call_1", stored: record.stored }])
+        expect(record.body).toEqual([{ callID: "call_1", stored: record.stored }])
+        expect(existsSync(marker)).toBe(phase === "after")
+
+        // Reopened by a process that never owned it, the admission is the same record whether or not the effect
+        // happened, and no outcome has been manufactured for the call or its turn.
+        expect(storedToolPart(db, record.messageID, "call_1")).toEqual(record.stored)
+        // Built locally: a shared build would hand back a Database this process already holds.
+        const reopened = yield* MessageV2.parts(MessageID.make(record.messageID)).pipe(
+          Effect.provide(Database.layerFromPath(db), { local: true }),
+        )
+        expect(reopened.find((part) => part.type === "tool" && part.callID === "call_1")).toMatchObject({
+          id: record.stored.id,
+          state: record.stored.state,
+        })
+        expect(storedToolPart(db, record.messageID, "call_1")).toEqual(record.stored)
+        const message = storedAssistant(db, record.messageID)
+        expect(message?.time.completed).toBeUndefined()
+        expect(message?.error).toBeUndefined()
+      }
+    }),
+  120_000,
+)
+
+// Forwards Session writes, letting a case act on a write before it reaches the store.
+const custodyWrites: { before?: (part: SessionV1.Part) => Effect.Effect<void> | undefined } = {}
+const custodyWriteSession = LayerNode.make({
+  service: Session.Service,
+  layer: Layer.effect(
+    Session.Service,
+    Effect.gen(function* () {
+      const real = yield* Session.Service
+      return Session.Service.of({
+        ...real,
+        updatePart: <T extends SessionV1.Part>(part: T) => {
+          const before = custodyWrites.before?.(part)
+          return before ? before.pipe(Effect.andThen(real.updatePart(part))) : real.updatePart(part)
+        },
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      Session.node.implementation as Layer.Layer<
+        Session.Service,
+        never,
+        BackgroundJob.Service | RuntimeFlags.Service | Database.Service | EventV2Bridge.Service
+      >,
+    ),
+  ),
+  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
+})
+const custodyWriteDbPath = path.join(import.meta.dir, `.opencode-tool-custody-writes-${crypto.randomUUID()}.db`)
+afterAll(async () => {
+  await Promise.all(
+    [custodyWriteDbPath, `${custodyWriteDbPath}-wal`, `${custodyWriteDbPath}-shm`].map((file) =>
+      rm(file, { force: true }),
+    ),
+  )
+})
+const itCustodyWrites = testEffect(
+  LayerNode.compile(
+    LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
+    [...replacements, [Session.node, custodyWriteSession], [Database.node, Database.layerFromPath(custodyWriteDbPath)]],
+  ),
+)
+const resetCustodyWrites = Effect.addFinalizer(() => Effect.sync(() => (custodyWrites.before = undefined)))
+
+itCustodyWrites.live("settles a turn interrupted between owning a call and writing its pending part", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        yield* resetCustodyWrites
+        yield* llm.tool("probe", { value: 12 })
+        // Once the consumer has built the call's pending write, its next operation yields to the scheduler, and the
+        // consumer is interrupted at that yield: before the write, or anything composed around it, can run.
+        const yielded = Deferred.makeUnsafe<void>()
+        const base = new Scheduler.MixedScheduler()
+        let armed: Fiber.Fiber<unknown, unknown> | undefined
+        let interrupt: Fiber.Fiber<unknown, unknown> | undefined
+        const scheduler: Scheduler.Scheduler = {
+          executionMode: base.executionMode,
+          shouldYield: (fiber) => {
+            if (fiber !== armed) return base.shouldYield(fiber)
+            armed = undefined
+            interrupt = fiber
+            return true
+          },
+          makeDispatcher: () => {
+            const dispatcher = base.makeDispatcher()
+            return {
+              scheduleTask: (task, priority) => {
+                const fiber = interrupt
+                interrupt = undefined
+                if (fiber)
+                  dispatcher.scheduleTask(() => {
+                    fiber.interruptUnsafe()
+                    Deferred.doneUnsafe(yielded, Exit.void)
+                  }, priority)
+                dispatcher.scheduleTask(task, priority)
+              },
+              flush: () => dispatcher.flush(),
+            }
+          },
+        }
+        custodyWrites.before = (part) => {
+          if (part.type === "tool" && part.callID === "call_1" && part.state.status === "pending")
+            armed = Fiber.getCurrent()
+          return undefined
+        }
+        const turn = yield* custodyTurn({
+          dir,
+          dbPath: custodyWriteDbPath,
+          body: (args) => writeMarker(path.join(dir, "probe-effect"), `effect:${args.value}`),
+        })
+        // Detached, so a turn that never settles fails this case's bound instead of holding the test's scope open.
+        const run = yield* turn.process.pipe(Effect.provideService(Scheduler.Scheduler, scheduler), Effect.forkDetach)
+
+        yield* awaitWithTimeout(Deferred.await(yielded), "the consumer was never interrupted at its pending write")
+        yield* awaitWithTimeout(Fiber.await(run), "the interrupted turn never finished settling")
+        expect(storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")?.state.status ?? "absent").not.toBe("pending")
+        const message = storedAssistant(custodyWriteDbPath, turn.msg.id)
+        expect(message?.time.completed).toBeDefined()
+        expect(message?.error?.name).toBe("MessageAbortedError")
+        yield* awaitWithTimeout(
+          Effect.promise(() => Promise.all(turn.executions)),
+          "a call dispatched by the interrupted turn was left waiting for admission",
+        )
+        expect(turn.plugin).toEqual([])
+        expect(turn.body).toEqual([])
+        expect(existsSync(path.join(dir, "probe-effect"))).toBe(false)
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itCustodyWrites.live(
+  "never admits a call a failed stream attempt dispatched against the retry that reuses its call ID",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          yield* resetCustodyWrites
+          yield* llm.tool("probe", { value: 1 })
+          yield* llm.tool("probe", { value: 2 })
+          const marker = (value: number) => path.join(dir, `probe-effect-${value}`)
+          const turn = yield* custodyTurn({
+            dir,
+            dbPath: custodyWriteDbPath,
+            body: (args) => writeMarker(marker(args.value), `effect:${args.value}`),
+          })
+          // The first attempt's step start is held until the AI SDK has dispatched that attempt's call_1, then fails
+          // retryably, so the attempt ends before its consumer registers the call. The retry dispatches call_1 again.
+          let failed = false
+          custodyWrites.before = (part) => {
+            if (failed || part.type !== "step-start") return undefined
+            failed = true
+            return awaitWithTimeout(
+              Deferred.await(turn.dispatched),
+              "the first attempt never dispatched its call",
+            ).pipe(
+              Effect.andThen(
+                Effect.die(Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET", syscall: "read" })),
+              ),
+              Effect.orDie,
+            )
+          }
+
+          expect(yield* turn.process).toBe("continue")
+          expect(yield* llm.calls).toBe(2)
+          expect(
+            yield* awaitWithTimeout(
+              Effect.promise(() => Promise.all(turn.executions)),
+              "the first attempt's call was left waiting for admission",
+            ),
+          ).toEqual(["rejected", "fulfilled"])
+          const admitted = {
+            callID: "call_1",
+            stored: { callID: "call_1", state: { status: "running", input: { value: 2 } } },
+          }
+          expect(turn.plugin).toMatchObject([admitted])
+          expect(turn.body).toMatchObject([admitted])
+          expect(existsSync(marker(1))).toBe(false)
+          expect(existsSync(marker(2))).toBe(true)
+          expect(storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")).toMatchObject({
+            state: { status: "completed", input: { value: 2 }, output: "probe:2" },
+          })
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  30_000,
 )
 
 // The native runtime consumes a tool call, which writes it running, before it dispatches the call; the dispatched
@@ -3288,7 +3675,11 @@ const nativeCustodyLLM = Layer.succeed(
   LLM.Service.of({
     stream: (input) => {
       const native = LLMNativeRuntime.stream({
-        model: { ...input.model, providerID: ProviderV2.ID.make("openai"), api: { ...input.model.api, npm: "@ai-sdk/openai" } },
+        model: {
+          ...input.model,
+          providerID: ProviderV2.ID.make("openai"),
+          api: { ...input.model.api, npm: "@ai-sdk/openai" },
+        },
         provider: {
           id: ProviderV2.ID.make("openai"),
           name: "OpenAI",

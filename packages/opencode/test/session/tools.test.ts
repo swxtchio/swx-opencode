@@ -171,6 +171,7 @@ it.effect("runs no plugin hook or tool body for a call its processor does not ad
   Effect.gen(function* () {
     const hooks: string[] = []
     const effects: string[] = []
+    const admissions: string[] = []
     const admitted: SessionV1.ToolPart = {
       id: partID,
       sessionID,
@@ -198,9 +199,12 @@ it.effect("runs no plugin hook or tool body for a call its processor does not ad
       updateToolCall: () => Effect.succeed(admitted),
       // The processor refuses admission by failing the execution, as it does for an unowned or ended call.
       admitToolCall: (toolCallID: string) =>
-        toolCallID.startsWith("refused")
-          ? Effect.die(new Error(`Tool call ${toolCallID} was not admitted for execution`))
-          : Effect.succeed(admitted),
+        Effect.suspend(() => {
+          admissions.push(toolCallID)
+          return toolCallID.startsWith("refused")
+            ? Effect.die(new Error(`Tool call ${toolCallID} was not admitted for execution`))
+            : Effect.succeed(admitted)
+        }),
       completeToolCall: () => Effect.void,
     } satisfies Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "admitToolCall" | "completeToolCall">
     const client = {
@@ -243,6 +247,16 @@ it.effect("runs no plugin hook or tool body for a call its processor does not ad
                 client,
               },
             }),
+          resources: () =>
+            Effect.sync(() => {
+              effects.push("resources")
+              return {}
+            }),
+          resourceTemplates: () =>
+            Effect.sync(() => {
+              effects.push("templates")
+              return {}
+            }),
           readResource: () =>
             Effect.sync(() => {
               effects.push("resource")
@@ -273,13 +287,11 @@ it.effect("runs no plugin hook or tool body for a call its processor does not ad
         }),
       ),
     )
-    const run = (name: string, toolCallID: string, args: Record<string, unknown>) => {
+    const run = (name: string, toolCallID: string, args: Record<string, unknown>, abort = new AbortController()) => {
       const execute = tools[name]?.execute
       if (!execute) throw new Error(`${name} is missing execute`)
       return Effect.promise(() =>
-        Promise.resolve(
-          execute(args, { toolCallId: toolCallID, abortSignal: new AbortController().signal, messages: [] }),
-        ).then(
+        Promise.resolve(execute(args, { toolCallId: toolCallID, abortSignal: abort.signal, messages: [] })).then(
           () => "fulfilled",
           () => "rejected",
         ),
@@ -288,6 +300,8 @@ it.effect("runs no plugin hook or tool body for a call its processor does not ad
     const calls = [
       ["probe", {}],
       ["srv_lookup", {}],
+      ["list_mcp_resources", {}],
+      ["list_mcp_resource_templates", {}],
       ["read_mcp_resource", { server: "srv", uri: "res://a" }],
     ] as const
 
@@ -295,10 +309,18 @@ it.effect("runs no plugin hook or tool body for a call its processor does not ad
     expect(hooks).toEqual([])
     expect(effects).toEqual([])
 
+    // A call whose stream attempt was already aborted never reaches its processor's admission.
+    const aborted = new AbortController()
+    aborted.abort()
+    for (const [name, args] of calls) expect(yield* run(name, `aborted-${name}`, args, aborted)).toBe("rejected")
+    expect(admissions.filter((id) => id.startsWith("aborted"))).toEqual([])
+    expect(hooks).toEqual([])
+    expect(effects).toEqual([])
+
     for (const [name, args] of calls) expect(yield* run(name, `admitted-${name}`, args)).toBe("fulfilled")
     expect(hooks.filter((hook) => hook.startsWith("tool.execute.before"))).toEqual(
       calls.map(([name]) => `tool.execute.before:admitted-${name}`),
     )
-    expect(effects).toEqual(["probe", "mcp", "resource"])
+    expect(effects).toEqual(["probe", "mcp", "resources", "templates", "resource"])
   }),
 )
