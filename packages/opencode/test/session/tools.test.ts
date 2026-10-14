@@ -166,3 +166,139 @@ it.effect("preserves running tool start time across metadata updates", () =>
     }
   }),
 )
+
+it.effect("runs no plugin hook or tool body for a call its processor does not admit", () =>
+  Effect.gen(function* () {
+    const hooks: string[] = []
+    const effects: string[] = []
+    const admitted: SessionV1.ToolPart = {
+      id: partID,
+      sessionID,
+      messageID,
+      type: "tool",
+      tool: "probe",
+      callID,
+      state: { status: "running", input: {}, time: { start: 1 } },
+    }
+    const processor = {
+      message: {
+        id: messageID,
+        sessionID,
+        role: "assistant",
+        parentID: MessageID.ascending(),
+        agent: "build",
+        mode: "build",
+        path: { cwd: "/tmp", root: "/tmp" },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ModelV2.ID.make("test-model"),
+        providerID: ProviderV2.ID.make("test"),
+        time: { created: 1 },
+      } satisfies SessionV1.Assistant,
+      updateToolCall: () => Effect.succeed(admitted),
+      // The processor refuses admission by failing the execution, as it does for an unowned or ended call.
+      admitToolCall: (toolCallID: string) =>
+        toolCallID.startsWith("refused")
+          ? Effect.die(new Error(`Tool call ${toolCallID} was not admitted for execution`))
+          : Effect.succeed(admitted),
+      completeToolCall: () => Effect.void,
+    } satisfies Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "admitToolCall" | "completeToolCall">
+    const client = {
+      getServerCapabilities: () => ({ resources: {} }),
+      callTool: async () => {
+        effects.push("mcp")
+        return { content: [{ type: "text", text: "called" }] }
+      },
+    }
+
+    const tools = yield* SessionTools.resolve({
+      agent,
+      model,
+      session: { id: sessionID, permission: [] } as unknown as Session.Info,
+      processor,
+      bypassAgentCheck: false,
+      messages: [],
+      promptOps: {} as never,
+    }).pipe(
+      Effect.provideService(
+        Plugin.Service,
+        Plugin.Service.of({
+          init: () => Effect.void,
+          list: () => Effect.succeed([]),
+          trigger: (name, input, output) =>
+            Effect.sync(() => {
+              hooks.push(`${name}:${(input as { callID: string }).callID}`)
+              return output
+            }),
+        }),
+      ),
+      Effect.provideService(
+        MCP.Service,
+        MCP.Service.of({
+          clients: () => Effect.succeed({ srv: client }),
+          tools: () =>
+            Effect.succeed({
+              srv_lookup: {
+                def: { name: "lookup", inputSchema: { type: "object", properties: {} } },
+                client,
+              },
+            }),
+          readResource: () =>
+            Effect.sync(() => {
+              effects.push("resource")
+              return { contents: [{ uri: "res://a", text: "a" }] }
+            }),
+        } as unknown as MCP.Interface),
+      ),
+      Effect.provideService(
+        ToolRegistry.Service,
+        ToolRegistry.Service.of({
+          ids: () => Effect.succeed(["probe"]),
+          all: () => Effect.succeed([]),
+          named: () => Effect.die("unused"),
+          tools: () =>
+            Effect.succeed([
+              {
+                id: "probe",
+                description: "records its effect",
+                parameters: Schema.Struct({}),
+                jsonSchema: { type: "object", properties: {} },
+                execute: () =>
+                  Effect.sync(() => {
+                    effects.push("probe")
+                    return { title: "probe", metadata: {}, output: "done" }
+                  }),
+              } satisfies Tool.Def,
+            ]),
+        }),
+      ),
+    )
+    const run = (name: string, toolCallID: string, args: Record<string, unknown>) => {
+      const execute = tools[name]?.execute
+      if (!execute) throw new Error(`${name} is missing execute`)
+      return Effect.promise(() =>
+        Promise.resolve(
+          execute(args, { toolCallId: toolCallID, abortSignal: new AbortController().signal, messages: [] }),
+        ).then(
+          () => "fulfilled",
+          () => "rejected",
+        ),
+      )
+    }
+    const calls = [
+      ["probe", {}],
+      ["srv_lookup", {}],
+      ["read_mcp_resource", { server: "srv", uri: "res://a" }],
+    ] as const
+
+    for (const [name, args] of calls) expect(yield* run(name, `refused-${name}`, args)).toBe("rejected")
+    expect(hooks).toEqual([])
+    expect(effects).toEqual([])
+
+    for (const [name, args] of calls) expect(yield* run(name, `admitted-${name}`, args)).toBe("fulfilled")
+    expect(hooks.filter((hook) => hook.startsWith("tool.execute.before"))).toEqual(
+      calls.map(([name]) => `tool.execute.before:admitted-${name}`),
+    )
+    expect(effects).toEqual(["probe", "mcp", "resource"])
+  }),
+)
