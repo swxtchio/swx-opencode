@@ -2901,6 +2901,8 @@ const custodyTurn = Effect.fn("test.custodyTurn")(function* (input: {
   dir: string
   dbPath: string
   body: (args: { value: number }, ctx: Tool.Context) => Effect.Effect<void>
+  // Runs when the runtime dispatches a call, before the production wrapper receives it.
+  dispatch?: (args: { value: number }) => Effect.Effect<void>
 }) {
   const { processors, session, provider } = yield* boot()
   const chat = yield* session.create({})
@@ -2988,7 +2990,9 @@ const custodyTurn = Effect.fn("test.custodyTurn")(function* (input: {
   tools.probe = {
     ...tools.probe,
     execute: (args, options) => {
-      const run = Promise.resolve(execute(args, options) as PromiseLike<unknown>)
+      const run = (input.dispatch ? Effect.runPromise(input.dispatch(args)) : Promise.resolve()).then(
+        () => execute(args, options) as PromiseLike<unknown>,
+      )
       executions.push(
         run.then(
           () => "fulfilled" as const,
@@ -3471,7 +3475,10 @@ it.live(
 )
 
 // Forwards Session writes, letting a case act on a write before it reaches the store.
-const custodyWrites: { before?: (part: SessionV1.Part) => Effect.Effect<void> | undefined } = {}
+const custodyWrites: {
+  before?: (part: SessionV1.Part) => Effect.Effect<void> | undefined
+  read?: (partID: string) => Effect.Effect<void> | undefined
+} = {}
 const custodyWriteSession = LayerNode.make({
   service: Session.Service,
   layer: Layer.effect(
@@ -3483,6 +3490,10 @@ const custodyWriteSession = LayerNode.make({
         updatePart: <T extends SessionV1.Part>(part: T) => {
           const before = custodyWrites.before?.(part)
           return before ? before.pipe(Effect.andThen(real.updatePart(part))) : real.updatePart(part)
+        },
+        getPart: (input) => {
+          const read = custodyWrites.read?.(input.partID)
+          return read ? read.pipe(Effect.andThen(real.getPart(input))) : real.getPart(input)
         },
       })
     }),
@@ -3511,7 +3522,12 @@ const itCustodyWrites = testEffect(
     [...replacements, [Session.node, custodyWriteSession], [Database.node, Database.layerFromPath(custodyWriteDbPath)]],
   ),
 )
-const resetCustodyWrites = Effect.addFinalizer(() => Effect.sync(() => (custodyWrites.before = undefined)))
+const resetCustodyWrites = Effect.addFinalizer(() =>
+  Effect.sync(() => {
+    custodyWrites.before = undefined
+    custodyWrites.read = undefined
+  }),
+)
 
 itCustodyWrites.live("settles a turn interrupted between owning a call and writing its pending part", () =>
   provideTmpdirServer(
@@ -3630,6 +3646,219 @@ itCustodyWrites.live(
           expect(existsSync(marker(1))).toBe(false)
           expect(existsSync(marker(2))).toBe(true)
           expect(storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")).toMatchObject({
+            state: { status: "completed", input: { value: 2 }, output: "probe:2" },
+          })
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  30_000,
+)
+
+// Runs a turn whose first stream attempt fails retryably while the call_1 it admitted with { value: 1 } is still
+// executing, so the retry dispatches call_1 again with { value: 2 }. Each attempt's consumer is held at its first read of call_1's part after
+// registering the call, outside any transaction, until that attempt's own execution has entered its body: the first
+// attempt then fails, and the retry's consumer resumes only once the retry's execution has been admitted.
+const retriedCall = Effect.fn("test.retriedCall")(function* (input: {
+  dir: string
+  body: (args: { value: number }, ctx: Tool.Context) => Effect.Effect<void>
+  dispatch?: (args: { value: number }) => Effect.Effect<void>
+}) {
+  yield* resetCustodyWrites
+  const entered = [Deferred.makeUnsafe<void>(), Deferred.makeUnsafe<void>()]
+  const takenOver = Deferred.makeUnsafe<void>()
+  const turn = yield* custodyTurn({
+    dir: input.dir,
+    dbPath: custodyWriteDbPath,
+    body: (args, ctx) =>
+      Deferred.succeed(entered[args.value - 1], undefined).pipe(Effect.andThen(input.body(args, ctx))),
+    dispatch: input.dispatch,
+  })
+  let attempt = 0
+  let consumer: Fiber.Fiber<unknown, unknown> | undefined
+  let partID: string | undefined
+  let reads = 0
+  custodyWrites.before = (part) => {
+    if (part.type === "step-start") {
+      attempt++
+      consumer = Fiber.getCurrent()
+      reads = 0
+    }
+    if (part.type === "tool" && part.callID === "call_1" && part.state.status === "pending") partID = part.id
+    return undefined
+  }
+  custodyWrites.read = (read) => {
+    if (read !== partID || Fiber.getCurrent() !== consumer) return undefined
+    reads++
+    // The first attempt registers call_1 with its pending write; the retry, with the read that takes the call over.
+    if (reads !== attempt) return undefined
+    if (attempt === 1)
+      return awaitWithTimeout(Deferred.await(entered[0]), "the first attempt's execution never entered its body").pipe(
+        Effect.andThen(
+          Effect.die(Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET", syscall: "read" })),
+        ),
+        Effect.orDie,
+      )
+    Deferred.doneUnsafe(takenOver, Exit.void)
+    return awaitWithTimeout(
+      Deferred.await(entered[1]),
+      "the retry's execution never entered its body",
+      "5 seconds",
+    ).pipe(Effect.orDie)
+  }
+  // Detached, so a turn that never settles fails this case's bounds instead of holding the test's scope open.
+  const run = yield* turn.process.pipe(Effect.forkDetach)
+  return { ...turn, run, entered, takenOver }
+})
+
+itCustodyWrites.live(
+  "admits the retry of an already-admitted call with the retry's own input",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          const release = Deferred.makeUnsafe<void>()
+          const marker = (value: number) => path.join(dir, `probe-effect-${value}`)
+          yield* llm.tool("probe", { value: 1 })
+          yield* llm.tool("probe", { value: 2 })
+          const turn = yield* retriedCall({
+            dir,
+            body: (args) =>
+              (args.value === 1 ? Deferred.await(release) : Effect.void).pipe(
+                Effect.andThen(writeMarker(marker(args.value), `effect:${args.value}`)),
+              ),
+          })
+          yield* awaitWithTimeout(Deferred.await(turn.entered[1]), "the retry never executed call_1", "10 seconds")
+          const admitted = (value: number) => ({
+            callID: "call_1",
+            stored: { callID: "call_1", state: { status: "running", input: { value } } },
+          })
+          expect(turn.plugin).toMatchObject([admitted(1), admitted(2)])
+          expect(turn.body).toMatchObject([admitted(1), admitted(2)])
+          expect(turn.body[1].stored?.id).toBe(turn.body[0].stored?.id)
+          expect(yield* awaitWithTimeout(Fiber.join(turn.run), "the retried turn never finished", "5 seconds")).toBe(
+            "continue",
+          )
+          yield* Deferred.succeed(release, undefined)
+          expect(
+            yield* awaitWithTimeout(
+              Effect.promise(() => Promise.all(turn.executions)),
+              "the superseded execution never finished",
+            ),
+          ).toEqual(["fulfilled", "fulfilled"])
+          expect(existsSync(marker(1))).toBe(true)
+          expect(storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")).toMatchObject({
+            state: { status: "completed", input: { value: 2 }, output: "probe:2" },
+          })
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  30_000,
+)
+
+itCustodyWrites.live(
+  "never lets an execution a retry superseded write metadata into or complete the retried call",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          const release = [Deferred.makeUnsafe<void>(), Deferred.makeUnsafe<void>()]
+          const metadata: Exit.Exit<void>[] = []
+          const marker = (value: number) => path.join(dir, `probe-effect-${value}`)
+          yield* llm.tool("probe", { value: 1 })
+          yield* llm.tool("probe", { value: 2 })
+          const turn = yield* retriedCall({
+            dir,
+            body: (args, ctx) =>
+              Effect.gen(function* () {
+                yield* Deferred.await(release[args.value - 1])
+                if (args.value === 1)
+                  metadata.push(yield* Effect.exit(ctx.metadata({ title: "obsolete", metadata: { value: 1 } })))
+                yield* writeMarker(marker(args.value), `effect:${args.value}`)
+              }),
+          })
+          yield* awaitWithTimeout(Deferred.await(turn.entered[1]), "the retry never executed call_1", "10 seconds")
+          // The superseded execution finishes while the retry's is still running; its wrapper, whose stream attempt
+          // has ended, then tries to record its own outcome.
+          yield* Deferred.succeed(release[0], undefined)
+          expect(
+            yield* awaitWithTimeout(
+              Effect.promise(() => turn.executions[0]),
+              "the superseded execution never finished",
+            ),
+          ).toBe("fulfilled")
+          expect(metadata).toHaveLength(1)
+          expect(Exit.isFailure(metadata[0])).toBe(true)
+          const retried = storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")
+          expect(retried?.state).toMatchObject({ status: "running", input: { value: 2 } })
+          expect(retried?.state).not.toHaveProperty("title")
+          expect(retried?.state).not.toHaveProperty("metadata")
+
+          yield* Deferred.succeed(release[1], undefined)
+          expect(yield* awaitWithTimeout(Fiber.join(turn.run), "the retried turn never finished", "5 seconds")).toBe(
+            "continue",
+          )
+          expect(existsSync(marker(1))).toBe(true)
+          expect(existsSync(marker(2))).toBe(true)
+          expect(storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")).toMatchObject({
+            id: retried?.id,
+            state: { status: "completed", input: { value: 2 }, output: "probe:2" },
+          })
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  30_000,
+)
+
+itCustodyWrites.live(
+  "never lets an execution write a call a retry has taken over, even before the retry admits its own",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          const release = Deferred.makeUnsafe<void>()
+          const redispatch = Deferred.makeUnsafe<void>()
+          const metadata: Exit.Exit<void>[] = []
+          const marker = (value: number) => path.join(dir, `probe-effect-${value}`)
+          yield* llm.tool("probe", { value: 1 })
+          yield* llm.tool("probe", { value: 2 })
+          const turn = yield* retriedCall({
+            dir,
+            body: (args, ctx) =>
+              Effect.gen(function* () {
+                if (args.value === 1) {
+                  yield* Deferred.await(release)
+                  metadata.push(yield* Effect.exit(ctx.metadata({ title: "obsolete", metadata: { value: 1 } })))
+                }
+                yield* writeMarker(marker(args.value), `effect:${args.value}`)
+              }),
+            // The retry's dispatch of call_1 is held from its admission until the superseded execution has finished.
+            dispatch: (args) => (args.value === 2 ? Deferred.await(redispatch) : Effect.void),
+          })
+          yield* awaitWithTimeout(Deferred.await(turn.takenOver), "the retry never took call_1 over", "10 seconds")
+          yield* Deferred.succeed(release, undefined)
+          expect(
+            yield* awaitWithTimeout(
+              Effect.promise(() => turn.executions[0]),
+              "the superseded execution never finished",
+            ),
+          ).toBe("fulfilled")
+          expect(metadata).toHaveLength(1)
+          expect(Exit.isFailure(metadata[0])).toBe(true)
+          // The call keeps the admission record of the execution that last ran it until the retry admits its own.
+          const taken = storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")
+          expect(taken?.state).toMatchObject({ status: "running", input: { value: 1 } })
+          expect(taken?.state).not.toHaveProperty("title")
+
+          yield* Deferred.succeed(redispatch, undefined)
+          expect(yield* awaitWithTimeout(Fiber.join(turn.run), "the retried turn never finished", "5 seconds")).toBe(
+            "continue",
+          )
+          expect(turn.body).toMatchObject([
+            { callID: "call_1", stored: { state: { status: "running", input: { value: 1 } } } },
+            { callID: "call_1", stored: { state: { status: "running", input: { value: 2 } } } },
+          ])
+          expect(storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")).toMatchObject({
+            id: taken?.id,
             state: { status: "completed", input: { value: 2 }, output: "probe:2" },
           })
         }),
