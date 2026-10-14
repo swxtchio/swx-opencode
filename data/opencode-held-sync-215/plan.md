@@ -23,24 +23,45 @@ already does.
 
 ## Change
 
-1. `queue.ts`: add `awaitHeld(sessionID, itemID)`. If the session has a live hold and the item has not
-   become a message, it waits on `released` (release or lapse) and returns true. If the item has
-   meanwhile left the queue without becoming a message (deleted or withdrawn), it fails with
-   `WithdrawnError`. Otherwise it returns false at once. The hold checks in `reserve`/`commit` and the
-   `awaitingDrain` exclusion of held rows stay as they are.
-2. `prompt.ts` `drain`: after the joined run, and after any background drain for other work, a caller
-   whose own item `awaitHeld` held back drains again. That re-drain delivers its prompt and returns
-   that turn's reply.
+1. `queue.ts`: `disposition(sessionID, itemID)` reports what became of a waiting caller's own item:
+   `answered` (its turn recorded a reply), `delivered` (it became a message whose turn has not), or
+   `pending`. A pending item first waits out any live hold (`released`: release or lapse), then is
+   observed again. It fails with `WithdrawnError` for an item withdrawn or deleted without becoming a
+   message. The hold checks in `reserve`/`commit` and the `awaitingDrain` exclusion of held rows stay
+   as they are.
+2. `prompt.ts` `drain`: after the joined run, and after any background drain for other work, the caller
+   drains again when its item is `pending`, or `delivered` while a run is busy. It observes busy after
+   the hold barrier, so the re-drain joins the release's own drain.
+
+Round 1 (review at `c98afefdee`) replaced the first version, `awaitHeld`. That version read "no hold
+is live now" as "nothing holds this item back". A hold that ended after the caller's
+`awaitingDrain`/idle checks therefore still returned the previous reply. That happened both before the
+release's promotion committed and after, while the delivered turn was still with the provider. The
+caller now decides from its item's state observed after the barrier, never from whether a hold is live.
+The one change outside holds: an item deleted while its caller waits now ends the caller with
+`PromptWithdrawn`, as a withdrawn one already did. It no longer returns the run's final message.
 
 ## Regression
 
-- `test/server/httpapi-session.test.ts`, beside the existing review-hold test: an existing session
-  with a completed turn ("prior done"). Under a hold, a sync `POST /session/:id/message` default steer
-  is pending and its request unresolved. The item is listed, the model sees no part of it, and the
-  provider call count is unchanged. On release the item is delivered and the response is the new
-  turn's reply, not "prior done". The same again with `delivery: "queue"`.
-- `test/session/queue-review.test.ts`, next to the existing lease test, uses TestClock because lapse
-  cannot be reached over live HTTP within a test's run: `awaitHeld` stays blocked under a renewed
-  lease and returns when the lease lapses. It fails `WithdrawnError` for an item deleted while held.
-  It returns false at once with no hold.
-- Red proof: with `awaitHeld` made to return false, both new tests fail.
+All of these are in `test/server/httpapi-session.test.ts`, over the production HTTP routes and a real
+provider server, on an existing session whose prior turn answered "prior done". Each runs once with
+the default steer and once with `delivery: "queue"`:
+
+- **Release.** While held, the sync request stays unresolved. Its item is listed, the model sees none
+  of it, and the provider call count is unchanged. After release, the response is the new turn's reply.
+- **Lease lapse.** The routes run on TestClock (`itClocked`). The request is still pending 5 test
+  minutes in, and gets the new turn's reply once the lease lapses at 6. No release route is called.
+- **Hold ending during the caller's checks.** This uses `itRacing`/`spanHold`. The caller is held
+  after `awaitingDrain` and after its idle check. The release ends the hold, and then the caller
+  decides. One ordering holds the release's promotion before it commits; the other lets it commit and
+  holds the provider. In both, the request stays unresolved and gets its own turn's reply.
+
+`test/session/queue-review.test.ts` covers `disposition` directly: it waits through a renewed lease and
+returns `pending` at lapse, and fails `WithdrawnError` for an item deleted while held.
+
+Red proofs:
+- Release, against the pre-fix base: the release test fails.
+- Hold ending during the caller's checks, against `c98afefdee`: it fails at both orderings.
+- Hold ending during the caller's checks, with the `delivered && busy` re-drain removed: the
+  after-commit ordering fails.
+- Lease lapse, against the base and with the `drain` hook removed: the lapse test fails.

@@ -45,6 +45,7 @@ import { ProviderTurnInterruptedMessage, ProviderTurnInterruptedOrigin } from "@
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import * as DateTime from "effect/DateTime"
+import * as TestClock from "effect/testing/TestClock"
 import { eq } from "drizzle-orm"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideInstanceEffect, TestInstance, tmpdirScoped } from "../fixture/fixture"
@@ -95,6 +96,25 @@ const itRacing = testEffect(
       Layer.provideMerge(NodeServices.layer),
     ),
   ).pipe(Layer.provide(Layer.succeed(Tracer.Tracer, racingSpans.tracer))),
+)
+// Its own served routes on the test clock, so a review hold's lease can lapse
+// within a test; the test's own waits run on the live clock.
+const clockedRoutes: Layer.Layer<never, Config.ConfigError, HttpServer.HttpServer> = HttpRouter.serve(
+  HttpApiApp.routes,
+  {
+    disableListenLog: true,
+    disableLogger: true,
+  },
+)
+const itClocked = testEffect(
+  Layer.mergeAll(
+    appLayer,
+    clockedRoutes.pipe(
+      Layer.provide(layerWebSocketConstructorGlobal),
+      Layer.provideMerge(NodeHttpServer.layerTest),
+      Layer.provideMerge(NodeServices.layer),
+    ),
+  ).pipe(Layer.provideMerge(TestClock.layer())),
 )
 
 function pathFor(path: string, params: Record<string, string>) {
@@ -2543,6 +2563,60 @@ describe("session HttpApi", () => {
           expect(yield* api.replyText(answered)).toBe(done)
           expect((yield* api.lastUsers).at(-1)).toEqual({ role: "user", content: text })
           yield* api.idle()
+          expect(yield* api.listed()).toEqual([])
+        }
+        expect(yield* llm.calls).toBe(3)
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  // A lapse ends the hold through the caller's own wait and the hold's lapse
+  // watch, not the release route (#215).
+  itClocked.live(
+    "a sync prompt held on an existing session gets its own turn's reply when the hold's lease lapses",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "review hold lapses" }).pipe(provideInstanceEffect(directory))
+        const api = reviewRoutes(directory, session.id, llm)
+        yield* llm.text("prior done")
+        expect(yield* api.replyText(yield* api.sync("before the hold"))).toBe("prior done")
+
+        for (const [text, delivery, done] of [
+          ["steer until the lapse", undefined, "steer done"],
+          ["queued until the lapse", "queue", "queue done"],
+        ] as const) {
+          expect((yield* api.post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+          const calls = yield* llm.calls
+          const held = yield* api.sync(text, delivery).pipe(Effect.forkChild)
+          yield* TestClock.withLive(
+            pollWithTimeout(
+              api.listed().pipe(Effect.map((items) => (api.texts(items).includes(text) ? true : undefined))),
+              `${text} never queued`,
+            ),
+          )
+          yield* TestClock.adjust("5 minutes")
+          expect(
+            Option.isNone(yield* TestClock.withLive(Fiber.await(held).pipe(Effect.timeoutOption("1 second")))),
+          ).toBe(true)
+          expect(api.texts(yield* api.listed())).toEqual([text])
+          expect(yield* llm.calls).toBe(calls)
+          const messages = yield* requestJson<SessionV1.WithParts[]>(
+            pathFor(SessionPaths.messages, { sessionID: session.id }),
+            { headers: api.headers },
+          )
+          expect(JSON.stringify(messages)).not.toContain(text)
+
+          yield* llm.text(done)
+          yield* TestClock.adjust("1 minute")
+          const answered = yield* TestClock.withLive(
+            awaitWithTimeout(Fiber.join(held), `${text} never answered after the lapse`, "10 seconds"),
+          )
+          expect(answered.status).toBe(200)
+          expect(yield* api.replyText(answered)).toBe(done)
+          expect((yield* api.lastUsers).at(-1)).toEqual({ role: "user", content: text })
+          yield* TestClock.withLive(api.idle())
           expect(yield* api.listed()).toEqual([])
         }
         expect(yield* llm.calls).toBe(3)
