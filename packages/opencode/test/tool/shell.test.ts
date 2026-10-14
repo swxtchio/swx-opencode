@@ -1348,6 +1348,7 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
   dir: string
   llm: TestLLMServer["Service"]
   command: string
+  timeout?: number
   interruptOn?: string
 }) {
   const sessions = yield* Session.Service
@@ -1357,7 +1358,7 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
   const chunks: Chunk[] = []
   const shell = yield* tappedShell(chunks)
 
-  yield* input.llm.tool(ShellID.ToolID, { command: input.command, description: "store test" })
+  yield* input.llm.tool(ShellID.ToolID, { command: input.command, description: "store test", timeout: input.timeout })
   const chat = yield* sessions.create({})
   const user = yield* sessions.updateMessage({
     id: MessageID.ascending(),
@@ -1630,6 +1631,34 @@ describe("tool.shell running output persistence", () => {
             const output = String(result.settled.state.metadata?.output)
             expect(output.startsWith("tail-marker\n")).toBe(true)
             expect(output).toContain("term-tail\n")
+          }),
+        { config: storeConfig },
+      ),
+    15_000,
+  )
+
+  unixStore(
+    "keeps output a timed-out command writes while it shuts down when an interruption settles it",
+    () =>
+      provideTmpdirServer(
+        ({ dir, llm }) =>
+          Effect.gen(function* () {
+            // The timeout starts the kill, and the interruption arrives during it: the marker comes from the SIGTERM
+            // handler, and the command outlives cleanup's wait.
+            const result = yield* throughSession({
+              dir,
+              llm,
+              command:
+                "trap 'echo timeout-tail; echo abort-marker' TERM; echo before-timeout; while :; do sleep 0.05; done",
+              timeout: 1000,
+              interruptOn: "abort-marker",
+            })
+            expect(result.settled?.state.status).toBe("error")
+            if (result.settled?.state.status !== "error") return
+            expect(result.settled.state.metadata?.interrupted).toBe(true)
+            const output = String(result.settled.state.metadata?.output)
+            expect(output.startsWith("before-timeout\n")).toBe(true)
+            expect(output).toContain("timeout-tail\nabort-marker\n")
           }),
         { config: storeConfig },
       ),

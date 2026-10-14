@@ -479,9 +479,10 @@ export const ShellTool = Tool.define(
           Effect.asVoid,
         )
       })
-      // Once aborted, processor cleanup may settle the part from the store at any moment, so output consumed while the
-      // command shuts down, such as a SIGTERM handler's, is written at once rather than an interval later.
-      const persist = Effect.suspend(() => (aborted ? flush : schedule))
+      // Once the command is being killed, an abort may make processor cleanup settle the part from the store at any
+      // moment, even after a timeout started the kill, so output consumed while the command shuts down, such as a
+      // SIGTERM handler's, is written at once rather than an interval later.
+      const persist = Effect.suspend(() => (aborted || expired ? flush : schedule))
 
       const closeSink = Effect.fnUntraced(function* () {
         const stream = sink
@@ -572,14 +573,11 @@ export const ShellTool = Tool.define(
             timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
           ])
 
-          if (exit.kind === "abort") {
-            aborted = true
+          if (exit.kind === "abort") aborted = true
+          if (exit.kind === "timeout") expired = true
+          if (exit.kind !== "exit") {
             // Processor cleanup may settle a still-running part from the store before this run returns.
             yield* flush
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-          }
-          if (exit.kind === "timeout") {
-            expired = true
             yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
           }
 
