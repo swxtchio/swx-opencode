@@ -4,7 +4,7 @@ import { Context, Effect, Layer } from "effect"
 import { SqlClient } from "effect/unstable/sql/SqlClient"
 
 // Outlasts the driver's own retry window, so it only catches a retry that never stops.
-const retryBackstop = "10 seconds"
+const retryBackstop = "15 seconds"
 
 const withImmediateSqliteLock = <A, E, R>(
   database: Database.Interface["db"],

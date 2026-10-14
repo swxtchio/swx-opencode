@@ -24,8 +24,12 @@ const nodeSqliteDrivers = await import("node:sqlite").then(
 )
 // Above the lock-hold threshold by a margin that scheduling noise cannot close.
 const longHoldMs = 400
+// The driver's retry window, which an exhausted statement waits out.
+const lockWindowMs = 10_000
 // Outlasts the driver's own retry window, so it only catches a retry that never stops.
-const lockBackstop = "10 seconds"
+const lockBackstop = "15 seconds"
+// Bun test timeouts for a test that exhausts the window, above the backstop.
+const exhaustionTestMs = 30_000
 
 type LogLine = { readonly text: unknown; readonly fields: Record<string, unknown> }
 
@@ -342,14 +346,14 @@ describe("SQLite lock retry exhaustion diagnostics", () => {
               "sqlite.errcode": 5,
             })
             expect(attempts.count).toBeGreaterThan(1)
-            expect(summaries[0].fields.elapsedMs).toBeGreaterThanOrEqual(5_000)
+            expect(summaries[0].fields.elapsedMs).toBeGreaterThanOrEqual(lockWindowMs)
             expect(summaries[0].fields.elapsedMs).toBeLessThanOrEqual(Math.ceil(elapsedMs))
             expect(holds(lines)).toEqual([])
             expect(unretried(lines)).toEqual([])
           }),
         ),
       ),
-    20_000,
+    exhaustionTestMs,
   )
 
   test(
@@ -373,7 +377,7 @@ describe("SQLite lock retry exhaustion diagnostics", () => {
             // One statement effect, run twice at once; the connection serializes them, so each meets its own window.
             const write = db.$client.unsafe(writerSql).raw.pipe(Effect.flip)
             yield* Effect.all([write, write], { concurrency: 2 }).pipe(
-              Effect.timeoutOrElse({ duration: "20 seconds", orElse: () => Effect.die(new Error("retries never stopped")) }),
+              Effect.timeoutOrElse({ duration: "30 seconds", orElse: () => Effect.die(new Error("retries never stopped")) }),
             )
 
             const summaries = exhausted(lines)
@@ -383,12 +387,12 @@ describe("SQLite lock retry exhaustion diagnostics", () => {
             expect(counts[0] + counts[1]).toBe(attempts.count)
             for (const line of summaries) {
               expect(line.fields.statement).toBe("insert")
-              expect(line.fields.elapsedMs).toBeLessThan(10_000)
+              expect(line.fields.elapsedMs).toBeLessThan(2 * lockWindowMs)
             }
           }),
         ),
       ),
-    30_000,
+    40_000,
   )
 
   test(
@@ -454,7 +458,7 @@ describe("SQLite lock retry exhaustion diagnostics", () => {
           }),
         ),
       ),
-    20_000,
+    exhaustionTestMs,
   )
 
   for (const clientType of ["core-node", "standalone-node"] as const) {
@@ -493,7 +497,7 @@ describe("SQLite lock retry exhaustion diagnostics", () => {
             }),
           ),
         ),
-      20_000,
+      exhaustionTestMs,
     )
   }
 

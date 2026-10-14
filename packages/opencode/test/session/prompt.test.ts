@@ -6375,12 +6375,12 @@ consumeLock.instance(
             pollWithTimeout(
               Effect.sync(() => (capture.locked.length > 0 ? true : undefined)),
               "consume never reported the held lock",
-              "15 seconds",
+              "30 seconds",
             ),
             Fiber.await(task),
           ),
           "neither a failed consume nor the run's end was observed",
-          "20 seconds",
+          "40 seconds",
         )
         const failed = records()
         yield* lock.release
@@ -6428,7 +6428,7 @@ consumeLock.instance(
         expect(remaining).toEqual([])
       }).pipe(Effect.provideService(Logger.CurrentLoggers, capture.loggers))
     }),
-  30_000,
+  60_000,
 )
 
 consumeLock.instance(
@@ -6446,7 +6446,7 @@ consumeLock.instance(
         const exits = yield* awaitWithTimeout(
           Effect.all([Fiber.await(task), Fiber.await(continuation)]),
           "the run never stopped under the held lock",
-          "60 seconds",
+          "120 seconds",
         )
 
         consumeRefusals(exits).forEach((refusal) => {
@@ -6464,7 +6464,7 @@ consumeLock.instance(
         yield* wakeDeliversContinuation(started)
       }).pipe(Effect.provideService(Logger.CurrentLoggers, capture.loggers))
     }),
-  90_000,
+  180_000,
 )
 
 consumeLock.instance(
@@ -6496,7 +6496,7 @@ consumeLock.instance(
         const exits = yield* awaitWithTimeout(
           Effect.all([Fiber.await(task), Fiber.await(continuation)]),
           "the run never stopped while the session permit was held",
-          "80 seconds",
+          "160 seconds",
         ).pipe(Effect.onError(() => Deferred.succeed(permitRelease, undefined)))
 
         consumeRefusals(exits).forEach((refusal) => {
@@ -6514,7 +6514,7 @@ consumeLock.instance(
         yield* wakeDeliversContinuation(started)
       }).pipe(Effect.provideService(Logger.CurrentLoggers, capture.loggers))
     }),
-  110_000,
+  220_000,
 )
 
 consumeLock.instance(
@@ -6554,14 +6554,14 @@ consumeLock.instance(
         const deletesBefore = deletes.count
 
         // The first attempt meets the native lock; then the transaction owns the connection and the lock is released.
-        yield* awaitWithTimeout(Deferred.await(owned), "the transaction never took the shared connection", "15 seconds")
+        yield* awaitWithTimeout(Deferred.await(owned), "the transaction never took the shared connection", "30 seconds")
         expect(begins.busy.length).toBeGreaterThan(0)
         expect(capture.locked).toEqual([{ "session.id": chat.id, attempts: 1 }])
         yield* lock.release
         const exits = yield* awaitWithTimeout(
           Effect.all([Fiber.await(task), Fiber.await(continuation)]),
           "the run never stopped while another transaction kept the connection",
-          "70 seconds",
+          "140 seconds",
         ).pipe(Effect.onError(() => Deferred.succeed(holderRelease, undefined)))
 
         // Refused, attributably and with the runner stopped, while the transaction still holds the connection.
@@ -6591,7 +6591,7 @@ consumeLock.instance(
         yield* wakeDeliversContinuation(started)
       }).pipe(Effect.provideService(Logger.CurrentLoggers, capture.loggers))
     }),
-  120_000,
+  240_000,
 )
 
 // Makes the consume's delete, which runs only after its transaction began, fail with SQLITE_BUSY while armed, so the

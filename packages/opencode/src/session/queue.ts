@@ -120,7 +120,7 @@ const consumeAttempts = 5
 // Bounds an attempt's wait for the session permit, the shared connection and
 // BEGIN together: its own statement window plus one other statement's window
 // ahead of it on the connection. The body, once begun, is not timed.
-const consumeAcquireBackstop = Duration.seconds(10)
+const consumeAcquireBackstop = Duration.seconds(20)
 // A review hold's lease (#212). Its client renews it on activity and closes its
 // view after 5 minutes without any, so a live view always renews in time; the
 // lease only ends a hold whose client vanished without releasing it.
