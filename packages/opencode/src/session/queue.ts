@@ -320,6 +320,19 @@ export interface Interface {
    * release, or by its last lease lapsing.
    */
   readonly released: (sessionID: SessionID) => Effect.Effect<HoldEnd>
+  /**
+   * What became of a waiting caller's own item once the run it joined ended
+   * (#215): `answered` when its turn recorded a reply, `delivered` when it became
+   * a message whose turn has not, and `pending` while it is still queued. A
+   * pending item first waits out any live review hold, ended by a release or a
+   * lapse, and is observed again after it, so a hold that ended after the
+   * caller's earlier checks is seen as ended. Fails with WithdrawnError when the
+   * item was withdrawn or deleted without becoming a message.
+   */
+  readonly disposition: (
+    sessionID: SessionID,
+    itemID: ItemID,
+  ) => Effect.Effect<"answered" | "delivered" | "pending", WithdrawnError>
   /** Deletes a pending item for good. None tells the caller it was not pending. */
   readonly remove: (sessionID: SessionID, itemID: ItemID) => Effect.Effect<Option.Option<Item>>
   /**
@@ -2020,6 +2033,30 @@ const layer = Layer.effect(
         }
       })
 
+    // The run a held caller joined could not deliver its item, so it ended on
+    // the turn before; that turn's reply is not this item's answer.
+    const disposition: Interface["disposition"] = Effect.fn("SessionQueue.disposition")(function* (sessionID, itemID) {
+      const before = yield* observe(sessionID, itemID)
+      if (before !== "pending") return before
+      yield* released(sessionID)
+      return yield* observe(sessionID, itemID)
+    })
+
+    const observe = Effect.fnUntraced(function* (sessionID: SessionID, itemID: ItemID) {
+      const own = channels.get(itemID)
+      const carried = channels.get(carrier(itemID))
+      if (own?.reply ?? carried?.reply) return "answered" as const
+      if (own?.message ?? carried?.message) return "delivered" as const
+      const row = yield* db
+        .select({ promoted: SessionPromptQueueTable.time_promoted, withdrawn: SessionPromptQueueTable.time_withdrawn })
+        .from(SessionPromptQueueTable)
+        .where(and(eq(SessionPromptQueueTable.id, carrier(itemID)), eq(SessionPromptQueueTable.session_id, sessionID)))
+        .get()
+        .pipe(Effect.orDie)
+      if (!row || row.withdrawn !== null) return yield* new WithdrawnError({ sessionID, itemID })
+      return row.promoted === null ? ("pending" as const) : ("delivered" as const)
+    })
+
     const remove = Effect.fn("SessionQueue.remove")(function* (sessionID: SessionID, itemID: ItemID) {
       return yield* exclusive(
         sessionID,
@@ -2870,6 +2907,7 @@ const layer = Layer.effect(
       hold,
       release,
       released,
+      disposition,
       remove,
       reorder,
       consolidate,

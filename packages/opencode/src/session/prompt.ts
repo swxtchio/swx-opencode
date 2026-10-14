@@ -1890,11 +1890,24 @@ const layer = Layer.effect(
           Effect.forkIn(scope, { startImmediately: true }),
         )
       }
+      // A review hold can keep this prompt pending past the run just joined, and
+      // can end at any point after the checks above. Its caller decides on what
+      // became of its own prompt after any hold ends, as a new session's first
+      // prompt waits one out, and drains again until its own turn answers (#215).
+      if (own) {
+        const disposition = yield* queue.disposition(sessionID, own)
+        if (
+          disposition === "pending" ||
+          (disposition === "delivered" && Exit.isFailure(yield* state.assertNotBusy(sessionID).pipe(Effect.exit)))
+        )
+          return yield* drain(sessionID, own, rootMessageID, retryFailedRoot)
+      }
       const reply = own ? yield* queue.reply(own) : undefined
       if (reply) return reply
-      // A prompt still pending when the run stopped, or delivered after its last
-      // history read, has no turn; its caller gets the run's final message, as
-      // every caller did before the queue.
+      // A prompt delivered to a run that stopped without answering it has no
+      // turn, and a drain without a prompt has none to wait for; either caller
+      // gets the run's final message, as every caller did before the queue. A
+      // prompt still pending on a parked session gets it from the re-drain.
       return yield* withdrawn.pipe(Effect.as(result))
     })
 
