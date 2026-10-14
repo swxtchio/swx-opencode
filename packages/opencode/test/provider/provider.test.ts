@@ -185,6 +185,55 @@ it.instance(
     ])
   }),
   { config: googleGeminiConfig },
+  { timeout: 15_000 },
+)
+
+it.instance(
+  "translates migrated Google model-level reasoning effort",
+  Effect.gen(function* () {
+    const provider = (yield* list)[ProviderV2.ID.make("google")]
+    const model = provider.models["gemini-3.8-flash"]
+    const publicModel = Provider.toPublicInfo(provider).models["gemini-3.8-flash"]
+    expect(model.options.thinkingConfig).toEqual({ includeThoughts: true, thinkingLevel: "medium" })
+    expect(model.options.reasoningEffort).toBeUndefined()
+    expect(publicModel?.options.thinkingConfig).toEqual({ includeThoughts: true, thinkingLevel: "medium" })
+  }),
+  { config: googleGeminiConfig },
+  { timeout: 15_000 },
+)
+
+it.instance(
+  "drops unsupported minimal only from migrated Google variants",
+  Effect.gen(function* () {
+    const provider = (yield* list)[ProviderV2.ID.make("google")]
+    expect(provider.models["gemini-3.8-flash"].variants?.minimal).toBeUndefined()
+    expect(provider.models["gemini-3.8-flash-native"].variants?.minimal?.reasoningEffort).toBe("minimal")
+  }),
+  { config: googleGeminiConfig },
+  { timeout: 15_000 },
+)
+
+it.instance(
+  "leaves already native Google reasoning options unchanged",
+  Effect.gen(function* () {
+    const native = (yield* list)[ProviderV2.ID.make("google")].models["gemini-3.8-flash-native"]
+    expect(native.api.npm).toBe("@ai-sdk/google")
+    expect(native.options.reasoningEffort).toBe("high")
+    expect(native.variants?.minimal?.reasoningEffort).toBe("minimal")
+  }),
+  { config: googleGeminiConfig },
+  { timeout: 15_000 },
+)
+
+it.instance(
+  "leaves an unmigrated native Google endpoint unchanged",
+  Effect.gen(function* () {
+    const native = (yield* list)[ProviderV2.ID.make("google")].models["gemini-3.8-flash-native"]
+    const language = yield* Provider.use.getLanguage(native)
+    expect(languageBaseURL(language)).toBe("https://generativelanguage.googleapis.com/v1beta/openai")
+  }),
+  { config: googleGeminiConfig },
+  { timeout: 15_000 },
 )
 
 it.instance(
