@@ -114,6 +114,9 @@ type ToolCall = {
 
 type Execution = { call: ToolCall; attempt: Attempt }
 
+// The owner of a call when its outcome committed.
+type Settled = { call: ToolCall; attempt: Attempt; execution?: Execution }
+
 // One stream attempt's admissions. A retry starts a fresh one, so a call a failed attempt dispatched can never be
 // admitted against the record of a retry that reuses its call ID.
 type Attempt = {
@@ -317,12 +320,21 @@ const layer = Layer.effect(
           aborted,
         })
 
+      // An execution owns its call while its attempt still owns the call and has admitted no later execution. Without
+      // an execution, the write is the consumer's own.
+      const owns = (call: ToolCall, execution: Execution | undefined) =>
+        !execution || (execution.call === call && call.execution === execution && call.attempt === execution.attempt)
+
+      // Settles a call once its outcome has committed, but only for the owner that committed it. The commit's
+      // publication runs before this, so a retry may have taken the call over meanwhile; settling then would release
+      // the retry's custody. The check and the release run without yielding, so they are ordered against a takeover.
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (
         toolCallID: string,
-        call: ToolCall,
+        settled: Settled,
       ) {
-        if (ctx.toolcalls[toolCallID] === call) delete ctx.toolcalls[toolCallID]
-        yield* Deferred.succeed(call.done, undefined).pipe(Effect.ignore)
+        if (settled.call.attempt !== settled.attempt || !owns(settled.call, settled.execution)) return
+        if (ctx.toolcalls[toolCallID] === settled.call) delete ctx.toolcalls[toolCallID]
+        yield* Deferred.succeed(settled.call.done, undefined).pipe(Effect.ignore)
       })
 
       const readToolCall = Effect.fn("SessionProcessor.readToolCall")(function* (toolCallID: string) {
@@ -361,11 +373,6 @@ const layer = Layer.effect(
             Deferred.succeed(registered, undefined),
           )
         })
-
-      // An execution owns its call while its attempt still owns the call and has admitted no later execution. Without
-      // an execution, the write is the consumer's own.
-      const owns = (call: ToolCall, execution: Execution | undefined) =>
-        !execution || (execution.call === call && call.execution === execution && call.attempt === execution.attempt)
 
       const updateToolCall = Effect.fn("SessionProcessor.updateToolCall")(function* (
         toolCallID: string,
@@ -444,7 +451,7 @@ const layer = Layer.effect(
                 attachments: output.attachments,
               },
             })
-            return match.call
+            return { call: match.call, attempt: match.call.attempt, execution } satisfies Settled
           }),
         )
         // Settled only once the outcome has committed: a write that fails leaves the call for cleanup to settle.
@@ -467,7 +474,7 @@ const layer = Layer.effect(
                 time: { start: match.part.state.time.start, end: Date.now() },
               },
             })
-            return match.call
+            return { call: match.call, attempt: match.call.attempt } satisfies Settled
           }),
         )
         if (!failed) return false
