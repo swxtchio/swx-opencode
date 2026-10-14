@@ -3867,6 +3867,145 @@ itCustodyWrites.live(
   30_000,
 )
 
+// Runs a turn whose first stream attempt fails retryably while the call_1 it admitted with { value: 1 } is still
+// executing. Once that attempt has ended, its execution completes call_1 itself: the completion commits, but its
+// publication is held, so its writer has not yet settled the call. Only then does the retry start; it takes call_1 over
+// and rewrites it running with { value: 2 }, and only after that is its dispatch of call_1 admitted. The case releases
+// the held publication once the retry's execution has entered its body.
+const committedBeforeTakeover = Effect.fn("test.committedBeforeTakeover")(function* (input: {
+  dir: string
+  body: (ctx: Tool.Context) => Effect.Effect<void>
+}) {
+  yield* resetCustodyWrites
+  const entered = [Deferred.makeUnsafe<void>(), Deferred.makeUnsafe<void>()]
+  const rewritten = Deferred.makeUnsafe<void>()
+  const publication = yield* holdPartPublication(
+    (part) => part.callID === "call_1" && part.state.status === "completed" && part.state.output === "probe:1",
+  )
+  const turn = yield* custodyTurn({
+    dir: input.dir,
+    dbPath: custodyWriteDbPath,
+    body: (args, ctx) =>
+      Deferred.succeed(entered[args.value - 1], undefined).pipe(
+        Effect.andThen(
+          args.value === 1
+            ? awaitWithTimeout(
+                Effect.callback<void>((resume) => {
+                  if (ctx.abort.aborted) return resume(Effect.void)
+                  ctx.abort.addEventListener("abort", () => resume(Effect.void), { once: true })
+                }),
+                "the first attempt never ended",
+              ).pipe(Effect.orDie)
+            : input.body(ctx),
+        ),
+      ),
+    dispatch: (args) =>
+      args.value === 2
+        ? awaitWithTimeout(Deferred.await(rewritten), "the retry never rewrote call_1", "10 seconds").pipe(Effect.orDie)
+        : Effect.void,
+  })
+  let attempt = 0
+  let consumer: Fiber.Fiber<unknown, unknown> | undefined
+  let partID: string | undefined
+  let reads = 0
+  custodyWrites.before = (part) => {
+    if (part.type === "step-start") {
+      attempt++
+      consumer = Fiber.getCurrent()
+      if (attempt === 2)
+        return awaitWithTimeout(
+          Deferred.await(publication.committed),
+          "the first attempt's execution never committed its outcome",
+          "5 seconds",
+        ).pipe(Effect.asVoid, Effect.orDie)
+    }
+    if (part.type !== "tool" || part.callID !== "call_1") return undefined
+    if (part.state.status === "pending") partID = part.id
+    if (attempt === 2 && part.state.status === "running" && part.state.input.value === 2)
+      Deferred.doneUnsafe(rewritten, Exit.void)
+    return undefined
+  }
+  custodyWrites.read = (read) => {
+    if (attempt !== 1 || read !== partID || Fiber.getCurrent() !== consumer || ++reads !== 1) return undefined
+    return awaitWithTimeout(Deferred.await(entered[0]), "the first attempt's execution never entered its body").pipe(
+      Effect.andThen(Effect.die(Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET", syscall: "read" }))),
+      Effect.orDie,
+    )
+  }
+  // Detached, so a turn that never settles fails this case's bounds instead of holding the test's scope open.
+  const run = yield* turn.process.pipe(Effect.forkDetach)
+  yield* awaitWithTimeout(Deferred.await(entered[1]), "the retry never executed call_1", "10 seconds")
+  yield* Deferred.succeed(publication.release, undefined)
+  expect(
+    yield* awaitWithTimeout(
+      Effect.promise(() => turn.executions[0]),
+      "the first attempt's execution never finished",
+    ),
+  ).toBe("fulfilled")
+  return { ...turn, run }
+})
+
+for (const gated of [false, true])
+  itCustodyWrites.live(
+    `keeps a retry's custody when an earlier execution's outcome settles after the retry took the call over${gated ? ", for an effect gated on metadata" : ""}`,
+    () =>
+      provideTmpdirServer(
+        ({ dir, llm }) =>
+          Effect.gen(function* () {
+            const proceed = Deferred.makeUnsafe<void>()
+            const marker = path.join(dir, "probe-effect-2")
+            yield* llm.tool("probe", { value: 1 })
+            yield* llm.tool("probe", { value: 2 })
+            const turn = yield* committedBeforeTakeover({
+              dir,
+              body: (ctx) =>
+                Deferred.await(proceed).pipe(
+                  Effect.andThen(gated ? ctx.metadata({ metadata: { value: 2 } }) : Effect.void),
+                  Effect.andThen(writeMarker(marker, "effect:2")),
+                ),
+            })
+            yield* Deferred.succeed(proceed, undefined)
+            expect(yield* awaitWithTimeout(Fiber.join(turn.run), "the retried turn never finished", "5 seconds")).toBe(
+              "continue",
+            )
+            expect(
+              yield* awaitWithTimeout(
+                Effect.promise(() => turn.executions[1]),
+                "the retry never finished",
+              ),
+            ).toBe("fulfilled")
+            expect(existsSync(marker)).toBe(true)
+            expect(storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")).toMatchObject({
+              state: { status: "completed", input: { value: 2 }, output: "probe:2" },
+            })
+          }),
+        { config: (url) => providerCfg(url) },
+      ),
+    30_000,
+  )
+
+itCustodyWrites.live(
+  "settles a cancelled retry whose call an earlier execution's outcome settled after the takeover",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          yield* llm.tool("probe", { value: 1 })
+          yield* llm.tool("probe", { value: 2 })
+          const turn = yield* committedBeforeTakeover({ dir, body: () => Effect.never })
+          yield* awaitWithTimeout(Fiber.interrupt(turn.run), "the cancelled retry never finished settling")
+          expect(storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")).toMatchObject({
+            state: { status: "error", input: { value: 2 }, error: "Tool execution aborted" },
+          })
+          const message = storedAssistant(custodyWriteDbPath, turn.msg.id)
+          expect(message?.time.completed).toBeDefined()
+          expect(message?.error?.name).toBe("MessageAbortedError")
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  30_000,
+)
+
 // The native runtime consumes a tool call, which writes it running, before it dispatches the call; the dispatched
 // wrapper's admission is therefore the call's second running write.
 const admissionFault = { callID: "", running: 0 }
