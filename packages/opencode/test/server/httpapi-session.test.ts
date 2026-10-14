@@ -2486,6 +2486,71 @@ describe("session HttpApi", () => {
     30_000,
   )
 
+  // swxtchio/swx-opencode#215: the turn before the hold is not a held prompt's answer.
+  it.live(
+    "a sync prompt held on an existing session waits for its own turn's reply",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "review hold, existing session" }).pipe(
+          provideInstanceEffect(directory),
+        )
+        const api = reviewRoutes(directory, session.id, llm)
+        const sync = (text: string, delivery?: SessionQueue.Delivery) =>
+          api.post(SessionPaths.prompt, {
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            ...(delivery ? { delivery } : {}),
+            parts: [{ type: "text", text }],
+          })
+        const replyText = (response: HttpClientResponse.HttpClientResponse) =>
+          json<SessionV1.WithParts>(response).pipe(
+            Effect.map((message) =>
+              message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
+            ),
+          )
+
+        yield* llm.text("prior done")
+        const prior = yield* sync("before the hold")
+        expect(prior.status).toBe(200)
+        expect(yield* replyText(prior)).toBe("prior done")
+
+        for (const [text, delivery, done] of [
+          ["steer while held", undefined, "steer done"],
+          ["queued while held", "queue", "queue done"],
+        ] as const) {
+          expect((yield* api.post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+          const calls = yield* llm.calls
+          const held = yield* sync(text, delivery).pipe(Effect.forkChild)
+          yield* pollWithTimeout(
+            api.listed().pipe(Effect.map((items) => (api.texts(items).includes(text) ? true : undefined))),
+            `${text} never queued`,
+          )
+          // Unfixed, the caller's joined run ended at once and answered it with "prior done".
+          expect(Option.isNone(yield* Fiber.await(held).pipe(Effect.timeoutOption("1 second")))).toBe(true)
+          expect(api.texts(yield* api.listed())).toEqual([text])
+          expect(yield* llm.calls).toBe(calls)
+          const messages = yield* requestJson<SessionV1.WithParts[]>(
+            pathFor(SessionPaths.messages, { sessionID: session.id }),
+            { headers: api.headers },
+          )
+          expect(JSON.stringify(messages)).not.toContain(text)
+
+          yield* llm.text(done)
+          expect((yield* api.post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+          const answered = yield* awaitWithTimeout(Fiber.join(held), `${text} never answered`, "10 seconds")
+          expect(answered.status).toBe(200)
+          expect(yield* replyText(answered)).toBe(done)
+          expect((yield* api.lastUsers).at(-1)).toEqual({ role: "user", content: text })
+          yield* api.idle()
+          expect(yield* api.listed()).toEqual([])
+        }
+        expect(yield* llm.calls).toBe(3)
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
   it.live(
     "deleted, reordered and consolidated pending prompts are delivered as the review left them",
     () => {

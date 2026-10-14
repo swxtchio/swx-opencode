@@ -477,6 +477,44 @@ it.instance(
   30_000,
 )
 
+// swxtchio/swx-opencode#215: a held sync caller waits for its own item until the hold ends.
+it.instance(
+  "a caller waits for its held item until the lease lapses, and ends withdrawn if it is deleted",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "held caller" })
+      const item = yield* admit(session.id, "steer", "waits for the lapse")
+      expect(yield* queue.awaitHeld(session.id, item.id)).toBe(false)
+
+      yield* queue.hold(session.id, "view")
+      const waiting = yield* queue.awaitHeld(session.id, item.id).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* TestClock.adjust("5 minutes")
+      expect((yield* queue.hold(session.id, "view")).started).toBe(false)
+      yield* TestClock.adjust("5 minutes")
+      for (let turn = 0; turn < 100; turn++) yield* Effect.yieldNow
+      expect(waiting.pollUnsafe()).toBeUndefined()
+      yield* TestClock.adjust("1 minute")
+      // A timeout would run on the test clock too, so a bounded number of turns
+      // lets the woken waiter finish instead.
+      for (let turn = 0; turn < 100 && waiting.pollUnsafe() === undefined; turn++) yield* Effect.yieldNow
+      const lapsed = waiting.pollUnsafe()
+      expect(lapsed && Exit.isSuccess(lapsed) ? lapsed.value : undefined).toBe(true)
+      expect((yield* queue.list(session.id)).map(text)).toEqual(["waits for the lapse"])
+
+      const doomed = yield* admit(session.id, "queue", "deleted while held")
+      yield* queue.hold(session.id, "view")
+      const deleted = yield* queue.awaitHeld(session.id, doomed.id).pipe(Effect.forkChild({ startImmediately: true }))
+      expect(Option.isSome(yield* queue.remove(session.id, doomed.id))).toBe(true)
+      expect(yield* queue.release(session.id, "view")).toBe(true)
+      for (let turn = 0; turn < 100 && deleted.pollUnsafe() === undefined; turn++) yield* Effect.yieldNow
+      const ended = deleted.pollUnsafe()
+      expect(ended && Exit.isFailure(ended) && Cause.squash(ended.cause)).toBeInstanceOf(SessionQueue.WithdrawnError)
+    }).pipe(Effect.provide(TestClock.layer())),
+  30_000,
+)
+
 it.instance(
   "remove deletes only a pending row, for good",
   () =>

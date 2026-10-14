@@ -1890,6 +1890,11 @@ const layer = Layer.effect(
           Effect.forkIn(scope, { startImmediately: true }),
         )
       }
+      // A review hold keeps this prompt pending, so the run just joined could
+      // not answer it; its caller waits out the hold as a new session's first
+      // prompt does, then drains again to deliver it (#215).
+      if (own && (yield* queue.awaitHeld(sessionID, own)))
+        return yield* drain(sessionID, own, rootMessageID, retryFailedRoot)
       const reply = own ? yield* queue.reply(own) : undefined
       if (reply) return reply
       // A prompt still pending when the run stopped, or delivered after its last

@@ -320,6 +320,14 @@ export interface Interface {
    * release, or by its last lease lapsing.
    */
   readonly released: (sessionID: SessionID) => Effect.Effect<HoldEnd>
+  /**
+   * A waiting caller's wait for its own item while a live review hold keeps it
+   * from becoming a message (#215): it waits until the hold ends, by a release or
+   * a lapse, and reports true, or fails with WithdrawnError when the item left
+   * the queue meanwhile without becoming one. False at once when nothing holds
+   * it back.
+   */
+  readonly awaitHeld: (sessionID: SessionID, itemID: ItemID) => Effect.Effect<boolean, WithdrawnError>
   /** Deletes a pending item for good. None tells the caller it was not pending. */
   readonly remove: (sessionID: SessionID, itemID: ItemID) => Effect.Effect<Option.Option<Item>>
   /**
@@ -2020,6 +2028,16 @@ const layer = Layer.effect(
         }
       })
 
+    // The run a held caller joined cannot deliver its item, so it ended on the
+    // turn before; that turn's reply is not this item's answer.
+    const awaitHeld: Interface["awaitHeld"] = Effect.fn("SessionQueue.awaitHeld")(function* (sessionID, itemID) {
+      const delivered = () => channels.get(itemID)?.message ?? channels.get(carrier(itemID))?.message
+      if (delivered() || !(yield* held(sessionID))) return false
+      yield* released(sessionID)
+      if (!delivered() && !(yield* unread(sessionID, itemID))) return yield* new WithdrawnError({ sessionID, itemID })
+      return true
+    })
+
     const remove = Effect.fn("SessionQueue.remove")(function* (sessionID: SessionID, itemID: ItemID) {
       return yield* exclusive(
         sessionID,
@@ -2870,6 +2888,7 @@ const layer = Layer.effect(
       hold,
       release,
       released,
+      awaitHeld,
       remove,
       reorder,
       consolidate,
