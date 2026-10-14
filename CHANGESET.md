@@ -70,11 +70,14 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#262** Route only configured Google Gemini 3.8+ models that migrate from the OpenAI-compatible entry through native Google generation. Translate model and agent effort options, preserve already-native models, and omit the unsupported `minimal` variant (swxtchio/swx-opencode#259). _Fork-only._
+
 - **#260** Write the shell tool's running output at most once per 500 ms instead of once per output chunk
   (swxtchio/swx-opencode#196). Each write is one immediate transaction on the shared database. The live view lags
-  by at most the interval, and the settled part keeps its exact output. An abort or interruption writes the
-  unwritten tail first, so a part that cleanup settles keeps it. The SQLite lock retry window grows from 5 to 10
-  seconds, and the queue consume's acquisition backstop, two windows, from 10 to 20. _Upstreamable._
+  by at most the interval, and the settled part keeps its exact output. An abort, timeout or interruption writes the
+  unwritten tail first, and output read while the command is killed is written at once, so a part that cleanup
+  settles keeps it. The SQLite lock retry window grows from 5 to 10 seconds, and the queue consume's acquisition
+  backstop, two windows, from 10 to 20. _Upstreamable._
 
 - **#258** Keep a synchronous V1 prompt that a review hold leaves pending on an existing session waiting for its own
   delivery (swxtchio/swx-opencode#215): it no longer returns the previous turn's reply. After its run the caller

@@ -91,7 +91,16 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
         sessionID: input.sessionID,
         providerOptions: input.provider.options,
       })
-  const options = mergeOptions(mergeOptions(mergeOptions(base, input.model.options), input.agent.options), variant)
+  const options = mergeOptions(
+    mergeOptions(
+      mergeOptions(
+        ProviderTransform.googleThinkingOptions(input.model, base),
+        ProviderTransform.googleThinkingOptions(input.model, input.model.options),
+      ),
+      ProviderTransform.googleThinkingOptions(input.model, input.agent.options),
+    ),
+    ProviderTransform.googleThinkingOptions(input.model, variant),
+  )
   if (
     input.model.api.npm === "@ai-sdk/azure" &&
     (input.provider.options.useCompletionUrls || input.model.options.useCompletionUrls || options.useCompletionUrls)

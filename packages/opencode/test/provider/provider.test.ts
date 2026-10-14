@@ -5,6 +5,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Effect, Layer } from "effect"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
+import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Global } from "@opencode-ai/core/global"
@@ -74,6 +75,10 @@ const providerLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
     [[RuntimeFlags.node, RuntimeFlags.layer(flags)]],
   )
 
+const googleGeminiConfig = JSON.parse(
+  await Bun.file(path.join(import.meta.dir, "fixtures/google-gemini-3.8-flash.json")).text(),
+) as ConfigV1.Info
+
 const list = Provider.use.list()
 
 const paid = (providers: Record<string, { models: Record<string, { cost: { input: number } }> }>) => {
@@ -128,6 +133,107 @@ it.instance(
     expect(providers[ProviderV2.ID.anthropic]).toBeDefined()
   }),
   { config: { provider: { anthropic: { options: { apiKey: "config-api-key" } } } } },
+)
+
+it.instance(
+  "registers Google Gemini 3.8 effort with a Google thinking level",
+  Effect.gen(function* () {
+    const providers = yield* list
+    const provider = providers[ProviderV2.ID.make("google")]
+    const model = provider.models["gemini-3.8-flash"]
+    const publicModel = Provider.toPublicInfo(provider).models["gemini-3.8-flash"]
+    expect(String(model.id)).toBe("gemini-3.8-flash")
+    expect(model.providerID).toBe(ProviderV2.ID.make("google"))
+    expect(model.api.npm).toBe("@ai-sdk/google")
+    expect(model.limit.context).toBe(1_048_576)
+    expect(model.limit.output).toBe(65_536)
+    expect(model.capabilities.reasoning).toBe(true)
+    expect(model.capabilities.toolcall).toBe(true)
+    expect(model.variants?.medium?.thinkingConfig).toEqual({ includeThoughts: true, thinkingLevel: "medium" })
+    expect(model.variants?.medium?.reasoningEffort).toBeUndefined()
+    expect(publicModel?.api.npm).toBe("@ai-sdk/google")
+    expect(publicModel?.variants?.medium?.thinkingConfig).toEqual({ includeThoughts: true, thinkingLevel: "medium" })
+    expect(
+      ["gemini-3.6-flash", "gemini-3.7-flash"].map((id) => {
+        const older = provider.models[id]
+        return {
+          id: String(older.id),
+          npm: older.api.npm,
+          context: older.limit.context,
+          output: older.limit.output,
+          reasoning: older.capabilities.reasoning,
+          toolcall: older.capabilities.toolcall,
+        }
+      }),
+    ).toEqual([
+      {
+        id: "gemini-3.6-flash",
+        npm: "@ai-sdk/openai-compatible",
+        context: 1_048_576,
+        output: 65_536,
+        reasoning: true,
+        toolcall: true,
+      },
+      {
+        id: "gemini-3.7-flash",
+        npm: "@ai-sdk/openai-compatible",
+        context: 1_048_576,
+        output: 65_536,
+        reasoning: true,
+        toolcall: true,
+      },
+    ])
+  }),
+  { config: googleGeminiConfig },
+  { timeout: 15_000 },
+)
+
+it.instance(
+  "translates migrated Google model-level reasoning effort",
+  Effect.gen(function* () {
+    const provider = (yield* list)[ProviderV2.ID.make("google")]
+    const model = provider.models["gemini-3.8-flash"]
+    const publicModel = Provider.toPublicInfo(provider).models["gemini-3.8-flash"]
+    expect(model.options.thinkingConfig).toEqual({ includeThoughts: true, thinkingLevel: "medium" })
+    expect(model.options.reasoningEffort).toBeUndefined()
+    expect(publicModel?.options.thinkingConfig).toEqual({ includeThoughts: true, thinkingLevel: "medium" })
+  }),
+  { config: googleGeminiConfig },
+  { timeout: 15_000 },
+)
+
+it.instance(
+  "drops unsupported minimal only from migrated Google variants",
+  Effect.gen(function* () {
+    const provider = (yield* list)[ProviderV2.ID.make("google")]
+    expect(provider.models["gemini-3.8-flash"].variants?.minimal).toBeUndefined()
+    expect(provider.models["gemini-3.8-flash-native"].variants?.minimal?.reasoningEffort).toBe("minimal")
+  }),
+  { config: googleGeminiConfig },
+  { timeout: 15_000 },
+)
+
+it.instance(
+  "leaves already native Google reasoning options unchanged",
+  Effect.gen(function* () {
+    const native = (yield* list)[ProviderV2.ID.make("google")].models["gemini-3.8-flash-native"]
+    expect(native.api.npm).toBe("@ai-sdk/google")
+    expect(native.options.reasoningEffort).toBe("high")
+    expect(native.variants?.minimal?.reasoningEffort).toBe("minimal")
+  }),
+  { config: googleGeminiConfig },
+  { timeout: 15_000 },
+)
+
+it.instance(
+  "leaves an unmigrated native Google endpoint unchanged",
+  Effect.gen(function* () {
+    const native = (yield* list)[ProviderV2.ID.make("google")].models["gemini-3.8-flash-native"]
+    const language = yield* Provider.use.getLanguage(native)
+    expect(languageBaseURL(language)).toBe("https://generativelanguage.googleapis.com/v1beta/openai")
+  }),
+  { config: googleGeminiConfig },
+  { timeout: 15_000 },
 )
 
 it.instance(

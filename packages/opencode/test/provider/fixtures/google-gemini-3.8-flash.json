@@ -1,0 +1,74 @@
+{
+  "enabled_providers": ["google"],
+  "provider": {
+    "google": {
+      "name": "Google",
+      "npm": "@ai-sdk/openai-compatible",
+      "env": [],
+      "options": {
+        "apiKey": "test-key",
+        "baseURL": "https://generativelanguage.googleapis.com/v1beta/openai/"
+      },
+      "models": {
+        "gemini-3.6-flash": {
+          "id": "gemini-3.6-flash",
+          "name": "Gemini 3.6 Flash",
+          "reasoning": true,
+          "tool_call": true,
+          "limit": { "context": 1048576, "output": 65536 },
+          "variants": {
+            "low": { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "high" }
+          }
+        },
+        "gemini-3.7-flash": {
+          "id": "gemini-3.7-flash",
+          "name": "Gemini 3.7 Flash",
+          "reasoning": true,
+          "tool_call": true,
+          "limit": { "context": 1048576, "output": 65536 },
+          "variants": {
+            "low": { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "high" }
+          }
+        },
+        "gemini-3.8-flash": {
+          "id": "gemini-3.8-flash",
+          "name": "Gemini 3.8 Flash",
+          "temperature": true,
+          "reasoning": true,
+          "attachment": true,
+          "tool_call": true,
+          "modalities": {
+            "input": ["text", "audio", "image", "video", "pdf"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 1048576,
+            "input": 1048576,
+            "output": 65536
+          },
+          "options": { "reasoningEffort": "medium" },
+          "variants": {
+            "minimal": { "reasoningEffort": "minimal" },
+            "low": { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "high" }
+          }
+        },
+        "gemini-3.8-flash-native": {
+          "id": "gemini-3.8-flash",
+          "name": "Gemini 3.8 Flash Native",
+          "provider": { "npm": "@ai-sdk/google" },
+          "reasoning": true,
+          "tool_call": true,
+          "limit": { "context": 1048576, "output": 65536 },
+          "options": { "reasoningEffort": "high" },
+          "variants": { "minimal": { "reasoningEffort": "minimal" } }
+        }
+      }
+    }
+  }
+}
