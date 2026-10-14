@@ -486,10 +486,10 @@ it.instance(
       const queue = yield* SessionQueue.Service
       const session = yield* sessions.create({ title: "held caller" })
       const item = yield* admit(session.id, "steer", "waits for the lapse")
-      expect(yield* queue.awaitHeld(session.id, item.id)).toBe(false)
+      expect(yield* queue.disposition(session.id, item.id)).toBe("pending")
 
       yield* queue.hold(session.id, "view")
-      const waiting = yield* queue.awaitHeld(session.id, item.id).pipe(Effect.forkChild({ startImmediately: true }))
+      const waiting = yield* queue.disposition(session.id, item.id).pipe(Effect.forkChild({ startImmediately: true }))
       yield* TestClock.adjust("5 minutes")
       expect((yield* queue.hold(session.id, "view")).started).toBe(false)
       yield* TestClock.adjust("5 minutes")
@@ -500,12 +500,12 @@ it.instance(
       // lets the woken waiter finish instead.
       for (let turn = 0; turn < 100 && waiting.pollUnsafe() === undefined; turn++) yield* Effect.yieldNow
       const lapsed = waiting.pollUnsafe()
-      expect(lapsed && Exit.isSuccess(lapsed) ? lapsed.value : undefined).toBe(true)
+      expect(lapsed && Exit.isSuccess(lapsed) ? lapsed.value : undefined).toBe("pending")
       expect((yield* queue.list(session.id)).map(text)).toEqual(["waits for the lapse"])
 
       const doomed = yield* admit(session.id, "queue", "deleted while held")
       yield* queue.hold(session.id, "view")
-      const deleted = yield* queue.awaitHeld(session.id, doomed.id).pipe(Effect.forkChild({ startImmediately: true }))
+      const deleted = yield* queue.disposition(session.id, doomed.id).pipe(Effect.forkChild({ startImmediately: true }))
       expect(Option.isSome(yield* queue.remove(session.id, doomed.id))).toBe(true)
       expect(yield* queue.release(session.id, "view")).toBe(true)
       for (let turn = 0; turn < 100 && deleted.pollUnsafe() === undefined; turn++) yield* Effect.yieldNow

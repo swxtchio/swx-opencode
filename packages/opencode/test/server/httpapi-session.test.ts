@@ -2368,6 +2368,18 @@ describe("session HttpApi", () => {
     return {
       headers,
       post,
+      // The synchronous route, answered with the turn's final message.
+      sync: (text: string, delivery?: SessionQueue.Delivery) =>
+        post(SessionPaths.prompt, {
+          agent: "build",
+          model: { providerID: "test", modelID: "test-model" },
+          ...(delivery ? { delivery } : {}),
+          parts: [{ type: "text", text }],
+        }),
+      replyText: (response: HttpClientResponse.HttpClientResponse) =>
+        json<SessionV1.WithParts>(response).pipe(
+          Effect.map((message) => message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")),
+        ),
       prompt: (text: string, delivery?: SessionQueue.Delivery) =>
         post(SessionPaths.promptAsync, {
           agent: "build",
@@ -2497,24 +2509,11 @@ describe("session HttpApi", () => {
           provideInstanceEffect(directory),
         )
         const api = reviewRoutes(directory, session.id, llm)
-        const sync = (text: string, delivery?: SessionQueue.Delivery) =>
-          api.post(SessionPaths.prompt, {
-            agent: "build",
-            model: { providerID: "test", modelID: "test-model" },
-            ...(delivery ? { delivery } : {}),
-            parts: [{ type: "text", text }],
-          })
-        const replyText = (response: HttpClientResponse.HttpClientResponse) =>
-          json<SessionV1.WithParts>(response).pipe(
-            Effect.map((message) =>
-              message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
-            ),
-          )
 
         yield* llm.text("prior done")
-        const prior = yield* sync("before the hold")
+        const prior = yield* api.sync("before the hold")
         expect(prior.status).toBe(200)
-        expect(yield* replyText(prior)).toBe("prior done")
+        expect(yield* api.replyText(prior)).toBe("prior done")
 
         for (const [text, delivery, done] of [
           ["steer while held", undefined, "steer done"],
@@ -2522,7 +2521,7 @@ describe("session HttpApi", () => {
         ] as const) {
           expect((yield* api.post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
           const calls = yield* llm.calls
-          const held = yield* sync(text, delivery).pipe(Effect.forkChild)
+          const held = yield* api.sync(text, delivery).pipe(Effect.forkChild)
           yield* pollWithTimeout(
             api.listed().pipe(Effect.map((items) => (api.texts(items).includes(text) ? true : undefined))),
             `${text} never queued`,
@@ -2541,13 +2540,83 @@ describe("session HttpApi", () => {
           expect((yield* api.post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
           const answered = yield* awaitWithTimeout(Fiber.join(held), `${text} never answered`, "10 seconds")
           expect(answered.status).toBe(200)
-          expect(yield* replyText(answered)).toBe(done)
+          expect(yield* api.replyText(answered)).toBe(done)
           expect((yield* api.lastUsers).at(-1)).toEqual({ role: "user", content: text })
           yield* api.idle()
           expect(yield* api.listed()).toEqual([])
         }
         expect(yield* llm.calls).toBe(3)
       }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  // The caller saw the hold live and the session idle after its run, then the
+  // release ended the hold before the caller decided what its prompt got (#215).
+  itRacing.live(
+    "a held sync prompt whose hold ends during its caller's checks still gets its own turn's reply",
+    () => {
+      const gate = Deferred.makeUnsafe<void>()
+      return Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "review hold ends mid-check" }).pipe(
+          provideInstanceEffect(directory),
+        )
+        const api = reviewRoutes(directory, session.id, llm)
+        yield* llm.text("prior done")
+        expect(yield* api.replyText(yield* api.sync("before the hold"))).toBe("prior done")
+
+        // The release's own drain is held before its promotion commits, then
+        // after it commits while that turn is still with the provider.
+        for (const [text, delivery, done, committed] of [
+          ["steered before commit", undefined, "steer done", false],
+          ["queued after commit", "queue", "queue done", true],
+        ] as const) {
+          expect((yield* api.post(SessionQueuePaths.hold, { holder: "view" })).status).toBe(200)
+          const checked = yield* racingSpans.arm({ name: "SessionQueue.awaitingDrain", parent: "SessionPrompt.loop" })
+          const held = yield* api.sync(text, delivery).pipe(Effect.forkChild)
+          const gates: Effect.Effect<void>[] = [checked.disarm]
+          yield* Effect.gen(function* () {
+            yield* awaitWithTimeout(checked.reached, `${text}: caller never checked for pending work`, "10 seconds")
+            const idle = yield* racingSpans.arm({ name: "SessionRunState.assertNotBusy", parent: "SessionPrompt.loop" })
+            gates.push(idle.disarm)
+            yield* checked.release
+            yield* awaitWithTimeout(idle.reached, `${text}: caller never checked for a run`, "10 seconds")
+
+            const calls = yield* llm.calls
+            const promoting = committed
+              ? undefined
+              : yield* racingSpans.arm({ name: "SessionPrompt.prepareUserMessage", parent: "SessionQueue.promote" })
+            if (promoting) gates.push(promoting.disarm)
+            yield* committed ? llm.hold(done, Effect.runPromise(Deferred.await(gate))) : llm.text(done)
+            expect((yield* api.post(SessionQueuePaths.release, { holder: "view" })).status).toBe(204)
+            if (promoting) {
+              yield* awaitWithTimeout(promoting.reached, `${text}: release never promoted`, "10 seconds")
+              expect(api.texts(yield* api.listed())).toEqual([text])
+            }
+            if (!promoting) {
+              yield* awaitWithTimeout(llm.wait(calls + 1), `${text}: delivered turn never started`, "10 seconds")
+              expect(yield* api.listed()).toEqual([])
+            }
+
+            yield* idle.release
+            // Unfixed, the caller answered here with "prior done".
+            expect(Option.isNone(yield* Fiber.await(held).pipe(Effect.timeoutOption("1 second")))).toBe(true)
+            yield* promoting ? promoting.release : Deferred.succeed(gate, undefined)
+            const answered = yield* awaitWithTimeout(Fiber.join(held), `${text} never answered`, "10 seconds")
+            expect(answered.status).toBe(200)
+            expect(yield* api.replyText(answered)).toBe(done)
+            expect((yield* api.lastUsers).at(-1)).toEqual({ role: "user", content: text })
+            yield* api.idle()
+          }).pipe(Effect.ensuring(Effect.all(gates).pipe(Effect.andThen(Fiber.interrupt(held)))))
+        }
+        expect(yield* llm.calls).toBe(3)
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(gate, undefined)),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      )
+    },
     30_000,
   )
 
