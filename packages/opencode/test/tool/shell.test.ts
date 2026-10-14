@@ -9,7 +9,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { and, asc, eq } from "drizzle-orm"
-import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Schedule, Stream } from "effect"
 import { ChildProcessSpawner } from "effect/unstable/process"
 import type * as Scope from "effect/Scope"
 import os from "os"
@@ -1341,9 +1341,9 @@ const storeConfig = (url: string) => ({
   },
 })
 
-
-// Runs one shell tool call through a real Session and returns what the store committed for its part. `interruptOn`
-// interrupts the processor as soon as the shell has consumed a chunk containing that text.
+// Runs one shell tool call through a real Session and returns what the store committed for its part, including when
+// each running output first became readable from the store. `interruptOn` interrupts the processor as soon as the
+// shell has consumed a chunk containing that text.
 const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (input: {
   dir: string
   llm: TestLLMServer["Service"]
@@ -1432,12 +1432,23 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
       tools,
     })
     .pipe(Effect.forkChild)
+  const visible: Chunk[] = []
+  const watch = yield* MessageV2.parts(assistant.id).pipe(
+    Effect.map((parts) => {
+      const part = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+      const output = part ? runningOutput(part) : ""
+      if (output && output !== visible.at(-1)?.text) visible.push({ text: output, time: Date.now() })
+    }),
+    Effect.repeat(Schedule.spaced("10 millis")),
+    Effect.forkChild,
+  )
   if (input.interruptOn) {
     const marker = input.interruptOn
     while (!chunks.some((chunk) => chunk.text.includes(marker))) yield* Effect.sleep("5 millis")
     yield* Fiber.interrupt(run)
   }
   yield* Fiber.await(run)
+  yield* Fiber.interrupt(watch)
 
   const updates = yield* database.db
     .select({ data: EventTable.data })
@@ -1464,6 +1475,7 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
     // A running snapshot carries consumed output; the shell's initialization write carries an empty one.
     snapshots: writes.filter((write) => write.part.state.status === "running" && runningOutput(write.part) !== ""),
     settled: parts.find((part): part is SessionV1.ToolPart => part.type === "tool"),
+    visible,
   }
 })
 
@@ -1496,10 +1508,11 @@ describe("tool.shell running output persistence", () => {
             expect(last - first).toBeLessThan(OUTPUT_WRITE_INTERVAL_MS)
 
             expect(result.snapshots).toHaveLength(1)
-            const snapshot = result.snapshots[0]!
-            // The quiet tail still reached the running part, within the interval of the output it carries.
-            expect(runningOutput(snapshot.part)).toBe(expected)
-            expect(snapshot.time - last).toBeLessThanOrEqual(OUTPUT_WRITE_INTERVAL_MS + 250)
+            expect(runningOutput(result.snapshots[0]!.part)).toBe(expected)
+            // The quiet tail became readable from the store as running output while the command still ran, within the
+            // interval of the output it carries.
+            expect(result.visible.map((output) => output.text)).toEqual([expected])
+            expect(result.visible[0]!.time - last).toBeLessThanOrEqual(OUTPUT_WRITE_INTERVAL_MS + 250)
 
             expect(result.settled?.state.status).toBe("completed")
             if (result.settled?.state.status !== "completed") return
@@ -1591,6 +1604,32 @@ describe("tool.shell running output persistence", () => {
             if (result.settled?.state.status !== "error") return
             expect(result.settled.state.metadata?.interrupted).toBe(true)
             expect(result.settled.state.metadata?.output).toBe("tail-marker\n")
+          }),
+        { config: storeConfig },
+      ),
+    15_000,
+  )
+
+  unixStore(
+    "keeps output a command writes while it shuts down when cleanup settles it",
+    () =>
+      provideTmpdirServer(
+        ({ dir, llm }) =>
+          Effect.gen(function* () {
+            // The SIGTERM handler writes after the abort's own write, and the command outlives cleanup's wait.
+            const result = yield* throughSession({
+              dir,
+              llm,
+              command: "trap 'echo term-tail' TERM; echo tail-marker; while :; do sleep 0.05; done",
+              interruptOn: "tail-marker",
+            })
+            expect(result.chunks.map((chunk) => chunk.text).join("")).toContain("term-tail\n")
+            expect(result.settled?.state.status).toBe("error")
+            if (result.settled?.state.status !== "error") return
+            expect(result.settled.state.metadata?.interrupted).toBe(true)
+            const output = String(result.settled.state.metadata?.output)
+            expect(output.startsWith("tail-marker\n")).toBe(true)
+            expect(output).toContain("term-tail\n")
           }),
         { config: storeConfig },
       ),

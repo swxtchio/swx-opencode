@@ -479,6 +479,9 @@ export const ShellTool = Tool.define(
           Effect.asVoid,
         )
       })
+      // Once aborted, processor cleanup may settle the part from the store at any moment, so output consumed while the
+      // command shuts down, such as a SIGTERM handler's, is written at once rather than an interval later.
+      const persist = Effect.suspend(() => (aborted ? flush : schedule))
 
       const closeSink = Effect.fnUntraced(function* () {
         const stream = sink
@@ -545,12 +548,12 @@ export const ShellTool = Tool.define(
                         full = ""
                       }),
                     ),
-                    Effect.andThen(schedule),
+                    Effect.andThen(persist),
                   )
                 }
               }
 
-              return schedule
+              return persist
             }),
           )
 
@@ -582,7 +585,10 @@ export const ShellTool = Tool.define(
 
           return exit.kind === "exit" ? exit.code : null
         }),
-      ).pipe(Effect.onInterrupt(() => flush), Effect.orDie)
+      ).pipe(
+        Effect.onInterrupt(() => flush),
+        Effect.orDie,
+      )
 
       const meta: string[] = []
       if (expired) {
