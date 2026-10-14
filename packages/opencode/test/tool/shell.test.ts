@@ -1,16 +1,25 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Effect, Exit, Layer } from "effect"
+import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
+import { EventTable } from "@opencode-ai/core/event/sql"
+import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { and, asc, eq } from "drizzle-orm"
+import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { ChildProcessSpawner } from "effect/unstable/process"
 import type * as Scope from "effect/Scope"
 import os from "os"
 import path from "path"
 import { Config } from "@/config/config"
 import { Shell } from "@opencode-ai/core/shell"
-import { ShellTool } from "../../src/tool/shell"
+import { OUTPUT_WRITE_INTERVAL_MS, ShellTool } from "../../src/tool/shell"
 import { Filesystem } from "@/util/filesystem"
-import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
-import type { Permission } from "../../src/permission"
+import { provideInstance, provideTmpdirServer, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
+import { Permission } from "../../src/permission"
 import { Agent } from "../../src/agent/agent"
 import { Truncate } from "@/tool/truncate"
 import { SessionID, MessageID } from "../../src/session/schema"
@@ -21,6 +30,18 @@ import { testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceStore } from "@/project/instance-store"
+import { Provider } from "@/provider/provider"
+import { MCP } from "@/mcp"
+import { EventV2Bridge } from "@/event-v2-bridge"
+import { Session } from "@/session/session"
+import { MessageV2 } from "@/session/message-v2"
+import { SessionProcessor } from "@/session/processor"
+import { SessionStatus } from "@/session/status"
+import { SessionSummary } from "@/session/summary"
+import { SessionTools } from "@/session/tools"
+import { ToolRegistry } from "@/tool/registry"
+import { ShellID } from "@/tool/shell/id"
+import { TestLLMServer } from "../lib/llm-server"
 
 const shellLayer = Layer.mergeAll(
   LayerNode.compile(
@@ -179,6 +200,28 @@ const mustTruncate = (result: {
     [`shell: ${process.env.SHELL || ""}`, `exit: ${String(result.metadata.exit)}`, "output:", result.output].join("\n"),
   )
 }
+
+type Chunk = { text: string; time: number }
+
+// The shell tool with its child's output stream tapped, recording each chunk the tool consumes as it consumes it.
+const tappedShell = Effect.fn("ShellToolTest.tappedShell")(function* (chunks: Chunk[]) {
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+  const tapped = ChildProcessSpawner.make((command) =>
+    spawner.spawn(command).pipe(
+      Effect.map((handle) =>
+        ChildProcessSpawner.makeHandle({
+          ...handle,
+          all: handle.all.pipe(
+            Stream.tap((bytes) =>
+              Effect.sync(() => chunks.push({ text: Buffer.from(bytes).toString("utf-8"), time: Date.now() })),
+            ),
+          ),
+        }),
+      ),
+    ),
+  )
+  return yield* Tool.init(yield* ShellTool.pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, tapped)))
+})
 
 describe("tool.shell", () => {
   each("basic", () =>
@@ -1110,9 +1153,10 @@ describe("tool.shell abort", () => {
       projectRoot,
       Effect.gen(function* () {
         const updates: string[] = []
+        // Each pause outlasts the write interval, so each line reaches a running write of its own.
         const result = yield* run(
           {
-            command: `echo first && sleep 0.1 && echo second`,
+            command: `echo first && sleep 1 && echo second && sleep 1`,
           },
           {
             ...ctx,
@@ -1129,6 +1173,32 @@ describe("tool.shell abort", () => {
       }),
     ),
   )
+
+  if (process.platform !== "win32") {
+    it.live("writes the unwritten tail when the run is interrupted", () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const chunks: Chunk[] = []
+          const shell = yield* tappedShell(chunks)
+          const updates: string[] = []
+          const running = yield* shell
+            .execute(
+              { command: "echo interrupted-tail; sleep 30" },
+              {
+                ...ctx,
+                metadata: (input) =>
+                  Effect.sync(() => void updates.push(String((input.metadata as { output?: string })?.output ?? ""))),
+              },
+            )
+            .pipe(Effect.forkChild)
+          while (!chunks.some((chunk) => chunk.text.includes("interrupted-tail"))) yield* Effect.sleep("5 millis")
+          yield* Fiber.interrupt(running)
+          expect(updates.at(-1)).toBe("interrupted-tail\n")
+        }),
+      ),
+    )
+  }
 })
 
 describe("tool.shell truncation", () => {
@@ -1195,5 +1265,335 @@ describe("tool.shell truncation", () => {
         expect(lines[lineCount - 1]).toBe(String(lineCount))
       }),
     ),
+  )
+})
+
+// Running output reaches the Session store through the production path: SessionTools' tool context, the processor's
+// updateToolCall and Session.updatePart, where each part update is one durable event. The spawner is tapped so a test
+// sees the chunks the shell actually consumed, since the OS may merge several child writes into one read.
+const storeLayer = Layer.mergeAll(
+  LayerNode.compile(
+    LayerNode.group([
+      SessionProcessor.node,
+      Session.node,
+      SessionProjector.node,
+      Provider.node,
+      Database.node,
+      EventV2Bridge.node,
+      SessionStatus.node,
+      CrossSpawnSpawner.node,
+      FSUtil.node,
+      Plugin.node,
+      Truncate.node,
+      Config.node,
+      Agent.node,
+      RuntimeFlags.node,
+      LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] }),
+    ]),
+    [
+      [
+        SessionSummary.node,
+        Layer.succeed(
+          SessionSummary.Service,
+          SessionSummary.Service.of({
+            summarize: () => Effect.void,
+            diff: () => Effect.succeed([]),
+            computeDiff: () => Effect.succeed([]),
+          }),
+        ),
+      ],
+    ],
+  ),
+  testInstanceStoreLayer,
+)
+const itStore = testEffect(storeLayer)
+
+const storeRef = { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") }
+const storeAgent: Agent.Info = {
+  name: "build",
+  mode: "primary",
+  options: {},
+  permission: [{ permission: "*", pattern: "*", action: "allow" }],
+}
+const storeConfig = (url: string) => ({
+  provider: {
+    test: {
+      name: "Test",
+      id: "test",
+      env: [],
+      npm: "@ai-sdk/openai-compatible",
+      models: {
+        "test-model": {
+          id: "test-model",
+          name: "Test Model",
+          attachment: false,
+          reasoning: false,
+          temperature: false,
+          tool_call: true,
+          release_date: "2025-01-01",
+          limit: { context: 100000, output: 10000 },
+          cost: { input: 0, output: 0 },
+          options: {},
+        },
+      },
+      options: { apiKey: "test-key", baseURL: url },
+    },
+  },
+})
+
+
+// Runs one shell tool call through a real Session and returns what the store committed for its part. `interruptOn`
+// interrupts the processor as soon as the shell has consumed a chunk containing that text.
+const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (input: {
+  dir: string
+  llm: TestLLMServer["Service"]
+  command: string
+  interruptOn?: string
+}) {
+  const sessions = yield* Session.Service
+  const processors = yield* SessionProcessor.Service
+  const provider = yield* Provider.Service
+  const database = yield* Database.Service
+  const chunks: Chunk[] = []
+  const shell = yield* tappedShell(chunks)
+
+  yield* input.llm.tool(ShellID.ToolID, { command: input.command, description: "store test" })
+  const chat = yield* sessions.create({})
+  const user = yield* sessions.updateMessage({
+    id: MessageID.ascending(),
+    role: "user",
+    sessionID: chat.id,
+    agent: "build",
+    model: storeRef,
+    time: { created: Date.now() },
+  })
+  const assistant = yield* sessions.updateMessage({
+    id: MessageID.ascending(),
+    role: "assistant",
+    sessionID: chat.id,
+    mode: "build",
+    agent: "build",
+    path: { cwd: input.dir, root: input.dir },
+    cost: 0,
+    tokens: { total: 0, input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: storeRef.modelID,
+    providerID: storeRef.providerID,
+    parentID: user.id,
+    time: { created: Date.now() },
+  } satisfies SessionV1.Assistant)
+  const model = yield* provider.getModel(storeRef.providerID, storeRef.modelID)
+  const handle = yield* processors.create({ assistantMessage: assistant, sessionID: chat.id, model })
+  const tools = yield* SessionTools.resolve({
+    agent: storeAgent,
+    model,
+    session: chat,
+    processor: handle,
+    bypassAgentCheck: false,
+    messages: [],
+    promptOps: {} as never,
+  }).pipe(
+    Effect.provideService(
+      ToolRegistry.Service,
+      ToolRegistry.Service.of({
+        ids: () => Effect.succeed([shell.id]),
+        all: () => Effect.succeed([shell]),
+        named: () => Effect.die("unused"),
+        tools: () => Effect.succeed([shell]),
+      }),
+    ),
+    Effect.provideService(
+      Permission.Service,
+      Permission.Service.of({ ask: () => Effect.void, reply: () => Effect.void, list: () => Effect.succeed([]) }),
+    ),
+    Effect.provideService(
+      MCP.Service,
+      MCP.Service.of({
+        tools: () => Effect.succeed({}),
+        clients: () => Effect.succeed({}),
+      } as Partial<MCP.Interface> as MCP.Interface),
+    ),
+  )
+
+  const run = yield* handle
+    .process({
+      user: {
+        id: user.id,
+        sessionID: chat.id,
+        role: "user",
+        time: user.time,
+        agent: user.agent,
+        model: storeRef,
+      } satisfies SessionV1.User,
+      sessionID: chat.id,
+      model,
+      agent: storeAgent,
+      system: [],
+      messages: [{ role: "user", content: "run the command" }],
+      tools,
+    })
+    .pipe(Effect.forkChild)
+  if (input.interruptOn) {
+    const marker = input.interruptOn
+    while (!chunks.some((chunk) => chunk.text.includes(marker))) yield* Effect.sleep("5 millis")
+    yield* Fiber.interrupt(run)
+  }
+  yield* Fiber.await(run)
+
+  const updates = yield* database.db
+    .select({ data: EventTable.data })
+    .from(EventTable)
+    .where(
+      and(
+        eq(EventTable.aggregate_id, chat.id),
+        eq(
+          EventTable.type,
+          EventV2.versionedType(SessionV1.Event.PartUpdated.type, SessionV1.Event.PartUpdated.durable!.version),
+        ),
+      ),
+    )
+    .orderBy(asc(EventTable.seq))
+    .all()
+    .pipe(Effect.orDie)
+  const writes = updates
+    .map((row) => row.data as { part: SessionV1.Part; time: number })
+    .filter((data): data is { part: SessionV1.ToolPart; time: number } => data.part.type === "tool")
+  const parts = yield* MessageV2.parts(assistant.id)
+  return {
+    chunks,
+    writes,
+    // A running snapshot carries consumed output; the shell's initialization write carries an empty one.
+    snapshots: writes.filter((write) => write.part.state.status === "running" && runningOutput(write.part) !== ""),
+    settled: parts.find((part): part is SessionV1.ToolPart => part.type === "tool"),
+  }
+})
+
+const runningOutput = (part: SessionV1.ToolPart) =>
+  part.state.status === "running" ? String(part.state.metadata?.output ?? "") : ""
+
+const lines = (prefix: string, count: number) =>
+  Array.from({ length: count }, (_, i) => `${prefix}-${i + 1}\n`).join("")
+
+const unixStore = process.platform === "win32" ? itStore.live.skip : itStore.live
+
+describe("tool.shell running output persistence", () => {
+  unixStore(
+    "coalesces a burst of chunks into one running write that lands while the command is quiet",
+    () =>
+      provideTmpdirServer(
+        ({ dir, llm }) =>
+          Effect.gen(function* () {
+            const result = yield* throughSession({
+              dir,
+              llm,
+              command: "for i in 1 2 3 4 5 6 7 8; do echo burst-$i; sleep 0.02; done; sleep 1.5",
+            })
+            const expected = lines("burst", 8)
+            // The burst reached the shell as several chunks, all inside one write interval.
+            expect(result.chunks.length).toBeGreaterThan(1)
+            expect(result.chunks.map((chunk) => chunk.text).join("")).toBe(expected)
+            const first = result.chunks[0]!.time
+            const last = result.chunks[result.chunks.length - 1]!.time
+            expect(last - first).toBeLessThan(OUTPUT_WRITE_INTERVAL_MS)
+
+            expect(result.snapshots).toHaveLength(1)
+            const snapshot = result.snapshots[0]!
+            // The quiet tail still reached the running part, within the interval of the output it carries.
+            expect(runningOutput(snapshot.part)).toBe(expected)
+            expect(snapshot.time - last).toBeLessThanOrEqual(OUTPUT_WRITE_INTERVAL_MS + 250)
+
+            expect(result.settled?.state.status).toBe("completed")
+            if (result.settled?.state.status !== "completed") return
+            expect(result.settled.state.output).toBe(expected)
+            expect(result.settled.state.metadata.output).toBe(expected)
+          }),
+        { config: storeConfig },
+      ),
+    15_000,
+  )
+
+  unixStore(
+    "bounds running writes of a sustained stream by elapsed time and settles its exact output",
+    () =>
+      provideTmpdirServer(
+        ({ dir, llm }) =>
+          Effect.gen(function* () {
+            const result = yield* throughSession({
+              dir,
+              llm,
+              command: "i=1; while [ $i -le 40 ]; do echo line-$i; i=$((i + 1)); sleep 0.05; done",
+            })
+            const expected = lines("line", 40)
+            const first = result.chunks[0]!.time
+            const last = result.chunks[result.chunks.length - 1]!.time
+            // At most one write per interval the output spanned, plus one for a window cut by the span's edges.
+            const allowed = Math.ceil((last - first) / OUTPUT_WRITE_INTERVAL_MS) + 1
+            expect(result.chunks.length).toBeGreaterThan(allowed)
+            expect(result.snapshots.length).toBeGreaterThan(0)
+            expect(result.snapshots.length).toBeLessThanOrEqual(allowed)
+            // Each committed snapshot extends the one before it, so no older output replaced newer output.
+            result.snapshots.slice(1).forEach((write, i) => {
+              expect(runningOutput(write.part).startsWith(runningOutput(result.snapshots[i]!.part))).toBe(true)
+            })
+
+            expect(result.settled?.state.status).toBe("completed")
+            if (result.settled?.state.status !== "completed") return
+            expect(result.settled.state.output).toBe(expected)
+            expect(result.settled.state.metadata).toMatchObject({ output: expected, exit: 0, truncated: false })
+          }),
+        { config: storeConfig },
+      ),
+    15_000,
+  )
+
+  unixStore(
+    "persists the final output of a command that exits before its next write and nothing replaces it",
+    () =>
+      provideTmpdirServer(
+        ({ dir, llm }) =>
+          Effect.gen(function* () {
+            const result = yield* throughSession({
+              dir,
+              llm,
+              command: "for i in 1 2 3 4 5; do echo fast-$i; done",
+            })
+            const expected = lines("fast", 5)
+            expect(result.settled?.state.status).toBe("completed")
+            if (result.settled?.state.status !== "completed") return
+            expect(result.settled.state.output).toBe(expected)
+            expect(result.settled.state.metadata.output).toBe(expected)
+
+            // Outlast any write that was still scheduled when the command settled.
+            yield* Effect.sleep(OUTPUT_WRITE_INTERVAL_MS * 2)
+            const parts = yield* MessageV2.parts(result.settled.messageID)
+            expect(parts.find((part) => part.type === "tool")).toEqual(result.settled)
+            const terminal = result.writes.findIndex((write) => write.part.state.status === "completed")
+            expect(terminal).toBe(result.writes.length - 1)
+          }),
+        { config: storeConfig },
+      ),
+    15_000,
+  )
+
+  unixStore(
+    "keeps the uncommitted tail when cleanup settles an interrupted command",
+    () =>
+      provideTmpdirServer(
+        ({ dir, llm }) =>
+          Effect.gen(function* () {
+            // Ignoring SIGTERM keeps the command running past cleanup's wait, so cleanup settles it from the store.
+            const result = yield* throughSession({
+              dir,
+              llm,
+              command: "trap '' TERM; echo tail-marker; while :; do sleep 0.1; done",
+              interruptOn: "tail-marker",
+            })
+            expect(result.settled?.state.status).toBe("error")
+            if (result.settled?.state.status !== "error") return
+            expect(result.settled.state.metadata?.interrupted).toBe(true)
+            expect(result.settled.state.metadata?.output).toBe("tail-marker\n")
+          }),
+        { config: storeConfig },
+      ),
+    15_000,
   )
 })

@@ -70,6 +70,11 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#260** Write the shell tool's running output at most once per 500 ms instead of once per output chunk
+  (swxtchio/swx-opencode#196). Each write is one immediate transaction on the shared database. The live view lags
+  by at most the interval, and the settled part keeps its exact output. An abort or interruption writes the
+  unwritten tail first, so a part that cleanup settles keeps it. _Upstreamable._
+
 - **#258** Keep a synchronous V1 prompt that a review hold leaves pending on an existing session waiting for its own
   delivery (swxtchio/swx-opencode#215): it no longer returns the previous turn's reply. After its run the caller
   decides from its own item's `SessionQueue.disposition`, observed after the hold ends by release or lease lapse, and

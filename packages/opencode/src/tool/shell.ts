@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Effect, Semaphore, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -25,6 +25,10 @@ import { BashArity } from "@/permission/arity"
 export { Parameters } from "./shell/prompt"
 
 const MAX_METADATA_LENGTH = 30_000
+// Each running-output write is one durable immediate transaction on a database shared by every local process (#196),
+// so streamed output reaches the running part at most once per interval, trailing the first unwritten chunk. The
+// settled part carries the final output itself, so the interval only bounds how far the live view lags.
+export const OUTPUT_WRITE_INTERVAL_MS = 500
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const FILES = new Set([
   ...CWD,
@@ -446,6 +450,35 @@ export const ShellTool = Tool.define(
       let cut = false
       let expired = false
       let aborted = false
+      let unwritten = false
+      let armed = false
+      const writes = Semaphore.makeUnsafe(1)
+      // Serialized and reading the newest preview inside the permit, so an older snapshot never commits over a newer
+      // one; uninterruptible, so a write in flight finishes before run settles the part.
+      const flush = writes
+        .withPermits(1)(
+          Effect.suspend(() => {
+            if (!unwritten) return Effect.void
+            unwritten = false
+            return ctx.metadata({
+              metadata: {
+                output: last,
+              },
+            })
+          }),
+        )
+        .pipe(Effect.uninterruptible)
+      // Arms one write, an interval after the first chunk the last write did not carry.
+      const schedule = Effect.suspend(() => {
+        if (armed) return Effect.void
+        armed = true
+        return Effect.sleep(OUTPUT_WRITE_INTERVAL_MS).pipe(
+          Effect.andThen(Effect.sync(() => void (armed = false))),
+          Effect.andThen(flush),
+          Effect.forkScoped,
+          Effect.asVoid,
+        )
+      })
 
       const closeSink = Effect.fnUntraced(function* () {
         const stream = sink
@@ -496,6 +529,7 @@ export const ShellTool = Tool.define(
               }
 
               last = preview(last + chunk)
+              unwritten = true
 
               if (file) {
                 sink?.write(chunk)
@@ -511,22 +545,12 @@ export const ShellTool = Tool.define(
                         full = ""
                       }),
                     ),
-                    Effect.andThen(
-                      ctx.metadata({
-                        metadata: {
-                          output: last,
-                        },
-                      }),
-                    ),
+                    Effect.andThen(schedule),
                   )
                 }
               }
 
-              return ctx.metadata({
-                metadata: {
-                  output: last,
-                },
-              })
+              return schedule
             }),
           )
 
@@ -547,6 +571,8 @@ export const ShellTool = Tool.define(
 
           if (exit.kind === "abort") {
             aborted = true
+            // Processor cleanup may settle a still-running part from the store before this run returns.
+            yield* flush
             yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
           }
           if (exit.kind === "timeout") {
@@ -556,7 +582,7 @@ export const ShellTool = Tool.define(
 
           return exit.kind === "exit" ? exit.code : null
         }),
-      ).pipe(Effect.orDie)
+      ).pipe(Effect.onInterrupt(() => flush), Effect.orDie)
 
       const meta: string[] = []
       if (expired) {
