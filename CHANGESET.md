@@ -70,6 +70,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#262** Route only configured Google Gemini 3.8+ models that migrate from the OpenAI-compatible entry through native Google generation. Translate model and agent effort options, preserve already-native models, and omit the unsupported `minimal` variant (swxtchio/swx-opencode#259). _Fork-only._
 - **#258** Keep a synchronous V1 prompt that a review hold leaves pending on an existing session waiting for its own
   delivery (swxtchio/swx-opencode#215): it no longer returns the previous turn's reply. After its run the caller
   decides from its own item's `SessionQueue.disposition`, observed after the hold ends by release or lease lapse, and

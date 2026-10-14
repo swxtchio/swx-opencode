@@ -702,6 +702,9 @@ function createChatStream(text: string) {
 const MODELS_FIXTURE = JSON.parse(
   await Bun.file(path.join(import.meta.dir, "../tool/fixtures/models-api.json")).text(),
 ) as Record<string, ModelsDev.Provider>
+const googleGeminiConfig = JSON.parse(
+  await Bun.file(path.join(import.meta.dir, "../provider/fixtures/google-gemini-3.8-flash.json")).text(),
+) as Partial<ConfigV1.Info>
 
 function loadFixture(providerID: string, modelID: string) {
   const provider = MODELS_FIXTURE[providerID]
@@ -2404,6 +2407,173 @@ describe("session.llm.stream", () => {
         provider: {
           [geminiFixture.providerID]: {
             options: { apiKey: "test-google-key", baseURL: `${state.server!.url.origin}/v1beta` },
+          },
+        },
+      }),
+    },
+  )
+
+  it.instance(
+    "selected Gemini variant overrides legacy agent effort while sending tools through the native Google SDK",
+    () =>
+      Effect.gen(function* () {
+        const modelID = "gemini-3.8-flash"
+        const pathSuffix = `/v1beta/models/${modelID}:streamGenerateContent`
+        const request = waitRequest(
+          pathSuffix,
+          createEventResponse([
+            {
+              candidates: [{ content: { parts: [{ text: "Hello" }] }, finishReason: "STOP" }],
+              usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
+            },
+          ]),
+        )
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.make("google"), ModelV2.ID.make(modelID))
+        const sessionID = SessionID.make("session-test-gemini-3-8-medium")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: { reasoningEffort: "low" },
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        yield* drain({
+          user: {
+            id: MessageID.make("msg_user-gemini-3-8-medium"),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: ProviderV2.ID.make("google"), modelID: resolved.id, variant: "medium" },
+          } satisfies SessionV1.User,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user", content: "Hello" }],
+          tools: {
+            lookup: tool({
+              description: "Look up a value",
+              inputSchema: z.object({ query: z.string() }),
+            }),
+          },
+        })
+
+        const capture = yield* Effect.promise(() => request)
+        const generationConfig = capture.body.generationConfig as
+          | { thinkingConfig?: { thinkingLevel?: string } }
+          | undefined
+        expect(capture.url.pathname).toBe(pathSuffix)
+        expect(generationConfig?.thinkingConfig?.thinkingLevel).toBe("medium")
+        expect(capture.body.tools).toMatchObject([{ functionDeclarations: [{ name: "lookup" }] }])
+      }),
+    {
+      config: () => ({
+        ...googleGeminiConfig,
+        provider: {
+          ...googleGeminiConfig.provider,
+          google: {
+            ...googleGeminiConfig.provider?.google,
+            options: {
+              ...googleGeminiConfig.provider?.google?.options,
+              apiKey: "test-google-key",
+              baseURL: `${state.server!.url.origin}/v1beta/openai/`,
+            },
+          },
+        },
+      }),
+    },
+  )
+
+  it.instance(
+    "sends migrated Google model and agent reasoning effort through the native SDK",
+    () =>
+      Effect.gen(function* () {
+        const modelID = "gemini-3.8-flash"
+        const pathSuffix = `/v1beta/models/${modelID}:streamGenerateContent`
+        const response = () =>
+          createEventResponse([
+            {
+              candidates: [{ content: { parts: [{ text: "Hello" }] }, finishReason: "STOP" }],
+              usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
+            },
+          ])
+        const modelOptionsRequest = waitRequest(pathSuffix, response())
+        const agentOptionsRequest = waitRequest(pathSuffix, response())
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.make("google"), ModelV2.ID.make(modelID))
+        const modelSessionID = SessionID.make("session-test-gemini-model-effort")
+        const modelAgent = {
+          name: "test-model-options",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        yield* drain({
+          user: {
+            id: MessageID.make("msg_user-gemini-model-effort"),
+            sessionID: modelSessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: modelAgent.name,
+            model: { providerID: ProviderV2.ID.make("google"), modelID: resolved.id },
+          } satisfies SessionV1.User,
+          sessionID: modelSessionID,
+          model: resolved,
+          agent: modelAgent,
+          system: [],
+          messages: [{ role: "user", content: "Use model options" }],
+          tools: {},
+        })
+
+        const modelCapture = yield* Effect.promise(() => modelOptionsRequest)
+        const agentSessionID = SessionID.make("session-test-gemini-agent-effort")
+        const agent = {
+          name: "test-agent-options",
+          mode: "primary",
+          options: { reasoningEffort: "low" },
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        yield* drain({
+          user: {
+            id: MessageID.make("msg_user-gemini-agent-effort"),
+            sessionID: agentSessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: ProviderV2.ID.make("google"), modelID: resolved.id },
+          } satisfies SessionV1.User,
+          sessionID: agentSessionID,
+          model: resolved,
+          agent,
+          system: [],
+          messages: [{ role: "user", content: "Use agent options" }],
+          tools: {},
+        })
+
+        const agentCapture = yield* Effect.promise(() => agentOptionsRequest)
+        const modelConfig = modelCapture.body.generationConfig as
+          | { thinkingConfig?: { thinkingLevel?: string } }
+          | undefined
+        const agentConfig = agentCapture.body.generationConfig as
+          | { thinkingConfig?: { thinkingLevel?: string } }
+          | undefined
+        expect(agentConfig?.thinkingConfig?.thinkingLevel).toBe("low")
+        expect(modelConfig?.thinkingConfig?.thinkingLevel).toBe("medium")
+      }),
+    {
+      config: () => ({
+        ...googleGeminiConfig,
+        provider: {
+          ...googleGeminiConfig.provider,
+          google: {
+            ...googleGeminiConfig.provider?.google,
+            options: {
+              ...googleGeminiConfig.provider?.google?.options,
+              apiKey: "test-google-key",
+              baseURL: `${state.server!.url.origin}/v1beta/openai/`,
+            },
           },
         },
       }),

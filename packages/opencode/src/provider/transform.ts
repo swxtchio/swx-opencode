@@ -1,11 +1,35 @@
 import type { ModelMessage, ToolResultPart } from "ai"
-import { mergeDeep, unique } from "remeda"
+import { mergeDeep, omit, unique } from "remeda"
 import type { JSONSchema7 } from "@ai-sdk/provider"
 import type * as Provider from "./provider"
 import type * as ModelsDev from "@opencode-ai/core/models-dev"
 import { iife } from "@/util/iife"
 
 type Modality = NonNullable<ModelsDev.Model["modalities"]>["input"][number]
+
+// Track exact config migrations so reasoning options on already-native models remain untouched.
+const migratedGoogleModels = new WeakSet<Provider.Model>()
+
+export function markGoogleCompatGeminiMigrated(model: Provider.Model) {
+  migratedGoogleModels.add(model)
+}
+
+export function isGoogleCompatGeminiMigrated(model: Provider.Model) {
+  return migratedGoogleModels.has(model)
+}
+
+export function googleThinkingOptions(model: Provider.Model, options: Record<string, any>) {
+  if (!migratedGoogleModels.has(model)) return options
+  const effort = options.reasoningEffort
+  if (typeof effort !== "string") return options
+  return {
+    ...omit(options, ["reasoningEffort"]),
+    thinkingConfig: mergeDeep(options.thinkingConfig ?? {}, {
+      includeThoughts: true,
+      thinkingLevel: effort,
+    }),
+  }
+}
 
 function mimeToModality(mime: string): Modality | undefined {
   if (mime.startsWith("image/")) return "image"
@@ -1431,15 +1455,18 @@ const SLUG_OVERRIDES: Record<string, string> = {
 }
 
 export function providerOptions(model: Provider.Model, options: { [x: string]: any }) {
+  const effectiveOptions = googleThinkingOptions(model, options)
   const usesOpenAIReasoningGate =
     model.api.npm === "@ai-sdk/openai" ||
     model.api.npm === "@ai-sdk/azure" ||
     model.api.npm === "@ai-sdk/amazon-bedrock/mantle"
   const normalized =
     usesOpenAIReasoningGate &&
-    (model.capabilities.reasoning || options.reasoningEffort !== undefined || options.reasoningSummary !== undefined)
-      ? { ...options, forceReasoning: true }
-      : anthropicBlockBinding(model, options)
+    (model.capabilities.reasoning ||
+      effectiveOptions.reasoningEffort !== undefined ||
+      effectiveOptions.reasoningSummary !== undefined)
+      ? { ...effectiveOptions, forceReasoning: true }
+      : anthropicBlockBinding(model, effectiveOptions)
 
   if (model.api.npm === "@ai-sdk/gateway") {
     // Gateway providerOptions are split across two namespaces:
