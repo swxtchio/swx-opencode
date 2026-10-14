@@ -42,7 +42,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
   model: Provider.Model
   session: Session.Info
-  processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+  processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "admitToolCall" | "completeToolCall">
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
@@ -64,20 +64,30 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps: input.promptOps },
     agent: input.agent.name,
     messages: input.messages,
+    // A tool may gate an effect on this update (shell spawns after it), so an update that reached no owned, running
+    // part fails the tool instead of passing as a no-op.
     metadata: (val) =>
-      input.processor.updateToolCall(options.toolCallId, (match) => {
-        if (!["running", "pending"].includes(match.state.status)) return match
-        return {
-          ...match,
-          state: {
-            title: val.title,
-            metadata: val.metadata,
-            status: "running",
-            input: args,
-            time: match.state.status === "running" ? match.state.time : { start: Date.now() },
-          },
-        }
-      }),
+      input.processor
+        .updateToolCall(options.toolCallId, (match) => {
+          if (!["running", "pending"].includes(match.state.status)) return match
+          return {
+            ...match,
+            state: {
+              title: val.title,
+              metadata: val.metadata,
+              status: "running",
+              input: args,
+              time: match.state.status === "running" ? match.state.time : { start: Date.now() },
+            },
+          }
+        })
+        .pipe(
+          Effect.flatMap((part) =>
+            part?.state.status === "running"
+              ? Effect.void
+              : Effect.die(new Error(`Tool call ${options.toolCallId} is no longer running under its processor`)),
+          ),
+        ),
     ask: (req) =>
       permission
         .ask({
@@ -88,6 +98,14 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         })
         .pipe(Effect.orDie),
   })
+
+  // Nothing a call runs, its plugin hooks included, may start before its processor has durably admitted it.
+  const admit = (args: unknown, options: ToolExecutionOptions) =>
+    Effect.gen(function* () {
+      yield* input.processor.admitToolCall(options.toolCallId, args)
+      if (options.abortSignal?.aborted)
+        return yield* Effect.die(new Error(`Tool call ${options.toolCallId} was aborted before execution`))
+    })
 
   for (const item of yield* registry.tools({
     modelID: ModelV2.ID.make(input.model.api.id),
@@ -102,6 +120,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       execute(args, options) {
         return run.promise(
           Effect.gen(function* () {
+            yield* admit(args, options)
             const ctx = context(args, options)
             yield* plugin.trigger(
               "tool.execute.before",
@@ -155,6 +174,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       execute(args, opts) {
         return run.promise(
           Effect.gen(function* () {
+            yield* admit(args, opts)
             const parsed = parseListMcpResourcesArgs(args)
             const ctx = context(toRecord(args), opts)
             const clients = yield* mcp.clients()
@@ -238,6 +258,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       execute(args, opts) {
         return run.promise(
           Effect.gen(function* () {
+            yield* admit(args, opts)
             const parsed = parseListMcpResourcesArgs(args)
             const ctx = context(toRecord(args), opts)
             const clients = yield* mcp.clients()
@@ -325,6 +346,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       execute(args, opts) {
         return run.promise(
           Effect.gen(function* () {
+            yield* admit(args, opts)
             const parsed = parseReadMcpResourceArgs(args)
             const ctx = context(toRecord(args), opts)
             const clients = yield* mcp.clients()
@@ -398,6 +420,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     item.execute = (args, opts) =>
       run.promise(
         Effect.gen(function* () {
+          yield* admit(args, opts)
           const ctx = context(args, opts)
           yield* plugin.trigger(
             "tool.execute.before",

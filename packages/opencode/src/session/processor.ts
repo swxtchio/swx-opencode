@@ -2,7 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Deferred, Duration, Effect, Exit, Layer, Context, Schedule, Scope, Schema } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Layer, Context, Schedule, Scope, Schema, Semaphore } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
@@ -61,6 +61,7 @@ export interface Handle {
     toolCallID: string,
     update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
   ) => Effect.Effect<SessionV1.ToolPart | undefined>
+  readonly admitToolCall: (toolCallID: string, input: unknown) => Effect.Effect<SessionV1.ToolPart>
   readonly completeToolCall: (
     toolCallID: string,
     output: {
@@ -97,6 +98,12 @@ type ToolCall = {
   messageID: SessionV1.ToolPart["messageID"]
   sessionID: SessionV1.ToolPart["sessionID"]
   done: Deferred.Deferred<void>
+  // Completes once the pending part's write has finished, committed or not. The call is owned from before that
+  // write, so cleanup still finds a part whose commit landed while its publication was interrupted.
+  written: Deferred.Deferred<void>
+  // Serializes every read-modify-write of the part, so the consumer, the executing tool and cleanup cannot
+  // overwrite each other's state.
+  lock: Semaphore.Semaphore
 }
 
 type FinalizationState = {
@@ -109,6 +116,10 @@ type FinalizationState = {
 
 interface ProcessorContext extends Input {
   toolcalls: Record<string, ToolCall>
+  // Completes when the consumer has persisted a call's pending part, or when the processor closes.
+  registrations: Record<string, Deferred.Deferred<void>>
+  // Set by cleanup: no call may be admitted for execution after this attempt has ended.
+  closed: boolean
   shouldBreak: boolean
   snapshot: string | undefined
   blocked: boolean
@@ -275,6 +286,8 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         model: input.model,
         toolcalls: {},
+        registrations: {},
+        closed: false,
         shouldBreak: false,
         snapshot: initialSnapshot,
         blocked: false,
@@ -300,32 +313,76 @@ const layer = Layer.effect(
       const readToolCall = Effect.fn("SessionProcessor.readToolCall")(function* (toolCallID: string) {
         const call = ctx.toolcalls[toolCallID]
         if (!call) return undefined
+        yield* Deferred.await(call.written)
         const part = yield* session.getPart({
           partID: call.partID,
           messageID: call.messageID,
           sessionID: call.sessionID,
         })
         if (!part || part.type !== "tool") {
-          delete ctx.toolcalls[toolCallID]
+          if (ctx.toolcalls[toolCallID] === call) delete ctx.toolcalls[toolCallID]
           return undefined
         }
         return { call, part }
       })
 
+      const withToolCall = <A, E, R>(toolCallID: string, self: Effect.Effect<A, E, R>) => {
+        const call = ctx.toolcalls[toolCallID]
+        return call ? call.lock.withPermit(self) : self
+      }
+
+      const registration = (toolCallID: string) => {
+        const existing = ctx.registrations[toolCallID]
+        if (existing) return existing
+        const next = Deferred.makeUnsafe<void>()
+        ctx.registrations[toolCallID] = next
+        return next
+      }
+
       const updateToolCall = Effect.fn("SessionProcessor.updateToolCall")(function* (
         toolCallID: string,
         update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
       ) {
-        const match = yield* readToolCall(toolCallID)
-        if (!match) return undefined
-        const part = yield* session.updatePart(update(match.part))
-        ctx.toolcalls[toolCallID] = {
-          ...match.call,
-          partID: part.id,
-          messageID: part.messageID,
-          sessionID: part.sessionID,
-        }
-        return part
+        return yield* withToolCall(
+          toolCallID,
+          Effect.gen(function* () {
+            const match = yield* readToolCall(toolCallID)
+            if (!match) return undefined
+            return yield* session.updatePart(update(match.part))
+          }),
+        )
+      })
+
+      // A locally executed call must be owned by this processor and durably running before any plugin hook or tool
+      // body runs. The AI SDK dispatches a call without waiting for this consumer, so admission waits for the
+      // consumer to persist the call rather than creating the part out of stream order. The running state records
+      // admission only: it does not show that the tool went on to produce an effect.
+      const admitToolCall = Effect.fn("SessionProcessor.admitToolCall")(function* (toolCallID: string, input: unknown) {
+        if (!ctx.closed) yield* Deferred.await(registration(toolCallID))
+        const refuse = (reason: string) =>
+          Effect.die(new Error(`Tool call ${toolCallID} was not admitted for execution: ${reason}`))
+        if (ctx.closed) return yield* refuse("the assistant turn has ended")
+        return yield* withToolCall(
+          toolCallID,
+          Effect.gen(function* () {
+            if (ctx.closed) return yield* refuse("the assistant turn has ended")
+            const match = yield* readToolCall(toolCallID)
+            if (!match) return yield* refuse("this processor does not own it")
+            if (match.part.state.status !== "pending" && match.part.state.status !== "running")
+              return yield* refuse(`it is already ${match.part.state.status}`)
+            return yield* session.updatePart({
+              ...match.part,
+              state:
+                match.part.state.status === "running"
+                  ? match.part.state
+                  : {
+                      status: "running",
+                      input: isRecord(input) ? input : { value: input },
+                      time: { start: Date.now() },
+                    },
+            })
+          }),
+        )
       })
 
       const completeToolCall = Effect.fn("SessionProcessor.completeToolCall")(function* (
@@ -337,42 +394,52 @@ const layer = Layer.effect(
           attachments?: SessionV1.FilePart[]
         },
       ) {
-        const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") return
-        yield* session.updatePart({
-          ...match.part,
-          state: {
-            status: "completed",
-            input: match.part.state.input,
-            output: output.output,
-            metadata: output.metadata,
-            title: output.title,
-            time: { start: match.part.state.time.start, end: Date.now() },
-            attachments: output.attachments,
-          },
-        })
-        yield* settleToolCall(toolCallID)
+        yield* withToolCall(
+          toolCallID,
+          Effect.gen(function* () {
+            const match = yield* readToolCall(toolCallID)
+            if (!match || match.part.state.status !== "running") return
+            yield* session.updatePart({
+              ...match.part,
+              state: {
+                status: "completed",
+                input: match.part.state.input,
+                output: output.output,
+                metadata: output.metadata,
+                title: output.title,
+                time: { start: match.part.state.time.start, end: Date.now() },
+                attachments: output.attachments,
+              },
+            })
+            yield* settleToolCall(toolCallID)
+          }),
+        )
       })
 
       const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
-        const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") return false
-        yield* session.updatePart({
-          ...match.part,
-          state: {
-            status: "error",
-            input: match.part.state.input,
-            error: errorMessage(error),
-            // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
-            metadata: match.part.state.metadata,
-            time: { start: match.part.state.time.start, end: Date.now() },
-          },
-        })
-        if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
-          ctx.blocked = ctx.shouldBreak
-        }
-        yield* settleToolCall(toolCallID)
-        return true
+        return yield* withToolCall(
+          toolCallID,
+          Effect.gen(function* () {
+            const match = yield* readToolCall(toolCallID)
+            if (!match || match.part.state.status !== "running") return false
+            yield* session.updatePart({
+              ...match.part,
+              state: {
+                status: "error",
+                input: match.part.state.input,
+                error: errorMessage(error),
+                // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
+                metadata: match.part.state.metadata,
+                time: { start: match.part.state.time.start, end: Date.now() },
+              },
+            })
+            if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
+              ctx.blocked = ctx.shouldBreak
+            }
+            yield* settleToolCall(toolCallID)
+            return true
+          }),
+        )
       })
 
       const finishReasoning = Effect.fn("SessionProcessor.finishReasoning")(function* (reasoningID: string) {
@@ -392,35 +459,37 @@ const layer = Layer.effect(
         const existing = yield* readToolCall(input.id)
         if (existing) {
           if (!input.providerExecuted || existing.part.metadata?.providerExecuted) return existing
-          const part = yield* session.updatePart({
-            ...existing.part,
-            metadata: { ...existing.part.metadata, providerExecuted: true },
-          })
-          ctx.toolcalls[input.id] = {
-            ...existing.call,
-            partID: part.id,
-            messageID: part.messageID,
-            sessionID: part.sessionID,
-          }
-          return { call: ctx.toolcalls[input.id], part }
+          const part = yield* updateToolCall(input.id, (match) => ({
+            ...match,
+            metadata: { ...match.metadata, providerExecuted: true },
+          }))
+          return part ? { call: existing.call, part } : undefined
         }
-        const part = yield* session.updatePart({
-          id: PartID.ascending(),
+        // Own the call before writing its pending part: a cancellation that lands after the commit but before this
+        // write returns must still find the part to settle.
+        const call: ToolCall = {
+          partID: PartID.ascending(),
           messageID: ctx.assistantMessage.id,
           sessionID: ctx.assistantMessage.sessionID,
-          type: "tool",
-          tool: input.name,
-          callID: input.id,
-          state: { status: "pending", input: {}, raw: "" },
-          metadata: input.providerExecuted ? { providerExecuted: true } : undefined,
-        } satisfies SessionV1.ToolPart)
-        ctx.toolcalls[input.id] = {
-          done: yield* Deferred.make<void>(),
-          partID: part.id,
-          messageID: part.messageID,
-          sessionID: part.sessionID,
+          done: Deferred.makeUnsafe<void>(),
+          written: Deferred.makeUnsafe<void>(),
+          lock: Semaphore.makeUnsafe(1),
         }
-        return { call: ctx.toolcalls[input.id], part }
+        ctx.toolcalls[input.id] = call
+        const part = yield* session
+          .updatePart({
+            id: call.partID,
+            messageID: call.messageID,
+            sessionID: call.sessionID,
+            type: "tool",
+            tool: input.name,
+            callID: input.id,
+            state: { status: "pending", input: {}, raw: "" },
+            metadata: input.providerExecuted ? { providerExecuted: true } : undefined,
+          } satisfies SessionV1.ToolPart)
+          .pipe(Effect.onExit(() => Deferred.succeed(call.written, undefined)))
+        yield* Deferred.succeed(registration(input.id), undefined)
+        return { call, part }
       })
 
       const isFilePart = (value: unknown): value is SessionV1.FilePart => Schema.is(SessionV1.FilePart)(value)
@@ -797,6 +866,10 @@ const layer = Layer.effect(
           if (Exit.isSuccess(exit)) delete ctx.reasoningMap[id]
         }
 
+        // Refuse every later admission, including ones still waiting for a call this attempt never registered.
+        ctx.closed = true
+        yield* Effect.forEach(Object.values(ctx.registrations), (registered) => Deferred.succeed(registered, undefined))
+
         yield* attempt(
           Effect.forEach(
             Object.values(ctx.toolcalls),
@@ -806,26 +879,36 @@ const layer = Layer.effect(
         )
 
         for (const toolCallID of Object.keys(ctx.toolcalls)) {
-          const readExit = yield* attempt(readToolCall(toolCallID))
-          if (Exit.isFailure(readExit)) continue
-          const match = readExit.value
-          if (!match) continue
-          const part = match.part
-          const end = Date.now()
-          const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
-          const exit = yield* attempt(
-            session.updatePart({
-              ...part,
-              state: {
-                ...part.state,
-                status: "error",
-                error: "Tool execution aborted",
-                metadata: { ...metadata, interrupted: true },
-                time: { start: "time" in part.state ? part.state.time.start : end, end },
-              },
+          yield* withToolCall(
+            toolCallID,
+            Effect.gen(function* () {
+              const readExit = yield* attempt(readToolCall(toolCallID))
+              if (Exit.isFailure(readExit)) return
+              const match = readExit.value
+              if (!match) return
+              const part = match.part
+              // A settled outcome is the tool's own record; only an unsettled part takes the interrupted disposition.
+              if (part.state.status !== "pending" && part.state.status !== "running") {
+                delete ctx.toolcalls[toolCallID]
+                return
+              }
+              const end = Date.now()
+              const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
+              const exit = yield* attempt(
+                session.updatePart({
+                  ...part,
+                  state: {
+                    ...part.state,
+                    status: "error",
+                    error: "Tool execution aborted",
+                    metadata: { ...metadata, interrupted: true },
+                    time: { start: "time" in part.state ? part.state.time.start : end, end },
+                  },
+                }),
+              )
+              if (Exit.isSuccess(exit)) delete ctx.toolcalls[toolCallID]
             }),
           )
-          if (Exit.isSuccess(exit)) delete ctx.toolcalls[toolCallID]
         }
         ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()
@@ -879,6 +962,8 @@ const layer = Layer.effect(
             messageID: input.assistantMessage.id,
           })
           ctx.needsCompaction = false
+          ctx.closed = false
+          ctx.registrations = {}
           ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
           yield* Effect.gen(function* () {
@@ -953,6 +1038,7 @@ const layer = Layer.effect(
           return ctx.assistantMessage
         },
         updateToolCall,
+        admitToolCall,
         completeToolCall,
         finalizeFailure: finalizeHandleFailure,
         process,
