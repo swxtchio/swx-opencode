@@ -61,18 +61,26 @@ export interface Handle {
     toolCallID: string,
     update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
   ) => Effect.Effect<SessionV1.ToolPart | undefined>
-  readonly admitToolCall: (toolCallID: string, input: unknown) => Effect.Effect<SessionV1.ToolPart>
-  readonly completeToolCall: (
-    toolCallID: string,
-    output: {
-      title: string
-      metadata: Record<string, any>
-      output: string
-      attachments?: SessionV1.FilePart[]
-    },
-  ) => Effect.Effect<void>
+  readonly admitToolCall: (toolCallID: string, input: unknown) => Effect.Effect<Admission>
+  readonly completeToolCall: (toolCallID: string, output: ToolOutput) => Effect.Effect<void>
   readonly finalizeFailure: (cause: Cause.Cause<unknown>, terminalize?: boolean) => Effect.Effect<void>
   readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
+}
+
+type ToolOutput = {
+  title: string
+  metadata: Record<string, any>
+  output: string
+  attachments?: SessionV1.FilePart[]
+}
+
+// One admitted execution of a call. Its writes reach the call only while that execution is still the one its
+// stream attempt admitted, so an execution a retry superseded can no longer write metadata into or settle the call.
+export interface Admission {
+  readonly update: (
+    update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
+  ) => Effect.Effect<SessionV1.ToolPart | undefined>
+  readonly complete: (output: ToolOutput) => Effect.Effect<void>
 }
 
 type Input = {
@@ -98,7 +106,13 @@ type ToolCall = {
   messageID: SessionV1.ToolPart["messageID"]
   sessionID: SessionV1.ToolPart["sessionID"]
   done: Deferred.Deferred<void>
+  // The stream attempt that owns the call. A retry that reuses the call ID takes it over.
+  attempt: Attempt
+  // The execution the call's owning attempt, or an earlier one, last admitted.
+  execution?: Execution
 }
+
+type Execution = { call: ToolCall; attempt: Attempt }
 
 // One stream attempt's admissions. A retry starts a fresh one, so a call a failed attempt dispatched can never be
 // admitted against the record of a retry that reuses its call ID.
@@ -303,10 +317,12 @@ const layer = Layer.effect(
           aborted,
         })
 
-      const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
-        const done = ctx.toolcalls[toolCallID]?.done
-        delete ctx.toolcalls[toolCallID]
-        if (done) yield* Deferred.succeed(done, undefined).pipe(Effect.ignore)
+      const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (
+        toolCallID: string,
+        call: ToolCall,
+      ) {
+        if (ctx.toolcalls[toolCallID] === call) delete ctx.toolcalls[toolCallID]
+        yield* Deferred.succeed(call.done, undefined).pipe(Effect.ignore)
       })
 
       const readToolCall = Effect.fn("SessionProcessor.readToolCall")(function* (toolCallID: string) {
@@ -346,14 +362,20 @@ const layer = Layer.effect(
           )
         })
 
+      // An execution owns its call while its attempt still owns the call and has admitted no later execution. Without
+      // an execution, the write is the consumer's own.
+      const owns = (call: ToolCall, execution: Execution | undefined) =>
+        !execution || (execution.call === call && call.execution === execution && call.attempt === execution.attempt)
+
       const updateToolCall = Effect.fn("SessionProcessor.updateToolCall")(function* (
         toolCallID: string,
         update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
+        execution?: Execution,
       ) {
         return yield* withToolCall(
           Effect.gen(function* () {
             const match = yield* readToolCall(toolCallID)
-            if (!match) return undefined
+            if (!match || !owns(match.call, execution)) return undefined
             return yield* session.updatePart(update(match.part))
           }),
         )
@@ -369,17 +391,20 @@ const layer = Layer.effect(
         const refuse = (reason: string) =>
           Effect.die(new Error(`Tool call ${toolCallID} was not admitted for execution: ${reason}`))
         if (attempt.closed) return yield* refuse("its stream attempt has ended")
-        return yield* withToolCall(
+        const execution = yield* withToolCall(
           Effect.gen(function* () {
             if (attempt.closed) return yield* refuse("its stream attempt has ended")
             const match = yield* readToolCall(toolCallID)
-            if (!match) return yield* refuse("this processor does not own it")
+            if (!match || match.call.attempt !== attempt) return yield* refuse("this processor does not own it")
             if (match.part.state.status !== "pending" && match.part.state.status !== "running")
               return yield* refuse(`it is already ${match.part.state.status}`)
-            return yield* session.updatePart({
+            if (match.call.execution?.attempt === attempt) return yield* refuse("it is already executing")
+            // A call an earlier attempt admitted records that execution until this one replaces it.
+            const superseded = match.call.execution !== undefined
+            yield* session.updatePart({
               ...match.part,
               state:
-                match.part.state.status === "running"
+                match.part.state.status === "running" && !superseded
                   ? match.part.state
                   : {
                       status: "running",
@@ -387,23 +412,26 @@ const layer = Layer.effect(
                       time: { start: Date.now() },
                     },
             })
+            const execution: Execution = { call: match.call, attempt }
+            match.call.execution = execution
+            return execution
           }),
         )
+        return {
+          update: (update) => updateToolCall(toolCallID, update, execution),
+          complete: (output) => completeToolCall(toolCallID, output, execution),
+        } satisfies Admission
       })
 
       const completeToolCall = Effect.fn("SessionProcessor.completeToolCall")(function* (
         toolCallID: string,
-        output: {
-          title: string
-          metadata: Record<string, any>
-          output: string
-          attachments?: SessionV1.FilePart[]
-        },
+        output: ToolOutput,
+        execution?: Execution,
       ) {
         const completed = yield* withToolCall(
           Effect.gen(function* () {
             const match = yield* readToolCall(toolCallID)
-            if (!match || match.part.state.status !== "running") return false
+            if (!match || !owns(match.call, execution) || match.part.state.status !== "running") return undefined
             yield* session.updatePart({
               ...match.part,
               state: {
@@ -416,18 +444,18 @@ const layer = Layer.effect(
                 attachments: output.attachments,
               },
             })
-            return true
+            return match.call
           }),
         )
         // Settled only once the outcome has committed: a write that fails leaves the call for cleanup to settle.
-        if (completed) yield* settleToolCall(toolCallID)
+        if (completed) yield* settleToolCall(toolCallID, completed)
       })
 
       const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
         const failed = yield* withToolCall(
           Effect.gen(function* () {
             const match = yield* readToolCall(toolCallID)
-            if (!match || match.part.state.status !== "running") return false
+            if (!match || match.part.state.status !== "running") return undefined
             yield* session.updatePart({
               ...match.part,
               state: {
@@ -439,14 +467,14 @@ const layer = Layer.effect(
                 time: { start: match.part.state.time.start, end: Date.now() },
               },
             })
-            return true
+            return match.call
           }),
         )
         if (!failed) return false
         if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
           ctx.blocked = ctx.shouldBreak
         }
-        yield* settleToolCall(toolCallID)
+        yield* settleToolCall(toolCallID, failed)
         return true
       })
 
@@ -464,10 +492,23 @@ const layer = Layer.effect(
         name: string
         providerExecuted?: boolean
       }) {
-        const existing = yield* readToolCall(input.id)
+        const attempt = ctx.attempt
+        // A retry that reuses a call ID takes over the part an earlier attempt registered. Taking it over in a call
+        // transaction orders it against the writes of the execution that attempt admitted: none can land after it.
+        const existing =
+          ctx.toolcalls[input.id] && ctx.toolcalls[input.id].attempt !== attempt
+            ? yield* withToolCall(
+                readToolCall(input.id).pipe(
+                  Effect.tap((match) =>
+                    Effect.sync(() => {
+                      if (match) match.call.attempt = attempt
+                    }),
+                  ),
+                ),
+              )
+            : yield* readToolCall(input.id)
         if (existing) {
-          // A retry that reuses a call ID resumes the part an earlier attempt registered.
-          yield* Deferred.succeed(registration(ctx.attempt, input.id), undefined)
+          yield* Deferred.succeed(registration(attempt, input.id), undefined)
           if (!input.providerExecuted || existing.part.metadata?.providerExecuted) return existing
           const part = yield* updateToolCall(input.id, (match) => ({
             ...match,
@@ -483,6 +524,7 @@ const layer = Layer.effect(
           messageID: ctx.assistantMessage.id,
           sessionID: ctx.assistantMessage.sessionID,
           done: Deferred.makeUnsafe<void>(),
+          attempt,
         }
         ctx.toolcalls[input.id] = call
         const part = yield* session.updatePart({
@@ -495,7 +537,7 @@ const layer = Layer.effect(
           state: { status: "pending", input: {}, raw: "" },
           metadata: input.providerExecuted ? { providerExecuted: true } : undefined,
         } satisfies SessionV1.ToolPart)
-        yield* Deferred.succeed(registration(ctx.attempt, input.id), undefined)
+        yield* Deferred.succeed(registration(attempt, input.id), undefined)
         return { call, part }
       })
 

@@ -42,7 +42,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
   model: Provider.Model
   session: Session.Info
-  processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "admitToolCall" | "completeToolCall">
+  processor: Pick<SessionProcessor.Handle, "message" | "admitToolCall">
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
@@ -56,7 +56,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const truncate = yield* Truncate.Service
   const flags = yield* RuntimeFlags.Service
 
-  const context = (args: Record<string, unknown>, options: ToolExecutionOptions): Tool.Context => ({
+  const context = (
+    args: Record<string, unknown>,
+    options: ToolExecutionOptions,
+    admission: SessionProcessor.Admission,
+  ): Tool.Context => ({
     sessionID: input.session.id,
     abort: options.abortSignal!,
     messageID: input.processor.message.id,
@@ -67,8 +71,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     // A tool may gate an effect on this update (shell spawns after it), so an update that reached no owned, running
     // part fails the tool instead of passing as a no-op.
     metadata: (val) =>
-      input.processor
-        .updateToolCall(options.toolCallId, (match) => {
+      admission
+        .update((match) => {
           if (!["running", "pending"].includes(match.state.status)) return match
           return {
             ...match,
@@ -105,8 +109,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     Effect.gen(function* () {
       const aborted = Effect.die(new Error(`Tool call ${options.toolCallId} was aborted before execution`))
       if (options.abortSignal?.aborted) return yield* aborted
-      yield* input.processor.admitToolCall(options.toolCallId, args)
+      const admission = yield* input.processor.admitToolCall(options.toolCallId, args)
       if (options.abortSignal?.aborted) return yield* aborted
+      return admission
     })
 
   for (const item of yield* registry.tools({
@@ -122,8 +127,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       execute(args, options) {
         return run.promise(
           Effect.gen(function* () {
-            yield* admit(args, options)
-            const ctx = context(args, options)
+            const admission = yield* admit(args, options)
+            const ctx = context(args, options, admission)
             yield* plugin.trigger(
               "tool.execute.before",
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
@@ -145,7 +150,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               output,
             )
             if (options.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(options.toolCallId, output)
+              yield* admission.complete(output)
             }
             return output
           }),
@@ -176,9 +181,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       execute(args, opts) {
         return run.promise(
           Effect.gen(function* () {
-            yield* admit(args, opts)
+            const admission = yield* admit(args, opts)
             const parsed = parseListMcpResourcesArgs(args)
-            const ctx = context(toRecord(args), opts)
+            const ctx = context(toRecord(args), opts, admission)
             const clients = yield* mcp.clients()
             const resourceServers = Object.entries(clients)
               .filter((entry) => !!entry[1].getServerCapabilities()?.resources)
@@ -233,7 +238,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               output,
             )
             if (opts.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(opts.toolCallId, output)
+              yield* admission.complete(output)
             }
             return output
           }),
@@ -260,9 +265,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       execute(args, opts) {
         return run.promise(
           Effect.gen(function* () {
-            yield* admit(args, opts)
+            const admission = yield* admit(args, opts)
             const parsed = parseListMcpResourcesArgs(args)
-            const ctx = context(toRecord(args), opts)
+            const ctx = context(toRecord(args), opts, admission)
             const clients = yield* mcp.clients()
             const resourceServers = Object.entries(clients)
               .filter((entry) => !!entry[1].getServerCapabilities()?.resources)
@@ -317,7 +322,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               output,
             )
             if (opts.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(opts.toolCallId, output)
+              yield* admission.complete(output)
             }
             return output
           }),
@@ -348,9 +353,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       execute(args, opts) {
         return run.promise(
           Effect.gen(function* () {
-            yield* admit(args, opts)
+            const admission = yield* admit(args, opts)
             const parsed = parseReadMcpResourceArgs(args)
-            const ctx = context(toRecord(args), opts)
+            const ctx = context(toRecord(args), opts, admission)
             const clients = yield* mcp.clients()
             const client = clients[parsed.server]
             if (!client) {
@@ -400,7 +405,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               output,
             )
             if (opts.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(opts.toolCallId, output)
+              yield* admission.complete(output)
             }
             return output
           }),
@@ -422,8 +427,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     item.execute = (args, opts) =>
       run.promise(
         Effect.gen(function* () {
-          yield* admit(args, opts)
-          const ctx = context(args, opts)
+          const admission = yield* admit(args, opts)
+          const ctx = context(args, opts, admission)
           yield* plugin.trigger(
             "tool.execute.before",
             { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },
@@ -506,7 +511,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             content: result.content,
           }
           if (opts.abortSignal?.aborted) {
-            yield* input.processor.completeToolCall(opts.toolCallId, output)
+            yield* admission.complete(output)
           }
           return output
         }),

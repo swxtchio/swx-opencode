@@ -125,16 +125,18 @@ it.effect("preserves running tool start time across metadata updates", () =>
         providerID: ProviderV2.ID.make("test"),
         time: { created: 1 },
       } satisfies SessionV1.Assistant,
-      updateToolCall: (_toolCallID, update) =>
-        Effect.sync(() => {
-          const next = update(state)
-          state.state = next.state
-          if (state.state.status === "running") updates.push(state.state.time.start)
-          return state
+      admitToolCall: () =>
+        Effect.succeed({
+          update: (update) =>
+            Effect.sync(() => {
+              const next = update(state)
+              state.state = next.state
+              if (state.state.status === "running") updates.push(state.state.time.start)
+              return state
+            }),
+          complete: () => Effect.void,
         }),
-      admitToolCall: () => Effect.succeed(state),
-      completeToolCall: () => Effect.void,
-    } satisfies Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "admitToolCall" | "completeToolCall">
+    } satisfies Pick<SessionProcessor.Handle, "message" | "admitToolCall">
 
     const tools = yield* SessionTools.resolve({
       agent,
@@ -196,17 +198,15 @@ it.effect("runs no plugin hook or tool body for a call its processor does not ad
         providerID: ProviderV2.ID.make("test"),
         time: { created: 1 },
       } satisfies SessionV1.Assistant,
-      updateToolCall: () => Effect.succeed(admitted),
       // The processor refuses admission by failing the execution, as it does for an unowned or ended call.
       admitToolCall: (toolCallID: string) =>
         Effect.suspend(() => {
           admissions.push(toolCallID)
           return toolCallID.startsWith("refused")
             ? Effect.die(new Error(`Tool call ${toolCallID} was not admitted for execution`))
-            : Effect.succeed(admitted)
+            : Effect.succeed({ update: () => Effect.succeed(admitted), complete: () => Effect.void })
         }),
-      completeToolCall: () => Effect.void,
-    } satisfies Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "admitToolCall" | "completeToolCall">
+    } satisfies Pick<SessionProcessor.Handle, "message" | "admitToolCall">
     const client = {
       getServerCapabilities: () => ({ resources: {} }),
       callTool: async () => {
