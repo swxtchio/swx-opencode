@@ -120,12 +120,14 @@ test("CLI inventory is read-only, validates the explicit cutoff, and narrows by 
 
 test("CLI apply deletes only the selected whole old Session and reclaims allocated bytes", async () => {
   await using store = await createStore()
+  const unrequested = await produce(store, { create: { payloadBytes: 128 } })
   const old = await produce(store, { create: { payloadBytes: 1024 * 1024, withdrawnV1: true } })
   addCompleteRetentionMarker(store.filename, old.created[0]!.id)
   await Bun.sleep(25)
   const cutoff = new Date(Date.now() - 5).toISOString()
   const recent = await produce(store, { create: { payloadBytes: 1024 * 1024, withdrawnV1: true } })
   const oldID = old.created[0]!.id
+  const unrequestedID = unrequested.created[0]!.id
   const recentID = recent.created[0]!.id
   const oldText = textParts(store.filename, oldID)
   expect(textParts(store.filename, recentID)).toEqual(oldText)
@@ -135,6 +137,7 @@ test("CLI apply deletes only the selected whole old Session and reclaims allocat
   await writeFile(ledgerFile, `${JSON.stringify({ id: "prune-fixture", usage_status: "partial", input_tokens: 12 })}\n`)
   const ledgerBefore = await readFile(ledgerFile)
   const beforeOld = ownedCounts(store.filename, oldID)
+  const beforeUnrequested = ownedCounts(store.filename, unrequestedID)
   const beforeRecent = ownedCounts(store.filename, recentID)
   expect(beforeOld.session).toBe(1)
   expect(beforeOld.message).toBeGreaterThan(0)
@@ -197,6 +200,7 @@ test("CLI apply deletes only the selected whole old Session and reclaims allocat
     eventWriter: 0,
   })
   expect(ownedCounts(store.filename, recentID)).toEqual(beforeRecent)
+  expect(ownedCounts(store.filename, unrequestedID)).toEqual(beforeUnrequested)
   expect(await allocatedBytes(store.filename)).toBeLessThan(beforeAllocated)
   expect(await readFile(ledgerFile)).toEqual(ledgerBefore)
   const db = new Database(store.filename, { readonly: true })
