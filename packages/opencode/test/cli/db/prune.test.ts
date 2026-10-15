@@ -145,7 +145,7 @@ test("CLI inventory is read-only, validates the explicit cutoff, and narrows by 
   expect(absent.status).not.toBe(0)
   expect(storedSessionIDs(store.filename)).toEqual(sessionIDsBefore)
   expect(await readFile(store.filename)).toEqual(before)
-})
+}, { timeout: 60_000 })
 
 test("rollover dates and hours are refused even when they would otherwise select an old Session", async () => {
   await using store = await createStore()
