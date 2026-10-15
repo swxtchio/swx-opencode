@@ -70,6 +70,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#266** Settle SDK tool-call custody durably before effects (swxtchio/swx-opencode#234): admitted tool writes are keyed on their execution rather than the raw call ID, so a retry that reuses a call ID can no longer adopt the failed attempt's admitted part; a tool call settles only for the owner that committed its outcome, an earlier outcome's publication is held across a retry's takeover, and V1 tool custody is pinned at its lifecycle boundaries. Cancelling after dispatch leaves no pending orphan.
 - **#258** Keep a synchronous V1 prompt that a review hold leaves pending on an existing session waiting for its own
   delivery (swxtchio/swx-opencode#215): it no longer returns the previous turn's reply. After its run the caller
   decides from its own item's `SessionQueue.disposition`, observed after the hold ends by release or lease lapse, and
