@@ -755,7 +755,7 @@ function measurementReport(args: PruneArgs) {
 function parseCutoff(input: string | undefined) {
   if (!input || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(input)) return undefined
   const result = Date.parse(input)
-  return Number.isFinite(result) ? result : undefined
+  return Number.isFinite(result) && result <= Date.now() ? result : undefined
 }
 
 function normalizeSessionIDs(input: readonly string[] | undefined) {

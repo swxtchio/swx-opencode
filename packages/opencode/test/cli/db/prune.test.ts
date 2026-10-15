@@ -91,6 +91,7 @@ test("CLI inventory is read-only, validates the explicit cutoff, and narrows by 
   await Bun.sleep(25)
   const cutoff = new Date(Date.now() - 5).toISOString()
   const recent = await produce(store, { create: { payloadBytes: 128 } })
+  const sessionIDsBefore = storedSessionIDs(store.filename)
   const before = await readFile(store.filename)
   const inventory = runCLI(store, [
     "--before",
@@ -112,9 +113,14 @@ test("CLI inventory is read-only, validates the explicit cutoff, and narrows by 
   expect(await readFile(store.filename)).toEqual(before)
 
   const invalid = runCLI(store, ["--before", "yesterday", "--apply"])
+  expect(storedSessionIDs(store.filename)).toEqual(sessionIDsBefore)
   expect(invalid.status).toBe(1)
+  const future = runCLI(store, ["--before", new Date(Date.now() + 60_000).toISOString(), "--apply"])
+  expect(future.status).toBe(1)
+  expect(storedSessionIDs(store.filename)).toEqual(sessionIDsBefore)
   const absent = runCLI(store, ["--apply"])
   expect(absent.status).not.toBe(0)
+  expect(storedSessionIDs(store.filename)).toEqual(sessionIDsBefore)
   expect(await readFile(store.filename)).toEqual(before)
 })
 
@@ -165,9 +171,10 @@ test("CLI apply deletes only the selected whole old Session and reclaims allocat
     "--usage-ledger-status",
     "available",
   ])
-  expect(result.status).toBe(0)
   const report = JSON.parse(result.stdout) as Report
+  expect(report.reclamation.reclaimedBytes).toBeGreaterThan(0)
   expect(report.action).toBe("applied")
+  expect(result.status).toBe(0)
   expect(report.deletedSessionIDs).toEqual([oldID])
   expect(report.usageMeasurement).toMatchObject({
     firstmateRun: "confirmed",
@@ -175,7 +182,6 @@ test("CLI apply deletes only the selected whole old Session and reclaims allocat
     durableLedgerStatus: "available",
     source: expect.stringContaining("do not gate pruning"),
   })
-  expect(report.reclamation.reclaimedBytes).toBeGreaterThan(0)
   expect(report.reclamation.allocatedBytesBefore?.totalBytes).toBeGreaterThan(
     report.reclamation.allocatedBytesAfter?.totalBytes ?? Number.POSITIVE_INFINITY,
   )
@@ -211,6 +217,41 @@ test("CLI apply deletes only the selected whole old Session and reclaims allocat
   } finally {
     db.close()
   }
+})
+
+test("a confirmed Firstmate run with unavailable coverage does not gate apply or invent zero usage", async () => {
+  await using store = await createStore()
+  const old = await produce(store, { create: { payloadBytes: 512 * 1024 } })
+  await Bun.sleep(25)
+  const cutoff = new Date(Date.now() - 5).toISOString()
+  const sessionID = old.created[0]!.id
+  const result = await invokeHandler(store, {
+    before: cutoff,
+    session: [sessionID],
+    apply: true,
+    firstmateRanIt: true,
+    measurementStatus: "unavailable",
+    usageLedgerStatus: "unavailable",
+  })
+  expect(result.report.action).toBe("applied")
+  expect(result.report.usageMeasurement).toEqual({
+    firstmateRun: "confirmed",
+    measurementStatus: "unavailable",
+    durableLedgerStatus: "unavailable",
+    source: "reported by the caller; measurement and ledger state do not gate pruning",
+  })
+  const failedMeasurement = await invokeHandler(store, {
+    before: cutoff,
+    firstmateRanIt: true,
+    measurementStatus: "failed",
+    usageLedgerStatus: "failed",
+  })
+  expect(failedMeasurement.report.usageMeasurement).toEqual({
+    firstmateRun: "confirmed",
+    measurementStatus: "failed",
+    durableLedgerStatus: "failed",
+    source: "reported by the caller; measurement and ledger state do not gate pruning",
+  })
 })
 
 test("recent activity on an old-created Session protects it while an equally old control is deleted", async () => {
@@ -449,6 +490,15 @@ function textParts(filename: string, sessionID: string) {
       .query<{ data: string }, [string]>("SELECT data FROM part WHERE session_id = ? AND json_extract(data, '$.type') = 'text' ORDER BY id")
       .all(sessionID)
       .map((row) => (JSON.parse(row.data) as { text: string }).text)
+  } finally {
+    db.close()
+  }
+}
+
+function storedSessionIDs(filename: string) {
+  const db = new Database(filename, { readonly: true })
+  try {
+    return db.query<{ id: string }, []>("SELECT id FROM session ORDER BY id").all().map((row) => row.id)
   } finally {
     db.close()
   }
