@@ -544,7 +544,7 @@ test("an unfinished assistant turn refuses explicit deletion while a clean contr
 test("a persisted running tool Part stays protected after its assistant turn completes", async () => {
   await using store = await createStore()
   const protectedSession = produce(store, { create: { runningTool: true } })
-  const control = produce(store, { create: {} })
+  const control = produce(store, { create: { payloadBytes: 512 * 1024 } })
   const protectedID = protectedSession.created[0]!.id
   const controlID = control.created[0]!.id
   const oldTime = Date.parse("2026-01-01T00:00:00Z")
@@ -583,12 +583,37 @@ test("a persisted running tool Part stays protected after its assistant turn com
     "assistant-or-tool-work-in-flight",
   )
 
+  const controlInventory = runCLI(store, ["--before", cutoff, "--session", controlID])
+  const controlInventoryReport = JSON.parse(controlInventory.stdout) as Report
+  if (
+    controlInventory.status !== 0 ||
+    controlInventoryReport.selectedSessions.length !== 1 ||
+    controlInventoryReport.selectedSessions[0]?.sessionID !== controlID ||
+    !controlInventoryReport.reclamation.ready
+  ) {
+    throw new Error(`clean control inventory was not ready: ${controlInventory.stdout}`)
+  }
+
   const cleanControl = runCLI(store, ["--before", cutoff, "--session", controlID, "--apply"])
+  if (cleanControl.status !== 0) {
+    throw new Error(
+      `clean control CLI failed: ${JSON.stringify({
+        status: cleanControl.status,
+        signal: cleanControl.signal,
+        error: cleanControl.error?.message,
+        stderr: cleanControl.stderr,
+        stdout: cleanControl.stdout,
+      })}`,
+    )
+  }
   expect(cleanControl.status).toBe(0)
-  expect((JSON.parse(cleanControl.stdout) as Report).deletedSessionIDs).toEqual([controlID])
+  const cleanReport = JSON.parse(cleanControl.stdout) as Report
+  expect(cleanReport.action).toBe("applied")
+  expect(cleanReport.deletedSessionIDs).toEqual([controlID])
+  expect(cleanReport.reclamation.reclaimedBytes).toBeGreaterThan(0)
   expect(ownedCounts(store.filename, controlID).session).toBe(0)
   expect(ownedCounts(store.filename, protectedID)).toEqual(before)
-})
+}, { timeout: 60_000 })
 
 test("a pending prompt added after inventory is revalidated before the first deletion", async () => {
   await using store = await createStore()
