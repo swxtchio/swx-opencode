@@ -38,6 +38,8 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Fork maintenance and CI
 
+- **#268** Raise the unit CI step budget from 20 to 30 minutes (swxtchio/swx-opencode#231): the step consumed 1,010s of its
+  1,200s limit on the #260 merge head and timed out on the #237 head with every test passing. No check is loosened.
 - **#150** The repository-read-only `fff-platform-validation.yml` builds and runs compiled FFF distributions on native Windows x64 and ARM64 runners, computes and checks Nix node_modules hashes on native Linux and macOS runners, retains runner evidence, and builds OpenCode with Nix after each hash matches. _Fork-only._
 - **#98** `tests/run.sh` runs the unit suite from the repository root as CI's "Run unit tests" step does
   (`GITHUB_ACTIONS=false bun turbo test`), returning its exit status, and fails when Bun or the installed workspace
@@ -72,6 +74,7 @@ Newest first. Each entry names the upstream range brought in.
 ### Runtime fixes
 
 - **#266** Settle SDK tool-call custody durably before effects (swxtchio/swx-opencode#234): admitted tool writes are keyed on their execution rather than the raw call ID, so a retry that reuses a call ID can no longer adopt the failed attempt's admitted part; a tool call settles only for the owner that committed its outcome, an earlier outcome's publication is held across a retry's takeover, and V1 tool custody is pinned at its lifecycle boundaries. Cancelling after dispatch leaves no pending orphan. A shell command that ignores SIGTERM is force-killed when its run is aborted or interrupted, even after the call was settled elsewhere and its output write is refused (swxtchio/swx-opencode#267).
+- **#264** Keep user `!` shell running snapshots bounded while preserving complete settled output (`SessionPrompt.shellImpl`). _Upstreamable._
 
 - **#262** Route only configured Google Gemini 3.8+ models that migrate from the OpenAI-compatible entry through native Google generation. Translate model and agent effort options, preserve already-native models, and omit the unsupported `minimal` variant (swxtchio/swx-opencode#259). _Fork-only._
 
