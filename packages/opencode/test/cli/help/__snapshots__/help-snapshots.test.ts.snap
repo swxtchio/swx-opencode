@@ -397,6 +397,8 @@ Commands:
   opencode db path          print the database path
   opencode db export-usage  export per-session usage as JSONL for archiving; step-finish totals take
                             precedence, with message totals for legacy rows
+  opencode db prune         inventory old local Sessions; --apply deletes whole Sessions and
+                            reclaims allocated database bytes
   opencode db retention     inventory Session retention candidates; --apply redacts only trees that
                             pass every gate
 
