@@ -551,7 +551,13 @@ const gates = {
   noReplyWrite: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   userShellPartUpdate: undefined as
     | undefined
-    | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void>; held: boolean },
+    | {
+        entered: Deferred.Deferred<void>
+        release: Deferred.Deferred<void>
+        written: Deferred.Deferred<void>
+        held: boolean
+        contains?: string
+      },
 }
 
 const gatedSession = LayerNode.make({
@@ -619,10 +625,16 @@ const gatedEventV2Bridge = LayerNode.make({
           const shellGate = gates.userShellPartUpdate
           if (shellGate && !shellGate.held && definition.type === SessionV1.Event.PartUpdated.type) {
             const update = data as typeof SessionV1.Event.PartUpdated.data.Type
-            if (update.part.type === "tool" && update.part.state.status === "running" && update.part.state.metadata?.output) {
+            const output = update.part.type === "tool" && update.part.state.status === "running"
+              ? update.part.state.metadata?.output
+              : undefined
+            if (output && (!shellGate.contains || output.includes(shellGate.contains))) {
               shellGate.held = true
               yield* Deferred.succeed(shellGate.entered, undefined)
               yield* Deferred.await(shellGate.release)
+              const result = yield* real.publish(definition, data, options)
+              yield* Deferred.succeed(shellGate.written, undefined)
+              return result
             }
           }
           if (definition.type === SessionV1.Event.MessageUpdated.type) {
@@ -8517,6 +8529,29 @@ function expectUserShellSettlement(sessionID: SessionID, expected: string) {
   })
 }
 
+function holdUserShellPartUpdate(contains?: string) {
+  return Effect.gen(function* () {
+    const gate = {
+      entered: yield* Deferred.make<void>(),
+      release: yield* Deferred.make<void>(),
+      written: yield* Deferred.make<void>(),
+      held: false,
+      ...(contains ? { contains } : {}),
+    }
+    gates.userShellPartUpdate = gate
+    yield* Effect.addFinalizer(() =>
+      Deferred.succeed(gate.release, undefined).pipe(
+        Effect.andThen(
+          Effect.sync(() => {
+            if (gates.userShellPartUpdate === gate) gates.userShellPartUpdate = undefined
+          }),
+        ),
+      ),
+    )
+    return gate
+  })
+}
+
 it.instance("shell rejects with BusyError when loop running", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
@@ -8845,27 +8880,18 @@ unixUserShellOrdering(
       Effect.gen(function* () {
         userShellChunks.length = 0
         userShellRunning.length = 0
-        const entered = yield* Deferred.make<void>()
-        const release = yield* Deferred.make<void>()
-        const gate = { entered, release, held: false }
-        gates.userShellPartUpdate = gate
-        yield* Effect.addFinalizer(() =>
-          Deferred.succeed(release, undefined).pipe(
-            Effect.andThen(
-              Effect.sync(() => {
-                if (gates.userShellPartUpdate === gate) gates.userShellPartUpdate = undefined
-              }),
-            ),
-          ),
-        )
-
+        const gate = yield* holdUserShellPartUpdate()
         const { prompt, sessions, chat } = yield* boot()
         const lines = Array.from({ length: 60 }, (_, index) => `line-${String(index).padStart(2, "0")}:${"x".repeat(128)}\n`)
         const expected = lines.join("")
         const command = `${process.execPath} -e 'for(let i=0;i<60;i++){process.stdout.write("line-"+String(i).padStart(2,"0")+":"+"x".repeat(128)+"\\n");await new Promise(r=>setTimeout(r,50))}'`
         const fiber = yield* prompt.shell({ sessionID: chat.id, agent: "build", command }).pipe(Effect.forkChild)
         yield* waitForBusy(chat.id)
-        yield* awaitWithTimeout(Deferred.await(entered), "first running snapshot did not enter the held commit", "5 seconds")
+        yield* awaitWithTimeout(
+          Deferred.await(gate.entered),
+          "first running snapshot did not enter the held commit",
+          "5 seconds",
+        )
         const beforeRelease = yield* userShellEvents(chat.id)
         const initial = beforeRelease.find((item) => item.part.state.status === "running")
         expect(initial).toBeDefined()
@@ -8877,7 +8903,7 @@ unixUserShellOrdering(
         const outstanding = whileHeld.filter(
           (item) => item.part.state.status === "running" && item.part.state.metadata?.output,
         )
-        yield* Deferred.succeed(release, undefined)
+        yield* Deferred.succeed(gate.release, undefined)
         expect(outstanding).toHaveLength(0)
 
         const exit = yield* Fiber.await(fiber)
@@ -8911,9 +8937,9 @@ unixUserShell(
         userShellChunks.length = 0
         userShellRunning.length = 0
         const { prompt, sessions, chat } = yield* boot()
-        const lines = Array.from({ length: 128 }, (_, index) => `${String(index).padStart(3, "0")}:${"x".repeat(4088)}\n`)
+        const lines = Array.from({ length: 128 }, (_, index) => `${String(index).padStart(3, "0")}:${"x🌱".repeat(817)}\n`)
         const expected = lines.join("")
-        const command = `${process.execPath} -e 'for(let i=0;i<128;i++){process.stdout.write(String(i).padStart(3,"0")+":"+"x".repeat(4088)+"\\n");await new Promise(r=>setTimeout(r,20))}'`
+        const command = `${process.execPath} -e 'for(let i=0;i<128;i++){process.stdout.write(String(i).padStart(3,"0")+":"+"x🌱".repeat(817)+"\\n");await new Promise(r=>setTimeout(r,20))}'`
         const result = yield* prompt.shell({ sessionID: chat.id, agent: "build", command })
         const chunks = [...userShellChunks]
         expect(userShellOutput(chunks)).toBe(expected)
@@ -8948,6 +8974,7 @@ unixUserShell(
           const consumed = chunks.filter((chunk) => chunk.time <= item.time).map((chunk) => chunk.text).join("")
           const output = String(item.part.state.status === "running" ? item.part.state.metadata?.output ?? "" : "")
           expect(Buffer.byteLength(output, "utf8")).toBeLessThanOrEqual(shellPreviewByteLimit)
+          expect(Buffer.from(output, "utf8").toString("utf8")).toBe(output)
           expect(consumed.endsWith(output.slice(-128))).toBe(true)
           expect(item.bytes).toBeLessThanOrEqual(shellPreviewByteLimit + 1024)
         })
@@ -9008,11 +9035,10 @@ unixUserShell(
 )
 
 unixUserShell(
-  "shell settles complete output after an Effect timeout and explicit cancellation",
+  "shell settles complete output after an Effect timeout",
   () =>
     withSh(() =>
       Effect.gen(function* () {
-        const payload = " ".repeat(40_960)
         userShellChunks.length = 0
         userShellRunning.length = 0
         const { prompt, chat } = yield* boot()
@@ -9037,51 +9063,104 @@ unixUserShell(
         expect((yield* status.get(chat.id)).type).toBe("idle")
         expect(userShellRunning).toHaveLength(1)
         expect(yield* userShellRunning[0]).toBe(false)
+      }),
+    ),
+  { config: cfg },
+  30_000,
+)
 
+unixUserShellOrdering(
+  "shell waits for a held running commit before normal exit and explicit cancellation settle",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        const payload = " ".repeat(40_960)
         userShellChunks.length = 0
         userShellRunning.length = 0
-        const { prompt: cancelPrompt, chat: cancelChat } = yield* boot()
+        const normalGate = yield* holdUserShellPartUpdate("normal-tail")
+        const { prompt, chat } = yield* boot()
+        const normalOutput = `normal-start\n${payload}normal-tail\n`
+        const normalFiber = yield* prompt
+          .shell({
+            sessionID: chat.id,
+            agent: "build",
+            command: "printf 'normal-start\\n'; sleep 0.1; printf '%40960s' ''; printf 'normal-tail\\n'; sleep 1",
+          })
+          .pipe(Effect.forkChild)
+        yield* waitForBusy(chat.id)
+        yield* awaitWithTimeout(Deferred.await(normalGate.entered), "normal output commit did not enter the hold", "5 seconds")
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            return userShellRunning.length === 1 && !(yield* userShellRunning[0]) ? true : undefined
+          }),
+          "normal shell process did not exit while its running commit was held",
+          "5 seconds",
+        )
+        expect(userShellOutput(userShellChunks)).toBe(normalOutput)
+        expect(userShellChunks.length).toBeGreaterThan(1)
+        yield* Deferred.succeed(normalGate.release, undefined)
+        yield* awaitWithTimeout(Deferred.await(normalGate.written), "held normal running commit did not finish", "5 seconds")
+        const normalExit = yield* Fiber.await(normalFiber)
+        expect(Exit.isSuccess(normalExit)).toBe(true)
+        yield* expectUserShellSettlement(chat.id, normalOutput)
+        expect(userShellRunning).toHaveLength(1)
+        expect(yield* userShellRunning[0]).toBe(false)
+
+        gates.userShellPartUpdate = undefined
+        userShellChunks.length = 0
+        userShellRunning.length = 0
+        const cancelGate = yield* holdUserShellPartUpdate("interrupt-tail")
+        const { prompt: cancelPrompt, chat: cancelChat, run } = yield* boot()
         const cancelOutput = `interrupt-start\n${payload}interrupt-tail\n`
-        const cancelFiber = yield* cancelPrompt
+        const cancelShell = yield* cancelPrompt
           .shell({
             sessionID: cancelChat.id,
             agent: "build",
-            command: "printf 'interrupt-start\\n'; sleep 1; printf '%40960s' ''; printf 'interrupt-tail\\n'; while :; do sleep 1; done",
+            command:
+              "printf 'interrupt-start\\n'; sleep 0.1; printf '%40960s' ''; printf 'interrupt-tail\\n'; while :; do sleep 1; done",
           })
           .pipe(Effect.forkChild)
         yield* waitForBusy(cancelChat.id)
+        yield* awaitWithTimeout(Deferred.await(cancelGate.entered), "cancel output commit did not enter the hold", "5 seconds")
+        const beforeDelay = yield* userShellEvents(cancelChat.id)
+        expect(
+          beforeDelay.some(
+            (item) =>
+              item.part.state.status === "running" &&
+              String(item.part.state.metadata?.output ?? "").includes("interrupt-tail"),
+          ),
+        ).toBe(false)
+        yield* Effect.sleep("750 millis")
+        const afterDelay = yield* userShellEvents(cancelChat.id)
+        expect(
+          afterDelay.some(
+            (item) =>
+              item.part.state.status === "running" &&
+              String(item.part.state.metadata?.output ?? "").includes("interrupt-tail"),
+          ),
+        ).toBe(false)
+        const cancelFiber = yield* cancelPrompt.cancel(cancelChat.id).pipe(Effect.forkChild({ startImmediately: true }))
         yield* pollWithTimeout(
           Effect.gen(function* () {
-            const writes = yield* userShellEvents(cancelChat.id)
-            return writes.findLast(
-              (item) => item.part.state.status === "running" && item.part.state.metadata?.output?.includes("interrupt-start"),
-            )
+            const state = yield* run.current(cancelChat.id)
+            return state?._tag === "Idle" ? true : undefined
           }),
-          "initial interrupt shell output did not reach the running part",
-          "2 seconds",
-        )
-        yield* pollWithTimeout(
-          Effect.sync(() => (userShellOutput(userShellChunks).includes("interrupt-tail\n") ? true : undefined)),
-          "cancelled shell did not emit its tail",
+          "explicit cancellation did not reach the shell runner",
           "5 seconds",
         )
-        expect(userShellChunks.length).toBeGreaterThan(1)
-        yield* cancelPrompt.cancel(cancelChat.id)
+        yield* Deferred.succeed(cancelGate.release, undefined)
+        yield* awaitWithTimeout(Deferred.await(cancelGate.written), "held cancellation running commit did not finish", "5 seconds")
         const cancelExit = yield* Fiber.await(cancelFiber)
         expect(Exit.isSuccess(cancelExit)).toBe(true)
+        const shellExit = yield* Fiber.await(cancelShell)
+        expect(Exit.isSuccess(shellExit)).toBe(true)
         expect(userShellOutput(userShellChunks)).toBe(cancelOutput)
+        expect(userShellChunks.length).toBeGreaterThan(1)
         const cancelAnnotation = `${cancelOutput}\n\n<metadata>\nUser aborted the command\n</metadata>`
         yield* expectUserShellSettlement(cancelChat.id, cancelAnnotation)
-        const cancelWrites = (yield* userShellEvents(cancelChat.id)).filter(
-          (item) => item.part.state.status === "running" && item.part.state.metadata?.output,
-        )
-        const latestRunning = cancelWrites.at(-1)?.part
-        expect(latestRunning?.state.status).toBe("running")
-        if (latestRunning?.state.status === "running")
-          expect(latestRunning.state.metadata?.output).not.toContain("interrupt-tail")
-        expect((yield* status.get(cancelChat.id)).type).toBe("idle")
         expect(userShellRunning).toHaveLength(1)
         expect(yield* userShellRunning[0]).toBe(false)
+        gates.userShellPartUpdate = undefined
       }),
     ),
   { config: cfg },

@@ -101,17 +101,29 @@ function formatMcpResourceBytes(value: number) {
   return `${Math.ceil(value / (1024 * 1024))} MB`
 }
 
-function appendUserShellPreview(preview: { output: string; truncated: boolean }, chunk: string) {
+function userShellOutputPreview(output: string, outputBytes: number) {
   // Keep the live metadata tail byte-bounded; the separate `output` value is kept complete for settlement.
-  const joined = Buffer.from(preview.output + chunk, "utf8")
+  if (outputBytes <= USER_SHELL_RUNNING_OUTPUT_MAX_BYTES) return { output, truncated: false }
   const markerBytes = Buffer.byteLength(USER_SHELL_OUTPUT_PREVIEW_MARKER, "utf8")
   const payloadLimit = USER_SHELL_RUNNING_OUTPUT_MAX_BYTES - markerBytes
-  const limit = preview.truncated ? payloadLimit : USER_SHELL_RUNNING_OUTPUT_MAX_BYTES
-  if (joined.byteLength <= limit) return { output: joined.toString("utf8"), truncated: preview.truncated }
-
-  let start = joined.byteLength - payloadLimit
-  while ((joined[start] & 0b11000000) === 0b10000000) start++
-  return { output: joined.toString("utf8", start), truncated: true }
+  let start = output.length
+  let bytes = 0
+  while (start > 0) {
+    const last = output.charCodeAt(start - 1)
+    let width = last <= 0x7f ? 1 : last <= 0x7ff ? 2 : 3
+    let units = 1
+    if (last >= 0xdc00 && last <= 0xdfff && start > 1) {
+      const first = output.charCodeAt(start - 2)
+      if (first >= 0xd800 && first <= 0xdbff) {
+        width = 4
+        units = 2
+      }
+    }
+    if (bytes + width > payloadLimit) break
+    bytes += width
+    start -= units
+  }
+  return { output: output.slice(start), truncated: true }
 }
 
 function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
@@ -553,8 +565,8 @@ const layer = Layer.effect(
           const sh = Shell.preferred(cfg.shell)
           const args = Shell.args(sh, input.command, cwd)
           let output = ""
+          let outputBytes = 0
           let aborted = false
-          let preview = { output: "", truncated: false }
           let unwritten = false
           let armed = false
           const writes = Semaphore.makeUnsafe(1)
@@ -564,6 +576,7 @@ const layer = Layer.effect(
               Effect.suspend(() => {
                 if (!unwritten || part.state.status !== "running") return Effect.void
                 unwritten = false
+                const preview = userShellOutputPreview(output, outputBytes)
                 part.state.metadata = {
                   output: preview.truncated
                     ? USER_SHELL_OUTPUT_PREVIEW_MARKER + preview.output
@@ -628,7 +641,7 @@ const layer = Layer.effect(
                 Effect.gen(function* () {
                   output += chunk
                   if (part.state.status === "running") {
-                    preview = appendUserShellPreview(preview, chunk)
+                    outputBytes += Buffer.byteLength(chunk, "utf8")
                     unwritten = true
                     yield* schedule
                   }
