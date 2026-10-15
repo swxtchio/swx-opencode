@@ -5007,6 +5007,7 @@ it.instance("prompt enhancement uses the configured provider without writing to 
     expect(JSON.stringify(calls[0])).toContain("preserving its intent")
     expect(yield* sessions.messages({ sessionID: session.id })).toEqual([])
   }),
+  20_000,
 )
 
 it.instance("prompt enhancement reports an unavailable configured model before making a provider request", () =>

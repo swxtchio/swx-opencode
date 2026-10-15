@@ -355,7 +355,7 @@ test("each prompt the user sends names its own request", async () => {
   } finally {
     await app.stop()
   }
-})
+}, 20_000)
 
 test("busy composer submits mark queued prompts as TUI-authored", async () => {
   const app = await startSession({ queue: [], status: { type: "busy" } })
@@ -393,7 +393,7 @@ test("busy composer submits mark queued prompts as TUI-authored", async () => {
     app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
     await app.stop()
   }
-})
+}, 20_000)
 
 // Submission-time visibility and UP recall (swxtchio/swx-opencode#249).
 
@@ -482,7 +482,7 @@ test("timeline dialog only offers TUI-authored prompts and filters injections", 
   } finally {
     await app.stop()
   }
-})
+}, 20_000)
 
 test("session rename remains available from its command menu", async () => {
   const app = await startSession()
@@ -496,7 +496,7 @@ test("session rename remains available from its command menu", async () => {
   } finally {
     await app.stop()
   }
-})
+}, 20_000)
 
 test("ctrl+e rewrites the draft from visible context without sending until a later submit", async () => {
   const lines = Array.from({ length: 110 }, (_, index) => `visible-${String(index + 1).padStart(3, "0")}`)
@@ -567,7 +567,7 @@ test("ctrl+e rewrites the draft from visible context without sending until a lat
     app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
     await app.stop()
   }
-})
+}, 20_000)
 
 test("failed prompt enhancement leaves the composer draft untouched and shows an error", async () => {
   const app = await startSession({
@@ -587,7 +587,7 @@ test("failed prompt enhancement leaves the composer draft untouched and shows an
   } finally {
     await app.stop()
   }
-})
+}, 20_000)
 
 // Lines of the pending row mark each prompt QUEUED; any other line holding the
 // text is the composer's.

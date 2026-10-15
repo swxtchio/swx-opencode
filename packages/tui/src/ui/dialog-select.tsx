@@ -59,7 +59,6 @@ export interface DialogSelectOption<T = any> {
   value: T
   description?: string
   details?: string[]
-  detailsWrap?: boolean
   footer?: JSX.Element | string
   titleWidth?: number
   truncateTitle?: boolean | "left"
@@ -699,10 +698,8 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
                           <For each={option.details}>
                             {(detail) => (
                               <box paddingLeft={3} paddingRight={3}>
-                                <text fg={theme.textMuted} wrapMode={option.detailsWrap ? "word" : "none"}>
-                                  {option.detailsWrap
-                                    ? detail
-                                    : Locale.truncateMiddle(detail, Math.max(1, Math.min(76, dimensions().width - 12)))}
+                                <text fg={theme.textMuted} wrapMode="none">
+                                  {Locale.truncateMiddle(detail, Math.max(1, Math.min(76, dimensions().width - 12)))}
                                 </text>
                               </box>
                             )}

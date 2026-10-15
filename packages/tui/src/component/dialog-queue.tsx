@@ -125,7 +125,6 @@ export function DialogQueue(props: { sessionID: string }) {
         value: item.id,
         description: [item.delivery, ...freshness(item, now())].join(" · "),
         details: lines.slice(1),
-        detailsWrap: true,
         footer: lines.length > 1 ? `+${lines.length - 1} lines` : undefined,
       }
     }),
