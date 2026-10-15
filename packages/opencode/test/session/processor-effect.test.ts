@@ -1828,7 +1828,7 @@ itHeldLock.live(
         }),
       { config: cfg },
     ),
-  30_000,
+  60_000,
 )
 
 itHeldLock.live(
@@ -1919,7 +1919,7 @@ itHeldLock.live(
         }),
       { config: cfg },
     ),
-  30_000,
+  60_000,
 )
 
 // Captures halt's error line, which carries the failed operation's recorded origin.
@@ -1977,7 +1977,7 @@ for (const scenario of [
           }),
         { config: cfg },
       ),
-    40_000,
+    80_000,
   )
 }
 

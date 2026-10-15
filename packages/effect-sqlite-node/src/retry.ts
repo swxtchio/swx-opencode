@@ -5,13 +5,13 @@ import type { SqlError } from "effect/unstable/sql/SqlError"
 
 const sqliteBusySnapshot = 517
 
-// Restore the lock tolerance the old busy_timeout gave, but wait asynchronously between short native attempts
-// so a contended statement never blocks the event loop. The window runs from the first failed retry, and the
-// backoff cap matches SQLite's own busy-handler sleep.
+// Give a competing writer up to 10 seconds, since many processes write to one shared database (#196), but wait
+// asynchronously between short native attempts so a contended statement never blocks the event loop. The window runs
+// from the first failed retry, and the backoff cap matches SQLite's own busy-handler sleep.
 const retrySchedule = Schedule.exponential("10 millis").pipe(
   Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 100)))),
   Schedule.jittered,
-  Schedule.both(Schedule.during("5 seconds")),
+  Schedule.both(Schedule.during("10 seconds")),
 )
 
 // A stale read snapshot fails every retry of the same statement, and only restarting its transaction can recover,

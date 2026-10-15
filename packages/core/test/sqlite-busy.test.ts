@@ -24,14 +24,18 @@ const nodeSqliteDrivers = await import("node:sqlite").then(
   () => undefined,
 )
 const nodeSqliteTest = test.skipIf(!nodeSqliteDrivers)
-// The retry window each statement must give a competing writer: the tolerance the old native busy_timeout gave.
-const lockWindowMs = 5_000
+// The retry window each statement must give a competing writer.
+const lockWindowMs = 10_000
 // Exhaustion may overrun the window by one capped backoff, one native attempt and scheduling delay.
 const lockWindowSlackMs = 1_500
 // Backstops sit above window plus slack so a statement that never stops fails with its own message.
-const lockBackstop = "10 seconds"
-// Well past the point where the old four-attempt schedule gave up, and well inside the restored window.
+const lockBackstop = "15 seconds"
+// Bun test timeouts for a test that exhausts the window, above the backstop.
+const exhaustionTestMs = 30_000
+// Well past the point where the old four-attempt schedule gave up, and well inside the window.
 const heldLockMs = 1_500
+// Past the old 5 second window and inside the current one, with room for the release to reach the writer.
+const longHeldLockMs = 9_500
 // The event loop must keep turning while a statement waits; a long synchronous native wait stalls it for seconds.
 const stallBoundMs = 1_000
 // A stale snapshot can never succeed on retry, so its write must fail far inside the retry window.
@@ -376,7 +380,7 @@ describe("SQLite busy timeout and statement retries", () => {
         )
         expect(Exit.isSuccess(exit)).toBe(true)
       },
-      20_000,
+      exhaustionTestMs,
     )
   }
 
@@ -476,7 +480,62 @@ describe("SQLite busy timeout and statement retries", () => {
       ),
     )
     if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
-  }, 20_000)
+  }, exhaustionTestMs)
+
+  test("commits an immediate transaction after a competing connection holds the write lock for 9.5 seconds", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "immediate-long-hold.sqlite")
+    const exit = await Effect.runPromiseExit(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const attempts = newStatementAttempts()
+          yield* patchBunQuery((sql) => sql === "begin immediate", attempts)
+          const context = yield* Layer.build(Database.layerFromPath(filename))
+          const database = Context.get(context, Database.Service).db
+          yield* database.run("CREATE TABLE busy_retry_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+          const holder = yield* Effect.promise(() => startLockHolder(filename))
+          yield* Effect.addFinalizer(() => Effect.promise(() => holder.release()))
+
+          let writerFinished = false
+          const writer = yield* database
+            .transaction((tx) => tx.run("INSERT INTO busy_retry_test (id, value) VALUES (1, 'long-hold-writer')"), {
+              behavior: "immediate",
+            })
+            .pipe(
+              Effect.onExit(() => Effect.sync(() => void (writerFinished = true))),
+              Effect.forkChild({ startImmediately: true }),
+            )
+          yield* Effect.gen(function* () {
+            while (attempts.busy.length === 0) yield* Effect.sleep("1 millis")
+          }).pipe(
+            Effect.timeoutOrElse({
+              duration: "1 second",
+              orElse: () => Effect.fail(new Error("writer did not meet the held write lock")),
+            }),
+          )
+          // The writer has met the lock; hold it past the old window and almost to the end of the current one.
+          const metAt = performance.now()
+          while (performance.now() - metAt < longHeldLockMs) yield* Effect.sleep("10 millis")
+          expect(writerFinished).toBe(false)
+
+          yield* Effect.promise(() => holder.release())
+          const result = yield* Fiber.await(writer).pipe(
+            Effect.timeoutOrElse({
+              duration: "2 seconds",
+              orElse: () => Effect.fail(new Error("writer did not finish after the lock was released")),
+            }),
+          )
+          if (Exit.isFailure(result)) return yield* Effect.fail(new Error(Cause.pretty(result.cause)))
+          expect(attempts.count).toBeGreaterThan(1)
+          expect(
+            yield* database.$client.unsafe("SELECT COUNT(*) FROM busy_retry_test WHERE value = 'long-hold-writer'")
+              .values,
+          ).toEqual([[1]])
+        }),
+      ),
+    )
+    if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
+  }, exhaustionTestMs)
 
   for (const clientType of ["bun", "core-node", "standalone-node"] as const) {
     test.skipIf(clientType !== "bun" && !nodeSqliteDrivers)(
@@ -565,7 +624,7 @@ describe("SQLite busy timeout and statement retries", () => {
         )
         if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
       },
-      20_000,
+      exhaustionTestMs,
     )
   }
 
@@ -807,7 +866,7 @@ describe("SQLite busy timeout and statement retries", () => {
         ),
       )
       if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
-    }, 20_000)
+    }, exhaustionTestMs)
   }
 
   for (const method of ["run", "values"] as const) {
