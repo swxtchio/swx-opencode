@@ -3266,7 +3266,17 @@ export function consolidation(items: readonly Item[], markers?: ConfigV1.Info["m
       const first = group[0]!
       const text = [
         `${first.command.verb} ${first.command.target}:`,
-        ...group.flatMap((entry) => entry.command.steps).map((step, index) => `${index + 1}. ${step}`),
+        ...group
+          .flatMap((entry) =>
+            entry.command.steps.map((step) => {
+              if (normalizeTarget(entry.command.target) === normalizeTarget(first.command.target)) return step
+              if (normalizeText(step) === normalizeText(plainText(entry.item.input) ?? "")) return step
+              const target = `${entry.command.target}:`
+              if (normalizeText(step).startsWith(normalizeText(target))) return step
+              return `${target} ${step}`
+            }),
+          )
+          .map((step, index) => `${index + 1}. ${step}`),
       ].join("\n")
       return [
         first.item.id,
@@ -3316,10 +3326,10 @@ function copyGroups(items: readonly Item[], markers?: ConfigV1.Info["machine_mes
   }))
   const candidates = exact.flatMap((entry) => {
     const text = plainText(entry.item.input)
-    if (!text || marked(entry.item.input, markers) || parseCommand(entry.item.input)) return []
+    if (!text || marked(entry.item.input, markers)) return []
     const normalized = normalizeText(text)
     if (!normalized) return []
-    return [{ entry, text, normalized, context: copyContextKey(entry.item) }]
+    return [{ entry, text, normalized, context: copyContextKey(entry.item), command: parseCommand(entry.item.input) }]
   })
   const grouped = new Set<(typeof exact)[number]>()
   const merged = [...Map.groupBy(candidates, (candidate) => candidate.context).values()].flatMap((group) => {
@@ -3328,9 +3338,13 @@ function copyGroups(items: readonly Item[], markers?: ConfigV1.Info["machine_mes
     )
     return ordered.flatMap((candidate) => {
       if (grouped.has(candidate.entry)) return []
-      const matching = ordered.filter(
-        (other) => !grouped.has(other.entry) && textPrefix(other.normalized, candidate.normalized),
-      )
+      // Same-job command prefixes keep ordered steps; other prefixes retain their longest text.
+      const matching = ordered.filter((other) => {
+        if (grouped.has(other.entry) || !textPrefix(other.normalized, candidate.normalized)) return false
+        if (other.normalized === candidate.normalized) return true
+        if (!other.command || !candidate.command) return true
+        return !sameCommand(other.entry.item, other.command, candidate.entry.item, candidate.command)
+      })
       matching.forEach((other) => grouped.add(other.entry))
       if (matching.length === 1) return [candidate.entry]
       const originals = matching.toSorted((left, right) => left.entry.order - right.entry.order)
@@ -3644,17 +3658,21 @@ function targetWords(target: string) {
 function targetMatches(left: string, right: string) {
   const leftText = targetText(left)
   const rightText = targetText(right)
-  const leftWords = targetWords(left)
-  const rightWords = targetWords(right)
-  const leftDistinctive = leftWords.filter((word) => !genericTargetWords.has(word))
-  const rightDistinctive = rightWords.filter((word) => !genericTargetWords.has(word))
-  if (leftDistinctive.length === 0 || rightDistinctive.length === 0) return false
+  if (leftText === rightText) return true
+  const leftDistinctive = targetDistinctiveWords(left)
+  const rightDistinctive = targetDistinctiveWords(right)
   if (
     (containsTarget(leftText, rightText) && rightDistinctive.length > 0) ||
     (containsTarget(rightText, leftText) && leftDistinctive.length > 0)
   )
     return true
   return leftDistinctive.some((word) => rightDistinctive.includes(word))
+}
+
+function targetDistinctiveWords(target: string) {
+  const components = normalizeTarget(target).split(/[\\/]/)
+  const subject = components[components.length - 1] ?? target
+  return targetWords(subject).filter((word) => !genericTargetWords.has(word))
 }
 
 function containsTarget(longer: string, shorter: string) {

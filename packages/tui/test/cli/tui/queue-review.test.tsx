@@ -474,6 +474,20 @@ test("an action with no selected prompt explains why it cannot run", async () =>
   expect(view.queued("remove")).toEqual([])
 })
 
+test("consolidating an empty queue explains that there is nothing to consolidate", async () => {
+  const view = await setup([])
+  DialogQueue.show(view.dialog, sessionID)
+  await wait(() => view.queued("hold").length === 1)
+  await wait(
+    async () =>
+      (await view.frame()).includes("(pausing delivery…)") || (await view.frame()).includes("(delivery paused)"),
+  )
+  await view.click("consolidate")
+  expect(await view.frame()).toContain("Nothing to consolidate")
+  expect(await view.frame()).not.toContain("No queued prompt is selected")
+  expect(view.queued("consolidate")).toEqual([])
+})
+
 // A response the test releases when it chooses.
 function later() {
   let answer!: (response: Response) => void

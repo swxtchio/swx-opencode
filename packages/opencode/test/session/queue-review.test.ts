@@ -263,7 +263,7 @@ it.instance("command targets ignore leading articles and adjective differences",
       { delivery: "queue", text: "fix an authentication handler: add regression coverage" },
     ])
     expect(items.map(text)).toEqual([
-      "fix the flaky authentication handler:\n1. keep null guards\n2. add regression coverage",
+      "fix the flaky authentication handler:\n1. keep null guards\n2. an authentication handler: add regression coverage",
     ])
   }),
 )
@@ -274,7 +274,7 @@ it.instance("commands derive no-colon targets past articles and adjectives", () 
       { delivery: "queue", text: "fix the broken auth.ts" },
       { delivery: "queue", text: "fix auth.ts --check" },
     ])
-    expect(items.map(text)).toEqual(["fix the broken auth.ts:\n1. fix the broken auth.ts\n2. --check"])
+    expect(items.map(text)).toEqual(["fix the broken auth.ts:\n1. fix the broken auth.ts\n2. auth.ts: --check"])
   }),
 )
 
@@ -285,8 +285,26 @@ it.instance("command targets match when one path contains the other", () =>
       { delivery: "queue", text: "UPDATE src/session/queue.ts: preserve original IDs" },
     ])
     expect(items.map(text)).toEqual([
-      "update packages/opencode/src/session/queue.ts:\n1. retain receipts\n2. preserve original IDs",
+      "update packages/opencode/src/session/queue.ts:\n1. retain receipts\n2. src/session/queue.ts: preserve original IDs",
     ])
+  }),
+)
+
+it.instance("command delivery retains the later target when similar paths consolidate", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "preserve every command target" })
+    yield* admit(session.id, "queue", "update packages/app/src/auth/login.ts: keep redirect checks")
+    yield* admit(session.id, "queue", "update src/auth/login.ts: add login fallback")
+
+    const items = yield* queue.consolidate(session.id)
+    const merged =
+      "update packages/app/src/auth/login.ts:\n1. keep redirect checks\n2. src/auth/login.ts: add login fallback"
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual([merged])
+    expect(items.map(text)).toEqual([merged])
   }),
 )
 
@@ -297,7 +315,7 @@ it.instance("command targets match on a distinctive token when neither contains 
       { delivery: "queue", text: "review receipt routing in authentication: verify settlement" },
     ])
     expect(items.map(text)).toEqual([
-      "review authentication receipt routing:\n1. preserve origin IDs\n2. verify settlement",
+      "review authentication receipt routing:\n1. preserve origin IDs\n2. receipt routing in authentication: verify settlement",
     ])
   }),
 )
@@ -312,6 +330,44 @@ it.instance("generic target words alone do not merge different command work", ()
       "fix the login bug: disable the redirect loop",
       "fix the signup bug: add the welcome email",
     ])
+  }),
+)
+
+it.instance("an exact generic command target still matches after article normalization", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "generic target equality" })
+    yield* admit(session.id, "queue", "fix the bug: preserve the first request")
+    yield* admit(session.id, "queue", "FIX a bug: preserve the second request")
+
+    const items = yield* queue.consolidate(session.id)
+    const merged = "fix the bug:\n1. preserve the first request\n2. preserve the second request"
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual([merged])
+    expect(items.map(text)).toEqual([merged])
+  }),
+)
+
+it.instance("a shared path directory does not match different file targets", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "different files under a shared directory" })
+    const expected = [
+      "update src/login/auth.ts: keep redirect checks",
+      "update tests/login/signup.ts: add signup coverage",
+    ]
+    yield* admit(session.id, "queue", expected[0]!)
+    yield* admit(session.id, "queue", expected[1]!)
+
+    const items = yield* queue.consolidate(session.id)
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual(expected)
+    expect(items.map(text)).toEqual(expected)
   }),
 )
 
@@ -336,6 +392,58 @@ it.instance("plain text copies match after case and whitespace normalization", (
     ])
     expect(items.map(text)).toEqual(["Please summarize the queue"])
     expect(items[0]!.origins).toHaveLength(2)
+  }),
+)
+
+it.instance("normalized command copies consolidate before command parsing", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "normalized command copies" })
+    yield* admit(session.id, "queue", "RUN   THE   SUITE")
+    yield* admit(session.id, "queue", " run the suite ")
+
+    expect(yield* queue.list(session.id)).toHaveLength(2)
+    const items = yield* queue.consolidate(session.id)
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual(["RUN   THE   SUITE"])
+    expect(items.map(text)).toEqual(["RUN   THE   SUITE"])
+  }),
+)
+
+it.instance("same-target command prefixes retain ordered steps through delivery", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "same-target command prefix" })
+    yield* admit(session.id, "queue", "run lint")
+    yield* admit(session.id, "queue", "run lint --fix")
+
+    expect(yield* queue.list(session.id)).toHaveLength(2)
+    const items = yield* queue.consolidate(session.id)
+    const merged = "run lint:\n1. run lint\n2. --fix"
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual([merged])
+    expect(items.map(text)).toEqual([merged])
+  }),
+)
+
+it.instance("command text prefixes retain the longer instruction through delivery", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "command text prefix" })
+    yield* admit(session.id, "queue", "run the suite")
+    yield* admit(session.id, "queue", "run the suite with coverage")
+
+    expect(yield* queue.list(session.id)).toHaveLength(2)
+    const items = yield* queue.consolidate(session.id)
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual(["run the suite with coverage"])
+    expect(items.map(text)).toEqual(["run the suite with coverage"])
   }),
 )
 
@@ -453,12 +561,38 @@ it.instance("receipt-bearing requests use the broadened command matcher", () =>
     yield* request(session.id, "queue", "auth-b", "FIX an auth handler: cover null responses")
     const items = yield* queue.list(session.id)
     expect(items.map(text)).toEqual([
-      "fix the flaky auth handler:\n1. retain receipt identities\n2. cover null responses",
+      "fix the flaky auth handler:\n1. retain receipt identities\n2. an auth handler: cover null responses",
     ])
     expect(Option.getOrThrow(yield* queue.receipt(session.id, "auth-b"))).toMatchObject({
       state: "merged",
       into: "auth-a",
     })
+  }),
+)
+
+it.instance("request admission ignores a shared path directory when file targets differ", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "receipt command path boundary" })
+    yield* request(session.id, "queue", "path-a", "update src/login/auth.ts: preserve the redirect")
+    yield* request(session.id, "queue", "path-b", "update tests/login/signup.ts: cover registration")
+
+    expect((yield* queue.list(session.id)).map(text)).toEqual([
+      "update src/login/auth.ts: preserve the redirect",
+      "update tests/login/signup.ts: cover registration",
+    ])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "path-a"))).toMatchObject({ state: "pending" })
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "path-b"))).toMatchObject({ state: "pending" })
+    const expected = [
+      "update src/login/auth.ts: preserve the redirect",
+      "update tests/login/signup.ts: cover registration",
+    ]
+    expect((yield* queue.consolidate(session.id)).map(text)).toEqual(expected)
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual(expected)
   }),
 )
 

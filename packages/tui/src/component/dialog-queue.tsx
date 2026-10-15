@@ -158,9 +158,9 @@ export function DialogQueue(props: { sessionID: string }) {
           : "Delivery is NOT paused because the hold failed.",
     })
   }
-  const explainUnavailable = () => {
+  const explainUnavailable = (message: string) => () => {
     active()
-    toast.show({ variant: "info", message: "No queued prompt is selected." })
+    toast.show({ variant: "info", message })
   }
 
   // Mouse use anywhere on the view, scrolling included, counts as activity.
@@ -185,7 +185,7 @@ export function DialogQueue(props: { sessionID: string }) {
             title: "delete",
             disabled: locked,
             onDisabledTrigger: explainLocked,
-            onUnavailableTrigger: explainUnavailable,
+            onUnavailableTrigger: explainUnavailable("No queued prompt is selected."),
             onTrigger: (option) => {
               active()
               void checked(sdk.client.session.queue.remove({ sessionID: props.sessionID, id: option.value })).catch(
@@ -198,7 +198,7 @@ export function DialogQueue(props: { sessionID: string }) {
             title: "earlier",
             disabled: locked,
             onDisabledTrigger: explainLocked,
-            onUnavailableTrigger: explainUnavailable,
+            onUnavailableTrigger: explainUnavailable("No queued prompt is selected."),
             onTrigger: (option) => {
               active()
               move(option.value, -1)
@@ -209,7 +209,7 @@ export function DialogQueue(props: { sessionID: string }) {
             title: "later",
             disabled: locked,
             onDisabledTrigger: explainLocked,
-            onUnavailableTrigger: explainUnavailable,
+            onUnavailableTrigger: explainUnavailable("No queued prompt is selected."),
             onTrigger: (option) => {
               active()
               move(option.value, 1)
@@ -220,7 +220,7 @@ export function DialogQueue(props: { sessionID: string }) {
             title: "consolidate",
             disabled: locked,
             onDisabledTrigger: explainLocked,
-            onUnavailableTrigger: explainUnavailable,
+            onUnavailableTrigger: explainUnavailable("Nothing to consolidate."),
             onTrigger: () => {
               active()
               const before = new Map(
