@@ -167,22 +167,76 @@ const request = (sessionID: SessionID, delivery: SessionQueue.Delivery, requestI
 
 const jobClassControls = [
   { title: "handler", first: "fix authentication handler", second: "fix billing handler" },
-  { title: "profile", first: "update user profile page", second: "update admin profile page" },
-  { title: "redirect", first: "fix login redirect loop", second: "fix signup redirect loop" },
-  { title: "pooling", first: "add postgres connection pooling", second: "add redis connection pooling" },
   { title: "crash", first: "fix the parser crash", second: "fix the tokenizer crash" },
-  { title: "service", first: "refactor billing service client", second: "refactor auth service client" },
 ]
 
-const sharedNounControls = [
+const sharedFirstNounControls = [
+  { title: "session queue", first: "refactor the session queue", second: "refactor the session projector" },
+  { title: "workspace queue", first: "rename the workspace queue", second: "rename the workspace projector" },
+]
+
+const sharedModifierHeadTargets = [
   {
     title: "intermittent failures",
     first: "fix intermittent authentication failures",
     second: "fix intermittent billing failures",
+    merged:
+      "fix intermittent authentication failures:\n1. fix intermittent authentication failures\n2. fix intermittent billing failures",
   },
-  { title: "session queue", first: "refactor the session queue", second: "refactor the session projector" },
-  { title: "workspace queue", first: "rename the workspace queue", second: "rename the workspace projector" },
+  {
+    title: "profile pages",
+    first: "update user profile page",
+    second: "update admin profile page",
+    merged: "update user profile page:\n1. update user profile page\n2. update admin profile page",
+  },
+  {
+    title: "redirect loops",
+    first: "fix login redirect loop",
+    second: "fix signup redirect loop",
+    merged: "fix login redirect loop:\n1. fix login redirect loop\n2. fix signup redirect loop",
+  },
+  {
+    title: "connection pooling",
+    first: "add postgres connection pooling",
+    second: "add redis connection pooling",
+    merged: "add postgres connection pooling:\n1. add postgres connection pooling\n2. add redis connection pooling",
+  },
+  {
+    title: "service clients",
+    first: "refactor billing service client",
+    second: "refactor auth service client",
+    merged: "refactor billing service client:\n1. refactor billing service client\n2. refactor auth service client",
+  },
 ]
+
+const literalFilenameTargets = [
+  {
+    title: "tool file siblings",
+    first: "update packages/core/src/tool/tool.ts: preserve the singular module",
+    second: "update packages/core/src/tool/tools.ts: preserve the plural module",
+  },
+  {
+    title: "route handler siblings",
+    first: "update packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts: preserve route identity",
+    second: "update packages/opencode/src/server/routes/instance/httpapi/handlers/sessions.ts: preserve route identity",
+  },
+  {
+    title: "short file target",
+    first: "update packages/core/src/tool/tool.ts: preserve the singular module",
+    second: "update tools.ts: preserve the standalone module",
+  },
+  {
+    title: "file extensions",
+    first: "update src/session/queue.ts: preserve the TypeScript module",
+    second: "update src/session/queue.tsx: preserve the JSX module",
+  },
+]
+
+const containedCommandTargets = {
+  first: "fix authentication: inspect sign-in",
+  second: "fix authentication failures: add a retry",
+  merged: "fix authentication:\n1. inspect sign-in\n2. authentication failures: add a retry",
+}
 
 const inflectionTargets = [
   {
@@ -372,11 +426,9 @@ it.instance("request admission matches whole no-colon subjects and keeps shared 
   }),
 )
 
-it.instance("unlisted modifiers and shared first nouns alone do not identify no-colon targets", () =>
+it.instance("shared first nouns with different job classes stay separate", () =>
   Effect.gen(function* () {
     const prompts = [
-      "fix intermittent authentication failures",
-      "fix intermittent billing failures",
       "refactor the session queue",
       "refactor the session projector",
       "rename the workspace queue",
@@ -392,12 +444,12 @@ it.instance("unlisted modifiers and shared first nouns alone do not identify no-
   }),
 )
 
-it.instance("request admission keeps different work apart on shared modifiers and first nouns", () =>
+it.instance("request admission keeps different job classes apart on shared first nouns", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
     for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of sharedNounControls) {
+      for (const pair of sharedFirstNounControls) {
         const session = yield* sessions.create({ title: `${delivery} ${pair.title} control` })
         yield* request(session.id, delivery, "shared-a", pair.first)
         yield* request(session.id, delivery, "shared-b", pair.second)
@@ -435,6 +487,68 @@ it.instance("request admission does not merge different work on a shared job-cla
         expect((yield* queue.list(session.id)).map(text)).toEqual([pair.first, pair.second])
         expect(Option.getOrThrow(yield* queue.receipt(session.id, "head-a"))).toMatchObject({ state: "pending" })
         expect(Option.getOrThrow(yield* queue.receipt(session.id, "head-b"))).toMatchObject({ state: "pending" })
+      }
+    }
+  }),
+)
+
+it.instance("consolidation keeps containment ahead of job-class head equality", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      const items = yield* consolidateAdmitted(`${delivery} contained target`, [
+        { delivery, text: containedCommandTargets.first },
+        { delivery, text: containedCommandTargets.second },
+      ])
+      expect(items.map(text)).toEqual([containedCommandTargets.merged])
+    }
+  }),
+)
+
+it.instance("request admission keeps containment ahead of job-class head equality", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      const session = yield* sessions.create({ title: `${delivery} contained target` })
+      yield* request(session.id, delivery, "contained-a", containedCommandTargets.first)
+      yield* request(session.id, delivery, "contained-b", containedCommandTargets.second)
+      expect((yield* queue.list(session.id)).map(text)).toEqual([containedCommandTargets.merged])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "contained-b"))).toMatchObject({
+        state: "merged",
+        into: "contained-a",
+      })
+    }
+  }),
+)
+
+it.instance("consolidation merges on a shared modifier and job-class head", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of sharedModifierHeadTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual([pair.merged])
+      }
+    }
+  }),
+)
+
+it.instance("request admission merges on a shared modifier and job-class head", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of sharedModifierHeadTargets) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title} merge` })
+        yield* request(session.id, delivery, "modifier-a", pair.first)
+        yield* request(session.id, delivery, "modifier-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.merged])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "modifier-b"))).toMatchObject({
+          state: "merged",
+          into: "modifier-a",
+        })
       }
     }
   }),
@@ -594,6 +708,37 @@ it.instance("command targets match when one path contains the other", () =>
   }),
 )
 
+it.instance("consolidation keeps path-like filenames literal", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of literalFilenameTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual([pair.first, pair.second])
+      }
+    }
+  }),
+)
+
+it.instance("request admission keeps path-like filenames literal", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of literalFilenameTargets) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "file-a", pair.first)
+        yield* request(session.id, delivery, "file-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.first, pair.second])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "file-a"))).toMatchObject({ state: "pending" })
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "file-b"))).toMatchObject({ state: "pending" })
+      }
+    }
+  }),
+)
+
 it.instance("command delivery retains the later target when similar paths consolidate", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
@@ -734,7 +879,7 @@ it.instance("same-target command prefixes retain ordered steps through delivery"
   }),
 )
 
-it.instance("command text prefixes retain the longer instruction through delivery", () =>
+it.instance("contained command targets merge in ordered steps through delivery", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
@@ -744,10 +889,11 @@ it.instance("command text prefixes retain the longer instruction through deliver
 
     expect(yield* queue.list(session.id)).toHaveLength(2)
     const items = yield* queue.consolidate(session.id)
+    const merged = "run the suite:\n1. run the suite\n2. run the suite with coverage"
     const written: string[] = []
     yield* promoter(session.id, written)("queue")
-    expect(written).toEqual(["run the suite with coverage"])
-    expect(items.map(text)).toEqual(["run the suite with coverage"])
+    expect(written).toEqual([merged])
+    expect(items.map(text)).toEqual([merged])
   }),
 )
 

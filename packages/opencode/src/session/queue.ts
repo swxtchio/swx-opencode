@@ -3536,7 +3536,6 @@ const genericTargetWords = new Set([
   "code",
   "codebase",
   "component",
-  "connection",
   "current",
   "did",
   "do",
@@ -3589,7 +3588,6 @@ const genericTargetWords = new Set([
   "how",
   "inaccurate",
   "in",
-  "intermittent",
   "into",
   "is",
   "it",
@@ -3642,9 +3640,7 @@ const genericTargetWords = new Set([
   "problem",
   "project",
   "prompt",
-  "profile",
   "rather",
-  "redirect",
   "repo",
   "repository",
   "related",
@@ -3653,7 +3649,6 @@ const genericTargetWords = new Set([
   "she",
   "secondary",
   "section",
-  "service",
   "simple",
   "since",
   "slow",
@@ -3825,36 +3820,38 @@ function targetWords(target: string) {
 }
 
 function targetMatches(left: string, right: string) {
-  const leftText = targetText(left)
-  const rightText = targetText(right)
-  if (leftText === rightText) return true
   const leftIdentity = targetIdentity(left)
   const rightIdentity = targetIdentity(right)
+  // Path-like targets compare by suffix; filename tokens don't use prose inflection rules.
   if (leftIdentity.path && rightIdentity.path)
     return pathSuffix(leftIdentity.path, rightIdentity.path) || pathSuffix(rightIdentity.path, leftIdentity.path)
+  if (leftIdentity.path || rightIdentity.path) return false
+  const leftText = targetText(left)
+  const rightText = targetText(right)
+  // A contained target includes its head, even when the longer target has a different one.
+  if (containsTarget(leftText, rightText) && rightIdentity.words.length > 0) return true
+  if (containsTarget(rightText, leftText) && leftIdentity.words.length > 0) return true
   if (!leftIdentity.head || leftIdentity.head !== rightIdentity.head) return false
-  if (containsTarget(leftText, rightText) && rightIdentity.evidence.length > 0) return true
-  if (containsTarget(rightText, leftText) && leftIdentity.evidence.length > 0) return true
   if (leftIdentity.evidence.length === 0 || rightIdentity.evidence.length === 0) return false
   return leftIdentity.evidence.some((word) => rightIdentity.evidence.includes(word))
 }
 
 function targetIdentity(target: string) {
   const components = normalizeTarget(target).split(/[\\/]/)
-  const path = components.length > 1 ? targetPath(target) : undefined
+  const path = /[\\/.]/.test(target) ? targetPath(target) : undefined
   const subject = path ? components[components.length - 1]! : targetSubject(target)
-  const words = targetWords(subject).map(normalizeTargetWord)
+  const words = targetWords(subject)
+  const tokens = path ? words : words.map(normalizeTargetWord)
   return {
     path,
-    head: words.at(-1),
-    evidence: words.slice(0, -1).filter((word) => !genericTargetWords.has(word)),
+    words: tokens,
+    head: tokens.at(-1),
+    evidence: tokens.slice(0, -1).filter((word) => !genericTargetWords.has(word)),
   }
 }
 
 function targetPath(target: string) {
-  const components = normalizeTarget(target).split(/[\\/]/)
-  const leaf = components.pop()!
-  return [...components, targetWords(leaf).map(normalizeTargetWord).join(" ")]
+  return normalizeTarget(target).split(/[\\/]/)
 }
 
 function pathSuffix(longer: readonly string[], shorter: readonly string[]) {
