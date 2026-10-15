@@ -165,6 +165,58 @@ const request = (sessionID: SessionID, delivery: SessionQueue.Delivery, requestI
     return yield* queue.request({ sessionID, delivery, requestID, parts: [{ type: "text", text: value }] })
   })
 
+const jobClassControls = [
+  { title: "handler", first: "fix authentication handler", second: "fix billing handler" },
+  { title: "profile", first: "update user profile page", second: "update admin profile page" },
+  { title: "redirect", first: "fix login redirect loop", second: "fix signup redirect loop" },
+  { title: "pooling", first: "add postgres connection pooling", second: "add redis connection pooling" },
+  { title: "crash", first: "fix the parser crash", second: "fix the tokenizer crash" },
+  { title: "service", first: "refactor billing service client", second: "refactor auth service client" },
+]
+
+const sharedNounControls = [
+  {
+    title: "intermittent failures",
+    first: "fix intermittent authentication failures",
+    second: "fix intermittent billing failures",
+  },
+  { title: "session queue", first: "refactor the session queue", second: "refactor the session projector" },
+  { title: "workspace queue", first: "rename the workspace queue", second: "rename the workspace projector" },
+]
+
+const inflectionTargets = [
+  {
+    title: "redirects",
+    first: "fix authentication redirect: trace callback",
+    second: "fix authentication redirects: inspect login",
+    merged: "fix authentication redirect:\n1. trace callback\n2. authentication redirects: inspect login",
+  },
+  {
+    title: "handlers",
+    first: "fix authentication handler: trace callback",
+    second: "fix authentication handlers: inspect login",
+    merged: "fix authentication handler:\n1. trace callback\n2. authentication handlers: inspect login",
+  },
+  {
+    title: "forms",
+    first: "update user profile form: validate fields",
+    second: "update user profile forms: map settings",
+    merged: "update user profile form:\n1. validate fields\n2. user profile forms: map settings",
+  },
+  {
+    title: "reconnects",
+    first: "refactor reconnect queue: preserve order",
+    second: "refactor reconnects queue: preserve retry order",
+    merged: "refactor reconnect queue:\n1. preserve order\n2. reconnects queue: preserve retry order",
+  },
+  {
+    title: "queues",
+    first: "refactor session queue: preserve order",
+    second: "refactor session queues: preserve receipts",
+    merged: "refactor session queue:\n1. preserve order\n2. session queues: preserve receipts",
+  },
+]
+
 const consolidateAdmitted = (title: string, values: readonly { delivery: SessionQueue.Delivery; text: string }[]) =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
@@ -330,11 +382,94 @@ it.instance("unlisted modifiers and shared first nouns alone do not identify no-
       "rename the workspace queue",
       "rename the workspace projector",
     ]
-    const items = yield* consolidateAdmitted(
-      "shared modifiers and first nouns",
-      prompts.map((text) => ({ delivery: "queue" as const, text })),
-    )
-    expect(items.map(text)).toEqual(prompts)
+    for (const delivery of ["steer", "queue"] as const) {
+      const items = yield* consolidateAdmitted(
+        `shared modifiers and first nouns ${delivery}`,
+        prompts.map((text) => ({ delivery, text })),
+      )
+      expect(items.map(text)).toEqual(prompts)
+    }
+  }),
+)
+
+it.instance("request admission keeps different work apart on shared modifiers and first nouns", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of sharedNounControls) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title} control` })
+        yield* request(session.id, delivery, "shared-a", pair.first)
+        yield* request(session.id, delivery, "shared-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.first, pair.second])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "shared-a"))).toMatchObject({ state: "pending" })
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "shared-b"))).toMatchObject({ state: "pending" })
+      }
+    }
+  }),
+)
+
+it.instance("a shared job-class head noun does not merge different work during consolidation", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of jobClassControls) {
+        const consolidated = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(consolidated.map(text)).toEqual([pair.first, pair.second])
+      }
+    }
+  }),
+)
+
+it.instance("request admission does not merge different work on a shared job-class head noun", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of jobClassControls) {
+        const session = yield* sessions.create({ title: `${delivery} request ${pair.title}` })
+        yield* request(session.id, delivery, "head-a", pair.first)
+        yield* request(session.id, delivery, "head-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.first, pair.second])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "head-a"))).toMatchObject({ state: "pending" })
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "head-b"))).toMatchObject({ state: "pending" })
+      }
+    }
+  }),
+)
+
+it.instance("consolidation matches shared identifiers across inflections in both delivery classes", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of inflectionTargets) {
+        const consolidated = yield* consolidateAdmitted(pair.title, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(consolidated.map(text)).toEqual([pair.merged])
+      }
+    }
+  }),
+)
+
+it.instance("request admission matches shared identifiers across inflections in both delivery classes", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of inflectionTargets) {
+        const session = yield* sessions.create({ title: `${delivery} request ${pair.title}` })
+        yield* request(session.id, delivery, "inflection-a", pair.first)
+        yield* request(session.id, delivery, "inflection-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.merged])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "inflection-b"))).toMatchObject({
+          state: "merged",
+          into: "inflection-a",
+        })
+      }
+    }
   }),
 )
 
@@ -372,21 +507,29 @@ it.instance("grammatical target words do not merge unrelated work in consolidati
         "investigate login redirects and how it fails: trace callback",
       ],
       ["investigate why the CI is red:", "investigate why the login is slow:"],
+      ["investigate how CI deployment works: inspect runner", "investigate how login routing works: trace callback"],
+      ["investigate why CI deployment fails: inspect runner", "investigate why login routing fails: trace callback"],
+      [
+        "investigate where CI deployment breaks: inspect runner",
+        "investigate where login routing breaks: trace callback",
+      ],
     ]
-    for (const [first, second] of cases) {
-      const items = yield* consolidateAdmitted("different interrogative targets", [
-        { delivery: "queue", text: first! },
-        { delivery: "queue", text: second! },
-      ])
-      expect(items.map(text)).toEqual([first, second])
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const [first, second] of cases) {
+        const items = yield* consolidateAdmitted(`different interrogative targets ${delivery}`, [
+          { delivery, text: first! },
+          { delivery, text: second! },
+        ])
+        expect(items.map(text)).toEqual([first, second])
+      }
     }
 
     const positive = yield* consolidateAdmitted("same deployment target", [
-      { delivery: "queue", text: "investigate CI deployment and how it works: inspect runner" },
-      { delivery: "queue", text: "investigate CI deployment and how it proceeds: trace callback" },
+      { delivery: "queue", text: "investigate how CI deployment works: inspect runner" },
+      { delivery: "queue", text: "investigate whether CI deployment works: trace callback" },
     ])
     expect(positive.map(text)).toEqual([
-      "investigate CI deployment and how it works:\n1. inspect runner\n2. CI deployment and how it proceeds: trace callback",
+      "investigate how CI deployment works:\n1. inspect runner\n2. whether CI deployment works: trace callback",
     ])
   }),
 )
@@ -395,27 +538,47 @@ it.instance("request admission ignores grammatical target overlap and keeps a sa
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
-    const different = yield* sessions.create({ title: "grammatical request boundary" })
     const requests = [
-      "investigate CI deployment and how it works: inspect runner",
-      "investigate login redirects and how it fails: trace callback",
+      {
+        first: "investigate CI deployment and how it works: inspect runner",
+        second: "investigate login redirects and how it fails: trace callback",
+      },
+      {
+        first: "investigate how CI deployment works: inspect runner",
+        second: "investigate how login routing works: trace callback",
+      },
+      {
+        first: "investigate why CI deployment fails: inspect runner",
+        second: "investigate why login routing fails: trace callback",
+      },
+      {
+        first: "investigate where CI deployment breaks: inspect runner",
+        second: "investigate where login routing breaks: trace callback",
+      },
     ]
-    yield* request(different.id, "queue", "grammar-a", requests[0]!)
-    yield* request(different.id, "queue", "grammar-b", requests[1]!)
-    expect((yield* queue.list(different.id)).map(text)).toEqual(requests)
-    expect(Option.getOrThrow(yield* queue.receipt(different.id, "grammar-a"))).toMatchObject({ state: "pending" })
-    expect(Option.getOrThrow(yield* queue.receipt(different.id, "grammar-b"))).toMatchObject({ state: "pending" })
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of requests) {
+        const different = yield* sessions.create({ title: `${delivery} grammatical request boundary ${pair.first}` })
+        yield* request(different.id, delivery, "grammar-a", pair.first)
+        yield* request(different.id, delivery, "grammar-b", pair.second)
+        expect((yield* queue.list(different.id)).map(text)).toEqual([pair.first, pair.second])
+        expect(Option.getOrThrow(yield* queue.receipt(different.id, "grammar-a"))).toMatchObject({ state: "pending" })
+        expect(Option.getOrThrow(yield* queue.receipt(different.id, "grammar-b"))).toMatchObject({ state: "pending" })
+      }
+    }
 
-    const same = yield* sessions.create({ title: "grammatical target positive" })
-    yield* request(same.id, "queue", "same-a", "investigate CI deployment and how it works: inspect runner")
-    yield* request(same.id, "queue", "same-b", "investigate CI deployment and how it proceeds: trace callback")
-    expect((yield* queue.list(same.id)).map(text)).toEqual([
-      "investigate CI deployment and how it works:\n1. inspect runner\n2. CI deployment and how it proceeds: trace callback",
-    ])
-    expect(Option.getOrThrow(yield* queue.receipt(same.id, "same-b"))).toMatchObject({
-      state: "merged",
-      into: "same-a",
-    })
+    for (const delivery of ["steer", "queue"] as const) {
+      const same = yield* sessions.create({ title: `${delivery} grammatical target positive` })
+      yield* request(same.id, delivery, "same-a", "investigate how CI deployment works: inspect runner")
+      yield* request(same.id, delivery, "same-b", "investigate whether CI deployment works: trace callback")
+      expect((yield* queue.list(same.id)).map(text)).toEqual([
+        "investigate how CI deployment works:\n1. inspect runner\n2. whether CI deployment works: trace callback",
+      ])
+      expect(Option.getOrThrow(yield* queue.receipt(same.id, "same-b"))).toMatchObject({
+        state: "merged",
+        into: "same-a",
+      })
+    }
   }),
 )
 
@@ -453,10 +616,10 @@ it.instance("command targets match on a distinctive token when neither contains 
   Effect.gen(function* () {
     const items = yield* consolidateAdmitted("distinctive target", [
       { delivery: "queue", text: "review authentication receipt routing: preserve origin IDs" },
-      { delivery: "queue", text: "review receipt routing in authentication: verify settlement" },
+      { delivery: "queue", text: "review billing receipt routing: verify settlement" },
     ])
     expect(items.map(text)).toEqual([
-      "review authentication receipt routing:\n1. preserve origin IDs\n2. receipt routing in authentication: verify settlement",
+      "review authentication receipt routing:\n1. preserve origin IDs\n2. billing receipt routing: verify settlement",
     ])
   }),
 )
@@ -698,11 +861,11 @@ it.instance("receipt-bearing requests use the broadened command matcher", () =>
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
     const session = yield* sessions.create({ title: "receipt command match" })
-    yield* request(session.id, "queue", "auth-a", "fix the flaky auth handler: retain receipt identities")
-    yield* request(session.id, "queue", "auth-b", "FIX an auth handler: cover null responses")
+    yield* request(session.id, "queue", "auth-a", "review authentication receipt routing: preserve origin IDs")
+    yield* request(session.id, "queue", "auth-b", "review billing receipt routing: verify settlement")
     const items = yield* queue.list(session.id)
     expect(items.map(text)).toEqual([
-      "fix the flaky auth handler:\n1. retain receipt identities\n2. an auth handler: cover null responses",
+      "review authentication receipt routing:\n1. preserve origin IDs\n2. billing receipt routing: verify settlement",
     ])
     expect(Option.getOrThrow(yield* queue.receipt(session.id, "auth-b"))).toMatchObject({
       state: "merged",

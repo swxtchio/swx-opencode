@@ -3536,6 +3536,7 @@ const genericTargetWords = new Set([
   "code",
   "codebase",
   "component",
+  "connection",
   "current",
   "did",
   "do",
@@ -3588,6 +3589,7 @@ const genericTargetWords = new Set([
   "how",
   "inaccurate",
   "in",
+  "intermittent",
   "into",
   "is",
   "it",
@@ -3640,7 +3642,9 @@ const genericTargetWords = new Set([
   "problem",
   "project",
   "prompt",
+  "profile",
   "rather",
+  "redirect",
   "repo",
   "repository",
   "related",
@@ -3649,6 +3653,7 @@ const genericTargetWords = new Set([
   "she",
   "secondary",
   "section",
+  "service",
   "simple",
   "since",
   "slow",
@@ -3823,22 +3828,40 @@ function targetMatches(left: string, right: string) {
   const leftText = targetText(left)
   const rightText = targetText(right)
   if (leftText === rightText) return true
-  const leftDistinctive = targetDistinctiveWords(left)
-  const rightDistinctive = targetDistinctiveWords(right)
-  if (
-    (containsTarget(leftText, rightText) && rightDistinctive.length > 0) ||
-    (containsTarget(rightText, leftText) && leftDistinctive.length > 0)
-  )
-    return true
-  return leftDistinctive.some((word) => rightDistinctive.includes(word))
+  const leftIdentity = targetIdentity(left)
+  const rightIdentity = targetIdentity(right)
+  if (leftIdentity.path && rightIdentity.path)
+    return pathSuffix(leftIdentity.path, rightIdentity.path) || pathSuffix(rightIdentity.path, leftIdentity.path)
+  if (!leftIdentity.head || leftIdentity.head !== rightIdentity.head) return false
+  if (containsTarget(leftText, rightText) && rightIdentity.evidence.length > 0) return true
+  if (containsTarget(rightText, leftText) && leftIdentity.evidence.length > 0) return true
+  if (leftIdentity.evidence.length === 0 || rightIdentity.evidence.length === 0) return false
+  return leftIdentity.evidence.some((word) => rightIdentity.evidence.includes(word))
 }
 
-function targetDistinctiveWords(target: string) {
+function targetIdentity(target: string) {
   const components = normalizeTarget(target).split(/[\\/]/)
-  const subject = components.length > 1 ? components[components.length - 1]! : targetSubject(target)
-  const words = targetWords(subject).filter((word) => !genericTargetWords.has(word))
-  // A leading modifier or shared parent noun is weak evidence; a one-word subject still counts.
-  return words.length > 1 ? words.slice(1) : words
+  const path = components.length > 1 ? targetPath(target) : undefined
+  const subject = path ? components[components.length - 1]! : targetSubject(target)
+  const words = targetWords(subject).map(normalizeTargetWord)
+  return {
+    path,
+    head: words.at(-1),
+    evidence: words.slice(0, -1).filter((word) => !genericTargetWords.has(word)),
+  }
+}
+
+function targetPath(target: string) {
+  const components = normalizeTarget(target).split(/[\\/]/)
+  const leaf = components.pop()!
+  return [...components, targetWords(leaf).map(normalizeTargetWord).join(" ")]
+}
+
+function pathSuffix(longer: readonly string[], shorter: readonly string[]) {
+  return (
+    shorter.length <= longer.length &&
+    shorter.every((component, index) => component === longer[longer.length - shorter.length + index])
+  )
 }
 
 function containsTarget(longer: string, shorter: string) {
@@ -3848,6 +3871,14 @@ function containsTarget(longer: string, shorter: string) {
     (!longer[start - 1] || !/[a-z0-9]/i.test(longer[start - 1]!)) &&
     (!longer[start + shorter.length] || !/[a-z0-9]/i.test(longer[start + shorter.length]!))
   )
+}
+
+function normalizeTargetWord(word: string) {
+  if (word.length > 4 && word.endsWith("ies")) return `${word.slice(0, -3)}y`
+  if (/(?:ses|xes|zes|ches|shes)$/.test(word)) return word.slice(0, -2)
+  if (word.length > 3 && word.endsWith("s") && !word.endsWith("ss") && !word.endsWith("us") && !word.endsWith("is"))
+    return word.slice(0, -1)
+  return word
 }
 
 // A copy's queue times join the survivor's: step by step when both carry the
