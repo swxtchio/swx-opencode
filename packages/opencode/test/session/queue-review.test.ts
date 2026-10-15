@@ -165,6 +165,16 @@ const request = (sessionID: SessionID, delivery: SessionQueue.Delivery, requestI
     return yield* queue.request({ sessionID, delivery, requestID, parts: [{ type: "text", text: value }] })
   })
 
+const consolidateAdmitted = (title: string, values: readonly { delivery: SessionQueue.Delivery; text: string }[]) =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title })
+    const admitted = yield* Effect.forEach(values, (value) => admit(session.id, value.delivery, value.text))
+    expect(yield* queue.list(session.id)).toHaveLength(admitted.length)
+    return yield* queue.consolidate(session.id)
+  })
+
 it.instance(
   "a preparation that fails or is interrupted after a merge made its reservation stale removes nothing",
   () =>
@@ -205,7 +215,7 @@ it.instance(
 )
 
 it.instance(
-  "a copy consolidated into a prompt that then joins a command follows it to the command",
+  "a copy in another delivery class stays pending while same-class commands consolidate",
   () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
@@ -214,21 +224,284 @@ it.instance(
       yield* admit(session.id, "steer", "run lint")
       yield* request(session.id, "steer", "req-b", "run lint --fix")
       yield* request(session.id, "queue", "req-c", "run lint --fix")
-      const [merged, ...rest] = yield* queue.consolidate(session.id)
-      expect([text(merged!), rest]).toEqual(["run lint:\n1. run lint\n2. --fix", []])
+      const result = yield* queue.consolidate(session.id)
+      expect(result.map((item) => [item.delivery, text(item)])).toEqual([
+        ["steer", "run lint:\n1. run lint\n2. --fix"],
+        ["queue", "run lint --fix"],
+      ])
       expect(Option.getOrThrow(yield* queue.receipt(session.id, "req-b"))).toEqual({
         state: "pending",
-        itemID: merged!.id,
+        itemID: result[0]!.id,
       })
-      expect(Option.getOrThrow(yield* queue.receipt(session.id, "req-c"))).toEqual({ state: "merged", into: "req-b" })
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "req-c"))).toEqual({
+        state: "pending",
+        itemID: result[1]!.id,
+      })
       yield* promoter(session.id, [])("steer")
-      expect(Option.getOrThrow(yield* queue.receipt(session.id, "req-c"))).toMatchObject({
-        state: "merged",
-        into: "req-b",
-        messageID: expect.any(String),
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "req-c"))).toEqual({
+        state: "pending",
+        itemID: result[1]!.id,
       })
     }),
   30_000,
+)
+
+it.instance("command targets match across verb and whitespace case changes", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("case and whitespace", [
+      { delivery: "queue", text: "  RUN   AUTH  " },
+      { delivery: "queue", text: "run auth --fix" },
+    ])
+    expect(items.map(text)).toEqual(["RUN AUTH:\n1. RUN AUTH\n2. --fix"])
+  }),
+)
+
+it.instance("command targets ignore leading articles and adjective differences", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("articles and adjectives", [
+      { delivery: "queue", text: "fix the flaky authentication handler: keep null guards" },
+      { delivery: "queue", text: "fix an authentication handler: add regression coverage" },
+    ])
+    expect(items.map(text)).toEqual([
+      "fix the flaky authentication handler:\n1. keep null guards\n2. add regression coverage",
+    ])
+  }),
+)
+
+it.instance("commands derive no-colon targets past articles and adjectives", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("no-colon target", [
+      { delivery: "queue", text: "fix the broken auth.ts" },
+      { delivery: "queue", text: "fix auth.ts --check" },
+    ])
+    expect(items.map(text)).toEqual(["fix the broken auth.ts:\n1. fix the broken auth.ts\n2. --check"])
+  }),
+)
+
+it.instance("command targets match when one path contains the other", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("path suffix", [
+      { delivery: "queue", text: "update packages/opencode/src/session/queue.ts: retain receipts" },
+      { delivery: "queue", text: "UPDATE src/session/queue.ts: preserve original IDs" },
+    ])
+    expect(items.map(text)).toEqual([
+      "update packages/opencode/src/session/queue.ts:\n1. retain receipts\n2. preserve original IDs",
+    ])
+  }),
+)
+
+it.instance("command targets match on a distinctive token when neither contains the other", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("distinctive target", [
+      { delivery: "queue", text: "review authentication receipt routing: preserve origin IDs" },
+      { delivery: "queue", text: "review receipt routing in authentication: verify settlement" },
+    ])
+    expect(items.map(text)).toEqual([
+      "review authentication receipt routing:\n1. preserve origin IDs\n2. verify settlement",
+    ])
+  }),
+)
+
+it.instance("generic target words alone do not merge different command work", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("different targets", [
+      { delivery: "queue", text: "fix the login bug: disable the redirect loop" },
+      { delivery: "queue", text: "fix the signup bug: add the welcome email" },
+    ])
+    expect(items.map(text)).toEqual([
+      "fix the login bug: disable the redirect loop",
+      "fix the signup bug: add the welcome email",
+    ])
+  }),
+)
+
+it.instance("a shared file extension alone does not identify a command target", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("different files", [
+      { delivery: "queue", text: "update alpha.ts: preserve the first module" },
+      { delivery: "queue", text: "update beta.ts: preserve the second module" },
+    ])
+    expect(items.map(text)).toEqual([
+      "update alpha.ts: preserve the first module",
+      "update beta.ts: preserve the second module",
+    ])
+  }),
+)
+
+it.instance("plain text copies match after case and whitespace normalization", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("normalized text", [
+      { delivery: "queue", text: "Please summarize the queue" },
+      { delivery: "queue", text: " please   SUMMARIZE THE queue " },
+    ])
+    expect(items.map(text)).toEqual(["Please summarize the queue"])
+    expect(items[0]!.origins).toHaveLength(2)
+  }),
+)
+
+it.instance("plain text prefixes retain the longer instruction and both queue origins", () =>
+  Effect.gen(function* () {
+    const prompts = ["Please summarize the queue", "please summarize the queue in detail"]
+    const items = yield* consolidateAdmitted(
+      "prefix text",
+      prompts.map((text) => ({ delivery: "queue" as const, text })),
+    )
+    expect(items.map(text)).toEqual([prompts[1]])
+    expect(items[0]!.origins).toHaveLength(2)
+  }),
+)
+
+it.instance("prefix text consolidation settles request receipts through delivery", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "prefix text receipts" })
+    const prompts = ["Please summarize the queue", "Please summarize the queue in detail"]
+    yield* request(session.id, "queue", "prefix-a", prompts[0]!)
+    yield* request(session.id, "queue", "prefix-b", prompts[1]!)
+    expect(yield* queue.list(session.id)).toHaveLength(2)
+    const [merged] = yield* queue.consolidate(session.id)
+    expect([text(merged!), merged!.origins.length]).toEqual([prompts[1], 2])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "prefix-b"))).toEqual({
+      state: "merged",
+      into: "prefix-a",
+    })
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual([prompts[1]])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "prefix-b"))).toMatchObject({
+      state: "merged",
+      into: "prefix-a",
+      messageID: expect.any(String),
+    })
+  }),
+)
+
+it.instance("plain text with distinct work stays separate without a prefix relation", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("different text", [
+      { delivery: "queue", text: "Please summarize the queue" },
+      { delivery: "queue", text: "Please summarize the prompt" },
+    ])
+    expect(items.map(text)).toEqual(["Please summarize the queue", "Please summarize the prompt"])
+  }),
+)
+
+it.instance("exact copies stay in their delivery class while normalized same-class prompts still merge", () =>
+  Effect.gen(function* () {
+    const separate = yield* consolidateAdmitted("exact delivery separation", [
+      { delivery: "steer", text: "Please check the queue" },
+      { delivery: "queue", text: "Please check the queue" },
+    ])
+    expect(separate.map((item) => [item.delivery, text(item)])).toEqual([
+      ["steer", "Please check the queue"],
+      ["queue", "Please check the queue"],
+    ])
+    const merged = yield* consolidateAdmitted("normalized same-class copies", [
+      { delivery: "steer", text: "Please check the queue" },
+      { delivery: "steer", text: " please   CHECK THE queue " },
+    ])
+    expect(merged.map((item) => [item.delivery, text(item)])).toEqual([["steer", "Please check the queue"]])
+  }),
+)
+
+it.instance("normalized prompt equality stays in its delivery class", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("normalized delivery separation", [
+      { delivery: "steer", text: "Please summarize the queue" },
+      { delivery: "queue", text: " please   SUMMARIZE THE queue " },
+    ])
+    expect(items.map((item) => [item.delivery, text(item)])).toEqual([
+      ["steer", "Please summarize the queue"],
+      ["queue", " please   SUMMARIZE THE queue "],
+    ])
+  }),
+)
+
+it.instance("prompt prefixes stay in their delivery class", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("prefix delivery separation", [
+      { delivery: "steer", text: "Please summarize the queue" },
+      { delivery: "queue", text: "Please summarize the queue in detail" },
+    ])
+    expect(items.map((item) => [item.delivery, text(item)])).toEqual([
+      ["steer", "Please summarize the queue"],
+      ["queue", "Please summarize the queue in detail"],
+    ])
+  }),
+)
+
+it.instance("similar commands stay in their delivery class", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("command delivery separation", [
+      { delivery: "steer", text: "update packages/opencode/src/session/queue.ts: retain provenance" },
+      { delivery: "queue", text: "UPDATE src/session/queue.ts: preserve receipts" },
+    ])
+    expect(items.map((item) => [item.delivery, text(item)])).toEqual([
+      ["steer", "update packages/opencode/src/session/queue.ts: retain provenance"],
+      ["queue", "UPDATE src/session/queue.ts: preserve receipts"],
+    ])
+  }),
+)
+
+it.instance("receipt-bearing requests use the broadened command matcher", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "receipt command match" })
+    yield* request(session.id, "queue", "auth-a", "fix the flaky auth handler: retain receipt identities")
+    yield* request(session.id, "queue", "auth-b", "FIX an auth handler: cover null responses")
+    const items = yield* queue.list(session.id)
+    expect(items.map(text)).toEqual([
+      "fix the flaky auth handler:\n1. retain receipt identities\n2. cover null responses",
+    ])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "auth-b"))).toMatchObject({
+      state: "merged",
+      into: "auth-a",
+    })
+  }),
+)
+
+it.instance("configured critical markers still protect matching receipt-bearing commands", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "protected command marker" })
+    const markers = { critical: [{ type: "prefix" as const, value: "fix auth.ts" }] }
+    const inputs = [
+      {
+        sessionID: session.id,
+        delivery: "queue" as const,
+        requestID: "protected-a",
+        parts: [{ type: "text" as const, text: "fix auth.ts: preserve the first origin" }],
+      },
+      {
+        sessionID: session.id,
+        delivery: "queue" as const,
+        requestID: "protected-b",
+        parts: [{ type: "text" as const, text: "fix auth.ts: preserve the second origin" }],
+      },
+    ]
+    yield* Effect.forEach(inputs, (input) => queue.request(input, markers))
+    expect((yield* queue.list(session.id)).map(text)).toEqual(inputs.map((input) => input.parts[0]!.text))
+    expect((yield* queue.consolidate(session.id, markers)).map(text)).toEqual(
+      inputs.map((input) => input.parts[0]!.text),
+    )
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "protected-a")).state).toBe("pending")
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "protected-b")).state).toBe("pending")
+  }),
+)
+
+it.instance("configured critical markers also protect free-text prefix matching", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "protected text marker" })
+    const markers = { critical: [{ type: "prefix" as const, value: "Please" }] }
+    const prompts = ["Please summarize the queue", "Please summarize the queue in detail"]
+    yield* Effect.forEach(prompts, (text) => admit(session.id, "queue", text))
+    expect((yield* queue.consolidate(session.id, markers)).map(text)).toEqual(prompts)
+  }),
 )
 
 it.instance(
@@ -588,7 +861,7 @@ it.instance(
 )
 
 it.instance(
-  "consolidate keeps one of identical prompts and merges similar commands into ordered steps",
+  "consolidate keeps copies within their delivery class and merges similar commands into ordered steps",
   () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
@@ -610,6 +883,7 @@ it.instance(
         ["steer", "review auth.ts: check the naming"],
         ["steer", "fix login.ts: tidy the imports"],
         ["steer", "run the full suite"],
+        ["queue", "run the full suite"],
         ["queue", "fix auth.ts: queued step"],
       ])
 
@@ -621,10 +895,12 @@ it.instance(
 
       yield* promote("steer")
       yield* promote("queue")
+      yield* promote("queue")
       expect(written).toEqual([
         "fix auth.ts:\n1. handle a null token\n2. add a regression test\n3. update the docs",
         "review auth.ts: check the naming",
         "fix login.ts: tidy the imports",
+        "run the full suite",
         "run the full suite",
         "fix auth.ts: queued step",
       ])
