@@ -24,6 +24,7 @@ import { Project } from "../../src/project/project"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import * as HttpSessionError from "../../src/server/routes/instance/httpapi/handlers/session-errors"
 import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/groups/experimental"
+import { InstancePaths } from "../../src/server/routes/instance/httpapi/groups/instance"
 import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
 import { SessionQueuePaths } from "../../src/server/routes/instance/httpapi/groups/session-queue"
 import { SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
@@ -561,8 +562,37 @@ describe("session HttpApi", () => {
     { git: true, config: { formatter: false, lsp: false } },
   )
 
-  it.live(
-    "uses the persisted session directory for prompt requests",
+it.live(
+  "enhances a draft through the configured provider without creating a session prompt",
+  () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      yield* llm.text("clear rewritten draft")
+      const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+      const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+      const response = yield* request(`${InstancePaths.promptEnhance}?directory=${encodeURIComponent(directory)}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "test/test-model",
+          draft: "rough draft",
+          context: "visible session context",
+        }),
+      })
+
+      expect(response.status).toBe(200)
+      expect(yield* json<string>(response)).toBe("clear rewritten draft")
+      const calls = yield* llm.inputs
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.model).toBe("test-model")
+      expect(JSON.stringify(calls[0])).toContain("visible session context")
+      expect(JSON.stringify(calls[0])).toContain("rough draft")
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  30_000,
+)
+
+it.live(
+  "uses the persisted session directory for prompt requests",
     () =>
       Effect.gen(function* () {
         const llm = yield* TestLLMServer

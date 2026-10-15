@@ -6,6 +6,7 @@ import {
   AttentionSoundName,
   Info,
   LeaderTimeoutDefault,
+  PromptEnhanceModelDefault,
   PluginSpec,
   resolve,
   TuiConfigProvider,
@@ -64,6 +65,7 @@ test("resolves host-neutral defaults", () => {
   expect(config.keybinds.has("terminal.suspend")).toBe(true)
   expect(config.keybinds.has("session.list")).toBe(true)
   expect(config.cursor).toBeUndefined()
+  expect(config.prompt_enhance_model).toBe(PromptEnhanceModelDefault)
 })
 
 test("resolves overrides without mutating input", () => {
@@ -81,6 +83,7 @@ test("resolves overrides without mutating input", () => {
     },
     keybinds: { session_list: "ctrl+l" },
     cursor: { blinking: false },
+    prompt_enhance_model: "test/test-model",
   }
   const config = resolve(input, { terminalSuspend: true })
 
@@ -90,6 +93,7 @@ test("resolves overrides without mutating input", () => {
     leader_timeout: 750,
     attention: input.attention,
     cursor: { style: "block", blinking: false },
+    prompt_enhance_model: "test/test-model",
   })
   expect(config.keybinds.get("session.list")).toHaveLength(1)
   expect(input.keybinds).toEqual({ session_list: "ctrl+l" })

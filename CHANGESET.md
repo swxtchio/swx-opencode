@@ -185,6 +185,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Features
 
+- **#272** Ctrl+r searches TUI composer prompts and keeps rename in the command menu; busy composer sends are delivered together as one ordered message with original text and receipts, and Ctrl+e rewrites a draft from visible context through the configured provider without submitting it. _Fork-only._
 - **#255** A sent prompt is never invisible (swxtchio/swx-opencode#249). `SessionPrompt.prompt` admits a queued
   prompt as its first step, before its config read, as a `time_preparing` row (migration `20261013194721`) that is
   listed and withdrawable but never promoted or merged until its classification, revert cleanup and model selection

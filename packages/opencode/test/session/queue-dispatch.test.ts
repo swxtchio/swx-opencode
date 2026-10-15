@@ -87,9 +87,13 @@ const writer = (sessions: Session.Interface) => (message: SessionV1.WithParts) =
     yield* Effect.forEach(message.parts, (part) => sessions.updatePart(part), { discard: true })
   })
 const metadata = (message: SessionV1.WithParts) =>
-  Schema.decodeUnknownSync(SessionPromptQueue.Group)(
-    message.parts.find((part) => part.type === "text")?.metadata?.sessionQueue,
-  )
+  message.parts
+    .flatMap((part) => {
+      if (part.type !== "text" || !part.metadata?.sessionQueue) return []
+      const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata.sessionQueue)
+      return Option.isSome(group) ? [group.value] : []
+    })
+    .toSorted((a, b) => b.constituents.length - a.constituents.length)[0]!
 const text = (message: SessionV1.WithParts) =>
   message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")
 
@@ -142,6 +146,103 @@ it.instance(
       yield* promote()
       expect(metadata((yield* MessageV2.stream(session.id))[0]).kind).toBe("watcher.check")
     }),
+)
+
+it.instance("queued TUI composer prompts form one ordered message and retain receipts around an injection", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const firstText = "A\nA keeps its newline"
+    const lastText = "composer batch B text"
+    const first = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "composer-a",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: firstText }],
+    })
+    const injectedText = check("between", "stalled")
+    const injected = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "injected-between",
+      delivery: "queue",
+      parts: [{ type: "text", text: injectedText }],
+    })
+    const second = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "composer-b",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: lastText }],
+    })
+    const promote = () =>
+      queue.promote({
+        sessionID: session.id,
+        delivery: "queue",
+        prepare,
+        write: writer(sessions),
+        rejected: () => Effect.void,
+      })
+
+    yield* promote()
+    const combined = (yield* MessageV2.stream(session.id))[0]
+    const group = metadata(combined)
+    expect(text(combined)).toBe(`${firstText}\n${lastText}`)
+    expect(group.kind).toBe("human")
+    expect(group.constituents.map((item) => item.id)).toEqual([first.id, second.id])
+    expect(group.constituents.map((item) => item.input.parts[0])).toEqual([
+      { type: "text", text: firstText },
+      { type: "text", text: lastText },
+    ])
+    expect(yield* queue.list(session.id)).toEqual([injected])
+    for (const requestID of ["composer-a", "composer-b"]) {
+      const receipt = yield* queue.receipt(session.id, requestID)
+      expect(Option.isSome(receipt) ? receipt.value : undefined).toEqual({
+        state: "delivered",
+        messageID: combined.info.id,
+      })
+    }
+
+    yield* promote()
+    const injectedMessage = (yield* MessageV2.stream(session.id)).find((message) => text(message).includes(injectedText))
+    expect(injectedMessage).toBeDefined()
+    expect(metadata(injectedMessage!).kind).toBe("watcher.check")
+    expect(text(injectedMessage!)).toContain(injectedText)
+    expect(text(injectedMessage!)).not.toContain(firstText)
+    expect(text(injectedMessage!)).not.toContain(lastText)
+    const injectedReceipt = yield* queue.receipt(session.id, "injected-between")
+    expect(Option.isSome(injectedReceipt) ? injectedReceipt.value : undefined).toEqual({
+      state: "delivered",
+      messageID: injectedMessage!.info.id,
+    })
+  }),
+)
+
+it.instance("a single queued TUI composer prompt keeps its own text and delivery", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    yield* queue.admit({
+      sessionID: session.id,
+      requestID: "composer-alone",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: "one queued prompt" }],
+    })
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "queue",
+      prepare,
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+    const message = (yield* MessageV2.stream(session.id))[0]
+    expect(text(message)).toBe("one queued prompt")
+    expect(metadata(message).kind).toBe("individual")
+    expect(yield* queue.list(session.id)).toEqual([])
+  }),
 )
 
 it.instance(

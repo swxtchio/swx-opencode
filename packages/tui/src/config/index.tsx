@@ -51,6 +51,10 @@ export const Attention = Schema.Struct({
 }).annotate({ description: "Attention notification and sound settings" })
 
 const PromptSize = Schema.Int.check(Schema.isGreaterThan(0))
+export const PromptEnhanceModelDefault = "google/gemini-4-argon"
+const PromptEnhanceModel = Schema.String.check(Schema.isPattern(/^[^/]+\/.+$/)).annotate({
+  description: "Provider and model ID used to enhance the current prompt draft",
+})
 export const Prompt = Schema.Struct({
   max_height: Schema.optional(PromptSize).annotate({ description: "Prompt textarea max height" }),
   max_width: Schema.optional(Schema.Union([PromptSize, Schema.Literal("auto")])).annotate({
@@ -67,6 +71,7 @@ export const Info = Schema.Struct({
   leader_timeout: Schema.optional(LeaderTimeout),
   attention: Schema.optional(Attention),
   prompt: Schema.optional(Prompt),
+  prompt_enhance_model: Schema.optional(PromptEnhanceModel),
   scroll_speed: Schema.optional(ScrollSpeed).annotate({ description: "TUI scroll speed" }),
   scroll_acceleration: Schema.optional(ScrollAcceleration),
   diff_style: Schema.optional(DiffStyle),
@@ -75,7 +80,10 @@ export const Info = Schema.Struct({
 })
 export type Info = Schema.Schema.Type<typeof Info>
 
-export type Resolved = Omit<Info, "attention" | "keybinds" | "leader_timeout" | "mouse" | "cursor"> & {
+export type Resolved = Omit<
+  Info,
+  "attention" | "keybinds" | "leader_timeout" | "mouse" | "cursor" | "prompt_enhance_model"
+> & {
   attention: {
     enabled: boolean
     notifications: boolean
@@ -87,6 +95,7 @@ export type Resolved = Omit<Info, "attention" | "keybinds" | "leader_timeout" | 
   keybinds: TuiKeybind.BindingLookupView
   leader_timeout: number
   mouse: boolean
+  prompt_enhance_model: typeof PromptEnhanceModel.Type
   cursor?: {
     style: "block" | "underline" | "line" | "default"
     blinking: boolean
@@ -126,6 +135,7 @@ export function resolve(input: Info, options: ResolveOptions): Resolved {
     }),
     leader_timeout: input.leader_timeout ?? LeaderTimeoutDefault,
     mouse: input.mouse ?? true,
+    prompt_enhance_model: input.prompt_enhance_model ?? PromptEnhanceModelDefault,
     cursor: input.cursor
       ? {
           style: input.cursor.style ?? "block",

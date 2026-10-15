@@ -4835,6 +4835,24 @@ const modelMessages = (input: Record<string, unknown> | undefined) => {
 
 const lastUser = (input: Record<string, unknown> | undefined) => modelMessages(input).at(-1)
 
+function lastUserText(input: Record<string, unknown>) {
+  const messages = input.messages
+  if (!Array.isArray(messages)) throw new Error("expected LLM messages")
+  const message = messages.findLast(
+    (item: unknown) => typeof item === "object" && item !== null && "role" in item && item.role === "user",
+  )
+  if (!message || typeof message !== "object" || !("content" in message)) return ""
+  const queueNote = (text: string) => text.replace(/^\[Queued prompt[^\]]*\]\s*/, "")
+  if (typeof message.content === "string") return queueNote(message.content)
+  const content = message.content
+  if (!Array.isArray(content)) return ""
+  return content.flatMap((part: unknown) =>
+    typeof part === "object" && part !== null && "text" in part && typeof part.text === "string"
+      ? [queueNote(part.text)]
+      : [],
+  ).join("")
+}
+
 const mentions = (input: Record<string, unknown> | undefined, value: string) =>
   JSON.stringify(modelMessages(input)).includes(value)
 
@@ -4967,6 +4985,94 @@ const startHeld = Effect.fn("test.startHeld")(function* (input?: {
   const release = Deferred.succeed(gate, void 0)
   return { llm, prompt, sessions, queue, chat, task, send, release }
 })
+
+it.instance("prompt enhancement uses the configured provider without writing to a session", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    yield* llm.text("clear rewritten draft")
+    const result = yield* prompt.enhance({
+      model: "test/test-model",
+      draft: "rough draft",
+      context: "visible session context",
+    })
+    const calls = yield* llm.inputs
+    expect(result).toBe("clear rewritten draft")
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.model).toBe("test-model")
+    expect(JSON.stringify(calls[0])).toContain("visible session context")
+    expect(JSON.stringify(calls[0])).toContain("rough draft")
+    expect(JSON.stringify(calls[0])).toContain("preserving its intent")
+    expect(yield* sessions.messages({ sessionID: session.id })).toEqual([])
+  }),
+)
+
+it.instance("prompt enhancement reports an unavailable configured model before making a provider request", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const result = yield* Effect.exit(
+      prompt.enhance({ model: "test/missing-model", draft: "draft", context: "" }),
+    )
+    expect(Exit.isFailure(result)).toBe(true)
+    expect(yield* llm.calls).toBe(0)
+  }),
+)
+
+it.instance("prompt enhancement reports provider failures", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    yield* llm.error(503, { error: "provider unavailable" })
+    const result = yield* Effect.exit(
+      prompt.enhance({ model: "test/test-model", draft: "draft", context: "visible context" }),
+    )
+    expect(Exit.isFailure(result)).toBe(true)
+    expect(yield* llm.calls).toBeGreaterThan(0)
+  }),
+)
+
+it.instance("busy TUI composer prompts are answered once as one ordered user message", () =>
+  Effect.gen(function* () {
+    const held = yield* startHeld()
+    const first = yield* held.send("A", {
+      requestID: "composer-a",
+      delivery: "queue",
+      origin: "tui-composer",
+    })
+    const second = yield* held.send("B", {
+      requestID: "composer-b",
+      delivery: "queue",
+      origin: "tui-composer",
+    })
+    yield* queued(held.chat.id, 2)
+    yield* held.llm.text("one answer for the batch")
+    yield* held.release
+    yield* finish(held.task, first, second)
+
+    const calls = yield* held.llm.inputs
+    const batchedCalls = calls.filter((call) => lastUserText(call).includes("A\nB"))
+    expect(calls).toHaveLength(2)
+    expect(batchedCalls).toHaveLength(1)
+    expect(lastUserText(batchedCalls[0]!)).toBe("A\nB")
+    const messages = yield* held.sessions.messages({ sessionID: held.chat.id })
+    const delivered = messages.filter(
+      (message) => message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === "A\nB"),
+    )
+    expect(delivered).toHaveLength(1)
+    for (const requestID of ["composer-a", "composer-b"]) {
+      const receipt = yield* held.queue.receipt(held.chat.id, requestID)
+      expect(Option.isSome(receipt) ? receipt.value : undefined).toEqual({
+        state: "delivered",
+        messageID: delivered[0]!.info.id,
+      })
+    }
+    expect(yield* held.queue.list(held.chat.id)).toEqual([])
+  }),
+  { timeout: 30000 },
+)
 
 function registerEnvironmentTest(name: string, enabled: boolean, register: () => void) {
   if (enabled) return register()

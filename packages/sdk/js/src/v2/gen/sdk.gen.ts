@@ -90,6 +90,8 @@ import type {
   GlobalUpgradeResponses,
   InstanceDisposeErrors,
   InstanceDisposeResponses,
+  InstancePromptEnhanceErrors,
+  InstancePromptEnhanceResponses,
   LocationRef,
   LspStatusErrors,
   LspStatusResponses,
@@ -1943,6 +1945,53 @@ export class File extends HeyApiClient {
   }
 }
 
+export class Prompt extends HeyApiClient {
+  /**
+   * Enhance prompt draft
+   *
+   * Rewrite a prompt draft with a configured provider model without sending it to a session.
+   */
+  public enhance<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      model?: string
+      draft?: string
+      context?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "model" },
+            { in: "body", key: "draft" },
+            { in: "body", key: "context" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      InstancePromptEnhanceResponses,
+      InstancePromptEnhanceErrors,
+      ThrowOnError
+    >({
+      url: "/prompt/enhance",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
 export class Instance extends HeyApiClient {
   /**
    * Dispose instance
@@ -1972,6 +2021,11 @@ export class Instance extends HeyApiClient {
       ...options,
       ...params,
     })
+  }
+
+  private _prompt?: Prompt
+  get prompt(): Prompt {
+    return (this._prompt ??= new Prompt({ client: this.client }))
   }
 }
 
@@ -4162,6 +4216,7 @@ export class Session2 extends HeyApiClient {
         modelID: string
       }
       agent?: string
+      origin?: "tui-composer"
       noReply?: boolean
       tools?: {
         [key: string]: boolean
@@ -4186,6 +4241,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "messageID" },
             { in: "body", key: "model" },
             { in: "body", key: "agent" },
+            { in: "body", key: "origin" },
             { in: "body", key: "noReply" },
             { in: "body", key: "tools" },
             { in: "body", key: "format" },
@@ -4519,6 +4575,7 @@ export class Session2 extends HeyApiClient {
         modelID: string
       }
       agent?: string
+      origin?: "tui-composer"
       noReply?: boolean
       tools?: {
         [key: string]: boolean
@@ -4543,6 +4600,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "messageID" },
             { in: "body", key: "model" },
             { in: "body", key: "agent" },
+            { in: "body", key: "origin" },
             { in: "body", key: "noReply" },
             { in: "body", key: "tools" },
             { in: "body", key: "format" },

@@ -45,6 +45,7 @@ import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
 import type { AssistantMessage, FilePart, SessionPromptQueueReceipt, UserMessage } from "@opencode-ai/sdk/v2"
 import { Locale } from "../../util/locale"
 import { errorMessage } from "../../util/error"
+import { promptEnhancementContext } from "../../util/transcript"
 import { isRecord } from "../../util/record"
 import { formatDuration } from "../../util/format"
 import { createColors, createFrames } from "../../ui/spinner"
@@ -309,6 +310,7 @@ export function Prompt(props: PromptProps) {
     extmarkToPartIndex: new Map(),
     interrupt: 0,
   })
+  const [enhancing, setEnhancing] = createSignal(false)
 
   createEffect(
     on(
@@ -396,6 +398,13 @@ export function Prompt(props: PromptProps) {
 
           dialog.clear()
         },
+      },
+      {
+        title: "Enhance prompt",
+        name: "prompt.enhance",
+        category: "Prompt",
+        enabled: !!store.prompt.input && !enhancing(),
+        run: () => void enhancePrompt(),
       },
       {
         title: "Remove editor context",
@@ -617,6 +626,13 @@ export function Prompt(props: PromptProps) {
       "workspace.set",
       "session.move",
     ]),
+  }))
+
+  useBindings(() => ({
+    mode: OPENCODE_BASE_MODE,
+    enabled: () => !!input && !input.isDestroyed && input.focused && store.mode === "normal",
+    priority: 2,
+    bindings: tuiConfig.keybinds.get("prompt.enhance"),
   }))
 
   const ref: PromptRef = {
@@ -1288,6 +1304,8 @@ export function Prompt(props: PromptProps) {
             requestID,
             ...selectedModel,
             agent: agent.name,
+            delivery: status().type === "idle" ? "steer" : "queue",
+            origin: "tui-composer",
             model: selectedModel,
             variant,
             parts: [
@@ -1483,6 +1501,71 @@ export function Prompt(props: PromptProps) {
       parts: [],
     })
     setStore("extmarkToPartIndex", new Map())
+  }
+
+  async function enhancePrompt() {
+    if (!input || input.isDestroyed || store.mode !== "normal" || enhancing()) return
+    const draft = input.plainText
+    if (!draft.trim()) return
+    setStore("prompt", "input", draft)
+    const placeholders = store.prompt.parts.flatMap((part) => {
+      if (part.type === "file" && part.source?.text) return [part.source.text.value]
+      if (part.type === "agent" && part.source) return [part.source.value]
+      if (part.type === "text" && part.source?.text) return [part.source.text.value]
+      return []
+    })
+    setEnhancing(true)
+    try {
+      const context = props.sessionID
+        ? promptEnhancementContext(
+            (sync.data.message[props.sessionID] ?? []).map((message) => ({
+              info: message,
+              parts: sync.data.part[message.id] ?? [],
+            })),
+          )
+        : ""
+      const response = await sdk.client.instance.prompt.enhance(
+        {
+          model: tuiConfig.prompt_enhance_model,
+          draft,
+          context,
+        },
+        { throwOnError: true },
+      )
+      const enhanced = response.data.trim()
+      if (!enhanced) throw new Error("The enhancement model returned an empty draft.")
+      if (placeholders.some((placeholder) => !enhanced.includes(placeholder)))
+        throw new Error("The enhancement omitted an attachment or reference placeholder.")
+      const parts = store.prompt.parts.map((part) => {
+        const value =
+          part.type === "file"
+            ? part.source?.text?.value
+            : part.type === "agent"
+              ? part.source?.value
+              : part.type === "text"
+                ? part.source?.text?.value
+                : undefined
+        if (!value) return part
+        const start = enhanced.indexOf(value)
+        if (start === -1) return part
+        const end = start + value.length
+        if (part.type === "file" && part.source?.text)
+          return { ...part, source: { ...part.source, text: { ...part.source.text, start, end } } }
+        if (part.type === "agent" && part.source) return { ...part, source: { ...part.source, start, end } }
+        if (part.type === "text" && part.source?.text)
+          return { ...part, source: { ...part.source, text: { ...part.source.text, start, end } } }
+        return part
+      })
+      input.setText(enhanced)
+      setStore("prompt", { input: enhanced, parts })
+      restoreExtmarksFromParts(parts)
+      input.gotoBufferEnd()
+      toast.show({ message: "Prompt enhanced", variant: "success" })
+    } catch (error) {
+      toast.show({ title: "Failed to enhance prompt", message: errorMessage(error), variant: "error" })
+    } finally {
+      setEnhancing(false)
+    }
   }
 
   const highlight = createMemo(() => {

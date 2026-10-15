@@ -3023,7 +3023,7 @@ function originalWitness(original: SessionPromptQueue.Group["constituents"][numb
       [pending ? "sessionQueuePendingOriginal" : "sessionQueue"]: Schema.encodeSync(SessionPromptQueue.Group)({
         version: 1,
         sessionID: original.sessionID,
-        kind: dispatch(original.input)?.kind === "peer" ? "peer" : "individual",
+        kind: groupKind(original.input, original.delivery),
         constituents: [original],
       }),
     },
@@ -3050,6 +3050,7 @@ function originalWitnesses(
 }
 
 function dispatch(input: SessionPromptQueue.QueuedInput, delivery?: Delivery) {
+  if (input.origin === "tui-composer") return
   input = { ...input, parts: input.parts.filter((part) => !pendingOriginal(part)) }
   if (!input.parts.length || input.parts.some((part) => part.type === "text" && (part.synthetic || part.ignored)))
     return
@@ -3066,12 +3067,20 @@ function dispatch(input: SessionPromptQueue.QueuedInput, delivery?: Delivery) {
 function selection(rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[]) {
   const classified = rows.map((row) => {
     const decoded = Schema.decodeUnknownOption(SessionPromptQueue.QueuedInput)(row.input)
-    return { row, kind: Option.isSome(decoded) ? dispatch(decoded.value, row.delivery) : undefined }
+    return {
+      row,
+      kind: Option.isSome(decoded) ? dispatch(decoded.value, row.delivery) : undefined,
+      origin: Option.isSome(decoded) ? decoded.value.origin : undefined,
+    }
   })
   // Native/unknown work remains individual and keeps human authority. Peers precede every automation type.
   const first =
     classified.find((item) => !item.kind) ?? classified.find((item) => item.kind?.kind === "peer") ?? classified[0]
   if (first.row.message_id) return rows.filter((row) => row.message_id === first.row.message_id)
+  if (first.origin === "tui-composer" && first.row.delivery === "queue")
+    return classified
+      .filter((item) => item.origin === "tui-composer" && item.row.delivery === "queue" && !item.row.message_id)
+      .map((item) => item.row)
   if (!first.kind) return [first.row]
   if (first.kind.kind === "peer")
     return classified
@@ -3097,10 +3106,16 @@ function grouped(
 ) {
   const items = rows.flatMap(originalsOf)
   const kind = dispatch(items[0].input)
+  const humanBatch =
+    rows.length > 1 &&
+    rows.every((row) => {
+      const input = Schema.decodeUnknownOption(SessionPromptQueue.QueuedInput)(row.input)
+      return row.delivery === "queue" && Option.isSome(input) && input.value.origin === "tui-composer"
+    })
   const group: SessionPromptQueue.Group = {
     version: 1,
     sessionID: items[0].sessionID,
-    kind: !kind ? "individual" : kind.kind === "peer" ? "peer" : kind.type,
+    kind: humanBatch ? "human" : groupKind(items[0].input, items[0].delivery),
     constituents: items,
   }
   const witnesses = rows.some((row) => decodeInput(row.input).parts.some(pendingOriginal))
@@ -3112,7 +3127,13 @@ function grouped(
       )
     : items.flatMap((item) => {
         const recorded = aliases.filter((alias) => alias.item_id === item.id).map((alias) => PartID.make(alias.id))
-        return (recorded.length ? recorded : constituentIDs(item.sessionID, item.input)).map((id) => ({
+        const identities = recorded.length ? recorded : constituentIDs(item.sessionID, item.input)
+        const witnessIDs = identities.length
+          ? identities
+          : item.input.origin === "tui-composer"
+            ? [PartID.ascending()]
+            : []
+        return witnessIDs.map((id) => ({
           type: "text" as const,
           id,
           text: "",
@@ -3122,6 +3143,35 @@ function grouped(
         }))
       })
   if (!kind) {
+    if (humanBatch) {
+      const parts = items
+        .flatMap((item, index) => [
+          ...(index ? [{ type: "text" as const, text: "\n" }] : []),
+          ...item.input.parts.filter((part) => !pendingOriginal(part)),
+        ])
+        .reduce((result, part) => {
+          const previous = result.at(-1)
+          if (part.type === "text" && previous?.type === "text") {
+            result[result.length - 1] = { ...previous, text: previous.text + part.text }
+            return result
+          }
+          result.push(part)
+          return result
+        }, [] as SessionPromptQueue.QueuedInput["parts"][number][])
+      const firstText = parts.findIndex((part) => part.type === "text" && !part.synthetic && !part.ignored)
+      if (firstText !== -1) {
+        const part = parts[firstText]
+        if (part?.type === "text")
+          parts[firstText] = {
+            ...part,
+            metadata: {
+              ...part.metadata,
+              sessionQueue: Schema.encodeSync(SessionPromptQueue.Group)(group),
+            },
+          }
+      }
+      return { ...items[0].input, model: undefined, variant: undefined, group, parts: [...parts, ...witnesses] }
+    }
     const visible = decodeInput(rows[0].input)
     return { ...visible, parts: [...visible.parts.filter((part) => !pendingOriginal(part)), ...witnesses] }
   }
@@ -3172,6 +3222,11 @@ function grouped(
       ...witnesses,
     ],
   }
+}
+
+function groupKind(input: SessionPromptQueue.QueuedInput, delivery?: Delivery) {
+  const machine = dispatch(input, delivery)
+  return !machine ? "individual" : machine.kind === "peer" ? "peer" : machine.type
 }
 
 function toReceipt(row: typeof SessionPromptReceiptTable.$inferSelect): Receipt {

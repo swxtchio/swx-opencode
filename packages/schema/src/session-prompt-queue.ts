@@ -44,6 +44,9 @@ export const Input = Schema.Struct({
     }),
   ),
   agent: Schema.optional(Schema.String),
+  origin: Schema.optional(Schema.Literal("tui-composer")).annotate({
+    description: "The interactive TUI composer supplied this prompt.",
+  }),
   noReply: Schema.optional(Schema.Boolean),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)).annotate({
     description:

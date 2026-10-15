@@ -756,6 +756,7 @@ export type SessionPromptQueueInput = {
     modelID: string
   }
   agent?: string
+  origin?: "tui-composer"
   tools?: {
     [key: string]: boolean
   }
@@ -8340,6 +8341,42 @@ export type PathGetResponses = {
 
 export type PathGetResponse = PathGetResponses[keyof PathGetResponses]
 
+export type InstancePromptEnhanceData = {
+  body?: {
+    model: string
+    draft: string
+    context: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/prompt/enhance"
+}
+
+export type InstancePromptEnhanceErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * InternalServerError
+   */
+  500: EffectHttpApiErrorInternalServerError
+}
+
+export type InstancePromptEnhanceError = InstancePromptEnhanceErrors[keyof InstancePromptEnhanceErrors]
+
+export type InstancePromptEnhanceResponses = {
+  /**
+   * Enhanced prompt draft
+   */
+  200: string
+}
+
+export type InstancePromptEnhanceResponse = InstancePromptEnhanceResponses[keyof InstancePromptEnhanceResponses]
+
 export type VcsGetData = {
   body?: never
   path?: never
@@ -10008,6 +10045,7 @@ export type SessionPromptData = {
       modelID: string
     }
     agent?: string
+    origin?: "tui-composer"
     noReply?: boolean
     tools?: {
       [key: string]: boolean
@@ -10361,6 +10399,7 @@ export type SessionPromptAsyncData = {
       modelID: string
     }
     agent?: string
+    origin?: "tui-composer"
     noReply?: boolean
     tools?: {
       [key: string]: boolean

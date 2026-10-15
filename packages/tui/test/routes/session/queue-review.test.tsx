@@ -2,8 +2,9 @@
 import { expect, test } from "bun:test"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { createTestRenderer } from "@opentui/core/testing"
-import type { GlobalEvent, Provider, Session, SessionPromptQueueItem } from "@opencode-ai/sdk/v2"
-import { Effect } from "effect"
+import type { GlobalEvent, Provider, Session, SessionPromptQueueItem, SessionStatus } from "@opencode-ai/sdk/v2"
+import { Effect, Schema } from "effect"
+import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Global } from "@opencode-ai/core/global"
 import path from "node:path"
@@ -61,7 +62,41 @@ const items: SessionPromptQueueItem[] = [
 
 // A send the scripted server has not answered yet: the prompt request runs
 // until the turn that answers it ends.
-type HeldPrompt = { requestID?: string; parts: { type: string; text?: string }[]; answer: (response: Response) => void }
+type HeldPrompt = {
+  requestID?: string
+  delivery?: "steer" | "queue"
+  origin?: "tui-composer"
+  parts: { type: string; text?: string }[]
+  answer: (response: Response) => void
+}
+type EnhancementRequest = { model: string; draft: string; context: string }
+
+function queueGroup(input: {
+  itemID: string
+  message: string
+  origin?: "tui-composer"
+  kind?: string
+  constituents?: { itemID: string; message: string; origin?: "tui-composer" }[]
+}) {
+  return Schema.encodeSync(SessionPromptQueue.Group)(
+    Schema.decodeUnknownSync(SessionPromptQueue.Group)({
+      version: 1,
+      sessionID,
+      kind: input.kind ?? "individual",
+      constituents: (input.constituents ?? [input]).map((item, index) => ({
+          id: item.itemID,
+          sessionID,
+          seq: index + 1,
+          delivery: "queue",
+          input: {
+            ...(item.origin ? { origin: item.origin } : {}),
+            parts: [{ type: "text", text: item.message }],
+          },
+          time: { created: 1 },
+        })),
+    }),
+  )
+}
 
 // The scripted server keeps real custody of its queue: a withdrawal takes an
 // item out and a restore puts it back, each publishing the list. A test's
@@ -71,12 +106,16 @@ type Apply = () => Response
 async function startSession(
   options: {
     queue?: SessionPromptQueueItem[]
+    messages?: unknown[]
+    status?: SessionStatus
+    tuiConfig?: ReturnType<typeof createTuiResolvedConfig>
+    enhance?: (payload: EnhancementRequest) => Response | Promise<Response>
     withdraw?: (itemID: string, apply: Apply) => Response | Promise<Response>
     restore?: (itemID: string, apply: Apply) => Response | Promise<Response>
     list?: (apply: Apply) => Response | Promise<Response>
   } = {},
 ) {
-  const setup = await createTestRenderer({ width: 160, height: 45, useThread: false })
+  const setup = await createTestRenderer({ width: 160, height: 45, useThread: false, kittyKeyboard: true })
   // Sent prompts are appended to the prompt history under state; keep it out
   // of the user's own and of the next test's.
   const state = await tmpdir()
@@ -88,7 +127,9 @@ async function startSession(
     merged: {} as Record<string, string>,
   }
   const requests: string[] = []
+  const paths: string[] = []
   const selections: unknown[] = []
+  const enhancements: EnhancementRequest[] = []
   const prompts: HeldPrompt[] = []
   const restored: unknown[] = []
   // The server publishes every change to the pending list.
@@ -126,6 +167,7 @@ async function startSession(
   const calls = createFetch((url) => {
     if (url.pathname === "/config/providers") return json({ providers: [provider], default: { test: "model" } })
     if (url.pathname === "/agent") return json([{ name: "build", mode: "primary", permission: [], options: {} }])
+    if (url.pathname === "/session/status" && options.status) return json({ [sessionID]: options.status })
     if (url.pathname === `/session/${sessionID}`)
       return json({
         id: sessionID,
@@ -138,18 +180,24 @@ async function startSession(
       } as Session)
     if (url.pathname === `/session/${sessionID}/queue/release`) return new Response(null, { status: 204 })
     if (url.pathname.startsWith(`/session/${sessionID}/queue`)) return json(queue.items)
-    if (url.pathname === `/session/${sessionID}/message`) return json([transcript])
+    if (url.pathname === `/session/${sessionID}/message`) return json(options.messages ?? [transcript])
     if ([`/session/${sessionID}/todo`, `/session/${sessionID}/diff`].includes(url.pathname)) return json([])
     return undefined
   }, events)
   const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const request = input instanceof Request ? input : new Request(input, init)
     const path = new URL(request.url).pathname
+    paths.push(path)
     if (path.startsWith(`/session/${sessionID}/queue/`)) requests.push(path.split("/").pop()!)
     if (path === `/session/${sessionID}` && request.method === "PATCH") selections.push(await request.clone().json())
     if (path === `/session/${sessionID}/message` && request.method === "POST") {
       const body = await request.clone().json()
       return new Promise<Response>((answer) => prompts.push({ ...body, answer }))
+    }
+    if (path === "/prompt/enhance" && request.method === "POST") {
+      const body = (await request.clone().json()) as EnhancementRequest
+      enhancements.push(body)
+      return options.enhance ? options.enhance(body) : json("rewritten draft")
     }
     if (path === `/session/${sessionID}/queue/restore`) {
       const body = (await request.clone().json()) as { id: string }
@@ -174,7 +222,7 @@ async function startSession(
         url: "http://test",
         directory,
         createRenderer: async () => setup.renderer,
-        config: createTuiResolvedConfig({ plugin_enabled: {} }),
+        config: options.tuiConfig ?? createTuiResolvedConfig({ plugin_enabled: {} }),
         fetch,
         events: events.source,
         args: { sessionID },
@@ -197,7 +245,11 @@ async function startSession(
   return {
     renderer: setup,
     requests,
+    paths,
     selections,
+    enhancements,
+    commands: () =>
+      api?.keymap.getCommandEntries({ namespace: "palette", visibility: "reachable" }).map((entry) => entry.command.name) ?? [],
     prompts,
     restored,
     publish,
@@ -294,9 +346,51 @@ test("each prompt the user sends names its own request", async () => {
     const [first, second] = app.prompts.map((prompt) => prompt.requestID)
     expect(first).toMatch(/^[A-Za-z0-9._:-]{1,128}$/)
     expect(second).toMatch(/^[A-Za-z0-9._:-]{1,128}$/)
+    expect(app.prompts.map((prompt) => [prompt.origin, prompt.delivery])).toEqual([
+      ["tui-composer", "steer"],
+      ["tui-composer", "steer"],
+    ])
     // The same words sent twice are two requests, not a retry of one.
     expect(second).not.toBe(first)
   } finally {
+    await app.stop()
+  }
+})
+
+test("busy composer submits mark queued prompts as TUI-authored", async () => {
+  const app = await startSession({ queue: [], status: { type: "busy" } })
+  try {
+    await until(async () => (await screen(app)).some((line) => line.includes("already in the transcript")), "session")
+    for (const [index, text] of ["A", "B"].entries()) {
+      if (index === 0) await app.renderer.mockInput.typeText(text)
+      else await app.renderer.mockInput.pasteBracketedText("B\ncontinued B")
+      app.renderer.mockInput.pressEnter()
+      await until(() => app.prompts.length === index + 1, `prompt ${index + 1}`)
+    }
+    expect(app.prompts.map((prompt) => [prompt.parts.at(-1)?.text, prompt.origin, prompt.delivery])).toEqual([
+      ["A", "tui-composer", "queue"],
+      ["B\ncontinued B", "tui-composer", "queue"],
+    ])
+    const items = app.prompts.map((prompt, index) => {
+      const text = prompt.parts.at(-1)?.text ?? ""
+      return pendingItem(`que_composer_${index}`, text, {
+        requestID: prompt.requestID,
+        seq: index + 1,
+        delivery: prompt.delivery ?? "steer",
+        input: { origin: prompt.origin, parts: [{ type: "text", text }] },
+      })
+    })
+    app.publish(items)
+    await until(async () => (await screen(app)).some((line) => line.includes("2 pending")), "the two queue rows")
+    app.renderer.mockInput.pressKey("x", { ctrl: true })
+    app.renderer.mockInput.pressKey("q")
+    await until(async () => (await screen(app)).some((line) => line.includes("Queued prompts")), "queue review")
+    const review = (await screen(app)).join("\n")
+    expect(review).toContain("A")
+    expect(review).toContain("B")
+    expect(review).toContain("continued B")
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
     await app.stop()
   }
 })
@@ -307,6 +401,193 @@ async function screen(app: Awaited<ReturnType<typeof startSession>>) {
   await app.renderer.renderOnce()
   return app.renderer.captureCharFrame().split("\n")
 }
+
+test("timeline dialog only offers TUI-authored prompts and filters injections", async () => {
+  const critical = "[fm-level:critical]\x1f injected-critical-token"
+  const peer = "[fm-from-peer]\x1f saas\x1f /scratch/saas\x1f p1791809000-1-abcd\x1f injected-peer-token"
+  const typedID = "msg_typed"
+  const messages = [
+    {
+      ...transcript,
+      info: { ...transcript.info, id: typedID, time: { created: 2 } },
+      parts: [
+        {
+          ...transcript.parts[0],
+          id: "prt_typed",
+          messageID: typedID,
+          text: "typed-history-token",
+          metadata: { sessionQueue: queueGroup({ itemID: "que_typed", message: "typed-history-token", origin: "tui-composer" }) },
+        },
+      ],
+    },
+    {
+      ...transcript,
+      info: { ...transcript.info, id: "msg_critical", time: { created: 3 } },
+      parts: [
+        {
+          ...transcript.parts[0],
+          id: "prt_critical",
+          messageID: "msg_critical",
+          text: critical,
+          metadata: { sessionQueue: queueGroup({ itemID: "que_critical", message: critical }) },
+        },
+      ],
+    },
+    {
+      ...transcript,
+      info: { ...transcript.info, id: "msg_peer", time: { created: 4 } },
+      parts: [
+        {
+          ...transcript.parts[0],
+          id: "prt_peer",
+          messageID: "msg_peer",
+          text: peer,
+          metadata: {
+            sessionQueue: queueGroup({
+              itemID: "que_peer_1",
+              message: peer,
+              kind: "peer",
+              constituents: [
+                { itemID: "que_peer_1", message: peer },
+                { itemID: "que_peer_2", message: "another injected peer" },
+              ],
+            }),
+          },
+        },
+      ],
+    },
+  ]
+  const app = await startSession({ queue: [], messages })
+  try {
+    await until(async () => (await screen(app)).some((line) => line.includes("typed-history-token")), "typed transcript")
+    app.renderer.mockInput.pressKey("r", { ctrl: true })
+    await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the timeline dialog")
+    const options = (await screen(app)).join("\n")
+    expect(options).toContain("typed-history-token")
+    expect(options).not.toContain("injected-critical-token")
+    expect(options).not.toContain("injected-peer-token")
+
+    await Bun.sleep(10)
+    await app.renderer.mockInput.typeText("injected-critical-token")
+    await until(async () => (await screen(app)).some((line) => line.includes("No results found")), "no injection match")
+    app.renderer.mockInput.pressEnter()
+    expect((await screen(app)).some((line) => line.includes("Message Actions"))).toBe(false)
+    app.renderer.mockInput.pressEscape()
+    app.renderer.mockInput.pressKey("r", { ctrl: true })
+    await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the reopened timeline")
+    await Bun.sleep(10)
+    await app.renderer.mockInput.typeText("typed-history-token")
+    app.renderer.mockInput.pressEnter()
+    await until(async () => (await screen(app)).some((line) => line.includes("Message Actions")), "the message actions")
+  } finally {
+    await app.stop()
+  }
+})
+
+test("session rename remains available from its command menu", async () => {
+  const app = await startSession()
+  try {
+    await until(async () => (await screen(app)).some((line) => line.includes("already in the transcript")), "session")
+    app.dispatch("command.palette.show")
+    await until(async () => (await screen(app)).some((line) => line.includes("Commands")), "the command menu")
+    await until(() => app.commands().includes("session.rename"), "rename command in the palette")
+    app.dispatch("session.rename")
+    await until(async () => (await screen(app)).some((line) => line.includes("Rename Session")), "rename dialog")
+  } finally {
+    await app.stop()
+  }
+})
+
+test("ctrl+e rewrites the draft from visible context without sending until a later submit", async () => {
+  const lines = Array.from({ length: 110 }, (_, index) => `visible-${String(index + 1).padStart(3, "0")}`)
+  const messageID = "msg_context"
+  const messages = [
+    {
+      ...transcript,
+      info: { ...transcript.info, id: messageID, time: { created: 2 } },
+      parts: [
+        {
+          ...transcript.parts[0],
+          id: "prt_context",
+          messageID,
+          text: lines.join("\n"),
+        },
+        {
+          id: "prt_context_synthetic",
+          sessionID,
+          messageID,
+          type: "text",
+          text: "hidden synthetic context",
+          synthetic: true,
+        },
+        {
+          id: "prt_context_ignored",
+          sessionID,
+          messageID,
+          type: "text",
+          text: "hidden ignored context",
+          ignored: true,
+        },
+      ],
+    },
+  ]
+  const app = await startSession({
+    queue: [],
+    messages,
+    tuiConfig: createTuiResolvedConfig({ plugin_enabled: {}, prompt_enhance_model: "test/rewrite-model" }),
+    enhance: () => json("clean rewritten draft"),
+  })
+  try {
+    await until(async () => (await screen(app)).some((line) => line.includes("visible-110")), "visible context")
+    await app.renderer.mockInput.typeText("rough draft")
+    await until(async () => (await screen(app)).some((line) => line.includes("rough draft")), "the current draft")
+    await until(() => app.commands().includes("prompt.enhance"), "the enabled enhance command")
+    app.renderer.mockInput.pressKey("e", { ctrl: true })
+    await until(() => app.paths.some((path) => path.endsWith("/prompt/enhance")), "the rewrite request")
+    expect(app.enhancements).toHaveLength(1)
+
+    expect(app.enhancements[0]).toMatchObject({ model: "test/rewrite-model", draft: "rough draft" })
+    expect(app.enhancements[0]!.context.split("\n")).toHaveLength(100)
+    expect(app.enhancements[0]!.context).toContain("visible-110")
+    expect(app.enhancements[0]!.context).not.toContain("visible-001")
+    expect(app.enhancements[0]!.context).not.toContain("hidden synthetic context")
+    expect(app.enhancements[0]!.context).not.toContain("hidden ignored context")
+    expect(app.prompts).toHaveLength(0)
+    await until(async () => {
+      const frame = (await screen(app)).join("\n")
+      return frame.includes("clean rewritten draft") && frame.includes("Prompt enhanced")
+    }, "the revised composer draft and confirmation")
+
+    await app.renderer.mockInput.typeText(" edited")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the later submit")
+    expect(app.prompts[0]!.parts.at(-1)?.text).toBe("clean rewritten draft edited")
+    app.prompts[0]!.answer(json(transcript))
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
+  }
+})
+
+test("failed prompt enhancement leaves the composer draft untouched and shows an error", async () => {
+  const app = await startSession({
+    queue: [],
+    enhance: () => json({ name: "InternalServerError", message: "provider unavailable" }, { status: 500 }),
+  })
+  try {
+    await until(async () => (await screen(app)).some((line) => line.includes("already in the transcript")), "session")
+    await app.renderer.mockInput.typeText("keep this draft")
+    app.renderer.mockInput.pressKey("e", { ctrl: true })
+    await until(() => app.paths.some((path) => path.endsWith("/prompt/enhance")), "the failed rewrite request")
+    expect(app.enhancements).toHaveLength(1)
+    await until(async () => (await screen(app)).some((line) => line.includes("Failed to enhance prompt")), "the error toast")
+    const frame = (await screen(app)).join("\n")
+    expect(frame).toContain("keep this draft")
+    expect(app.prompts).toHaveLength(0)
+  } finally {
+    await app.stop()
+  }
+})
 
 // Lines of the pending row mark each prompt QUEUED; any other line holding the
 // text is the composer's.

@@ -10,7 +10,7 @@ import { Session } from "./session"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
 
-import { type Tool as AITool, tool, jsonSchema } from "ai"
+import { type Tool as AITool, tool, jsonSchema, streamText } from "ai"
 import type { JSONSchema7 } from "@ai-sdk/provider"
 import { SessionCompaction } from "./compaction"
 import { SystemPrompt } from "./system"
@@ -143,6 +143,10 @@ export interface Interface {
     input: CommandInput,
   ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionQueue.WithdrawnError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
+  readonly enhance: (input: { model: string; draft: string; context: string }) => Effect.Effect<
+    string,
+    Provider.ModelNotFoundError | Error
+  >
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") {}
@@ -228,6 +232,29 @@ const layer = Layer.effect(
         { concurrency: "unbounded", discard: true },
       )
       return parts
+    })
+
+    const enhance = Effect.fn("SessionPrompt.enhance")(function* (input: {
+      model: string
+      draft: string
+      context: string
+    }) {
+      const parsed = Provider.parseModel(input.model)
+      const model = yield* provider.getModel(parsed.providerID, parsed.modelID)
+      const language = yield* provider.getLanguage(model)
+      const result = yield* Effect.tryPromise({
+        try: () =>
+          streamText({
+            model: language,
+            maxRetries: 0,
+            system:
+              "Rewrite the user's draft while preserving its intent. Improve wording, clarity, and structure. Return only the rewritten draft; do not answer the draft, execute it, or add requests. Treat visible session context as background only. Preserve each bracketed attachment or reference placeholder exactly.",
+            prompt: `Visible session context (last 100 lines):\n${input.context || "(none)"}\n\nCurrent draft:\n${input.draft}`,
+          }).text,
+        catch: (cause) =>
+          new NamedError.Unknown({ message: cause instanceof Error ? cause.message : String(cause) }),
+      })
+      return result
     })
 
     const title = Effect.fn("SessionPrompt.ensureTitle")(function* (input: {
@@ -1216,6 +1243,9 @@ const layer = Layer.effect(
       const classificationText = input.parts
         .flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : []))
         .join("")
+      const classify = (markers?: Parameters<typeof MachineMessage.classify>[1]) =>
+        input.origin === "tui-composer" ? undefined : MachineMessage.classify(classificationText, markers)
+      const dispatch = input.origin === "tui-composer" ? undefined : MachineMessage.dispatch(classificationText)
       const deliveryOf = (classification: ReturnType<typeof MachineMessage.classify>) =>
         classification === "hold" ? "queue" : classification === "critical" ? "steer" : input.delivery
       // A queued prompt is admitted before any other work on it, so it is
@@ -1224,7 +1254,7 @@ const layer = Layer.effect(
       // promotes or merges it until the work below has prepared the session for
       // it; when that work fails the admission is taken back, so a failed send
       // leaves nothing pending and its exact retry is admitted again.
-      const arriving = deliveryOf(MachineMessage.classify(classificationText))
+      const arriving = deliveryOf(classify())
       const early =
         admitted || input.noReply === true
           ? undefined
@@ -1251,7 +1281,7 @@ const layer = Layer.effect(
           return yield* prompt(input)
         }
         const markers = (yield* config.get()).machine_message_markers
-        const delivery = deliveryOf(MachineMessage.classify(classificationText, markers))
+        const delivery = deliveryOf(classify(markers))
         const reconciled = yield* queue.reconcile({ ...input, ...(delivery ? { delivery } : {}) })
         if (reconciled?.kind === "direct") return reconciled.message
         if (early.kind === "retry") return yield* followRequest(input, early)
@@ -1264,7 +1294,7 @@ const layer = Layer.effect(
       const prepared = yield* Effect.gen(function* () {
         const markers = (yield* config.get()).machine_message_markers
         known.markers = markers
-        const classification = MachineMessage.classify(classificationText, markers)
+        const classification = classify(markers)
         const delivery = deliveryOf(classification)
         // A request the session already has is followed, never admitted or applied again (#212).
         if (!own && input.requestID && Option.isSome(yield* queue.receipt(input.sessionID, input.requestID)))
@@ -1286,7 +1316,7 @@ const layer = Layer.effect(
         // delivered (swxtchio/swx-opencode#212).
         if (
           (input.model || input.variant) &&
-          (classification === "critical" || !MachineMessage.dispatch(classificationText))
+          (classification === "critical" || !dispatch)
         ) {
           const model = input.model ?? (yield* currentModel(input.sessionID))
           yield* sessions.setModel({
@@ -2139,6 +2169,7 @@ const layer = Layer.effect(
       shell,
       command,
       resolvePromptParts,
+      enhance,
     })
   }),
 )

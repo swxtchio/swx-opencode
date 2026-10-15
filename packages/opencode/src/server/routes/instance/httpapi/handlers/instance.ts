@@ -6,10 +6,11 @@ import { Global } from "@opencode-ai/core/global"
 import { LSP } from "@/lsp/lsp"
 import { Vcs } from "@/project/vcs"
 import { Skill } from "@/skill"
+import { SessionPrompt } from "@/session/prompt"
 import { Effect } from "effect"
-import { HttpApiBuilder } from "effect/unstable/httpapi"
+import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { ApiVcsApplyError } from "../groups/instance"
+import { ApiVcsApplyError, PromptEnhancePayload } from "../groups/instance"
 import { markInstanceForDisposal } from "../lifecycle"
 
 export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance", (handlers) =>
@@ -20,6 +21,7 @@ export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance"
     const lsp = yield* LSP.Service
     const skill = yield* Skill.Service
     const vcs = yield* Vcs.Service
+    const prompt = yield* SessionPrompt.Service
 
     const dispose = Effect.fn("InstanceHttpApi.dispose")(function* () {
       yield* markInstanceForDisposal(yield* InstanceState.context)
@@ -35,6 +37,14 @@ export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance"
         worktree: ctx.worktree,
         directory: ctx.directory,
       }
+    })
+
+    const promptEnhance = Effect.fn("InstanceHttpApi.promptEnhance")(function* (ctx: {
+      payload: typeof PromptEnhancePayload.Type
+    }) {
+      return yield* prompt
+        .enhance(ctx.payload)
+        .pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
     })
 
     const getVcs = Effect.fn("InstanceHttpApi.vcs")(function* () {
@@ -96,6 +106,7 @@ export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance"
     return handlers
       .handle("dispose", dispose)
       .handle("path", getPath)
+      .handle("promptEnhance", promptEnhance)
       .handle("vcs", getVcs)
       .handle("vcsStatus", getVcsStatus)
       .handle("vcsDiff", getVcsDiff)
