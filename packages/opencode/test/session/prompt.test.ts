@@ -4,10 +4,10 @@ import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
-import { EventRetentionTable } from "@opencode-ai/core/event/sql"
+import { EventRetentionTable, EventTable } from "@opencode-ai/core/event/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Global } from "@opencode-ai/core/global"
-import { eq } from "drizzle-orm"
+import { and, asc, eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { afterAll, expect, test } from "bun:test"
 import { Database as Sqlite } from "bun:sqlite"
@@ -81,6 +81,7 @@ import { Snapshot } from "../../src/snapshot"
 import { ToolRegistry } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { ChildProcessSpawner } from "effect/unstable/process"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { provideInstanceEffect, TestInstance, tmpdirScoped } from "../fixture/fixture"
@@ -385,6 +386,35 @@ const promptSdk = makeGlobalNode({
 const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })
 const processorCreateDie = processorWithCreate(() => Effect.die(new Error("processor creation defect")))
 
+const userShellChunks: { text: string; time: number }[] = []
+const userShellRunning: Effect.Effect<boolean, unknown>[] = []
+const crossSpawnImplementation = CrossSpawnSpawner.node.implementation
+if (!crossSpawnImplementation) throw new Error("CrossSpawnSpawner node has no implementation")
+const userShellSpawner = makeGlobalNode({
+  service: ChildProcessSpawner.ChildProcessSpawner,
+  layer: Layer.effect(
+    ChildProcessSpawner.ChildProcessSpawner,
+    Effect.gen(function* () {
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+      return ChildProcessSpawner.make((command) =>
+        Effect.gen(function* () {
+          const handle = yield* spawner.spawn(command)
+          userShellRunning.push(handle.isRunning)
+          return ChildProcessSpawner.makeHandle({
+            ...handle,
+            all: handle.all.pipe(
+              Stream.tap((bytes) =>
+                Effect.sync(() => userShellChunks.push({ text: Buffer.from(bytes).toString("utf-8"), time: Date.now() })),
+              ),
+            ),
+          })
+        }),
+      )
+    }),
+  ).pipe(Layer.provide([crossSpawnImplementation])),
+  deps: [CrossSpawnSpawner.node.dependencies[0], CrossSpawnSpawner.node.dependencies[1]],
+}) as typeof CrossSpawnSpawner.node
+
 const promptRoot = LayerNode.group([
   Npm.node,
   SessionPrompt.node,
@@ -434,6 +464,8 @@ type PromptTestOptions = {
   compaction?: Layer.Layer<SessionCompaction.Service>
   plugin?: Layer.Layer<Plugin.Service>
   llm?: Layer.Layer<LLM.Service>
+  spawner?: typeof CrossSpawnSpawner.node
+  eventBridge?: typeof EventV2Bridge.node
 }
 
 function makePrompt(input?: PromptTestOptions) {
@@ -447,6 +479,8 @@ function makePrompt(input?: PromptTestOptions) {
     ...(input?.compaction ? [[SessionCompaction.node, input.compaction] as const] : []),
     ...(input?.plugin ? [[Plugin.node, input.plugin] as const] : []),
     ...(input?.llm ? [[LLM.node, input.llm] as const] : []),
+    ...(input?.spawner ? [[CrossSpawnSpawner.node, input.spawner] as const] : []),
+    ...(input?.eventBridge ? [[EventV2Bridge.node, input.eventBridge] as const] : []),
   ] as const
   if (input?.processor === "blocking") {
     return LayerNode.compile(promptRoot, [...replacements, [SessionProcessor.node, blockingProcessor]])
@@ -466,6 +500,8 @@ function makeHttp(input?: PromptTestOptions) {
     ...(input?.compaction ? [[SessionCompaction.node, input.compaction] as const] : []),
     ...(input?.plugin ? [[Plugin.node, input.plugin] as const] : []),
     ...(input?.llm ? [[LLM.node, input.llm] as const] : []),
+    ...(input?.spawner ? [[CrossSpawnSpawner.node, input.spawner] as const] : []),
+    ...(input?.eventBridge ? [[EventV2Bridge.node, input.eventBridge] as const] : []),
   ] as const
   if (input?.processor === "blocking") {
     return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
@@ -513,6 +549,9 @@ const gates = {
     | undefined
     | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void>; skip?: number },
   noReplyWrite: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  userShellPartUpdate: undefined as
+    | undefined
+    | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void>; held: boolean },
 }
 
 const gatedSession = LayerNode.make({
@@ -577,6 +616,15 @@ const gatedEventV2Bridge = LayerNode.make({
       const real = yield* EventV2Bridge.Service
       const publish: EventV2.Interface["publish"] = (definition, data, options) =>
         Effect.gen(function* () {
+          const shellGate = gates.userShellPartUpdate
+          if (shellGate && !shellGate.held && definition.type === SessionV1.Event.PartUpdated.type) {
+            const update = data as typeof SessionV1.Event.PartUpdated.data.Type
+            if (update.part.type === "tool" && update.part.state.status === "running" && update.part.state.metadata?.output) {
+              shellGate.held = true
+              yield* Deferred.succeed(shellGate.entered, undefined)
+              yield* Deferred.await(shellGate.release)
+            }
+          }
           if (definition.type === SessionV1.Event.MessageUpdated.type) {
             const update = data as typeof SessionV1.Event.MessageUpdated.data.Type
             const failure = gates.compactionWriteFailure
@@ -762,6 +810,10 @@ const instructionClearFailureTest = promptTests(
   ]),
 )
 const noLLMServer = promptTests(makeHttpNoLLMServer())
+const userShellPrompt = promptTests(makeHttpNoLLMServer({ spawner: userShellSpawner }))
+const userShellOrderingPrompt = promptTests(
+  makeHttpNoLLMServer({ spawner: userShellSpawner, eventBridge: gatedEventV2Bridge }),
+)
 const raceNoLLMServer = promptTests(makeHttpNoLLMServer({ processor: "blocking" }))
 const processorDies = promptTests(
   LayerNode.compile(promptRoot, [
@@ -786,6 +838,9 @@ const withMcpInstructions = promptTests(
 )
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
+const unixUserShell = process.platform !== "win32" ? userShellPrompt.instance : userShellPrompt.instance.skip
+const unixUserShellOrdering =
+  process.platform !== "win32" ? userShellOrderingPrompt.instance : userShellOrderingPrompt.instance.skip
 const nonOwnerCancelDatabasePath = path.join(os.tmpdir(), `opencode-non-owner-cancel-${randomUUID()}.db`)
 const nonOwnerCancel = promptTests(makeHttpWithDatabase(Database.layerFromPath(nonOwnerCancelDatabasePath)))
 const nonOwnerRunState = LayerNode.compile(
@@ -8413,6 +8468,55 @@ noLLMServer.instance("assertNotBusy succeeds when idle", () =>
 
 // Shell semantics
 
+const shellWriteIntervalMs = 500
+const shellPreviewByteLimit = 32 * 1024
+
+function userShellEvents(sessionID: SessionID) {
+  return Effect.gen(function* () {
+    const database = yield* Database.Service
+    const rows = yield* database.db
+      .select({ data: EventTable.data })
+      .from(EventTable)
+      .where(
+        and(
+          eq(EventTable.aggregate_id, sessionID),
+          eq(
+            EventTable.type,
+            EventV2.versionedType(SessionV1.Event.PartUpdated.type, SessionV1.Event.PartUpdated.durable!.version),
+          ),
+        ),
+      )
+      .orderBy(asc(EventTable.seq))
+      .all()
+      .pipe(Effect.orDie)
+    return rows.flatMap((row) => {
+      const data = Schema.decodeUnknownOption(SessionV1.Event.PartUpdated.data)(row.data)
+      if (Option.isNone(data) || data.value.part.type !== "tool") return []
+      return [{ part: data.value.part, time: data.value.time, bytes: Buffer.byteLength(JSON.stringify(row.data), "utf8") }]
+    })
+  })
+}
+
+function userShellOutput(chunks: { text: string; time: number }[]) {
+  return chunks.map((chunk) => chunk.text).join("")
+}
+
+function expectUserShellSettlement(sessionID: SessionID, expected: string) {
+  return Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const part = (yield* userShellEvents(sessionID)).at(-1)?.part
+    expect(part?.state.status).toBe("completed")
+    if (!part || part.state.status !== "completed") return
+    expect(part.state.output).toBe(expected)
+    expect(part.state.metadata.output).toBe(expected)
+    const stored = yield* sessions.getPart({ sessionID, messageID: part.messageID, partID: part.id })
+    expect(stored?.type).toBe("tool")
+    if (stored?.type !== "tool" || stored.state.status !== "completed") return
+    expect(stored.state.output).toBe(expected)
+    expect(stored.state.metadata.output).toBe(expected)
+  })
+}
+
 it.instance("shell rejects with BusyError when loop running", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
@@ -8591,7 +8695,7 @@ unixNoLLMServer(
         const { prompt, chat } = yield* boot()
 
         const fiber = yield* prompt
-          .shell({ sessionID: chat.id, agent: "build", command: "printf first && sleep 0.2 && printf second" })
+          .shell({ sessionID: chat.id, agent: "build", command: "printf first && sleep 1 && printf second" })
           .pipe(Effect.forkChild)
 
         yield* pollWithTimeout(
@@ -8600,12 +8704,384 @@ unixNoLLMServer(
             const taskMsg = msgs.find((item) => item.info.role === "assistant")
             const tool = taskMsg ? toolPart(taskMsg.parts) : undefined
             if (tool?.state.status === "running" && tool.state.metadata?.output.includes("first")) return true
+            return undefined
           }),
           "timed out waiting for running shell metadata",
         )
 
         const exit = yield* Fiber.await(fiber)
         expect(Exit.isSuccess(exit)).toBe(true)
+      }),
+    ),
+  { config: cfg },
+  30_000,
+)
+
+unixUserShell(
+  "shell persists a coalesced quiet tail while running and keeps settlement final",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        userShellChunks.length = 0
+        userShellRunning.length = 0
+        const { prompt, sessions, chat } = yield* boot()
+        const command = `${process.execPath} -e 'for(let i=1;i<=8;i++){process.stdout.write("burst-"+i+"\\n");await new Promise(r=>setTimeout(r,20))}await new Promise(r=>setTimeout(r,1500))'`
+        const fiber = yield* prompt.shell({ sessionID: chat.id, agent: "build", command }).pipe(Effect.forkChild)
+        yield* waitForBusy(chat.id)
+        yield* pollWithTimeout(
+          Effect.sync(() => (userShellOutput(userShellChunks).includes("burst-8\n") ? true : undefined)),
+          "user shell did not consume the quiet-tail marker",
+        )
+
+        const expected = Array.from({ length: 8 }, (_, index) => `burst-${index + 1}\n`).join("")
+        const chunks = [...userShellChunks]
+        expect(chunks.length).toBeGreaterThan(1)
+        expect(userShellOutput(chunks)).toBe(expected)
+        const span = chunks.at(-1)!.time - chunks[0].time
+        expect(span).toBeLessThan(shellWriteIntervalMs)
+        expect(chunks.length).toBeGreaterThan(Math.ceil(span / shellWriteIntervalMs) + 1)
+
+        const visible = yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const writes = yield* userShellEvents(chat.id)
+            const write = writes.findLast(
+              (item) => item.part.state.status === "running" && item.part.state.metadata?.output === expected,
+            )
+            return write ? { write, observedAt: Date.now() } : undefined
+          }),
+          "quiet user-shell output did not reach the committed running part",
+          "2 seconds",
+        )
+        expect(visible.write.part.state.status).toBe("running")
+        expect(visible.observedAt - chunks.at(-1)!.time).toBeLessThanOrEqual(shellWriteIntervalMs + 750)
+        const status = yield* SessionStatus.Service
+        expect((yield* status.get(chat.id)).type).toBe("busy")
+
+        const exit = yield* Fiber.await(fiber)
+        expect(Exit.isSuccess(exit)).toBe(true)
+        if (!Exit.isSuccess(exit)) return
+        const part = toolPart(exit.value.parts)
+        expect(part?.state.status).toBe("completed")
+        if (!part || part.state.status !== "completed") return
+        expect(part.state.output).toBe(expected)
+        expect(part.state.metadata.output).toBe(expected)
+
+        const settled = yield* sessions.getPart({ sessionID: chat.id, messageID: part.messageID, partID: part.id })
+        expect(settled?.type).toBe("tool")
+        if (settled?.type !== "tool" || settled.state.status !== "completed") return
+        expect(settled.state.output).toBe(expected)
+        expect(settled.state.metadata.output).toBe(expected)
+
+        const committed = (yield* userShellEvents(chat.id)).filter((item) => item.part.id === part.id)
+        const running = committed.filter(
+          (item) => item.part.state.status === "running" && item.part.state.metadata?.output,
+        )
+        expect(running.length).toBeLessThanOrEqual(Math.ceil(span / shellWriteIntervalMs) + 1)
+        expect(
+          running.some((item) => item.part.state.status === "running" && item.part.state.metadata?.output === expected),
+        ).toBe(true)
+        expect(committed.at(-1)?.part.state.status).toBe("completed")
+        expect(userShellRunning).toHaveLength(1)
+        expect(yield* userShellRunning[0]).toBe(false)
+
+        yield* Effect.sleep(shellWriteIntervalMs + 250)
+        const afterThrottle = (yield* userShellEvents(chat.id)).filter((item) => item.part.id === part.id)
+        expect(afterThrottle).toHaveLength(committed.length)
+        expect(afterThrottle.at(-1)?.part.state.status).toBe("completed")
+        const stored = yield* sessions.getPart({ sessionID: chat.id, messageID: part.messageID, partID: part.id })
+        expect(stored).toMatchObject({ state: { status: "completed", output: expected, metadata: { output: expected } } })
+      }),
+    ),
+  { config: cfg },
+  30_000,
+)
+
+unixUserShell(
+  "shell settles before its pending running snapshot and does not write after settlement",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        userShellChunks.length = 0
+        userShellRunning.length = 0
+        const { prompt, sessions, chat } = yield* boot()
+        const expected = "fast-settlement-tail\n"
+        const result = yield* prompt.shell({
+          sessionID: chat.id,
+          agent: "build",
+          command: "printf 'fast-settlement-tail\\n'; sleep 0.1",
+        })
+        expect(userShellOutput(userShellChunks)).toBe(expected)
+        const part = toolPart(result.parts)
+        expect(part?.state.status).toBe("completed")
+        if (!part || part.state.status !== "completed") return
+        const committed = (yield* userShellEvents(chat.id)).filter((item) => item.part.id === part.id)
+        const snapshots = committed.filter(
+          (item) => item.part.state.status === "running" && item.part.state.metadata?.output,
+        )
+        const settlement = committed.filter((item) => item.part.state.status === "completed")
+        expect(snapshots).toHaveLength(0)
+        expect(settlement).toHaveLength(1)
+        expect(settlement[0].time - userShellChunks.at(-1)!.time).toBeLessThan(shellWriteIntervalMs)
+        const settled = settlement[0]?.part
+        expect(settled?.state.status).toBe("completed")
+        if (settled?.state.status === "completed") expect(settled.state.output).toBe(expected)
+
+        yield* Effect.sleep(shellWriteIntervalMs + 250)
+        const afterThrottle = (yield* userShellEvents(chat.id)).filter((item) => item.part.id === part.id)
+        expect(afterThrottle).toHaveLength(committed.length)
+        expect(afterThrottle.at(-1)?.part.state.status).toBe("completed")
+        const stored = yield* sessions.getPart({ sessionID: chat.id, messageID: part.messageID, partID: part.id })
+        expect(stored).toMatchObject({ state: { status: "completed", output: expected, metadata: { output: expected } } })
+      }),
+    ),
+  { config: cfg },
+  30_000,
+)
+
+unixUserShellOrdering(
+  "shell serializes scheduled writes so a delayed older snapshot cannot follow a newer one",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        userShellChunks.length = 0
+        userShellRunning.length = 0
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const gate = { entered, release, held: false }
+        gates.userShellPartUpdate = gate
+        yield* Effect.addFinalizer(() =>
+          Deferred.succeed(release, undefined).pipe(
+            Effect.andThen(
+              Effect.sync(() => {
+                if (gates.userShellPartUpdate === gate) gates.userShellPartUpdate = undefined
+              }),
+            ),
+          ),
+        )
+
+        const { prompt, sessions, chat } = yield* boot()
+        const lines = Array.from({ length: 60 }, (_, index) => `line-${String(index).padStart(2, "0")}:${"x".repeat(128)}\n`)
+        const expected = lines.join("")
+        const command = `${process.execPath} -e 'for(let i=0;i<60;i++){process.stdout.write("line-"+String(i).padStart(2,"0")+":"+"x".repeat(128)+"\\n");await new Promise(r=>setTimeout(r,50))}'`
+        const fiber = yield* prompt.shell({ sessionID: chat.id, agent: "build", command }).pipe(Effect.forkChild)
+        yield* waitForBusy(chat.id)
+        yield* awaitWithTimeout(Deferred.await(entered), "first running snapshot did not enter the held commit", "5 seconds")
+        const beforeRelease = yield* userShellEvents(chat.id)
+        const initial = beforeRelease.find((item) => item.part.state.status === "running")
+        expect(initial).toBeDefined()
+        if (!initial) return
+
+        yield* Effect.sleep(shellWriteIntervalMs + 250)
+        expect(userShellOutput(userShellChunks)).toContain("line-10:")
+        const whileHeld = (yield* userShellEvents(chat.id)).filter((item) => item.part.id === initial.part.id)
+        const outstanding = whileHeld.filter(
+          (item) => item.part.state.status === "running" && item.part.state.metadata?.output,
+        )
+        yield* Deferred.succeed(release, undefined)
+        expect(outstanding).toHaveLength(0)
+
+        const exit = yield* Fiber.await(fiber)
+        expect(Exit.isSuccess(exit)).toBe(true)
+        if (!Exit.isSuccess(exit)) return
+        const part = toolPart(exit.value.parts)
+        expect(part?.state.status).toBe("completed")
+        if (!part || part.state.status !== "completed") return
+        expect(userShellOutput(userShellChunks)).toBe(expected)
+        expect(part.state.output).toBe(expected)
+        expect(part.state.metadata.output).toBe(expected)
+        const committed = (yield* userShellEvents(chat.id)).filter((item) => item.part.id === part.id)
+        const snapshots = committed.filter(
+          (item) => item.part.state.status === "running" && item.part.state.metadata?.output,
+        )
+        expect(snapshots.length).toBeGreaterThanOrEqual(2)
+        snapshots.slice(1).forEach((item, index) => expect(item.time).toBeGreaterThanOrEqual(snapshots[index].time))
+        const stored = yield* sessions.getPart({ sessionID: chat.id, messageID: part.messageID, partID: part.id })
+        expect(stored).toMatchObject({ state: { status: "completed", output: expected, metadata: { output: expected } } })
+      }),
+    ),
+  { config: cfg },
+  30_000,
+)
+
+unixUserShell(
+  "shell bounds durable running writes and bytes for a sustained stream",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        userShellChunks.length = 0
+        userShellRunning.length = 0
+        const { prompt, sessions, chat } = yield* boot()
+        const lines = Array.from({ length: 128 }, (_, index) => `${String(index).padStart(3, "0")}:${"x".repeat(4088)}\n`)
+        const expected = lines.join("")
+        const command = `${process.execPath} -e 'for(let i=0;i<128;i++){process.stdout.write(String(i).padStart(3,"0")+":"+"x".repeat(4088)+"\\n");await new Promise(r=>setTimeout(r,20))}'`
+        const result = yield* prompt.shell({ sessionID: chat.id, agent: "build", command })
+        const chunks = [...userShellChunks]
+        expect(userShellOutput(chunks)).toBe(expected)
+        const span = chunks.at(-1)!.time - chunks[0].time
+        const allowedRunningWrites = Math.ceil(span / shellWriteIntervalMs) + 1
+        expect(chunks.length).toBeGreaterThan(allowedRunningWrites)
+
+        const part = toolPart(result.parts)
+        expect(part?.state.status).toBe("completed")
+        if (!part || part.state.status !== "completed") return
+        expect(part.state.output).toBe(expected)
+        expect(part.state.metadata.output).toBe(expected)
+
+        const committed = (yield* userShellEvents(chat.id)).filter((item) => item.part.id === part.id)
+        const initialization = committed.filter(
+          (item) => item.part.state.status === "running" && !item.part.state.metadata?.output,
+        )
+        const snapshots = committed.filter(
+          (item) => item.part.state.status === "running" && item.part.state.metadata?.output,
+        )
+        const settlement = committed.filter((item) => item.part.state.status === "completed")
+        expect(initialization).toHaveLength(1)
+        expect(snapshots.length).toBeGreaterThan(0)
+        expect(snapshots.length).toBeLessThanOrEqual(allowedRunningWrites)
+        expect(settlement).toHaveLength(1)
+
+        const persistedBytes = committed.reduce((total, item) => total + item.bytes, 0)
+        expect(settlement[0].bytes).toBeGreaterThanOrEqual(Buffer.byteLength(expected, "utf8"))
+        expect(persistedBytes).toBeLessThan(settlement[0].bytes * 2)
+        snapshots.forEach((item, index) => {
+          if (index > 0) expect(item.time).toBeGreaterThanOrEqual(snapshots[index - 1].time)
+          const consumed = chunks.filter((chunk) => chunk.time <= item.time).map((chunk) => chunk.text).join("")
+          const output = String(item.part.state.status === "running" ? item.part.state.metadata?.output ?? "" : "")
+          expect(Buffer.byteLength(output, "utf8")).toBeLessThanOrEqual(shellPreviewByteLimit)
+          expect(consumed.endsWith(output.slice(-128))).toBe(true)
+          expect(item.bytes).toBeLessThanOrEqual(shellPreviewByteLimit + 1024)
+        })
+
+        const stored = yield* sessions.getPart({ sessionID: chat.id, messageID: part.messageID, partID: part.id })
+        expect(stored).toMatchObject({ state: { status: "completed", output: expected, metadata: { output: expected } } })
+        expect(userShellRunning).toHaveLength(1)
+        expect(yield* userShellRunning[0]).toBe(false)
+      }),
+    ),
+  { config: cfg },
+  30_000,
+)
+
+unixUserShell(
+  "shell settles complete output after nonzero exit and execution failure",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        const payload = " ".repeat(40_960)
+        userShellChunks.length = 0
+        userShellRunning.length = 0
+        const { prompt, chat } = yield* boot()
+        const nonzeroOutput = `${payload}nonzero-tail\n`
+        const nonzero = yield* prompt.shell({
+          sessionID: chat.id,
+          agent: "build",
+          command: "printf '%40960s' ''; printf 'nonzero-tail\\n'; exit 7",
+        })
+        expect(userShellOutput(userShellChunks)).toBe(nonzeroOutput)
+        const completed = completedTool(nonzero.parts)
+        expect(completed?.state.output).toBe(nonzeroOutput)
+        expect(completed?.state.metadata.output).toBe(nonzeroOutput)
+        yield* expectUserShellSettlement(chat.id, nonzeroOutput)
+        expect(userShellRunning).toHaveLength(1)
+        expect(yield* userShellRunning[0]).toBe(false)
+
+        userShellChunks.length = 0
+        userShellRunning.length = 0
+        const { chat: failedChat, prompt: failedPrompt } = yield* boot()
+        const failedOutput = `${payload}failure-tail\n`
+        const failure = yield* failedPrompt
+          .shell({
+            sessionID: failedChat.id,
+            agent: "build",
+            command: "printf '%40960s' ''; printf 'failure-tail\\n'; kill -TERM $$",
+          })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(failure)).toBe(true)
+        expect(userShellOutput(userShellChunks)).toBe(failedOutput)
+        yield* expectUserShellSettlement(failedChat.id, failedOutput)
+        expect(userShellRunning).toHaveLength(1)
+        expect(yield* userShellRunning[0]).toBe(false)
+      }),
+    ),
+  { config: cfg },
+  30_000,
+)
+
+unixUserShell(
+  "shell settles complete output after an Effect timeout and explicit cancellation",
+  () =>
+    withSh(() =>
+      Effect.gen(function* () {
+        const payload = " ".repeat(40_960)
+        userShellChunks.length = 0
+        userShellRunning.length = 0
+        const { prompt, chat } = yield* boot()
+        const timeoutCommand = `${process.execPath} -e 'for(;;){process.stdout.write("t".repeat(4096));await new Promise(r=>setTimeout(r,100))}'`
+        const timeoutFiber = yield* prompt
+          .shell({
+            sessionID: chat.id,
+            agent: "build",
+            command: timeoutCommand,
+          })
+          .pipe(Effect.timeout("4 seconds"), Effect.forkChild)
+        yield* waitForBusy(chat.id)
+        const timeoutExit = yield* Fiber.await(timeoutFiber)
+        expect(Exit.isFailure(timeoutExit)).toBe(true)
+        const timeoutOutput = userShellOutput(userShellChunks)
+        expect(timeoutOutput.length).toBeGreaterThan(shellPreviewByteLimit)
+        expect(timeoutOutput).toBe("t".repeat(timeoutOutput.length))
+        expect(userShellOutput(userShellChunks)).toBe(timeoutOutput)
+        const timeoutAnnotation = `${timeoutOutput}\n\n<metadata>\nUser aborted the command\n</metadata>`
+        yield* expectUserShellSettlement(chat.id, timeoutAnnotation)
+        const status = yield* SessionStatus.Service
+        expect((yield* status.get(chat.id)).type).toBe("idle")
+        expect(userShellRunning).toHaveLength(1)
+        expect(yield* userShellRunning[0]).toBe(false)
+
+        userShellChunks.length = 0
+        userShellRunning.length = 0
+        const { prompt: cancelPrompt, chat: cancelChat } = yield* boot()
+        const cancelOutput = `interrupt-start\n${payload}interrupt-tail\n`
+        const cancelFiber = yield* cancelPrompt
+          .shell({
+            sessionID: cancelChat.id,
+            agent: "build",
+            command: "printf 'interrupt-start\\n'; sleep 1; printf '%40960s' ''; printf 'interrupt-tail\\n'; while :; do sleep 1; done",
+          })
+          .pipe(Effect.forkChild)
+        yield* waitForBusy(cancelChat.id)
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const writes = yield* userShellEvents(cancelChat.id)
+            return writes.findLast(
+              (item) => item.part.state.status === "running" && item.part.state.metadata?.output?.includes("interrupt-start"),
+            )
+          }),
+          "initial interrupt shell output did not reach the running part",
+          "2 seconds",
+        )
+        yield* pollWithTimeout(
+          Effect.sync(() => (userShellOutput(userShellChunks).includes("interrupt-tail\n") ? true : undefined)),
+          "cancelled shell did not emit its tail",
+          "5 seconds",
+        )
+        expect(userShellChunks.length).toBeGreaterThan(1)
+        yield* cancelPrompt.cancel(cancelChat.id)
+        const cancelExit = yield* Fiber.await(cancelFiber)
+        expect(Exit.isSuccess(cancelExit)).toBe(true)
+        expect(userShellOutput(userShellChunks)).toBe(cancelOutput)
+        const cancelAnnotation = `${cancelOutput}\n\n<metadata>\nUser aborted the command\n</metadata>`
+        yield* expectUserShellSettlement(cancelChat.id, cancelAnnotation)
+        const cancelWrites = (yield* userShellEvents(cancelChat.id)).filter(
+          (item) => item.part.state.status === "running" && item.part.state.metadata?.output,
+        )
+        const latestRunning = cancelWrites.at(-1)?.part
+        expect(latestRunning?.state.status).toBe("running")
+        if (latestRunning?.state.status === "running")
+          expect(latestRunning.state.metadata?.output).not.toContain("interrupt-tail")
+        expect((yield* status.get(cancelChat.id)).type).toBe("idle")
+        expect(userShellRunning).toHaveLength(1)
+        expect(yield* userShellRunning[0]).toBe(false)
       }),
     ),
   { config: cfg },

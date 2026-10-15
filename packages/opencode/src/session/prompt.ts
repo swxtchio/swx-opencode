@@ -42,7 +42,7 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Semaphore, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
@@ -68,6 +68,9 @@ globalThis.AI_SDK_LOG_WARNINGS = false
 const decodeMessageInfo = Schema.decodeUnknownExit(SessionV1.Info)
 const decodeMessagePart = Schema.decodeUnknownExit(SessionV1.Part)
 const MAX_MCP_RESOURCE_BLOB_BYTES = 10 * 1024 * 1024
+const USER_SHELL_OUTPUT_WRITE_INTERVAL_MS = 500
+const USER_SHELL_RUNNING_OUTPUT_MAX_BYTES = 30_000
+const USER_SHELL_OUTPUT_PREVIEW_MARKER = "...output truncated...\n"
 const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "application/pdf",
   "image/gif",
@@ -96,6 +99,19 @@ function formatMcpResourceBytes(value: number) {
   if (value < 1024) return `${value} B`
   if (value < 1024 * 1024) return `${Math.ceil(value / 1024)} KB`
   return `${Math.ceil(value / (1024 * 1024))} MB`
+}
+
+function appendUserShellPreview(preview: { output: string; truncated: boolean }, chunk: string) {
+  // Keep the live metadata tail byte-bounded; the separate `output` value is kept complete for settlement.
+  const joined = Buffer.from(preview.output + chunk, "utf8")
+  const markerBytes = Buffer.byteLength(USER_SHELL_OUTPUT_PREVIEW_MARKER, "utf8")
+  const payloadLimit = USER_SHELL_RUNNING_OUTPUT_MAX_BYTES - markerBytes
+  const limit = preview.truncated ? payloadLimit : USER_SHELL_RUNNING_OUTPUT_MAX_BYTES
+  if (joined.byteLength <= limit) return { output: joined.toString("utf8"), truncated: preview.truncated }
+
+  let start = joined.byteLength - payloadLimit
+  while ((joined[start] & 0b11000000) === 0b10000000) start++
+  return { output: joined.toString("utf8", start), truncated: true }
 }
 
 function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
@@ -538,6 +554,36 @@ const layer = Layer.effect(
           const args = Shell.args(sh, input.command, cwd)
           let output = ""
           let aborted = false
+          let preview = { output: "", truncated: false }
+          let unwritten = false
+          let armed = false
+          const writes = Semaphore.makeUnsafe(1)
+          // Read the newest preview inside the permit so a delayed snapshot cannot commit after a newer one.
+          const flush = writes
+            .withPermits(1)(
+              Effect.suspend(() => {
+                if (!unwritten || part.state.status !== "running") return Effect.void
+                unwritten = false
+                part.state.metadata = {
+                  output: preview.truncated
+                    ? USER_SHELL_OUTPUT_PREVIEW_MARKER + preview.output
+                    : preview.output,
+                }
+                return sessions.updatePart(part).pipe(Effect.asVoid)
+              }),
+            )
+            .pipe(Effect.uninterruptible)
+          const schedule = Effect.suspend(() => {
+            if (armed) return Effect.void
+            armed = true
+            return Effect.sleep(USER_SHELL_OUTPUT_WRITE_INTERVAL_MS).pipe(
+              Effect.andThen(Effect.sync(() => void (armed = false))),
+              Effect.andThen(flush),
+              // Finish runs after this scope closes, so no scheduled writer can replace the settled full output.
+              Effect.forkScoped,
+              Effect.asVoid,
+            )
+          })
 
           const finish = Effect.uninterruptible(
             Effect.gen(function* () {
@@ -582,8 +628,9 @@ const layer = Layer.effect(
                 Effect.gen(function* () {
                   output += chunk
                   if (part.state.status === "running") {
-                    part.state.metadata = { output }
-                    yield* sessions.updatePart(part)
+                    preview = appendUserShellPreview(preview, chunk)
+                    unwritten = true
+                    yield* schedule
                   }
                 }),
               )

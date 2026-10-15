@@ -70,6 +70,8 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#264** Keep user `!` shell running snapshots bounded while preserving complete settled output (`SessionPrompt.shellImpl`). _Upstreamable._
+
 - **#262** Route only configured Google Gemini 3.8+ models that migrate from the OpenAI-compatible entry through native Google generation. Translate model and agent effort options, preserve already-native models, and omit the unsupported `minimal` variant (swxtchio/swx-opencode#259). _Fork-only._
 
 - **#260** Write the shell tool's running output at most once per 500 ms instead of once per output chunk
