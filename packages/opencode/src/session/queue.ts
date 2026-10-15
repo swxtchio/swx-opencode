@@ -3495,23 +3495,41 @@ const conversationalLeads = new Set([
   "you",
 ])
 
+// Common nouns and grammatical words do not identify a target by themselves.
 const genericTargetWords = new Set([
   "a",
   "about",
   "after",
+  "all",
+  "also",
   "additional",
+  "although",
+  "am",
   "an",
+  "any",
   "and",
   "app",
   "application",
   "area",
+  "are",
+  "as",
   "at",
   "bad",
+  "be",
+  "because",
+  "been",
   "before",
+  "being",
+  "between",
+  "both",
+  "but",
   "by",
   "broken",
   "bug",
   "buggy",
+  "can",
+  "cannot",
+  "could",
   "change",
   "changes",
   "class",
@@ -3519,11 +3537,26 @@ const genericTargetWords = new Set([
   "codebase",
   "component",
   "current",
+  "did",
+  "do",
+  "does",
   "deprecated",
   "directory",
+  "doc",
+  "docs",
+  "documentation",
   "duplicate",
+  "during",
+  "each",
+  "either",
   "existing",
   "extra",
+  "else",
+  "ever",
+  "every",
+  "few",
+  "failure",
+  "failures",
   "feature",
   "flaky",
   "for",
@@ -3531,63 +3564,154 @@ const genericTargetWords = new Set([
   "files",
   "from",
   "full",
+  "further",
+  "had",
+  "has",
+  "have",
+  "he",
+  "her",
+  "here",
+  "hers",
+  "herself",
+  "him",
+  "himself",
+  "his",
   "failing",
   "failed",
   "flow",
   "folder",
   "function",
   "general",
+  "get",
+  "got",
+  "hence",
+  "how",
   "inaccurate",
   "in",
   "into",
+  "is",
+  "it",
+  "its",
+  "itself",
   "incorrect",
   "index",
   "issue",
   "invalid",
+  "i",
+  "if",
+  "just",
   "line",
   "lines",
+  "many",
+  "may",
   "main",
+  "me",
+  "might",
   "method",
+  "more",
+  "most",
   "missing",
+  "must",
+  "my",
+  "myself",
+  "neither",
   "module",
+  "much",
+  "no",
+  "nor",
+  "not",
+  "nothing",
+  "now",
   "new",
   "of",
+  "once",
   "on",
   "or",
+  "other",
+  "others",
+  "our",
+  "ours",
+  "ourselves",
   "old",
   "package",
   "part",
+  "per",
   "primary",
   "problem",
   "project",
   "prompt",
+  "rather",
   "repo",
   "repository",
   "related",
+  "same",
+  "shall",
+  "she",
   "secondary",
   "section",
   "simple",
+  "since",
   "slow",
+  "so",
   "source",
   "specific",
   "src",
   "stale",
+  "such",
   "step",
   "steps",
+  "than",
+  "that",
   "system",
   "suite",
+  "themselves",
+  "them",
+  "then",
+  "there",
   "task",
+  "these",
   "the",
+  "they",
+  "this",
   "test",
   "tests",
+  "those",
   "thing",
   "things",
+  "though",
+  "through",
   "ts",
   "tsx",
+  "too",
+  "under",
+  "until",
+  "up",
+  "upon",
   "js",
   "jsx",
   "json",
   "md",
+  "us",
+  "very",
+  "was",
+  "we",
+  "were",
+  "what",
+  "whatever",
+  "when",
+  "whenever",
+  "where",
+  "whereas",
+  "wherever",
+  "whether",
+  "which",
+  "whichever",
+  "while",
+  "who",
+  "whoever",
+  "whom",
+  "whose",
+  "why",
   "py",
   "rs",
   "go",
@@ -3602,12 +3726,21 @@ const genericTargetWords = new Set([
   "toml",
   "sh",
   "sql",
+  "will",
+  "with",
+  "within",
+  "without",
+  "would",
+  "you",
+  "your",
+  "yours",
+  "yourself",
+  "yourselves",
   "to",
   "unused",
   "updated",
   "vulnerable",
   "work",
-  "with",
   "wrong",
 ])
 
@@ -3644,6 +3777,37 @@ function normalizeTarget(target: string) {
     .replace(/^(?:(?:a|an|the)\s+)+/, "")
 }
 
+const targetComplements = new Set([
+  "about",
+  "after",
+  "as",
+  "at",
+  "before",
+  "by",
+  "for",
+  "from",
+  "in",
+  "into",
+  "of",
+  "on",
+  "over",
+  "through",
+  "to",
+  "under",
+  "with",
+  "within",
+  "without",
+])
+
+function targetSubject(target: string) {
+  const normalized = normalizeTarget(target)
+  if (/[\\/]/.test(normalized)) return normalized
+  const words = normalized.split(" ")
+  const boundary = words.findIndex((word) => targetComplements.has(word))
+  if (boundary <= 0) return normalized
+  return words.slice(0, boundary).join(" ")
+}
+
 function targetText(target: string) {
   return normalizeTarget(target)
     .split(/([\\/\s]+)/)
@@ -3671,8 +3835,10 @@ function targetMatches(left: string, right: string) {
 
 function targetDistinctiveWords(target: string) {
   const components = normalizeTarget(target).split(/[\\/]/)
-  const subject = components[components.length - 1] ?? target
-  return targetWords(subject).filter((word) => !genericTargetWords.has(word))
+  const subject = components.length > 1 ? components[components.length - 1]! : targetSubject(target)
+  const words = targetWords(subject).filter((word) => !genericTargetWords.has(word))
+  // A leading modifier or shared parent noun is weak evidence; a one-word subject still counts.
+  return words.length > 1 ? words.slice(1) : words
 }
 
 function containsTarget(longer: string, shorter: string) {
@@ -3707,19 +3873,19 @@ function parseCommand(input: SessionPromptQueue.QueuedInput) {
   const verb = match[1]!
   const rest = match[2]!.trim()
   if (!rest) return undefined
-  const separator = /:\s|:$/.exec(rest)
-  const target = separator ? rest.slice(0, separator.index).trim() : undefined
-  const remainder = separator ? rest.slice(separator.index + (rest[separator.index + 1] ? 2 : 1)).trim() : undefined
-  const words = separator ? undefined : rest.split(/\s+/)
-  const targetIndex = words?.findIndex(
-    (word) =>
-      !word.startsWith("-") && !genericTargetWords.has(word.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "")),
-  )
-  const fallbackIndex = words?.findIndex((word) => !["a", "an", "the"].includes(word.toLowerCase()))
-  const targetEnd = targetIndex !== undefined && targetIndex >= 0 ? targetIndex : (fallbackIndex ?? -1)
-  const commandTarget = target ?? words?.slice(0, targetEnd + 1).join(" ")
+  // Keep the whole subject phrase; punctuation, options, and a trailing file path separate later instructions.
+  const separator = /:\s|:$|\.\s+|[!?]\s+|;\s+|\n|\s+(?=--\S)/.exec(rest)
+  const path = separator ? undefined : /(?:^|\s)(?:[^\s\\/]+[\\/])*[^\s\\/]+\.[a-z0-9]+(?=\s+\S)/i.exec(rest)
+  const pathEnd = path ? path.index + path[0].length : undefined
+  const end = separator?.index ?? pathEnd ?? rest.length
+  const commandTarget = rest.slice(0, end).trim()
+  const remainder = separator
+    ? rest.slice(separator.index + separator[0].length).trim()
+    : pathEnd !== undefined
+      ? rest.slice(pathEnd).trim()
+      : undefined
   if (!commandTarget) return undefined
-  const step = remainder ?? words?.slice(targetEnd + 1).join(" ")
+  const step = remainder
   if (!step) return { verb, target: commandTarget, steps: [`${verb} ${commandTarget}`] }
   const lines = step.split("\n")
   const numbered = lines.length > 1 && lines.every((line) => /^\d+\.\s+\S/.test(line))

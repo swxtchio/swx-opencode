@@ -268,13 +268,154 @@ it.instance("command targets ignore leading articles and adjective differences",
   }),
 )
 
-it.instance("commands derive no-colon targets past articles and adjectives", () =>
+it.instance("no-colon commands match whole subjects across unlisted modifiers", () =>
   Effect.gen(function* () {
-    const items = yield* consolidateAdmitted("no-colon target", [
-      { delivery: "queue", text: "fix the broken auth.ts" },
-      { delivery: "queue", text: "fix auth.ts --check" },
+    const cases = [
+      {
+        title: "intermittent authentication failures",
+        prompts: ["fix intermittent authentication failures", "fix authentication failures"],
+        merged:
+          "fix intermittent authentication failures:\n1. fix intermittent authentication failures\n2. fix authentication failures",
+      },
+      {
+        title: "sporadic login redirects",
+        prompts: ["repair sporadic login redirects", "repair login redirects"],
+        merged: "repair sporadic login redirects:\n1. repair sporadic login redirects\n2. repair login redirects",
+      },
+    ]
+    for (const test of cases) {
+      const items = yield* consolidateAdmitted(
+        test.title,
+        test.prompts.map((text) => ({ delivery: "queue" as const, text })),
+      )
+      expect(items.map(text)).toEqual([test.merged])
+    }
+  }),
+)
+
+it.instance("request admission matches whole no-colon subjects and keeps shared modifiers separate", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const positive = yield* sessions.create({ title: "no-colon request subject match" })
+    yield* request(positive.id, "queue", "subject-a", "fix intermittent authentication failures")
+    yield* request(positive.id, "queue", "subject-b", "fix authentication failures")
+    expect((yield* queue.list(positive.id)).map(text)).toEqual([
+      "fix intermittent authentication failures:\n1. fix intermittent authentication failures\n2. fix authentication failures",
     ])
-    expect(items.map(text)).toEqual(["fix the broken auth.ts:\n1. fix the broken auth.ts\n2. auth.ts: --check"])
+    expect(Option.getOrThrow(yield* queue.receipt(positive.id, "subject-b"))).toMatchObject({
+      state: "merged",
+      into: "subject-a",
+    })
+
+    const different = yield* sessions.create({ title: "no-colon shared modifier control" })
+    yield* request(different.id, "queue", "different-a", "fix intermittent authentication failures")
+    yield* request(different.id, "queue", "different-b", "fix intermittent billing timeouts")
+    expect((yield* queue.list(different.id)).map(text)).toEqual([
+      "fix intermittent authentication failures",
+      "fix intermittent billing timeouts",
+    ])
+    expect(Option.getOrThrow(yield* queue.receipt(different.id, "different-a"))).toMatchObject({ state: "pending" })
+    expect(Option.getOrThrow(yield* queue.receipt(different.id, "different-b"))).toMatchObject({ state: "pending" })
+  }),
+)
+
+it.instance("unlisted modifiers and shared first nouns alone do not identify no-colon targets", () =>
+  Effect.gen(function* () {
+    const prompts = [
+      "fix intermittent authentication failures",
+      "fix intermittent billing failures",
+      "refactor the session queue",
+      "refactor the session projector",
+      "rename the workspace queue",
+      "rename the workspace projector",
+    ]
+    const items = yield* consolidateAdmitted(
+      "shared modifiers and first nouns",
+      prompts.map((text) => ({ delivery: "queue" as const, text })),
+    )
+    expect(items.map(text)).toEqual(prompts)
+  }),
+)
+
+it.instance("colon targets stop at the short subject before a trailing note", () =>
+  Effect.gen(function* () {
+    const cases = [
+      {
+        title: "different parser duties",
+        prompts: [
+          "add tests for the parser. Note: preserve AST coverage",
+          "add docs for the parser. Note: update usage guidance",
+        ],
+      },
+      {
+        title: "different sentence subjects",
+        prompts: ["add parser tests. Note: preserve AST coverage", "add router docs. Note: update usage guidance"],
+      },
+    ]
+    for (const test of cases) {
+      const items = yield* consolidateAdmitted(
+        test.title,
+        test.prompts.map((text) => ({ delivery: "queue" as const, text })),
+      )
+      expect(items.map(text)).toEqual(test.prompts)
+    }
+  }),
+)
+
+it.instance("grammatical target words do not merge unrelated work in consolidation", () =>
+  Effect.gen(function* () {
+    const cases = [
+      ["investigate how CI deploys: check runner", "investigate how login redirects: trace callback"],
+      [
+        "investigate CI deployment and how it works: inspect runner",
+        "investigate login redirects and how it fails: trace callback",
+      ],
+      ["investigate why the CI is red:", "investigate why the login is slow:"],
+    ]
+    for (const [first, second] of cases) {
+      const items = yield* consolidateAdmitted("different interrogative targets", [
+        { delivery: "queue", text: first! },
+        { delivery: "queue", text: second! },
+      ])
+      expect(items.map(text)).toEqual([first, second])
+    }
+
+    const positive = yield* consolidateAdmitted("same deployment target", [
+      { delivery: "queue", text: "investigate CI deployment and how it works: inspect runner" },
+      { delivery: "queue", text: "investigate CI deployment and how it proceeds: trace callback" },
+    ])
+    expect(positive.map(text)).toEqual([
+      "investigate CI deployment and how it works:\n1. inspect runner\n2. CI deployment and how it proceeds: trace callback",
+    ])
+  }),
+)
+
+it.instance("request admission ignores grammatical target overlap and keeps a same-job positive", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const different = yield* sessions.create({ title: "grammatical request boundary" })
+    const requests = [
+      "investigate CI deployment and how it works: inspect runner",
+      "investigate login redirects and how it fails: trace callback",
+    ]
+    yield* request(different.id, "queue", "grammar-a", requests[0]!)
+    yield* request(different.id, "queue", "grammar-b", requests[1]!)
+    expect((yield* queue.list(different.id)).map(text)).toEqual(requests)
+    expect(Option.getOrThrow(yield* queue.receipt(different.id, "grammar-a"))).toMatchObject({ state: "pending" })
+    expect(Option.getOrThrow(yield* queue.receipt(different.id, "grammar-b"))).toMatchObject({ state: "pending" })
+
+    const same = yield* sessions.create({ title: "grammatical target positive" })
+    yield* request(same.id, "queue", "same-a", "investigate CI deployment and how it works: inspect runner")
+    yield* request(same.id, "queue", "same-b", "investigate CI deployment and how it proceeds: trace callback")
+    expect((yield* queue.list(same.id)).map(text)).toEqual([
+      "investigate CI deployment and how it works:\n1. inspect runner\n2. CI deployment and how it proceeds: trace callback",
+    ])
+    expect(Option.getOrThrow(yield* queue.receipt(same.id, "same-b"))).toMatchObject({
+      state: "merged",
+      into: "same-a",
+    })
   }),
 )
 
