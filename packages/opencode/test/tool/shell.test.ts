@@ -9,7 +9,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { and, asc, eq } from "drizzle-orm"
-import { Cause, Effect, Exit, Fiber, Layer, Schedule, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schedule, Stream } from "effect"
 import { ChildProcessSpawner } from "effect/unstable/process"
 import type * as Scope from "effect/Scope"
 import os from "os"
@@ -1199,6 +1199,143 @@ describe("tool.shell abort", () => {
       ),
     )
   }
+})
+
+// A shell whose command ignores SIGTERM, so only a SIGKILL ends it. The tool runs through a spawner that signals once
+// it has consumed the command's first output, by which point the command has recorded its PID.
+const sigtermResistant = Effect.fn("ShellToolTest.sigtermResistant")(function* () {
+  const dir = yield* tmpdirScoped()
+  const pidFile = path.join(dir, "pid")
+  const consumed = Deferred.makeUnsafe<void>()
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+  const signalling = ChildProcessSpawner.make((command) =>
+    spawner.spawn(command).pipe(
+      Effect.map((handle) =>
+        ChildProcessSpawner.makeHandle({
+          ...handle,
+          all: handle.all.pipe(
+            Stream.flatMap((chunk) =>
+              Stream.make(chunk).pipe(Stream.concat(Stream.fromEffectDrain(Deferred.succeed(consumed, undefined)))),
+            ),
+          ),
+        }),
+      ),
+    ),
+  )
+  const tool = yield* Tool.init(
+    yield* ShellTool.pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, signalling)),
+  )
+  const program = `process.on("SIGTERM", () => {}); require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); console.log("ready"); setInterval(() => {}, 1000)`
+  const pid = Effect.promise(() => Bun.file(pidFile).text()).pipe(Effect.map(Number))
+  // Reaps the command whatever the case leaves behind, so a run held open by it can end.
+  yield* Effect.addFinalizer(() =>
+    pid.pipe(
+      Effect.flatMap((value) =>
+        Effect.sync(() => {
+          for (const target of [-value, value])
+            try {
+              process.kill(target, "SIGKILL")
+            } catch {}
+        }),
+      ),
+      Effect.ignore,
+    ),
+  )
+  return {
+    tool,
+    consumed,
+    command: `exec ${bin} -e ${squote(program)}`,
+    alive: pid.pipe(
+      Effect.map((value) => {
+        try {
+          process.kill(value, 0)
+          return true
+        } catch {
+          return false
+        }
+      }),
+    ),
+  }
+})
+
+// Refuses every progress write once refusing is set, as SessionTools does for a call it no longer owns.
+const refusing = (input: { abort: AbortSignal; refuse: () => boolean; refused: { count: number } }) => ({
+  ...ctx,
+  callID: "refused",
+  abort: input.abort,
+  metadata: () =>
+    Effect.suspend(() => {
+      if (!input.refuse()) return Effect.void
+      input.refused.count++
+      return Effect.die(new Tool.CallNotOwnedError({ callID: "refused" }))
+    }),
+})
+
+describe("tool.shell teardown", () => {
+  const unix = process.platform === "win32" ? it.live.skip : it.live
+
+  unix(
+    "reaps a command that ignores SIGTERM when the abort's output write is refused",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const shell = yield* sigtermResistant()
+          const controller = new AbortController()
+          const refused = { count: 0 }
+          const execution = yield* shell.tool
+            .execute(
+              { command: shell.command },
+              refusing({ abort: controller.signal, refuse: () => controller.signal.aborted, refused }),
+            )
+            .pipe(Effect.exit, Effect.forkDetach)
+          yield* Deferred.await(shell.consumed).pipe(Effect.timeout("5 seconds"))
+          controller.abort()
+          const completion = yield* Fiber.await(execution).pipe(Effect.timeoutOption("6 seconds"))
+          expect({
+            completion: completion._tag === "Some" ? "finished" : "timeout",
+            alive: yield* shell.alive,
+          }).toEqual({
+            completion: "finished",
+            alive: false,
+          })
+          // The abort's write of the consumed output was the one refused.
+          expect(refused.count).toBeGreaterThan(0)
+        }),
+      ),
+    15_000,
+  )
+
+  unix(
+    "reaps a command that ignores SIGTERM when its run is interrupted and its output write is refused",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const shell = yield* sigtermResistant()
+          let interrupting = false
+          const refused = { count: 0 }
+          const execution = yield* shell.tool
+            .execute(
+              { command: shell.command },
+              refusing({ abort: new AbortController().signal, refuse: () => interrupting, refused }),
+            )
+            .pipe(Effect.forkDetach)
+          yield* Deferred.await(shell.consumed).pipe(Effect.timeout("5 seconds"))
+          interrupting = true
+          const completion = yield* Fiber.interrupt(execution).pipe(Effect.timeoutOption("6 seconds"))
+          expect({
+            completion: completion._tag === "Some" ? "finished" : "timeout",
+            alive: yield* shell.alive,
+          }).toEqual({
+            completion: "finished",
+            alive: false,
+          })
+          expect(refused.count).toBeGreaterThan(0)
+        }),
+      ),
+    15_000,
+  )
 })
 
 describe("tool.shell truncation", () => {

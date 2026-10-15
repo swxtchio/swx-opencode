@@ -8,9 +8,10 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { afterAll, expect } from "bun:test"
 import { Database as Sqlite } from "bun:sqlite"
 import { tool } from "ai"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, Schema, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, Scheduler, Schema, Stream } from "effect"
 import { isSqlError } from "effect/unstable/sql/SqlError"
-import { rm } from "node:fs/promises"
+import { mkdtemp, rm } from "node:fs/promises"
+import os from "node:os"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -31,7 +32,17 @@ import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { provideTmpdirInstance, provideTmpdirServer } from "../fixture/fixture"
 import { produceSqliteBusyError } from "../fixture/sqlite-lock"
 import { sqliteLockMessage } from "@/util/sqlite-error"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
+import { SessionTools } from "@/session/tools"
+import { Plugin } from "@/plugin"
+import { Permission } from "@/permission"
+import { MCP } from "@/mcp"
+import { Truncate } from "@/tool/truncate"
+import { ToolRegistry } from "@/tool/registry"
+import type { Tool } from "@/tool/tool"
+import { LLMNativeRuntime } from "@/session/llm/native-runtime"
+import type { LLMClientShape } from "@opencode-ai/llm/route"
+import { existsSync } from "node:fs"
 import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -2810,5 +2821,1311 @@ itRouted.live(
         expect(zeroCostOutput.join("\n")).toContain("0.0%")
       }),
     { config: routedConfig() },
+  ),
+)
+
+// ---------------------------------------------------------------------------
+// Tool execution custody (#234): a locally executed call is owned and durably
+// admitted before its plugin hook or body runs, and cancellation settles every
+// tool part the attempt created. Effects are private marker files.
+// ---------------------------------------------------------------------------
+
+const custodyDbPath = path.join(import.meta.dir, `.opencode-tool-custody-${crypto.randomUUID()}.db`)
+const nativeCustodyDbPath = path.join(import.meta.dir, `.opencode-native-custody-${crypto.randomUUID()}.db`)
+
+afterAll(async () => {
+  await Promise.all(
+    [custodyDbPath, nativeCustodyDbPath]
+      .flatMap((file) => [file, `${file}-wal`, `${file}-shm`])
+      .map((file) => rm(file, { force: true })),
+  )
+})
+
+const itCustody = testEffect(
+  LayerNode.compile(
+    LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
+    [...replacements, [Database.node, Database.layerFromPath(custodyDbPath)]],
+  ),
+)
+
+type StoredToolPart = {
+  id: string
+  sessionID: string
+  messageID: string
+  type: string
+  tool: string
+  callID: string
+  state: SessionV1.ToolPart["state"]
+}
+
+// Reads through a connection of its own, as a process reopening the store would, so nothing the processor holds in
+// memory can stand in for what was committed.
+function storedRows(dbPath: string, sql: string, id: string) {
+  const db = new Sqlite(dbPath, { readonly: true })
+  try {
+    db.exec("PRAGMA busy_timeout = 5000")
+    return db.query<{ id: string; session_id: string; message_id?: string; data: string }, [string]>(sql).all(id)
+  } finally {
+    db.close()
+  }
+}
+
+function storedToolPart(dbPath: string, messageID: string, callID: string) {
+  return storedRows(
+    dbPath,
+    "select id, session_id, message_id, data from part where message_id = ? order by id",
+    messageID,
+  )
+    .map(
+      (row) =>
+        ({
+          ...JSON.parse(row.data),
+          id: row.id,
+          sessionID: row.session_id,
+          messageID: row.message_id,
+        }) as StoredToolPart,
+    )
+    .find((part) => part.type === "tool" && part.callID === callID)
+}
+
+function storedAssistant(dbPath: string, messageID: string) {
+  const row = storedRows(dbPath, "select id, session_id, data from message where id = ?", messageID)[0]
+  return row ? (JSON.parse(row.data) as Pick<SessionV1.Assistant, "time" | "error">) : undefined
+}
+
+type CustodyEntry = { callID: string; stored: StoredToolPart | undefined }
+
+// Resolves the production tool wrappers for one `probe` tool against a real processor handle. The plugin hook and the
+// tool body each record the stored part they started under, then the body runs the case's private effect.
+const custodyTurn = Effect.fn("test.custodyTurn")(function* (input: {
+  dir: string
+  dbPath: string
+  body: (args: { value: number }, ctx: Tool.Context) => Effect.Effect<void>
+  // Runs when the runtime dispatches a call, before the production wrapper receives it.
+  dispatch?: (args: { value: number }) => Effect.Effect<void>
+}) {
+  const { processors, session, provider } = yield* boot()
+  const chat = yield* session.create({})
+  const parent = yield* user(chat.id, "probe")
+  const msg = yield* assistant(chat.id, parent.id, path.resolve(input.dir))
+  const model = yield* provider.getModel(ref.providerID, ref.modelID)
+  const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+  const plugin: CustodyEntry[] = []
+  const body: CustodyEntry[] = []
+  const executions: Promise<"fulfilled" | "rejected">[] = []
+  const dispatched = Deferred.makeUnsafe<string>()
+  const read = (callID: string | undefined) => storedToolPart(input.dbPath, msg.id, callID ?? "")
+
+  const tools = yield* SessionTools.resolve({
+    agent: agent(),
+    model,
+    session: chat,
+    processor: handle,
+    bypassAgentCheck: false,
+    messages: [],
+    promptOps: {} as never,
+  }).pipe(
+    Effect.provideService(
+      Plugin.Service,
+      Plugin.Service.of({
+        init: () => Effect.void,
+        list: () => Effect.succeed([]),
+        trigger: (name, hook, output) =>
+          Effect.sync(() => {
+            if (name !== "tool.execute.before") return output
+            const callID = (hook as { callID: string }).callID
+            plugin.push({ callID, stored: read(callID) })
+            return output
+          }),
+      }),
+    ),
+    Effect.provideService(
+      Permission.Service,
+      Permission.Service.of({ ask: () => Effect.void, reply: () => Effect.void, list: () => Effect.succeed([]) }),
+    ),
+    Effect.provideService(
+      MCP.Service,
+      MCP.Service.of({
+        tools: () => Effect.succeed({}),
+        clients: () => Effect.succeed({}),
+      } as Partial<MCP.Interface> as MCP.Interface),
+    ),
+    Effect.provideService(
+      Truncate.Service,
+      Truncate.Service.of({
+        cleanup: () => Effect.void,
+        write: () => Effect.succeed("output.txt"),
+        output: (text: string) => Effect.succeed({ content: text, truncated: false }),
+        limits: () => Effect.succeed({ maxLines: 2000, maxBytes: 50 * 1024 }),
+      }),
+    ),
+    Effect.provideService(
+      ToolRegistry.Service,
+      ToolRegistry.Service.of({
+        ids: () => Effect.succeed(["probe"]),
+        all: () => Effect.succeed([]),
+        named: () => Effect.die("unused"),
+        tools: () =>
+          Effect.succeed([
+            {
+              id: "probe",
+              description: "Writes a private effect marker",
+              parameters: Schema.Struct({ value: Schema.Number }),
+              jsonSchema: { type: "object", properties: { value: { type: "number" } }, required: ["value"] },
+              execute: (args: { value: number }, ctx: Tool.Context) =>
+                Effect.gen(function* () {
+                  body.push({ callID: ctx.callID ?? "", stored: read(ctx.callID) })
+                  yield* input.body(args, ctx)
+                  return { title: "probe", metadata: {}, output: `probe:${args.value}` }
+                }),
+            } satisfies Tool.Def,
+          ]),
+      }),
+    ),
+    Effect.provide(RuntimeFlags.layer()),
+  )
+  const execute = tools.probe?.execute
+  if (!execute) throw new Error("probe tool is missing execute")
+  // Observes the runtime entering the production wrapper, independently of anything the wrapper then runs.
+  tools.probe = {
+    ...tools.probe,
+    execute: (args, options) => {
+      const run = (input.dispatch ? Effect.runPromise(input.dispatch(args)) : Promise.resolve()).then(
+        () => execute(args, options) as PromiseLike<unknown>,
+      )
+      executions.push(
+        run.then(
+          () => "fulfilled" as const,
+          () => "rejected" as const,
+        ),
+      )
+      Deferred.doneUnsafe(dispatched, Exit.succeed(options.toolCallId))
+      return run
+    },
+  }
+
+  const process = handle.process({
+    user: {
+      id: parent.id,
+      sessionID: chat.id,
+      role: "user",
+      time: parent.time,
+      agent: parent.agent,
+      model: { providerID: ref.providerID, modelID: ref.modelID },
+    } satisfies SessionV1.User,
+    sessionID: chat.id,
+    model,
+    agent: agent(),
+    system: [],
+    messages: [{ role: "user", content: "probe" }],
+    tools,
+  })
+  return { chat, msg, tools, plugin, body, executions, dispatched, process }
+})
+
+// Holds the post-commit publication of the first tool part update that matches: the part is committed, but its writer
+// has not yet returned from writing it.
+type PublishedToolPart = Extract<typeof SessionV1.Event.PartUpdated.data.Type.part, { type: "tool" }>
+const holdPartPublication = Effect.fn("test.holdPartPublication")(function* (
+  matches: (part: PublishedToolPart) => boolean,
+) {
+  const events = yield* EventV2Bridge.Service
+  const committed = Deferred.makeUnsafe<string>()
+  const release = Deferred.makeUnsafe<void>()
+  let held = false
+  const off = yield* events.listen((event) => {
+    if (held || event.type !== SessionV1.Event.PartUpdated.type) return Effect.void
+    const part = (event.data as typeof SessionV1.Event.PartUpdated.data.Type).part
+    if (part.type !== "tool" || !matches(part)) return Effect.void
+    held = true
+    return Deferred.succeed(committed, part.id).pipe(Effect.andThen(Deferred.await(release)))
+  })
+  // A failed assertion must not leave the writer held.
+  yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.andThen(off)))
+  return { committed, release, off }
+})
+
+// Holds the post-commit publication of a call's pending part: the part is committed, but the processor has not yet
+// returned from writing it, which is the window the AI SDK's independent dispatch can run in.
+const holdPendingCommit = (callID: string) =>
+  holdPartPublication((part) => part.callID === callID && part.state.status === "pending")
+
+const writeMarker = (file: string, text: string) => Effect.promise(() => Bun.write(file, text)).pipe(Effect.asVoid)
+
+itCustody.live("admits an AI SDK-dispatched tool durably before its plugin hook or body runs", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const marker = path.join(dir, "probe-effect")
+        const bodyEntered = Deferred.makeUnsafe<void>()
+        const effectGate = Deferred.makeUnsafe<void>()
+        const effectWritten = Deferred.makeUnsafe<void>()
+        const settleGate = Deferred.makeUnsafe<void>()
+        yield* llm.tool("probe", { value: 1 })
+        const hold = yield* holdPendingCommit("call_1")
+        const turn = yield* custodyTurn({
+          dir,
+          dbPath: custodyDbPath,
+          body: (args) =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(bodyEntered, undefined)
+              yield* Deferred.await(effectGate)
+              yield* writeMarker(marker, `effect:${args.value}`)
+              yield* Deferred.succeed(effectWritten, undefined)
+              yield* Deferred.await(settleGate)
+            }),
+        })
+        const run = yield* turn.process.pipe(Effect.forkChild)
+
+        const pendingID = yield* awaitWithTimeout(Deferred.await(hold.committed), "pending part was never committed")
+        expect(yield* awaitWithTimeout(Deferred.await(turn.dispatched), "AI SDK never dispatched the call")).toBe(
+          "call_1",
+        )
+        yield* Deferred.succeed(hold.release, undefined)
+        yield* awaitWithTimeout(Deferred.await(bodyEntered), "admitted tool body never ran")
+
+        const admitted = {
+          id: pendingID,
+          sessionID: turn.chat.id,
+          messageID: turn.msg.id,
+          callID: "call_1",
+          tool: "probe",
+          state: { status: "running", input: { value: 1 } },
+        }
+        expect(turn.plugin).toMatchObject([{ callID: "call_1", stored: admitted }])
+        expect(turn.body).toMatchObject([{ callID: "call_1", stored: admitted }])
+
+        // The admission is the same stored record before and after the effect, read fresh each time: it records that
+        // execution was allowed, never whether the effect happened.
+        const beforeEffect = storedToolPart(custodyDbPath, turn.msg.id, "call_1")
+        expect(beforeEffect).toMatchObject(admitted)
+        expect(existsSync(marker)).toBe(false)
+        yield* Deferred.succeed(effectGate, undefined)
+        yield* awaitWithTimeout(Deferred.await(effectWritten), "probe effect was never written")
+        expect(existsSync(marker)).toBe(true)
+        expect(storedToolPart(custodyDbPath, turn.msg.id, "call_1")).toEqual(beforeEffect!)
+        // Built locally: a shared build would hand back the processor's own Database.
+        const reopened = yield* MessageV2.parts(turn.msg.id).pipe(
+          Effect.provide(Database.layerFromPath(custodyDbPath), { local: true }),
+        )
+        expect(reopened.find((part) => part.type === "tool" && part.callID === "call_1")).toMatchObject({
+          id: pendingID,
+          state: beforeEffect!.state,
+        })
+        expect(storedToolPart(custodyDbPath, turn.msg.id, "call_1")).toEqual(beforeEffect!)
+
+        yield* Deferred.succeed(settleGate, undefined)
+        expect(yield* Fiber.join(run)).toBe("continue")
+        yield* hold.off
+        expect(storedToolPart(custodyDbPath, turn.msg.id, "call_1")).toMatchObject({
+          id: pendingID,
+          state: { status: "completed", input: { value: 1 }, output: "probe:1" },
+        })
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itCustody.live("settles an AI SDK-dispatched tool cancelled before its processor owns it, without running it", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const marker = path.join(dir, "probe-effect")
+        yield* llm.tool("probe", { value: 2 })
+        const hold = yield* holdPendingCommit("call_1")
+        const turn = yield* custodyTurn({
+          dir,
+          dbPath: custodyDbPath,
+          body: (args) => writeMarker(marker, `effect:${args.value}`),
+        })
+        const run = yield* turn.process.pipe(Effect.forkChild)
+
+        const pendingID = yield* awaitWithTimeout(Deferred.await(hold.committed), "pending part was never committed")
+        yield* awaitWithTimeout(Deferred.await(turn.dispatched), "AI SDK never dispatched the call")
+        yield* Fiber.interrupt(run)
+        yield* hold.off
+
+        expect(yield* Effect.promise(() => turn.executions[0]!)).toBe("rejected")
+        expect(turn.plugin).toEqual([])
+        expect(turn.body).toEqual([])
+        expect(existsSync(marker)).toBe(false)
+        expect(storedToolPart(custodyDbPath, turn.msg.id, "call_1")).toMatchObject({
+          id: pendingID,
+          callID: "call_1",
+          state: { status: "error", error: "Tool execution aborted", metadata: { interrupted: true } },
+        })
+        const message = storedAssistant(custodyDbPath, turn.msg.id)
+        expect(message?.time.completed).toBeDefined()
+        expect(message?.error?.name).toBe("MessageAbortedError")
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itCustody.live("settles an admitted tool on cancellation and refuses the effect it gates on metadata", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const marker = path.join(dir, "probe-effect")
+        const bodyEntered = Deferred.makeUnsafe<void>()
+        const proceed = Deferred.makeUnsafe<void>()
+        yield* llm.tool("probe", { value: 3 })
+        const turn = yield* custodyTurn({
+          dir,
+          dbPath: custodyDbPath,
+          // Like shell, which spawns only after its metadata update.
+          body: (args, ctx) =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(bodyEntered, undefined)
+              yield* Deferred.await(proceed)
+              yield* ctx.metadata({ metadata: { phase: "spawning" } })
+              yield* writeMarker(marker, `effect:${args.value}`)
+            }),
+        })
+        const run = yield* turn.process.pipe(Effect.forkChild)
+
+        yield* awaitWithTimeout(Deferred.await(bodyEntered), "admitted tool body never ran")
+        yield* Fiber.interrupt(run)
+        const interrupted = storedToolPart(custodyDbPath, turn.msg.id, "call_1")
+        expect(interrupted).toMatchObject({
+          callID: "call_1",
+          state: { status: "error", error: "Tool execution aborted", metadata: { interrupted: true } },
+        })
+
+        yield* Deferred.succeed(proceed, undefined)
+        expect(yield* Effect.promise(() => turn.executions[0]!)).toBe("rejected")
+        expect(existsSync(marker)).toBe(false)
+        expect(storedToolPart(custodyDbPath, turn.msg.id, "call_1")).toEqual(interrupted!)
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itCustody.live("keeps progress and effect evidence when a tool is cancelled after its effect", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const marker = path.join(dir, "probe-effect")
+        const effectWritten = Deferred.makeUnsafe<void>()
+        const finish = Deferred.makeUnsafe<void>()
+        yield* llm.tool("probe", { value: 4 })
+        const turn = yield* custodyTurn({
+          dir,
+          dbPath: custodyDbPath,
+          body: (args, ctx) =>
+            Effect.gen(function* () {
+              yield* ctx.metadata({ metadata: { progress: "effect written" } })
+              yield* writeMarker(marker, `effect:${args.value}`)
+              yield* Deferred.succeed(effectWritten, undefined)
+              yield* Deferred.await(finish)
+            }),
+        })
+        const run = yield* turn.process.pipe(Effect.forkChild)
+
+        yield* awaitWithTimeout(Deferred.await(effectWritten), "probe effect was never written")
+        yield* Fiber.interrupt(run)
+        yield* Deferred.succeed(finish, undefined)
+        yield* Effect.promise(() => turn.executions[0]!)
+
+        // The interrupted disposition records the cancellation; the effect happened anyway.
+        expect(existsSync(marker)).toBe(true)
+        expect(storedToolPart(custodyDbPath, turn.msg.id, "call_1")).toMatchObject({
+          callID: "call_1",
+          state: {
+            status: "error",
+            error: "Tool execution aborted",
+            input: { value: 4 },
+            metadata: { progress: "effect written", interrupted: true },
+          },
+        })
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itCustody.live("refuses a tool dispatched after its turn ended, though the same tool ran within the turn", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        yield* llm.tool("probe", { value: 5 })
+        const turn = yield* custodyTurn({
+          dir,
+          dbPath: custodyDbPath,
+          body: (args, ctx) => writeMarker(path.join(dir, `probe-effect-${ctx.callID}`), `effect:${args.value}`),
+        })
+
+        expect(yield* turn.process).toBe("continue")
+        expect(existsSync(path.join(dir, "probe-effect-call_1"))).toBe(true)
+        expect(storedToolPart(custodyDbPath, turn.msg.id, "call_1")).toMatchObject({
+          state: { status: "completed", output: "probe:5" },
+        })
+
+        const late = yield* awaitWithTimeout(
+          Effect.promise(() =>
+            Promise.resolve(
+              turn.tools.probe!.execute!(
+                { value: 6 },
+                { toolCallId: "call_late", messages: [], abortSignal: new AbortController().signal },
+              ) as PromiseLike<unknown>,
+            ).then(
+              () => "fulfilled",
+              () => "rejected",
+            ),
+          ),
+          "a call dispatched after its turn ended was left waiting for admission",
+        )
+        expect(late).toBe("rejected")
+        expect(turn.plugin.map((entry) => entry.callID)).toEqual(["call_1"])
+        expect(turn.body.map((entry) => entry.callID)).toEqual(["call_1"])
+        expect(existsSync(path.join(dir, "probe-effect-call_late"))).toBe(false)
+        expect(storedToolPart(custodyDbPath, turn.msg.id, "call_late")).toBeUndefined()
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itCustody.live("settles a cancelled turn without waiting on a running tool's held publication", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        yield* llm.tool("probe", { value: 10 })
+        const hold = yield* holdPartPublication(
+          (part) =>
+            part.callID === "call_1" && part.state.status === "running" && part.state.metadata?.phase === "held",
+        )
+        const turn = yield* custodyTurn({
+          dir,
+          dbPath: custodyDbPath,
+          body: (_args, ctx) => ctx.metadata({ metadata: { phase: "held" } }),
+        })
+        const run = yield* turn.process.pipe(Effect.forkChild)
+
+        // The executing tool's progress is committed, and its own publication of it is held.
+        const partID = yield* awaitWithTimeout(Deferred.await(hold.committed), "the tool's progress never committed")
+        yield* awaitWithTimeout(Fiber.interrupt(run), "cancellation waited on the executing tool's publication")
+        const settled = storedToolPart(custodyDbPath, turn.msg.id, "call_1")
+        expect(settled).toMatchObject({
+          id: partID,
+          state: {
+            status: "error",
+            error: "Tool execution aborted",
+            input: { value: 10 },
+            metadata: { phase: "held", interrupted: true },
+          },
+        })
+
+        yield* Deferred.succeed(hold.release, undefined)
+        yield* awaitWithTimeout(
+          Effect.promise(() => turn.executions[0]!),
+          "the released tool never finished",
+        )
+        expect(storedToolPart(custodyDbPath, turn.msg.id, "call_1")).toEqual(settled!)
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itCustody.live("preserves an outcome committed before cancellation interrupts its settlement", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        yield* llm.tool("probe", { value: 11 })
+        const hold = yield* holdPartPublication((part) => part.callID === "call_1" && part.state.status === "completed")
+        const turn = yield* custodyTurn({ dir, dbPath: custodyDbPath, body: () => Effect.void })
+        const run = yield* turn.process.pipe(Effect.forkChild)
+
+        // The outcome is committed, but the consumer has not returned from writing it, so the call is still unsettled.
+        yield* awaitWithTimeout(Deferred.await(hold.committed), "the tool's outcome never committed")
+        const completed = storedToolPart(custodyDbPath, turn.msg.id, "call_1")
+        expect(completed).toMatchObject({ state: { status: "completed", input: { value: 11 }, output: "probe:11" } })
+        yield* awaitWithTimeout(Fiber.interrupt(run), "the interrupted turn never finished settling")
+        expect(storedToolPart(custodyDbPath, turn.msg.id, "call_1")).toEqual(completed!)
+        expect(storedAssistant(custodyDbPath, turn.msg.id)?.error?.name).toBe("MessageAbortedError")
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+// A worker process runs an admitted tool, records what is stored, then loses its owner abruptly, before or after the
+// tool's private effect. The test process reopens the store afterwards.
+const ownerLoss = {
+  db: process.env.OPENCODE_CUSTODY_OWNER_LOSS_DB,
+  phase: process.env.OPENCODE_CUSTODY_OWNER_LOSS_PHASE,
+  output: process.env.OPENCODE_CUSTODY_OWNER_LOSS_OUTPUT ?? "",
+  marker: process.env.OPENCODE_CUSTODY_OWNER_LOSS_MARKER ?? "",
+}
+const ownerLossWorker = "custody-owner-loss-worker kills its process while an admitted tool runs"
+
+if (ownerLoss.db) {
+  const db = ownerLoss.db
+  testEffect(
+    LayerNode.compile(
+      LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
+      [...replacements, [Database.node, Database.layerFromPath(db)]],
+    ),
+  ).live(
+    ownerLossWorker,
+    () =>
+      provideTmpdirServer(
+        ({ dir, llm }) =>
+          Effect.gen(function* () {
+            yield* llm.tool("probe", { value: 1 })
+            const owner = { sessionID: "", messageID: "", plugin: [] as CustodyEntry[], body: [] as CustodyEntry[] }
+            const turn = yield* custodyTurn({
+              dir,
+              dbPath: db,
+              body: (args) =>
+                Effect.gen(function* () {
+                  if (ownerLoss.phase === "after") yield* writeMarker(ownerLoss.marker, `effect:${args.value}`)
+                  const record = { ...owner, dir, stored: storedToolPart(db, owner.messageID, "call_1") }
+                  yield* Effect.promise(() => Bun.write(ownerLoss.output, JSON.stringify(record)))
+                  process.kill(process.pid, "SIGKILL")
+                  yield* Effect.never
+                }),
+            })
+            Object.assign(owner, {
+              sessionID: turn.chat.id,
+              messageID: turn.msg.id,
+              plugin: turn.plugin,
+              body: turn.body,
+            })
+            yield* turn.process
+          }),
+        { config: (url) => providerCfg(url) },
+      ),
+    30_000,
+  )
+}
+
+it.live(
+  "keeps an admitted tool's record unchanged when its owner is lost before or after its effect",
+  () =>
+    Effect.gen(function* () {
+      const dir = yield* Effect.acquireRelease(
+        Effect.promise(() => mkdtemp(path.join(os.tmpdir(), "opencode-owner-loss-"))),
+        (dir) => Effect.promise(() => rm(dir, { recursive: true, force: true })),
+      )
+      for (const phase of ["before", "after"] as const) {
+        const db = path.join(dir, `${phase}.db`)
+        const output = path.join(dir, `${phase}.json`)
+        const marker = path.join(dir, `${phase}-effect`)
+        const worker = Bun.spawn(
+          [process.execPath, "test", "test/session/processor-effect.test.ts", `--test-name-pattern=${ownerLossWorker}`],
+          {
+            cwd: path.join(import.meta.dir, "../.."),
+            env: {
+              ...process.env,
+              OPENCODE_CUSTODY_OWNER_LOSS_DB: db,
+              OPENCODE_CUSTODY_OWNER_LOSS_PHASE: phase,
+              OPENCODE_CUSTODY_OWNER_LOSS_OUTPUT: output,
+              OPENCODE_CUSTODY_OWNER_LOSS_MARKER: marker,
+            },
+            stdout: "ignore",
+            stderr: "ignore",
+          },
+        )
+        yield* Effect.addFinalizer(() => Effect.sync(() => worker.kill()))
+        yield* awaitWithTimeout(
+          Effect.promise(() => worker.exited),
+          `the ${phase}-effect worker never lost its owner`,
+          "60 seconds",
+        )
+        expect(worker.signalCode).toBe("SIGKILL")
+        const record = JSON.parse(yield* Effect.promise(() => Bun.file(output).text())) as {
+          dir: string
+          sessionID: string
+          messageID: string
+          stored: StoredToolPart
+          plugin: CustodyEntry[]
+          body: CustodyEntry[]
+        }
+        yield* Effect.addFinalizer(() => Effect.promise(() => rm(record.dir, { recursive: true, force: true })))
+
+        // The owner admitted the call before its plugin hook and body ran, and was lost while it still held it.
+        const admitted = {
+          sessionID: record.sessionID,
+          messageID: record.messageID,
+          callID: "call_1",
+          tool: "probe",
+          state: { status: "running", input: { value: 1 } },
+        }
+        expect(record.stored).toMatchObject(admitted)
+        expect(record.plugin).toEqual([{ callID: "call_1", stored: record.stored }])
+        expect(record.body).toEqual([{ callID: "call_1", stored: record.stored }])
+        expect(existsSync(marker)).toBe(phase === "after")
+
+        // Reopened by a process that never owned it, the admission is the same record whether or not the effect
+        // happened, and no outcome has been manufactured for the call or its turn.
+        expect(storedToolPart(db, record.messageID, "call_1")).toEqual(record.stored)
+        // Built locally: a shared build would hand back a Database this process already holds.
+        const reopened = yield* MessageV2.parts(MessageID.make(record.messageID)).pipe(
+          Effect.provide(Database.layerFromPath(db), { local: true }),
+        )
+        expect(reopened.find((part) => part.type === "tool" && part.callID === "call_1")).toMatchObject({
+          id: record.stored.id,
+          state: record.stored.state,
+        })
+        expect(storedToolPart(db, record.messageID, "call_1")).toEqual(record.stored)
+        const message = storedAssistant(db, record.messageID)
+        expect(message?.time.completed).toBeUndefined()
+        expect(message?.error).toBeUndefined()
+      }
+    }),
+  120_000,
+)
+
+// Forwards Session writes, letting a case act on a write before it reaches the store.
+const custodyWrites: {
+  before?: (part: SessionV1.Part) => Effect.Effect<void> | undefined
+  read?: (partID: string) => Effect.Effect<void> | undefined
+} = {}
+const custodyWriteSession = LayerNode.make({
+  service: Session.Service,
+  layer: Layer.effect(
+    Session.Service,
+    Effect.gen(function* () {
+      const real = yield* Session.Service
+      return Session.Service.of({
+        ...real,
+        updatePart: <T extends SessionV1.Part>(part: T) => {
+          const before = custodyWrites.before?.(part)
+          return before ? before.pipe(Effect.andThen(real.updatePart(part))) : real.updatePart(part)
+        },
+        getPart: (input) => {
+          const read = custodyWrites.read?.(input.partID)
+          return read ? read.pipe(Effect.andThen(real.getPart(input))) : real.getPart(input)
+        },
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      Session.node.implementation as Layer.Layer<
+        Session.Service,
+        never,
+        BackgroundJob.Service | RuntimeFlags.Service | Database.Service | EventV2Bridge.Service
+      >,
+    ),
+  ),
+  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
+})
+const custodyWriteDbPath = path.join(import.meta.dir, `.opencode-tool-custody-writes-${crypto.randomUUID()}.db`)
+afterAll(async () => {
+  await Promise.all(
+    [custodyWriteDbPath, `${custodyWriteDbPath}-wal`, `${custodyWriteDbPath}-shm`].map((file) =>
+      rm(file, { force: true }),
+    ),
+  )
+})
+const itCustodyWrites = testEffect(
+  LayerNode.compile(
+    LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
+    [...replacements, [Session.node, custodyWriteSession], [Database.node, Database.layerFromPath(custodyWriteDbPath)]],
+  ),
+)
+const resetCustodyWrites = Effect.addFinalizer(() =>
+  Effect.sync(() => {
+    custodyWrites.before = undefined
+    custodyWrites.read = undefined
+  }),
+)
+
+itCustodyWrites.live("settles a turn interrupted between owning a call and writing its pending part", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        yield* resetCustodyWrites
+        yield* llm.tool("probe", { value: 12 })
+        // Once the consumer has built the call's pending write, its next operation yields to the scheduler, and the
+        // consumer is interrupted at that yield: before the write, or anything composed around it, can run.
+        const yielded = Deferred.makeUnsafe<void>()
+        const base = new Scheduler.MixedScheduler()
+        let armed: Fiber.Fiber<unknown, unknown> | undefined
+        let interrupt: Fiber.Fiber<unknown, unknown> | undefined
+        const scheduler: Scheduler.Scheduler = {
+          executionMode: base.executionMode,
+          shouldYield: (fiber) => {
+            if (fiber !== armed) return base.shouldYield(fiber)
+            armed = undefined
+            interrupt = fiber
+            return true
+          },
+          makeDispatcher: () => {
+            const dispatcher = base.makeDispatcher()
+            return {
+              scheduleTask: (task, priority) => {
+                const fiber = interrupt
+                interrupt = undefined
+                if (fiber)
+                  dispatcher.scheduleTask(() => {
+                    fiber.interruptUnsafe()
+                    Deferred.doneUnsafe(yielded, Exit.void)
+                  }, priority)
+                dispatcher.scheduleTask(task, priority)
+              },
+              flush: () => dispatcher.flush(),
+            }
+          },
+        }
+        custodyWrites.before = (part) => {
+          if (part.type === "tool" && part.callID === "call_1" && part.state.status === "pending")
+            armed = Fiber.getCurrent()
+          return undefined
+        }
+        const turn = yield* custodyTurn({
+          dir,
+          dbPath: custodyWriteDbPath,
+          body: (args) => writeMarker(path.join(dir, "probe-effect"), `effect:${args.value}`),
+        })
+        // Detached, so a turn that never settles fails this case's bound instead of holding the test's scope open.
+        const run = yield* turn.process.pipe(Effect.provideService(Scheduler.Scheduler, scheduler), Effect.forkDetach)
+
+        yield* awaitWithTimeout(Deferred.await(yielded), "the consumer was never interrupted at its pending write")
+        yield* awaitWithTimeout(Fiber.await(run), "the interrupted turn never finished settling")
+        expect(storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")?.state.status ?? "absent").not.toBe("pending")
+        const message = storedAssistant(custodyWriteDbPath, turn.msg.id)
+        expect(message?.time.completed).toBeDefined()
+        expect(message?.error?.name).toBe("MessageAbortedError")
+        yield* awaitWithTimeout(
+          Effect.promise(() => Promise.all(turn.executions)),
+          "a call dispatched by the interrupted turn was left waiting for admission",
+        )
+        expect(turn.plugin).toEqual([])
+        expect(turn.body).toEqual([])
+        expect(existsSync(path.join(dir, "probe-effect"))).toBe(false)
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itCustodyWrites.live(
+  "never admits a call a failed stream attempt dispatched against the retry that reuses its call ID",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          yield* resetCustodyWrites
+          yield* llm.tool("probe", { value: 1 })
+          yield* llm.tool("probe", { value: 2 })
+          const marker = (value: number) => path.join(dir, `probe-effect-${value}`)
+          const turn = yield* custodyTurn({
+            dir,
+            dbPath: custodyWriteDbPath,
+            body: (args) => writeMarker(marker(args.value), `effect:${args.value}`),
+          })
+          // The first attempt's step start is held until the AI SDK has dispatched that attempt's call_1, then fails
+          // retryably, so the attempt ends before its consumer registers the call. The retry dispatches call_1 again.
+          let failed = false
+          custodyWrites.before = (part) => {
+            if (failed || part.type !== "step-start") return undefined
+            failed = true
+            return awaitWithTimeout(
+              Deferred.await(turn.dispatched),
+              "the first attempt never dispatched its call",
+            ).pipe(
+              Effect.andThen(
+                Effect.die(Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET", syscall: "read" })),
+              ),
+              Effect.orDie,
+            )
+          }
+
+          expect(yield* turn.process).toBe("continue")
+          expect(yield* llm.calls).toBe(2)
+          expect(
+            yield* awaitWithTimeout(
+              Effect.promise(() => Promise.all(turn.executions)),
+              "the first attempt's call was left waiting for admission",
+            ),
+          ).toEqual(["rejected", "fulfilled"])
+          const admitted = {
+            callID: "call_1",
+            stored: { callID: "call_1", state: { status: "running", input: { value: 2 } } },
+          }
+          expect(turn.plugin).toMatchObject([admitted])
+          expect(turn.body).toMatchObject([admitted])
+          expect(existsSync(marker(1))).toBe(false)
+          expect(existsSync(marker(2))).toBe(true)
+          expect(storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")).toMatchObject({
+            state: { status: "completed", input: { value: 2 }, output: "probe:2" },
+          })
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  30_000,
+)
+
+// Runs a turn whose first stream attempt fails retryably while the call_1 it admitted with { value: 1 } is still
+// executing, so the retry dispatches call_1 again with { value: 2 }. Each attempt's consumer is held at its first read of call_1's part after
+// registering the call, outside any transaction, until that attempt's own execution has entered its body: the first
+// attempt then fails, and the retry's consumer resumes only once the retry's execution has been admitted.
+const retriedCall = Effect.fn("test.retriedCall")(function* (input: {
+  dir: string
+  body: (args: { value: number }, ctx: Tool.Context) => Effect.Effect<void>
+  dispatch?: (args: { value: number }) => Effect.Effect<void>
+}) {
+  yield* resetCustodyWrites
+  const entered = [Deferred.makeUnsafe<void>(), Deferred.makeUnsafe<void>()]
+  const takenOver = Deferred.makeUnsafe<void>()
+  const turn = yield* custodyTurn({
+    dir: input.dir,
+    dbPath: custodyWriteDbPath,
+    body: (args, ctx) =>
+      Deferred.succeed(entered[args.value - 1], undefined).pipe(Effect.andThen(input.body(args, ctx))),
+    dispatch: input.dispatch,
+  })
+  let attempt = 0
+  let consumer: Fiber.Fiber<unknown, unknown> | undefined
+  let partID: string | undefined
+  let reads = 0
+  custodyWrites.before = (part) => {
+    if (part.type === "step-start") {
+      attempt++
+      consumer = Fiber.getCurrent()
+      reads = 0
+    }
+    if (part.type === "tool" && part.callID === "call_1" && part.state.status === "pending") partID = part.id
+    return undefined
+  }
+  custodyWrites.read = (read) => {
+    if (read !== partID || Fiber.getCurrent() !== consumer) return undefined
+    reads++
+    // The first attempt registers call_1 with its pending write; the retry, with the read that takes the call over.
+    if (reads !== attempt) return undefined
+    if (attempt === 1)
+      return awaitWithTimeout(Deferred.await(entered[0]), "the first attempt's execution never entered its body").pipe(
+        Effect.andThen(
+          Effect.die(Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET", syscall: "read" })),
+        ),
+        Effect.orDie,
+      )
+    Deferred.doneUnsafe(takenOver, Exit.void)
+    return awaitWithTimeout(
+      Deferred.await(entered[1]),
+      "the retry's execution never entered its body",
+      "5 seconds",
+    ).pipe(Effect.orDie)
+  }
+  // Detached, so a turn that never settles fails this case's bounds instead of holding the test's scope open.
+  const run = yield* turn.process.pipe(Effect.forkDetach)
+  return { ...turn, run, entered, takenOver }
+})
+
+itCustodyWrites.live(
+  "admits the retry of an already-admitted call with the retry's own input",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          const release = Deferred.makeUnsafe<void>()
+          const marker = (value: number) => path.join(dir, `probe-effect-${value}`)
+          yield* llm.tool("probe", { value: 1 })
+          yield* llm.tool("probe", { value: 2 })
+          const turn = yield* retriedCall({
+            dir,
+            body: (args) =>
+              (args.value === 1 ? Deferred.await(release) : Effect.void).pipe(
+                Effect.andThen(writeMarker(marker(args.value), `effect:${args.value}`)),
+              ),
+          })
+          yield* awaitWithTimeout(Deferred.await(turn.entered[1]), "the retry never executed call_1", "10 seconds")
+          const admitted = (value: number) => ({
+            callID: "call_1",
+            stored: { callID: "call_1", state: { status: "running", input: { value } } },
+          })
+          expect(turn.plugin).toMatchObject([admitted(1), admitted(2)])
+          expect(turn.body).toMatchObject([admitted(1), admitted(2)])
+          expect(turn.body[1].stored?.id).toBe(turn.body[0].stored?.id)
+          expect(yield* awaitWithTimeout(Fiber.join(turn.run), "the retried turn never finished", "5 seconds")).toBe(
+            "continue",
+          )
+          yield* Deferred.succeed(release, undefined)
+          expect(
+            yield* awaitWithTimeout(
+              Effect.promise(() => Promise.all(turn.executions)),
+              "the superseded execution never finished",
+            ),
+          ).toEqual(["fulfilled", "fulfilled"])
+          expect(existsSync(marker(1))).toBe(true)
+          expect(storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")).toMatchObject({
+            state: { status: "completed", input: { value: 2 }, output: "probe:2" },
+          })
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  30_000,
+)
+
+itCustodyWrites.live(
+  "never lets an execution a retry superseded write metadata into or complete the retried call",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          const release = [Deferred.makeUnsafe<void>(), Deferred.makeUnsafe<void>()]
+          const metadata: Exit.Exit<void>[] = []
+          const marker = (value: number) => path.join(dir, `probe-effect-${value}`)
+          yield* llm.tool("probe", { value: 1 })
+          yield* llm.tool("probe", { value: 2 })
+          const turn = yield* retriedCall({
+            dir,
+            body: (args, ctx) =>
+              Effect.gen(function* () {
+                yield* Deferred.await(release[args.value - 1])
+                if (args.value === 1)
+                  metadata.push(yield* Effect.exit(ctx.metadata({ title: "obsolete", metadata: { value: 1 } })))
+                yield* writeMarker(marker(args.value), `effect:${args.value}`)
+              }),
+          })
+          yield* awaitWithTimeout(Deferred.await(turn.entered[1]), "the retry never executed call_1", "10 seconds")
+          // The superseded execution finishes while the retry's is still running; its wrapper, whose stream attempt
+          // has ended, then tries to record its own outcome.
+          yield* Deferred.succeed(release[0], undefined)
+          expect(
+            yield* awaitWithTimeout(
+              Effect.promise(() => turn.executions[0]),
+              "the superseded execution never finished",
+            ),
+          ).toBe("fulfilled")
+          expect(metadata).toHaveLength(1)
+          expect(Exit.isFailure(metadata[0])).toBe(true)
+          const retried = storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")
+          expect(retried?.state).toMatchObject({ status: "running", input: { value: 2 } })
+          expect(retried?.state).not.toHaveProperty("title")
+          expect(retried?.state).not.toHaveProperty("metadata")
+
+          yield* Deferred.succeed(release[1], undefined)
+          expect(yield* awaitWithTimeout(Fiber.join(turn.run), "the retried turn never finished", "5 seconds")).toBe(
+            "continue",
+          )
+          expect(existsSync(marker(1))).toBe(true)
+          expect(existsSync(marker(2))).toBe(true)
+          expect(storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")).toMatchObject({
+            id: retried?.id,
+            state: { status: "completed", input: { value: 2 }, output: "probe:2" },
+          })
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  30_000,
+)
+
+itCustodyWrites.live(
+  "never lets an execution write a call a retry has taken over, even before the retry admits its own",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          const release = Deferred.makeUnsafe<void>()
+          const redispatch = Deferred.makeUnsafe<void>()
+          const metadata: Exit.Exit<void>[] = []
+          const marker = (value: number) => path.join(dir, `probe-effect-${value}`)
+          yield* llm.tool("probe", { value: 1 })
+          yield* llm.tool("probe", { value: 2 })
+          const turn = yield* retriedCall({
+            dir,
+            body: (args, ctx) =>
+              Effect.gen(function* () {
+                if (args.value === 1) {
+                  yield* Deferred.await(release)
+                  metadata.push(yield* Effect.exit(ctx.metadata({ title: "obsolete", metadata: { value: 1 } })))
+                }
+                yield* writeMarker(marker(args.value), `effect:${args.value}`)
+              }),
+            // The retry's dispatch of call_1 is held from its admission until the superseded execution has finished.
+            dispatch: (args) => (args.value === 2 ? Deferred.await(redispatch) : Effect.void),
+          })
+          yield* awaitWithTimeout(Deferred.await(turn.takenOver), "the retry never took call_1 over", "10 seconds")
+          yield* Deferred.succeed(release, undefined)
+          expect(
+            yield* awaitWithTimeout(
+              Effect.promise(() => turn.executions[0]),
+              "the superseded execution never finished",
+            ),
+          ).toBe("fulfilled")
+          expect(metadata).toHaveLength(1)
+          expect(Exit.isFailure(metadata[0])).toBe(true)
+          // The call keeps the admission record of the execution that last ran it until the retry admits its own.
+          const taken = storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")
+          expect(taken?.state).toMatchObject({ status: "running", input: { value: 1 } })
+          expect(taken?.state).not.toHaveProperty("title")
+
+          yield* Deferred.succeed(redispatch, undefined)
+          expect(yield* awaitWithTimeout(Fiber.join(turn.run), "the retried turn never finished", "5 seconds")).toBe(
+            "continue",
+          )
+          expect(turn.body).toMatchObject([
+            { callID: "call_1", stored: { state: { status: "running", input: { value: 1 } } } },
+            { callID: "call_1", stored: { state: { status: "running", input: { value: 2 } } } },
+          ])
+          expect(storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")).toMatchObject({
+            id: taken?.id,
+            state: { status: "completed", input: { value: 2 }, output: "probe:2" },
+          })
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  30_000,
+)
+
+// Runs a turn whose first stream attempt fails retryably while the call_1 it admitted with { value: 1 } is still
+// executing. Once that attempt has ended, its execution completes call_1 itself: the completion commits, but its
+// publication is held, so its writer has not yet settled the call. Only then does the retry start; it takes call_1 over
+// and rewrites it running with { value: 2 }, and only after that is its dispatch of call_1 admitted. The case releases
+// the held publication once the retry's execution has entered its body.
+const committedBeforeTakeover = Effect.fn("test.committedBeforeTakeover")(function* (input: {
+  dir: string
+  body: (ctx: Tool.Context) => Effect.Effect<void>
+}) {
+  yield* resetCustodyWrites
+  const entered = [Deferred.makeUnsafe<void>(), Deferred.makeUnsafe<void>()]
+  const rewritten = Deferred.makeUnsafe<void>()
+  const publication = yield* holdPartPublication(
+    (part) => part.callID === "call_1" && part.state.status === "completed" && part.state.output === "probe:1",
+  )
+  const turn = yield* custodyTurn({
+    dir: input.dir,
+    dbPath: custodyWriteDbPath,
+    body: (args, ctx) =>
+      Deferred.succeed(entered[args.value - 1], undefined).pipe(
+        Effect.andThen(
+          args.value === 1
+            ? awaitWithTimeout(
+                Effect.callback<void>((resume) => {
+                  if (ctx.abort.aborted) return resume(Effect.void)
+                  ctx.abort.addEventListener("abort", () => resume(Effect.void), { once: true })
+                }),
+                "the first attempt never ended",
+              ).pipe(Effect.orDie)
+            : input.body(ctx),
+        ),
+      ),
+    dispatch: (args) =>
+      args.value === 2
+        ? awaitWithTimeout(Deferred.await(rewritten), "the retry never rewrote call_1", "10 seconds").pipe(Effect.orDie)
+        : Effect.void,
+  })
+  let attempt = 0
+  let consumer: Fiber.Fiber<unknown, unknown> | undefined
+  let partID: string | undefined
+  let reads = 0
+  custodyWrites.before = (part) => {
+    if (part.type === "step-start") {
+      attempt++
+      consumer = Fiber.getCurrent()
+      if (attempt === 2)
+        return awaitWithTimeout(
+          Deferred.await(publication.committed),
+          "the first attempt's execution never committed its outcome",
+          "5 seconds",
+        ).pipe(Effect.asVoid, Effect.orDie)
+    }
+    if (part.type !== "tool" || part.callID !== "call_1") return undefined
+    if (part.state.status === "pending") partID = part.id
+    if (attempt === 2 && part.state.status === "running" && part.state.input.value === 2)
+      Deferred.doneUnsafe(rewritten, Exit.void)
+    return undefined
+  }
+  custodyWrites.read = (read) => {
+    if (attempt !== 1 || read !== partID || Fiber.getCurrent() !== consumer || ++reads !== 1) return undefined
+    return awaitWithTimeout(Deferred.await(entered[0]), "the first attempt's execution never entered its body").pipe(
+      Effect.andThen(Effect.die(Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET", syscall: "read" }))),
+      Effect.orDie,
+    )
+  }
+  // Detached, so a turn that never settles fails this case's bounds instead of holding the test's scope open.
+  const run = yield* turn.process.pipe(Effect.forkDetach)
+  yield* awaitWithTimeout(Deferred.await(entered[1]), "the retry never executed call_1", "10 seconds")
+  yield* Deferred.succeed(publication.release, undefined)
+  expect(
+    yield* awaitWithTimeout(
+      Effect.promise(() => turn.executions[0]),
+      "the first attempt's execution never finished",
+    ),
+  ).toBe("fulfilled")
+  return { ...turn, run }
+})
+
+for (const gated of [false, true])
+  itCustodyWrites.live(
+    `keeps a retry's custody when an earlier execution's outcome settles after the retry took the call over${gated ? ", for an effect gated on metadata" : ""}`,
+    () =>
+      provideTmpdirServer(
+        ({ dir, llm }) =>
+          Effect.gen(function* () {
+            const proceed = Deferred.makeUnsafe<void>()
+            const marker = path.join(dir, "probe-effect-2")
+            yield* llm.tool("probe", { value: 1 })
+            yield* llm.tool("probe", { value: 2 })
+            const turn = yield* committedBeforeTakeover({
+              dir,
+              body: (ctx) =>
+                Deferred.await(proceed).pipe(
+                  Effect.andThen(gated ? ctx.metadata({ metadata: { value: 2 } }) : Effect.void),
+                  Effect.andThen(writeMarker(marker, "effect:2")),
+                ),
+            })
+            yield* Deferred.succeed(proceed, undefined)
+            expect(yield* awaitWithTimeout(Fiber.join(turn.run), "the retried turn never finished", "5 seconds")).toBe(
+              "continue",
+            )
+            expect(
+              yield* awaitWithTimeout(
+                Effect.promise(() => turn.executions[1]),
+                "the retry never finished",
+              ),
+            ).toBe("fulfilled")
+            expect(existsSync(marker)).toBe(true)
+            expect(storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")).toMatchObject({
+              state: { status: "completed", input: { value: 2 }, output: "probe:2" },
+            })
+          }),
+        { config: (url) => providerCfg(url) },
+      ),
+    30_000,
+  )
+
+itCustodyWrites.live(
+  "settles a cancelled retry whose call an earlier execution's outcome settled after the takeover",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          yield* llm.tool("probe", { value: 1 })
+          yield* llm.tool("probe", { value: 2 })
+          const turn = yield* committedBeforeTakeover({ dir, body: () => Effect.never })
+          yield* awaitWithTimeout(Fiber.interrupt(turn.run), "the cancelled retry never finished settling")
+          expect(storedToolPart(custodyWriteDbPath, turn.msg.id, "call_1")).toMatchObject({
+            state: { status: "error", input: { value: 2 }, error: "Tool execution aborted" },
+          })
+          const message = storedAssistant(custodyWriteDbPath, turn.msg.id)
+          expect(message?.time.completed).toBeDefined()
+          expect(message?.error?.name).toBe("MessageAbortedError")
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  30_000,
+)
+
+// The native runtime consumes a tool call, which writes it running, before it dispatches the call; the dispatched
+// wrapper's admission is therefore the call's second running write.
+const admissionFault = { callID: "", running: 0 }
+const admissionFaultSession = LayerNode.make({
+  service: Session.Service,
+  layer: Layer.effect(
+    Session.Service,
+    Effect.gen(function* () {
+      const real = yield* Session.Service
+      return Session.Service.of({
+        ...real,
+        updatePart: <T extends SessionV1.Part>(part: T) => {
+          if (part.type !== "tool" || part.callID !== admissionFault.callID || part.state.status !== "running")
+            return real.updatePart(part)
+          admissionFault.running++
+          if (admissionFault.running === 2) return Effect.die(new Error("admission write refused"))
+          return real.updatePart(part)
+        },
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      Session.node.implementation as Layer.Layer<
+        Session.Service,
+        never,
+        BackgroundJob.Service | RuntimeFlags.Service | Database.Service | EventV2Bridge.Service
+      >,
+    ),
+  ),
+  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
+})
+const nativeCall = { id: "", value: 0 }
+const nativeCustodyLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: (input) => {
+      const native = LLMNativeRuntime.stream({
+        model: {
+          ...input.model,
+          providerID: ProviderV2.ID.make("openai"),
+          api: { ...input.model.api, npm: "@ai-sdk/openai" },
+        },
+        provider: {
+          id: ProviderV2.ID.make("openai"),
+          name: "OpenAI",
+          source: "config",
+          env: [],
+          options: { apiKey: "test-key" },
+          models: {},
+        },
+        auth: undefined,
+        llmClient: {
+          prepare: () => Effect.die("unused"),
+          stream: () =>
+            Stream.fromIterable([
+              LLMEvent.stepStart({ index: 0 }),
+              LLMEvent.toolCall({ id: nativeCall.id, name: "probe", input: { value: nativeCall.value } }),
+              LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+              LLMEvent.finish({ reason: "tool-calls" }),
+            ]),
+          generate: () => Effect.die("unused"),
+        } as unknown as LLMClientShape,
+        messages: [],
+        tools: input.tools,
+        headers: {},
+        abort: new AbortController().signal,
+      })
+      if (native.type === "unsupported") return Stream.die(new Error(native.reason))
+      return native.stream
+    },
+  }),
+)
+const itNativeCustody = testEffect(
+  LayerNode.compile(root, [
+    ...replacements,
+    [LLM.node, nativeCustodyLLM],
+    [Session.node, admissionFaultSession],
+    [Database.node, Database.layerFromPath(nativeCustodyDbPath)],
+  ]),
+)
+
+itNativeCustody.live("runs nothing when the native runtime dispatches a call whose admission write fails", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const run = Effect.fn("test.nativeProbe")(function* (callID: string, value: number) {
+          nativeCall.id = callID
+          nativeCall.value = value
+          const turn = yield* custodyTurn({
+            dir,
+            dbPath: nativeCustodyDbPath,
+            body: (args) => writeMarker(path.join(dir, `probe-effect-${callID}`), `effect:${args.value}`),
+          })
+          yield* turn.process
+          return { ...turn, execution: yield* Effect.promise(() => turn.executions[0]!) }
+        })
+
+        admissionFault.callID = "call-refused"
+        admissionFault.running = 0
+        const refused = yield* run("call-refused", 7)
+        expect(admissionFault.running).toBe(2)
+        expect(refused.execution).toBe("rejected")
+        expect(refused.plugin).toEqual([])
+        expect(refused.body).toEqual([])
+        expect(existsSync(path.join(dir, "probe-effect-call-refused"))).toBe(false)
+        const stored = storedToolPart(nativeCustodyDbPath, refused.msg.id, "call-refused")
+        expect(stored?.state.status).toBe("error")
+        if (stored?.state.status === "error") expect(stored.state.error).toContain("admission write refused")
+
+        // The same tool runs once its admission commits.
+        const admitted = yield* run("call-admitted", 8)
+        expect(admitted.execution).toBe("fulfilled")
+        expect(admitted.plugin).toMatchObject([
+          { callID: "call-admitted", stored: { state: { status: "running", input: { value: 8 } } } },
+        ])
+        expect(existsSync(path.join(dir, "probe-effect-call-admitted"))).toBe(true)
+        expect(storedToolPart(nativeCustodyDbPath, admitted.msg.id, "call-admitted")).toMatchObject({
+          state: { status: "completed", output: "probe:8" },
+        })
+      }),
+    { config: cfg },
   ),
 )
