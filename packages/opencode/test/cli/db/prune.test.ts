@@ -120,10 +120,11 @@ test("CLI inventory is read-only, validates the explicit cutoff, and narrows by 
 
 test("CLI apply deletes only the selected whole old Session and reclaims allocated bytes", async () => {
   await using store = await createStore()
-  const old = await produce(store, { create: { payloadBytes: 1024 * 1024 } })
+  const old = await produce(store, { create: { payloadBytes: 1024 * 1024, withdrawnV1: true } })
+  addCompleteRetentionMarker(store.filename, old.created[0]!.id)
   await Bun.sleep(25)
   const cutoff = new Date(Date.now() - 5).toISOString()
-  const recent = await produce(store, { create: { payloadBytes: 1024 * 1024 } })
+  const recent = await produce(store, { create: { payloadBytes: 1024 * 1024, withdrawnV1: true } })
   const oldID = old.created[0]!.id
   const recentID = recent.created[0]!.id
   const oldText = textParts(store.filename, oldID)
@@ -144,6 +145,10 @@ test("CLI apply deletes only the selected whole old Session and reclaims allocat
   expect(beforeOld.eventSequence).toBe(1)
   expect(beforeOld.event).toBeGreaterThan(0)
   expect(beforeOld.eventWriter).toBeGreaterThan(0)
+  expect(beforeOld.queue).toBeGreaterThan(0)
+  expect(beforeOld.queueSequence).toBe(1)
+  expect(beforeOld.receipt).toBe(1)
+  expect(beforeOld.eventRetention).toBe(1)
   const beforeAllocated = await allocatedBytes(store.filename)
   const result = runCLI(store, [
     "--before",
@@ -443,6 +448,15 @@ function textParts(filename: string, sessionID: string) {
   } finally {
     db.close()
   }
+}
+
+function addCompleteRetentionMarker(filename: string, sessionID: string) {
+  const db = new Database(filename)
+  const now = Date.now()
+  db.query(
+    "INSERT INTO event_retention (aggregate_id, state, progress_table, progress_id, evidence, time_started, time_updated) VALUES (?, 'complete', NULL, NULL, '{}', ?, ?)",
+  ).run(sessionID, now, now)
+  db.close()
 }
 
 async function createStore(): Promise<Store> {

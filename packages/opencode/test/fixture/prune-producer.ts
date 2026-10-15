@@ -33,6 +33,7 @@ const input = JSON.parse(serialized) as {
     payloadBytes?: number
     pendingV1?: boolean
     preparingV1?: boolean
+    withdrawnV1?: boolean
     pendingV2?: boolean
     unfinished?: boolean
   }
@@ -154,6 +155,15 @@ const produce = Effect.gen(function* () {
         undefined,
         true,
       )
+    }
+    if (input.create.withdrawnV1) {
+      const requested = yield* queue.request({
+        sessionID,
+        requestID: Schema.decodeSync(SessionQueue.RequestID)("prune-withdrawn"),
+        delivery: "queue",
+        parts: [{ type: "text", text: "withdrawn work retained for history" }],
+      })
+      if (requested.kind === "admitted") yield* queue.withdraw(sessionID, requested.own.id)
     }
     if (input.create.pendingV2) {
       yield* v2.prompt({ sessionID: SessionV2.ID.make(sessionID), prompt: { text: "durable pending work" }, resume: false })
