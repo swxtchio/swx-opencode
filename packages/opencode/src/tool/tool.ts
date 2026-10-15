@@ -33,6 +33,18 @@ export class InvalidArgumentsError extends Schema.TaggedErrorClass<InvalidArgume
   }
 }
 
+/**
+ * Raised, as a defect, by `Context.metadata` when the update reached no running call that its processor still owns. A
+ * tool that gates an effect on its metadata update (shell spawns after it) stops here rather than run unowned.
+ */
+export class CallNotOwnedError extends Schema.TaggedErrorClass<CallNotOwnedError>()("ToolCallNotOwnedError", {
+  callID: Schema.String,
+}) {
+  override get message() {
+    return `Tool call ${this.callID} is no longer running under its processor`
+  }
+}
+
 export type Context<M extends Metadata = Metadata> = {
   sessionID: SessionID
   messageID: MessageID

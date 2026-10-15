@@ -205,6 +205,7 @@ function fake(
       return msg
     },
     updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
+    admitToolCall: Effect.fn("TestSessionProcessor.admitToolCall")(() => Effect.die("unused")),
     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
     finalizeFailure: () => Effect.void,
     process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),

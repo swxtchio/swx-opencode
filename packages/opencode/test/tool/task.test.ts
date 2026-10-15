@@ -17,6 +17,7 @@ import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { Tool } from "@/tool/tool"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -746,6 +747,68 @@ describe("tool.task", () => {
       expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.output).toBe("background done")
       expect((yield* Deferred.await(injected)).parts[0]?.type).toBe("text")
       expect(runs).toBe(1)
+    }),
+  )
+
+  it.instance("promotes a foreground task whose call its processor has already settled", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const ready = yield* Deferred.make<void>()
+      const done = yield* Deferred.make<void>()
+      const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+      const promptOps: TaskPromptOps = {
+        cancel: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) {
+            return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
+          }
+          return Effect.gen(function* () {
+            yield* Deferred.succeed(ready, undefined)
+            yield* Deferred.await(done)
+            return reply(input, "background done")
+          })
+        },
+      }
+
+      const fiber = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            // The promotion update raises what SessionTools' metadata callback raises once the processor no longer
+            // owns the call.
+            metadata: (input) =>
+              input.metadata?.background === true
+                ? Effect.die(new Tool.CallNotOwnedError({ callID: "call-promoted" }))
+                : Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Deferred.await(ready)
+      const job = (yield* jobs.list())[0]
+      if (!job) throw new Error("task job not found")
+      expect((yield* jobs.promote(job.id))?.metadata?.background).toBe(true)
+
+      const result = yield* Fiber.join(fiber)
+      expect(result.metadata.background).toBe(true)
+      yield* Deferred.succeed(done, undefined)
+      expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.output).toBe("background done")
+      expect((yield* Deferred.await(injected)).parts[0]?.type).toBe("text")
     }),
   )
 
