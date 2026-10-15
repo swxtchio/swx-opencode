@@ -43,6 +43,28 @@ const input = JSON.parse(serialized) as {
   pendingV2?: string
   holdSessionID?: string
   hold?: boolean
+  holdAfterSignal?: { startFile: string; readyFile: string }
+}
+
+if (input.holdAfterSignal) {
+  const sqlite = await import("bun:sqlite")
+  console.log("PRUNE_HOLDER_WAITING")
+  const deadline = Date.now() + 20_000
+  while (!(await Bun.file(input.holdAfterSignal.startFile).exists())) {
+    if (Date.now() >= deadline) throw new Error("late database reader never received its start signal")
+    await Bun.sleep(5)
+  }
+  const db = new sqlite.Database(filename, { readonly: true })
+  db.query("SELECT count(*) FROM session").get()
+  await Bun.write(input.holdAfterSignal.readyFile, "ready\n")
+  console.log(`PRUNE_HOLDER_READY ${process.pid}`)
+  await new Promise<void>((resolve) => {
+    process.stdin.once("end", resolve)
+    process.stdin.once("close", resolve)
+    process.stdin.resume()
+  })
+  db.close()
+  process.exit(0)
 }
 
 const produce = Effect.gen(function* () {

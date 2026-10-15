@@ -30,6 +30,9 @@ type SessionReport = {
   reasons: string[]
 }
 
+// Keep the relationship snapshot available for revalidation without exposing it in CLI JSON.
+const parentSnapshot = Symbol("parentSnapshot")
+
 const ownedSessionTables = new Set([
   "session",
   "message",
@@ -337,7 +340,14 @@ async function inventorySnapshot(
     })
   }
 
-  const readinessReasons = [...schema.failures, ...unknownStorage, ...ownership, ...holderReasons]
+  const crossSessionOwnership = crossSessionCascadeFailures(db, [...candidates.keys()])
+  const readinessReasons = [
+    ...schema.failures,
+    ...unknownStorage,
+    ...ownership,
+    ...crossSessionOwnership,
+    ...holderReasons,
+  ]
   if (integrity.state !== "ok") readinessReasons.push(`integrity-check-${integrity.state}`)
   if (foreignKeys.state !== "ok") readinessReasons.push(`foreign-key-check-${foreignKeys.state}`)
   if (autoVacuum !== 2) readinessReasons.push(`incremental-auto-vacuum-unsupported:${autoVacuum ?? "unreadable"}`)
@@ -360,7 +370,7 @@ async function inventorySnapshot(
     },
     rawTranscriptWarning: "Applying this command permanently deletes the old raw transcripts in selected Sessions.",
     changedRows: 0,
-    parentSnapshot: parents,
+    [parentSnapshot]: parents,
   }
 }
 
@@ -386,7 +396,7 @@ async function applyPrune(
     if (!sameIDs(inventory.deletionScope.sessionIDs, current.deletionScope.sessionIDs)) {
       throw new Error("selection-changed-after-inventory")
     }
-    if (!sameParents(inventory.parentSnapshot, current.parentSnapshot)) {
+    if (!sameParents(inventory[parentSnapshot], current[parentSnapshot])) {
       throw new Error("session-relationships-changed-after-inventory")
     }
     if (!sameIDs(current.deletionScope.sessionIDs, inventory.selectedSessions.map((item) => item.sessionID))) {
@@ -404,6 +414,14 @@ async function applyPrune(
     const afterForeignKeys = foreignKeyResult(db)
     if (afterIntegrity.state !== "ok") throw new Error(`integrity-check-after-delete-${afterIntegrity.state}`)
     if (afterForeignKeys.state !== "ok") throw new Error(`foreign-key-check-after-delete-${afterForeignKeys.state}`)
+
+    const holdersBeforeCommit = scanDatabaseHolders(filename)
+    if (holdersBeforeCommit.state === "unreadable") {
+      throw new Error(`database-liveness-unreadable:${holdersBeforeCommit.reason}`)
+    }
+    if (holdersBeforeCommit.pids.length > 0) {
+      throw new Error(`database-in-use-by-process:${holdersBeforeCommit.pids.join(",")}`)
+    }
     db.exec("COMMIT")
   } catch (error) {
     if (db.inTransaction) db.exec("ROLLBACK")
@@ -415,17 +433,42 @@ async function applyPrune(
     }
   }
 
-  const checkpoint = db.query<{ busy: number }, []>("PRAGMA wal_checkpoint(TRUNCATE)").get()
+  const checkpoint = (() => {
+    try {
+      return (
+        db.query<{ busy: number }, []>("PRAGMA wal_checkpoint(TRUNCATE)").get() ?? {
+          error: "wal-checkpoint-returned-no-result",
+        }
+      )
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : "unknown" }
+    }
+  })()
   const afterAllocated = await allocatedBytes(filename)
   const beforeAllocated = inventory.reclamation.allocatedBytes
   const reclaimedBytes =
     beforeAllocated.status === "measured" && afterAllocated.status === "measured"
       ? beforeAllocated.totalBytes - afterAllocated.totalBytes
       : undefined
+  const allocatedBytesByPath = beforeAllocated.files.map((before) => {
+    const after = afterAllocated.files.find((item) => item.path === before.path)
+    const allocatedBytesBefore = before.status === "measured" ? before.allocatedBytes : null
+    const allocatedBytesAfter = after?.status === "measured" ? after.allocatedBytes : null
+    return {
+      path: before.path,
+      allocatedBytesBefore,
+      allocatedBytesAfter,
+      reclaimedBytes:
+        allocatedBytesBefore !== null && allocatedBytesAfter !== null
+          ? allocatedBytesBefore - allocatedBytesAfter
+          : null,
+    }
+  })
   const postIntegrity = integrityResult(db)
   const postForeignKeys = foreignKeyResult(db)
   const reclamationReasons = []
-  if (checkpoint?.busy !== 0) reclamationReasons.push("wal-checkpoint-did-not-complete")
+  if ("error" in checkpoint) reclamationReasons.push(`wal-checkpoint-failed:${checkpoint.error}`)
+  else if (checkpoint.busy !== 0) reclamationReasons.push("wal-checkpoint-did-not-complete")
   if (afterAllocated.status !== "measured") reclamationReasons.push("allocated-byte-measurement-after-apply-unavailable")
   if (reclaimedBytes === undefined || reclaimedBytes <= 0) reclamationReasons.push("allocated-bytes-not-reclaimed")
   if (postIntegrity.state !== "ok") reclamationReasons.push(`integrity-check-after-checkpoint-${postIntegrity.state}`)
@@ -434,6 +477,7 @@ async function applyPrune(
   return {
     ...inventory,
     action,
+    committed: true,
     changedRows,
     deletedSessionIDs: inventory.deletionScope.sessionIDs,
     reclamation: {
@@ -441,6 +485,7 @@ async function applyPrune(
       allocatedBytesBefore: beforeAllocated,
       allocatedBytesAfter: afterAllocated,
       reclaimedBytes,
+      allocatedBytesByPath,
       checkpoint,
       integrityAfter: postIntegrity,
       foreignKeysAfter: postForeignKeys,
@@ -529,6 +574,35 @@ function aggregateOwnershipFailures(db: SqliteAccess, sessionIDs: ReadonlySet<st
     }
   }
   return [...failures].toSorted()
+}
+
+function crossSessionCascadeFailures(db: SqliteAccess, sessionIDs: readonly string[]) {
+  if (sessionIDs.length === 0) return []
+  const cascadesParts = db
+    .query<{ table: string; from: string; to: string; on_delete: string }, []>("PRAGMA foreign_key_list(part)")
+    .all()
+    .some(
+      (foreignKey) =>
+        foreignKey.table === "message" &&
+        foreignKey.from === "message_id" &&
+        foreignKey.to === "id" &&
+        foreignKey.on_delete.toUpperCase() === "CASCADE",
+    )
+  if (!cascadesParts) return []
+
+  const selected = new Set(sessionIDs)
+  return db
+    .query<{ parentSessionID: string; childSessionID: string; messageID: string }, []>(
+      `SELECT message.session_id AS parentSessionID, part.session_id AS childSessionID, message.id AS messageID
+       FROM message
+       JOIN part ON part.message_id = message.id
+       WHERE message.session_id <> part.session_id
+       ORDER BY message.session_id, part.session_id, message.id`,
+    )
+    .all()
+    .filter((row) => selected.has(row.parentSessionID) && !selected.has(row.childSessionID))
+    .map((row) => `cross-session-cascade:part.message_id:${row.messageID}:${row.parentSessionID}->${row.childSessionID}`)
+    .toSorted()
 }
 
 function activityBySession(
@@ -753,7 +827,27 @@ function measurementReport(args: PruneArgs) {
 }
 
 function parseCutoff(input: string | undefined) {
-  if (!input || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(input)) return undefined
+  if (!input) return undefined
+  const match = /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.exec(input)
+  if (!match) return undefined
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const daysInMonth = [
+    31,
+    year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ][month - 1]
+  if (!daysInMonth || day < 1 || day > daysInMonth) return undefined
   const result = Date.parse(input)
   return Number.isFinite(result) && result <= Date.now() ? result : undefined
 }

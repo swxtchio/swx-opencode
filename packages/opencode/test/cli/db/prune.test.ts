@@ -1,7 +1,8 @@
 import { afterAll, expect, spyOn, test } from "bun:test"
-import { Database } from "bun:sqlite"
+import { Database, type SQLQueryBindings } from "bun:sqlite"
 import { spawnSync } from "node:child_process"
-import { chmod, copyFile, mkdir, mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises"
+import { existsSync, writeFileSync } from "node:fs"
+import { chmod, copyFile, mkdir, mkdtemp, open, readFile, realpath, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { PruneCommand } from "@/cli/cmd/db-prune"
@@ -38,7 +39,14 @@ type Report = {
     allocatedBytesBefore?: { status: string; totalBytes?: number }
     allocatedBytesAfter?: { status: string; totalBytes?: number }
     reclaimedBytes?: number
+    allocatedBytesByPath?: {
+      path: string
+      allocatedBytesBefore: number | null
+      allocatedBytesAfter: number | null
+      reclaimedBytes: number | null
+    }[]
     integrityAfter?: { state: string }
+    checkpoint?: { busy: number } | { error: string }
   }
   rawTranscriptWarning?: string
   usageMeasurement?: {
@@ -49,6 +57,7 @@ type Report = {
   }
   refusalReasons?: string[]
   changedRows: number
+  committed?: boolean
   deletedSessionIDs?: string[]
 }
 
@@ -104,6 +113,12 @@ test("CLI inventory is read-only, validates the explicit cutoff, and narrows by 
   if (inventory.status !== 0) throw new Error(`inventory CLI failed: ${inventory.stderr}\n${inventory.stdout}`)
   const report = JSON.parse(inventory.stdout) as Report
   expect(report.action).toBe("inventory")
+  expect(report.database).toBe(await realpath(store.filename))
+  expect(report).not.toHaveProperty("parentSnapshot")
+  const aliasedPath = { ...store, filename: `${store.directory}/alias/../opencode.db` }
+  const aliasedInventory = runCLI(aliasedPath, ["--before", cutoff])
+  expect(aliasedInventory.status).toBe(0)
+  expect((JSON.parse(aliasedInventory.stdout) as Report).database).toBe(await realpath(store.filename))
   expect(report.selectedSessions.map((item) => item.sessionID)).toEqual([old.created[0]!.id])
   expect(report.excludedSessions.find((item) => item.sessionID === recent.created[0]!.id)?.reasons).toContain(
     "activity-at-or-after-cutoff",
@@ -115,6 +130,10 @@ test("CLI inventory is read-only, validates the explicit cutoff, and narrows by 
   const invalid = runCLI(store, ["--before", "yesterday", "--apply"])
   expect(storedSessionIDs(store.filename)).toEqual(sessionIDsBefore)
   expect(invalid.status).toBe(1)
+  const rollover = runCLI(store, ["--before", "2026-02-30T00:00:00Z", "--apply"])
+  expect(rollover.status).toBe(1)
+  expect((JSON.parse(rollover.stdout) as Report).reclamation.reasons).toContain("invalid-or-missing-cutoff")
+  expect(storedSessionIDs(store.filename)).toEqual(sessionIDsBefore)
   const future = runCLI(store, ["--before", new Date(Date.now() + 60_000).toISOString(), "--apply"])
   expect(future.status).toBe(1)
   expect(storedSessionIDs(store.filename)).toEqual(sessionIDsBefore)
@@ -122,6 +141,45 @@ test("CLI inventory is read-only, validates the explicit cutoff, and narrows by 
   expect(absent.status).not.toBe(0)
   expect(storedSessionIDs(store.filename)).toEqual(sessionIDsBefore)
   expect(await readFile(store.filename)).toEqual(before)
+})
+
+test("a rollover date is refused even when it would otherwise select an old Session", async () => {
+  await using store = await createStore()
+  const created = await produce(store, { create: { payloadBytes: 512 * 1024 } })
+  const sessionID = created.created[0]!.id
+  const oldTime = Date.parse("2026-01-01T00:00:00Z")
+  const db = new Database(store.filename)
+  db.query("UPDATE session SET time_created = ?, time_updated = ? WHERE id = ?").run(oldTime, oldTime, sessionID)
+  db.query("UPDATE message SET time_created = ?, time_updated = ? WHERE session_id = ?").run(
+    oldTime,
+    oldTime,
+    sessionID,
+  )
+  db.query("UPDATE part SET time_created = ?, time_updated = ? WHERE session_id = ?").run(oldTime, oldTime, sessionID)
+  db.query("UPDATE todo SET time_created = ?, time_updated = ? WHERE session_id = ?").run(oldTime, oldTime, sessionID)
+  db.query("UPDATE session_message SET time_created = ?, time_updated = ? WHERE session_id = ?").run(
+    oldTime,
+    oldTime,
+    sessionID,
+  )
+  db.query("UPDATE event_aggregate_writer SET time_last_append = ? WHERE aggregate_id = ?").run(oldTime, sessionID)
+  db.close()
+  const before = ownedCounts(store.filename, sessionID)
+  expect(before.session).toBe(1)
+  expect(before.message).toBeGreaterThan(0)
+  expect(before.part).toBeGreaterThan(0)
+
+  const invalid = runCLI(store, ["--before", "2026-02-30T00:00:00Z", "--session", sessionID, "--apply"])
+  const refused = JSON.parse(invalid.stdout) as Report
+  expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+  expect(invalid.status).toBe(1)
+  expect(refused.action).toBe("refused")
+  expect(refused.reclamation.reasons).toContain("invalid-or-missing-cutoff")
+
+  const cleanControl = runCLI(store, ["--before", "2026-03-02T00:00:00Z", "--session", sessionID, "--apply"])
+  expect(cleanControl.status).toBe(0)
+  expect((JSON.parse(cleanControl.stdout) as Report).action).toBe("applied")
+  expect(ownedCounts(store.filename, sessionID).session).toBe(0)
 })
 
 test("CLI apply deletes only the selected whole old Session and reclaims allocated bytes", async () => {
@@ -175,6 +233,7 @@ test("CLI apply deletes only the selected whole old Session and reclaims allocat
   expect(report.reclamation.reclaimedBytes).toBeGreaterThan(0)
   expect(report.action).toBe("applied")
   expect(result.status).toBe(0)
+  expect(report).not.toHaveProperty("parentSnapshot")
   expect(report.deletedSessionIDs).toEqual([oldID])
   expect(report.usageMeasurement).toMatchObject({
     firstmateRun: "confirmed",
@@ -184,6 +243,20 @@ test("CLI apply deletes only the selected whole old Session and reclaims allocat
   })
   expect(report.reclamation.allocatedBytesBefore?.totalBytes).toBeGreaterThan(
     report.reclamation.allocatedBytesAfter?.totalBytes ?? Number.POSITIVE_INFINITY,
+  )
+  expect(report.reclamation.allocatedBytesByPath).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        path: store.filename,
+        allocatedBytesBefore: expect.any(Number),
+        allocatedBytesAfter: expect.any(Number),
+        reclaimedBytes: expect.any(Number),
+      }),
+    ]),
+  )
+  expect(report.reclamation.allocatedBytesByPath).toHaveLength(4)
+  expect(report.reclamation.allocatedBytesByPath?.reduce((sum, item) => sum + (item.reclaimedBytes ?? 0), 0)).toBe(
+    report.reclamation.reclaimedBytes,
   )
   expect(report.reclamation.integrityAfter?.state).toBe("ok")
   expect(ownedCounts(store.filename, oldID)).toEqual({
@@ -217,6 +290,54 @@ test("CLI apply deletes only the selected whole old Session and reclaims allocat
   } finally {
     db.close()
   }
+})
+
+test("a post-commit checkpoint failure reports committed deletions", async () => {
+  await using store = await createStore()
+  const old = await produce(store, { create: { payloadBytes: 512 * 1024 } })
+  await Bun.sleep(25)
+  const sessionID = old.created[0]!.id
+  const cutoff = new Date(Date.now() - 5).toISOString()
+  const before = ownedCounts(store.filename, sessionID)
+  const originalQuery = Database.prototype.query
+  const query = spyOn(Database.prototype, "query").mockImplementation(function <
+    ReturnType,
+    ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+  >(this: Database, statement: string) {
+    if (statement === "PRAGMA wal_checkpoint(TRUNCATE)") throw new Error("fixture-checkpoint-failure")
+    return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+  })
+  try {
+    const result = await invokeHandler(store, { before: cutoff, session: [sessionID], apply: true })
+    expect(ownedCounts(store.filename, sessionID)).toEqual({
+      ...before,
+      session: 0,
+      message: 0,
+      part: 0,
+      todo: 0,
+      sessionMessage: 0,
+      sessionInput: 0,
+      contextEpoch: 0,
+      queue: 0,
+      queueSequence: 0,
+      queueAlias: 0,
+      provenance: 0,
+      receipt: 0,
+      share: 0,
+      eventSequence: 0,
+      event: 0,
+      eventRetention: 0,
+      eventWriter: 0,
+    })
+    expect(result.report.action).toBe("failed")
+    expect(result.report.committed).toBe(true)
+    expect(result.report.changedRows).toBeGreaterThan(0)
+    expect(result.report.deletedSessionIDs).toEqual([sessionID])
+    expect(result.report.refusalReasons).toContain("wal-checkpoint-failed:fixture-checkpoint-failure")
+  } finally {
+    query.mockRestore()
+  }
+
 })
 
 test("a confirmed Firstmate run with unavailable coverage does not gate apply or invent zero usage", async () => {
@@ -302,6 +423,58 @@ test("an eligible parent never deletes a protected child, and explicit selection
   expect(result.report.excludedSessions.find((item) => item.sessionID === parentID)?.reasons).toContain(
     `protected-descendant:${childID}`,
   )
+})
+
+test("a cross-session message cascade refuses before deleting a protected Session's Part", async () => {
+  await using source = await createStore()
+  const old = await produce(source, { create: { payloadBytes: 512 * 1024 } })
+  await Bun.sleep(25)
+  const cutoff = new Date(Date.now() - 5).toISOString()
+  const protectedSession = await produce(source, { create: { payloadBytes: 128 } })
+  await using unsafe = await copyStore(source)
+  const oldID = old.created[0]!.id
+  const protectedID = protectedSession.created[0]!.id
+  const protectedPartID = protectedSession.created[0]!.partID
+  const oldMessageID = old.created[0]!.messageID
+  const db = new Database(unsafe.filename)
+  const cascade = db
+    .query<{ on_delete: string }, []>("PRAGMA foreign_key_list(part)")
+    .all()
+    .find((foreignKey) => foreignKey.on_delete.toUpperCase() === "CASCADE")
+  expect(cascade).toBeTruthy()
+  db.query("UPDATE part SET message_id = ? WHERE id = ?").run(oldMessageID, protectedPartID)
+  db.close()
+  const beforeOld = ownedCounts(unsafe.filename, oldID)
+  const beforeProtected = ownedCounts(unsafe.filename, protectedID)
+  expect(beforeOld.session).toBe(1)
+  expect(beforeOld.message).toBeGreaterThan(0)
+  expect(beforeProtected.session).toBe(1)
+  expect(beforeProtected.part).toBeGreaterThan(0)
+
+  const refused = runCLI(unsafe, ["--before", cutoff, "--session", oldID, "--apply"])
+  const report = JSON.parse(refused.stdout) as Report
+  expect(ownedCounts(unsafe.filename, protectedID)).toEqual(beforeProtected)
+  expect(ownedCounts(unsafe.filename, oldID)).toEqual(beforeOld)
+  const verify = new Database(unsafe.filename, { readonly: true })
+  try {
+    expect(verify.query("SELECT message_id FROM part WHERE id = ?").get(protectedPartID)).toEqual({
+      message_id: oldMessageID,
+    })
+  } finally {
+    verify.close()
+  }
+  expect(refused.status).toBe(1)
+  expect(report.action).toBe("refused")
+  expect(report.changedRows).toBe(0)
+  expect(report.reclamation.reasons.some((reason) => reason.startsWith("cross-session-cascade:part.message_id:"))).toBe(
+    true,
+  )
+
+  const cleanControl = runCLI(source, ["--before", cutoff, "--session", oldID, "--apply"])
+  expect(cleanControl.status).toBe(0)
+  expect((JSON.parse(cleanControl.stdout) as Report).action).toBe("applied")
+  expect(ownedCounts(source.filename, oldID).session).toBe(0)
+  expect(ownedCounts(source.filename, protectedID)).toEqual(beforeProtected)
 })
 
 test("a pending V1 queue prompt refuses explicit deletion while a clean control deletes", () =>
@@ -392,6 +565,66 @@ test("a live review hold is a liveness blocker, with a clean private control", a
   expect(controlResult.report.action).toBe("applied")
 })
 
+test("a reader that opens after deletion starts is rechecked before commit", async () => {
+  await using store = await createStore()
+  const old = await produce(store, { create: { payloadBytes: 512 * 1024 } })
+  await Bun.sleep(25)
+  const cutoff = new Date(Date.now() - 5).toISOString()
+  const sessionID = old.created[0]!.id
+  const startFile = path.join(store.directory, "late-reader-start")
+  const readyFile = path.join(store.directory, "late-reader-ready")
+  const holder = startProducer(store, { holdAfterSignal: { startFile, readyFile } })
+  try {
+    await readMatchingLine(holder.stdout, "PRUNE_HOLDER_WAITING")
+    const before = ownedCounts(store.filename, sessionID)
+    const originalExec = Database.prototype.exec
+    let readerOpened = false
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+      if (statement === "PRAGMA incremental_vacuum" && !readerOpened) {
+        readerOpened = true
+        writeFileSync(startFile, "open\n")
+        const deadline = Date.now() + 10_000
+        const wait = new Int32Array(new SharedArrayBuffer(4))
+        while (!existsSync(readyFile)) {
+          if (Date.now() >= deadline) throw new Error("late database reader did not acknowledge its open connection")
+          Atomics.wait(wait, 0, 0, 5)
+        }
+      }
+      return originalExec.call(this, statement)
+    })
+    try {
+      const result = await invokeHandler(store, { before: cutoff, session: [sessionID], apply: true })
+      expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+      expect(readerOpened).toBe(true)
+      expect(result.report.action).toBe("refused")
+      expect(result.report.changedRows).toBe(0)
+      expect(result.report.refusalReasons).toEqual(
+        expect.arrayContaining([expect.stringMatching(/database-(?:in-use-by-process|liveness-unreadable):/)]),
+      )
+    } finally {
+      exec.mockRestore()
+    }
+  } finally {
+    if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
+    await holder.stdin.write("release\n")
+    await holder.stdin.end()
+    await holder.exited
+  }
+
+  await using controlStore = await createStore()
+  const control = await produce(controlStore, { create: { payloadBytes: 512 * 1024 } })
+  await Bun.sleep(25)
+  const cleanControl = runCLI(controlStore, [
+    "--before",
+    new Date(Date.now() - 5).toISOString(),
+    "--session",
+    control.created[0]!.id,
+    "--apply",
+  ])
+  expect(cleanControl.status).toBe(0)
+  expect((JSON.parse(cleanControl.stdout) as Report).action).toBe("applied")
+})
+
 test("unreadable liveness refuses without row changes, then deletion works when evidence is readable", async () => {
   await using store = await createStore()
   const created = await produce(store, { create: { payloadBytes: 512 * 1024 } })
@@ -425,14 +658,115 @@ test("unknown aggregate ownership refuses the whole apply while its clean copy c
   db.exec("INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES ('agg_unknown', 0, NULL)")
   db.close()
   const before = ownedCounts(unsafe.filename, sessionID)
-  const refused = await invokeHandler(unsafe, { before: cutoff, session: [sessionID], apply: true })
-  expect(refused.report.action).toBe("refused")
-  expect(refused.report.changedRows).toBe(0)
-  expect(refused.report.reclamation.reasons).toContain("unknown-aggregate-owner:event_sequence:agg_unknown")
-  expect(ownedCounts(unsafe.filename, sessionID)).toEqual(before)
+  expect(before.session).toBe(1)
+  expect(before.eventSequence).toBeGreaterThan(0)
+  const orphanBefore = new Database(unsafe.filename, { readonly: true })
+  expect(count(orphanBefore, "SELECT count(*) AS rows FROM event_sequence WHERE aggregate_id = ?", "agg_unknown")).toBe(
+    1,
+  )
+  orphanBefore.close()
 
-  const control = await invokeHandler(source, { before: cutoff, session: [sessionID], apply: true })
-  expect(control.report.action).toBe("applied")
+  const refused = runCLI(unsafe, ["--before", cutoff, "--session", sessionID, "--apply"])
+  const report = JSON.parse(refused.stdout) as Report
+  expect(ownedCounts(unsafe.filename, sessionID)).toEqual(before)
+  const orphanAfter = new Database(unsafe.filename, { readonly: true })
+  expect(count(orphanAfter, "SELECT count(*) AS rows FROM event_sequence WHERE aggregate_id = ?", "agg_unknown")).toBe(
+    1,
+  )
+  orphanAfter.close()
+  expect(refused.status).toBe(1)
+  expect(report.action).toBe("refused")
+  expect(report.changedRows).toBe(0)
+  expect(report.reclamation.reasons).toContain("unknown-aggregate-owner:event_sequence:agg_unknown")
+
+  const control = runCLI(source, ["--before", cutoff, "--session", sessionID, "--apply"])
+  expect(control.status).toBe(0)
+  expect((JSON.parse(control.stdout) as Report).action).toBe("applied")
+  expect(ownedCounts(source.filename, sessionID).session).toBe(0)
+})
+
+test("unclassified Session storage refuses without changing populated rows and a clean control deletes", async () => {
+  await using source = await createStore()
+  const created = await produce(source, { create: { payloadBytes: 512 * 1024 } })
+  await Bun.sleep(25)
+  const cutoff = new Date(Date.now() - 5).toISOString()
+  await using unsafe = await copyStore(source)
+  const sessionID = created.created[0]!.id
+  const storage = new Database(unsafe.filename)
+  storage.exec("CREATE TABLE plugin_session_storage (session_id TEXT NOT NULL, value TEXT NOT NULL)")
+  storage.query("INSERT INTO plugin_session_storage (session_id, value) VALUES (?, ?)").run(sessionID, "retained")
+  storage.close()
+
+  const before = ownedCounts(unsafe.filename, sessionID)
+  expect(before.session).toBe(1)
+  expect(before.message).toBeGreaterThan(0)
+  expect(before.part).toBeGreaterThan(0)
+  const storageBefore = new Database(unsafe.filename, { readonly: true })
+  expect(
+    count(storageBefore, "SELECT count(*) AS rows FROM plugin_session_storage WHERE session_id = ?", sessionID),
+  ).toBe(1)
+  storageBefore.close()
+
+  const refused = runCLI(unsafe, ["--before", cutoff, "--session", sessionID, "--apply"])
+  const report = JSON.parse(refused.stdout) as Report
+  expect(ownedCounts(unsafe.filename, sessionID)).toEqual(before)
+  const storageAfter = new Database(unsafe.filename, { readonly: true })
+  expect(
+    count(storageAfter, "SELECT count(*) AS rows FROM plugin_session_storage WHERE session_id = ?", sessionID),
+  ).toBe(1)
+  storageAfter.close()
+  expect(refused.status).toBe(1)
+  expect(report.action).toBe("refused")
+  expect(report.changedRows).toBe(0)
+  expect(report.reclamation.reasons).toContain("unclassified-session-storage:plugin_session_storage")
+
+  const cleanControl = runCLI(source, ["--before", cutoff, "--session", sessionID, "--apply"])
+  expect(cleanControl.status).toBe(0)
+  expect((JSON.parse(cleanControl.stdout) as Report).action).toBe("applied")
+  expect(ownedCounts(source.filename, sessionID).session).toBe(0)
+})
+
+test("an unknown durable event owner refuses with its populated event row intact and a clean control deletes", async () => {
+  await using source = await createStore()
+  const created = await produce(source, { create: { payloadBytes: 512 * 1024 } })
+  await Bun.sleep(25)
+  const cutoff = new Date(Date.now() - 5).toISOString()
+  await using unsafe = await copyStore(source)
+  const sessionID = created.created[0]!.id
+  const unknownType = "fixture.unknown.durable.owner"
+  const db = new Database(unsafe.filename)
+  const nextSequence = db
+    .query<{ seq: number }, [string]>("SELECT coalesce(max(seq), 0) + 1 AS seq FROM event WHERE aggregate_id = ?")
+    .get(sessionID)!.seq
+  db.query("INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)").run(
+    "unknown-owner-event",
+    sessionID,
+    nextSequence,
+    unknownType,
+    "{}",
+  )
+  db.close()
+  const before = ownedCounts(unsafe.filename, sessionID)
+  expect(before.session).toBe(1)
+  expect(before.event).toBeGreaterThan(0)
+  const unknownBefore = new Database(unsafe.filename, { readonly: true })
+  expect(count(unknownBefore, "SELECT count(*) AS rows FROM event WHERE type = ?", unknownType)).toBe(1)
+  unknownBefore.close()
+
+  const refused = runCLI(unsafe, ["--before", cutoff, "--session", sessionID, "--apply"])
+  const report = JSON.parse(refused.stdout) as Report
+  expect(ownedCounts(unsafe.filename, sessionID)).toEqual(before)
+  const unknownAfter = new Database(unsafe.filename, { readonly: true })
+  expect(count(unknownAfter, "SELECT count(*) AS rows FROM event WHERE type = ?", unknownType)).toBe(1)
+  unknownAfter.close()
+  expect(refused.status).toBe(1)
+  expect(report.action).toBe("refused")
+  expect(report.changedRows).toBe(0)
+  expect(report.reclamation.reasons).toContain(`unknown-durable-event-owner:${unknownType}`)
+
+  const cleanControl = runCLI(source, ["--before", cutoff, "--session", sessionID, "--apply"])
+  expect(cleanControl.status).toBe(0)
+  expect((JSON.parse(cleanControl.stdout) as Report).action).toBe("applied")
   expect(ownedCounts(source.filename, sessionID).session).toBe(0)
 })
 
@@ -445,14 +779,28 @@ test("a failed integrity check refuses with zero rows changed and the clean cont
   const sessionID = created.created[0]!.id
   await corruptSecondaryIndex(unsafe.filename)
   const before = ownedCounts(unsafe.filename, sessionID)
-  const refused = await invokeHandler(unsafe, { before: cutoff, session: [sessionID], apply: true })
-  expect(refused.report.action).toBe("refused")
-  expect(refused.report.changedRows).toBe(0)
-  expect(refused.report.reclamation.reasons).toContain("integrity-check-unreadable")
-  expect(ownedCounts(unsafe.filename, sessionID)).toEqual(before)
+  expect(before.session).toBe(1)
+  expect(before.message).toBeGreaterThan(0)
+  expect(before.part).toBeGreaterThan(0)
+  expect(before.eventSequence).toBeGreaterThan(0)
+  const fixtureBefore = new Database(unsafe.filename, { readonly: true })
+  expect(fixtureBefore.query("SELECT count(*) AS rows FROM prune_integrity_fixture").get()).toEqual({ rows: 1 })
+  fixtureBefore.close()
 
-  const control = await invokeHandler(source, { before: cutoff, session: [sessionID], apply: true })
-  expect(control.report.action).toBe("applied")
+  const refused = runCLI(unsafe, ["--before", cutoff, "--session", sessionID, "--apply"])
+  const report = JSON.parse(refused.stdout) as Report
+  expect(ownedCounts(unsafe.filename, sessionID)).toEqual(before)
+  const fixtureAfter = new Database(unsafe.filename, { readonly: true })
+  expect(fixtureAfter.query("SELECT count(*) AS rows FROM prune_integrity_fixture").get()).toEqual({ rows: 1 })
+  fixtureAfter.close()
+  expect(refused.status).toBe(1)
+  expect(report.action).toBe("refused")
+  expect(report.changedRows).toBe(0)
+  expect(report.reclamation.reasons.some((reason) => reason.startsWith("integrity-check-"))).toBe(true)
+
+  const control = runCLI(source, ["--before", cutoff, "--session", sessionID, "--apply"])
+  expect(control.status).toBe(0)
+  expect((JSON.parse(control.stdout) as Report).action).toBe("applied")
   expect(ownedCounts(source.filename, sessionID).session).toBe(0)
 })
 
@@ -663,13 +1011,20 @@ async function allocatedBytes(filename: string) {
 }
 
 async function corruptSecondaryIndex(filename: string) {
-  const db = new Database(filename, { readonly: true })
+  const db = new Database(filename)
+  db.exec(
+    "CREATE TABLE prune_integrity_fixture (value TEXT NOT NULL); CREATE INDEX prune_integrity_fixture_value_idx ON prune_integrity_fixture(value)",
+  )
+  db.query("INSERT INTO prune_integrity_fixture (value) VALUES (?)").run("present")
   const index = db
-    .query<{ rootpage: number }, []>("SELECT rootpage FROM sqlite_master WHERE type = 'index' AND name = 'session_project_idx'")
+    .query<
+      { rootpage: number },
+      []
+    >("SELECT rootpage FROM sqlite_master WHERE type = 'index' AND name = 'prune_integrity_fixture_value_idx'")
     .get()
   const pageSize = db.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size
   db.close()
-  if (!index) throw new Error("production Session index was not created")
+  if (!index) throw new Error("integrity fixture index was not created")
   const file = await open(filename, "r+")
   await file.write(Buffer.from([0]), 0, 1, (index.rootpage - 1) * pageSize)
   await file.sync()
