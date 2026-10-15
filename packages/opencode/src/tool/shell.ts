@@ -310,6 +310,9 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
     env,
     stdin: "ignore",
     detached: process.platform !== "win32",
+    // The spawner's scope release only sends SIGTERM unless this is set, so a command that ignores it would hold an
+    // interrupted or failed run open forever.
+    forceKillAfter: "3 seconds",
   })
 }
 const parser = lazy(async () => {
@@ -576,9 +579,9 @@ export const ShellTool = Tool.define(
           if (exit.kind === "abort") aborted = true
           if (exit.kind === "timeout") expired = true
           if (exit.kind !== "exit") {
-            // Processor cleanup may settle a still-running part from the store before this run returns.
-            yield* flush
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            // Processor cleanup may settle a still-running part from the store before this run returns. Once it has,
+            // the flush is refused, and the kill must still run.
+            yield* flush.pipe(Effect.ensuring(handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)))
           }
 
           return exit.kind === "exit" ? exit.code : null

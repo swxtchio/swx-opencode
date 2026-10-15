@@ -70,6 +70,8 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#266** Settle SDK tool-call custody durably before effects (swxtchio/swx-opencode#234): admitted tool writes are keyed on their execution rather than the raw call ID, so a retry that reuses a call ID can no longer adopt the failed attempt's admitted part; a tool call settles only for the owner that committed its outcome, an earlier outcome's publication is held across a retry's takeover, and V1 tool custody is pinned at its lifecycle boundaries. Cancelling after dispatch leaves no pending orphan. A shell command that ignores SIGTERM is force-killed when its run is aborted or interrupted, even after the call was settled elsewhere and its output write is refused (swxtchio/swx-opencode#267).
+
 - **#262** Route only configured Google Gemini 3.8+ models that migrate from the OpenAI-compatible entry through native Google generation. Translate model and agent effort options, preserve already-native models, and omit the unsupported `minimal` variant (swxtchio/swx-opencode#259). _Fork-only._
 
 - **#260** Write the shell tool's running output at most once per 500 ms instead of once per output chunk

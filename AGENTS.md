@@ -208,6 +208,19 @@ const table = sqliteTable("session", {
 
 - At eligible V1 delivery boundaries, deliver validated peers before automation, at most ten complete numbered constituents per batch. Coalesce validated automation by type and latest admitted text for an identified episode, explicitly as historical provenance rather than a current measurement, preserving distinct duties and original text-part constituent metadata. Keep native/unknown requests individual, critical steers immediate, and model/variant selection recipient-owned at committed promotion. See `docs/v1-queue-dispatch.md`.
 
+## V1 Tool Execution (fork)
+
+- A local V1 tool runs only after `SessionProcessor.admitToolCall` has durably marked its owned part running (#234).
+  Every execute wrapper in `session/tools.ts` admits before its plugin hook or body, and writes metadata and its outcome
+  only through the `Admission` that returns; a new wrapper must too. The AI SDK dispatches without waiting for the
+  processor, so admission waits for the consumer's registration, never creates the part, and is bound to its stream
+  attempt. A retry that reuses a call ID takes the call over: an execution an earlier attempt admitted can no longer
+  write or settle it, and the retry's admission records its own input. A running part records the latest admission,
+  not that the effect happened.
+- Tool part read-modify-writes in `processor.ts` run in one immediate transaction (`withToolCall`), never under an
+  in-memory lock: a lock held across `Session.updatePart` also waits on event listeners, so cancellation cleanup would
+  wait on another fiber's publication.
+
 ## Session Retention (fork)
 
 - `opencode db retention` (`packages/opencode/src/cli/cmd/db-retention.ts`) redacts inactive Session trees only when every gate in `candidateFailures` passes, re-checked inside each batch's write lock.

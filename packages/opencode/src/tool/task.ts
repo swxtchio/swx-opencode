@@ -287,10 +287,18 @@ export const TaskTool = Tool.define(
         title: params.description,
         metadata,
         onPromote: Effect.all([
-          ctx.metadata({
-            title: params.description,
-            metadata: { ...metadata, background: true, jobId: nextSession.id },
-          }),
+          ctx
+            .metadata({
+              title: params.description,
+              metadata: { ...metadata, background: true, jobId: nextSession.id },
+            })
+            .pipe(
+              // Promotion also returns the background result, whose completion can settle the call first; it
+              // carries this same metadata.
+              Effect.catchDefect((defect) =>
+                defect instanceof Tool.CallNotOwnedError ? Effect.void : Effect.die(defect),
+              ),
+            ),
           notify(nextSession.id),
         ]),
         run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
