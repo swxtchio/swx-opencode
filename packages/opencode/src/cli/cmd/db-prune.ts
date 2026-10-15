@@ -600,7 +600,7 @@ function crossSessionCascadeFailures(db: SqliteAccess, sessionIDs: readonly stri
        ORDER BY message.session_id, part.session_id, message.id`,
     )
     .all()
-    .filter((row) => selected.has(row.parentSessionID) && !selected.has(row.childSessionID))
+    .filter((row) => selected.has(row.parentSessionID) !== selected.has(row.childSessionID))
     .map((row) => `cross-session-cascade:part.message_id:${row.messageID}:${row.parentSessionID}->${row.childSessionID}`)
     .toSorted()
 }
@@ -828,11 +828,12 @@ function measurementReport(args: PruneArgs) {
 
 function parseCutoff(input: string | undefined) {
   if (!input) return undefined
-  const match = /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.exec(input)
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.exec(input)
   if (!match) return undefined
   const year = Number(match[1])
   const month = Number(match[2])
   const day = Number(match[3])
+  const hour = Number(match[4])
   const daysInMonth = [
     31,
     year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28,
@@ -847,7 +848,7 @@ function parseCutoff(input: string | undefined) {
     30,
     31,
   ][month - 1]
-  if (!daysInMonth || day < 1 || day > daysInMonth) return undefined
+  if (!daysInMonth || day < 1 || day > daysInMonth || hour > 23) return undefined
   const result = Date.parse(input)
   return Number.isFinite(result) && result <= Date.now() ? result : undefined
 }

@@ -4,8 +4,11 @@ import { spawnSync } from "node:child_process"
 import { existsSync, writeFileSync } from "node:fs"
 import { chmod, copyFile, mkdir, mkdtemp, open, readFile, realpath, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
+import { Effect } from "effect"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { PruneCommand } from "@/cli/cmd/db-prune"
+import { MessageV2 } from "@/session/message-v2"
+import { MessageID, SessionID } from "@/session/schema"
 
 const packageRoot = path.resolve(import.meta.dir, "../../..")
 const worktreeRoot = path.resolve(packageRoot, "../..")
@@ -45,6 +48,7 @@ type Report = {
       allocatedBytesAfter: number | null
       reclaimedBytes: number | null
     }[]
+    integrity?: { state: string; details: string[] }
     integrityAfter?: { state: string }
     checkpoint?: { busy: number } | { error: string }
   }
@@ -143,27 +147,12 @@ test("CLI inventory is read-only, validates the explicit cutoff, and narrows by 
   expect(await readFile(store.filename)).toEqual(before)
 })
 
-test("a rollover date is refused even when it would otherwise select an old Session", async () => {
+test("rollover dates and hours are refused even when they would otherwise select an old Session", async () => {
   await using store = await createStore()
   const created = await produce(store, { create: { payloadBytes: 512 * 1024 } })
   const sessionID = created.created[0]!.id
   const oldTime = Date.parse("2026-01-01T00:00:00Z")
-  const db = new Database(store.filename)
-  db.query("UPDATE session SET time_created = ?, time_updated = ? WHERE id = ?").run(oldTime, oldTime, sessionID)
-  db.query("UPDATE message SET time_created = ?, time_updated = ? WHERE session_id = ?").run(
-    oldTime,
-    oldTime,
-    sessionID,
-  )
-  db.query("UPDATE part SET time_created = ?, time_updated = ? WHERE session_id = ?").run(oldTime, oldTime, sessionID)
-  db.query("UPDATE todo SET time_created = ?, time_updated = ? WHERE session_id = ?").run(oldTime, oldTime, sessionID)
-  db.query("UPDATE session_message SET time_created = ?, time_updated = ? WHERE session_id = ?").run(
-    oldTime,
-    oldTime,
-    sessionID,
-  )
-  db.query("UPDATE event_aggregate_writer SET time_last_append = ? WHERE aggregate_id = ?").run(oldTime, sessionID)
-  db.close()
+  backdateSession(store.filename, sessionID, oldTime)
   const before = ownedCounts(store.filename, sessionID)
   expect(before.session).toBe(1)
   expect(before.message).toBeGreaterThan(0)
@@ -175,6 +164,11 @@ test("a rollover date is refused even when it would otherwise select an old Sess
   expect(invalid.status).toBe(1)
   expect(refused.action).toBe("refused")
   expect(refused.reclamation.reasons).toContain("invalid-or-missing-cutoff")
+
+  const invalidHour = runCLI(store, ["--before", "2026-03-02T24:00:00Z", "--session", sessionID, "--apply"])
+  expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+  expect(invalidHour.status).toBe(1)
+  expect((JSON.parse(invalidHour.stdout) as Report).reclamation.reasons).toContain("invalid-or-missing-cutoff")
 
   const cleanControl = runCLI(store, ["--before", "2026-03-02T00:00:00Z", "--session", sessionID, "--apply"])
   expect(cleanControl.status).toBe(0)
@@ -477,6 +471,60 @@ test("a cross-session message cascade refuses before deleting a protected Sessio
   expect(ownedCounts(source.filename, protectedID)).toEqual(beforeProtected)
 })
 
+test("a selected Part linked to an unselected Message refuses and preserves MessageV2 output", async () => {
+  await using source = await createStore()
+  const selected = produce(source, { create: { payloadBytes: 512 * 1024 } })
+  const retained = produce(source, { create: { payloadBytes: 128 } })
+  const selectedID = selected.created[0]!.id
+  const retainedID = retained.created[0]!.id
+  const retainedMessageID = retained.created[0]!.messageID
+  const cutoff = "2026-03-02T00:00:00Z"
+  const oldTime = Date.parse("2026-01-01T00:00:00Z")
+  backdateSession(source.filename, selectedID, oldTime)
+  await using unsafe = await copyStore(source)
+  produce(unsafe, { crossPart: { sessionID: selectedID, messageID: retainedMessageID } })
+  backdateSession(unsafe.filename, selectedID, oldTime)
+  const retainedMessage = {
+    sessionID: SessionID.make(retainedID),
+    messageID: MessageID.make(retainedMessageID),
+  }
+  const coreDatabase = await import("@opencode-ai/core/database/database")
+  const readParts = (filename: string) =>
+    Effect.runPromise(
+      Effect.scoped(
+        MessageV2.get(retainedMessage).pipe(
+          Effect.map((message) => message.parts),
+          Effect.provide(coreDatabase.Database.layerFromPath(filename)),
+        ),
+      ),
+    )
+  const cleanPartsBefore = await readParts(source.filename)
+  expect(cleanPartsBefore).toHaveLength(1)
+  const beforeParts = await readParts(unsafe.filename)
+  expect(beforeParts).toHaveLength(2)
+  expect(beforeParts.some((part) => part.sessionID === selectedID)).toBe(true)
+  const beforeSelected = ownedCounts(unsafe.filename, selectedID)
+  const beforeRetained = ownedCounts(unsafe.filename, retainedID)
+
+  const refused = runCLI(unsafe, ["--before", cutoff, "--session", selectedID, "--apply"])
+  const report = JSON.parse(refused.stdout) as Report
+  expect(await readParts(unsafe.filename)).toEqual(beforeParts)
+  expect(ownedCounts(unsafe.filename, selectedID)).toEqual(beforeSelected)
+  expect(ownedCounts(unsafe.filename, retainedID)).toEqual(beforeRetained)
+  expect(refused.status).toBe(1)
+  expect(report.action).toBe("refused")
+  expect(report.changedRows).toBe(0)
+  expect(report.reclamation.reasons.some((reason) => reason.startsWith("cross-session-cascade:part.message_id:"))).toBe(
+    true,
+  )
+
+  const cleanControl = runCLI(source, ["--before", cutoff, "--session", selectedID, "--apply"])
+  expect(cleanControl.status).toBe(0)
+  expect((JSON.parse(cleanControl.stdout) as Report).deletedSessionIDs).toEqual([selectedID])
+  expect(await readParts(source.filename)).toEqual(cleanPartsBefore)
+  expect(ownedCounts(source.filename, retainedID)).toEqual(beforeRetained)
+})
+
 test("a pending V1 queue prompt refuses explicit deletion while a clean control deletes", () =>
   verifyPendingWork({ pendingV1: true }, "v1-prompt-pending-or-in-custody"),
 )
@@ -492,6 +540,55 @@ test("a durable V2 input refuses explicit deletion while a clean control deletes
 test("an unfinished assistant turn refuses explicit deletion while a clean control deletes", () =>
   verifyPendingWork({ unfinished: true }, "assistant-or-tool-work-in-flight"),
 )
+
+test("a persisted running tool Part stays protected after its assistant turn completes", async () => {
+  await using store = await createStore()
+  const protectedSession = produce(store, { create: { runningTool: true } })
+  const control = produce(store, { create: {} })
+  const protectedID = protectedSession.created[0]!.id
+  const controlID = control.created[0]!.id
+  const oldTime = Date.parse("2026-01-01T00:00:00Z")
+  backdateSession(store.filename, protectedID, oldTime)
+  backdateSession(store.filename, controlID, oldTime)
+
+  const before = ownedCounts(store.filename, protectedID)
+  expect(before.session).toBe(1)
+  expect(before.part).toBeGreaterThan(0)
+  const db = new Database(store.filename, { readonly: true })
+  const assistant = db
+    .query<{ data: string }, [string]>(
+      "SELECT data FROM message WHERE session_id = ? AND json_extract(data, '$.role') = 'assistant'",
+    )
+    .get(protectedID)
+  const tool = db
+    .query<{ data: string }, [string]>(
+      "SELECT data FROM part WHERE session_id = ? AND json_extract(data, '$.type') = 'tool'",
+    )
+    .get(protectedID)
+  db.close()
+  expect(assistant && JSON.parse(assistant.data)).toMatchObject({ time: { completed: expect.any(Number) } })
+  expect(tool && JSON.parse(tool.data)).toMatchObject({
+    type: "tool",
+    callID: "prune-custody-fixture",
+    state: { status: "running" },
+  })
+
+  const cutoff = "2026-03-02T00:00:00Z"
+  const refused = runCLI(store, ["--before", cutoff, "--session", protectedID, "--apply"])
+  const report = JSON.parse(refused.stdout) as Report
+  expect(ownedCounts(store.filename, protectedID)).toEqual(before)
+  expect(refused.status).toBe(1)
+  expect(report.action).toBe("refused")
+  expect(report.excludedSessions.find((item) => item.sessionID === protectedID)?.reasons).toContain(
+    "assistant-or-tool-work-in-flight",
+  )
+
+  const cleanControl = runCLI(store, ["--before", cutoff, "--session", controlID, "--apply"])
+  expect(cleanControl.status).toBe(0)
+  expect((JSON.parse(cleanControl.stdout) as Report).deletedSessionIDs).toEqual([controlID])
+  expect(ownedCounts(store.filename, controlID).session).toBe(0)
+  expect(ownedCounts(store.filename, protectedID)).toEqual(before)
+})
 
 test("a pending prompt added after inventory is revalidated before the first deletion", async () => {
   await using store = await createStore()
@@ -726,6 +823,58 @@ test("unclassified Session storage refuses without changing populated rows and a
   expect(ownedCounts(source.filename, sessionID).session).toBe(0)
 })
 
+test("unclassified message-linked storage is refused through indirect foreign-key ownership", async () => {
+  await using source = await createStore()
+  const created = produce(source, { create: { payloadBytes: 512 * 1024 } })
+  await Bun.sleep(25)
+  const cutoff = new Date(Date.now() - 5).toISOString()
+  await using unsafe = await copyStore(source)
+  const sessionID = created.created[0]!.id
+  const messageID = created.created[0]!.messageID
+  const db = new Database(unsafe.filename)
+  db.exec(`
+    CREATE TABLE plugin_message_storage (
+      id TEXT PRIMARY KEY,
+      message_id TEXT NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+      time_created INTEGER NOT NULL,
+      data TEXT NOT NULL
+    )
+  `)
+  db.query("INSERT INTO plugin_message_storage (id, message_id, time_created, data) VALUES (?, ?, ?, ?)").run(
+    "message-linked-fixture",
+    messageID,
+    Date.now(),
+    "{}",
+  )
+  db.close()
+  const before = ownedCounts(unsafe.filename, sessionID)
+  expect(before.session).toBe(1)
+  expect(before.message).toBeGreaterThan(0)
+  const fixtureBefore = new Database(unsafe.filename, { readonly: true })
+  expect(
+    count(fixtureBefore, "SELECT count(*) AS rows FROM plugin_message_storage WHERE id = ?", "message-linked-fixture"),
+  ).toBe(1)
+  fixtureBefore.close()
+
+  const refused = runCLI(unsafe, ["--before", cutoff, "--session", sessionID, "--apply"])
+  const report = JSON.parse(refused.stdout) as Report
+  expect(ownedCounts(unsafe.filename, sessionID)).toEqual(before)
+  const fixtureAfter = new Database(unsafe.filename, { readonly: true })
+  expect(
+    count(fixtureAfter, "SELECT count(*) AS rows FROM plugin_message_storage WHERE id = ?", "message-linked-fixture"),
+  ).toBe(1)
+  fixtureAfter.close()
+  expect(refused.status).toBe(1)
+  expect(report.action).toBe("refused")
+  expect(report.changedRows).toBe(0)
+  expect(report.reclamation.reasons).toContain("unclassified-session-storage:plugin_message_storage")
+
+  const cleanControl = runCLI(source, ["--before", cutoff, "--session", sessionID, "--apply"])
+  expect(cleanControl.status).toBe(0)
+  expect((JSON.parse(cleanControl.stdout) as Report).action).toBe("applied")
+  expect(ownedCounts(source.filename, sessionID).session).toBe(0)
+})
+
 test("an unknown durable event owner refuses with its populated event row intact and a clean control deletes", async () => {
   await using source = await createStore()
   const created = await produce(source, { create: { payloadBytes: 512 * 1024 } })
@@ -796,7 +945,9 @@ test("a failed integrity check refuses with zero rows changed and the clean cont
   expect(refused.status).toBe(1)
   expect(report.action).toBe("refused")
   expect(report.changedRows).toBe(0)
-  expect(report.reclamation.reasons.some((reason) => reason.startsWith("integrity-check-"))).toBe(true)
+  expect(report.reclamation.integrity).toMatchObject({ state: "failed" })
+  expect(report.reclamation.integrity?.details.some((detail) => detail.includes("missing from index"))).toBe(true)
+  expect(report.reclamation.reasons).toContain("integrity-check-failed")
 
   const control = runCLI(source, ["--before", cutoff, "--session", sessionID, "--apply"])
   expect(control.status).toBe(0)
@@ -859,6 +1010,63 @@ function addCompleteRetentionMarker(filename: string, sessionID: string) {
     "INSERT INTO event_retention (aggregate_id, state, progress_table, progress_id, evidence, time_started, time_updated) VALUES (?, 'complete', NULL, NULL, '{}', ?, ?)",
   ).run(sessionID, now, now)
   db.close()
+}
+
+function backdateSession(filename: string, sessionID: string, timestamp: number) {
+  const db = new Database(filename)
+  try {
+    db.query("UPDATE session SET time_created = ?, time_updated = ? WHERE id = ?").run(timestamp, timestamp, sessionID)
+    db.query("UPDATE message SET time_created = ?, time_updated = ? WHERE session_id = ?").run(
+      timestamp,
+      timestamp,
+      sessionID,
+    )
+    db.query("UPDATE part SET time_created = ?, time_updated = ? WHERE session_id = ?").run(
+      timestamp,
+      timestamp,
+      sessionID,
+    )
+    db.query("UPDATE todo SET time_created = ?, time_updated = ? WHERE session_id = ?").run(
+      timestamp,
+      timestamp,
+      sessionID,
+    )
+    db.query("UPDATE session_message SET time_created = ?, time_updated = ? WHERE session_id = ?").run(
+      timestamp,
+      timestamp,
+      sessionID,
+    )
+    db.query("UPDATE session_input SET time_created = ? WHERE session_id = ?").run(timestamp, sessionID)
+    db.query(
+      `UPDATE session_prompt_queue
+       SET time_created = ?,
+         time_promoted = CASE WHEN time_promoted IS NULL THEN NULL ELSE ? END,
+         time_withdrawn = CASE WHEN time_withdrawn IS NULL THEN NULL ELSE ? END,
+         time_preparing = CASE WHEN time_preparing IS NULL THEN NULL ELSE ? END
+       WHERE session_id = ?`,
+    ).run(timestamp, timestamp, timestamp, timestamp, sessionID)
+    db.query("UPDATE session_prompt_receipt SET time_created = ?, time_updated = ? WHERE session_id = ?").run(
+      timestamp,
+      timestamp,
+      sessionID,
+    )
+    db.query("UPDATE session_share SET time_created = ?, time_updated = ? WHERE session_id = ?").run(
+      timestamp,
+      timestamp,
+      sessionID,
+    )
+    db.query("UPDATE event_retention SET time_started = ?, time_updated = ? WHERE aggregate_id = ?").run(
+      timestamp,
+      timestamp,
+      sessionID,
+    )
+    db.query("UPDATE event_aggregate_writer SET time_last_append = ? WHERE aggregate_id = ?").run(
+      timestamp,
+      sessionID,
+    )
+  } finally {
+    db.close()
+  }
 }
 
 async function createStore(): Promise<Store> {
@@ -1015,7 +1223,7 @@ async function corruptSecondaryIndex(filename: string) {
   db.exec(
     "CREATE TABLE prune_integrity_fixture (value TEXT NOT NULL); CREATE INDEX prune_integrity_fixture_value_idx ON prune_integrity_fixture(value)",
   )
-  db.query("INSERT INTO prune_integrity_fixture (value) VALUES (?)").run("present")
+  db.query("INSERT INTO prune_integrity_fixture (value) VALUES (?)").run("zzzzzzz")
   const index = db
     .query<
       { rootpage: number },
@@ -1023,10 +1231,19 @@ async function corruptSecondaryIndex(filename: string) {
     >("SELECT rootpage FROM sqlite_master WHERE type = 'index' AND name = 'prune_integrity_fixture_value_idx'")
     .get()
   const pageSize = db.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size
+  const checkpoint = db.query<{ busy: number }, []>("PRAGMA wal_checkpoint(TRUNCATE)").get()
   db.close()
   if (!index) throw new Error("integrity fixture index was not created")
+  if (checkpoint?.busy !== 0) throw new Error("integrity fixture checkpoint did not complete")
+  const bytes = await readFile(filename)
+  const pageStart = (index.rootpage - 1) * pageSize
+  const position = bytes.indexOf(Buffer.from("zzzzzzz"), pageStart)
+  if (position < pageStart || position >= pageStart + pageSize) {
+    throw new Error("integrity fixture index key was not found")
+  }
   const file = await open(filename, "r+")
-  await file.write(Buffer.from([0]), 0, 1, (index.rootpage - 1) * pageSize)
+  // Keep the B-tree readable while making its lone index key disagree with the table row.
+  await file.write(Buffer.from("aaaaaaa"), 0, 7, position)
   await file.sync()
   await file.close()
 }

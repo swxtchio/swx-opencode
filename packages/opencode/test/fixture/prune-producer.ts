@@ -22,7 +22,7 @@ import { InstanceBootstrap } from "@/project/bootstrap"
 import { Session } from "@/session/session"
 import { SessionQueue } from "@/session/queue"
 import { Todo } from "@/session/todo"
-import { MessageID, PartID, type SessionID } from "@/session/schema"
+import { MessageID, PartID, SessionID } from "@/session/schema"
 
 const [filename, directory, serialized] = process.argv.slice(2)
 if (!filename || !directory || !serialized) throw new Error("usage: <db> <project directory> <operation JSON>")
@@ -36,8 +36,10 @@ const input = JSON.parse(serialized) as {
     withdrawnV1?: boolean
     pendingV2?: boolean
     unfinished?: boolean
+    runningTool?: boolean
   }
   touch?: string
+  crossPart?: { sessionID: string; messageID: string }
   queue?: string
   preparing?: string
   pendingV2?: string
@@ -120,6 +122,18 @@ const produce = Effect.gen(function* () {
       type: "text",
       text,
     } as SessionV1.TextPart)
+
+    if (input.create.runningTool) {
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        sessionID,
+        messageID: assistantID,
+        type: "tool",
+        tool: "prune-custody-fixture",
+        callID: "prune-custody-fixture",
+        state: { status: "running", input: {}, time: { start: Date.now() } },
+      } as SessionV1.ToolPart)
+    }
 
     const timestamp = yield* DateTime.now
     const assistantMessageID = SessionMessage.ID.create()
@@ -224,6 +238,21 @@ const produce = Effect.gen(function* () {
       sessionID: SessionV2.ID.make(input.pendingV2),
       prompt: { text: "durable pending work after inventory" },
       resume: false,
+    })
+  }
+
+  if (input.crossPart) {
+    const sessionID = SessionID.make(input.crossPart.sessionID)
+    yield* events.publish(SessionV1.Event.PartUpdated, {
+      sessionID,
+      part: {
+        id: PartID.ascending(),
+        sessionID,
+        messageID: MessageID.make(input.crossPart.messageID),
+        type: "text",
+        text: "PartUpdated fixture spanning two Sessions",
+      } as SessionV1.TextPart,
+      time: Date.now(),
     })
   }
 
