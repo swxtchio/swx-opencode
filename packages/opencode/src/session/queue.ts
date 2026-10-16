@@ -3995,9 +3995,9 @@ function containsTarget(longer: string, shorter: string) {
   const longerWords = targetWords(longer).map(normalizeTargetWord)
   const shorterWords = targetWords(shorter).map(normalizeTargetWord)
   if (shorterWords.length === 0 || shorterWords.length >= longerWords.length) return false
-  return longerWords.some((_, index) =>
-    shorterWords.every((word, offset) => targetWordMatches(word, longerWords[index + offset]!)),
-  )
+  return longerWords
+    .slice(0, longerWords.length - shorterWords.length + 1)
+    .some((_, index) => shorterWords.every((word, offset) => targetWordMatches(word, longerWords[index + offset]!)))
 }
 
 function normalizeTargetWord(word: string) {

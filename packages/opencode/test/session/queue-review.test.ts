@@ -1618,6 +1618,30 @@ it.instance("generic target words alone do not merge different command work", ()
   }),
 )
 
+it.instance("command target containment ignores incomplete suffix windows", () =>
+  Effect.gen(function* () {
+    const prompts = ["fix epsilon beta", "fix gamma delta epsilon"]
+    const items = yield* consolidateAdmitted(
+      "different command targets with different word counts",
+      prompts.map((text) => ({ delivery: "queue" as const, text })),
+    )
+    expect(items.map(text)).toEqual(prompts)
+  }),
+)
+
+it.instance("request admission bounds command target containment windows", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "different request targets with different word counts" })
+    const prompts = ["fix epsilon beta", "fix gamma delta epsilon"]
+    yield* Effect.forEach(prompts, (text, index) => request(session.id, "queue", `target-${index}`, text))
+    expect((yield* queue.list(session.id)).map(text)).toEqual(prompts)
+    const receipts = yield* Effect.forEach(prompts, (_, index) => queue.receipt(session.id, `target-${index}`))
+    expect(receipts.map((receipt) => Option.getOrThrow(receipt).state)).toEqual(["pending", "pending"])
+  }),
+)
+
 it.instance("an exact generic command target still matches after article normalization", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
