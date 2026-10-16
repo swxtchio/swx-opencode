@@ -768,18 +768,21 @@ You can control context compaction behavior through the `compaction` option.
 
 ### Watcher
 
-You can configure file watcher ignore patterns through the `watcher` option.
+You can configure file watcher ignore patterns and the FFF search watcher through the `watcher` option. The FFF watcher is enabled by default; setting `watcher.fff` to `false` disables only that background watcher and keeps FFF search available. The setting follows normal config precedence and can also be provided through `OPENCODE_CONFIG_CONTENT`.
 
 ```json title="opencode.json"
 {
   "$schema": "https://opencode.ai/config.json",
   "watcher": {
-    "ignore": ["node_modules/**", "dist/**", ".git/**"]
+    "ignore": ["node_modules/**", "dist/**", ".git/**"],
+    "fff": false
   }
 }
 ```
 
-Patterns follow glob syntax. Use this to exclude noisy directories from file watching.
+Patterns follow glob syntax. Restart OpenCode after changing `watcher.fff`; configuration is read when a project location opens. With FFF watching disabled, search uses the index from its initial scan and does not track later filesystem changes.
+
+The native FFF watcher runs inside OpenCode's process. A fatal native abort can terminate that process and cannot be recovered by JavaScript error handling.
 
 ---
 
