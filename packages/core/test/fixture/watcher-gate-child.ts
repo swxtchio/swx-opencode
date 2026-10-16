@@ -6,13 +6,13 @@ import path from "path"
 import { BroadcastChannel } from "worker_threads"
 import { ConfigProvider, Deferred, Effect, Fiber, Layer, Logger, Scope, Stream } from "effect"
 import { TestClock } from "effect/testing"
-import { Config } from "@opencode-ai/core/config"
 import { makeLocationNode } from "@opencode-ai/core/effect/app-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Git } from "@opencode-ai/core/git"
+import { WatcherConfig } from "@opencode-ai/core/filesystem/watcher-config"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -140,11 +140,14 @@ const scenarios: Record<string, Effect.Effect<unknown, Error, Watcher.Service | 
 const gatedWatcher = makeLocationNode({
   service: Watcher.Service,
   layer: Watcher.layerWith({ workerTarget: new URL("./gated-parcel-worker.ts", import.meta.url) }),
-  deps: [FSUtil.node, Location.node, Config.node, Git.node, EventV2.node],
+  deps: [FSUtil.node, Location.node, WatcherConfig.node, Git.node, EventV2.node],
 })
 
 const layer = AppNodeBuilder.build(LayerNode.group([gatedWatcher, EventV2.node, FSUtil.node]), [
-  [Config.node, Layer.succeed(Config.Service, Config.Service.of({ entries: () => Effect.succeed([]) }))],
+  [
+    WatcherConfig.node,
+    Layer.succeed(WatcherConfig.Service, WatcherConfig.Service.of({ get: () => Effect.succeed({}) })),
+  ],
   [
     Location.node,
     Layer.succeed(

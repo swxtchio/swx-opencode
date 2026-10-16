@@ -1222,6 +1222,7 @@ export type Config = {
   }
   watcher?: {
     ignore?: Array<string>
+    fff?: boolean
   }
   plugin?: Array<string>
   snapshot?: boolean

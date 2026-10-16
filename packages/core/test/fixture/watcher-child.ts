@@ -5,11 +5,11 @@ import { $ } from "bun"
 import fs from "fs/promises"
 import path from "path"
 import { ConfigProvider, Deferred, Effect, Layer, Stream } from "effect"
-import { Config } from "@opencode-ai/core/config"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { WatcherConfig } from "@opencode-ai/core/filesystem/watcher-config"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -79,7 +79,10 @@ const program = Effect.gen(function* () {
 })
 
 const layer = AppNodeBuilder.build(LayerNode.group([Watcher.node, EventV2.node, FSUtil.node]), [
-  [Config.node, Layer.succeed(Config.Service, Config.Service.of({ entries: () => Effect.succeed([]) }))],
+  [
+    WatcherConfig.node,
+    Layer.succeed(WatcherConfig.Service, WatcherConfig.Service.of({ get: () => Effect.succeed({}) })),
+  ],
   [
     Location.node,
     Layer.succeed(
