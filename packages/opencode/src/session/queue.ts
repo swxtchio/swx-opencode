@@ -3343,7 +3343,8 @@ function copyGroups(items: readonly Item[], markers?: ConfigV1.Info["machine_mes
         if (grouped.has(other.entry) || !textPrefix(other.normalized, candidate.normalized)) return false
         if (other.normalized === candidate.normalized) return true
         if (!other.command || !candidate.command) return true
-        return !sameCommand(other.entry.item, other.command, candidate.entry.item, candidate.command)
+        if (sameCommand(other.entry.item, other.command, candidate.entry.item, candidate.command)) return false
+        return targetText(targetSubject(other.command.target)) === targetText(targetSubject(candidate.command.target))
       })
       matching.forEach((other) => grouped.add(other.entry))
       if (matching.length === 1) return [candidate.entry]
@@ -3766,7 +3767,7 @@ function normalizeText(text: string) {
 }
 
 function textPrefix(shorter: string, longer: string) {
-  return shorter === longer || longer.startsWith(shorter)
+  return shorter === longer || (longer.startsWith(shorter) && !/[a-z0-9_]/i.test(longer[shorter.length]!))
 }
 
 function normalizeTarget(target: string) {
@@ -3774,6 +3775,7 @@ function normalizeTarget(target: string) {
     .trim()
     .toLowerCase()
     .replace(/\s+/g, " ")
+    .replace(/[.,;:!?]+$/g, "")
     .replace(/^(?:(?:a|an|the)\s+)+/, "")
 }
 
@@ -3834,22 +3836,25 @@ const targetFileExtensions = new Set([
 
 function targetSubject(target: string) {
   const normalized = normalizeTarget(target)
-  if (/[\\/]/.test(normalized)) return normalized
-  const words = normalized.split(" ")
+  if (targetPaths(normalized).length > 0) return normalized
+  const prose = normalized.replace(/(?:[a-z0-9_.-]+[\\/])+[a-z0-9_.-]+/g, " ").trim()
+  const words = prose.split(" ")
   const boundary = words.findIndex((word) => targetComplements.has(word))
-  if (boundary <= 0) return normalized
+  if (boundary <= 0) return prose
   return words.slice(0, boundary).join(" ")
 }
 
 function targetText(target: string) {
   return normalizeTarget(target)
-    .split(/([\\/\s]+)/)
-    .map((part) => (targetFileExtension(part) ? part.slice(0, part.lastIndexOf(".")) : part))
-    .join("")
 }
 
 function targetWords(target: string) {
-  return targetText(target).match(/[a-z0-9]+/g) ?? []
+  return targetText(target)
+    .split(/[\\/\s]+/)
+    .flatMap((part) => {
+      const word = targetFileExtension(part) ? part.slice(0, part.lastIndexOf(".")) : part
+      return word.match(/[a-z0-9]+/g) ?? []
+    })
 }
 
 function targetMatches(left: string, right: string) {
@@ -3879,10 +3884,9 @@ function targetMatches(left: string, right: string) {
 }
 
 function targetPaths(target: string) {
-  const tokens = normalizeTarget(target).match(/[a-z0-9_.-]+(?:[\\/][a-z0-9_.-]+)*/g) ?? []
-  return tokens
-    .filter((token) => /[\\/]/.test(token) || targetFileExtension(token))
-    .map((token) => token.split(/[\\/]/))
+  const normalized = normalizeTarget(target)
+  if (!/[\\/]/.test(normalized) || /\s/.test(normalized)) return []
+  return [normalized.split(/[\\/]/)]
 }
 
 function targetFileExtension(target: string) {
@@ -3909,12 +3913,10 @@ function pathSuffix(longer: readonly string[], shorter: readonly string[]) {
 }
 
 function containsTarget(longer: string, shorter: string) {
-  const start = longer.indexOf(shorter)
-  if (start < 0) return false
-  return (
-    (!longer[start - 1] || !/[a-z0-9]/i.test(longer[start - 1]!)) &&
-    (!longer[start + shorter.length] || !/[a-z0-9]/i.test(longer[start + shorter.length]!))
-  )
+  const longerWords = targetWords(longer).map(normalizeTargetWord)
+  const shorterWords = targetWords(shorter).map(normalizeTargetWord)
+  if (shorterWords.length === 0 || shorterWords.length >= longerWords.length) return false
+  return longerWords.some((_, index) => shorterWords.every((word, offset) => word === longerWords[index + offset]))
 }
 
 function normalizeTargetWord(word: string) {
@@ -3948,17 +3950,17 @@ function parseCommand(input: SessionPromptQueue.QueuedInput) {
   const verb = match[1]!
   const rest = match[2]!.trim()
   if (!rest) return undefined
-  // Keep the whole subject phrase; punctuation, options, and a trailing file path separate later instructions.
+  // Keep the whole subject phrase; punctuation, options, and a leading file token separate later instructions.
   const separator = /:\s|:$|\.\s+|[!?]\s+|;\s+|\n|\s+(?=--\S)/.exec(rest)
-  const pathCandidate = separator ? undefined : /(?:^|\s)(?:[^\s\\/]+[\\/])*[^\s\\/]+\.[a-z0-9]+(?=\s+\S)/i.exec(rest)
-  const path = pathCandidate && targetFileExtension(pathCandidate[0]) ? pathCandidate : undefined
-  const pathEnd = path ? path.index + path[0].length : undefined
-  const end = separator?.index ?? pathEnd ?? rest.length
+  const candidate = separator ? undefined : /^(?:[^\s\\/]+[\\/])*[^\s\\/]+\.[a-z0-9]+(?=\s+\S)/i.exec(rest)
+  const fileCandidate = candidate && targetFileExtension(candidate[0]) ? candidate : undefined
+  const fileEnd = fileCandidate ? fileCandidate.index + fileCandidate[0].length : undefined
+  const end = separator?.index ?? fileEnd ?? rest.length
   const commandTarget = rest.slice(0, end).trim()
   const remainder = separator
     ? rest.slice(separator.index + separator[0].length).trim()
-    : pathEnd !== undefined
-      ? rest.slice(pathEnd).trim()
+    : fileEnd !== undefined
+      ? rest.slice(fileEnd).trim()
       : undefined
   if (!commandTarget) return undefined
   const step = remainder

@@ -231,6 +231,30 @@ const literalFilenameTargets = [
   },
 ]
 
+const bareDottedTargets = [
+  {
+    title: "Node.js natural subject",
+    first: "fix Node.js runtime checks: keep async test",
+    second: "fix Node runtime checks: cover async test",
+    merged: "fix Node.js runtime checks:\n1. keep async test\n2. Node runtime checks: cover async test",
+  },
+  {
+    title: "different bare filename extensions",
+    first: "fix queue.ts",
+    second: "fix queue.tsx",
+  },
+  {
+    title: "bare dotted suffix changes a word-boundary target",
+    first: "fix login",
+    second: "fix login.tsx",
+  },
+  {
+    title: "plain-text filename suffix is not a word prefix",
+    first: "Please summarize queue.ts",
+    second: "Please summarize queue.tsx",
+  },
+]
+
 const containedCommandTargets = [
   {
     title: "parser",
@@ -262,23 +286,38 @@ const containedCommandTargets = [
     second: "fix authentication handler",
     merged: "fix v1.2 authentication handler:\n1. fix v1.2 authentication handler\n2. fix authentication handler",
   },
+  {
+    title: "trailing punctuation",
+    first: "Fix the flaky auth test.",
+    second: "fix flaky auth test",
+    merged: "Fix the flaky auth test.:\n1. Fix the flaky auth test.\n2. fix flaky auth test",
+  },
+  {
+    title: "punctuation-normalized containment",
+    first: "fix the flaky auth-test page.",
+    second: "fix auth test",
+    merged: "fix the flaky auth-test page.:\n1. fix the flaky auth-test page.\n2. fix auth test",
+  },
 ]
 
-const prosePathReferences = [
+const punctuationNormalizedTargets = [
   {
-    title: "login file reference",
-    first: "fix login.ts",
-    second: "fix the login handler in login.ts",
-    merged: "fix login.ts:\n1. fix login.ts\n2. fix the login handler in login.ts",
-  },
-  {
-    title: "investigation file reference",
-    first: "investigate why the CI is slow in src/auth.ts",
-    second: "investigate login delays in auth.ts",
-    merged:
-      "investigate why the CI is slow in src/auth.ts:\n1. investigate why the CI is slow in src/auth.ts\n2. investigate login delays in auth.ts",
+    first: "Fix the test suite.",
+    second: "fix test suite",
+    merged: "Fix the test suite.:\n1. Fix the test suite.\n2. fix test suite",
   },
 ]
+
+const sameWorkProseFileReference = {
+  first: "fix login.ts",
+  second: "fix the login handler in login.ts",
+  merged: "fix login.ts:\n1. fix login.ts\n2. fix the login handler in login.ts",
+}
+
+const differentInvestigationPathReferences = {
+  first: "investigate why the CI is slow in src/auth.ts",
+  second: "investigate login delays in auth.ts",
+}
 
 const inflectionTargets = [
   {
@@ -567,6 +606,39 @@ it.instance("request admission keeps containment ahead of job-class head equalit
   }),
 )
 
+it.instance("consolidation normalizes trailing punctuation on an exact generic target", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of punctuationNormalizedTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} punctuation target`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual([pair.merged])
+      }
+    }
+  }),
+)
+
+it.instance("request admission normalizes trailing punctuation on an exact generic target", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of punctuationNormalizedTargets) {
+        const session = yield* sessions.create({ title: `${delivery} punctuation target` })
+        yield* request(session.id, delivery, "punctuation-a", pair.first)
+        yield* request(session.id, delivery, "punctuation-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.merged])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "punctuation-b"))).toMatchObject({
+          state: "merged",
+          into: "punctuation-a",
+        })
+      }
+    }
+  }),
+)
+
 it.instance("consolidation keeps different modifiers apart when the job-class head is shared", () =>
   Effect.gen(function* () {
     for (const delivery of ["steer", "queue"] as const) {
@@ -787,35 +859,97 @@ it.instance("request admission keeps path-like filenames literal", () =>
   }),
 )
 
-it.instance("consolidation resolves file paths embedded in prose targets", () =>
+it.instance("bare dotted targets match on natural words, while filename extensions stay distinct", () =>
   Effect.gen(function* () {
     for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of prosePathReferences) {
+      for (const pair of bareDottedTargets) {
         const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
           { delivery, text: pair.first },
           { delivery, text: pair.second },
         ])
-        expect(items.map(text)).toEqual([pair.merged])
+        expect(items.map(text)).toEqual(pair.merged ? [pair.merged] : [pair.first, pair.second])
       }
     }
   }),
 )
 
-it.instance("request admission resolves file paths embedded in prose targets", () =>
+it.instance("request admission uses natural words for bare dotted targets without merging filename extensions", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
     for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of prosePathReferences) {
+      for (const pair of bareDottedTargets) {
         const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
-        yield* request(session.id, delivery, "path-reference-a", pair.first)
-        yield* request(session.id, delivery, "path-reference-b", pair.second)
-        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.merged])
-        expect(Option.getOrThrow(yield* queue.receipt(session.id, "path-reference-b"))).toMatchObject({
-          state: "merged",
-          into: "path-reference-a",
-        })
+        yield* request(session.id, delivery, "bare-dotted-a", pair.first)
+        yield* request(session.id, delivery, "bare-dotted-b", pair.second)
+        const expected = pair.merged ? [pair.merged] : [pair.first, pair.second]
+        expect((yield* queue.list(session.id)).map(text)).toEqual(expected)
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "bare-dotted-b"))).toMatchObject(
+          pair.merged ? { state: "merged", into: "bare-dotted-a" } : { state: "pending" },
+        )
       }
+    }
+  }),
+)
+
+it.instance("prose path references do not consolidate different command work", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      const items = yield* consolidateAdmitted(`${delivery} investigation path references`, [
+        { delivery, text: differentInvestigationPathReferences.first },
+        { delivery, text: differentInvestigationPathReferences.second },
+      ])
+      expect(items.map(text)).toEqual([
+        differentInvestigationPathReferences.first,
+        differentInvestigationPathReferences.second,
+      ])
+    }
+  }),
+)
+
+it.instance("request admission does not consolidate different work because prose paths share a suffix", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      const session = yield* sessions.create({ title: `${delivery} separate investigation path references` })
+      yield* request(session.id, delivery, "investigation-a", differentInvestigationPathReferences.first)
+      yield* request(session.id, delivery, "investigation-b", differentInvestigationPathReferences.second)
+      expect((yield* queue.list(session.id)).map(text)).toEqual([
+        differentInvestigationPathReferences.first,
+        differentInvestigationPathReferences.second,
+      ])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "investigation-a"))).toMatchObject({ state: "pending" })
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "investigation-b"))).toMatchObject({ state: "pending" })
+    }
+  }),
+)
+
+it.instance("consolidation matches a prose file reference from its other target words", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      const items = yield* consolidateAdmitted(`${delivery} login file target words`, [
+        { delivery, text: sameWorkProseFileReference.first },
+        { delivery, text: sameWorkProseFileReference.second },
+      ])
+      expect(items.map(text)).toEqual([sameWorkProseFileReference.merged])
+    }
+  }),
+)
+
+it.instance("request admission matches a prose file reference from its other target words", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      const session = yield* sessions.create({ title: `${delivery} login file target words` })
+      yield* request(session.id, delivery, "login-file-a", sameWorkProseFileReference.first)
+      yield* request(session.id, delivery, "login-file-b", sameWorkProseFileReference.second)
+      expect((yield* queue.list(session.id)).map(text)).toEqual([sameWorkProseFileReference.merged])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "login-file-b"))).toMatchObject({
+        state: "merged",
+        into: "login-file-a",
+      })
     }
   }),
 )
