@@ -102,7 +102,8 @@ import { sessionQueueHandlers } from "./handlers/session-queue"
 import { syncHandlers } from "./handlers/sync"
 import { tuiHandlers } from "./handlers/tui"
 import { handlers } from "@opencode-ai/server/handlers"
-import { buildOpenCodeLocationServiceMap, LocationServiceMap } from "@/filesystem/location-services"
+import { buildLocationServiceMap } from "@opencode-ai/core/location-services"
+import { LocationServiceMap } from "@/filesystem/location-services"
 import { layer as locationLayer } from "@opencode-ai/server/location"
 import { sessionLocationLayer } from "@opencode-ai/server/middleware/session-location"
 import { PtyEnvironment } from "@opencode-ai/server/pty-environment"
@@ -276,7 +277,7 @@ export function createRoutes(
   corsOptions?: CorsOptions,
   appReplacements: LayerNode.Replacements = [],
 ): Layer.Layer<never, EffectConfig.ConfigError, RouteRequirements> {
-  const locationServiceMapV2 = buildOpenCodeLocationServiceMap()
+  const locationServiceMapV2 = buildLocationServiceMap()
 
   return Layer.mergeAll(
     rootApiRoutes,
