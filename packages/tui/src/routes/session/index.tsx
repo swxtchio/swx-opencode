@@ -87,6 +87,7 @@ import { getRevertDiffFiles } from "../../util/revert-diff"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
 import { LocationProvider } from "../../context/location"
+import { preserveMachineAppended } from "../../prompt/part"
 
 addDefaultParsers(parsers.parsers)
 
@@ -276,8 +277,15 @@ export function Session() {
     const index = messages().findIndex((message) => message.id === messageID)
     return index === -1 ? messages() : messages().slice(0, index)
   }
-  const enhancementMessages = () =>
-    messagesBeforeRevert().map((message) => ({ info: message, parts: sync.data.part[message.id] ?? [] }))
+  const enhancementContext = () => ({
+    messages: messagesBeforeRevert().map((message) => ({ info: message, parts: sync.data.part[message.id] ?? [] })),
+    options: {
+      thinking: thinkingMode() === "show",
+      toolDetails: showDetails(),
+      assistantMetadata: showAssistantMetadata(),
+      providers: sync.data.provider,
+    },
+  })
   const foregroundTasks = createMemo(() =>
     sync.data.capabilities.experimentalBackgroundSubagents ? activeForegroundTasks(sync, messages()) : [],
   )
@@ -747,18 +755,17 @@ export function Session() {
             toBottom()
           })
         const parts = sync.data.part[message.id]
-        prompt?.set(
-          parts.reduce(
-            (agg, part) => {
-              if (part.type === "text") {
-                if (!part.synthetic) agg.input += part.text
-              }
-              if (part.type === "file") agg.parts.push(part)
-              return agg
-            },
-            { input: "", parts: [] as PromptInfo["parts"] },
-          ),
+        const promptInfo = parts.reduce(
+          (agg, part) => {
+            if (part.type === "text") {
+              if (!part.synthetic) agg.input += part.text
+            }
+            if (part.type === "file") agg.parts.push(part)
+            return agg
+          },
+          { input: "", parts: [] as PromptInfo["parts"] },
         )
+        prompt?.set(preserveMachineAppended(parts, promptInfo))
         dialog.clear()
       },
     },
@@ -1447,7 +1454,7 @@ export function Session() {
                         toBottom()
                       }}
                       sessionID={route.sessionID}
-                      enhancementMessages={enhancementMessages}
+                      enhancementContext={enhancementContext}
                       right={<pluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />}
                     />
                   </pluginRuntime.Slot>

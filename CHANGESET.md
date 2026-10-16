@@ -185,7 +185,11 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Features
 
-- **#272** Search human prompts from the TUI timeline, batch ordered busy composer sends with their original text and receipts, and enhance an editable draft with Ctrl+e from visible session context. Set `prompt_enhance_model` at the root of TUI `tui.json` to choose the provider model. _Fork-only._
+- **#272** Search human prompts from the TUI timeline and keep unmarked existing history reachable while filtering
+  built-in and configured machine markers. Busy composer Enter waits for the run's idle boundary and batches ordered
+  prompts; it no longer steers the active turn. Explicit steer callers retain their current behavior. Ctrl+e
+  enhances an editable draft from visible session context. Set `prompt_enhance_model` at the root of TUI `tui.json`
+  to choose the provider model. _Fork-only._
 - **#255** A sent prompt is never invisible (swxtchio/swx-opencode#249). `SessionPrompt.prompt` admits a queued
   prompt as its first step, before its config read, as a `time_preparing` row (migration `20261013194721`) that is
   listed and withdrawable but never promoted or merged until its classification, revert cleanup and model selection

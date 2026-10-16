@@ -3184,7 +3184,11 @@ function grouped(
           },
         }
     }
-    return { ...items[0].input, model: undefined, variant: undefined, group, parts: [...parts, ...witnesses] }
+    return {
+      ...items[0].input,
+      ...(humanBatch ? { model: undefined, variant: undefined, group } : {}),
+      parts: [...parts, ...witnesses],
+    }
   }
   const latest = new Map<string, ItemID>()
   items.forEach((item) => {

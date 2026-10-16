@@ -2085,6 +2085,7 @@ it.instance(
           agent: "build",
           model: ref,
           delivery: "steer",
+          origin: "tui-composer",
           parts: [{ type: "text", text: heldText }],
         })
         .pipe(Effect.forkChild)
@@ -2109,6 +2110,7 @@ it.instance(
           agent: "build",
           model: ref,
           delivery: "queue",
+          origin: "tui-composer",
           parts: [{ type: "text", text: criticalText }],
         })
         .pipe(Effect.forkChild)
@@ -5080,6 +5082,52 @@ it.instance("busy TUI composer prompts are answered once as one ordered user mes
       })
     }
     expect(yield* held.queue.list(held.chat.id)).toEqual([])
+  }),
+  { timeout: 30000 },
+)
+
+it.instance("an individual queued prompt retains its agent and session model variant", () =>
+  Effect.gen(function* () {
+    const held = yield* startHeld({
+      config: (url) => {
+        const base = providerCfg(url)
+        return {
+          ...base,
+          provider: {
+            ...base.provider,
+            test: {
+              ...base.provider.test,
+              models: {
+                ...base.provider.test.models,
+                "test-model": {
+                  ...base.provider.test.models["test-model"],
+                  variants: { low: {}, high: {} },
+                },
+              },
+            },
+          },
+        } as Partial<ConfigV1.Info>
+      },
+    })
+    const queuedPrompt = yield* held.send("individual recipient selection", {
+      delivery: "queue",
+      agent: "plan",
+      variant: "high",
+    })
+    yield* queued(held.chat.id, 1)
+    yield* held.llm.text("queued prompt answered")
+    yield* held.release
+    yield* finish(held.task, queuedPrompt)
+
+    const delivered = (yield* held.sessions.messages({ sessionID: held.chat.id })).find(
+      (message) => message.info.role === "user" && visibleUserText(message) === "individual recipient selection",
+    )
+    expect(delivered?.info.role).toBe("user")
+    if (delivered?.info.role !== "user") throw new Error("individual prompt did not reach history")
+    expect(delivered.info.agent).toBe("plan")
+    expect(delivered.info.model.providerID).toBe(ref.providerID)
+    expect(delivered.info.model.modelID).toBe(ref.modelID)
+    expect(delivered.info.model.variant).toBe("high")
   }),
   { timeout: 30000 },
 )

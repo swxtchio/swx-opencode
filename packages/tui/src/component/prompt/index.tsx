@@ -46,7 +46,7 @@ import type { AssistantMessage, FilePart, SessionPromptQueueReceipt, UserMessage
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { Locale } from "../../util/locale"
 import { errorMessage } from "../../util/error"
-import { promptEnhancementContext, type MessageWithParts } from "../../util/transcript"
+import { promptEnhancementContext, type MessageWithParts, type TranscriptOptions } from "../../util/transcript"
 import { isRecord } from "../../util/record"
 import { formatDuration } from "../../util/format"
 import { createColors, createFrames } from "../../ui/spinner"
@@ -71,7 +71,10 @@ registerOpencodeSpinner()
 
 export type PromptProps = {
   sessionID?: string
-  enhancementMessages?: () => MessageWithParts[]
+  enhancementContext?: () => {
+    messages: MessageWithParts[]
+    options: Pick<TranscriptOptions, "thinking" | "toolDetails" | "assistantMetadata" | "providers">
+  }
   visible?: boolean
   disabled?: boolean
   onSubmit?: () => void
@@ -1547,7 +1550,8 @@ export function Prompt(props: PromptProps) {
     })
     setEnhancing(true)
     try {
-      const context = promptEnhancementContext(props.enhancementMessages?.() ?? [])
+      const transcript = props.enhancementContext?.()
+      const context = transcript ? promptEnhancementContext(transcript.messages, transcript.options) : ""
       const response = await sdk.client.instance.prompt.enhance(
         {
           model: tuiConfig.prompt_enhance_model,

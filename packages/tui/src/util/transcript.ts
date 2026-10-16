@@ -45,14 +45,20 @@ export function formatTranscript(
   return transcript
 }
 
-export function promptEnhancementContext(messages: MessageWithParts[]) {
-  const options = { thinking: false, toolDetails: false, assistantMetadata: false }
+export function promptEnhancementContext(
+  messages: MessageWithParts[],
+  options: Pick<TranscriptOptions, "thinking" | "toolDetails" | "assistantMetadata" | "providers">,
+) {
   return messages
     .toSorted((a, b) => a.info.time.created - b.info.time.created || a.info.id.localeCompare(b.info.id))
     .map((message) =>
       formatMessage(
         message.info,
-        message.parts.filter((part) => part.type !== "text" || (!part.synthetic && !part.ignored)),
+        message.parts.filter((part) => {
+          if (part.type === "text") return !part.synthetic && !part.ignored
+          if (part.type === "tool" && !options.toolDetails && part.state.status === "completed") return false
+          return true
+        }),
         options,
       ),
     )

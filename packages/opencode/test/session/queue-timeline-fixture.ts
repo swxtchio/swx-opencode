@@ -7,11 +7,11 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { EventV2 } from "@opencode-ai/core/event"
+import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceStore } from "@/project/instance-store"
@@ -19,7 +19,7 @@ import { InstanceBootstrap } from "@/project/bootstrap"
 import { Session } from "@/session/session"
 import { SessionQueue } from "@/session/queue"
 import { MessageV2 } from "@/session/message-v2"
-import { PartID } from "@/session/schema"
+import { MessageID, PartID } from "@/session/schema"
 import { withTmpdirInstance } from "../fixture/fixture"
 
 const peer =
@@ -46,7 +46,10 @@ const queueLayer = (filename: string) =>
     ],
   )
 
-export async function queueTimelineFixture() {
+export async function queueTimelineFixture(
+  composerInput: SessionPromptQueue.Input,
+  appendedInput: SessionPromptQueue.Input,
+) {
   const filename = path.join(process.cwd(), `.queue-timeline-${randomUUID()}.db`)
   try {
     return await Effect.runPromise(
@@ -54,49 +57,8 @@ export async function queueTimelineFixture() {
         const queue = yield* SessionQueue.Service
         const sessions = yield* Session.Service
         const session = yield* sessions.create({})
-        yield* queue.admit({
-          sessionID: session.id,
-          delivery: "queue",
-          origin: "tui-composer",
-          parts: [{ type: "text", text: "typed-history-token" }],
-        })
-        yield* queue.admit({
-          sessionID: session.id,
-          delivery: "queue",
-          parts: [{ type: "text", text: "legacy-app-history-token" }],
-        })
-        yield* queue.admit({
-          sessionID: session.id,
-          delivery: "queue",
-          origin: "tui-composer",
-          parts: [{ type: "text", text: "OBSERVER: [fm-level:directive]\x1f injected-history-token" }],
-        })
-        yield* queue.admit({
-          sessionID: session.id,
-          delivery: "queue",
-          origin: "tui-composer",
-          parts: [{ type: "text", text: "[fm-level:critical]\x1f injected-critical-history-token" }],
-        })
-        yield* queue.admit({
-          sessionID: session.id,
-          delivery: "queue",
-          origin: "tui-composer",
-          parts: [{ type: "text", text: peer }],
-        })
-        yield* queue.admit({
-          sessionID: session.id,
-          delivery: "queue",
-          origin: "tui-composer",
-          parts: [
-            {
-              type: "text",
-              text: "firstmate appended history token",
-              metadata: { [SessionPromptQueue.TuiPromptAppendMetadataKey]: true },
-            },
-          ],
-        })
-        for (let attempt = 0; attempt < 6; attempt++)
-          yield* queue.promote({
+        const promote = () =>
+          queue.promote({
             sessionID: session.id,
             delivery: "queue",
             prepare: (input) =>
@@ -129,6 +91,69 @@ export async function queueTimelineFixture() {
               }),
             rejected: () => Effect.void,
           })
+        yield* queue.admit({ ...composerInput, sessionID: session.id, delivery: "queue" })
+        yield* queue.admit({
+          sessionID: session.id,
+          delivery: "queue",
+          parts: [{ type: "text", text: "legacy-app-history-token" }],
+        })
+        yield* queue.admit({
+          sessionID: session.id,
+          delivery: "queue",
+          origin: "tui-composer",
+          parts: [{ type: "text", text: "OBSERVER: [fm-level:directive]\x1f injected-history-token" }],
+        })
+        yield* queue.admit({
+          sessionID: session.id,
+          delivery: "queue",
+          origin: "tui-composer",
+          parts: [{ type: "text", text: "[fm-level:critical]\x1f injected-critical-history-token" }],
+        })
+        yield* queue.admit({
+          sessionID: session.id,
+          delivery: "queue",
+          origin: "tui-composer",
+          parts: [{ type: "text", text: peer }],
+        })
+        yield* queue.admit({
+          sessionID: session.id,
+          delivery: "queue",
+          parts: [{ type: "text", text: "CUSTOM-HOLD: configured-injected-history-token" }],
+        })
+        for (let attempt = 0; attempt < 6; attempt++)
+          yield* promote()
+        const legacyID = MessageID.ascending()
+        yield* queue.writeDirect({
+          admission: { sessionID: session.id, parts: [{ type: "text", text: "pre-upgrade-history-token" }] },
+          prepare: () =>
+            Effect.sync(() => ({
+              info: {
+                id: legacyID,
+                sessionID: session.id,
+                role: "user" as const,
+                time: { created: Date.now() },
+                agent: "build",
+                model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+              },
+              parts: [
+                {
+                  type: "text" as const,
+                  id: PartID.ascending(),
+                  sessionID: session.id,
+                  messageID: legacyID,
+                  text: "pre-upgrade-history-token",
+                },
+              ],
+            })),
+          write: (message: SessionV1.WithParts) =>
+            Effect.gen(function* () {
+              yield* sessions.updateMessage(message.info)
+              yield* Effect.forEach(message.parts, (part) => sessions.updatePart(part), { discard: true })
+              return message
+            }),
+        })
+        yield* queue.admit({ ...appendedInput, sessionID: session.id, delivery: "queue" })
+        yield* promote()
         return { sessionID: session.id, messages: yield* MessageV2.stream(session.id) }
       }).pipe(
         withTmpdirInstance({ git: true, config: { formatter: false, lsp: false } }),

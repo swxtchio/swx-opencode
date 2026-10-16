@@ -1184,6 +1184,11 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
                       sessionID: session.id,
                       delivery: "queue",
                       messageID: MessageID.make("msg_checkpoint_individual"),
+                      model: {
+                        providerID: ProviderV2.ID.make("test"),
+                        modelID: ModelV2.ID.make("individual-model"),
+                      },
+                      variant: "high",
                       parts: [{ type: "text", text: "Synthetic individual original with stable transport identity" }],
                     },
                   ]
@@ -1207,11 +1212,16 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
             : []
           yield* Effect.forEach(retryCalls, (input) => queue.admit(input))
           const pending = yield* queue.list(session.id)
+          const preparedInputs: SessionQueue.PromotedInput[] = []
           yield* queue.promote({
             sessionID: session.id,
             delivery: "queue",
             peersOnly: name === "peerContinuation",
-            prepare,
+            prepare: (input) =>
+              Effect.gen(function* () {
+                if (name === "individual") preparedInputs.push(input)
+                return yield* prepare(input)
+              }),
             write: writer(sessions),
             rejected: () => Effect.void,
           })
@@ -1256,7 +1266,7 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
               .filter((part) => part.ignored)
               .every((part) => part.synthetic && part.messageID === returned.info.id),
           ).toBe(true)
-          expect(witnesses.filter((part) => !part.ignored)).toHaveLength(name === "individual" ? 0 : 1)
+          expect(witnesses.filter((part) => !part.ignored)).toHaveLength(1)
           expect(witnesses.filter((part) => part.ignored)).toHaveLength(
             name === "individual" ? 1 : name === "heartbeat" ? 2 : peerScenario ? 4 : 3,
           )
@@ -1284,6 +1294,15 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
           if (name === "individual") {
             expect(group.kind).toBe("individual")
             expect(text(returned)).toBe(inputs[0].parts[0].type === "text" ? inputs[0].parts[0].text : "")
+            expect(preparedInputs).toHaveLength(1)
+            expect(preparedInputs[0]?.group).toBeUndefined()
+            expect(preparedInputs[0]?.model).toEqual({
+              providerID: ProviderV2.ID.make("test"),
+              modelID: ModelV2.ID.make("individual-model"),
+            })
+            expect(preparedInputs[0]?.variant).toBe("high")
+            expect(group.constituents[0]?.input.model).toEqual(preparedInputs[0]?.model)
+            expect(group.constituents[0]?.input.variant).toBe("high")
           }
           expect(modelInput).toHaveLength(1)
           expect(modelInput[0].role).toBe("user")
