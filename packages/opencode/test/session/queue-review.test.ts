@@ -1630,26 +1630,50 @@ it.instance("generic target words alone do not merge different command work", ()
   }),
 )
 
-it.instance("command target containment ignores incomplete suffix windows", () =>
+it.instance("steer consolidation bounds partial command suffix windows", () =>
   Effect.gen(function* () {
-    const prompts = ["fix epsilon beta", "fix gamma delta epsilon"]
+    const prompts = ["fix billing login auth", "fix auth handler"]
     const items = yield* consolidateAdmitted(
-      "different command targets with different word counts",
+      "steer partial suffix target",
+      prompts.map((text) => ({ delivery: "steer" as const, text })),
+    )
+    expect(items.map(text)).toEqual(prompts)
+  }),
+)
+
+it.instance("queue consolidation bounds partial command suffix windows", () =>
+  Effect.gen(function* () {
+    const prompts = ["fix billing login auth", "fix auth handler"]
+    const items = yield* consolidateAdmitted(
+      "queue partial suffix target",
       prompts.map((text) => ({ delivery: "queue" as const, text })),
     )
     expect(items.map(text)).toEqual(prompts)
   }),
 )
 
-it.instance("request admission bounds command target containment windows", () =>
+it.instance("steer request admission bounds partial command suffix windows", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
-    const session = yield* sessions.create({ title: "different request targets with different word counts" })
-    const prompts = ["fix epsilon beta", "fix gamma delta epsilon"]
-    yield* Effect.forEach(prompts, (text, index) => request(session.id, "queue", `target-${index}`, text))
+    const session = yield* sessions.create({ title: "steer request partial suffix target" })
+    const prompts = ["fix billing login auth", "fix auth handler"]
+    yield* Effect.forEach(prompts, (text, index) => request(session.id, "steer", `steer-target-${index}`, text))
     expect((yield* queue.list(session.id)).map(text)).toEqual(prompts)
-    const receipts = yield* Effect.forEach(prompts, (_, index) => queue.receipt(session.id, `target-${index}`))
+    const receipts = yield* Effect.forEach(prompts, (_, index) => queue.receipt(session.id, `steer-target-${index}`))
+    expect(receipts.map((receipt) => Option.getOrThrow(receipt).state)).toEqual(["pending", "pending"])
+  }),
+)
+
+it.instance("queue request admission bounds partial command suffix windows", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "queue request partial suffix target" })
+    const prompts = ["fix billing login auth", "fix auth handler"]
+    yield* Effect.forEach(prompts, (text, index) => request(session.id, "queue", `queue-target-${index}`, text))
+    expect((yield* queue.list(session.id)).map(text)).toEqual(prompts)
+    const receipts = yield* Effect.forEach(prompts, (_, index) => queue.receipt(session.id, `queue-target-${index}`))
     expect(receipts.map((receipt) => Option.getOrThrow(receipt).state)).toEqual(["pending", "pending"])
   }),
 )
