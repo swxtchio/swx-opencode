@@ -3801,46 +3801,14 @@ const targetComplements = new Set([
   "without",
 ])
 
-const targetFileExtensions = new Set([
-  "c",
-  "cc",
-  "cpp",
-  "css",
-  "go",
-  "h",
-  "hpp",
-  "html",
-  "java",
-  "js",
-  "jsx",
-  "json",
-  "kt",
-  "md",
-  "mdx",
-  "mjs",
-  "cjs",
-  "mts",
-  "cts",
-  "py",
-  "rs",
-  "sh",
-  "sql",
-  "swift",
-  "toml",
-  "ts",
-  "tsx",
-  "xml",
-  "yaml",
-  "yml",
-])
-
 function targetSubject(target: string) {
   const normalized = normalizeTarget(target)
   if (targetPaths(normalized).length > 0) return normalized
-  const prose = normalized.replace(/(?:[a-z0-9_.-]+[\\/])+[a-z0-9_.-]+/g, " ").trim()
-  const words = prose.split(" ")
-  const boundary = words.findIndex((word) => targetComplements.has(word))
-  if (boundary <= 0) return prose
+  const words = normalized.split(" ")
+  const boundary = words.findIndex(
+    (word, index) => targetComplements.has(word) || (word === "and" && words[index + 1] === "how"),
+  )
+  if (boundary <= 0) return normalized
   return words.slice(0, boundary).join(" ")
 }
 
@@ -3852,7 +3820,7 @@ function targetWords(target: string) {
   return targetText(target)
     .split(/[\\/\s]+/)
     .flatMap((part) => {
-      const word = targetFileExtension(part) ? part.slice(0, part.lastIndexOf(".")) : part
+      const word = targetFileSuffix(part) ? part.slice(0, part.lastIndexOf(".")) : part
       return word.match(/[a-z0-9]+/g) ?? []
     })
 }
@@ -3860,10 +3828,17 @@ function targetWords(target: string) {
 function targetMatches(left: string, right: string) {
   const leftPaths = targetPaths(left)
   const rightPaths = targetPaths(right)
-  if (leftPaths.length > 0 || rightPaths.length > 0)
-    return leftPaths.some((leftPath) =>
-      rightPaths.some((rightPath) => pathSuffix(leftPath, rightPath) || pathSuffix(rightPath, leftPath)),
-    )
+  if (leftPaths.length > 0 && rightPaths.length > 0) {
+    const samePaths =
+      leftPaths.every((leftPath) =>
+        rightPaths.some((rightPath) => pathSuffix(leftPath, rightPath) || pathSuffix(rightPath, leftPath)),
+      ) &&
+      rightPaths.every((rightPath) =>
+        leftPaths.some((leftPath) => pathSuffix(leftPath, rightPath) || pathSuffix(rightPath, leftPath)),
+      )
+    if (!samePaths) return false
+    if (directPathTarget(left, leftPaths) && directPathTarget(right, rightPaths)) return true
+  }
   const leftText = targetText(left)
   const rightText = targetText(right)
   if (leftText === rightText) return true
@@ -3884,15 +3859,24 @@ function targetMatches(left: string, right: string) {
 }
 
 function targetPaths(target: string) {
-  const normalized = normalizeTarget(target)
-  if (!/[\\/]/.test(normalized) || /\s/.test(normalized)) return []
-  return [normalized.split(/[\\/]/)]
+  const tokens = normalizeTarget(target).match(/[a-z0-9_.-]+(?:[\\/][a-z0-9_.-]+)*/g) ?? []
+  return tokens.filter((token) => targetFileSuffix(token)).map((token) => token.split(/[\\/]/))
 }
 
-function targetFileExtension(target: string) {
+function targetFileSuffix(target: string) {
   const component = target.trim().split(/[\\/]/).at(-1)!
   const dot = component.lastIndexOf(".")
-  return dot > 0 && targetFileExtensions.has(component.slice(dot + 1).toLowerCase())
+  if (dot <= 0 || dot === component.length - 1) return undefined
+  return component.slice(dot + 1).toLowerCase()
+}
+
+function targetFileToken(target: string) {
+  return Boolean(targetFileSuffix(target)?.match(/[a-z]/))
+}
+
+function directPathTarget(target: string, paths: readonly (readonly string[])[]) {
+  const normalized = normalizeTarget(target).replace(/\\/g, "/")
+  return paths.length === 1 && normalized === paths[0]!.join("/")
 }
 
 function targetIdentity(target: string) {
@@ -3920,6 +3904,7 @@ function containsTarget(longer: string, shorter: string) {
 }
 
 function normalizeTargetWord(word: string) {
+  if (word.endsWith("nection")) return `${word.slice(0, -7)}nect`
   if (word.length > 4 && word.endsWith("ies")) return `${word.slice(0, -3)}y`
   if (/(?:ses|xes|zes|ches|shes)$/.test(word)) return word.slice(0, -2)
   if (word.length > 3 && word.endsWith("s") && !word.endsWith("ss") && !word.endsWith("us") && !word.endsWith("is"))
@@ -3953,7 +3938,7 @@ function parseCommand(input: SessionPromptQueue.QueuedInput) {
   // Keep the whole subject phrase; punctuation, options, and a leading file token separate later instructions.
   const separator = /:\s|:$|\.\s+|[!?]\s+|;\s+|\n|\s+(?=--\S)/.exec(rest)
   const candidate = separator ? undefined : /^(?:[^\s\\/]+[\\/])*[^\s\\/]+\.[a-z0-9]+(?=\s+\S)/i.exec(rest)
-  const fileCandidate = candidate && targetFileExtension(candidate[0]) ? candidate : undefined
+  const fileCandidate = candidate && targetFileToken(candidate[0]) ? candidate : undefined
   const fileEnd = fileCandidate ? fileCandidate.index + fileCandidate[0].length : undefined
   const end = separator?.index ?? fileEnd ?? rest.length
   const commandTarget = rest.slice(0, end).trim()
