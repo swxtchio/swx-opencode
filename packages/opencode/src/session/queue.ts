@@ -4009,6 +4009,13 @@ function targetMatches(left: string, right: string) {
   const rightSubject = targetSubject(right)
   const leftSubjectText = targetText(leftSubject)
   const rightSubjectText = targetText(rightSubject)
+  const leftSubjectWords = targetWords(leftSubjectText)
+  const rightSubjectWords = targetWords(rightSubjectText)
+  if (
+    leftSubjectWords.length === rightSubjectWords.length &&
+    leftSubjectWords.every((word, index) => targetWordMatches(word, rightSubjectWords[index]!))
+  )
+    return true
   const leftIdentity = targetIdentity(leftSubject)
   const rightIdentity = targetIdentity(rightSubject)
   if (containsTarget(leftSubjectText, rightSubjectText) && rightIdentity.nonGeneric.length > 0) return true
@@ -4059,11 +4066,14 @@ function directPathTarget(target: string, paths: readonly (readonly string[])[])
 }
 
 function targetIdentity(target: string) {
-  const words = targetWords(target).map(normalizeTargetWord)
-  const nonGeneric = words.filter((word) => !genericTargetWords.has(word))
+  const words = targetWords(target).map((word) => ({
+    word,
+    generic: [...targetWordCandidates(word)].some((candidate) => genericTargetWords.has(candidate)),
+  }))
+  const nonGeneric = words.filter((item) => !item.generic).map((item) => item.word)
   return {
-    head: words.at(-1),
-    evidence: words.slice(0, -1).filter((word) => !genericTargetWords.has(word)),
+    head: words.at(-1)?.word,
+    evidence: words.slice(0, -1).filter((item) => !item.generic).map((item) => item.word),
     nonGeneric,
   }
 }
@@ -4071,11 +4081,15 @@ function targetIdentity(target: string) {
 // A dotted natural name can share its base with an undotted subject without equating two dotted identities.
 function targetWordMatches(left: string, right: string) {
   if (left === right) return true
-  if (left.includes(".") === right.includes(".")) return false
-  const dotted = left.includes(".") ? left : right
-  const plain = left.includes(".") ? right : left
-  const suffix = dotted.slice(dotted.indexOf(".") + 1)
-  return /^[a-z][a-z0-9-]*$/.test(suffix) && dotted.slice(0, dotted.indexOf(".")) === plain
+  if (left.includes(".") || right.includes(".")) {
+    if (left.includes(".") === right.includes(".")) return false
+    const dotted = left.includes(".") ? left : right
+    const plain = left.includes(".") ? right : left
+    const suffix = dotted.slice(dotted.indexOf(".") + 1)
+    return /^[a-z][a-z0-9-]*$/.test(suffix) && dotted.slice(0, dotted.indexOf(".")) === plain
+  }
+  const rightCandidates = targetWordCandidates(right)
+  return [...targetWordCandidates(left)].some((candidate) => rightCandidates.has(candidate))
 }
 
 function pathSuffix(longer: readonly string[], shorter: readonly string[]) {
@@ -4086,21 +4100,37 @@ function pathSuffix(longer: readonly string[], shorter: readonly string[]) {
 }
 
 function containsTarget(longer: string, shorter: string) {
-  const longerWords = targetWords(longer).map(normalizeTargetWord)
-  const shorterWords = targetWords(shorter).map(normalizeTargetWord)
+  const longerWords = targetWords(longer)
+  const shorterWords = targetWords(shorter)
   if (shorterWords.length === 0 || shorterWords.length >= longerWords.length) return false
   return longerWords
     .slice(0, longerWords.length - shorterWords.length + 1)
     .some((_, index) => shorterWords.every((word, offset) => targetWordMatches(word, longerWords[index + offset]!)))
 }
 
-function normalizeTargetWord(word: string) {
-  if (word.includes(".")) return word
-  if (word.length > 4 && word.endsWith("ies")) return `${word.slice(0, -3)}y`
-  if (/(?:ses|xes|zes|ches|shes)$/.test(word)) return word.slice(0, -2)
-  if (word.length > 3 && word.endsWith("s") && !word.endsWith("ss") && !word.endsWith("us") && !word.endsWith("is"))
-    return word.slice(0, -1)
-  return word
+function targetWordCandidates(word: string) {
+  const candidates = new Set([word])
+  if (word.includes(".")) return candidates
+  if (word.length > 3 && word.endsWith("ies")) {
+    candidates.add(word.slice(0, -1))
+    candidates.add(`${word.slice(0, -3)}y`)
+    return candidates
+  }
+  if (word.length > 3 && word.endsWith("es")) {
+    candidates.add(word.slice(0, -1))
+    const withoutEs = word.slice(0, -2)
+    candidates.add(withoutEs)
+    if (word.endsWith("zzes")) candidates.add(word.slice(0, -3))
+    return candidates
+  }
+  if (word.endsWith("is")) {
+    if (!genericTargetWords.has(word)) candidates.add(`${word.slice(0, -2)}es`)
+    return candidates
+  }
+  if (word.length > 3 && word.endsWith("z") && !word.endsWith("zz")) candidates.add(`${word}z`)
+  if (word.length > 3 && word.endsWith("s") && !word.endsWith("ss") && !word.endsWith("us"))
+    candidates.add(word.slice(0, -1))
+  return candidates
 }
 
 // A copy's queue times join the survivor's: step by step when both carry the

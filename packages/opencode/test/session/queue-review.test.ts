@@ -544,67 +544,49 @@ const sameJobTailTargets = [
   },
 ]
 
+const pluralTargetPair = (title: string, first: string, second: string) => ({
+  title,
+  first,
+  second,
+  merged: `${first}:\n1. ${first}\n2. ${second}`,
+})
+
 const pluralTargetPairs = [
-  {
-    title: "templates and template",
-    first: "fix email templates",
-    second: "fix email template",
-    merged: "fix email templates:\n1. fix email templates\n2. fix email template",
-  },
-  {
-    title: "classes and class",
-    first: "fix parser classes",
-    second: "fix parser class",
-    merged: "fix parser classes:\n1. fix parser classes\n2. fix parser class",
-  },
-  {
-    title: "policies and policy",
-    first: "fix routing policies",
-    second: "fix routing policy",
-    merged: "fix routing policies:\n1. fix routing policies\n2. fix routing policy",
-  },
-  {
-    title: "certificates and certificate",
-    first: "fix tls certificates",
-    second: "fix tls certificate",
-    merged: "fix tls certificates:\n1. fix tls certificates\n2. fix tls certificate",
-  },
-  {
-    title: "activations and activation",
-    first: "fix user activations",
-    second: "fix user activation",
-    merged: "fix user activations:\n1. fix user activations\n2. fix user activation",
-  },
-  {
-    title: "updates and update",
-    first: "fix updates page",
-    second: "fix update page",
-    merged: "fix updates page:\n1. fix updates page\n2. fix update page",
-  },
-  {
-    title: "migrations and migration",
-    first: "fix database migrations",
-    second: "fix database migration",
-    merged: "fix database migrations:\n1. fix database migrations\n2. fix database migration",
-  },
-  {
-    title: "connections and connection",
-    first: "fix database connections",
-    second: "fix database connection",
-    merged: "fix database connections:\n1. fix database connections\n2. fix database connection",
-  },
-  {
-    title: "validations and validation",
-    first: "fix API validations",
-    second: "fix API validation",
-    merged: "fix API validations:\n1. fix API validations\n2. fix API validation",
-  },
-  {
-    title: "replications and replication",
-    first: "fix database replications",
-    second: "fix database replication",
-    merged: "fix database replications:\n1. fix database replications\n2. fix database replication",
-  },
+  pluralTargetPair("templates/template", "fix email templates", "fix email template"),
+  pluralTargetPair("classes/class", "fix parser classes", "fix parser class"),
+  pluralTargetPair("policies/policy", "fix routing policies", "fix routing policy"),
+  pluralTargetPair("certificates/certificate", "fix tls certificates", "fix tls certificate"),
+  pluralTargetPair("activations/activation", "fix user activations", "fix user activation"),
+  pluralTargetPair("updates/update", "fix updates page", "fix update page"),
+  pluralTargetPair("migrations/migration", "fix database migrations", "fix database migration"),
+  pluralTargetPair("connections/connection", "fix database connections", "fix database connection"),
+  pluralTargetPair("validations/validation", "fix API validations", "fix API validation"),
+  pluralTargetPair("replications/replication", "fix database replications", "fix database replication"),
+  pluralTargetPair("databases/database", "fix databases", "fix database"),
+  pluralTargetPair("databases/database -es candidate", "fix databas", "fix databases"),
+  pluralTargetPair("database caches/cache", "fix the database caches", "fix the database cache"),
+  pluralTargetPair("image sizes/size", "fix image sizes", "fix image size"),
+  pluralTargetPair("API responses/response", "fix the api responses", "fix the api response"),
+  pluralTargetPair("test cases/case", "fix the test cases", "fix the test case"),
+  pluralTargetPair("releases/release notes", "fix releases notes", "fix release notes"),
+  pluralTargetPair("uses/use list", "fix the uses list", "fix the use list"),
+  pluralTargetPair("user licenses/license", "fix the user licenses", "fix the user license"),
+  pluralTargetPair("build phases/phase", "fix the build phases", "fix the build phase"),
+  pluralTargetPair("cookies/cookie banner", "fix the cookies banner", "fix the cookie banner"),
+  pluralTargetPair("movies/movie page", "fix the movies page", "fix the movie page"),
+  pluralTargetPair("canvases/canvas", "fix canvases shapes", "fix canvas shapes"),
+  pluralTargetPair("aliases/alias", "fix dns aliases", "fix dns alias"),
+  pluralTargetPair("biases/bias", "fix user biases", "fix user bias"),
+  pluralTargetPair("quizzes/quiz", "fix quizzes", "fix quiz"),
+  pluralTargetPair("quizzes/quizz candidate", "fix quizz", "fix quizzes"),
+  pluralTargetPair("axes/axis", "fix axes", "fix axis"),
+  pluralTargetPair("echo/echoes", "fix echo", "fix echoes"),
+  pluralTargetPair("veto/vetoes", "fix veto", "fix vetoes"),
+  pluralTargetPair("zero/zeroes", "fix zero", "fix zeroes"),
+  pluralTargetPair("size/sizes reverse order", "fix size", "fix sizes"),
+  pluralTargetPair("cookies/cooky candidate", "fix cooky", "fix cookies"),
+  pluralTargetPair("movies/movy candidate", "fix movy", "fix movies"),
+  pluralTargetPair("heroes/hero", "fix heroes", "fix hero"),
 ]
 
 const derivationalWordControls = [
@@ -1582,6 +1564,7 @@ it.instance("consolidation merges regular plural target variants", () =>
       }
     }
   }),
+  30_000,
 )
 
 it.instance("request admission merges regular plural target variants", () =>
@@ -1601,6 +1584,7 @@ it.instance("request admission merges regular plural target variants", () =>
       }
     }
   }),
+  30_000,
 )
 
 it.instance("consolidation keeps derivational word forms distinct", () =>
