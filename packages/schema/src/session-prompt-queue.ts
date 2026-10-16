@@ -30,6 +30,8 @@ export const RequestID = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9._:-]{
 })
 export type RequestID = typeof RequestID.Type
 
+export const TuiPromptAppendMetadataKey = "tuiPromptAppend"
+
 // The V1 prompt payload. SessionPrompt.PromptInput is this plus the sessionID.
 export const Input = Schema.Struct({
   requestID: Schema.optional(RequestID).annotate({
@@ -45,7 +47,7 @@ export const Input = Schema.Struct({
   ),
   agent: Schema.optional(Schema.String),
   origin: Schema.optional(Schema.Literal("tui-composer")).annotate({
-    description: "The interactive TUI composer supplied this prompt.",
+    description: "The prompt came through the interactive TUI composer; machine-message markers still classify it.",
   }),
   noReply: Schema.optional(Schema.Boolean),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)).annotate({

@@ -8,6 +8,7 @@ import { DialogMessage } from "./dialog-message"
 import { useDialog } from "../../ui/dialog"
 import type { PromptInfo } from "../../component/prompt/history"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
+import { classify } from "@opencode-ai/schema/session-machine-message"
 
 export function DialogTimeline(props: {
   sessionID: string
@@ -48,14 +49,30 @@ export function timelineOptions(input: {
       const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueue)
       return Option.isSome(group) ? [group.value] : []
     })
-    if (!groups.length || groups.some((group) =>
-      !group.constituents.length || !group.constituents.every((item) => item.input.origin === "tui-composer"),
-    ))
+    if (
+      !groups.length ||
+      groups.some((group) => {
+        if ((group.kind !== "human" && group.kind !== "individual") || !group.constituents.length) return true
+        return group.constituents.some((item) => {
+          const text = item.input.parts
+            .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
+            .join("")
+          const appended = item.input.parts.some(
+            (part) => part.type === "text" && part.metadata?.[SessionPromptQueue.TuiPromptAppendMetadataKey] === true,
+          )
+          const classified = classify(text) !== undefined
+          return appended || classified || (item.input.origin !== undefined && item.input.origin !== "tui-composer")
+        })
+      })
+    )
       continue
     const text = parts.filter((part): part is TextPart => part.type === "text" && !part.synthetic && !part.ignored)
     if (!text.length) continue
     result.push({
-      title: text.map((part) => part.text).join("").replace(/\n/g, " "),
+      title: text
+        .map((part) => part.text)
+        .join("")
+        .replace(/\n/g, " "),
       value: message.id,
       footer: Locale.time(message.time.created),
       onSelect: (dialog) => {

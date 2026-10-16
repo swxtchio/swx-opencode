@@ -3,14 +3,21 @@ import { Command } from "@/command"
 import * as InstanceState from "@/effect/instance-state"
 import { Format } from "@/format"
 import { Global } from "@opencode-ai/core/global"
+import { NamedError } from "@opencode-ai/core/util/error"
 import { LSP } from "@/lsp/lsp"
+import { Provider } from "@/provider/provider"
 import { Vcs } from "@/project/vcs"
 import { Skill } from "@/skill"
 import { SessionPrompt } from "@/session/prompt"
 import { Effect } from "effect"
-import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
+import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { ApiVcsApplyError, PromptEnhancePayload } from "../groups/instance"
+import {
+  ApiVcsApplyError,
+  PromptEnhanceModelNotFoundError,
+  PromptEnhancePayload,
+  PromptEnhanceProviderError,
+} from "../groups/instance"
 import { markInstanceForDisposal } from "../lifecycle"
 
 export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance", (handlers) =>
@@ -42,9 +49,16 @@ export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance"
     const promptEnhance = Effect.fn("InstanceHttpApi.promptEnhance")(function* (ctx: {
       payload: typeof PromptEnhancePayload.Type
     }) {
-      return yield* prompt
-        .enhance(ctx.payload)
-        .pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
+      return yield* prompt.enhance(ctx.payload).pipe(
+        Effect.mapError((error) => {
+          if (Provider.ModelNotFoundError.isInstance(error))
+            return new PromptEnhanceModelNotFoundError({ model: ctx.payload.model, message: error.message })
+          return new PromptEnhanceProviderError({
+            model: ctx.payload.model,
+            message: promptEnhanceErrorMessage(error),
+          })
+        }),
+      )
     })
 
     const getVcs = Effect.fn("InstanceHttpApi.vcs")(function* () {
@@ -119,3 +133,12 @@ export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance"
       .handle("formatter", getFormatter)
   }),
 )
+
+function promptEnhanceErrorMessage(error: unknown) {
+  if (error instanceof NamedError) {
+    const data = error.toObject().data
+    if (data && typeof data === "object" && "message" in data && typeof data.message === "string") return data.message
+  }
+  if (error instanceof Error) return error.message
+  return String(error)
+}

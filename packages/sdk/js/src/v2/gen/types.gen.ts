@@ -2444,6 +2444,16 @@ export type Path = {
   directory: string
 }
 
+export type PromptEnhanceModelNotFoundError = {
+  model: string
+  message: string
+}
+
+export type PromptEnhanceProviderError = {
+  model: string
+  message: string
+}
+
 export type VcsInfo = {
   branch?: string
   default_branch?: string
@@ -8361,9 +8371,13 @@ export type InstancePromptEnhanceErrors = {
    */
   400: BadRequestError
   /**
-   * InternalServerError
+   * PromptEnhanceModelNotFoundError
    */
-  500: EffectHttpApiErrorInternalServerError
+  404: PromptEnhanceModelNotFoundError
+  /**
+   * PromptEnhanceProviderError
+   */
+  502: PromptEnhanceProviderError
 }
 
 export type InstancePromptEnhanceError = InstancePromptEnhanceErrors[keyof InstancePromptEnhanceErrors]

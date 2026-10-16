@@ -9,6 +9,7 @@ import type { PromptInfo } from "./history"
 export type StashEntry = {
   input: string
   parts: PromptInfo["parts"]
+  machineAppended?: true
   timestamp: number
 }
 

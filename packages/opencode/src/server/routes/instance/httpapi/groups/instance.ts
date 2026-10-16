@@ -29,6 +29,14 @@ export const PromptEnhancePayload = Schema.Struct({
   context: Schema.String,
 })
 
+export class PromptEnhanceModelNotFoundError extends Schema.ErrorClass<PromptEnhanceModelNotFoundError>(
+  "PromptEnhanceModelNotFoundError",
+)({ model: Schema.String, message: Schema.String }, { httpApiStatus: 404 }) {}
+
+export class PromptEnhanceProviderError extends Schema.ErrorClass<PromptEnhanceProviderError>(
+  "PromptEnhanceProviderError",
+)({ model: Schema.String, message: Schema.String }, { httpApiStatus: 502 }) {}
+
 export const VcsDiffQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
   mode: Vcs.Mode,
@@ -91,7 +99,7 @@ export const InstanceApi = HttpApi.make("instance")
           query: WorkspaceRoutingQuery,
           payload: PromptEnhancePayload,
           success: described(Schema.String, "Enhanced prompt draft"),
-          error: [HttpApiError.InternalServerError],
+          error: [PromptEnhanceModelNotFoundError, PromptEnhanceProviderError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "instance.prompt.enhance",

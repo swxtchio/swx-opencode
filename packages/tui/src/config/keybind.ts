@@ -172,7 +172,7 @@ export const Definitions = {
   input_select_up: keybind("shift+up", "Select up in input"),
   input_select_down: keybind("shift+down", "Select down in input"),
   input_line_home: keybind("ctrl+a", "Move to start of line in input"),
-  input_line_end: keybind("none", "Move to end of line in input"),
+  input_line_end: keybind("ctrl+e", "Move to end of line in input"),
   input_select_line_home: keybind("ctrl+shift+a", "Select to start of line in input"),
   input_select_line_end: keybind("ctrl+shift+e", "Select to end of line in input"),
   input_visual_line_home: keybind("alt+a", "Move to start of visual line in input"),

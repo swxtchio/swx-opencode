@@ -58,7 +58,7 @@ function compareMessage(a: Message, b: Message) {
 
 const messageKey = (message: Message) => message.time.created + message.id
 
-export type SendingPrompt = { requestID: string; text: string }
+export type SendingPrompt = { requestID: string; text: string; machineAppended?: true }
 
 // The prompts being sent that a list of queue items does not carry yet.
 function unlisted(sending: SendingPrompt[], items: SessionPromptQueueItem[]) {

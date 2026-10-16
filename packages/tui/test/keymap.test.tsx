@@ -149,31 +149,29 @@ test("ctrl+r opens timeline and ctrl+e enhances the prompt while rename stays un
     const keymap = createDefaultOpenTuiKeymap(renderer)
     const config = createResolvedKeymapConfig()
     const offKeymap = registerOpencodeKeymap(keymap, renderer, config)
+    bindings.lineEndDefault = config.keybinds.get("input.line.end")
     const offLayer = keymap.registerLayer({
       commands: [
         { name: "session.timeline", run: () => void calls.push("session.timeline") },
         { name: "session.rename", run: () => void calls.push("session.rename") },
         { name: "prompt.enhance", run: () => void calls.push("prompt.enhance") },
-        { name: "input.line.end", run: () => void calls.push("input.line.end") },
       ],
-      bindings: config.keybinds.gather("session", [
-        "session.timeline",
-        "session.rename",
-        "prompt.enhance",
-        "input.line.end",
-      ]),
+      bindings: config.keybinds.gather("session", ["session.timeline", "session.rename", "prompt.enhance"]),
     })
     const registered = keymap.getCommandBindings({
       visibility: "registered",
       commands: ["session.timeline", "session.rename", "prompt.enhance", "input.line.end"],
     })
-    bindings.timeline = registered.get("session.timeline")?.map((binding) =>
-      binding.sequence.map((part) => ({ name: part.stroke.name, ctrl: part.stroke.ctrl })),
-    )
+    bindings.timeline = registered
+      .get("session.timeline")
+      ?.map((binding) => binding.sequence.map((part) => ({ name: part.stroke.name, ctrl: part.stroke.ctrl })))
     bindings.rename = registered.get("session.rename")?.length ?? 0
-    bindings.enhance = registered.get("prompt.enhance")?.map((binding) =>
-      binding.sequence.map((part) => ({ name: part.stroke.name, ctrl: part.stroke.ctrl })),
-    )
+    bindings.enhance = registered
+      .get("prompt.enhance")
+      ?.map((binding) => binding.sequence.map((part) => ({ name: part.stroke.name, ctrl: part.stroke.ctrl })))
+    bindings.lineEnd = registered
+      .get("input.line.end")
+      ?.map((binding) => binding.sequence.map((part) => ({ name: part.stroke.name, ctrl: part.stroke.ctrl })))
     onCleanup(() => {
       offLayer()
       offKeymap()
@@ -194,6 +192,8 @@ test("ctrl+r opens timeline and ctrl+e enhances the prompt while rename stays un
     expect(bindings.timeline).toEqual([[{ name: "r", ctrl: true }]])
     expect(bindings.rename).toBe(0)
     expect(bindings.enhance).toEqual([[{ name: "e", ctrl: true }]])
+    expect(bindings.lineEnd).toContainEqual([{ name: "e", ctrl: true }])
+    expect(bindings.lineEndDefault).toMatchObject([{ key: "ctrl+e" }])
   } finally {
     app.renderer.destroy()
   }

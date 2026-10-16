@@ -53,7 +53,7 @@ export const Attention = Schema.Struct({
 const PromptSize = Schema.Int.check(Schema.isGreaterThan(0))
 export const PromptEnhanceModelDefault = "google/gemini-4-argon"
 const PromptEnhanceModel = Schema.String.check(Schema.isPattern(/^[^/]+\/.+$/)).annotate({
-  description: "Provider and model ID used to enhance the current prompt draft",
+  description: "Provider and model ID used to enhance the current prompt draft, set at the root of tui.json",
 })
 export const Prompt = Schema.Struct({
   max_height: Schema.optional(PromptSize).annotate({ description: "Prompt textarea max height" }),

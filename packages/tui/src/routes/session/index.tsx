@@ -276,6 +276,8 @@ export function Session() {
     const index = messages().findIndex((message) => message.id === messageID)
     return index === -1 ? messages() : messages().slice(0, index)
   }
+  const enhancementMessages = () =>
+    messagesBeforeRevert().map((message) => ({ info: message, parts: sync.data.part[message.id] ?? [] }))
   const foregroundTasks = createMemo(() =>
     sync.data.capabilities.experimentalBackgroundSubagents ? activeForegroundTasks(sync, messages()) : [],
   )
@@ -1445,6 +1447,7 @@ export function Session() {
                         toBottom()
                       }}
                       sessionID={route.sessionID}
+                      enhancementMessages={enhancementMessages}
                       right={<pluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />}
                     />
                   </pluginRuntime.Slot>
@@ -2076,11 +2079,7 @@ function InlineTool(props: {
     if (props.part.state.status !== "pending" && props.part.state.status !== "running") return false
     const current = message()
     if (current?.role !== "assistant") return false
-    return (
-      current.time.completed === undefined &&
-      current.error === undefined &&
-      status() === "unknown"
-    )
+    return current.time.completed === undefined && current.error === undefined && status() === "unknown"
   })
   const active = createMemo(() => {
     const current = message()
@@ -2241,9 +2240,7 @@ function BlockTool(props: {
   const [hover, setHover] = createSignal(false)
   const error = createMemo(() => (props.part?.state.status === "error" ? props.part.state.error : undefined))
   const message = createMemo(() =>
-    props.part
-      ? sync.data.message[props.part.sessionID]?.find((item) => item.id === props.part?.messageID)
-      : undefined,
+    props.part ? sync.data.message[props.part.sessionID]?.find((item) => item.id === props.part?.messageID) : undefined,
   )
   const status = createMemo(() => {
     if (!props.part) return "idle" as const
@@ -2261,12 +2258,7 @@ function BlockTool(props: {
     if (!props.part || (props.part.state.status !== "pending" && props.part.state.status !== "running")) return false
     const current = message()
     if (current?.role !== "assistant") return false
-    return (
-      current.time.completed !== undefined ||
-      current.error !== undefined ||
-      status() === "failed" ||
-      unresolved()
-    )
+    return current.time.completed !== undefined || current.error !== undefined || status() === "failed" || unresolved()
   })
   return (
     <box

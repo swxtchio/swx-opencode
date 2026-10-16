@@ -1939,7 +1939,9 @@ it.instance(
             messageID: heldID,
             agent: "build",
             model: ref,
-            parts: [{ type: "text", text: "[fm-from-firstmate]\x1f queued-mail" }],
+            delivery: "steer",
+            origin: "tui-composer",
+            parts: [{ type: "text", text: "OBSERVER: [fm-level:directive]\x1f queued-mail" }],
           })
           .pipe(Effect.forkChild)
         const queuedHeld = yield* pollWithTimeout(
@@ -1956,6 +1958,8 @@ it.instance(
             messageID: criticalID,
             agent: "build",
             model: ref,
+            delivery: "queue",
+            origin: "tui-composer",
             parts: [
               {
                 type: "text",
@@ -4835,6 +4839,13 @@ const modelMessages = (input: Record<string, unknown> | undefined) => {
 
 const lastUser = (input: Record<string, unknown> | undefined) => modelMessages(input).at(-1)
 
+function visibleUserText(message: SessionV1.WithParts) {
+  return message.parts
+    .filter((part): part is SessionV1.TextPart => part.type === "text" && !part.synthetic && !part.ignored)
+    .map((part) => part.text)
+    .join("")
+}
+
 function lastUserText(input: Record<string, unknown>) {
   const messages = input.messages
   if (!Array.isArray(messages)) throw new Error("expected LLM messages")
@@ -5059,9 +5070,7 @@ it.instance("busy TUI composer prompts are answered once as one ordered user mes
     expect(batchedCalls).toHaveLength(1)
     expect(lastUserText(batchedCalls[0]!)).toBe("A\nB")
     const messages = yield* held.sessions.messages({ sessionID: held.chat.id })
-    const delivered = messages.filter(
-      (message) => message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.text === "A\nB"),
-    )
+    const delivered = messages.filter((message) => message.info.role === "user" && visibleUserText(message) === "A\nB")
     expect(delivered).toHaveLength(1)
     for (const requestID of ["composer-a", "composer-b"]) {
       const receipt = yield* held.queue.receipt(held.chat.id, requestID)
@@ -5072,6 +5081,51 @@ it.instance("busy TUI composer prompts are answered once as one ordered user mes
     }
     expect(yield* held.queue.list(held.chat.id)).toEqual([])
   }),
+  { timeout: 30000 },
+)
+
+it.instance(
+  "identical busy TUI composer prompts survive admission and answer once as A newline A",
+  () =>
+    Effect.gen(function* () {
+      const held = yield* startHeld()
+      const first = yield* held.send("A", {
+        requestID: "composer-duplicate-a",
+        delivery: "queue",
+        origin: "tui-composer",
+      })
+      const second = yield* held.send("A", {
+        requestID: "composer-duplicate-b",
+        delivery: "queue",
+        origin: "tui-composer",
+      })
+      const pending = yield* queued(held.chat.id, 2)
+      expect(pending.map((item) => item.input.parts[0]?.type === "text" && item.input.parts[0].text)).toEqual([
+        "A",
+        "A",
+      ])
+      yield* held.llm.text("one answer for the duplicate batch")
+      yield* held.release
+      yield* finish(held.task, first, second)
+
+      const calls = yield* held.llm.inputs
+      const batch = calls.filter((call) => lastUserText(call).includes("A\nA"))
+      expect(calls).toHaveLength(2)
+      expect(batch).toHaveLength(1)
+      expect(lastUserText(batch[0]!)).toBe("A\nA")
+      const delivered = (yield* held.sessions.messages({ sessionID: held.chat.id })).filter(
+        (message) => message.info.role === "user" && visibleUserText(message) === "A\nA",
+      )
+      expect(delivered).toHaveLength(1)
+      for (const requestID of ["composer-duplicate-a", "composer-duplicate-b"]) {
+        const receipt = yield* held.queue.receipt(held.chat.id, requestID)
+        expect(Option.isSome(receipt) ? receipt.value : undefined).toEqual({
+          state: "delivered",
+          messageID: delivered[0]!.info.id,
+        })
+      }
+      expect(yield* held.queue.list(held.chat.id)).toEqual([])
+    }),
   { timeout: 30000 },
 )
 

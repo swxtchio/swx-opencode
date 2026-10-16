@@ -568,7 +568,18 @@ it.live(
     Effect.gen(function* () {
       const llm = yield* TestLLMServer
       yield* llm.text("clear rewritten draft")
-      const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+      const base = testProviderConfig(llm.url)
+      const config = {
+        ...base,
+        provider: {
+          ...base.provider,
+          test: {
+            ...base.provider.test,
+            options: { ...base.provider.test.options, setCacheKey: true },
+          },
+        },
+      }
+      const directory = yield* tmpdirScoped({ git: true, config })
       const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
       const response = yield* request(`${InstancePaths.promptEnhance}?directory=${encodeURIComponent(directory)}`, {
         method: "POST",
@@ -587,6 +598,50 @@ it.live(
       expect(calls[0]?.model).toBe("test-model")
       expect(JSON.stringify(calls[0])).toContain("visible session context")
       expect(JSON.stringify(calls[0])).toContain("rough draft")
+      expect(JSON.stringify(calls[0])).toContain("preserving its intent")
+      expect(JSON.stringify(calls[0])).toContain("promptCacheKey")
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  30_000,
+)
+
+it.live(
+  "reports an unavailable prompt enhancement model as a model resolution failure",
+  () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+      const response = yield* request(`${InstancePaths.promptEnhance}?directory=${encodeURIComponent(directory)}`, {
+        method: "POST",
+        headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+        body: JSON.stringify({ model: "test/missing-model", draft: "rough draft", context: "" }),
+      })
+
+      expect(response.status).toBe(404)
+      const body = yield* response.text
+      expect(body).toContain("test/missing-model")
+      expect(body).toContain("Model not found")
+      expect(yield* llm.calls).toBe(0)
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  30_000,
+)
+
+it.live(
+  "reports enhancement provider failures with the provider error detail",
+  () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      yield* llm.error(401, { error: "credentials rejected" })
+      const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+      const response = yield* request(`${InstancePaths.promptEnhance}?directory=${encodeURIComponent(directory)}`, {
+        method: "POST",
+        headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+        body: JSON.stringify({ model: "test/test-model", draft: "rough draft", context: "" }),
+      })
+
+      expect(response.status).toBe(502)
+      const body = yield* response.text
+      expect(body).toContain("credentials rejected")
+      expect(yield* llm.calls).toBe(1)
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
   30_000,
 )
