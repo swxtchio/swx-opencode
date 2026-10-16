@@ -214,7 +214,12 @@ const sessionGlobalBindingCommands = [
 
 const sessionGlobalUnfocusedBindingCommands = ["session.first", "session.last"] as const
 
-type PresentationSegment = "content" | "inline-error" | `block-error:${string}` | `diagnostics:${string}`
+type PresentationSegment =
+  | "content"
+  | "inline-error"
+  | "inline-failure"
+  | `block-error:${string}`
+  | `diagnostics:${string}`
 
 export const SessionContext = createContext<{
   width: number
@@ -297,7 +302,17 @@ export function Session() {
       providers: sync.data.provider,
     },
     presentation: new Map(
-      Array.from(presentedParts, ([partID, segments]) => [partID, Array.from(segments.values()).join("\n")] as const),
+      Array.from(presentedParts, ([partID, segments]) => [
+        partID,
+        [
+          segments.get("inline-failure") ?? segments.get("content"),
+          ...Array.from(segments)
+            .filter(([segment]) => segment !== "content" && segment !== "inline-failure")
+            .map(([, text]) => text),
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      ] as const),
     ),
   })
   const foregroundTasks = createMemo(() =>
@@ -2157,6 +2172,10 @@ function InlineTool(props: {
 
   const failed = createMemo(() => Boolean(error() && !denied()) || (stopped() && !unresolved()))
   const clickable = createMemo(() => Boolean(props.onClick || failed()))
+  createEffect(() =>
+    ctx.presentPart(props.part.id, failed() && !props.complete ? props.failure : undefined, "inline-failure"),
+  )
+  onCleanup(() => ctx.presentPart(props.part.id, undefined, "inline-failure"))
   createEffect(() =>
     ctx.presentPart(props.part.id, failed() && errorExpanded() ? error() : undefined, "inline-error"),
   )

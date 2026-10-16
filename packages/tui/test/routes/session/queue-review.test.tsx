@@ -1115,6 +1115,36 @@ test("ctrl+e context includes visible tool errors and diagnostics", async () => 
             time: { start: 2, end: 3 },
           },
         },
+        {
+          id: "prt_apply_patch_error",
+          sessionID,
+          messageID: assistantID,
+          type: "tool",
+          callID: "call_apply_patch_error",
+          tool: "apply_patch",
+          state: {
+            status: "error",
+            input: { patch: "*** Begin Patch\n*** End Patch" },
+            error: "patch rejected",
+            metadata: {},
+            time: { start: 2, end: 3 },
+          },
+        },
+        {
+          id: "prt_todo_write_error",
+          sessionID,
+          messageID: assistantID,
+          type: "tool",
+          callID: "call_todo_write_error",
+          tool: "todowrite",
+          state: {
+            status: "error",
+            input: { todos: [{ content: "finish review", status: "in_progress" }] },
+            error: "todo update rejected",
+            metadata: {},
+            time: { start: 2, end: 3 },
+          },
+        },
       ],
     },
   ]
@@ -1123,7 +1153,12 @@ test("ctrl+e context includes visible tool errors and diagnostics", async () => 
     await until(
       async () => {
         const frame = (await screen(app)).join("\n")
-        return frame.includes("visible BlockTool error token") && frame.includes("visible tool diagnostic token")
+        return (
+          frame.includes("visible BlockTool error token") &&
+          frame.includes("visible tool diagnostic token") &&
+          frame.includes("Patch failed") &&
+          frame.includes("Todo update failed")
+        )
       },
       "visible block error and diagnostics",
     )
@@ -1131,7 +1166,10 @@ test("ctrl+e context includes visible tool errors and diagnostics", async () => 
     app.renderer.mockInput.pressKey("e", { ctrl: true })
     await until(() => app.enhancements.length === 1, "context with visible errors")
     expect(app.enhancements[0]!.context).toContain("visible BlockTool error token")
+    expect(app.enhancements[0]!.context).toContain("visible shell output token")
     expect(app.enhancements[0]!.context).toContain("Error [1:1] visible tool diagnostic token")
+    expect(app.enhancements[0]!.context).toContain("Patch failed")
+    expect(app.enhancements[0]!.context).toContain("Todo update failed")
     expect(app.enhancements[0]!.context).not.toContain("expanded inline tool error token")
 
     await clickVisible(app, "WebFetch https://example.test")
