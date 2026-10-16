@@ -3803,8 +3803,6 @@ const targetComplements = new Set([
 
 const targetClauseConjunctions = new Set(["and", "but", "or"])
 const targetClauseOpeners = new Set(["how", "what", "when", "where", "whether", "which", "who", "why"])
-// These names end with a recognized file suffix but still describe natural-language targets.
-const targetRuntimeNames = new Set(["node.js", "next.js", "vue.js"])
 
 const targetFileSuffixes = new Set([
   "ts",
@@ -3880,14 +3878,17 @@ function targetWords(target: string) {
       .match(/[a-z0-9_.-]+(?:[\\/][a-z0-9_.-]+)*/g)
       ?.flatMap((part) => {
         const path = part.replace(/\\/g, "/")
-        if (paths.has(path)) return part.slice(0, part.lastIndexOf(".")).match(/[a-z0-9]+/g) ?? []
-        if (targetRuntimeNames.has(part)) return [part.slice(0, part.indexOf("."))]
-        const dot = part.lastIndexOf(".")
-        if (dot > 0 && dot < part.length - 1) {
-          // Keep arbitrary dotted suffixes literal so inflection cannot equate different names.
-          return [...(part.slice(0, dot).match(/[a-z0-9]+/g) ?? []), `.${part.slice(dot + 1)}`]
+        if (paths.has(path)) {
+          return part
+            .slice(0, part.lastIndexOf("."))
+            .split(/[\\/]/)
+            .flatMap((component) => component.match(/[a-z0-9]+/g) ?? [])
         }
-        return part.match(/[a-z0-9]+/g) ?? []
+        return part.split(/[\\/]/).flatMap((component) => {
+          // Keep unlisted suffix basenames whole so prose stemming cannot rewrite their identity.
+          if (component.includes(".")) return [component]
+          return component.match(/[a-z0-9]+/g) ?? []
+        })
       }) ?? []
   )
 }
@@ -3918,17 +3919,32 @@ function targetMatches(left: string, right: string) {
   const rightIdentity = targetIdentity(rightSubject)
   if (containsTarget(leftSubjectText, rightSubjectText) && rightIdentity.nonGeneric.length > 0) return true
   if (containsTarget(rightSubjectText, leftSubjectText) && leftIdentity.nonGeneric.length > 0) return true
-  if (!leftIdentity.head || leftIdentity.head !== rightIdentity.head) return false
-  if (leftIdentity.evidence.length === 0 || rightIdentity.evidence.length === 0) return false
+  if (!leftIdentity.head || !rightIdentity.head || !targetWordMatches(leftIdentity.head, rightIdentity.head))
+    return false
+  if (leftIdentity.evidence.length === 0 || rightIdentity.evidence.length === 0) {
+    return (
+      leftIdentity.nonGeneric.length === 1 &&
+      rightIdentity.nonGeneric.length === 1 &&
+      targetWordMatches(leftIdentity.nonGeneric[0]!, rightIdentity.nonGeneric[0]!)
+    )
+  }
   return (
-    leftIdentity.evidence.every((word) => rightIdentity.evidence.includes(word)) ||
-    rightIdentity.evidence.every((word) => leftIdentity.evidence.includes(word))
+    leftIdentity.evidence.every((word) => rightIdentity.evidence.some((other) => targetWordMatches(word, other))) ||
+    rightIdentity.evidence.every((word) => leftIdentity.evidence.some((other) => targetWordMatches(word, other)))
   )
 }
 
 function targetPaths(target: string) {
-  const tokens = normalizeTarget(target).match(/[a-z0-9_.-]+(?:[\\/][a-z0-9_.-]+)*/g) ?? []
-  return tokens.filter(targetFileToken).map((token) => token.split(/[\\/]/))
+  const normalized = normalizeTarget(target)
+  const tokens = normalized.match(/[a-z0-9_.-]+(?:[\\/][a-z0-9_.-]+)*/g) ?? []
+  return tokens
+    .filter(
+      (token) =>
+        targetFileToken(token) &&
+        // A bare JavaScript name in a subject is ambiguous; slash paths and exact file targets remain literal.
+        (targetFileSuffix(token) !== "js" || token.includes("/") || normalized === token),
+    )
+    .map((token) => token.split(/[\\/]/))
 }
 
 function targetFileSuffix(target: string) {
@@ -3940,8 +3956,7 @@ function targetFileSuffix(target: string) {
 }
 
 function targetFileToken(target: string) {
-  const normalized = normalizeTarget(target)
-  return !targetRuntimeNames.has(normalized) && Boolean(targetFileSuffix(normalized))
+  return Boolean(targetFileSuffix(target))
 }
 
 function directPathTarget(target: string, paths: readonly (readonly string[])[]) {
@@ -3959,6 +3974,16 @@ function targetIdentity(target: string) {
   }
 }
 
+// A dotted natural name can share its base with an undotted subject without equating two dotted identities.
+function targetWordMatches(left: string, right: string) {
+  if (left === right) return true
+  if (left.includes(".") === right.includes(".")) return false
+  const dotted = left.includes(".") ? left : right
+  const plain = left.includes(".") ? right : left
+  const suffix = dotted.slice(dotted.indexOf(".") + 1)
+  return /^[a-z][a-z0-9-]*$/.test(suffix) && dotted.slice(0, dotted.indexOf(".")) === plain
+}
+
 function pathSuffix(longer: readonly string[], shorter: readonly string[]) {
   return (
     shorter.length <= longer.length &&
@@ -3970,13 +3995,23 @@ function containsTarget(longer: string, shorter: string) {
   const longerWords = targetWords(longer).map(normalizeTargetWord)
   const shorterWords = targetWords(shorter).map(normalizeTargetWord)
   if (shorterWords.length === 0 || shorterWords.length >= longerWords.length) return false
-  return longerWords.some((_, index) => shorterWords.every((word, offset) => word === longerWords[index + offset]))
+  return longerWords.some((_, index) =>
+    shorterWords.every((word, offset) => targetWordMatches(word, longerWords[index + offset]!)),
+  )
 }
 
 function normalizeTargetWord(word: string) {
-  if (word.startsWith(".")) return word
-  // Requiring a five-character root keeps short pairs such as port/portion and edit/edition distinct.
-  if (word.length > 7 && word.endsWith("ion")) return word.slice(0, -3)
+  if (word.includes(".")) return word
+  if (word.length > 7 && word.endsWith("ion")) {
+    const root = word.slice(0, -3)
+    // The -ation and -ction boundaries are productive; -ssion and -stion roots are not.
+    if (root.length >= 5 && /(?:at|ct)$/.test(root)) return root
+  }
+  if (word.length > 5 && word.endsWith("ate")) {
+    // Only reduce productive -ate verbs to a consonant-final stem.
+    const root = word.slice(0, -1)
+    if (root.length >= 5 && root.endsWith("t")) return root
+  }
   if (word.length > 6 && word.endsWith("ing")) return word.slice(0, -3)
   if (word.length > 5 && word.endsWith("ed")) return word.slice(0, -2)
   if (word.length > 4 && word.endsWith("ies")) return `${word.slice(0, -3)}y`
@@ -4012,7 +4047,13 @@ function parseCommand(input: SessionPromptQueue.QueuedInput) {
   // Keep the whole subject phrase; punctuation, options, and a leading file token separate later instructions.
   const separator = /:\s|:$|\.\s+|[!?]\s+|;\s+|\n|\s+(?=--\S)/.exec(rest)
   const candidate = separator ? undefined : /^(?:[^\s\\/]+[\\/])*[^\s\\/]+\.[a-z0-9]+(?=\s+\S)/i.exec(rest)
-  const fileCandidate = candidate && targetFileToken(candidate[0]) ? candidate : undefined
+  // A bare .js token with trailing words can be a runtime name, so preserve that complete subject.
+  const fileCandidate =
+    candidate &&
+    targetFileToken(candidate[0]) &&
+    (targetFileSuffix(candidate[0]) !== "js" || candidate[0].includes("/"))
+      ? candidate
+      : undefined
   const fileEnd = fileCandidate ? fileCandidate.index + fileCandidate[0].length : undefined
   const end = separator?.index ?? fileEnd ?? rest.length
   const commandTarget = rest.slice(0, end).trim()

@@ -253,10 +253,30 @@ const literalFilenameTargets = [
 
 const suffixFilenameTargets = [
   {
+    title: "unlisted suffix basenames use literal identity after case normalization",
+    first: "fix auth tool.test: preserve the module",
+    second: "fix auth tools.TEST: verify the schema",
+  },
+  {
+    title: "unlisted suffix basenames stay literal under a path prefix",
+    first: "fix src/tool.test: preserve the module",
+    second: "fix src/tools.test: verify the schema",
+  },
+  {
+    title: "unlisted suffix basenames do not singularize before identity",
+    first: "fix auth.graphql: preserve the schema",
+    second: "fix auths.graphql: verify the schema",
+  },
+  {
+    title: "an ing suffix does not singularize an unlisted dotted basename",
+    first: "fix auth redirecting.test: preserve the route",
+    second: "fix auth redirect.test: verify the route",
+  },
+  {
     title: "an unlisted dotted filename retains literal path containment",
-    first: "update src/file.test: preserve the test identity",
+    first: "update src/File.TEST: preserve the test identity",
     second: "update file.test: document the fixture",
-    merged: "update src/file.test:\n1. preserve the test identity\n2. file.test: document the fixture",
+    merged: "update src/File.TEST:\n1. preserve the test identity\n2. file.test: document the fixture",
   },
   {
     title: "curated bare suffix matches a slash-qualified filename",
@@ -346,6 +366,47 @@ const runtimeNameTarget = {
   merged: "upgrade node.js runtime:\n1. upgrade node.js runtime\n2. upgrade node runtime",
 }
 
+const dottedRuntimeControls = [
+  {
+    title: "express.js authentication and billing handlers stay separate",
+    first: "fix express.js authentication handler",
+    second: "fix express.js billing handler",
+  },
+  {
+    title: "nuxt.js authentication and billing handlers stay separate",
+    first: "fix nuxt.js authentication handler",
+    second: "fix nuxt.js billing handler",
+  },
+  {
+    title: "d3.js chart and axis handlers stay separate",
+    first: "fix d3.js chart handler",
+    second: "fix d3.js axis handler",
+  },
+]
+
+const dottedRuntimeSameJobTargets = [
+  {
+    title: "express.js and express keep the same subject",
+    first: "fix express.js authentication handler",
+    second: "fix express authentication handler",
+    merged:
+      "fix express.js authentication handler:\n1. fix express.js authentication handler\n2. fix express authentication handler",
+  },
+  {
+    title: "nuxt.js and nuxt keep the same subject",
+    first: "fix nuxt.js authentication handler",
+    second: "fix nuxt authentication handler",
+    merged:
+      "fix nuxt.js authentication handler:\n1. fix nuxt.js authentication handler\n2. fix nuxt authentication handler",
+  },
+  {
+    title: "d3.js and d3 keep the same subject",
+    first: "fix d3.js chart handler",
+    second: "fix d3 chart handler",
+    merged: "fix d3.js chart handler:\n1. fix d3.js chart handler\n2. fix d3 chart handler",
+  },
+]
+
 const caseInsensitiveFilenameTargets = [
   {
     title: "no-colon uppercase filename retains its identity",
@@ -363,6 +424,12 @@ const caseInsensitiveFilenameTargets = [
     title: "uppercase extension keeps different files distinct",
     first: "update Auth.TS: preserve the TypeScript module",
     second: "update Auth.TSX: preserve the JSX module",
+  },
+  {
+    title: "a slash-qualified and bare JavaScript path share file identity",
+    first: "update src/node.js: parse options",
+    second: "update node.js: format tokens",
+    merged: "update src/node.js:\n1. parse options\n2. node.js: format tokens",
   },
 ]
 
@@ -479,6 +546,18 @@ const sameJobWordForms = [
     merged: "investigate network failed:\n1. investigate network failed\n2. investigate network fail",
   },
   {
+    title: "activation and activate share a bounded -ate/-ion root",
+    first: "fix user activation",
+    second: "fix user activate",
+    merged: "fix user activation:\n1. fix user activation\n2. fix user activate",
+  },
+  {
+    title: "normalized singleton migration roots match",
+    first: "fix migration",
+    second: "fix migrate",
+    merged: "fix migration:\n1. fix migration\n2. fix migrate",
+  },
+  {
     title: "reconnecting and reconnection match with a trailing subject noun",
     first: "fix websocket reconnecting handler",
     second: "fix websocket reconnection handler",
@@ -488,10 +567,15 @@ const sameJobWordForms = [
 ]
 
 const boundedStemControls = [
-  { title: "port and portion", first: "fix auth port", second: "fix auth portion" },
-  { title: "edit and edition", first: "fix auth edit", second: "fix auth edition" },
-  { title: "region and reg", first: "fix auth region", second: "fix auth reg" },
-  { title: "activation and activate", first: "fix auth activation", second: "fix auth activate" },
+  {
+    title: "express parser and expression parser",
+    first: "fix auth express parser",
+    second: "fix auth expression parser",
+  },
+  { title: "quest parser and question parser", first: "fix auth quest parser", second: "fix auth question parser" },
+  { title: "port parser and portion parser", first: "fix auth port parser", second: "fix auth portion parser" },
+  { title: "edit page and edition page", first: "fix auth edit page", second: "fix auth edition page" },
+  { title: "region cache and reg cache", first: "fix auth region cache", second: "fix auth reg cache" },
 ]
 
 const inflectionTargets = [
@@ -1069,15 +1153,21 @@ it.instance("request admission normalizes case before classifying file identity"
 
 it.instance("consolidation matches curated filenames and keeps other suffixes distinct", () =>
   Effect.gen(function* () {
+    const actual: string[][] = []
     for (const delivery of ["steer", "queue"] as const) {
       for (const pair of suffixFilenameTargets) {
         const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
           { delivery, text: pair.first },
           { delivery, text: pair.second },
         ])
-        expect(items.map(text)).toEqual(pair.merged ? [pair.merged] : [pair.first, pair.second])
+        actual.push(items.map(text))
       }
     }
+    expect(actual).toEqual(
+      ["steer", "queue"].flatMap(() =>
+        suffixFilenameTargets.map((pair) => (pair.merged ? [pair.merged] : [pair.first, pair.second])),
+      ),
+    )
   }),
 )
 
@@ -1085,18 +1175,28 @@ it.instance("request admission matches curated filenames and keeps other suffixe
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
+    const actual: string[][] = []
+    const receipts: string[] = []
     for (const delivery of ["steer", "queue"] as const) {
       for (const pair of suffixFilenameTargets) {
         const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
         yield* request(session.id, delivery, "suffix-a", pair.first)
         yield* request(session.id, delivery, "suffix-b", pair.second)
-        const expected = pair.merged ? [pair.merged] : [pair.first, pair.second]
-        expect((yield* queue.list(session.id)).map(text)).toEqual(expected)
-        expect(Option.getOrThrow(yield* queue.receipt(session.id, "suffix-b"))).toMatchObject(
-          pair.merged ? { state: "merged", into: "suffix-a" } : { state: "pending" },
-        )
+        actual.push((yield* queue.list(session.id)).map(text))
+        const receipt = Option.getOrThrow(yield* queue.receipt(session.id, "suffix-b"))
+        receipts.push(receipt.state === "merged" ? `${receipt.state}:${receipt.into}` : receipt.state)
       }
     }
+    expect(actual).toEqual(
+      ["steer", "queue"].flatMap(() =>
+        suffixFilenameTargets.map((pair) => (pair.merged ? [pair.merged] : [pair.first, pair.second])),
+      ),
+    )
+    expect(receipts).toEqual(
+      ["steer", "queue"].flatMap(() =>
+        suffixFilenameTargets.map((pair) => (pair.merged ? "merged:suffix-a" : "pending")),
+      ),
+    )
   }),
 )
 
@@ -1159,6 +1259,88 @@ it.instance("request admission keeps a dotted runtime name as a natural target",
         into: "runtime-a",
       })
     }
+  }),
+)
+
+it.instance("dotted runtime names retain different subjects in every delivery class", () =>
+  Effect.gen(function* () {
+    const actual: string[][] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of dottedRuntimeControls) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        actual.push(items.map(text))
+      }
+    }
+    expect(actual).toEqual(
+      ["steer", "queue"].flatMap(() => dottedRuntimeControls.map((pair) => [pair.first, pair.second])),
+    )
+  }),
+)
+
+it.instance("request admission retains dotted runtime subjects in every delivery class", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const actual: string[][] = []
+    const receipts: string[][] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of dottedRuntimeControls) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "runtime-control-a", pair.first)
+        yield* request(session.id, delivery, "runtime-control-b", pair.second)
+        actual.push((yield* queue.list(session.id)).map(text))
+        receipts.push([
+          Option.getOrThrow(yield* queue.receipt(session.id, "runtime-control-a")).state,
+          Option.getOrThrow(yield* queue.receipt(session.id, "runtime-control-b")).state,
+        ])
+      }
+    }
+    expect(actual).toEqual(
+      ["steer", "queue"].flatMap(() => dottedRuntimeControls.map((pair) => [pair.first, pair.second])),
+    )
+    expect(receipts).toEqual(["steer", "queue"].flatMap(() => dottedRuntimeControls.map(() => ["pending", "pending"])))
+  }),
+)
+
+it.instance("dotted runtime names match their undotted subject in every delivery class", () =>
+  Effect.gen(function* () {
+    const actual: string[][] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of dottedRuntimeSameJobTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        actual.push(items.map(text))
+      }
+    }
+    expect(actual).toEqual(["steer", "queue"].flatMap(() => dottedRuntimeSameJobTargets.map((pair) => [pair.merged])))
+  }),
+)
+
+it.instance("request admission matches dotted runtime subjects in every delivery class", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const actual: string[][] = []
+    const receipts: string[] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of dottedRuntimeSameJobTargets) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "runtime-match-a", pair.first)
+        yield* request(session.id, delivery, "runtime-match-b", pair.second)
+        actual.push((yield* queue.list(session.id)).map(text))
+        const receipt = Option.getOrThrow(yield* queue.receipt(session.id, "runtime-match-b"))
+        receipts.push(receipt.state === "merged" ? `${receipt.state}:${receipt.into}` : receipt.state)
+      }
+    }
+    expect(actual).toEqual(["steer", "queue"].flatMap(() => dottedRuntimeSameJobTargets.map((pair) => [pair.merged])))
+    expect(receipts).toEqual(
+      ["steer", "queue"].flatMap(() => dottedRuntimeSameJobTargets.map(() => "merged:runtime-match-a")),
+    )
   }),
 )
 
@@ -1315,15 +1497,17 @@ it.instance("request admission extracts the same subject across dependent-clause
 
 it.instance("consolidation matches word forms through shared lexical roots", () =>
   Effect.gen(function* () {
+    const actual: string[][] = []
     for (const delivery of ["steer", "queue"] as const) {
       for (const pair of sameJobWordForms) {
         const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
           { delivery, text: pair.first },
           { delivery, text: pair.second },
         ])
-        expect(items.map(text)).toEqual([pair.merged])
+        actual.push(items.map(text))
       }
     }
+    expect(actual).toEqual(["steer", "queue"].flatMap(() => sameJobWordForms.map((pair) => [pair.merged])))
   }),
 )
 
@@ -1331,32 +1515,38 @@ it.instance("request admission matches word forms through shared lexical roots",
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
+    const actual: string[][] = []
+    const receipts: string[] = []
     for (const delivery of ["steer", "queue"] as const) {
       for (const pair of sameJobWordForms) {
         const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
         yield* request(session.id, delivery, "word-form-a", pair.first)
         yield* request(session.id, delivery, "word-form-b", pair.second)
-        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.merged])
-        expect(Option.getOrThrow(yield* queue.receipt(session.id, "word-form-b"))).toMatchObject({
-          state: "merged",
-          into: "word-form-a",
-        })
+        actual.push((yield* queue.list(session.id)).map(text))
+        const receipt = Option.getOrThrow(yield* queue.receipt(session.id, "word-form-b"))
+        receipts.push(receipt.state === "merged" ? `${receipt.state}:${receipt.into}` : receipt.state)
       }
     }
+    expect(actual).toEqual(["steer", "queue"].flatMap(() => sameJobWordForms.map((pair) => [pair.merged])))
+    expect(receipts).toEqual(["steer", "queue"].flatMap(() => sameJobWordForms.map(() => "merged:word-form-a")))
   }),
 )
 
 it.instance("consolidation keeps short false-friend stems distinct", () =>
   Effect.gen(function* () {
+    const actual: string[][] = []
     for (const delivery of ["steer", "queue"] as const) {
       for (const pair of boundedStemControls) {
         const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
           { delivery, text: pair.first },
           { delivery, text: pair.second },
         ])
-        expect(items.map(text)).toEqual([pair.first, pair.second])
+        actual.push(items.map(text))
       }
     }
+    expect(actual).toEqual(
+      ["steer", "queue"].flatMap(() => boundedStemControls.map((pair) => [pair.first, pair.second])),
+    )
   }),
 )
 
@@ -1364,16 +1554,24 @@ it.instance("request admission keeps short false-friend stems distinct", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
+    const actual: string[][] = []
+    const receipts: string[][] = []
     for (const delivery of ["steer", "queue"] as const) {
       for (const pair of boundedStemControls) {
         const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
         yield* request(session.id, delivery, "bounded-a", pair.first)
         yield* request(session.id, delivery, "bounded-b", pair.second)
-        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.first, pair.second])
-        expect(Option.getOrThrow(yield* queue.receipt(session.id, "bounded-a"))).toMatchObject({ state: "pending" })
-        expect(Option.getOrThrow(yield* queue.receipt(session.id, "bounded-b"))).toMatchObject({ state: "pending" })
+        actual.push((yield* queue.list(session.id)).map(text))
+        receipts.push([
+          Option.getOrThrow(yield* queue.receipt(session.id, "bounded-a")).state,
+          Option.getOrThrow(yield* queue.receipt(session.id, "bounded-b")).state,
+        ])
       }
     }
+    expect(actual).toEqual(
+      ["steer", "queue"].flatMap(() => boundedStemControls.map((pair) => [pair.first, pair.second])),
+    )
+    expect(receipts).toEqual(["steer", "queue"].flatMap(() => boundedStemControls.map(() => ["pending", "pending"])))
   }),
 )
 
