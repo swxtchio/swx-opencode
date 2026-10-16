@@ -19,6 +19,7 @@ import { HttpClient } from "effect/unstable/http"
 const root = process.argv[2]
 const global = process.argv[3]
 const expectWatcher = process.argv[4] === "watch"
+const abortSimulation = process.argv[5] === "abort"
 if (!root || !global) throw new Error("expected project and global config directories")
 ;(Global.Path as { config: string }).config = global
 
@@ -48,15 +49,16 @@ const result = await Effect.runPromise(
       const search = yield* FileSystemSearch.Service
       const watcher = yield* Watcher.Service
       const target = RelativePath.make("src/nested/needle-target.ts")
+      const abortNativeWatcher = abortSimulation ? yield* waitForAbortRequest(search, expectWatcher) : false
       const files = yield* waitForFile(search, target)
       const directories = yield* search.find({ type: "directory", query: "nested", limit: 10 })
       const glob = yield* search.glob({ pattern: "src/nested/*.ts", limit: 10 })
       const matches = yield* search.grep({ pattern: "picker-content", limit: 10 })
       const watcherStatus = yield* watcher.status
-      const indexed = yield* waitForScanProgress(search)
+      const indexed = abortSimulation ? true : yield* waitForScanProgress(search)
       if (!indexed) return yield* Effect.fail(new Error("FFF initial scan did not reach every fixture sentinel"))
       // Only sample thread state after the production picker indexed known files at the start, middle, and end of the fixture.
-      const nativeWatcher = yield* nativeWatcherReady(expectWatcher)
+      const nativeWatcher = abortSimulation ? abortNativeWatcher : yield* nativeWatcherReady(expectWatcher)
       return {
         files: files.map((item) => item.path),
         directories: directories.map((item) => item.path),
@@ -117,5 +119,44 @@ function nativeWatcherReady(expected: boolean) {
       yield* Effect.sleep("20 millis")
     }
     return yield* Effect.fail(new Error(`FFF watcher did not reach expected state: ${expected}`))
+  })
+}
+
+function waitForAbortRequest(search: FileSystemSearch.Interface, expected: boolean) {
+  return Effect.gen(function* () {
+    const indexed = yield* waitForScanProgress(search)
+    if (!indexed) return yield* Effect.fail(new Error("FFF initial scan did not reach every fixture sentinel"))
+    const running = yield* nativeWatcherState(expected)
+    console.log("FFF_READY")
+    yield* Effect.promise(
+      () => new Promise<void>((resolve) => {
+        process.stdin.once("end", () => resolve())
+        process.stdin.once("close", () => resolve())
+        process.stdin.resume()
+      }),
+    )
+    return running
+  })
+}
+
+function nativeWatcherState(expected: boolean) {
+  if (process.platform !== "linux") return Effect.succeed(false)
+  return Effect.gen(function* () {
+    const deadline = Date.now() + 10_000
+    let absentSince: number | undefined
+    while (Date.now() < deadline) {
+      const tasks = yield* Effect.promise(() => fs.readdir("/proc/self/task"))
+      const names = yield* Effect.promise(() =>
+        Promise.all(tasks.map((task) => fs.readFile(`/proc/self/task/${task}/comm`, "utf8").catch(() => ""))),
+      )
+      if (names.some((name) => name.trim().startsWith("notify-rs"))) return true
+      if (!expected) {
+        absentSince ??= Date.now()
+        if (Date.now() - absentSince >= 500) return false
+      }
+      yield* Effect.sleep("20 millis")
+    }
+    if (expected) return yield* Effect.fail(new Error("FFF native watcher did not start before abort simulation"))
+    return false
   })
 }
