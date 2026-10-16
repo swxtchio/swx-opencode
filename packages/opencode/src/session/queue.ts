@@ -259,6 +259,7 @@ export interface Interface {
     readonly untilStarted?: boolean
     /** Safe active continuation selects peers only; native holds and automation remain queued. */
     readonly peersOnly?: boolean
+    readonly markers?: ConfigV1.Info["machine_message_markers"]
   }) => Effect.Effect<boolean, E>
   /**
    * Called by a drain before it reads history; returns the wake count that read
@@ -2228,7 +2229,13 @@ const layer = Layer.effect(
         ),
       )
 
-    const eligible = (query: DatabaseAccess, sessionID: SessionID, delivery: Delivery, peersOnly = false) =>
+    const eligible = (
+      query: DatabaseAccess,
+      sessionID: SessionID,
+      delivery: Delivery,
+      peersOnly = false,
+      markers?: ConfigV1.Info["machine_message_markers"],
+    ) =>
       query
         .select()
         .from(SessionPromptQueueTable)
@@ -2241,7 +2248,7 @@ const layer = Layer.effect(
             peersOnly
               ? rows.filter((row) => {
                   const decoded = Schema.decodeUnknownOption(SessionPromptQueue.QueuedInput)(row.input)
-                  return Option.isSome(decoded) && dispatch(decoded.value, row.delivery)?.kind === "peer"
+                  return Option.isSome(decoded) && dispatch(decoded.value, row.delivery, markers)?.kind === "peer"
                 })
               : rows,
           ),
@@ -2323,7 +2330,13 @@ const layer = Layer.effect(
       })
 
     // A shared reservation ID fixes membership across process restart. Preparation holds no DB/session lock.
-    const reserve = (sessionID: SessionID, delivery: Delivery, isolate = new Set<ItemID>(), peersOnly = false) =>
+    const reserve = (
+      sessionID: SessionID,
+      delivery: Delivery,
+      isolate = new Set<ItemID>(),
+      peersOnly = false,
+      markers?: ConfigV1.Info["machine_message_markers"],
+    ) =>
       exclusive(
         sessionID,
         Effect.gen(function* () {
@@ -2333,9 +2346,9 @@ const layer = Layer.effect(
           const result = yield* writable(sessionID, (tx) =>
             Effect.gen(function* () {
               yield* indexAliases(tx, sessionID)
-              const rows = yield* eligible(tx, sessionID, delivery, peersOnly)
+              const rows = yield* eligible(tx, sessionID, delivery, peersOnly, markers)
               if (!rows.length) return undefined
-              const picked = selection(rows)
+              const picked = selection(rows, markers)
               const selected = picked.some((row) => isolate.has(row.id)) ? [picked[0]] : picked
               const row = selected[0]
               const decoded = Schema.decodeUnknownExit(SessionPromptQueue.QueuedInput)(row.input)
@@ -2373,7 +2386,7 @@ const layer = Layer.effect(
                 .set({ message_id: id })
                 .where(inArray(SessionPromptQueueTable.id, ids))
                 .run()
-              return { kind: "reserved" as const, rows: selected, input: grouped(selected, aliases), id }
+              return { kind: "reserved" as const, rows: selected, input: grouped(selected, aliases, markers), id }
             }),
           ).pipe(Effect.orDie)
           if (!result) return undefined
@@ -2418,6 +2431,7 @@ const layer = Layer.effect(
       write: (prepared: P) => Effect.Effect<unknown>,
       valid?: (prepared: P) => Effect.Effect<boolean>,
       peersOnly = false,
+      markers?: ConfigV1.Info["machine_message_markers"],
     ) =>
       exclusive(
         sessionID,
@@ -2428,7 +2442,7 @@ const layer = Layer.effect(
           }
           const written = yield* writable(sessionID, (tx) =>
             Effect.gen(function* () {
-              const current = yield* eligible(tx, sessionID, delivery, peersOnly)
+              const current = yield* eligible(tx, sessionID, delivery, peersOnly, markers)
               const members = current.filter((row) => row.message_id === id)
               // A withdrawn/edited constituent cancels the whole preparation. Concurrent arrivals stay outside it.
               if (
@@ -2448,7 +2462,7 @@ const layer = Layer.effect(
                   .run()
                 return false
               }
-              const picked = selection(current)
+              const picked = selection(current, markers)
               if (picked[0].message_id !== id) {
                 yield* tx
                   .update(SessionPromptQueueTable)
@@ -2522,6 +2536,7 @@ const layer = Layer.effect(
       readonly own?: ItemID
       readonly untilStarted?: boolean
       readonly peersOnly?: boolean
+      readonly markers?: ConfigV1.Info["machine_message_markers"]
     }) =>
       semaphore(order, input.sessionID)
         .withPermit(
@@ -2530,7 +2545,7 @@ const layer = Layer.effect(
             const isolate = new Set<ItemID>()
             while (true) {
               if (input.untilStarted && !(yield* empty(input.sessionID))) return changed
-              const next = yield* reserve(input.sessionID, input.delivery, isolate, input.peersOnly)
+              const next = yield* reserve(input.sessionID, input.delivery, isolate, input.peersOnly, input.markers)
               if (!next) return changed
               changed = true
               if (next.kind === "finished") {
@@ -2556,6 +2571,7 @@ const layer = Layer.effect(
                     input.write,
                     input.valid,
                     input.peersOnly,
+                    input.markers,
                   ).pipe(Effect.exit)
               if (Exit.isFailure(attempt)) {
                 const current = yield* exclusive(
@@ -3023,7 +3039,7 @@ function originalWitness(original: SessionPromptQueue.Group["constituents"][numb
       [pending ? "sessionQueuePendingOriginal" : "sessionQueue"]: Schema.encodeSync(SessionPromptQueue.Group)({
         version: 1,
         sessionID: original.sessionID,
-        kind: dispatch(original.input)?.kind === "peer" ? "peer" : "individual",
+        kind: groupKind(original.input, original.delivery),
         constituents: [original],
       }),
     },
@@ -3049,7 +3065,11 @@ function originalWitnesses(
   })
 }
 
-function dispatch(input: SessionPromptQueue.QueuedInput, delivery?: Delivery) {
+function dispatch(
+  input: SessionPromptQueue.QueuedInput,
+  delivery?: Delivery,
+  markers?: ConfigV1.Info["machine_message_markers"],
+) {
   input = { ...input, parts: input.parts.filter((part) => !pendingOriginal(part)) }
   if (!input.parts.length || input.parts.some((part) => part.type === "text" && (part.synthetic || part.ignored)))
     return
@@ -3063,15 +3083,26 @@ function dispatch(input: SessionPromptQueue.QueuedInput, delivery?: Delivery) {
   return kind?.kind === "automation" && delivery === "steer" ? undefined : kind
 }
 
-function selection(rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[]) {
+function selection(
+  rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[],
+  markers?: ConfigV1.Info["machine_message_markers"],
+) {
   const classified = rows.map((row) => {
     const decoded = Schema.decodeUnknownOption(SessionPromptQueue.QueuedInput)(row.input)
-    return { row, kind: Option.isSome(decoded) ? dispatch(decoded.value, row.delivery) : undefined }
+    return {
+      row,
+      kind: Option.isSome(decoded) ? dispatch(decoded.value, row.delivery, markers) : undefined,
+      human: Option.isSome(decoded) && humanComposer(decoded.value, markers),
+    }
   })
   // Native/unknown work remains individual and keeps human authority. Peers precede every automation type.
   const first =
     classified.find((item) => !item.kind) ?? classified.find((item) => item.kind?.kind === "peer") ?? classified[0]
   if (first.row.message_id) return rows.filter((row) => row.message_id === first.row.message_id)
+  if (first.human && first.row.delivery === "queue")
+    return classified
+      .filter((item) => item.human && item.row.delivery === "queue" && !item.row.message_id)
+      .map((item) => item.row)
   if (!first.kind) return [first.row]
   if (first.kind.kind === "peer")
     return classified
@@ -3094,13 +3125,20 @@ function selection(rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[
 function grouped(
   rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[],
   aliases: readonly (typeof SessionPromptQueueAliasTable.$inferSelect)[] = [],
+  markers?: ConfigV1.Info["machine_message_markers"],
 ) {
   const items = rows.flatMap(originalsOf)
-  const kind = dispatch(items[0].input)
+  const kind = dispatch(items[0].input, items[0].delivery, markers)
+  const humanBatch =
+    rows.length > 1 &&
+    rows.every((row) => {
+      const input = Schema.decodeUnknownOption(SessionPromptQueue.QueuedInput)(row.input)
+      return row.delivery === "queue" && Option.isSome(input) && humanComposer(input.value, markers)
+    })
   const group: SessionPromptQueue.Group = {
     version: 1,
     sessionID: items[0].sessionID,
-    kind: !kind ? "individual" : kind.kind === "peer" ? "peer" : kind.type,
+    kind: humanBatch ? "human" : groupKind(items[0].input, items[0].delivery, markers),
     constituents: items,
   }
   const witnesses = rows.some((row) => decodeInput(row.input).parts.some(pendingOriginal))
@@ -3112,7 +3150,13 @@ function grouped(
       )
     : items.flatMap((item) => {
         const recorded = aliases.filter((alias) => alias.item_id === item.id).map((alias) => PartID.make(alias.id))
-        return (recorded.length ? recorded : constituentIDs(item.sessionID, item.input)).map((id) => ({
+        const identities = recorded.length ? recorded : constituentIDs(item.sessionID, item.input)
+        const witnessIDs = identities.length
+          ? identities
+          : item.input.origin === "tui-composer"
+            ? [PartID.ascending()]
+            : []
+        return witnessIDs.map((id) => ({
           type: "text" as const,
           id,
           text: "",
@@ -3122,12 +3166,33 @@ function grouped(
         }))
       })
   if (!kind) {
-    const visible = decodeInput(rows[0].input)
-    return { ...visible, parts: [...visible.parts.filter((part) => !pendingOriginal(part)), ...witnesses] }
+    const parts = humanBatch
+      ? items.flatMap((item, index) => [
+          ...(index ? [{ type: "text" as const, text: "\n" }] : []),
+          ...item.input.parts.filter((part) => !pendingOriginal(part)),
+        ])
+      : decodeInput(rows[0].input).parts.filter((part) => !pendingOriginal(part))
+    const firstText = parts.findIndex((part) => part.type === "text" && !part.synthetic && !part.ignored)
+    if (firstText !== -1) {
+      const part = parts[firstText]
+      if (part?.type === "text")
+        parts[firstText] = {
+          ...part,
+          metadata: {
+            ...part.metadata,
+            sessionQueue: Schema.encodeSync(SessionPromptQueue.Group)(group),
+          },
+        }
+    }
+    return {
+      ...items[0].input,
+      ...(humanBatch ? { model: undefined, variant: undefined, group } : {}),
+      parts: [...parts, ...witnesses],
+    }
   }
   const latest = new Map<string, ItemID>()
   items.forEach((item) => {
-    const machine = dispatch(item.input)
+    const machine = dispatch(item.input, item.delivery, markers)
     if (machine?.kind === "automation" && machine.episode) latest.set(machine.episode, item.id)
   })
   const shown =
@@ -3172,6 +3237,19 @@ function grouped(
       ...witnesses,
     ],
   }
+}
+
+function groupKind(
+  input: SessionPromptQueue.QueuedInput,
+  delivery?: Delivery,
+  markers?: ConfigV1.Info["machine_message_markers"],
+) {
+  const machine = dispatch(input, delivery, markers)
+  return !machine ? "individual" : machine.kind === "peer" ? "peer" : machine.type
+}
+
+function humanComposer(input: SessionPromptQueue.QueuedInput, markers?: ConfigV1.Info["machine_message_markers"]) {
+  return input.origin === "tui-composer" && !marked(input, markers)
 }
 
 function toReceipt(row: typeof SessionPromptReceiptTable.$inferSelect): Receipt {
@@ -3256,7 +3334,7 @@ function elapsed(ms: number) {
  * at the session's selection when it is delivered.
  */
 export function consolidation(items: readonly Item[], markers?: ConfigV1.Info["machine_message_markers"]) {
-  const copies = Map.groupBy(items, copyKey)
+  const copies = Map.groupBy(items, (item) => copyKey(item, markers))
   const kept = [...copies.values()].map((group) => ({
     item: {
       ...group[0]!,
@@ -3267,7 +3345,10 @@ export function consolidation(items: readonly Item[], markers?: ConfigV1.Info["m
   }))
   const groups = Map.groupBy(
     kept.flatMap((entry) => {
-      const command = marked(entry.item.input, markers) ? undefined : parseCommand(entry.item.input)
+      const command =
+        marked(entry.item.input, markers) || humanComposer(entry.item.input, markers)
+          ? undefined
+          : parseCommand(entry.item.input)
       if (!command) return []
       return [{ item: entry.item, command, key: commandKey(entry.item, command) }]
     }),
@@ -3340,7 +3421,7 @@ export function admission(pending: readonly Item[], added: Item, markers?: Confi
   const others = pending.filter((item) => item.id !== added.id && item.delivery === added.delivery)
   const own = envelopeOf(added)
   const absorbed = others.filter((item) => {
-    if (copyKey(item) === copyKey(added)) return own?.level !== "critical"
+    if (copyKey(item, markers) === copyKey(added, markers)) return own?.level !== "critical"
     if (!item.requestID || !added.requestID || !own?.sender.startsWith("peer") || own.reply) return false
     if (own.level === "critical") return false
     const other = envelopeOf(item)
@@ -3360,10 +3441,19 @@ export function admission(pending: readonly Item[], added: Item, markers?: Confi
           return other?.sender === own.sender && other.level === "nudge" && other.key === own.key && !other.reply
         })
       : []
-  const command = added.requestID && !marked(added.input, markers) ? parseCommand(added.input) : undefined
+  const command =
+    added.requestID && !marked(added.input, markers) && !humanComposer(added.input, markers)
+      ? parseCommand(added.input)
+      : undefined
   const into = command
     ? others.find((item) => {
-        if (!item.requestID || absorbed.includes(item) || marked(item.input, markers)) return false
+        if (
+          !item.requestID ||
+          absorbed.includes(item) ||
+          marked(item.input, markers) ||
+          humanComposer(item.input, markers)
+        )
+          return false
         const other = parseCommand(item.input)
         return other !== undefined && commandKey(item, other) === commandKey(added, command)
       })
@@ -3377,8 +3467,9 @@ function envelopeOf(item: Item) {
   )
 }
 
-function copyKey(item: Item) {
-  return JSON.stringify(withoutUndefined(comparable(item.input)))
+function copyKey(item: Item, markers?: ConfigV1.Info["machine_message_markers"]) {
+  const key = JSON.stringify(withoutUndefined(comparable(item.input)))
+  return humanComposer(item.input, markers) ? `${key}\n${item.id}` : key
 }
 
 // Commands merge within one delivery, verb (any case) and target, and with the
@@ -3396,6 +3487,12 @@ function comparable(input: SessionPromptQueue.QueuedInput) {
 }
 
 function marked(input: SessionPromptQueue.QueuedInput, markers?: ConfigV1.Info["machine_message_markers"]) {
+  if (
+    input.parts.some(
+      (part) => part.type === "text" && part.metadata?.[SessionPromptQueue.TuiPromptAppendMetadataKey] === true,
+    )
+  )
+    return true
   const text = input.parts.flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : [])).join("")
   return MachineMessage.classify(text, markers) !== undefined
 }

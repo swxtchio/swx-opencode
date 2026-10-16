@@ -109,6 +109,7 @@ function Transcript(props: { messages: AssistantMessage[] }) {
     showTimestamps: () => false,
     showDetails: () => true,
     showGenericToolOutput: () => false,
+    presentPart: () => {},
     diffWrapMode: () => "word" as const,
     providers: () => new Map(),
     sync,

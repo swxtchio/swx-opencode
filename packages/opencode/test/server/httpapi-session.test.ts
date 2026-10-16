@@ -24,6 +24,7 @@ import { Project } from "../../src/project/project"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import * as HttpSessionError from "../../src/server/routes/instance/httpapi/handlers/session-errors"
 import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/groups/experimental"
+import { InstancePaths } from "../../src/server/routes/instance/httpapi/groups/instance"
 import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
 import { SessionQueuePaths } from "../../src/server/routes/instance/httpapi/groups/session-queue"
 import { SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
@@ -561,8 +562,92 @@ describe("session HttpApi", () => {
     { git: true, config: { formatter: false, lsp: false } },
   )
 
-  it.live(
-    "uses the persisted session directory for prompt requests",
+it.live(
+  "enhances a draft through the configured provider without creating a session prompt",
+  () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      yield* llm.text("clear rewritten draft")
+      const base = testProviderConfig(llm.url)
+      const config = {
+        ...base,
+        provider: {
+          ...base.provider,
+          test: {
+            ...base.provider.test,
+            options: { ...base.provider.test.options, setCacheKey: true },
+          },
+        },
+      }
+      const directory = yield* tmpdirScoped({ git: true, config })
+      const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+      const response = yield* request(`${InstancePaths.promptEnhance}?directory=${encodeURIComponent(directory)}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "test/test-model",
+          draft: "rough draft",
+          context: "visible session context",
+        }),
+      })
+
+      expect(response.status).toBe(200)
+      expect(yield* json<string>(response)).toBe("clear rewritten draft")
+      const calls = yield* llm.inputs
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.model).toBe("test-model")
+      expect(JSON.stringify(calls[0])).toContain("visible session context")
+      expect(JSON.stringify(calls[0])).toContain("rough draft")
+      expect(JSON.stringify(calls[0])).toContain("preserving its intent")
+      expect(JSON.stringify(calls[0])).toContain("promptCacheKey")
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  30_000,
+)
+
+it.live(
+  "reports an unavailable prompt enhancement model as a model resolution failure",
+  () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+      const response = yield* request(`${InstancePaths.promptEnhance}?directory=${encodeURIComponent(directory)}`, {
+        method: "POST",
+        headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+        body: JSON.stringify({ model: "test/missing-model", draft: "rough draft", context: "" }),
+      })
+
+      expect(response.status).toBe(404)
+      const body = yield* response.text
+      expect(body).toContain("test/missing-model")
+      expect(body).toContain("Model not found")
+      expect(yield* llm.calls).toBe(0)
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  30_000,
+)
+
+it.live(
+  "reports enhancement provider failures with the provider error detail",
+  () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      yield* llm.error(401, { error: "credentials rejected" })
+      const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+      const response = yield* request(`${InstancePaths.promptEnhance}?directory=${encodeURIComponent(directory)}`, {
+        method: "POST",
+        headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+        body: JSON.stringify({ model: "test/test-model", draft: "rough draft", context: "" }),
+      })
+
+      expect(response.status).toBe(502)
+      const body = yield* response.text
+      expect(body).toContain("credentials rejected")
+      expect(yield* llm.calls).toBe(1)
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  30_000,
+)
+
+it.live(
+  "uses the persisted session directory for prompt requests",
     () =>
       Effect.gen(function* () {
         const llm = yield* TestLLMServer
@@ -3506,13 +3591,14 @@ describe("session HttpApi queue freshness", () => {
             if (part.type === "text") expect(part.text).not.toContain("[Queued prompt")
           }),
         )
-        const peerMessage = stored.find((message) =>
-          message.parts.some((part) => part.type === "text" && !part.ignored && part.metadata?.sessionQueue),
-        )!
-        const aggregate = peerMessage.parts.find(
-          (part) => part.type === "text" && !part.ignored && part.metadata?.sessionQueue,
-        )!
-        if (aggregate.type !== "text") throw new Error("Expected the actual peer aggregate")
+        const isPeerAggregate = (part: SessionV1.Part) =>
+          part.type === "text" &&
+          !part.ignored &&
+          !!part.metadata?.sessionQueue &&
+          Schema.decodeUnknownSync(SessionPromptQueue.Group)(part.metadata.sessionQueue).kind === "peer"
+        const peerMessage = stored.find((message) => message.parts.some(isPeerAggregate))!
+        const aggregate = peerMessage.parts.find(isPeerAggregate)
+        if (aggregate?.type !== "text") throw new Error("Expected the actual peer aggregate")
         const group = Schema.decodeUnknownSync(SessionPromptQueue.Group)(aggregate.metadata?.sessionQueue)
         expect(group.kind).toBe("peer")
         expect(group.constituents.map((item) => item.input.parts)).toEqual([

@@ -5,7 +5,7 @@ import { useSDK } from "../../context/sdk"
 import { useRoute } from "../../context/route"
 import { useClipboard } from "../../context/clipboard"
 import type { PromptInfo } from "../../component/prompt/history"
-import { stripPromptPartIDs as strip } from "../../prompt/part"
+import { preserveMachineAppended, stripPromptPartIDs as strip } from "../../prompt/part"
 
 export function DialogMessage(props: {
   messageID: string
@@ -47,7 +47,7 @@ export function DialogMessage(props: {
                 },
                 { input: "", parts: [] as PromptInfo["parts"] },
               )
-              props.setPrompt(promptInfo)
+              props.setPrompt(preserveMachineAppended(parts, promptInfo))
             }
 
             dialog.clear()
@@ -83,8 +83,9 @@ export function DialogMessage(props: {
               messageID: props.messageID,
             })
             const msg = message()
-            const prompt = msg
-              ? sync.data.part[msg.id].reduce(
+            const parts = msg ? sync.data.part[msg.id] : undefined
+            const prompt = parts
+              ? parts.reduce(
                   (agg, part) => {
                     if (part.type === "text") {
                       if (!part.synthetic) agg.input += part.text
@@ -98,7 +99,7 @@ export function DialogMessage(props: {
             route.navigate({
               sessionID: result.data!.id,
               type: "session",
-              prompt,
+              prompt: prompt && parts ? preserveMachineAppended(parts, prompt) : undefined,
             })
             dialog.clear()
           },

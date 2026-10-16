@@ -3,13 +3,21 @@ import { Command } from "@/command"
 import * as InstanceState from "@/effect/instance-state"
 import { Format } from "@/format"
 import { Global } from "@opencode-ai/core/global"
+import { NamedError } from "@opencode-ai/core/util/error"
 import { LSP } from "@/lsp/lsp"
+import { Provider } from "@/provider/provider"
 import { Vcs } from "@/project/vcs"
 import { Skill } from "@/skill"
+import { SessionPrompt } from "@/session/prompt"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { ApiVcsApplyError } from "../groups/instance"
+import {
+  ApiVcsApplyError,
+  PromptEnhanceModelNotFoundError,
+  PromptEnhancePayload,
+  PromptEnhanceProviderError,
+} from "../groups/instance"
 import { markInstanceForDisposal } from "../lifecycle"
 
 export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance", (handlers) =>
@@ -20,6 +28,7 @@ export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance"
     const lsp = yield* LSP.Service
     const skill = yield* Skill.Service
     const vcs = yield* Vcs.Service
+    const prompt = yield* SessionPrompt.Service
 
     const dispose = Effect.fn("InstanceHttpApi.dispose")(function* () {
       yield* markInstanceForDisposal(yield* InstanceState.context)
@@ -35,6 +44,21 @@ export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance"
         worktree: ctx.worktree,
         directory: ctx.directory,
       }
+    })
+
+    const promptEnhance = Effect.fn("InstanceHttpApi.promptEnhance")(function* (ctx: {
+      payload: typeof PromptEnhancePayload.Type
+    }) {
+      return yield* prompt.enhance(ctx.payload).pipe(
+        Effect.mapError((error) => {
+          if (Provider.ModelNotFoundError.isInstance(error))
+            return new PromptEnhanceModelNotFoundError({ model: ctx.payload.model, message: error.message })
+          return new PromptEnhanceProviderError({
+            model: ctx.payload.model,
+            message: promptEnhanceErrorMessage(error),
+          })
+        }),
+      )
     })
 
     const getVcs = Effect.fn("InstanceHttpApi.vcs")(function* () {
@@ -96,6 +120,7 @@ export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance"
     return handlers
       .handle("dispose", dispose)
       .handle("path", getPath)
+      .handle("promptEnhance", promptEnhance)
       .handle("vcs", getVcs)
       .handle("vcsStatus", getVcsStatus)
       .handle("vcsDiff", getVcsDiff)
@@ -108,3 +133,12 @@ export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance"
       .handle("formatter", getFormatter)
   }),
 )
+
+function promptEnhanceErrorMessage(error: unknown) {
+  if (error instanceof NamedError) {
+    const data = error.toObject().data
+    if (data && typeof data === "object" && "message" in data && typeof data.message === "string") return data.message
+  }
+  if (error instanceof Error) return error.message
+  return String(error)
+}

@@ -87,6 +87,7 @@ import { getRevertDiffFiles } from "../../util/revert-diff"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
 import { LocationProvider } from "../../context/location"
+import { preserveMachineAppended } from "../../prompt/part"
 
 addDefaultParsers(parsers.parsers)
 
@@ -213,6 +214,13 @@ const sessionGlobalBindingCommands = [
 
 const sessionGlobalUnfocusedBindingCommands = ["session.first", "session.last"] as const
 
+type PresentationSegment =
+  | "content"
+  | "inline-error"
+  | "inline-failure"
+  | `block-error:${string}`
+  | `diagnostics:${string}`
+
 export const SessionContext = createContext<{
   width: number
   sessionID: string
@@ -222,6 +230,7 @@ export const SessionContext = createContext<{
   showTimestamps: () => boolean
   showDetails: () => boolean
   showGenericToolOutput: () => boolean
+  presentPart: (partID: string, text?: string, segment?: PresentationSegment) => void
   diffWrapMode: () => "word" | "none"
   providers: () => ReadonlyMap<string, Provider>
   sync: ReturnType<typeof useSync>
@@ -269,6 +278,14 @@ export function Session() {
       .filter((x) => x.parentID === parentID || x.id === parentID)
       .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   })
+  const presentedParts = new Map<string, Map<PresentationSegment, string>>()
+  const presentPart = (partID: string, text?: string, segment: PresentationSegment = "content") => {
+    const segments = presentedParts.get(partID) ?? new Map<PresentationSegment, string>()
+    if (text) segments.set(segment, text)
+    else segments.delete(segment)
+    if (!segments.size) return presentedParts.delete(partID)
+    presentedParts.set(partID, segments)
+  }
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
   const messagesBeforeRevert = () => {
     const messageID = session()?.revert?.messageID
@@ -276,6 +293,28 @@ export function Session() {
     const index = messages().findIndex((message) => message.id === messageID)
     return index === -1 ? messages() : messages().slice(0, index)
   }
+  const enhancementContext = () => ({
+    messages: messagesBeforeRevert().map((message) => ({ info: message, parts: sync.data.part[message.id] ?? [] })),
+    options: {
+      thinking: thinkingMode() === "show",
+      toolDetails: showDetails(),
+      assistantMetadata: showAssistantMetadata(),
+      providers: sync.data.provider,
+    },
+    presentation: new Map(
+      Array.from(presentedParts, ([partID, segments]) => [
+        partID,
+        [
+          segments.get("inline-failure") ?? segments.get("content"),
+          ...Array.from(segments)
+            .filter(([segment]) => segment !== "content" && segment !== "inline-failure")
+            .map(([, text]) => text),
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      ] as const),
+    ),
+  })
   const foregroundTasks = createMemo(() =>
     sync.data.capabilities.experimentalBackgroundSubagents ? activeForegroundTasks(sync, messages()) : [],
   )
@@ -745,18 +784,17 @@ export function Session() {
             toBottom()
           })
         const parts = sync.data.part[message.id]
-        prompt?.set(
-          parts.reduce(
-            (agg, part) => {
-              if (part.type === "text") {
-                if (!part.synthetic) agg.input += part.text
-              }
-              if (part.type === "file") agg.parts.push(part)
-              return agg
-            },
-            { input: "", parts: [] as PromptInfo["parts"] },
-          ),
+        const promptInfo = parts.reduce(
+          (agg, part) => {
+            if (part.type === "text") {
+              if (!part.synthetic) agg.input += part.text
+            }
+            if (part.type === "file") agg.parts.push(part)
+            return agg
+          },
+          { input: "", parts: [] as PromptInfo["parts"] },
         )
+        prompt?.set(preserveMachineAppended(parts, promptInfo))
         dialog.clear()
       },
     },
@@ -1285,6 +1323,7 @@ export function Session() {
           showTimestamps,
           showDetails,
           showGenericToolOutput,
+          presentPart,
           diffWrapMode,
           providers,
           sync,
@@ -1445,6 +1484,7 @@ export function Session() {
                         toBottom()
                       }}
                       sessionID={route.sessionID}
+                      enhancementContext={enhancementContext}
                       right={<pluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />}
                     />
                   </pluginRuntime.Slot>
@@ -1745,6 +1785,22 @@ export function ReasoningPartView(props: { last: boolean; part: ReasoningPart; m
   const summary = createMemo(() => reasoningSummary(content()))
   const syntax = createSyntaxStyleMemo(() => generateSubtleSyntax(theme))
 
+  createEffect(() => {
+    if (!content()) return ctx.presentPart(props.part.id)
+    const stateValue = state()
+    const title = summary().title
+    const header = stateValue.unresolved
+      ? "Thinking status unknown"
+      : stateValue.done
+        ? `Thought${title ? `: ${title}` : ""}`
+        : title
+          ? `Thinking: ${title}`
+          : "Thinking"
+    const body = !inMinimal() || expanded() ? summary().body : ""
+    ctx.presentPart(props.part.id, [header, body].filter(Boolean).join("\n"))
+  })
+  onCleanup(() => ctx.presentPart(props.part.id))
+
   const toggle = () => {
     if (!inMinimal()) return
     setExpanded((prev) => !prev)
@@ -1936,6 +1992,7 @@ export function ToolPartView(props: { last: boolean; part: ToolPart; message: As
     get part() {
       return props.part
     },
+    present: (text?: string, segment?: PresentationSegment) => ctx.presentPart(props.part.id, text, segment),
   }
 
   return (
@@ -1998,7 +2055,14 @@ type ToolProps = {
   tool: string
   output?: string
   part: ToolPart
+  present: (text?: string, segment?: PresentationSegment) => void
 }
+
+function presentToolPart(props: ToolProps, content: () => string) {
+  createEffect(() => props.present(content()))
+  onCleanup(() => props.present())
+}
+
 function GenericTool(props: ToolProps) {
   const { theme } = useTheme()
   const ctx = use()
@@ -2010,6 +2074,11 @@ function GenericTool(props: ToolProps) {
   const limited = createMemo(() => {
     if (expanded() || !collapsed().overflow) return output()
     return collapsed().output
+  })
+  presentToolPart(props, () => {
+    const title = `# ${props.tool} ${input(props.input)}`.trim()
+    if (!props.output || !ctx.showGenericToolOutput()) return title
+    return `${title}\n${limited()}`
   })
 
   return (
@@ -2076,11 +2145,7 @@ function InlineTool(props: {
     if (props.part.state.status !== "pending" && props.part.state.status !== "running") return false
     const current = message()
     if (current?.role !== "assistant") return false
-    return (
-      current.time.completed === undefined &&
-      current.error === undefined &&
-      status() === "unknown"
-    )
+    return current.time.completed === undefined && current.error === undefined && status() === "unknown"
   })
   const active = createMemo(() => {
     const current = message()
@@ -2107,6 +2172,14 @@ function InlineTool(props: {
 
   const failed = createMemo(() => Boolean(error() && !denied()) || (stopped() && !unresolved()))
   const clickable = createMemo(() => Boolean(props.onClick || failed()))
+  createEffect(() =>
+    ctx.presentPart(props.part.id, failed() && !props.complete ? props.failure : undefined, "inline-failure"),
+  )
+  onCleanup(() => ctx.presentPart(props.part.id, undefined, "inline-failure"))
+  createEffect(() =>
+    ctx.presentPart(props.part.id, failed() && errorExpanded() ? error() : undefined, "inline-error"),
+  )
+  onCleanup(() => ctx.presentPart(props.part.id, undefined, "inline-error"))
   const fg = createMemo(() => {
     if (unresolved()) return theme.textMuted
     if (props.color) return props.color
@@ -2236,14 +2309,22 @@ function BlockTool(props: {
   spinner?: boolean
 }) {
   const { theme } = useTheme()
+  const ctx = use()
   const sync = useSync()
   const renderer = useRenderer()
   const [hover, setHover] = createSignal(false)
   const error = createMemo(() => (props.part?.state.status === "error" ? props.part.state.error : undefined))
+  const errorSegment: PresentationSegment = `block-error:${props.title ?? ""}`
+  createEffect(() => {
+    if (!props.part) return
+    ctx.presentPart(props.part.id, error(), errorSegment)
+  })
+  onCleanup(() => {
+    if (!props.part) return
+    ctx.presentPart(props.part.id, undefined, errorSegment)
+  })
   const message = createMemo(() =>
-    props.part
-      ? sync.data.message[props.part.sessionID]?.find((item) => item.id === props.part?.messageID)
-      : undefined,
+    props.part ? sync.data.message[props.part.sessionID]?.find((item) => item.id === props.part?.messageID) : undefined,
   )
   const status = createMemo(() => {
     if (!props.part) return "idle" as const
@@ -2261,12 +2342,7 @@ function BlockTool(props: {
     if (!props.part || (props.part.state.status !== "pending" && props.part.state.status !== "running")) return false
     const current = message()
     if (current?.role !== "assistant") return false
-    return (
-      current.time.completed !== undefined ||
-      current.error !== undefined ||
-      status() === "failed" ||
-      unresolved()
-    )
+    return current.time.completed !== undefined || current.error !== undefined || status() === "failed" || unresolved()
   })
   return (
     <box
@@ -2354,6 +2430,11 @@ function Shell(props: ToolProps) {
     if (!wd) return
     return `# Running in ${wd}`
   })
+  presentToolPart(props, () => {
+    const command = stringValue(props.input.command)
+    if (stringValue(props.metadata.output) === undefined) return command ?? "Shell"
+    return [title(), command ? `$ ${command}` : "", output() ? limited() : ""].filter(Boolean).join("\n")
+  })
 
   return (
     <Switch>
@@ -2391,6 +2472,10 @@ function Write(props: ToolProps) {
   const code = createMemo(() => {
     return stringValue(props.input.content) ?? ""
   })
+  presentToolPart(props, () => {
+    const filepath = pathFormatter.format(stringValue(props.input.filePath))
+    return props.metadata.diagnostics !== undefined ? `Wrote ${filepath}\n${code()}` : `Write ${filepath}`
+  })
 
   return (
     <Switch>
@@ -2405,7 +2490,11 @@ function Write(props: ToolProps) {
               content={code()}
             />
           </line_number>
-          <Diagnostics diagnostics={props.metadata.diagnostics} filePath={stringValue(props.input.filePath) ?? ""} />
+          <Diagnostics
+            diagnostics={props.metadata.diagnostics}
+            filePath={stringValue(props.input.filePath) ?? ""}
+            present={(text) => props.present(text, `diagnostics:${stringValue(props.input.filePath) ?? ""}`)}
+          />
         </BlockTool>
       </Match>
       <Match when={true}>
@@ -2419,6 +2508,13 @@ function Write(props: ToolProps) {
 
 function Glob(props: ToolProps) {
   const pathFormatter = usePathFormatter()
+  presentToolPart(props, () => {
+    const path = stringValue(props.input.path)
+    const count = numberValue(props.metadata.count)
+    return `Glob "${stringValue(props.input.pattern)}"${path ? ` in ${pathFormatter.format(path)}` : ""}${
+      count ? ` (${count} ${count === 1 ? "match" : "matches"})` : ""
+    }`
+  })
   return (
     <InlineTool icon="✱" pending="Finding files…" complete={stringValue(props.input.pattern)} part={props.part}>
       Glob "{stringValue(props.input.pattern)}"{" "}
@@ -2440,6 +2536,13 @@ function Read(props: ToolProps) {
     const value = props.metadata.loaded
     if (!value || !Array.isArray(value)) return []
     return value.filter((p): p is string => typeof p === "string")
+  })
+  presentToolPart(props, () => {
+    const filepath = pathFormatter.format(stringValue(props.input.filePath))
+    const details = input(props.input, ["filePath"])
+    return [`Read ${filepath} ${details}`.trim(), ...loaded().map((filepath) => `Loaded ${pathFormatter.format(filepath)}`)]
+      .filter(Boolean)
+      .join("\n")
   })
   return (
     <>
@@ -2467,6 +2570,13 @@ function Read(props: ToolProps) {
 
 function Grep(props: ToolProps) {
   const pathFormatter = usePathFormatter()
+  presentToolPart(props, () => {
+    const path = stringValue(props.input.path)
+    const matches = numberValue(props.metadata.matches)
+    return `Grep "${stringValue(props.input.pattern)}"${path ? ` in ${pathFormatter.format(path)}` : ""}${
+      matches ? ` (${matches} ${matches === 1 ? "match" : "matches"})` : ""
+    }`
+  })
   return (
     <InlineTool icon="✱" pending="Searching content…" complete={stringValue(props.input.pattern)} part={props.part}>
       Grep "{stringValue(props.input.pattern)}"{" "}
@@ -2479,6 +2589,7 @@ function Grep(props: ToolProps) {
 }
 
 function WebFetch(props: ToolProps) {
+  presentToolPart(props, () => `WebFetch ${stringValue(props.input.url)}`)
   return (
     <InlineTool icon="%" pending="Fetching from the web…" complete={stringValue(props.input.url)} part={props.part}>
       WebFetch {stringValue(props.input.url)}
@@ -2487,6 +2598,11 @@ function WebFetch(props: ToolProps) {
 }
 
 function WebSearch(props: ToolProps) {
+  presentToolPart(props, () => {
+    const query = stringValue(props.input.query)
+    const count = numberValue(props.metadata.numResults)
+    return `${webSearchProviderLabel(props.metadata.provider)} "${query}"${count ? ` (${count} results)` : ""}`
+  })
   return (
     <InlineTool icon="◈" pending="Searching web…" complete={stringValue(props.input.query)} part={props.part}>
       {webSearchProviderLabel(props.metadata.provider)} "{stringValue(props.input.query)}"{" "}
@@ -2573,6 +2689,7 @@ function Task(props: ToolProps) {
 
     return content.join("\n")
   })
+  presentToolPart(props, () => content())
 
   return (
     <InlineTool
@@ -2644,6 +2761,7 @@ function Execute(props: ToolProps) {
     }
     return lines.join("\n")
   })
+  presentToolPart(props, () => `${content()}${showOutput() ? `\n${outputPreview()}` : ""}`)
 
   return (
     <>
@@ -2688,6 +2806,10 @@ function Edit(props: ToolProps) {
   const ft = createMemo(() => filetype(stringValue(props.input.filePath)))
 
   const diffContent = createMemo(() => stringValue(props.metadata.diff) ?? "")
+  presentToolPart(props, () => {
+    const filepath = pathFormatter.format(stringValue(props.input.filePath))
+    return props.metadata.diff !== undefined ? `Edit ${filepath}\n${diffContent()}` : `Edit ${filepath}`
+  })
 
   return (
     <Switch>
@@ -2714,7 +2836,11 @@ function Edit(props: ToolProps) {
               removedLineNumberBg={theme.diffRemovedLineNumberBg}
             />
           </box>
-          <Diagnostics diagnostics={props.metadata.diagnostics} filePath={stringValue(props.input.filePath) ?? ""} />
+          <Diagnostics
+            diagnostics={props.metadata.diagnostics}
+            filePath={stringValue(props.input.filePath) ?? ""}
+            present={(text) => props.present(text, `diagnostics:${stringValue(props.input.filePath) ?? ""}`)}
+          />
         </BlockTool>
       </Match>
       <Match when={true}>
@@ -2772,6 +2898,16 @@ function ApplyPatch(props: ToolProps) {
     return "← Patched " + file.relativePath
   }
 
+  presentToolPart(props, () =>
+    files()
+      .map((file) =>
+        file.type === "delete"
+          ? `${title(file)}\n-${file.deletions} line${file.deletions !== 1 ? "s" : ""}`
+          : `${title(file)}\n${file.patch}`,
+      )
+      .join("\n"),
+  )
+
   return (
     <Switch>
       <Match when={files().length > 0}>
@@ -2787,7 +2923,11 @@ function ApplyPatch(props: ToolProps) {
                 }
               >
                 <Diff diff={file.patch} filePath={file.filePath} />
-                <Diagnostics diagnostics={props.metadata.diagnostics} filePath={file.movePath ?? file.filePath} />
+                <Diagnostics
+                  diagnostics={props.metadata.diagnostics}
+                  filePath={file.movePath ?? file.filePath}
+                  present={(text) => props.present(text, `diagnostics:${file.movePath ?? file.filePath}`)}
+                />
               </Show>
             </BlockTool>
           )}
@@ -2804,6 +2944,11 @@ function ApplyPatch(props: ToolProps) {
 
 function TodoWrite(props: ToolProps) {
   const todos = createMemo(() => parseTodos(props.input.todos))
+  presentToolPart(props, () =>
+    parseTodos(props.metadata.todos).length
+      ? todos().map((todo) => `${todo.status} ${todo.content}`).join("\n")
+      : "Updating todos…",
+  )
   return (
     <Switch>
       <Match when={parseTodos(props.metadata.todos).length}>
@@ -2833,6 +2978,14 @@ function Question(props: ToolProps) {
     return answer.join(", ")
   }
 
+  presentToolPart(props, () =>
+    answers()
+      ? questions()
+          .map((question, index) => `${question.question}\n${format(answers()?.[index])}`)
+          .join("\n")
+      : `Asked ${count()} question${count() !== 1 ? "s" : ""}`,
+  )
+
   return (
     <Switch>
       <Match when={answers()}>
@@ -2859,6 +3012,7 @@ function Question(props: ToolProps) {
 }
 
 function Skill(props: ToolProps) {
+  presentToolPart(props, () => `Skill "${stringValue(props.input.name)}"`)
   return (
     <InlineTool icon="→" pending="Loading skill…" complete={stringValue(props.input.name)} part={props.part}>
       Skill "{stringValue(props.input.name)}"
@@ -2866,7 +3020,7 @@ function Skill(props: ToolProps) {
   )
 }
 
-function Diagnostics(props: { diagnostics: unknown; filePath: string }) {
+function Diagnostics(props: { diagnostics: unknown; filePath: string; present?: (text?: string) => void }) {
   const { theme } = useTheme()
   const terminalEnvironment = useTuiTerminalEnvironment()
   const errors = createMemo(() => {
@@ -2876,6 +3030,17 @@ function Diagnostics(props: { diagnostics: unknown; filePath: string }) {
     )
     return parseDiagnostics(props.diagnostics, normalized)
   })
+  createEffect(() =>
+    props.present?.(
+      errors()
+        .map(
+          (diagnostic) =>
+            `Error [${diagnostic.range.start.line + 1}:${diagnostic.range.start.character + 1}] ${diagnostic.message}`,
+        )
+        .join("\n"),
+    ),
+  )
+  onCleanup(() => props.present?.())
 
   return (
     <Show when={errors().length}>

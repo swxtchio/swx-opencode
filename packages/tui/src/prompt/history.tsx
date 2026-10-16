@@ -9,6 +9,7 @@ import { appendText, readText, writeText } from "../util/persistence"
 export type PromptInfo = {
   input: string
   mode?: "normal" | "shell"
+  machineAppended?: true
   parts: (
     | Omit<FilePart, "id" | "messageID" | "sessionID">
     | Omit<AgentPart, "id" | "messageID" | "sessionID">

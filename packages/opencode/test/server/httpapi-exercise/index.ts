@@ -123,6 +123,16 @@ const scenarios: Scenario[] = [
     check(body.worktree === ctx.directory, "worktree should resolve from x-opencode-directory")
   }),
   http.protected.get("/vcs", "vcs.get").json(),
+  http.protected
+    .post("/prompt/enhance", "instance.prompt.enhance")
+    .withLlm()
+    .seeded((ctx) => ctx.llmText("rewritten draft"))
+    .at((ctx) => ({
+      path: "/prompt/enhance",
+      headers: ctx.headers(),
+      body: { model: "test/test-model", draft: "rough draft", context: "visible transcript" },
+    }))
+    .json(200, (body) => check(body === "rewritten draft", "prompt enhancement should return the rewritten draft")),
   http.protected.get("/vcs/status", "vcs.status").json(200, array),
   http.protected
     .get("/vcs/diff", "vcs.diff")
@@ -2013,6 +2023,7 @@ const llmScenarios = new Set([
   "session.init",
   "session.prompt",
   "session.prompt_async",
+  "instance.prompt.enhance",
   "session.command",
   "session.summarize",
 ])

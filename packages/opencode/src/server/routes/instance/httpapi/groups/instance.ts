@@ -5,7 +5,7 @@ import { LSP } from "@/lsp/lsp"
 import { Vcs } from "@/project/vcs"
 import { Skill } from "@/skill"
 import { Schema } from "effect"
-import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
+import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
 import {
@@ -22,6 +22,20 @@ const PathInfo = Schema.Struct({
   worktree: Schema.String,
   directory: Schema.String,
 }).annotate({ identifier: "Path" })
+
+export const PromptEnhancePayload = Schema.Struct({
+  model: Schema.String,
+  draft: Schema.String,
+  context: Schema.String,
+})
+
+export class PromptEnhanceModelNotFoundError extends Schema.ErrorClass<PromptEnhanceModelNotFoundError>(
+  "PromptEnhanceModelNotFoundError",
+)({ model: Schema.String, message: Schema.String }, { httpApiStatus: 404 }) {}
+
+export class PromptEnhanceProviderError extends Schema.ErrorClass<PromptEnhanceProviderError>(
+  "PromptEnhanceProviderError",
+)({ model: Schema.String, message: Schema.String }, { httpApiStatus: 502 }) {}
 
 export const VcsDiffQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
@@ -53,6 +67,7 @@ export const InstancePaths = {
   skill: "/skill",
   lsp: "/lsp",
   formatter: "/formatter",
+  promptEnhance: "/prompt/enhance",
 } as const
 
 export const InstanceApi = HttpApi.make("instance")
@@ -78,6 +93,18 @@ export const InstanceApi = HttpApi.make("instance")
             summary: "Get paths",
             description:
               "Retrieve the current working directory and related path information for the OpenCode instance.",
+          }),
+        ),
+        HttpApiEndpoint.post("promptEnhance", InstancePaths.promptEnhance, {
+          query: WorkspaceRoutingQuery,
+          payload: PromptEnhancePayload,
+          success: described(Schema.String, "Enhanced prompt draft"),
+          error: [PromptEnhanceModelNotFoundError, PromptEnhanceProviderError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "instance.prompt.enhance",
+            summary: "Enhance prompt draft",
+            description: "Rewrite a prompt draft with a configured provider model without sending it to a session.",
           }),
         ),
         HttpApiEndpoint.get("vcs", InstancePaths.vcs, {

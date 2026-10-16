@@ -268,6 +268,7 @@ Use a dedicated `tui.json` (or `tui.jsonc`) file for TUI-specific settings.
 ```json title="tui.json"
 {
   "$schema": "https://opencode.ai/tui.json",
+  "prompt_enhance_model": "google/gemini-4-argon",
   "scroll_speed": 3,
   "scroll_acceleration": {
     "enabled": true
@@ -292,6 +293,8 @@ Use `OPENCODE_TUI_CONFIG` to point to a custom TUI config file.
 When `cursor.style` is `"default"`, the terminal default cursor is restored, so `cursor.blinking` has no effect.
 
 Set `attention.enabled` to turn on TUI desktop notifications and sounds. See [TUI attention](/docs/tui#attention).
+
+`prompt_enhance_model` is a top-level `tui.json` key that selects the provider/model used by Ctrl+e prompt enhancement. The rewrite stays in the composer for review and is not sent until you submit it.
 
 Legacy `theme`, `keybinds`, and `tui` keys in `opencode.json` are deprecated and automatically migrated when possible.
 

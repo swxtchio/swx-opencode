@@ -1,0 +1,357 @@
+type Marker = { type: "prefix"; value: string } | { type: "fleet-heartbeat" }
+type MarkerConfig = { hold?: Marker[]; critical?: Marker[] }
+type Level = "critical" | "request" | "info" | "directive" | "nudge"
+
+type LevelToken = {
+  level: Level
+  key?: string
+  body: string
+}
+
+const DEFAULT_HOLD_MARKERS: Marker[] = [
+  { type: "prefix", value: `[fm-from-peer]\x1f` },
+  { type: "prefix", value: `[fm-from-firstmate]\x1f` },
+  { type: "prefix", value: "\x1f" },
+  { type: "prefix", value: "WATCHER FIRED [" },
+  { type: "prefix", value: "OBSERVER: " },
+  { type: "fleet-heartbeat" },
+]
+const DEFAULT_CRITICAL_LEVELS = new Set<Level>(["critical"])
+const LEVEL_PREFIX = "[fm-level:"
+const UNIT_SEPARATOR = "\x1f"
+const PEER_PREFIX = `[fm-from-peer]${UNIT_SEPARATOR}`
+const FIRSTMATE_PREFIX = `[fm-from-firstmate]${UNIT_SEPARATOR}`
+const OBSERVER_PREFIX = "OBSERVER: "
+
+const HEARTBEAT_PROMPT =
+  "Fleet heartbeat. Run one supervision cycle from live state, not memory: read the live fleet, backlog, and open work fresh; identify who is blocked only on firstmate, and take the highest-value in-scope action that advances convergence. Escalate destructive, irreversible, or security-sensitive decisions to the captain. See docs/fleet-operating-process.md."
+const HEARTBEAT_NUDGE_ANCHOR = " See docs/fleet-operating-process.md."
+const HEARTBEAT_INLINE_PAYLOAD_MAX_CHARS = 700
+const HEARTBEAT_LONG_SUMMARY_MAX_CHARS = 240
+const HEARTBEAT_TIMESTAMP_PREFIX = [
+  { digits: 4 },
+  { literal: "-" },
+  { digits: 2 },
+  { literal: "-" },
+  { digits: 2 },
+  { literal: "T" },
+  { digits: 2 },
+  { literal: ":" },
+  { digits: 2 },
+  { literal: "Z · " },
+] as const
+const HEARTBEAT_RAM_PREFIX = [
+  { literal: "System RAM: " },
+  { number: "decimal" },
+  { literal: "\x2f" },
+  { number: "decimal" },
+  { literal: " GiB used (" },
+  { number: "integer" },
+  { literal: "%) · " },
+  { number: "decimal" },
+  { literal: " GiB available · " },
+] as const
+const HEARTBEAT_UNAVAILABLE_CONTEXT_PREFIX = [
+  { literal: "Session transcript: unavailable (reason=" },
+  { number: "word" },
+  { literal: ") · " },
+] as const
+const HEARTBEAT_MEASURED_CONTEXT_PREFIX = [
+  { literal: "Session transcript: harness=" },
+  { number: "word" },
+  { literal: " session=" },
+  { number: "word" },
+  { literal: " bytes=" },
+  { number: "integer" },
+  { literal: " MB=" },
+  { number: "decimal" },
+  { literal: " severity=" },
+  { choices: ["safe", "warning", "high", "critical"] },
+  { literal: " · " },
+] as const
+
+type PrefixToken =
+  | { readonly literal: string }
+  | { readonly digits: number }
+  | { readonly number: "integer" | "decimal" | "word" }
+  | { readonly choices: readonly string[] }
+
+export function classify(input: string, config?: MarkerConfig) {
+  const token = parseLevelToken(input)
+  if (token && DEFAULT_CRITICAL_LEVELS.has(token.level)) return "critical" as const
+  if (config?.critical?.some((marker) => matches(marker, input))) return "critical" as const
+  if (token) return "hold" as const
+  if ([...DEFAULT_HOLD_MARKERS, ...(config?.hold ?? [])].some((marker) => matches(marker, input)))
+    return "hold" as const
+}
+
+// Only generated, validated framing authorizes grouping. Unknown held messages stay individual.
+export function dispatch(input: string) {
+  const token = parseLevelToken(input)
+  const peer = input.startsWith(PEER_PREFIX) ? peerEnvelope(input) : undefined
+  if (peer) {
+    return {
+      kind: "peer" as const,
+      sender: peer.name,
+      home: peer.home,
+      messageID: peer.messageID,
+      level: token?.level,
+    }
+  }
+  if (isFleetHeartbeat(input) && token?.level !== "critical") {
+    const duty = (token?.body ?? input).match(/ Periodic nudge: (.+) See docs\/fleet-operating-process\.md\./)?.[1]
+    return { kind: "automation" as const, type: "heartbeat", episode: duty ? `heartbeat-duty:${duty}` : undefined }
+  }
+  if (token?.level === "critical") return
+  if (token && (input.startsWith(OBSERVER_PREFIX) || input.startsWith(FIRSTMATE_PREFIX)))
+    return {
+      kind: "automation" as const,
+      type: `${input.startsWith(OBSERVER_PREFIX) ? "observer" : "firstmate"}.${token.level}`,
+      episode: undefined,
+    }
+  if (token?.key && token.key !== "watcher.wake")
+    return { kind: "automation" as const, type: `nudge.${token.key}`, episode: undefined }
+  if (
+    token?.level === "request" &&
+    /^WATCHER FIRED \[(failure|lifecycle|session-lock)-[0-9]+\][^\n]*\n\nwatcher: /.test(token.body)
+  )
+    return { kind: "automation" as const, type: "watcher.lifecycle", episode: undefined }
+  if (token?.key !== "watcher.wake") return
+  const wake = token.body.match(
+    /^WATCHER FIRED \[[a-z]+-[0-9]+\][^\n]*\n\n(check|signal|waiting|stale|orphaned|turn-died|heartbeat):?\s*([\s\S]*)$/,
+  )
+  if (!wake) return
+  const check = wake[1] === "check" ? wake[2].match(/^(\/[^\n:]+\.check\.sh): /)?.[1] : undefined
+  // A check file is the producer's durable episode identity. Other wakes have no single episode key.
+  return { kind: "automation" as const, type: `watcher.${wake[1]}`, episode: check }
+}
+
+function matches(marker: Marker, input: string) {
+  if (marker.type === "prefix") return marker.value.length > 0 && input.startsWith(marker.value)
+  return isFleetHeartbeat(input)
+}
+
+function isFleetHeartbeat(input: string) {
+  const token = parseLevelToken(input)
+  const payload = token?.body ?? input
+  if (payload.includes("\n") || payload.includes("\r")) return false
+  const envelope = payload.match(/^(.*) \[fm-heartbeat-receipt:([a-zA-Z0-9._-]+)\]$/)
+  if (!envelope) return false
+  const body = envelope[1]
+  if (characterCount(payload) <= HEARTBEAT_INLINE_PAYLOAD_MAX_CHARS && isGeneratedPayload(body)) return true
+  return isGeneratedSummary(body)
+}
+
+function parseLevelToken(input: string): LevelToken | undefined {
+  const body = levelTokenBody(input)
+  if (!body?.startsWith(LEVEL_PREFIX)) return
+  const end = body.indexOf(`]${UNIT_SEPARATOR}`, LEVEL_PREFIX.length)
+  if (end === -1) return
+  const specification = body.slice(LEVEL_PREFIX.length, end)
+  const trailing = body.slice(end + 2)
+  const content = trailing.startsWith(" ") ? trailing.slice(1) : trailing
+  if (specification === "nudge") return { level: "nudge", body: content }
+  if (specification.startsWith("nudge:")) {
+    const key = specification.slice("nudge:".length)
+    if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(key)) return
+    return { level: "nudge", key, body: content }
+  }
+  if (["critical", "request", "info", "directive"].includes(specification))
+    return { level: specification as Level, body: content }
+}
+
+/**
+ * Who sent a framed message, at what level, under which supersede key, and its
+ * text after the framing (#212); undefined when it carries no framing. A peer
+ * is named by its name and home, so its msgid never makes two senders.
+ */
+export function envelope(input: string) {
+  const peer = input.startsWith(PEER_PREFIX) ? peerEnvelope(input) : undefined
+  if (input.startsWith(PEER_PREFIX) && !peer) return
+  const token = parseLevelToken(input)
+  const sender = peer
+    ? `peer${UNIT_SEPARATOR}${peer.name}${UNIT_SEPARATOR}${peer.home}`
+    : input.startsWith(FIRSTMATE_PREFIX)
+      ? "firstmate"
+      : input.startsWith(OBSERVER_PREFIX)
+        ? "observer"
+        : token
+          ? "unaddressed"
+          : undefined
+  if (!sender) return
+  const body = token?.body ?? peer?.body ?? levelTokenBody(input) ?? input
+  return {
+    sender,
+    level: token?.level,
+    key: token?.key,
+    body,
+    // A reply acknowledges one msgid, so replies to different ones never meet.
+    reply: /^re:p[0-9]+-[0-9]+-[0-9a-f]{4}(?=\s|$)/.exec(body)?.[0],
+  }
+}
+
+function levelTokenBody(input: string): string | undefined {
+  if (input.startsWith(PEER_PREFIX)) return peerEnvelope(input)?.body
+  if (input.startsWith(FIRSTMATE_PREFIX)) return input.slice(FIRSTMATE_PREFIX.length)
+  if (input.startsWith(OBSERVER_PREFIX)) return input.slice(OBSERVER_PREFIX.length)
+  if (input.startsWith(UNIT_SEPARATOR)) return input.slice(UNIT_SEPARATOR.length)
+  return input
+}
+
+function peerEnvelopeBody(input: string) {
+  return peerEnvelope(input)?.body
+}
+
+function peerEnvelope(input: string) {
+  let rest = input.slice(PEER_PREFIX.length)
+  let padded = false
+  if (rest.startsWith(" ")) {
+    padded = true
+    rest = rest.slice(1)
+  }
+  const field = (stripPadding: boolean) => {
+    const separator = rest.indexOf(UNIT_SEPARATOR)
+    if (separator === -1) return
+    const value = rest.slice(0, separator)
+    rest = rest.slice(separator + 1)
+    if (stripPadding && rest.startsWith(" ")) {
+      padded = true
+      rest = rest.slice(1)
+    }
+    return value
+  }
+  const name = field(true)
+  const home = field(true)
+  const messageID = field(false)
+  if (!name || !home || !messageID) return
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(name) || isPeerTaskLabel(name)) return
+  if (!home.startsWith("/") || home.includes("\n") || home.includes("\r")) return
+  if (!/^p[0-9]+-[0-9]+-[0-9a-f]{4}$/.test(messageID)) return
+  if (padded && rest.startsWith(" ")) rest = rest.slice(1)
+  return { name, home, messageID, body: rest }
+}
+
+function isPeerTaskLabel(name: string) {
+  if (name.startsWith("fm-") && name.length > 3) return true
+  const separator = name.indexOf("-fm-")
+  if (separator === -1) return false
+  const short = name.slice(0, separator)
+  const id = name.slice(separator + "-fm-".length)
+  return /^[a-z0-9]+$/.test(short) && short !== "fm" && id.length > 0
+}
+
+function isGeneratedPayload(input: string) {
+  let body = input
+  const timestamp = body.match(/^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z) · /)
+  if (timestamp) body = body.slice(timestamp[0].length)
+
+  if (body.startsWith("System RAM: ")) {
+    const ram = body.match(
+      /^System RAM: [0-9]+\.[0-9]\x2f[0-9]+\.[0-9] GiB used \([0-9]+%\) · [0-9]+\.[0-9] GiB available · (.*)$/,
+    )
+    if (!ram) return false
+    body = ram[1]
+  }
+
+  if (body.startsWith("Session transcript: ")) {
+    const transcript = body.match(
+      /^Session transcript: (unavailable \(reason=[^\s]+\)|harness=[^\s]+ session=[^\s]+ bytes=[0-9]+ MB=[0-9]+\.[0-9]+ severity=(safe|warning|high|critical)) · (.*)$/,
+    )
+    if (!transcript) return false
+    body = transcript[3]
+  }
+
+  if (body === HEARTBEAT_PROMPT) return true
+  const core = HEARTBEAT_PROMPT.slice(0, -HEARTBEAT_NUDGE_ANCHOR.length)
+  const nudgePrefix = `${core} Periodic nudge: `
+  if (!body.startsWith(nudgePrefix) || !body.endsWith(HEARTBEAT_NUDGE_ANCHOR)) return false
+  const duty = body.slice(nudgePrefix.length, -HEARTBEAT_NUDGE_ANCHOR.length)
+  return duty.length > 0
+}
+
+function isGeneratedSummary(input: string) {
+  const summary = input.match(
+    /^Heartbeat summary: ([^\u0000-\u001f\u007f]+)… Full message: (\x2f[^\u0000-\u001f\u007f]+)$/,
+  )
+  return (
+    summary !== null &&
+    characterCount(summary[1]) === HEARTBEAT_LONG_SUMMARY_MAX_CHARS &&
+    isGeneratedPayloadPrefix(summary[1])
+  )
+}
+
+function isGeneratedPayloadPrefix(input: string) {
+  let body = input
+  const timestamp = body.match(/^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z · )/)
+  if (timestamp) body = body.slice(timestamp[0].length)
+  else if (isPrefixOfTokens(body, HEARTBEAT_TIMESTAMP_PREFIX)) return true
+
+  if (body.startsWith("System RAM: ")) {
+    const ram = body.match(
+      /^System RAM: [0-9]+\.[0-9]\x2f[0-9]+\.[0-9] GiB used \([0-9]+%\) · [0-9]+\.[0-9] GiB available · /,
+    )
+    if (!ram) return isPrefixOfTokens(body, HEARTBEAT_RAM_PREFIX)
+    body = body.slice(ram[0].length)
+  }
+
+  if (body.startsWith("Session transcript: ")) {
+    const transcript = body.match(
+      /^Session transcript: (unavailable \(reason=[^\s]+\)|harness=[^\s]+ session=[^\s]+ bytes=[0-9]+ MB=[0-9]+\.[0-9]+ severity=(safe|warning|high|critical)) · /,
+    )
+    if (!transcript)
+      return (
+        isPrefixOfTokens(body, HEARTBEAT_UNAVAILABLE_CONTEXT_PREFIX) ||
+        isPrefixOfTokens(body, HEARTBEAT_MEASURED_CONTEXT_PREFIX)
+      )
+    body = body.slice(transcript[0].length)
+  }
+
+  return HEARTBEAT_PROMPT.startsWith(body)
+}
+
+function isPrefixOfTokens(input: string, tokens: readonly PrefixToken[]) {
+  let rest = input
+  for (const token of tokens) {
+    if (rest.length === 0) return true
+    if ("literal" in token) {
+      if (token.literal.startsWith(rest)) return true
+      if (!rest.startsWith(token.literal)) return false
+      rest = rest.slice(token.literal.length)
+      continue
+    }
+    if ("digits" in token) {
+      const digits = rest.match(/^[0-9]+/)?.[0] ?? ""
+      if (rest.length < token.digits) return digits.length === rest.length
+      if (digits.length < token.digits) return false
+      rest = rest.slice(token.digits)
+      continue
+    }
+    if ("choices" in token) {
+      const value = token.choices.find((choice) => rest.startsWith(choice))
+      if (!value) return token.choices.some((choice) => choice.startsWith(rest))
+      if (rest.length <= value.length) return true
+      rest = rest.slice(value.length)
+      continue
+    }
+    if (token.number === "word") {
+      const whitespace = rest.search(/\s/)
+      if (whitespace === -1) return true
+      if (whitespace === 0) return false
+      rest = rest.slice(whitespace)
+      continue
+    }
+    const value = rest.match(token.number === "decimal" ? /^[0-9]+\.[0-9]/ : /^[0-9]+/)?.[0]
+    if (value) {
+      if (value.length === rest.length) return true
+      rest = rest.slice(value.length)
+      continue
+    }
+    if (token.number === "decimal") return /^[0-9]+\.?$/.test(rest)
+    return false
+  }
+  return rest.length === 0
+}
+
+function characterCount(input: string) {
+  return Array.from(input).length
+}
