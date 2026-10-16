@@ -4108,6 +4108,12 @@ function containsTarget(longer: string, shorter: string) {
     .some((_, index) => shorterWords.every((word, offset) => targetWordMatches(word, longerWords[index + offset]!)))
 }
 
+const targetEsPluralWordPairs = new Map([
+  ["echoes", "echo"],
+  ["vetoes", "veto"],
+  ["zeroes", "zero"],
+])
+
 function targetWordCandidates(word: string) {
   const candidates = new Set([word])
   if (word.includes(".")) return candidates
@@ -4116,18 +4122,7 @@ function targetWordCandidates(word: string) {
     candidates.add(`${word.slice(0, -3)}y`)
     return candidates
   }
-  if (word.length > 3 && word.endsWith("es")) {
-    candidates.add(word.slice(0, -1))
-    const withoutEs = word.slice(0, -2)
-    candidates.add(withoutEs)
-    if (word.endsWith("zzes")) candidates.add(word.slice(0, -3))
-    return candidates
-  }
-  if (word.endsWith("is")) {
-    if (!genericTargetWords.has(word)) candidates.add(`${word.slice(0, -2)}es`)
-    return candidates
-  }
-  if (word.length > 3 && word.endsWith("z") && !word.endsWith("zz")) candidates.add(`${word}z`)
+  if (targetEsPluralWordPairs.has(word)) candidates.add(targetEsPluralWordPairs.get(word)!)
   if (word.length > 3 && word.endsWith("s") && !word.endsWith("ss") && !word.endsWith("us"))
     candidates.add(word.slice(0, -1))
   return candidates

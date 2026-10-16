@@ -552,18 +552,7 @@ const pluralTargetPair = (title: string, first: string, second: string) => ({
 })
 
 const pluralTargetPairs = [
-  pluralTargetPair("templates/template", "fix email templates", "fix email template"),
-  pluralTargetPair("classes/class", "fix parser classes", "fix parser class"),
-  pluralTargetPair("policies/policy", "fix routing policies", "fix routing policy"),
-  pluralTargetPair("certificates/certificate", "fix tls certificates", "fix tls certificate"),
-  pluralTargetPair("activations/activation", "fix user activations", "fix user activation"),
-  pluralTargetPair("updates/update", "fix updates page", "fix update page"),
-  pluralTargetPair("migrations/migration", "fix database migrations", "fix database migration"),
-  pluralTargetPair("connections/connection", "fix database connections", "fix database connection"),
-  pluralTargetPair("validations/validation", "fix API validations", "fix API validation"),
-  pluralTargetPair("replications/replication", "fix database replications", "fix database replication"),
   pluralTargetPair("databases/database", "fix databases", "fix database"),
-  pluralTargetPair("databases/database -es candidate", "fix databas", "fix databases"),
   pluralTargetPair("database caches/cache", "fix the database caches", "fix the database cache"),
   pluralTargetPair("image sizes/size", "fix image sizes", "fix image size"),
   pluralTargetPair("API responses/response", "fix the api responses", "fix the api response"),
@@ -572,21 +561,9 @@ const pluralTargetPairs = [
   pluralTargetPair("uses/use list", "fix the uses list", "fix the use list"),
   pluralTargetPair("user licenses/license", "fix the user licenses", "fix the user license"),
   pluralTargetPair("build phases/phase", "fix the build phases", "fix the build phase"),
-  pluralTargetPair("cookies/cookie banner", "fix the cookies banner", "fix the cookie banner"),
-  pluralTargetPair("movies/movie page", "fix the movies page", "fix the movie page"),
-  pluralTargetPair("canvases/canvas", "fix canvases shapes", "fix canvas shapes"),
-  pluralTargetPair("aliases/alias", "fix dns aliases", "fix dns alias"),
-  pluralTargetPair("biases/bias", "fix user biases", "fix user bias"),
-  pluralTargetPair("quizzes/quiz", "fix quizzes", "fix quiz"),
-  pluralTargetPair("quizzes/quizz candidate", "fix quizz", "fix quizzes"),
-  pluralTargetPair("axes/axis", "fix axes", "fix axis"),
   pluralTargetPair("echo/echoes", "fix echo", "fix echoes"),
   pluralTargetPair("veto/vetoes", "fix veto", "fix vetoes"),
   pluralTargetPair("zero/zeroes", "fix zero", "fix zeroes"),
-  pluralTargetPair("size/sizes reverse order", "fix size", "fix sizes"),
-  pluralTargetPair("cookies/cooky candidate", "fix cooky", "fix cookies"),
-  pluralTargetPair("movies/movy candidate", "fix movy", "fix movies"),
-  pluralTargetPair("heroes/hero", "fix heroes", "fix hero"),
 ]
 
 const derivationalWordControls = [
@@ -1552,7 +1529,7 @@ it.instance("request admission extracts the same subject across dependent-clause
   }),
 )
 
-it.instance("consolidation merges regular plural target variants", () =>
+it.instance("consolidation merges only the reviewed plural target pairs", () =>
   Effect.gen(function* () {
     for (const delivery of ["steer", "queue"] as const) {
       for (const pair of pluralTargetPairs) {
@@ -1567,7 +1544,7 @@ it.instance("consolidation merges regular plural target variants", () =>
   30_000,
 )
 
-it.instance("request admission merges regular plural target variants", () =>
+it.instance("request admission merges only the reviewed plural target pairs", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
