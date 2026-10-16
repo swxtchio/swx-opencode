@@ -8,12 +8,12 @@ import { existsSync, readFileSync, watch } from "fs"
 import path from "path"
 import { fileURLToPath } from "url"
 import { Worker } from "worker_threads"
-import { Config } from "../config"
 import { EventV2 } from "../event"
 import { Flag } from "../flag/flag"
 import { FSUtil } from "../fs-util"
 import { Git } from "../git"
 import { Location } from "../location"
+import { WatcherConfig } from "./watcher-config"
 import { Ignore } from "./ignore"
 import { ParcelBinding } from "./parcel-binding"
 import type { Reply, Request, Response } from "./parcel-service"
@@ -93,9 +93,7 @@ export const layerWith = (
           return runFork(Effect.logWarning("watcher not confirmed, continuing without it until it confirms", fields))
       }
 
-      const config = (yield* (yield* Config.Service).entries())
-        .filter((entry): entry is Config.Document => entry.type === "document")
-        .flatMap((item) => item.info.watcher?.ignore ?? [])
+      const config = (yield* (yield* WatcherConfig.Service).get())?.ignore ?? []
 
       if (location.vcs?.type === "git") {
         const resolved = (yield* git.repo.discover(location.directory))?.gitDirectory
@@ -327,5 +325,5 @@ function workerTarget() {
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [FSUtil.node, Location.node, Config.node, Git.node, EventV2.node],
+  deps: [FSUtil.node, Location.node, WatcherConfig.node, Git.node, EventV2.node],
 })

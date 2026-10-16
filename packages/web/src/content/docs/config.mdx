@@ -768,7 +768,7 @@ You can control context compaction behavior through the `compaction` option.
 
 ### Watcher
 
-You can configure file watcher ignore patterns and the FFF search watcher through the `watcher` option. The FFF watcher is enabled by default; setting `watcher.fff` to `false` disables only that background watcher and keeps FFF search available.
+You can configure file watcher ignore patterns and the FFF search watcher through the `watcher` option. The FFF watcher is enabled by default; setting `watcher.fff` to `false` disables only that background watcher and keeps FFF search available. The setting follows normal config precedence and can also be provided through `OPENCODE_CONFIG_CONTENT`.
 
 ```json title="opencode.json"
 {

@@ -2333,6 +2333,103 @@
         ]
       }
     },
+    "/prompt/enhance": {
+      "post": {
+        "tags": ["instance"],
+        "operationId": "instance.prompt.enhance",
+        "parameters": [
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Enhanced prompt draft",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string",
+                  "description": "Enhanced prompt draft"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "PromptEnhanceModelNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PromptEnhanceModelNotFoundError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "PromptEnhanceProviderError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PromptEnhanceProviderError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Rewrite a prompt draft with a configured provider model without sending it to a session.",
+        "summary": "Enhance prompt draft",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "model": {
+                    "type": "string"
+                  },
+                  "draft": {
+                    "type": "string"
+                  },
+                  "context": {
+                    "type": "string"
+                  }
+                },
+                "required": ["model", "draft", "context"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.instance.prompt.enhance({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/vcs": {
       "get": {
         "tags": ["instance"],
@@ -6345,6 +6442,10 @@
                   "agent": {
                     "type": "string"
                   },
+                  "origin": {
+                    "type": "string",
+                    "enum": ["tui-composer"]
+                  },
                   "noReply": {
                     "type": "boolean"
                   },
@@ -7243,6 +7344,10 @@
                   },
                   "agent": {
                     "type": "string"
+                  },
+                  "origin": {
+                    "type": "string",
+                    "enum": ["tui-composer"]
                   },
                   "noReply": {
                     "type": "boolean"
@@ -18607,6 +18712,10 @@
           "agent": {
             "type": "string"
           },
+          "origin": {
+            "type": "string",
+            "enum": ["tui-composer"]
+          },
           "tools": {
             "type": "object",
             "additionalProperties": {
@@ -22697,6 +22806,9 @@
                 "items": {
                   "type": "string"
                 }
+              },
+              "fff": {
+                "type": "boolean"
               }
             },
             "additionalProperties": false
@@ -23883,6 +23995,32 @@
         "required": ["home", "state", "config", "worktree", "directory"],
         "additionalProperties": false
       },
+      "PromptEnhanceModelNotFoundError": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": ["model", "message"],
+        "additionalProperties": false
+      },
+      "PromptEnhanceProviderError": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": ["model", "message"],
+        "additionalProperties": false
+      },
       "VcsInfo": {
         "type": "object",
         "properties": {
@@ -24678,6 +24816,21 @@
               "state": {
                 "type": "string",
                 "enum": ["pending"]
+              },
+              "itemID": {
+                "type": "string",
+                "pattern": "^que_"
+              }
+            },
+            "required": ["state", "itemID"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": ["withdrawn"]
               },
               "itemID": {
                 "type": "string",
