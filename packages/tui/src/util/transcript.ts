@@ -23,6 +23,8 @@ export type MessageWithParts = {
   parts: Part[]
 }
 
+export type TranscriptPresentation = ReadonlyMap<string, string>
+
 export function formatTranscript(
   session: SessionInfo,
   messages: MessageWithParts[],
@@ -45,11 +47,40 @@ export function formatTranscript(
   return transcript
 }
 
+export function promptEnhancementContext(
+  messages: MessageWithParts[],
+  options: Pick<TranscriptOptions, "thinking" | "toolDetails" | "assistantMetadata" | "providers">,
+  presentation?: TranscriptPresentation,
+) {
+  return messages
+    .toSorted((a, b) => a.info.time.created - b.info.time.created || a.info.id.localeCompare(b.info.id))
+    .map((message) =>
+      formatMessage(
+        message.info,
+        message.parts.filter((part) => {
+          if (part.type === "text") return !part.synthetic && !part.ignored
+          if (presentation && (part.type === "reasoning" || part.type === "tool"))
+            return presentation.has(part.id)
+          if (part.type === "tool" && !options.toolDetails && part.state.status === "completed") return false
+          return true
+        }),
+        options,
+        undefined,
+        presentation,
+      ),
+    )
+    .join("")
+    .split("\n")
+    .slice(-100)
+    .join("\n")
+}
+
 export function formatMessage(
   msg: UserMessage | AssistantMessage,
   parts: Part[],
   options: TranscriptOptions,
   providers?: Provider[] | ReadonlyMap<string, Provider>,
+  presentation?: TranscriptPresentation,
 ): string {
   let result = ""
 
@@ -60,6 +91,11 @@ export function formatMessage(
   }
 
   for (const part of parts) {
+    if (presentation && (part.type === "reasoning" || part.type === "tool")) {
+      const rendered = presentation.get(part.id)
+      if (rendered) result += `${rendered}\n\n`
+      continue
+    }
     result += formatPart(part, options)
   }
 

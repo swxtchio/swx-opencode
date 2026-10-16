@@ -139,3 +139,62 @@ test("mode-less bindings stay active when opencode mode changes", async () => {
     app.renderer.destroy()
   }
 })
+
+test("ctrl+r opens timeline and ctrl+e enhances the prompt while rename stays unbound", async () => {
+  const calls: string[] = []
+  const bindings: Record<string, unknown> = {}
+
+  function Harness() {
+    const renderer = useRenderer()
+    const keymap = createDefaultOpenTuiKeymap(renderer)
+    const config = createResolvedKeymapConfig()
+    const offKeymap = registerOpencodeKeymap(keymap, renderer, config)
+    bindings.lineEndDefault = config.keybinds.get("input.line.end")
+    const offLayer = keymap.registerLayer({
+      commands: [
+        { name: "session.timeline", run: () => void calls.push("session.timeline") },
+        { name: "session.rename", run: () => void calls.push("session.rename") },
+        { name: "prompt.enhance", run: () => void calls.push("prompt.enhance") },
+      ],
+      bindings: config.keybinds.gather("session", ["session.timeline", "session.rename", "prompt.enhance"]),
+    })
+    const registered = keymap.getCommandBindings({
+      visibility: "registered",
+      commands: ["session.timeline", "session.rename", "prompt.enhance", "input.line.end"],
+    })
+    bindings.timeline = registered
+      .get("session.timeline")
+      ?.map((binding) => binding.sequence.map((part) => ({ name: part.stroke.name, ctrl: part.stroke.ctrl })))
+    bindings.rename = registered.get("session.rename")?.length ?? 0
+    bindings.enhance = registered
+      .get("prompt.enhance")
+      ?.map((binding) => binding.sequence.map((part) => ({ name: part.stroke.name, ctrl: part.stroke.ctrl })))
+    bindings.lineEnd = registered
+      .get("input.line.end")
+      ?.map((binding) => binding.sequence.map((part) => ({ name: part.stroke.name, ctrl: part.stroke.ctrl })))
+    onCleanup(() => {
+      offLayer()
+      offKeymap()
+    })
+
+    return (
+      <OpencodeKeymapProvider keymap={keymap}>
+        <box />
+      </OpencodeKeymapProvider>
+    )
+  }
+
+  const app = await testRender(() => <Harness />, { kittyKeyboard: true })
+  try {
+    app.mockInput.pressKey("r", { ctrl: true })
+    app.mockInput.pressKey("e", { ctrl: true })
+    expect(calls).toEqual(["session.timeline", "prompt.enhance"])
+    expect(bindings.timeline).toEqual([[{ name: "r", ctrl: true }]])
+    expect(bindings.rename).toBe(0)
+    expect(bindings.enhance).toEqual([[{ name: "e", ctrl: true }]])
+    expect(bindings.lineEnd).toContainEqual([{ name: "e", ctrl: true }])
+    expect(bindings.lineEndDefault).toMatchObject([{ key: "ctrl+e" }])
+  } finally {
+    app.renderer.destroy()
+  }
+})

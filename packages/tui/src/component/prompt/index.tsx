@@ -43,8 +43,15 @@ import { DialogStash } from "../dialog-stash"
 import { type AutocompleteRef, Autocomplete } from "./autocomplete"
 import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
 import type { AssistantMessage, FilePart, SessionPromptQueueReceipt, UserMessage } from "@opencode-ai/sdk/v2"
+import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { Locale } from "../../util/locale"
 import { errorMessage } from "../../util/error"
+import {
+  promptEnhancementContext,
+  type MessageWithParts,
+  type TranscriptOptions,
+  type TranscriptPresentation,
+} from "../../util/transcript"
 import { isRecord } from "../../util/record"
 import { formatDuration } from "../../util/format"
 import { createColors, createFrames } from "../../ui/spinner"
@@ -69,6 +76,11 @@ registerOpencodeSpinner()
 
 export type PromptProps = {
   sessionID?: string
+  enhancementContext?: () => {
+    messages: MessageWithParts[]
+    options: Pick<TranscriptOptions, "thinking" | "toolDetails" | "assistantMetadata" | "providers">
+    presentation: TranscriptPresentation
+  }
   visible?: boolean
   disabled?: boolean
   onSubmit?: () => void
@@ -249,6 +261,7 @@ export function Prompt(props: PromptProps) {
   event.on("tui.prompt.append", (evt, { workspace }) => {
     if (workspace !== project.workspace.current()) return
     if (!input || input.isDestroyed) return
+    setStore("prompt", "machineAppended", true)
     input.insertText(evt.properties.text)
     setTimeout(() => {
       // setTimeout is a workaround and needs to be addressed properly
@@ -309,6 +322,8 @@ export function Prompt(props: PromptProps) {
     extmarkToPartIndex: new Map(),
     interrupt: 0,
   })
+  const [enhancing, setEnhancing] = createSignal(false)
+  let promptRevision = 0
 
   createEffect(
     on(
@@ -396,6 +411,13 @@ export function Prompt(props: PromptProps) {
 
           dialog.clear()
         },
+      },
+      {
+        title: "Enhance prompt",
+        name: "prompt.enhance",
+        category: "Prompt",
+        enabled: !!store.prompt.input && !enhancing(),
+        run: () => void enhancePrompt(),
       },
       {
         title: "Remove editor context",
@@ -619,6 +641,13 @@ export function Prompt(props: PromptProps) {
     ]),
   }))
 
+  useBindings(() => ({
+    mode: OPENCODE_BASE_MODE,
+    enabled: () => !!input && !input.isDestroyed && input.focused && store.mode === "normal",
+    priority: 2,
+    bindings: tuiConfig.keybinds.get("prompt.enhance"),
+  }))
+
   const ref: PromptRef = {
     get focused() {
       return input.focused
@@ -785,6 +814,7 @@ export function Prompt(props: PromptProps) {
           stash.push({
             input: store.prompt.input,
             parts: store.prompt.parts,
+            ...(store.prompt.machineAppended ? { machineAppended: true } : {}),
           })
           input.extmarks.clear()
           input.clear()
@@ -802,7 +832,11 @@ export function Prompt(props: PromptProps) {
           const entry = stash.pop()
           if (entry) {
             input.setText(entry.input)
-            setStore("prompt", { input: entry.input, parts: entry.parts })
+            setStore("prompt", {
+              input: entry.input,
+              parts: entry.parts,
+              ...(entry.machineAppended ? { machineAppended: true } : {}),
+            })
             restoreExtmarksFromParts(entry.parts)
             input.gotoBufferEnd()
           }
@@ -819,7 +853,11 @@ export function Prompt(props: PromptProps) {
             <DialogStash
               onSelect={(entry) => {
                 input.setText(entry.input)
-                setStore("prompt", { input: entry.input, parts: entry.parts })
+                setStore("prompt", {
+                  input: entry.input,
+                  parts: entry.parts,
+                  ...(entry.machineAppended ? { machineAppended: true } : {}),
+                })
                 restoreExtmarksFromParts(entry.parts)
                 input.gotoBufferEnd()
               }}
@@ -1003,7 +1041,9 @@ export function Prompt(props: PromptProps) {
     if (!withdrawn?.data)
       return giveBack(
         { sessionID, itemID, requestID },
-        prompt.item ? recalledPrompt(prompt.item) : { input: prompt.text, parts: [] },
+        prompt.item
+          ? recalledPrompt(prompt.item)
+          : { input: prompt.text, parts: [], ...(prompt.machineAppended ? { machineAppended: true } : {}) },
         "Could not take that prompt back",
       )
     sync.queue.withdrawn(sessionID, withdrawn.data)
@@ -1074,7 +1114,11 @@ export function Prompt(props: PromptProps) {
             : "That prompt is no longer pending",
         })
       if (where === "withdrawn") {
-        stash.push({ input: prompt.input, parts: prompt.parts })
+        stash.push({
+          input: prompt.input,
+          parts: prompt.parts,
+          ...(prompt.machineAppended ? { machineAppended: true } : {}),
+        })
         return toast.show({
           variant: "error",
           message: `${reason}, and it could not be put back in the queue; its text is in the prompt stash`,
@@ -1280,7 +1324,11 @@ export function Prompt(props: PromptProps) {
       // Names this send, so the server can say what became of it (#212), and
       // so the pending row shows it until the queue lists it (#249).
       const requestID = crypto.randomUUID()
-      const settled = sync.queue.sending(sessionID, { requestID, text: inputText })
+      const settled = sync.queue.sending(sessionID, {
+        requestID,
+        text: inputText,
+        ...(store.prompt.machineAppended ? { machineAppended: true } : {}),
+      })
       sdk.client.session
         .prompt(
           {
@@ -1288,6 +1336,8 @@ export function Prompt(props: PromptProps) {
             requestID,
             ...selectedModel,
             agent: agent.name,
+            delivery: status().type === "idle" ? "steer" : "queue",
+            origin: "tui-composer",
             model: selectedModel,
             variant,
             parts: [
@@ -1295,6 +1345,9 @@ export function Prompt(props: PromptProps) {
               {
                 type: "text",
                 text: inputText,
+                ...(store.prompt.machineAppended
+                  ? { metadata: { [SessionPromptQueue.TuiPromptAppendMetadataKey]: true } }
+                  : {}),
               },
               ...nonTextParts,
             ],
@@ -1319,10 +1372,7 @@ export function Prompt(props: PromptProps) {
         .finally(settled)
       if (editorParts.length > 0) editor.markSelectionSent()
     }
-    history.append({
-      ...store.prompt,
-      mode: currentMode,
-    })
+    if (!store.prompt.machineAppended) history.append({ ...store.prompt, mode: currentMode })
     input.extmarks.clear()
     setStore("prompt", {
       input: "",
@@ -1470,7 +1520,10 @@ export function Prompt(props: PromptProps) {
   }
 
   function clearPrompt() {
-    if (store.prompt.input.trim().length >= DRAFT_RETENTION_MIN_CHARS || store.prompt.parts.length > 0) {
+    if (
+      !store.prompt.machineAppended &&
+      (store.prompt.input.trim().length >= DRAFT_RETENTION_MIN_CHARS || store.prompt.parts.length > 0)
+    ) {
       history.append({
         ...store.prompt,
         mode: store.mode,
@@ -1483,6 +1536,83 @@ export function Prompt(props: PromptProps) {
       parts: [],
     })
     setStore("extmarkToPartIndex", new Map())
+  }
+
+  async function enhancePrompt() {
+    if (!input || input.isDestroyed || store.mode !== "normal" || enhancing()) return
+    const requestInput = input
+    const sessionID = props.sessionID
+    const revision = promptRevision
+    const draft = requestInput.plainText
+    if (!draft.trim()) return
+    setStore("prompt", "input", draft)
+    const requestParts = store.prompt.parts
+    const requestPartsSnapshot = JSON.stringify(requestParts)
+    const placeholders = requestParts.flatMap((part) => {
+      if (part.type === "file" && part.source?.text) return [part.source.text.value]
+      if (part.type === "agent" && part.source) return [part.source.value]
+      if (part.type === "text" && part.source?.text) return [part.source.text.value]
+      return []
+    })
+    setEnhancing(true)
+    try {
+      const transcript = props.enhancementContext?.()
+      const context = transcript
+        ? promptEnhancementContext(transcript.messages, transcript.options, transcript.presentation)
+        : ""
+      const response = await sdk.client.instance.prompt.enhance(
+        {
+          model: tuiConfig.prompt_enhance_model,
+          draft,
+          context,
+        },
+        { throwOnError: true },
+      )
+      if (
+        input !== requestInput ||
+        requestInput.isDestroyed ||
+        props.sessionID !== sessionID ||
+        promptRevision !== revision ||
+        requestInput.plainText !== draft ||
+        JSON.stringify(store.prompt.parts) !== requestPartsSnapshot
+      ) {
+        toast.show({ message: "Prompt changed while enhancement was running", variant: "info" })
+        return
+      }
+      const enhanced = response.data.trim()
+      if (!enhanced) throw new Error("The enhancement model returned an empty draft.")
+      if (placeholders.some((placeholder) => !enhanced.includes(placeholder)))
+        throw new Error("The enhancement omitted an attachment or reference placeholder.")
+      const parts = requestParts.map((part) => {
+        const value =
+          part.type === "file"
+            ? part.source?.text?.value
+            : part.type === "agent"
+              ? part.source?.value
+              : part.type === "text"
+                ? part.source?.text?.value
+                : undefined
+        if (!value) return part
+        const start = enhanced.indexOf(value)
+        if (start === -1) return part
+        const end = start + value.length
+        if (part.type === "file" && part.source?.text)
+          return { ...part, source: { ...part.source, text: { ...part.source.text, start, end } } }
+        if (part.type === "agent" && part.source) return { ...part, source: { ...part.source, start, end } }
+        if (part.type === "text" && part.source?.text)
+          return { ...part, source: { ...part.source, text: { ...part.source.text, start, end } } }
+        return part
+      })
+      input.setText(enhanced)
+      setStore("prompt", { input: enhanced, parts })
+      restoreExtmarksFromParts(parts)
+      input.gotoBufferEnd()
+      toast.show({ message: "Prompt enhanced", variant: "success" })
+    } catch (error) {
+      toast.show({ title: "Failed to enhance prompt", message: errorMessage(error), variant: "error" })
+    } finally {
+      setEnhancing(false)
+    }
   }
 
   const highlight = createMemo(() => {
@@ -1575,7 +1705,16 @@ export function Prompt(props: PromptProps) {
               minHeight={1}
               maxHeight={maxHeight()}
               onContentChange={() => {
+                promptRevision++
                 const value = input.plainText
+                if (!value && store.prompt.machineAppended) {
+                  setStore(
+                    "prompt",
+                    produce((draft) => {
+                      delete draft.machineAppended
+                    }),
+                  )
+                }
                 setStore("prompt", "input", value)
                 auto()?.onInput(value)
                 syncExtmarksWithPromptParts()

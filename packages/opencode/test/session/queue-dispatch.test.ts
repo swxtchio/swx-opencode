@@ -87,9 +87,13 @@ const writer = (sessions: Session.Interface) => (message: SessionV1.WithParts) =
     yield* Effect.forEach(message.parts, (part) => sessions.updatePart(part), { discard: true })
   })
 const metadata = (message: SessionV1.WithParts) =>
-  Schema.decodeUnknownSync(SessionPromptQueue.Group)(
-    message.parts.find((part) => part.type === "text")?.metadata?.sessionQueue,
-  )
+  message.parts
+    .flatMap((part) => {
+      if (part.type !== "text" || !part.metadata?.sessionQueue) return []
+      const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata.sessionQueue)
+      return Option.isSome(group) ? [group.value] : []
+    })
+    .toSorted((a, b) => b.constituents.length - a.constituents.length)[0]!
 const text = (message: SessionV1.WithParts) =>
   message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")
 
@@ -111,6 +115,7 @@ it.instance(
           queue.admit({
             sessionID: session.id,
             delivery: "queue",
+            ...(n === 1 ? { origin: "tui-composer" as const } : {}),
             parts: [{ type: "text", text: peer(n, n === 2 ? "info" : "request") }],
           }),
       )
@@ -142,6 +147,205 @@ it.instance(
       yield* promote()
       expect(metadata((yield* MessageV2.stream(session.id))[0]).kind).toBe("watcher.check")
     }),
+)
+
+it.instance("queued TUI composer prompts form one ordered message and retain receipts around an injection", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const firstText = "A\nA keeps its newline"
+    const lastText = "composer batch B text"
+    const first = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "composer-a",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: firstText }],
+    })
+    const injectedText = check("between", "stalled")
+    const injected = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "injected-between",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: injectedText }],
+    })
+    const second = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "composer-b",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: lastText }],
+    })
+    const promote = () =>
+      queue.promote({
+        sessionID: session.id,
+        delivery: "queue",
+        prepare,
+        write: writer(sessions),
+        rejected: () => Effect.void,
+      })
+
+    yield* promote()
+    const combined = (yield* MessageV2.stream(session.id))[0]
+    const group = metadata(combined)
+    expect(text(combined)).toBe(`${firstText}\n${lastText}`)
+    expect(group.kind).toBe("human")
+    expect(group.constituents.map((item) => item.id)).toEqual([first.id, second.id])
+    expect(group.constituents.map((item) => item.input.parts[0])).toEqual([
+      { type: "text", text: firstText },
+      { type: "text", text: lastText },
+    ])
+    expect(yield* queue.list(session.id)).toEqual([injected])
+    for (const requestID of ["composer-a", "composer-b"]) {
+      const receipt = yield* queue.receipt(session.id, requestID)
+      expect(Option.isSome(receipt) ? receipt.value : undefined).toEqual({
+        state: "delivered",
+        messageID: combined.info.id,
+      })
+    }
+
+    yield* promote()
+    const injectedMessage = (yield* MessageV2.stream(session.id)).find((message) =>
+      text(message).includes(injectedText),
+    )
+    expect(injectedMessage).toBeDefined()
+    expect(metadata(injectedMessage!).kind).toBe("watcher.check")
+    expect(text(injectedMessage!)).toContain(injectedText)
+    expect(text(injectedMessage!)).not.toContain(firstText)
+    expect(text(injectedMessage!)).not.toContain(lastText)
+    const injectedReceipt = yield* queue.receipt(session.id, "injected-between")
+    expect(Option.isSome(injectedReceipt) ? injectedReceipt.value : undefined).toEqual({
+      state: "delivered",
+      messageID: injectedMessage!.info.id,
+    })
+  }),
+)
+
+it.instance("a single queued TUI composer prompt keeps its own text and delivery", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    yield* queue.admit({
+      sessionID: session.id,
+      requestID: "composer-alone",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: "one queued prompt" }],
+    })
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "queue",
+      prepare,
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+    const message = (yield* MessageV2.stream(session.id))[0]
+    expect(text(message)).toBe("one queued prompt")
+    expect(metadata(message).kind).toBe("individual")
+    expect(yield* queue.list(session.id)).toEqual([])
+  }),
+)
+
+it.instance("duplicate and command-shaped human sends survive admission and consolidation for one batch", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const admit = (requestID: string, text: string) =>
+      queue.admit({
+        sessionID: session.id,
+        requestID,
+        delivery: "queue",
+        origin: "tui-composer",
+        parts: [{ type: "text", text }],
+      })
+    const originals = yield* Effect.forEach(
+      [
+        ["composer-a-1", "A"],
+        ["composer-a-2", "A"],
+        ["composer-command-1", "build API"],
+        ["composer-command-2", "build API"],
+      ] as const,
+      ([requestID, text]) => admit(requestID, text),
+    )
+    expect(yield* queue.list(session.id)).toHaveLength(4)
+
+    yield* queue.consolidate(session.id)
+    expect(yield* queue.list(session.id)).toHaveLength(4)
+
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "queue",
+      prepare,
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+    const message = (yield* MessageV2.stream(session.id))[0]
+    const group = metadata(message)
+    expect(text(message)).toBe("A\nA\nbuild API\nbuild API")
+    expect(group.kind).toBe("human")
+    expect(group.constituents.map((item) => item.id)).toEqual(originals.map((item) => item.id))
+    for (const requestID of ["composer-a-1", "composer-a-2", "composer-command-1", "composer-command-2"]) {
+      const receipt = yield* queue.receipt(session.id, requestID)
+      expect(Option.isSome(receipt) ? receipt.value : undefined).toEqual({
+        state: "delivered",
+        messageID: message.info.id,
+      })
+    }
+  }),
+)
+
+it.instance("human batching preserves synthetic context and typed-part provenance", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    yield* queue.admit({
+      sessionID: session.id,
+      requestID: "composer-context-a",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [
+        { type: "text", text: "Selected editor context", synthetic: true },
+        { type: "text", text: "A", metadata: { source: "typed-part-a" } },
+      ],
+    })
+    yield* queue.admit({
+      sessionID: session.id,
+      requestID: "composer-context-b",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: "B\ncontinued B", metadata: { source: "typed-part-b" } }],
+    })
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "queue",
+      prepare,
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+
+    const message = (yield* MessageV2.stream(session.id))[0]
+    const group = metadata(message)
+    const visibleText = message.parts.filter(
+      (part): part is Extract<SessionV1.Part, { type: "text" }> =>
+        part.type === "text" && !part.synthetic && !part.ignored,
+    )
+    expect(visibleText.map((part) => part.text).join("")).toBe("A\nB\ncontinued B")
+    expect(
+      message.parts.some((part) => part.type === "text" && part.text === "Selected editor context" && part.synthetic),
+    ).toBe(true)
+    expect(group.kind).toBe("human")
+    expect(group.constituents[0]!.input.parts).toMatchObject([
+      { type: "text", text: "Selected editor context", synthetic: true },
+      { type: "text", text: "A", metadata: { source: "typed-part-a" } },
+    ])
+    expect(visibleText[0]?.metadata).toMatchObject({ source: "typed-part-a", sessionQueue: { kind: "human" } })
+    expect(visibleText.find((part) => part.text.startsWith("B"))?.metadata).toMatchObject({ source: "typed-part-b" })
+  }),
 )
 
 it.instance(
@@ -980,6 +1184,11 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
                       sessionID: session.id,
                       delivery: "queue",
                       messageID: MessageID.make("msg_checkpoint_individual"),
+                      model: {
+                        providerID: ProviderV2.ID.make("test"),
+                        modelID: ModelV2.ID.make("individual-model"),
+                      },
+                      variant: "high",
                       parts: [{ type: "text", text: "Synthetic individual original with stable transport identity" }],
                     },
                   ]
@@ -1003,11 +1212,16 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
             : []
           yield* Effect.forEach(retryCalls, (input) => queue.admit(input))
           const pending = yield* queue.list(session.id)
+          const preparedInputs: SessionQueue.PromotedInput[] = []
           yield* queue.promote({
             sessionID: session.id,
             delivery: "queue",
             peersOnly: name === "peerContinuation",
-            prepare,
+            prepare: (input) =>
+              Effect.gen(function* () {
+                if (name === "individual") preparedInputs.push(input)
+                return yield* prepare(input)
+              }),
             write: writer(sessions),
             rejected: () => Effect.void,
           })
@@ -1052,7 +1266,7 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
               .filter((part) => part.ignored)
               .every((part) => part.synthetic && part.messageID === returned.info.id),
           ).toBe(true)
-          expect(witnesses.filter((part) => !part.ignored)).toHaveLength(name === "individual" ? 0 : 1)
+          expect(witnesses.filter((part) => !part.ignored)).toHaveLength(1)
           expect(witnesses.filter((part) => part.ignored)).toHaveLength(
             name === "individual" ? 1 : name === "heartbeat" ? 2 : peerScenario ? 4 : 3,
           )
@@ -1080,6 +1294,15 @@ it.instance("emits grouped consumer checkpoint through admission promotion and m
           if (name === "individual") {
             expect(group.kind).toBe("individual")
             expect(text(returned)).toBe(inputs[0].parts[0].type === "text" ? inputs[0].parts[0].text : "")
+            expect(preparedInputs).toHaveLength(1)
+            expect(preparedInputs[0]?.group).toBeUndefined()
+            expect(preparedInputs[0]?.model).toEqual({
+              providerID: ProviderV2.ID.make("test"),
+              modelID: ModelV2.ID.make("individual-model"),
+            })
+            expect(preparedInputs[0]?.variant).toBe("high")
+            expect(group.constituents[0]?.input.model).toEqual(preparedInputs[0]?.model)
+            expect(group.constituents[0]?.input.variant).toBe("high")
           }
           expect(modelInput).toHaveLength(1)
           expect(modelInput[0].role).toBe("user")

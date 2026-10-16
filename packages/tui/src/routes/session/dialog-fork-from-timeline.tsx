@@ -7,7 +7,7 @@ import { useSDK } from "../../context/sdk"
 import { useRoute } from "../../context/route"
 import { useDialog, type DialogContext } from "../../ui/dialog"
 import type { PromptInfo } from "../../component/prompt/history"
-import { stripPromptPartIDs as strip } from "../../prompt/part"
+import { preserveMachineAppended, stripPromptPartIDs as strip } from "../../prompt/part"
 
 export function DialogForkFromTimeline(props: { sessionID: string; onMove: (messageID?: string) => void }) {
   const sync = useSync()
@@ -63,7 +63,7 @@ export function DialogForkFromTimeline(props: { sessionID: string; onMove: (mess
           route.navigate({
             sessionID: forked.data!.id,
             type: "session",
-            prompt,
+            prompt: preserveMachineAppended(parts, prompt),
           })
           dialog.clear()
         },

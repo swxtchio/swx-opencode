@@ -1,10 +1,21 @@
-import type { SessionPromptQueueItem } from "@opencode-ai/sdk/v2"
+import type { Part, SessionPromptQueueItem } from "@opencode-ai/sdk/v2"
+import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { displaySlice, promptOffsetWidth } from "./display"
 import type { PromptInfo } from "./history"
 
 export function stripPromptPartIDs<Part extends { id: string; messageID: string; sessionID: string }>(part: Part) {
   const { id: _id, messageID: _messageID, sessionID: _sessionID, ...rest } = part
   return rest
+}
+
+export function hasMachineAppendedPart(parts: readonly Part[]) {
+  return parts.some(
+    (part) => part.type === "text" && part.metadata?.[SessionPromptQueue.TuiPromptAppendMetadataKey] === true,
+  )
+}
+
+export function preserveMachineAppended(parts: readonly Part[], prompt: PromptInfo): PromptInfo {
+  return hasMachineAppendedPart(parts) ? { ...prompt, machineAppended: true } : prompt
 }
 
 export function expandPastedTextPlaceholders(text: string, parts: readonly unknown[]) {
@@ -48,6 +59,11 @@ export function recalledPrompt(item: SessionPromptQueueItem): PromptInfo {
   const typed = item.input.parts
     .flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : []))
     .join("\n")
+  const machineAppended =
+    item.input.origin !== "tui-composer" ||
+    item.input.parts.some(
+      (part) => part.type === "text" && part.metadata?.[SessionPromptQueue.TuiPromptAppendMetadataKey] === true,
+    )
   return item.input.parts.reduce<PromptInfo>(
     (prompt, part) => {
       if (part.type !== "file" && part.type !== "agent") return prompt
@@ -67,7 +83,11 @@ export function recalledPrompt(item: SessionPromptQueueItem): PromptInfo {
         : { type: "file" as const, path: part.filename ?? "", text: at }
       return { input, parts: [...prompt.parts, { ...withoutID(part), source }] }
     },
-    { input: typed, parts: [] },
+    {
+      input: typed,
+      parts: [],
+      ...(machineAppended ? { machineAppended: true } : {}),
+    },
   )
 }
 

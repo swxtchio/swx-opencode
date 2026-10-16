@@ -141,6 +141,7 @@ export function DialogQueue(props: { sessionID: string }) {
         title: Locale.truncate(lines[0]!.trim(), 60),
         value: item.id,
         description: [item.delivery, ...freshness(item, now())].join(" · "),
+        details: lines.slice(1),
         footer: lines.length > 1 ? `+${lines.length - 1} lines` : undefined,
       }
     }),

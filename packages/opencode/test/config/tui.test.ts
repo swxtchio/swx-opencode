@@ -141,6 +141,22 @@ it.instance("loads tui config with the same precedence order as server config pa
   ),
 )
 
+it.instance("loads the prompt enhancement model from the dedicated tui config", () =>
+  withCleanState(
+    Effect.gen(function* () {
+      const fs = yield* FSUtil.Service
+      const test = yield* TestInstance
+      expect((yield* getTuiConfig(test.directory)).prompt_enhance_model).toBe("google/gemini-4-argon")
+      yield* fs.writeJson(path.join(test.directory, "tui.json"), {
+        prompt_enhance_model: "test/rewrite-model",
+      })
+
+      const config = yield* getTuiConfig(test.directory)
+      expect(config.prompt_enhance_model).toBe("test/rewrite-model")
+    }),
+  ),
+)
+
 it.instance("resolves attention config defaults and overrides", () =>
   withCleanState(
     Effect.gen(function* () {

@@ -37,9 +37,9 @@ OpenCode has a list of keybinds that you can customize through `tui.json`.
     "session_move": "none",
     "session_new": "<leader>n",
     "session_list": "<leader>l",
-    "session_timeline": "<leader>g",
+    "session_timeline": "ctrl+r",
     "session_fork": "none",
-    "session_rename": "ctrl+r",
+    "session_rename": "none",
     "session_delete": "ctrl+d",
     "session_share": "none",
     "session_unshare": "none",
@@ -88,6 +88,7 @@ OpenCode has a list of keybinds that you can customize through `tui.json`.
     "display_thinking": "none",
 
     "prompt_submit": "none",
+    "prompt_enhance": "ctrl+e",
     "prompt_editor_context_clear": "none",
     "prompt_skills": "none",
     "prompt_stash": "none",
@@ -111,7 +112,7 @@ OpenCode has a list of keybinds that you can customize through `tui.json`.
     "input_select_up": "shift+up",
     "input_select_down": "shift+down",
     "input_line_home": "ctrl+a",
-    "input_line_end": "ctrl+e",
+    "input_line_end": "none",
     "input_select_line_home": "ctrl+shift+a",
     "input_select_line_end": "ctrl+shift+e",
     "input_visual_line_home": "alt+a",
@@ -177,6 +178,8 @@ OpenCode has a list of keybinds that you can customize through `tui.json`.
   }
 }
 ```
+
+By default, Ctrl+r opens the message timeline and session rename remains available from the command menu. Ctrl+e rewrites the current draft and leaves it editable in the composer until you submit it.
 
 :::note
 On Windows, the defaults for `input_undo` and `terminal_suspend` are different:

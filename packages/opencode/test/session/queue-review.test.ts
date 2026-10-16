@@ -159,10 +159,22 @@ const stale = (
     )
   })
 
-const request = (sessionID: SessionID, delivery: SessionQueue.Delivery, requestID: string, value: string) =>
+const request = (
+  sessionID: SessionID,
+  delivery: SessionQueue.Delivery,
+  requestID: string,
+  value: string,
+  origin?: "tui-composer",
+) =>
   Effect.gen(function* () {
     const queue = yield* SessionQueue.Service
-    return yield* queue.request({ sessionID, delivery, requestID, parts: [{ type: "text", text: value }] })
+    return yield* queue.request({
+      sessionID,
+      delivery,
+      requestID,
+      ...(origin ? { origin } : {}),
+      parts: [{ type: "text", text: value }],
+    })
   })
 
 const jobClassControls = [
@@ -1978,7 +1990,7 @@ it.instance(
         ["r3", status("re:p1760000000-3-cccc done")],
         ["s2", status("status: tests running")],
       ] as const
-      for (const [requestID, value] of notices) yield* request(session.id, "queue", requestID, value)
+      for (const [requestID, value] of notices) yield* request(session.id, "queue", requestID, value, "tui-composer")
       expect((yield* queue.list(session.id)).map(text)).toEqual([
         status("re:p1760000000-1-aaaa done"),
         status("re:p1760000000-2-bbbb done"),

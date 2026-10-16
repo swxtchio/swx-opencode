@@ -756,6 +756,7 @@ export type SessionPromptQueueInput = {
     modelID: string
   }
   agent?: string
+  origin?: "tui-composer"
   tools?: {
     [key: string]: boolean
   }
@@ -2441,6 +2442,16 @@ export type Path = {
   config: string
   worktree: string
   directory: string
+}
+
+export type PromptEnhanceModelNotFoundError = {
+  model: string
+  message: string
+}
+
+export type PromptEnhanceProviderError = {
+  model: string
+  message: string
 }
 
 export type VcsInfo = {
@@ -8340,6 +8351,46 @@ export type PathGetResponses = {
 
 export type PathGetResponse = PathGetResponses[keyof PathGetResponses]
 
+export type InstancePromptEnhanceData = {
+  body?: {
+    model: string
+    draft: string
+    context: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/prompt/enhance"
+}
+
+export type InstancePromptEnhanceErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * PromptEnhanceModelNotFoundError
+   */
+  404: PromptEnhanceModelNotFoundError
+  /**
+   * PromptEnhanceProviderError
+   */
+  502: PromptEnhanceProviderError
+}
+
+export type InstancePromptEnhanceError = InstancePromptEnhanceErrors[keyof InstancePromptEnhanceErrors]
+
+export type InstancePromptEnhanceResponses = {
+  /**
+   * Enhanced prompt draft
+   */
+  200: string
+}
+
+export type InstancePromptEnhanceResponse = InstancePromptEnhanceResponses[keyof InstancePromptEnhanceResponses]
+
 export type VcsGetData = {
   body?: never
   path?: never
@@ -10008,6 +10059,7 @@ export type SessionPromptData = {
       modelID: string
     }
     agent?: string
+    origin?: "tui-composer"
     noReply?: boolean
     tools?: {
       [key: string]: boolean
@@ -10361,6 +10413,7 @@ export type SessionPromptAsyncData = {
       modelID: string
     }
     agent?: string
+    origin?: "tui-composer"
     noReply?: boolean
     tools?: {
       [key: string]: boolean
