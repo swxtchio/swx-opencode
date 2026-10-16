@@ -12,6 +12,7 @@ import { Location } from "../location"
 import { Ripgrep } from "../ripgrep"
 import { RelativePath } from "../schema"
 import { Flag } from "../flag/flag"
+import { WatcherConfig } from "./watcher-config"
 
 declare const FFF_BUN_EXTERNAL_LIBRARY: string
 
@@ -131,6 +132,9 @@ export const fffLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const location = yield* Location.Service
+    const config = yield* WatcherConfig.Service
+    // Config.latest only sees Core file entries; OpenCode supplies its merged watcher settings here.
+    const watcher = yield* config.get()
     const result = yield* Effect.try({
       try: () =>
         Fff.create({
@@ -138,6 +142,7 @@ export const fffLayer = Layer.effect(
           aiMode: true,
           disableMmapCache: true,
           disableContentIndexing: true,
+          disableWatch: watcher?.fff === false,
         }),
       catch: (cause) => cause,
     }).pipe(
@@ -241,16 +246,22 @@ export const fffLayer = Layer.effect(
 )
 
 const layer = Layer.unwrap(
-  Effect.sync(() => {
-    if (Flag.OPENCODE_DISABLE_FFF) return ripgrepLayer
-    if (Fff.available()) return fffLayer
-    if (typeof FFF_BUN_EXTERNAL_LIBRARY === "string") {
-      throw new Error(packagedFffUnavailableMessage(FFF_BUN_EXTERNAL_LIBRARY))
-    }
-    return ripgrepLayer
-  }),
+  Effect.sync(
+    (): Layer.Layer<Service, never, FSUtil.Service | Location.Service | Ripgrep.Service | WatcherConfig.Service> => {
+      if (Flag.OPENCODE_DISABLE_FFF) return ripgrepLayer
+      if (Fff.available()) return fffLayer
+      if (typeof FFF_BUN_EXTERNAL_LIBRARY === "string") {
+        throw new Error(packagedFffUnavailableMessage(FFF_BUN_EXTERNAL_LIBRARY))
+      }
+      return ripgrepLayer
+    },
+  ),
 )
 
 export const locationLayer = layer
 
-export const node = makeLocationNode({ service: Service, layer, deps: [FSUtil.node, Location.node, Ripgrep.node] })
+export const node = makeLocationNode({
+  service: Service,
+  layer,
+  deps: [FSUtil.node, Location.node, Ripgrep.node, WatcherConfig.node],
+})

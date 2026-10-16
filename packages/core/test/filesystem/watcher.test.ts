@@ -5,14 +5,13 @@ import type { FSWatcher } from "fs"
 import fs from "fs/promises"
 import path from "path"
 import { ConfigProvider, Deferred, Duration, Effect, Exit, Layer, Option, Schema, Scope } from "effect"
-import { Config } from "@opencode-ai/core/config"
-import { ConfigWatcher } from "@opencode-ai/core/config/watcher"
 import { makeLocationNode } from "@opencode-ai/core/effect/app-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
+import { WatcherConfig } from "@opencode-ai/core/filesystem/watcher-config"
 import { Git } from "@opencode-ai/core/git"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -41,21 +40,9 @@ function provide(directory: string, vcs?: Location.Interface["vcs"], options?: O
 }
 
 function watcherLayer(directory: string, vcs?: Location.Interface["vcs"], options?: Options) {
-  const configLayer = Layer.succeed(
-    Config.Service,
-    Config.Service.of({
-      entries: () =>
-        Effect.succeed(
-          options?.ignore
-            ? [
-                new Config.Document({
-                  type: "document",
-                  info: new Config.Info({ watcher: new ConfigWatcher.Info({ ignore: options.ignore }) }),
-                }),
-              ]
-            : [],
-        ),
-    }),
+  const watcherConfigLayer = Layer.succeed(
+    WatcherConfig.Service,
+    WatcherConfig.Service.of({ get: () => Effect.succeed({ ignore: options?.ignore }) }),
   )
   const flagsLayer = ConfigProvider.layer(
     ConfigProvider.fromUnknown({
@@ -77,13 +64,13 @@ function watcherLayer(directory: string, vcs?: Location.Interface["vcs"], option
           onHeadWatcher: options?.onHeadWatcher,
           onHeadReadError: options?.onHeadReadError,
         }),
-        deps: [FSUtil.node, Location.node, Config.node, Git.node, EventV2.node],
+        deps: [FSUtil.node, Location.node, WatcherConfig.node, Git.node, EventV2.node],
       })
     : Watcher.node
   return AppNodeBuilder.build(
     watcherNode,
     [
-      [Config.node, configLayer],
+      [WatcherConfig.node, watcherConfigLayer],
       [Location.node, locationLayer],
       ...(options?.events ? [[EventV2.node, Layer.succeed(EventV2.Service, options.events)] as const] : []),
     ],
