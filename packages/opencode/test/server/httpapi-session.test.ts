@@ -3591,13 +3591,14 @@ describe("session HttpApi queue freshness", () => {
             if (part.type === "text") expect(part.text).not.toContain("[Queued prompt")
           }),
         )
-        const peerMessage = stored.find((message) =>
-          message.parts.some((part) => part.type === "text" && !part.ignored && part.metadata?.sessionQueue),
-        )!
-        const aggregate = peerMessage.parts.find(
-          (part) => part.type === "text" && !part.ignored && part.metadata?.sessionQueue,
-        )!
-        if (aggregate.type !== "text") throw new Error("Expected the actual peer aggregate")
+        const isPeerAggregate = (part: SessionV1.Part) =>
+          part.type === "text" &&
+          !part.ignored &&
+          !!part.metadata?.sessionQueue &&
+          Schema.decodeUnknownSync(SessionPromptQueue.Group)(part.metadata.sessionQueue).kind === "peer"
+        const peerMessage = stored.find((message) => message.parts.some(isPeerAggregate))!
+        const aggregate = peerMessage.parts.find(isPeerAggregate)
+        if (aggregate?.type !== "text") throw new Error("Expected the actual peer aggregate")
         const group = Schema.decodeUnknownSync(SessionPromptQueue.Group)(aggregate.metadata?.sessionQueue)
         expect(group.kind).toBe("peer")
         expect(group.constituents.map((item) => item.input.parts)).toEqual([

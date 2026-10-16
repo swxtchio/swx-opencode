@@ -17,6 +17,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceStore } from "@/project/instance-store"
 import { InstanceBootstrap } from "@/project/bootstrap"
 import { Session } from "@/session/session"
+import { SessionPrompt } from "@/session/prompt"
 import { SessionQueue } from "@/session/queue"
 import { MessageV2 } from "@/session/message-v2"
 import { MessageID, PartID } from "@/session/schema"
@@ -28,6 +29,7 @@ const queueLayer = (filename: string) =>
   AppNodeBuilder.build(
     LayerNode.group([
       Session.node,
+      SessionPrompt.node,
       SessionQueue.node,
       EventV2.node,
       EventV2Bridge.node,
@@ -51,16 +53,19 @@ export async function queueTimelineFixture(
   appendedInput: SessionPromptQueue.Input,
 ) {
   const filename = path.join(process.cwd(), `.queue-timeline-${randomUUID()}.db`)
+  const machineMarkers = { hold: [{ type: "prefix" as const, value: "CUSTOM-HOLD:" }] }
   try {
     return await Effect.runPromise(
       Effect.gen(function* () {
         const queue = yield* SessionQueue.Service
+        const prompt = yield* SessionPrompt.Service
         const sessions = yield* Session.Service
         const session = yield* sessions.create({})
         const promote = () =>
           queue.promote({
             sessionID: session.id,
             delivery: "queue",
+            markers: machineMarkers,
             prepare: (input) =>
               Effect.sync(() => ({
                 info: {
@@ -118,6 +123,7 @@ export async function queueTimelineFixture(
         yield* queue.admit({
           sessionID: session.id,
           delivery: "queue",
+          origin: "tui-composer",
           parts: [{ type: "text", text: "CUSTOM-HOLD: configured-injected-history-token" }],
         })
         for (let attempt = 0; attempt < 6; attempt++)
@@ -152,11 +158,26 @@ export async function queueTimelineFixture(
               return message
             }),
         })
+        yield* prompt.prompt({
+          sessionID: session.id,
+          agent: "build",
+          model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("model") },
+          origin: "tui-composer",
+          noReply: true,
+          parts: [{ type: "text", text: "direct-composer-history-token" }],
+        })
+        yield* prompt.prompt({
+          sessionID: session.id,
+          agent: "build",
+          model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("model") },
+          noReply: true,
+          parts: [{ type: "text", text: "CUSTOM-HOLD: configured-direct-injection-token" }],
+        })
         yield* queue.admit({ ...appendedInput, sessionID: session.id, delivery: "queue" })
         yield* promote()
         return { sessionID: session.id, messages: yield* MessageV2.stream(session.id) }
       }).pipe(
-        withTmpdirInstance({ git: true, config: { formatter: false, lsp: false } }),
+        withTmpdirInstance({ git: true, config: { formatter: false, lsp: false, machine_message_markers: machineMarkers } }),
         Effect.scoped,
         Effect.provide(queueLayer(filename)),
       ),

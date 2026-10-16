@@ -31,6 +31,8 @@ export const RequestID = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9._:-]{
 export type RequestID = typeof RequestID.Type
 
 export const TuiPromptAppendMetadataKey = "tuiPromptAppend"
+// Direct TUI prompts lack queue constituents, so persist their transport origin on the text part.
+export const TuiComposerOriginMetadataKey = "tuiComposerOrigin"
 
 // The V1 prompt payload. SessionPrompt.PromptInput is this plus the sessionID.
 export const Input = Schema.Struct({

@@ -457,6 +457,13 @@ async function openMessageActions(app: Awaited<ReturnType<typeof startSession>>,
   await until(async () => (await screen(app)).some((line) => line.includes("Message Actions")), "message actions")
 }
 
+async function clickVisible(app: Awaited<ReturnType<typeof startSession>>, text: string) {
+  const lines = await screen(app)
+  const y = lines.findIndex((line) => line.includes(text))
+  if (y === -1) throw new Error(`text is not visible: ${text}`)
+  await app.renderer.mockMouse.click(lines[y]!.indexOf(text), y)
+}
+
 const composerLines = (lines: string[], text: string) =>
   lines.filter((line) => !line.includes("QUEUED") && line.includes(text))
 
@@ -522,11 +529,14 @@ test("timeline search uses queue-produced human provenance and excludes injected
   })
   const titles = candidates.map((candidate) => candidate.title)
   expect(titles).toContain("typed-history-token")
-  expect(titles).toContain("legacy-app-history-token")
-  expect(titles).toContain("pre-upgrade-history-token")
+  expect(titles).toContain("direct-composer-history-token")
+  expect(titles).not.toContain("legacy-app-history-token")
+  expect(titles).not.toContain("pre-upgrade-history-token")
   expect(titles).not.toContain("injected-history-token")
   expect(titles).not.toContain("injected-critical-history-token")
   expect(titles).not.toContain("configured-injected-history-token")
+  expect(titles).not.toContain("configured-direct-injection-token")
+  expect(titles.some((title) => title.includes("configured-injected-history-token"))).toBe(false)
   expect(titles.some((title) => title.includes("Complete peer 31"))).toBe(false)
   expect(titles).not.toContain("firstmate appended history token")
   const app = await startSession({
@@ -564,10 +574,26 @@ test("timeline search uses queue-produced human provenance and excludes injected
     await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the reopened timeline")
     await Bun.sleep(10)
     await app.renderer.mockInput.typeText("pre-upgrade-history-token")
+    await until(async () => (await screen(app)).some((line) => line.includes("No results found")), "unknown history exclusion")
+    app.renderer.mockInput.pressEnter()
+    expect((await screen(app)).some((line) => line.includes("Message Actions"))).toBe(false)
+    app.renderer.mockInput.pressEscape()
+    app.renderer.mockInput.pressKey("r", { ctrl: true })
+    await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the reopened timeline")
+    await Bun.sleep(10)
+    await app.renderer.mockInput.typeText("legacy-app-history-token")
+    await until(async () => (await screen(app)).some((line) => line.includes("No results found")), "originless queue exclusion")
+    app.renderer.mockInput.pressEnter()
+    expect((await screen(app)).some((line) => line.includes("Message Actions"))).toBe(false)
+    app.renderer.mockInput.pressEscape()
+    app.renderer.mockInput.pressKey("r", { ctrl: true })
+    await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the reopened timeline")
+    await Bun.sleep(10)
+    await app.renderer.mockInput.typeText("direct-composer-history-token")
     app.renderer.mockInput.pressEnter()
     await until(
       async () => (await screen(app)).some((line) => line.includes("Message Actions")),
-      "pre-upgrade message actions",
+      "direct composer message actions",
     )
     app.renderer.mockInput.pressEscape()
     app.renderer.mockInput.pressKey("r", { ctrl: true })
@@ -584,7 +610,7 @@ test("timeline search uses queue-produced human provenance and excludes injected
   }
 }, 30_000)
 
-test("timeline can jump to a queue-produced legacy prompt without origin", async () => {
+test("timeline fails closed for a queue-produced prompt without composer origin", async () => {
   const fixture = await queueTimelineFixture(
     await submitComposerPrompt("typed-history-token"),
     await submitComposerPrompt("firstmate appended history token", true),
@@ -599,11 +625,9 @@ test("timeline can jump to a queue-produced legacy prompt without origin", async
     await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the timeline dialog")
     await Bun.sleep(10)
     app.renderer.mockInput.typeText("legacy-app-history-token")
+    await until(async () => (await screen(app)).some((line) => line.includes("No results found")), "originless prompt exclusion")
     app.renderer.mockInput.pressEnter()
-    await until(
-      async () => (await screen(app)).some((line) => line.includes("Message Actions")),
-      "the legacy message actions",
-    )
+    expect((await screen(app)).some((line) => line.includes("Message Actions"))).toBe(false)
   } finally {
     await app.stop()
   }
@@ -892,6 +916,122 @@ test("ctrl+e context follows the session's expanded thinking and tool visibility
     await until(() => app.enhancements.length === 2, "the second enhancement request")
     expect(app.enhancements[1]!.context).toContain("expanded reasoning visible in the session")
     expect(app.enhancements[1]!.context).not.toContain("visible tool output")
+    expect(app.prompts).toHaveLength(0)
+  } finally {
+    await app.stop()
+  }
+}, 20_000)
+
+test("ctrl+e context follows each reasoning and tool part's rendered expansion", async () => {
+  const assistantID = "msg_part_projection"
+  const shellOutput = Array.from({ length: 12 }, (_, index) =>
+    index === 11 ? `shell line ${index + 1} shell-tail-visible-token` : `shell line ${index + 1}`,
+  ).join("\n")
+  const genericOutput = Array.from({ length: 5 }, (_, index) =>
+    index === 4 ? `generic line ${index + 1} generic-tail-visible-token` : `generic line ${index + 1}`,
+  ).join("\n")
+  const messages = [
+    transcript,
+    {
+      info: {
+        id: assistantID,
+        sessionID,
+        role: "assistant",
+        parentID: transcript.info.id,
+        mode: "primary",
+        agent: "build",
+        modelID: "model",
+        providerID: "test",
+        path: { cwd: directory, root: directory },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        time: { created: 2, completed: 3 },
+      },
+      parts: [
+        {
+          id: "prt_local_reasoning",
+          sessionID,
+          messageID: assistantID,
+          type: "reasoning",
+          text: "**Local thought**\n\nexpanded reasoning visible in the session",
+          time: { start: 2, end: 3 },
+        },
+        {
+          id: "prt_shell_projection",
+          sessionID,
+          messageID: assistantID,
+          type: "tool",
+          callID: "call_shell_projection",
+          tool: "bash",
+          state: {
+            status: "completed",
+            input: { command: "printf shell-output" },
+            output: "state output is not rendered by Shell",
+            title: "Print output",
+            metadata: { output: shellOutput },
+            time: { start: 2, end: 3 },
+          },
+        },
+        {
+          id: "prt_generic_projection",
+          sessionID,
+          messageID: assistantID,
+          type: "tool",
+          callID: "call_generic_projection",
+          tool: "custom_tool",
+          state: {
+            status: "completed",
+            input: { query: "generic tool title" },
+            output: genericOutput,
+            title: "Custom tool",
+            metadata: {},
+            time: { start: 2, end: 3 },
+          },
+        },
+      ],
+    },
+  ]
+  const app = await startSession({ queue: [], messages })
+  try {
+    await until(async () => (await screen(app)).some((line) => line.includes("shell line 1")), "rendered shell output")
+    await app.renderer.mockInput.typeText("rewrite from the visible parts")
+    app.renderer.mockInput.pressKey("e", { ctrl: true })
+    await until(() => app.enhancements.length === 1, "collapsed part context")
+    expect(app.enhancements[0]!.context).toContain("shell line 1")
+    expect(app.enhancements[0]!.context).not.toContain("shell-tail-visible-token")
+    expect(app.enhancements[0]!.context).not.toContain("state output is not rendered by Shell")
+    expect(app.enhancements[0]!.context).not.toContain("expanded reasoning visible in the session")
+    expect(app.enhancements[0]!.context).not.toContain("generic line 1")
+    expect(app.enhancements[0]!.context).not.toContain("generic-tail-visible-token")
+
+    await clickVisible(app, "Thought: Local thought")
+    await clickVisible(app, "Click to expand")
+    await until(
+      async () => {
+        const frame = (await screen(app)).join("\n")
+        return frame.includes("expanded reasoning visible in the session") && frame.includes("shell-tail-visible-token")
+      },
+      "expanded reasoning and shell output",
+    )
+    app.dispatch("prompt.enhance")
+    await until(() => app.enhancements.length === 2, "expanded part context")
+    expect(app.enhancements[1]!.context).toContain("expanded reasoning visible in the session")
+    expect(app.enhancements[1]!.context).toContain("shell-tail-visible-token")
+    expect(app.enhancements[1]!.context).not.toContain("state output is not rendered by Shell")
+    expect(app.enhancements[1]!.context).not.toContain("generic-tail-visible-token")
+
+    app.dispatch("session.toggle.generic_tool_output")
+    await until(async () => (await screen(app)).some((line) => line.includes("generic line 1")), "generic tool output")
+    expect((await screen(app)).join("\n")).not.toContain("generic-tail-visible-token")
+    app.dispatch("prompt.enhance")
+    await until(() => app.enhancements.length === 3, "collapsed generic part context")
+    expect(app.enhancements[2]!.context).toContain("generic line 1")
+    expect(app.enhancements[2]!.context).not.toContain("generic-tail-visible-token")
+    await clickVisible(app, "Click to expand")
+    await until(async () => (await screen(app)).some((line) => line.includes("generic-tail-visible-token")), "expanded generic output")
+    app.dispatch("prompt.enhance")
+    await until(() => app.enhancements.length === 4, "expanded generic part context")
+    expect(app.enhancements[3]!.context).toContain("generic-tail-visible-token")
     expect(app.prompts).toHaveLength(0)
   } finally {
     await app.stop()

@@ -1133,7 +1133,21 @@ const layer = Layer.effect(
           ]
         }
 
-        return [{ ...part, messageID: info.id, sessionID: input.sessionID }]
+        return [
+          {
+            ...part,
+            ...(part.type === "text" && input.origin === "tui-composer"
+              ? {
+                  metadata: {
+                    ...part.metadata,
+                    [SessionPromptQueue.TuiComposerOriginMetadataKey]: true,
+                  },
+                }
+              : {}),
+            messageID: info.id,
+            sessionID: input.sessionID,
+          },
+        ]
       })
 
       const resolvedParts = yield* Effect.forEach(input.parts, resolvePart, { concurrency: "unbounded" }).pipe(

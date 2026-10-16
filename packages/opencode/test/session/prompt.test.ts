@@ -5048,6 +5048,27 @@ it.instance("prompt enhancement reports provider failures", () =>
   }),
 )
 
+it.instance("direct TUI composer prompts persist their transport origin on text parts", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const message = yield* prompt.prompt({
+      sessionID: session.id,
+      origin: "tui-composer",
+      noReply: true,
+      parts: [{ type: "text", text: "direct composer prompt" }],
+    })
+
+    expect(
+      message.parts.some(
+        (part) =>
+          part.type === "text" && part.metadata?.[SessionPromptQueue.TuiComposerOriginMetadataKey] === true,
+      ),
+    ).toBe(true)
+  }),
+)
+
 it.instance("busy TUI composer prompts are answered once as one ordered user message", () =>
   Effect.gen(function* () {
     const held = yield* startHeld()
@@ -10813,7 +10834,7 @@ it.instance(
             ? [Schema.decodeUnknownSync(SessionPromptQueue.Group)(part.metadata.sessionQueue)]
             : [],
         ),
-      )
+      ).filter((group) => group.kind === "peer")
       expect(groups.map((group) => group.constituents.map((item) => item.id))).toEqual([
         originals.slice(0, 10).map((item) => item.id),
         [originals[10].id],

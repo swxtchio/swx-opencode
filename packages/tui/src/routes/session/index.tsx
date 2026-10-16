@@ -223,6 +223,7 @@ export const SessionContext = createContext<{
   showTimestamps: () => boolean
   showDetails: () => boolean
   showGenericToolOutput: () => boolean
+  presentPart: (partID: string, text?: string) => void
   diffWrapMode: () => "word" | "none"
   providers: () => ReadonlyMap<string, Provider>
   sync: ReturnType<typeof useSync>
@@ -270,6 +271,11 @@ export function Session() {
       .filter((x) => x.parentID === parentID || x.id === parentID)
       .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   })
+  const presentedParts = new Map<string, string>()
+  const presentPart = (partID: string, text?: string) => {
+    if (text) presentedParts.set(partID, text)
+    else presentedParts.delete(partID)
+  }
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
   const messagesBeforeRevert = () => {
     const messageID = session()?.revert?.messageID
@@ -285,6 +291,7 @@ export function Session() {
       assistantMetadata: showAssistantMetadata(),
       providers: sync.data.provider,
     },
+    presentation: new Map(presentedParts),
   })
   const foregroundTasks = createMemo(() =>
     sync.data.capabilities.experimentalBackgroundSubagents ? activeForegroundTasks(sync, messages()) : [],
@@ -1294,6 +1301,7 @@ export function Session() {
           showTimestamps,
           showDetails,
           showGenericToolOutput,
+          presentPart,
           diffWrapMode,
           providers,
           sync,
@@ -1755,6 +1763,22 @@ export function ReasoningPartView(props: { last: boolean; part: ReasoningPart; m
   const summary = createMemo(() => reasoningSummary(content()))
   const syntax = createSyntaxStyleMemo(() => generateSubtleSyntax(theme))
 
+  createEffect(() => {
+    if (!content()) return ctx.presentPart(props.part.id)
+    const stateValue = state()
+    const title = summary().title
+    const header = stateValue.unresolved
+      ? "Thinking status unknown"
+      : stateValue.done
+        ? `Thought${title ? `: ${title}` : ""}`
+        : title
+          ? `Thinking: ${title}`
+          : "Thinking"
+    const body = !inMinimal() || expanded() ? summary().body : ""
+    ctx.presentPart(props.part.id, [header, body].filter(Boolean).join("\n"))
+  })
+  onCleanup(() => ctx.presentPart(props.part.id))
+
   const toggle = () => {
     if (!inMinimal()) return
     setExpanded((prev) => !prev)
@@ -1946,6 +1970,7 @@ export function ToolPartView(props: { last: boolean; part: ToolPart; message: As
     get part() {
       return props.part
     },
+    present: (text?: string) => ctx.presentPart(props.part.id, text),
   }
 
   return (
@@ -2008,7 +2033,14 @@ type ToolProps = {
   tool: string
   output?: string
   part: ToolPart
+  present: (text?: string) => void
 }
+
+function presentToolPart(props: ToolProps, content: () => string) {
+  createEffect(() => props.present(content()))
+  onCleanup(() => props.present())
+}
+
 function GenericTool(props: ToolProps) {
   const { theme } = useTheme()
   const ctx = use()
@@ -2020,6 +2052,11 @@ function GenericTool(props: ToolProps) {
   const limited = createMemo(() => {
     if (expanded() || !collapsed().overflow) return output()
     return collapsed().output
+  })
+  presentToolPart(props, () => {
+    const title = `# ${props.tool} ${input(props.input)}`.trim()
+    if (!props.output || !ctx.showGenericToolOutput()) return title
+    return `${title}\n${limited()}`
   })
 
   return (
@@ -2353,6 +2390,11 @@ function Shell(props: ToolProps) {
     if (!wd) return
     return `# Running in ${wd}`
   })
+  presentToolPart(props, () => {
+    const command = stringValue(props.input.command)
+    if (stringValue(props.metadata.output) === undefined) return command ?? "Shell"
+    return [title(), command ? `$ ${command}` : "", output() ? limited() : ""].filter(Boolean).join("\n")
+  })
 
   return (
     <Switch>
@@ -2390,6 +2432,10 @@ function Write(props: ToolProps) {
   const code = createMemo(() => {
     return stringValue(props.input.content) ?? ""
   })
+  presentToolPart(props, () => {
+    const filepath = pathFormatter.format(stringValue(props.input.filePath))
+    return props.metadata.diagnostics !== undefined ? `Wrote ${filepath}\n${code()}` : `Write ${filepath}`
+  })
 
   return (
     <Switch>
@@ -2418,6 +2464,13 @@ function Write(props: ToolProps) {
 
 function Glob(props: ToolProps) {
   const pathFormatter = usePathFormatter()
+  presentToolPart(props, () => {
+    const path = stringValue(props.input.path)
+    const count = numberValue(props.metadata.count)
+    return `Glob "${stringValue(props.input.pattern)}"${path ? ` in ${pathFormatter.format(path)}` : ""}${
+      count ? ` (${count} ${count === 1 ? "match" : "matches"})` : ""
+    }`
+  })
   return (
     <InlineTool icon="✱" pending="Finding files…" complete={stringValue(props.input.pattern)} part={props.part}>
       Glob "{stringValue(props.input.pattern)}"{" "}
@@ -2439,6 +2492,13 @@ function Read(props: ToolProps) {
     const value = props.metadata.loaded
     if (!value || !Array.isArray(value)) return []
     return value.filter((p): p is string => typeof p === "string")
+  })
+  presentToolPart(props, () => {
+    const filepath = pathFormatter.format(stringValue(props.input.filePath))
+    const details = input(props.input, ["filePath"])
+    return [`Read ${filepath} ${details}`.trim(), ...loaded().map((filepath) => `Loaded ${pathFormatter.format(filepath)}`)]
+      .filter(Boolean)
+      .join("\n")
   })
   return (
     <>
@@ -2466,6 +2526,13 @@ function Read(props: ToolProps) {
 
 function Grep(props: ToolProps) {
   const pathFormatter = usePathFormatter()
+  presentToolPart(props, () => {
+    const path = stringValue(props.input.path)
+    const matches = numberValue(props.metadata.matches)
+    return `Grep "${stringValue(props.input.pattern)}"${path ? ` in ${pathFormatter.format(path)}` : ""}${
+      matches ? ` (${matches} ${matches === 1 ? "match" : "matches"})` : ""
+    }`
+  })
   return (
     <InlineTool icon="✱" pending="Searching content…" complete={stringValue(props.input.pattern)} part={props.part}>
       Grep "{stringValue(props.input.pattern)}"{" "}
@@ -2478,6 +2545,7 @@ function Grep(props: ToolProps) {
 }
 
 function WebFetch(props: ToolProps) {
+  presentToolPart(props, () => `WebFetch ${stringValue(props.input.url)}`)
   return (
     <InlineTool icon="%" pending="Fetching from the web…" complete={stringValue(props.input.url)} part={props.part}>
       WebFetch {stringValue(props.input.url)}
@@ -2486,6 +2554,11 @@ function WebFetch(props: ToolProps) {
 }
 
 function WebSearch(props: ToolProps) {
+  presentToolPart(props, () => {
+    const query = stringValue(props.input.query)
+    const count = numberValue(props.metadata.numResults)
+    return `${webSearchProviderLabel(props.metadata.provider)} "${query}"${count ? ` (${count} results)` : ""}`
+  })
   return (
     <InlineTool icon="◈" pending="Searching web…" complete={stringValue(props.input.query)} part={props.part}>
       {webSearchProviderLabel(props.metadata.provider)} "{stringValue(props.input.query)}"{" "}
@@ -2572,6 +2645,7 @@ function Task(props: ToolProps) {
 
     return content.join("\n")
   })
+  presentToolPart(props, () => content())
 
   return (
     <InlineTool
@@ -2643,6 +2717,7 @@ function Execute(props: ToolProps) {
     }
     return lines.join("\n")
   })
+  presentToolPart(props, () => `${content()}${showOutput() ? `\n${outputPreview()}` : ""}`)
 
   return (
     <>
@@ -2687,6 +2762,10 @@ function Edit(props: ToolProps) {
   const ft = createMemo(() => filetype(stringValue(props.input.filePath)))
 
   const diffContent = createMemo(() => stringValue(props.metadata.diff) ?? "")
+  presentToolPart(props, () => {
+    const filepath = pathFormatter.format(stringValue(props.input.filePath))
+    return props.metadata.diff !== undefined ? `Edit ${filepath}\n${diffContent()}` : `Edit ${filepath}`
+  })
 
   return (
     <Switch>
@@ -2771,6 +2850,16 @@ function ApplyPatch(props: ToolProps) {
     return "← Patched " + file.relativePath
   }
 
+  presentToolPart(props, () =>
+    files()
+      .map((file) =>
+        file.type === "delete"
+          ? `${title(file)}\n-${file.deletions} line${file.deletions !== 1 ? "s" : ""}`
+          : `${title(file)}\n${file.patch}`,
+      )
+      .join("\n"),
+  )
+
   return (
     <Switch>
       <Match when={files().length > 0}>
@@ -2803,6 +2892,11 @@ function ApplyPatch(props: ToolProps) {
 
 function TodoWrite(props: ToolProps) {
   const todos = createMemo(() => parseTodos(props.input.todos))
+  presentToolPart(props, () =>
+    parseTodos(props.metadata.todos).length
+      ? todos().map((todo) => `${todo.status} ${todo.content}`).join("\n")
+      : "Updating todos…",
+  )
   return (
     <Switch>
       <Match when={parseTodos(props.metadata.todos).length}>
@@ -2832,6 +2926,14 @@ function Question(props: ToolProps) {
     return answer.join(", ")
   }
 
+  presentToolPart(props, () =>
+    answers()
+      ? questions()
+          .map((question, index) => `${question.question}\n${format(answers()?.[index])}`)
+          .join("\n")
+      : `Asked ${count()} question${count() !== 1 ? "s" : ""}`,
+  )
+
   return (
     <Switch>
       <Match when={answers()}>
@@ -2858,6 +2960,7 @@ function Question(props: ToolProps) {
 }
 
 function Skill(props: ToolProps) {
+  presentToolPart(props, () => `Skill "${stringValue(props.input.name)}"`)
   return (
     <InlineTool icon="→" pending="Loading skill…" complete={stringValue(props.input.name)} part={props.part}>
       Skill "{stringValue(props.input.name)}"
