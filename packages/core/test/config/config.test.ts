@@ -115,6 +115,32 @@ describe("Config", () => {
     }),
   )
 
+  it.live("loads the FFF watcher setting from v1 configuration", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.promise(() =>
+          fs.writeFile(
+            path.join(tmp.path, "opencode.json"),
+            JSON.stringify({ snapshot: false, watcher: { fff: false } }),
+          ),
+        ).pipe(
+          Effect.flatMap(() =>
+            Effect.gen(function* () {
+              const config = yield* Config.Service
+              const document = (yield* config.entries()).findLast(
+                (entry): entry is Config.Document => entry.type === "document",
+              )
+              expect(document?.info.watcher?.fff).toBe(false)
+            }).pipe(Effect.provide(testLayer(tmp.path))),
+          ),
+        ),
+      ),
+    ),
+  )
+
   it.effect("migrates v1 command configuration", () =>
     Effect.sync(() => {
       expect(
@@ -305,7 +331,7 @@ describe("Config", () => {
                   },
                 },
                 snapshots: false,
-                watcher: { ignore: ["node_modules/**", "dist/**", ".git"] },
+                watcher: { ignore: ["node_modules/**", "dist/**", ".git"], fff: false },
                 formatter: {
                   prettier: { disabled: true },
                   custom: { command: ["custom-fmt", "$FILE"], extensions: [".foo"] },
@@ -388,7 +414,7 @@ describe("Config", () => {
             expect(reviewer?.disabled).toBe(false)
             expect(reviewer?.permissions).toEqual([{ action: "edit", resource: "*", effect: "deny" }])
             expect(documents[0]?.info.snapshots).toBe(false)
-            expect(documents[0]?.info.watcher).toEqual({ ignore: ["node_modules/**", "dist/**", ".git"] })
+            expect(documents[0]?.info.watcher).toEqual({ ignore: ["node_modules/**", "dist/**", ".git"], fff: false })
             expect(documents[0]?.info.formatter).toEqual({
               prettier: { disabled: true },
               custom: { command: ["custom-fmt", "$FILE"], extensions: [".foo"] },

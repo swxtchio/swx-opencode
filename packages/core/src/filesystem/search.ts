@@ -7,6 +7,7 @@ import { Fff } from "#fff"
 import fuzzysort from "fuzzysort"
 import { Entry, Match } from "@opencode-ai/schema/filesystem"
 import type { FileSystem } from "../filesystem"
+import { Config } from "../config"
 import { FSUtil } from "../fs-util"
 import { Location } from "../location"
 import { Ripgrep } from "../ripgrep"
@@ -131,6 +132,8 @@ export const fffLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const location = yield* Location.Service
+    const config = yield* Config.Service
+    const entries = yield* config.entries()
     const result = yield* Effect.try({
       try: () =>
         Fff.create({
@@ -138,6 +141,12 @@ export const fffLayer = Layer.effect(
           aiMode: true,
           disableMmapCache: true,
           disableContentIndexing: true,
+          disableWatch:
+            entries
+              .flatMap((entry) =>
+                entry.type === "document" && entry.info.watcher?.fff !== undefined ? [entry.info.watcher.fff] : [],
+              )
+              .at(-1) === false,
         }),
       catch: (cause) => cause,
     }).pipe(
@@ -241,7 +250,7 @@ export const fffLayer = Layer.effect(
 )
 
 const layer = Layer.unwrap(
-  Effect.sync(() => {
+  Effect.sync((): Layer.Layer<Service, never, FSUtil.Service | Location.Service | Ripgrep.Service | Config.Service> => {
     if (Flag.OPENCODE_DISABLE_FFF) return ripgrepLayer
     if (Fff.available()) return fffLayer
     if (typeof FFF_BUN_EXTERNAL_LIBRARY === "string") {
@@ -253,4 +262,8 @@ const layer = Layer.unwrap(
 
 export const locationLayer = layer
 
-export const node = makeLocationNode({ service: Service, layer, deps: [FSUtil.node, Location.node, Ripgrep.node] })
+export const node = makeLocationNode({
+  service: Service,
+  layer,
+  deps: [FSUtil.node, Location.node, Ripgrep.node, Config.node],
+})
