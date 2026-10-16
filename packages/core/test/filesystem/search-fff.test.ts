@@ -51,6 +51,37 @@ describe("FileSystemSearch.fffLayer", () => {
       ),
     15_000,
   )
+
+  it.live(
+    "honors a Core WatcherConfig fff false value and keeps native search useful",
+    () =>
+      withTmp((directory) =>
+        Effect.promise(async () => {
+          await fs.mkdir(path.join(directory, "src", "nested"), { recursive: true })
+          await fs.writeFile(path.join(directory, "src", "nested", "needle-target.ts"), "picker-content\n")
+          await fs.writeFile(path.join(directory, "opencode.json"), JSON.stringify({ watcher: { fff: false } }))
+        }).pipe(
+          Effect.andThen(
+            Effect.scoped(
+              Effect.gen(function* () {
+                const search = yield* FileSystemSearch.Service
+                const target = RelativePath.make("src/nested/needle-target.ts")
+                const files = yield* waitForFile(search, target)
+                const directories = yield* search.find({ type: "directory", query: "nested", limit: 10 })
+                const glob = yield* search.glob({ pattern: "src/nested/*.ts", limit: 10 })
+                const matches = yield* search.grep({ pattern: "picker-content", limit: 10 })
+                expect(files.map((item) => item.path)).toContain(target)
+                expect(directories.some((item) => item.path.includes("nested"))).toBe(true)
+                expect(glob.map((item) => item.path)).toContain(target)
+                expect(matches.some((item) => item.text.includes("picker-content"))).toBe(true)
+                if (process.platform === "linux") expect(yield* noNativeWatcherAfterScan()).toBe(false)
+              }).pipe(Effect.provide(searchLayer(directory))),
+            ),
+          ),
+        ),
+      ),
+    15_000,
+  )
 })
 
 function searchLayer(directory: string) {
@@ -87,5 +118,25 @@ function waitForFile(
     if (Date.now() - started > 10_000) throw new Error(`FFF did not index ${relativePath}`)
     yield* Effect.sleep("100 millis")
     return yield* waitForFile(search, relativePath, started)
+  })
+}
+
+function noNativeWatcherAfterScan() {
+  if (process.platform !== "linux") return Effect.succeed(undefined)
+  return Effect.gen(function* () {
+    const deadline = Date.now() + 5_000
+    let absentSince: number | undefined
+    while (Date.now() < deadline) {
+      const tasks = yield* Effect.promise(() => fs.readdir("/proc/self/task"))
+      const names = yield* Effect.promise(() =>
+        Promise.all(tasks.map((task) => fs.readFile(`/proc/self/task/${task}/comm`, "utf8").catch(() => ""))),
+      )
+      if (names.some((name) => name.trim().startsWith("notify-rs")))
+        return yield* Effect.fail(new Error("Core watcher.fff=false started the native FFF watcher"))
+      absentSince ??= Date.now()
+      if (Date.now() - absentSince >= 500) return false
+      yield* Effect.sleep("20 millis")
+    }
+    return yield* Effect.fail(new Error("Core FFF watcher absence was not stable after search indexing"))
   })
 }

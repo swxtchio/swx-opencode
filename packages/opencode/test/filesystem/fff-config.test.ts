@@ -6,23 +6,20 @@ import { tmpdir } from "../fixture/fixture"
 
 const fixture = path.join(import.meta.dir, "../fixture/fff-effective-search.ts")
 
-test("an omitted watcher.fff keeps the default native watcher enabled", async () => {
-  const result = await run({ global: {} })
-  expect(result.watcherConfig?.fff).toBeUndefined()
-  expectSearch(result)
-  if (process.platform === "linux") expect(result.nativeWatcher).toBe(true)
-})
-
-test("OPENCODE_CONFIG_CONTENT disables the FFF watcher while keeping native search useful", async () => {
-  const result = await run({
+test("production location-map control distinguishes enabled and no-watch FFF startup", async () => {
+  const enabled = await run({ global: {}, watcher: true })
+  const disabled = await run({
     global: { watcher: { fff: true, ignore: ["global-ignore"] } },
     content: { watcher: { fff: false, ignore: ["content-ignore"] } },
+    watcher: false,
   })
-  expect(result.watcherConfig?.fff).toBe(false)
-  expect(result.watcherConfig?.ignore).toContain("content-ignore")
-  expect(result.watcherStatus).toEqual([])
-  expectSearch(result)
-  if (process.platform === "linux") expect(result.nativeWatcher).toBe(false)
+  expectSearch(enabled)
+  expectSearch(disabled)
+  expect(disabled.watcherStatus).toEqual([])
+  if (process.platform === "linux") {
+    expect(enabled.nativeWatcher).toBe(true)
+    expect(disabled.nativeWatcher).toBe(false)
+  }
 })
 
 test("OPENCODE_CONFIG_CONTENT watcher.ignore reaches the active file watcher", async () => {
@@ -30,10 +27,11 @@ test("OPENCODE_CONFIG_CONTENT watcher.ignore reaches the active file watcher", a
     global: { watcher: { fff: true, ignore: ["global-ignore"] } },
     content: { watcher: { fff: true, ignore: [".git"] } },
     git: true,
+    watcher: true,
   })
   expect(result.watcherStatus).toEqual([])
-  expect(result.watcherConfig?.ignore).toContain(".git")
   expectSearch(result)
+  if (process.platform === "linux") expect(result.nativeWatcher).toBe(true)
 })
 
 test("OPENCODE_DISABLE_PROJECT_CONFIG excludes project watcher overrides", async () => {
@@ -43,13 +41,8 @@ test("OPENCODE_DISABLE_PROJECT_CONFIG excludes project watcher overrides", async
     projectOpenCode: { watcher: { fff: true, ignore: [".git", "project-opencode-ignore"] } },
     disableProjectConfig: true,
     git: true,
+    watcher: false,
   })
-  expect(result.watcherConfig?.fff).toBe(false)
-  expect(result.watcherConfig?.ignore).toContain("global-ignore")
-  expect(result.watcherConfig?.ignore).not.toContain("project-ignore")
-  expect(result.watcherConfig?.ignore).not.toContain("project-opencode-ignore")
-  expect(result.watcherConfig?.ignore).not.toContain(".git")
-  expect(result.watcherStatus.some((item) => item.watch === "git")).toBe(true)
   expect(result.watcherStatus.some((item) => item.watch === "git")).toBe(true)
   expectSearch(result)
   if (process.platform === "linux") expect(result.nativeWatcher).toBe(false)
@@ -59,8 +52,8 @@ test("a higher-priority watcher.fff true override re-enables the native watcher"
   const result = await run({
     global: { watcher: { fff: false } },
     content: { watcher: { fff: true } },
+    watcher: true,
   })
-  expect(result.watcherConfig?.fff).toBe(true)
   expectSearch(result)
   if (process.platform === "linux") expect(result.nativeWatcher).toBe(true)
 })
@@ -72,6 +65,7 @@ async function run(input: {
   projectOpenCode?: object
   disableProjectConfig?: boolean
   git?: boolean
+  watcher: boolean
 }) {
   const tmp = await tmpdir()
   try {
@@ -80,8 +74,20 @@ async function run(input: {
     await fs.mkdir(path.join(root, ".opencode"), { recursive: true })
     await fs.mkdir(global, { recursive: true })
     await fs.mkdir(path.join(root, "src", "nested"), { recursive: true })
+    const environment = {
+      home: path.join(tmp.path, "home"),
+      config: path.join(tmp.path, "xdg-config"),
+      data: path.join(tmp.path, "xdg-data"),
+      cache: path.join(tmp.path, "xdg-cache"),
+      state: path.join(tmp.path, "xdg-state"),
+      managed: path.join(tmp.path, "managed"),
+    }
+    await Promise.all(Object.values(environment).map((directory) => fs.mkdir(directory, { recursive: true })))
     if (input.git) await $`git init`.cwd(root).quiet()
+    await fs.mkdir(path.join(root, "src"), { recursive: true })
+    await fs.writeFile(path.join(root, "src", "a-first.ts"), "first-marker\n")
     await fs.writeFile(path.join(root, "src", "nested", "needle-target.ts"), "picker-content\n")
+    await fs.writeFile(path.join(root, "z-last.ts"), "last-marker\n")
     await fs.writeFile(path.join(global, "opencode.json"), JSON.stringify(input.global))
     if (input.project) await fs.writeFile(path.join(root, "opencode.json"), JSON.stringify(input.project))
     if (input.projectOpenCode)
@@ -93,10 +99,17 @@ async function run(input: {
     delete env.OPENCODE_CONFIG_CONTENT
     delete env.OPENCODE_DISABLE_PROJECT_CONFIG
     delete env.OPENCODE_DISABLE_FFF
+    env.HOME = environment.home
+    env.OPENCODE_TEST_HOME = environment.home
+    env.OPENCODE_TEST_MANAGED_CONFIG_DIR = environment.managed
+    env.XDG_CONFIG_HOME = environment.config
+    env.XDG_DATA_HOME = environment.data
+    env.XDG_CACHE_HOME = environment.cache
+    env.XDG_STATE_HOME = environment.state
     if (input.content) env.OPENCODE_CONFIG_CONTENT = JSON.stringify(input.content)
     if (input.disableProjectConfig) env.OPENCODE_DISABLE_PROJECT_CONFIG = "true"
 
-    const child = Bun.spawn([process.execPath, fixture, root, global, input.git ? "git" : ""], {
+    const child = Bun.spawn([process.execPath, fixture, root, global, input.watcher ? "watch" : "no-watch"], {
       env,
       stdout: "pipe",
       stderr: "pipe",
@@ -121,7 +134,6 @@ async function run(input: {
       directories: string[]
       glob: string[]
       matches: string[]
-      watcherConfig?: { fff?: boolean; ignore?: string[] }
       watcherStatus: { watch: string }[]
       nativeWatcher?: boolean
     }

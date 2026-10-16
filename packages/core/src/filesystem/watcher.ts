@@ -93,7 +93,8 @@ export const layerWith = (
           return runFork(Effect.logWarning("watcher not confirmed, continuing without it until it confirms", fields))
       }
 
-      const config = (yield* (yield* WatcherConfig.Service).get())?.ignore ?? []
+      const watcherConfig = yield* WatcherConfig.Service
+      const config = (yield* watcherConfig.get())?.ignore ?? []
 
       if (location.vcs?.type === "git") {
         const resolved = (yield* git.repo.discover(location.directory))?.gitDirectory

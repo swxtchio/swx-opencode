@@ -1,5 +1,6 @@
 import { buildLocationServiceMap, LocationServiceMap } from "@opencode-ai/core/location-services"
 import { WatcherConfig } from "@opencode-ai/core/filesystem/watcher-config"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { makeLocationNode } from "@opencode-ai/core/effect/app-node"
 import { Location } from "@opencode-ai/core/location"
 import { Config } from "@/config/config"
@@ -9,7 +10,7 @@ import { Effect, Layer } from "effect"
 
 export { LocationServiceMap }
 
-export const watcherConfigNode = makeLocationNode({
+const watcherConfigNode = makeLocationNode({
   service: WatcherConfig.Service,
   layer: Layer.effect(
     WatcherConfig.Service,
@@ -34,8 +35,8 @@ export const watcherConfigNode = makeLocationNode({
   deps: [Config.node, Location.node],
 })
 
-export function buildOpenCodeLocationServiceMap() {
-  return buildLocationServiceMap([[WatcherConfig.node, watcherConfigNode]])
+export function buildOpenCodeLocationServiceMap(replacements: LayerNode.Replacements = []) {
+  return buildLocationServiceMap([[WatcherConfig.node, watcherConfigNode], ...replacements])
 }
 
 export const locationServiceMapLayer = buildOpenCodeLocationServiceMap()
