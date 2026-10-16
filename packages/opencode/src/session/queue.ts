@@ -3799,6 +3799,39 @@ const targetComplements = new Set([
   "without",
 ])
 
+const targetFileExtensions = new Set([
+  "c",
+  "cc",
+  "cpp",
+  "css",
+  "go",
+  "h",
+  "hpp",
+  "html",
+  "java",
+  "js",
+  "jsx",
+  "json",
+  "kt",
+  "md",
+  "mdx",
+  "mjs",
+  "cjs",
+  "mts",
+  "cts",
+  "py",
+  "rs",
+  "sh",
+  "sql",
+  "swift",
+  "toml",
+  "ts",
+  "tsx",
+  "xml",
+  "yaml",
+  "yml",
+])
+
 function targetSubject(target: string) {
   const normalized = normalizeTarget(target)
   if (/[\\/]/.test(normalized)) return normalized
@@ -3811,7 +3844,7 @@ function targetSubject(target: string) {
 function targetText(target: string) {
   return normalizeTarget(target)
     .split(/([\\/\s]+)/)
-    .map((part) => part.replace(/^(.+)\.[a-z0-9]+$/i, "$1"))
+    .map((part) => (targetFileExtension(part) ? part.slice(0, part.lastIndexOf(".")) : part))
     .join("")
 }
 
@@ -3820,38 +3853,52 @@ function targetWords(target: string) {
 }
 
 function targetMatches(left: string, right: string) {
-  const leftIdentity = targetIdentity(left)
-  const rightIdentity = targetIdentity(right)
-  // Path-like targets compare by suffix; filename tokens don't use prose inflection rules.
-  if (leftIdentity.path && rightIdentity.path)
-    return pathSuffix(leftIdentity.path, rightIdentity.path) || pathSuffix(rightIdentity.path, leftIdentity.path)
-  if (leftIdentity.path || rightIdentity.path) return false
+  const leftPaths = targetPaths(left)
+  const rightPaths = targetPaths(right)
+  if (leftPaths.length > 0 || rightPaths.length > 0)
+    return leftPaths.some((leftPath) =>
+      rightPaths.some((rightPath) => pathSuffix(leftPath, rightPath) || pathSuffix(rightPath, leftPath)),
+    )
   const leftText = targetText(left)
   const rightText = targetText(right)
-  // A contained target includes its head, even when the longer target has a different one.
-  if (containsTarget(leftText, rightText) && rightIdentity.words.length > 0) return true
-  if (containsTarget(rightText, leftText) && leftIdentity.words.length > 0) return true
+  if (leftText === rightText) return true
+  const leftSubject = targetSubject(left)
+  const rightSubject = targetSubject(right)
+  const leftSubjectText = targetText(leftSubject)
+  const rightSubjectText = targetText(rightSubject)
+  const leftIdentity = targetIdentity(leftSubject)
+  const rightIdentity = targetIdentity(rightSubject)
+  if (containsTarget(leftSubjectText, rightSubjectText) && rightIdentity.nonGeneric.length > 0) return true
+  if (containsTarget(rightSubjectText, leftSubjectText) && leftIdentity.nonGeneric.length > 0) return true
   if (!leftIdentity.head || leftIdentity.head !== rightIdentity.head) return false
   if (leftIdentity.evidence.length === 0 || rightIdentity.evidence.length === 0) return false
-  return leftIdentity.evidence.some((word) => rightIdentity.evidence.includes(word))
+  return (
+    leftIdentity.evidence.every((word) => rightIdentity.evidence.includes(word)) ||
+    rightIdentity.evidence.every((word) => leftIdentity.evidence.includes(word))
+  )
+}
+
+function targetPaths(target: string) {
+  const tokens = normalizeTarget(target).match(/[a-z0-9_.-]+(?:[\\/][a-z0-9_.-]+)*/g) ?? []
+  return tokens
+    .filter((token) => /[\\/]/.test(token) || targetFileExtension(token))
+    .map((token) => token.split(/[\\/]/))
+}
+
+function targetFileExtension(target: string) {
+  const component = target.trim().split(/[\\/]/).at(-1)!
+  const dot = component.lastIndexOf(".")
+  return dot > 0 && targetFileExtensions.has(component.slice(dot + 1).toLowerCase())
 }
 
 function targetIdentity(target: string) {
-  const components = normalizeTarget(target).split(/[\\/]/)
-  const path = /[\\/.]/.test(target) ? targetPath(target) : undefined
-  const subject = path ? components[components.length - 1]! : targetSubject(target)
-  const words = targetWords(subject)
-  const tokens = path ? words : words.map(normalizeTargetWord)
+  const words = targetWords(target).map(normalizeTargetWord)
+  const nonGeneric = words.filter((word) => !genericTargetWords.has(word))
   return {
-    path,
-    words: tokens,
-    head: tokens.at(-1),
-    evidence: tokens.slice(0, -1).filter((word) => !genericTargetWords.has(word)),
+    head: words.at(-1),
+    evidence: words.slice(0, -1).filter((word) => !genericTargetWords.has(word)),
+    nonGeneric,
   }
-}
-
-function targetPath(target: string) {
-  return normalizeTarget(target).split(/[\\/]/)
 }
 
 function pathSuffix(longer: readonly string[], shorter: readonly string[]) {
@@ -3903,7 +3950,8 @@ function parseCommand(input: SessionPromptQueue.QueuedInput) {
   if (!rest) return undefined
   // Keep the whole subject phrase; punctuation, options, and a trailing file path separate later instructions.
   const separator = /:\s|:$|\.\s+|[!?]\s+|;\s+|\n|\s+(?=--\S)/.exec(rest)
-  const path = separator ? undefined : /(?:^|\s)(?:[^\s\\/]+[\\/])*[^\s\\/]+\.[a-z0-9]+(?=\s+\S)/i.exec(rest)
+  const pathCandidate = separator ? undefined : /(?:^|\s)(?:[^\s\\/]+[\\/])*[^\s\\/]+\.[a-z0-9]+(?=\s+\S)/i.exec(rest)
+  const path = pathCandidate && targetFileExtension(pathCandidate[0]) ? pathCandidate : undefined
   const pathEnd = path ? path.index + path[0].length : undefined
   const end = separator?.index ?? pathEnd ?? rest.length
   const commandTarget = rest.slice(0, end).trim()

@@ -175,37 +175,36 @@ const sharedFirstNounControls = [
   { title: "workspace queue", first: "rename the workspace queue", second: "rename the workspace projector" },
 ]
 
-const sharedModifierHeadTargets = [
+const differentModifierSameHeadTargets = [
   {
     title: "intermittent failures",
     first: "fix intermittent authentication failures",
     second: "fix intermittent billing failures",
-    merged:
-      "fix intermittent authentication failures:\n1. fix intermittent authentication failures\n2. fix intermittent billing failures",
   },
   {
     title: "profile pages",
     first: "update user profile page",
     second: "update admin profile page",
-    merged: "update user profile page:\n1. update user profile page\n2. update admin profile page",
   },
   {
     title: "redirect loops",
     first: "fix login redirect loop",
     second: "fix signup redirect loop",
-    merged: "fix login redirect loop:\n1. fix login redirect loop\n2. fix signup redirect loop",
   },
   {
     title: "connection pooling",
     first: "add postgres connection pooling",
     second: "add redis connection pooling",
-    merged: "add postgres connection pooling:\n1. add postgres connection pooling\n2. add redis connection pooling",
   },
   {
     title: "service clients",
     first: "refactor billing service client",
     second: "refactor auth service client",
-    merged: "refactor billing service client:\n1. refactor billing service client\n2. refactor auth service client",
+  },
+  {
+    title: "receipt routing",
+    first: "review authentication receipt routing: preserve origin IDs",
+    second: "review billing receipt routing: verify settlement",
   },
 ]
 
@@ -217,8 +216,8 @@ const literalFilenameTargets = [
   },
   {
     title: "route handler siblings",
-    first: "update packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts: preserve route identity",
-    second: "update packages/opencode/src/server/routes/instance/httpapi/handlers/sessions.ts: preserve route identity",
+    first: "update packages/opencode/src/server/routes/api/session.ts: preserve route identity",
+    second: "update packages/opencode/src/server/routes/api/sessions.ts: preserve route identity",
   },
   {
     title: "short file target",
@@ -232,11 +231,54 @@ const literalFilenameTargets = [
   },
 ]
 
-const containedCommandTargets = {
-  first: "fix authentication: inspect sign-in",
-  second: "fix authentication failures: add a retry",
-  merged: "fix authentication:\n1. inspect sign-in\n2. authentication failures: add a retry",
-}
+const containedCommandTargets = [
+  {
+    title: "parser",
+    first: "fix the parser",
+    second: "fix parser crash",
+    merged: "fix the parser:\n1. fix the parser\n2. fix parser crash",
+  },
+  {
+    title: "authentication redirect",
+    first: "fix authentication",
+    second: "fix authentication redirect",
+    merged: "fix authentication:\n1. fix authentication\n2. fix authentication redirect",
+  },
+  {
+    title: "login page",
+    first: "fix the login page",
+    second: "fix login",
+    merged: "fix the login page:\n1. fix the login page\n2. fix login",
+  },
+  {
+    title: "login page complement",
+    first: "fix the login page for mobile",
+    second: "fix login",
+    merged: "fix the login page for mobile:\n1. fix the login page for mobile\n2. fix login",
+  },
+  {
+    title: "dotted prose target",
+    first: "fix v1.2 authentication handler",
+    second: "fix authentication handler",
+    merged: "fix v1.2 authentication handler:\n1. fix v1.2 authentication handler\n2. fix authentication handler",
+  },
+]
+
+const prosePathReferences = [
+  {
+    title: "login file reference",
+    first: "fix login.ts",
+    second: "fix the login handler in login.ts",
+    merged: "fix login.ts:\n1. fix login.ts\n2. fix the login handler in login.ts",
+  },
+  {
+    title: "investigation file reference",
+    first: "investigate why the CI is slow in src/auth.ts",
+    second: "investigate login delays in auth.ts",
+    merged:
+      "investigate why the CI is slow in src/auth.ts:\n1. investigate why the CI is slow in src/auth.ts\n2. investigate login delays in auth.ts",
+  },
+]
 
 const inflectionTargets = [
   {
@@ -495,37 +537,8 @@ it.instance("request admission does not merge different work on a shared job-cla
 it.instance("consolidation keeps containment ahead of job-class head equality", () =>
   Effect.gen(function* () {
     for (const delivery of ["steer", "queue"] as const) {
-      const items = yield* consolidateAdmitted(`${delivery} contained target`, [
-        { delivery, text: containedCommandTargets.first },
-        { delivery, text: containedCommandTargets.second },
-      ])
-      expect(items.map(text)).toEqual([containedCommandTargets.merged])
-    }
-  }),
-)
-
-it.instance("request admission keeps containment ahead of job-class head equality", () =>
-  Effect.gen(function* () {
-    const sessions = yield* Session.Service
-    const queue = yield* SessionQueue.Service
-    for (const delivery of ["steer", "queue"] as const) {
-      const session = yield* sessions.create({ title: `${delivery} contained target` })
-      yield* request(session.id, delivery, "contained-a", containedCommandTargets.first)
-      yield* request(session.id, delivery, "contained-b", containedCommandTargets.second)
-      expect((yield* queue.list(session.id)).map(text)).toEqual([containedCommandTargets.merged])
-      expect(Option.getOrThrow(yield* queue.receipt(session.id, "contained-b"))).toMatchObject({
-        state: "merged",
-        into: "contained-a",
-      })
-    }
-  }),
-)
-
-it.instance("consolidation merges on a shared modifier and job-class head", () =>
-  Effect.gen(function* () {
-    for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of sharedModifierHeadTargets) {
-        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+      for (const pair of containedCommandTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} contained ${pair.title}`, [
           { delivery, text: pair.first },
           { delivery, text: pair.second },
         ])
@@ -535,19 +548,54 @@ it.instance("consolidation merges on a shared modifier and job-class head", () =
   }),
 )
 
-it.instance("request admission merges on a shared modifier and job-class head", () =>
+it.instance("request admission keeps containment ahead of job-class head equality", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
     for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of sharedModifierHeadTargets) {
-        const session = yield* sessions.create({ title: `${delivery} ${pair.title} merge` })
+      for (const pair of containedCommandTargets) {
+        const session = yield* sessions.create({ title: `${delivery} contained ${pair.title}` })
+        yield* request(session.id, delivery, "contained-a", pair.first)
+        yield* request(session.id, delivery, "contained-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.merged])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "contained-b"))).toMatchObject({
+          state: "merged",
+          into: "contained-a",
+        })
+      }
+    }
+  }),
+)
+
+it.instance("consolidation keeps different modifiers apart when the job-class head is shared", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of differentModifierSameHeadTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual([pair.first, pair.second])
+      }
+    }
+  }),
+)
+
+it.instance("request admission keeps different modifiers apart when the job-class head is shared", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of differentModifierSameHeadTargets) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title} control` })
         yield* request(session.id, delivery, "modifier-a", pair.first)
         yield* request(session.id, delivery, "modifier-b", pair.second)
-        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.merged])
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.first, pair.second])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "modifier-a"))).toMatchObject({
+          state: "pending",
+        })
         expect(Option.getOrThrow(yield* queue.receipt(session.id, "modifier-b"))).toMatchObject({
-          state: "merged",
-          into: "modifier-a",
+          state: "pending",
         })
       }
     }
@@ -739,6 +787,39 @@ it.instance("request admission keeps path-like filenames literal", () =>
   }),
 )
 
+it.instance("consolidation resolves file paths embedded in prose targets", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of prosePathReferences) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual([pair.merged])
+      }
+    }
+  }),
+)
+
+it.instance("request admission resolves file paths embedded in prose targets", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of prosePathReferences) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "path-reference-a", pair.first)
+        yield* request(session.id, delivery, "path-reference-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.merged])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "path-reference-b"))).toMatchObject({
+          state: "merged",
+          into: "path-reference-a",
+        })
+      }
+    }
+  }),
+)
+
 it.instance("command delivery retains the later target when similar paths consolidate", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
@@ -761,10 +842,10 @@ it.instance("command targets match on a distinctive token when neither contains 
   Effect.gen(function* () {
     const items = yield* consolidateAdmitted("distinctive target", [
       { delivery: "queue", text: "review authentication receipt routing: preserve origin IDs" },
-      { delivery: "queue", text: "review billing receipt routing: verify settlement" },
+      { delivery: "queue", text: "review receipt routing in authentication: verify settlement" },
     ])
     expect(items.map(text)).toEqual([
-      "review authentication receipt routing:\n1. preserve origin IDs\n2. billing receipt routing: verify settlement",
+      "review authentication receipt routing:\n1. preserve origin IDs\n2. receipt routing in authentication: verify settlement",
     ])
   }),
 )
@@ -879,7 +960,7 @@ it.instance("same-target command prefixes retain ordered steps through delivery"
   }),
 )
 
-it.instance("contained command targets merge in ordered steps through delivery", () =>
+it.instance("command text prefixes retain the longer instruction through delivery", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
@@ -889,11 +970,10 @@ it.instance("contained command targets merge in ordered steps through delivery",
 
     expect(yield* queue.list(session.id)).toHaveLength(2)
     const items = yield* queue.consolidate(session.id)
-    const merged = "run the suite:\n1. run the suite\n2. run the suite with coverage"
     const written: string[] = []
     yield* promoter(session.id, written)("queue")
-    expect(written).toEqual([merged])
-    expect(items.map(text)).toEqual([merged])
+    expect(written).toEqual(["run the suite with coverage"])
+    expect(items.map(text)).toEqual(["run the suite with coverage"])
   }),
 )
 
@@ -1002,7 +1082,7 @@ it.instance("similar commands stay in their delivery class", () =>
   }),
 )
 
-it.instance("receipt-bearing requests use the broadened command matcher", () =>
+it.instance("receipt-bearing requests keep different modifiers apart on a shared target", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
@@ -1011,7 +1091,23 @@ it.instance("receipt-bearing requests use the broadened command matcher", () =>
     yield* request(session.id, "queue", "auth-b", "review billing receipt routing: verify settlement")
     const items = yield* queue.list(session.id)
     expect(items.map(text)).toEqual([
-      "review authentication receipt routing:\n1. preserve origin IDs\n2. billing receipt routing: verify settlement",
+      "review authentication receipt routing: preserve origin IDs",
+      "review billing receipt routing: verify settlement",
+    ])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "auth-a"))).toMatchObject({ state: "pending" })
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "auth-b"))).toMatchObject({ state: "pending" })
+  }),
+)
+
+it.instance("receipt-bearing requests merge contained targets for the same job", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "receipt command containment" })
+    yield* request(session.id, "queue", "auth-a", "review authentication receipt routing: preserve origin IDs")
+    yield* request(session.id, "queue", "auth-b", "review receipt routing in authentication: verify settlement")
+    expect((yield* queue.list(session.id)).map(text)).toEqual([
+      "review authentication receipt routing:\n1. preserve origin IDs\n2. receipt routing in authentication: verify settlement",
     ])
     expect(Option.getOrThrow(yield* queue.receipt(session.id, "auth-b"))).toMatchObject({
       state: "merged",
