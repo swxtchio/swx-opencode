@@ -3803,6 +3803,8 @@ const targetComplements = new Set([
 
 const targetClauseConjunctions = new Set(["and", "but", "or"])
 const targetClauseOpeners = new Set(["how", "what", "when", "where", "whether", "which", "who", "why"])
+// These names end with a recognized file suffix but still describe natural-language targets.
+const targetRuntimeNames = new Set(["node.js", "next.js", "vue.js"])
 
 const targetFileSuffixes = new Set([
   "ts",
@@ -3850,6 +3852,14 @@ function targetSubject(target: string) {
     .replace(/\s+/g, " ")
     .replace(/[.,;:!?]+$/g, "")
     .replace(/^(?:(?:a|an|the)\s+)+/i, "")
+  const commaParts = subject.split(/,\s*/)
+  const commaBoundary = commaParts.findIndex((part, index) => {
+    if (index === 0) return false
+    const words = normalizeTarget(part).split(" ")
+    const opener = targetClauseConjunctions.has(words[0]!) ? words[1] : words[0]
+    return targetClauseOpeners.has(opener!)
+  })
+  if (commaBoundary > 0) return commaParts.slice(0, commaBoundary).join(", ").trim()
   const words = normalized.split(" ")
   const boundary = words.findIndex(
     (word, index) =>
@@ -3869,8 +3879,15 @@ function targetWords(target: string) {
     targetText(target)
       .match(/[a-z0-9_.-]+(?:[\\/][a-z0-9_.-]+)*/g)
       ?.flatMap((part) => {
-        const word = paths.has(part.replace(/\\/g, "/")) ? part.slice(0, part.lastIndexOf(".")) : part
-        return word.match(/[a-z0-9]+/g) ?? []
+        const path = part.replace(/\\/g, "/")
+        if (paths.has(path)) return part.slice(0, part.lastIndexOf(".")).match(/[a-z0-9]+/g) ?? []
+        if (targetRuntimeNames.has(part)) return [part.slice(0, part.indexOf("."))]
+        const dot = part.lastIndexOf(".")
+        if (dot > 0 && dot < part.length - 1) {
+          // Keep arbitrary dotted suffixes literal so inflection cannot equate different names.
+          return [...(part.slice(0, dot).match(/[a-z0-9]+/g) ?? []), `.${part.slice(dot + 1)}`]
+        }
+        return part.match(/[a-z0-9]+/g) ?? []
       }) ?? []
   )
 }
@@ -3910,16 +3927,12 @@ function targetMatches(left: string, right: string) {
 }
 
 function targetPaths(target: string) {
-  const tokens =
-    target
-      .trim()
-      .replace(/[.,;:!?]+$/g, "")
-      .match(/[a-z0-9_.-]+(?:[\\/][a-z0-9_.-]+)*/gi) ?? []
-  return tokens.filter(targetFileToken).map((token) => normalizeTarget(token).split(/[\\/]/))
+  const tokens = normalizeTarget(target).match(/[a-z0-9_.-]+(?:[\\/][a-z0-9_.-]+)*/g) ?? []
+  return tokens.filter(targetFileToken).map((token) => token.split(/[\\/]/))
 }
 
 function targetFileSuffix(target: string) {
-  const component = target.trim().split(/[\\/]/).at(-1)!
+  const component = normalizeTarget(target).split(/[\\/]/).at(-1)!
   const dot = component.lastIndexOf(".")
   if (dot <= 0 || dot === component.length - 1) return undefined
   const suffix = component.slice(dot + 1).toLowerCase()
@@ -3927,8 +3940,8 @@ function targetFileSuffix(target: string) {
 }
 
 function targetFileToken(target: string) {
-  const component = target.trim().split(/[\\/]/).at(-1)!
-  return Boolean(targetFileSuffix(target)) && (/[\\/]/.test(target) || !/[A-Z]/.test(component))
+  const normalized = normalizeTarget(target)
+  return !targetRuntimeNames.has(normalized) && Boolean(targetFileSuffix(normalized))
 }
 
 function directPathTarget(target: string, paths: readonly (readonly string[])[]) {
@@ -3961,8 +3974,11 @@ function containsTarget(longer: string, shorter: string) {
 }
 
 function normalizeTargetWord(word: string) {
-  if (word.length > 5 && word.endsWith("ion")) return word.slice(0, -3)
-  if (word.length > 5 && word.endsWith("ate")) return word.slice(0, -1)
+  if (word.startsWith(".")) return word
+  // Requiring a five-character root keeps short pairs such as port/portion and edit/edition distinct.
+  if (word.length > 7 && word.endsWith("ion")) return word.slice(0, -3)
+  if (word.length > 6 && word.endsWith("ing")) return word.slice(0, -3)
+  if (word.length > 5 && word.endsWith("ed")) return word.slice(0, -2)
   if (word.length > 4 && word.endsWith("ies")) return `${word.slice(0, -3)}y`
   if (/(?:ses|xes|zes|ches|shes)$/.test(word)) return word.slice(0, -2)
   if (word.length > 3 && word.endsWith("s") && !word.endsWith("ss") && !word.endsWith("us") && !word.endsWith("is"))

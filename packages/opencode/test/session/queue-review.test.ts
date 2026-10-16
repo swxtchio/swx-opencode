@@ -211,6 +211,21 @@ const differentModifierSameHeadTargets = [
     first: "investigate auth deployment and when it runs",
     second: "investigate billing deployment and why it runs",
   },
+  {
+    title: "lowercase node.js retains different subsystem subjects",
+    first: "fix node.js authentication handler",
+    second: "fix node.js billing handler",
+  },
+  {
+    title: "comma clauses retain conflicting subject modifiers",
+    first: "investigate auth deployment, how it works",
+    second: "investigate billing deployment, how it works",
+  },
+  {
+    title: "comma clauses retain conflicting subject nouns",
+    first: "investigate CI deployment, how it works",
+    second: "investigate CI rollback, how it works",
+  },
 ]
 
 const literalFilenameTargets = [
@@ -238,9 +253,10 @@ const literalFilenameTargets = [
 
 const suffixFilenameTargets = [
   {
-    title: "an unlisted suffix does not establish file identity",
+    title: "an unlisted dotted filename retains literal path containment",
     first: "update src/file.test: preserve the test identity",
     second: "update file.test: document the fixture",
+    merged: "update src/file.test:\n1. preserve the test identity\n2. file.test: document the fixture",
   },
   {
     title: "curated bare suffix matches a slash-qualified filename",
@@ -264,6 +280,11 @@ const suffixFilenameTargets = [
     first: "fix auth.proto: preserve the wire schema",
     second: "fix auth.protos: preserve generated documentation",
   },
+  {
+    title: "different unlisted dotted suffixes stay literal",
+    first: "fix auth.graphql: preserve the query schema",
+    second: "fix auth.graphqls: preserve the schema documentation",
+  },
 ]
 
 const bareDottedTargets = [
@@ -272,6 +293,18 @@ const bareDottedTargets = [
     first: "fix Node.js runtime checks: keep async test",
     second: "fix Node runtime checks: cover async test",
     merged: "fix Node.js runtime checks:\n1. keep async test\n2. Node runtime checks: cover async test",
+  },
+  {
+    title: "Next.js remains a natural target name",
+    first: "fix Next.js routing bug: preserve fallback",
+    second: "fix Next routing bug: add retry",
+    merged: "fix Next.js routing bug:\n1. preserve fallback\n2. Next routing bug: add retry",
+  },
+  {
+    title: "vue.js remains a natural target name",
+    first: "fix vue.js reactivity bug: preserve the proxy",
+    second: "fix vue reactivity bug: trace the observer",
+    merged: "fix vue.js reactivity bug:\n1. preserve the proxy\n2. vue reactivity bug: trace the observer",
   },
   {
     title: "v1.2 remains part of its natural target",
@@ -308,10 +341,30 @@ const bareDottedTargets = [
 ]
 
 const runtimeNameTarget = {
-  first: "upgrade Node.js runtime",
-  second: "upgrade Node runtime",
-  merged: "upgrade Node.js runtime:\n1. upgrade Node.js runtime\n2. upgrade Node runtime",
+  first: "upgrade node.js runtime",
+  second: "upgrade node runtime",
+  merged: "upgrade node.js runtime:\n1. upgrade node.js runtime\n2. upgrade node runtime",
 }
+
+const caseInsensitiveFilenameTargets = [
+  {
+    title: "no-colon uppercase filename retains its identity",
+    first: "update Auth.ts preserve the schema",
+    second: "update auth.ts verify the route",
+    merged: "update Auth.ts:\n1. preserve the schema\n2. verify the route",
+  },
+  {
+    title: "uppercase path suffix matches its lowercase basename",
+    first: "update src/Auth.ts: preserve origin IDs",
+    second: "update auth.ts: verify settlement",
+    merged: "update src/Auth.ts:\n1. preserve origin IDs\n2. auth.ts: verify settlement",
+  },
+  {
+    title: "uppercase extension keeps different files distinct",
+    first: "update Auth.TS: preserve the TypeScript module",
+    second: "update Auth.TSX: preserve the JSX module",
+  },
+]
 
 const packageNameTarget = {
   first: "upgrade socket.io",
@@ -403,21 +456,42 @@ const sameJobTailTargets = [
     merged:
       "review API caching and when it expires:\n1. review API caching and when it expires\n2. review API caching and why it refreshes",
   },
+  {
+    title: "comma-led dependent clauses leave the same deployment subject intact",
+    first: "investigate CI deployment, how it works",
+    second: "investigate CI deployment, how it proceeds",
+    merged:
+      "investigate CI deployment, how it works:\n1. investigate CI deployment, how it works\n2. investigate CI deployment, how it proceeds",
+  },
 ]
 
 const sameJobWordForms = [
   {
-    title: "websocket reconnection word formation",
-    first: "fix websocket reconnect",
+    title: "websocket reconnecting and reconnection share a root",
+    first: "fix websocket reconnecting",
     second: "fix websocket reconnection",
-    merged: "fix websocket reconnect:\n1. fix websocket reconnect\n2. fix websocket reconnection",
+    merged: "fix websocket reconnecting:\n1. fix websocket reconnecting\n2. fix websocket reconnection",
   },
   {
-    title: "a broader ion noun form matches its verb form",
-    first: "fix user activation",
-    second: "fix user activate",
-    merged: "fix user activation:\n1. fix user activation\n2. fix user activate",
+    title: "a past verb form and its base share a root",
+    first: "investigate network failed",
+    second: "investigate network fail",
+    merged: "investigate network failed:\n1. investigate network failed\n2. investigate network fail",
   },
+  {
+    title: "reconnecting and reconnection match with a trailing subject noun",
+    first: "fix websocket reconnecting handler",
+    second: "fix websocket reconnection handler",
+    merged:
+      "fix websocket reconnecting handler:\n1. fix websocket reconnecting handler\n2. fix websocket reconnection handler",
+  },
+]
+
+const boundedStemControls = [
+  { title: "port and portion", first: "fix auth port", second: "fix auth portion" },
+  { title: "edit and edition", first: "fix auth edit", second: "fix auth edition" },
+  { title: "region and reg", first: "fix auth region", second: "fix auth reg" },
+  { title: "activation and activate", first: "fix auth activation", second: "fix auth activate" },
 ]
 
 const inflectionTargets = [
@@ -960,6 +1034,39 @@ it.instance("request admission keeps path-like filenames literal", () =>
   }),
 )
 
+it.instance("consolidation normalizes case before classifying file identity", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of caseInsensitiveFilenameTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual(pair.merged ? [pair.merged] : [pair.first, pair.second])
+      }
+    }
+  }),
+)
+
+it.instance("request admission normalizes case before classifying file identity", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of caseInsensitiveFilenameTargets) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "case-file-a", pair.first)
+        yield* request(session.id, delivery, "case-file-b", pair.second)
+        const expected = pair.merged ? [pair.merged] : [pair.first, pair.second]
+        expect((yield* queue.list(session.id)).map(text)).toEqual(expected)
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "case-file-b"))).toMatchObject(
+          pair.merged ? { state: "merged", into: "case-file-a" } : { state: "pending" },
+        )
+      }
+    }
+  }),
+)
+
 it.instance("consolidation matches curated filenames and keeps other suffixes distinct", () =>
   Effect.gen(function* () {
     for (const delivery of ["steer", "queue"] as const) {
@@ -1234,6 +1341,37 @@ it.instance("request admission matches word forms through shared lexical roots",
           state: "merged",
           into: "word-form-a",
         })
+      }
+    }
+  }),
+)
+
+it.instance("consolidation keeps short false-friend stems distinct", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of boundedStemControls) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual([pair.first, pair.second])
+      }
+    }
+  }),
+)
+
+it.instance("request admission keeps short false-friend stems distinct", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of boundedStemControls) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "bounded-a", pair.first)
+        yield* request(session.id, delivery, "bounded-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.first, pair.second])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "bounded-a"))).toMatchObject({ state: "pending" })
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "bounded-b"))).toMatchObject({ state: "pending" })
       }
     }
   }),
