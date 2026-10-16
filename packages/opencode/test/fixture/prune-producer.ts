@@ -27,25 +27,37 @@ import { MessageID, PartID, SessionID } from "@/session/schema"
 const [filename, directory, serialized] = process.argv.slice(2)
 if (!filename || !directory || !serialized) throw new Error("usage: <db> <project directory> <operation JSON>")
 
+type Create = {
+  parentID?: string
+  payloadBytes?: number
+  pendingV1?: boolean
+  preparingV1?: boolean
+  withdrawnV1?: boolean
+  pendingV2?: boolean
+  unfinished?: boolean
+  runningTool?: boolean
+}
+
 const input = JSON.parse(serialized) as {
-  create?: {
-    parentID?: string
-    payloadBytes?: number
-    pendingV1?: boolean
-    preparingV1?: boolean
-    withdrawnV1?: boolean
-    pendingV2?: boolean
-    unfinished?: boolean
-    runningTool?: boolean
-  }
+  create?: Create | Create[]
   touch?: string
   crossPart?: { sessionID: string; messageID: string }
   queue?: string
+  queueAfterSignal?: { sessionID: string; startFile: string; readyFile: string }
   preparing?: string
   pendingV2?: string
   holdSessionID?: string
   hold?: boolean
   holdAfterSignal?: { startFile: string; readyFile: string }
+}
+
+if (input.queueAfterSignal) {
+  console.log("PRUNE_QUEUE_WAITING")
+  const deadline = Date.now() + 20_000
+  while (!(await Bun.file(input.queueAfterSignal.startFile).exists())) {
+    if (Date.now() >= deadline) throw new Error("pending prompt producer never received its start signal")
+    await Bun.sleep(5)
+  }
 }
 
 if (input.holdAfterSignal) {
@@ -76,136 +88,140 @@ const produce = Effect.gen(function* () {
   const todo = yield* Todo.Service
   const events = yield* EventV2Bridge.Service
   const { db } = yield* Database.Service
-  const created = [] as { id: string; parentID: string | null; time: number; messageID: string; partID: string }[]
-  let heldSessionID: SessionID | undefined
+  const creates = Array.isArray(input.create) ? input.create : input.create ? [input.create] : []
+  const created = yield* Effect.forEach(creates, (create) =>
+    Effect.gen(function* () {
+      const info = yield* sessions.create({
+        title: "prune fixture",
+        ...(create.parentID ? { parentID: create.parentID as SessionID } : {}),
+      })
+      const sessionID = info.id
+      const text = "Important: preserve the customer recovery plan. " + "x".repeat(create.payloadBytes ?? 0)
+      const userID = MessageID.ascending()
+      const partID = PartID.ascending()
+      yield* sessions.updateMessage({
+        id: userID,
+        sessionID,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "build",
+        model: { providerID: "provider-a", modelID: "requested-model" },
+      } as SessionV1.User)
+      yield* sessions.updatePart({ id: partID, sessionID, messageID: userID, type: "text", text } as SessionV1.TextPart)
 
-  if (input.create) {
-    const info = yield* sessions.create({
-      title: "prune fixture",
-      ...(input.create.parentID ? { parentID: input.create.parentID as SessionID } : {}),
-    })
-    const sessionID = info.id
-    heldSessionID = sessionID
-    const text = "Important: preserve the customer recovery plan. " + "x".repeat(input.create.payloadBytes ?? 0)
-    const userID = MessageID.ascending()
-    const partID = PartID.ascending()
-    yield* sessions.updateMessage({
-      id: userID,
-      sessionID,
-      role: "user",
-      time: { created: Date.now() },
-      agent: "build",
-      model: { providerID: "provider-a", modelID: "requested-model" },
-    } as SessionV1.User)
-    yield* sessions.updatePart({ id: partID, sessionID, messageID: userID, type: "text", text } as SessionV1.TextPart)
-
-    const assistantID = MessageID.ascending()
-    yield* sessions.updateMessage({
-      id: assistantID,
-      sessionID,
-      role: "assistant",
-      time: { created: Date.now(), ...(!input.create.unfinished ? { completed: Date.now() } : {}) },
-      parentID: userID,
-      modelID: "requested-model",
-      providerID: "provider-a",
-      mode: "build",
-      agent: "build",
-      path: { cwd: info.directory, root: info.directory },
-      responseModelIDs: ["served-model"],
-      cost: 0.25,
-      tokens: { total: 32, input: 12, output: 17, reasoning: 3, cache: { read: 5, write: 7 } },
-    } as SessionV1.Assistant)
-    yield* sessions.updatePart({
-      id: PartID.ascending(),
-      sessionID,
-      messageID: assistantID,
-      type: "text",
-      text,
-    } as SessionV1.TextPart)
-
-    if (input.create.runningTool) {
+      const assistantID = MessageID.ascending()
+      yield* sessions.updateMessage({
+        id: assistantID,
+        sessionID,
+        role: "assistant",
+        time: { created: Date.now(), ...(!create.unfinished ? { completed: Date.now() } : {}) },
+        parentID: userID,
+        modelID: "requested-model",
+        providerID: "provider-a",
+        mode: "build",
+        agent: "build",
+        path: { cwd: info.directory, root: info.directory },
+        responseModelIDs: ["served-model"],
+        cost: 0.25,
+        tokens: { total: 32, input: 12, output: 17, reasoning: 3, cache: { read: 5, write: 7 } },
+      } as SessionV1.Assistant)
       yield* sessions.updatePart({
         id: PartID.ascending(),
         sessionID,
         messageID: assistantID,
-        type: "tool",
-        tool: "prune-custody-fixture",
-        callID: "prune-custody-fixture",
-        state: { status: "running", input: {}, time: { start: Date.now() } },
-      } as SessionV1.ToolPart)
-    }
+        type: "text",
+        text,
+      } as SessionV1.TextPart)
 
-    const timestamp = yield* DateTime.now
-    const assistantMessageID = SessionMessage.ID.create()
-    yield* events.publish(SessionEvent.Step.Started, {
-      sessionID: SessionV2.ID.make(sessionID),
-      timestamp,
-      assistantMessageID,
-      agent: "build",
-      model: { id: ModelV2.ID.make("requested-model"), providerID: ProviderV2.ID.make("provider-a") },
-    })
-    if (!input.create.unfinished) {
-      yield* events.publish(SessionEvent.Step.Ended, {
+      if (create.runningTool) {
+        yield* sessions.updatePart({
+          id: PartID.ascending(),
+          sessionID,
+          messageID: assistantID,
+          type: "tool",
+          tool: "prune-custody-fixture",
+          callID: "prune-custody-fixture",
+          state: { status: "running", input: {}, time: { start: Date.now() } },
+        } as SessionV1.ToolPart)
+      }
+
+      const timestamp = yield* DateTime.now
+      const assistantMessageID = SessionMessage.ID.create()
+      yield* events.publish(SessionEvent.Step.Started, {
         sessionID: SessionV2.ID.make(sessionID),
         timestamp,
         assistantMessageID,
-        finish: "stop",
-        cost: 0.25,
-        tokens: { input: 12, output: 17, reasoning: 3, cache: { read: 5, write: 7 } },
+        agent: "build",
+        model: { id: ModelV2.ID.make("requested-model"), providerID: ProviderV2.ID.make("provider-a") },
       })
-    }
-    yield* events.publish(SessionEvent.ContextUpdated, {
-      sessionID: SessionV2.ID.make(sessionID),
-      messageID: SessionMessage.ID.create(),
-      timestamp,
-      text,
-    })
-    yield* todo.update({
-      sessionID,
-      todos: [{ content: "todo produced for prune fixture", status: "pending", priority: "high" }],
-    })
-    yield* SessionContextEpoch.initialize(
-      db,
-      Effect.succeed(
-        SystemContext.make({
-          key: Schema.decodeSync(SystemContext.Key)("prune/fixture"),
-          codec: Schema.toCodecJson(Schema.String),
-          load: Effect.succeed("prune fixture context"),
-          baseline: String,
-          update: (_previous, current) => current,
-        }),
-      ),
-      SessionV2.ID.make(sessionID),
-    )
-
-    if (input.create.pendingV1) {
-      yield* queue.admit({
+      if (!create.unfinished) {
+        yield* events.publish(SessionEvent.Step.Ended, {
+          sessionID: SessionV2.ID.make(sessionID),
+          timestamp,
+          assistantMessageID,
+          finish: "stop",
+          cost: 0.25,
+          tokens: { input: 12, output: 17, reasoning: 3, cache: { read: 5, write: 7 } },
+        })
+      }
+      yield* events.publish(SessionEvent.ContextUpdated, {
+        sessionID: SessionV2.ID.make(sessionID),
+        messageID: SessionMessage.ID.create(),
+        timestamp,
+        text,
+      })
+      yield* todo.update({
         sessionID,
-        delivery: "queue",
-        parts: [{ type: "text", text: "queued work" }],
+        todos: [{ content: "todo produced for prune fixture", status: "pending", priority: "high" }],
       })
-    }
-    if (input.create.preparingV1) {
-      yield* queue.request(
-        { sessionID, delivery: "queue", parts: [{ type: "text", text: "preparing queued work" }] },
-        undefined,
-        true,
+      yield* SessionContextEpoch.initialize(
+        db,
+        Effect.succeed(
+          SystemContext.make({
+            key: Schema.decodeSync(SystemContext.Key)("prune/fixture"),
+            codec: Schema.toCodecJson(Schema.String),
+            load: Effect.succeed("prune fixture context"),
+            baseline: String,
+            update: (_previous, current) => current,
+          }),
+        ),
+        SessionV2.ID.make(sessionID),
       )
-    }
-    if (input.create.withdrawnV1) {
-      const requested = yield* queue.request({
-        sessionID,
-        requestID: Schema.decodeSync(SessionQueue.RequestID)("prune-withdrawn"),
-        delivery: "queue",
-        parts: [{ type: "text", text: "withdrawn work retained for history" }],
-      })
-      if (requested.kind === "admitted") yield* queue.withdraw(sessionID, requested.own.id)
-    }
-    if (input.create.pendingV2) {
-      yield* v2.prompt({ sessionID: SessionV2.ID.make(sessionID), prompt: { text: "durable pending work" }, resume: false })
-    }
-    created.push({ id: sessionID, parentID: input.create.parentID ?? null, time: Date.now(), messageID: userID, partID })
-  }
+
+      if (create.pendingV1) {
+        yield* queue.admit({
+          sessionID,
+          delivery: "queue",
+          parts: [{ type: "text", text: "queued work" }],
+        })
+      }
+      if (create.preparingV1) {
+        yield* queue.request(
+          { sessionID, delivery: "queue", parts: [{ type: "text", text: "preparing queued work" }] },
+          undefined,
+          true,
+        )
+      }
+      if (create.withdrawnV1) {
+        const requested = yield* queue.request({
+          sessionID,
+          requestID: Schema.decodeSync(SessionQueue.RequestID)("prune-withdrawn"),
+          delivery: "queue",
+          parts: [{ type: "text", text: "withdrawn work retained for history" }],
+        })
+        if (requested.kind === "admitted") yield* queue.withdraw(sessionID, requested.own.id)
+      }
+      if (create.pendingV2) {
+        yield* v2.prompt({
+          sessionID: SessionV2.ID.make(sessionID),
+          prompt: { text: "durable pending work" },
+          resume: false,
+        })
+      }
+      return { id: sessionID, parentID: create.parentID ?? null, time: Date.now(), messageID: userID, partID }
+    }),
+  )
+  const heldSessionID = created.at(-1)?.id as SessionID | undefined
 
   if (input.touch) {
     const timestamp = yield* DateTime.now
@@ -220,6 +236,14 @@ const produce = Effect.gen(function* () {
   if (input.queue) {
     yield* queue.admit({
       sessionID: input.queue as SessionID,
+      delivery: "queue",
+      parts: [{ type: "text", text: "queued work after inventory" }],
+    })
+  }
+
+  if (input.queueAfterSignal) {
+    yield* queue.admit({
+      sessionID: input.queueAfterSignal.sessionID as SessionID,
       delivery: "queue",
       parts: [{ type: "text", text: "queued work after inventory" }],
     })
@@ -282,12 +306,26 @@ const layer = AppNodeBuilder.build(
   [
     [Database.node, Database.layerFromPath(filename)],
     [RuntimeFlags.node, RuntimeFlags.layer({ experimentalWorkspaces: false })],
-    [InstanceBootstrap.node, Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))],
+    [
+      InstanceBootstrap.node,
+      Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void })),
+    ],
     [SessionExecution.node, SessionExecution.noopLayer],
   ],
 )
 
 const result = await Effect.runPromise(
-  Effect.scoped(InstanceStore.Service.use((store) => store.provide({ directory }, produce)).pipe(Effect.provide(layer))),
-)
+  Effect.scoped(
+    InstanceStore.Service.use((store) => store.provide({ directory }, produce)).pipe(Effect.provide(layer)),
+  ),
+).catch(async (error) => {
+  if (input.queueAfterSignal) {
+    await Bun.write(
+      input.queueAfterSignal.readyFile,
+      JSON.stringify({ ready: false, error: error instanceof Error ? error.message : String(error) }),
+    )
+  }
+  throw error
+})
+if (input.queueAfterSignal) await Bun.write(input.queueAfterSignal.readyFile, JSON.stringify({ ready: true }))
 if (!input.hold) console.log(JSON.stringify(result))
