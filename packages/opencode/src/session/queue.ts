@@ -3801,15 +3801,62 @@ const targetComplements = new Set([
   "without",
 ])
 
+const targetClauseConjunctions = new Set(["and", "but", "or"])
+const targetClauseOpeners = new Set(["how", "what", "when", "where", "whether", "which", "who", "why"])
+
+const targetFileSuffixes = new Set([
+  "ts",
+  "tsx",
+  "js",
+  "jsx",
+  "mjs",
+  "cjs",
+  "py",
+  "go",
+  "rs",
+  "sh",
+  "md",
+  "json",
+  "yaml",
+  "yml",
+  "toml",
+  "proto",
+  "sql",
+  "c",
+  "h",
+  "cpp",
+  "hpp",
+  "rb",
+  "php",
+  "java",
+  "kt",
+  "swift",
+  "vue",
+  "svelte",
+  "css",
+  "scss",
+  "html",
+  "env",
+  "cfg",
+  "ini",
+  "lock",
+])
+
 function targetSubject(target: string) {
   const normalized = normalizeTarget(target)
-  if (targetPaths(normalized).length > 0) return normalized
+  if (targetPaths(target).length > 0) return normalized
+  const subject = target
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[.,;:!?]+$/g, "")
+    .replace(/^(?:(?:a|an|the)\s+)+/i, "")
   const words = normalized.split(" ")
   const boundary = words.findIndex(
-    (word, index) => targetComplements.has(word) || (word === "and" && words[index + 1] === "how"),
+    (word, index) =>
+      targetComplements.has(word) || (targetClauseConjunctions.has(word) && targetClauseOpeners.has(words[index + 1]!)),
   )
-  if (boundary <= 0) return normalized
-  return words.slice(0, boundary).join(" ")
+  if (boundary <= 0) return subject
+  return subject.split(" ").slice(0, boundary).join(" ")
 }
 
 function targetText(target: string) {
@@ -3817,17 +3864,21 @@ function targetText(target: string) {
 }
 
 function targetWords(target: string) {
-  return targetText(target)
-    .split(/[\\/\s]+/)
-    .flatMap((part) => {
-      const word = targetFileSuffix(part) ? part.slice(0, part.lastIndexOf(".")) : part
-      return word.match(/[a-z0-9]+/g) ?? []
-    })
+  const paths = new Set(targetPaths(target).map((path) => path.join("/")))
+  return (
+    targetText(target)
+      .match(/[a-z0-9_.-]+(?:[\\/][a-z0-9_.-]+)*/g)
+      ?.flatMap((part) => {
+        const word = paths.has(part.replace(/\\/g, "/")) ? part.slice(0, part.lastIndexOf(".")) : part
+        return word.match(/[a-z0-9]+/g) ?? []
+      }) ?? []
+  )
 }
 
 function targetMatches(left: string, right: string) {
   const leftPaths = targetPaths(left)
   const rightPaths = targetPaths(right)
+  if (Boolean(leftPaths.length) !== Boolean(rightPaths.length)) return false
   if (leftPaths.length > 0 && rightPaths.length > 0) {
     const samePaths =
       leftPaths.every((leftPath) =>
@@ -3859,19 +3910,25 @@ function targetMatches(left: string, right: string) {
 }
 
 function targetPaths(target: string) {
-  const tokens = normalizeTarget(target).match(/[a-z0-9_.-]+(?:[\\/][a-z0-9_.-]+)*/g) ?? []
-  return tokens.filter((token) => targetFileSuffix(token)).map((token) => token.split(/[\\/]/))
+  const tokens =
+    target
+      .trim()
+      .replace(/[.,;:!?]+$/g, "")
+      .match(/[a-z0-9_.-]+(?:[\\/][a-z0-9_.-]+)*/gi) ?? []
+  return tokens.filter(targetFileToken).map((token) => normalizeTarget(token).split(/[\\/]/))
 }
 
 function targetFileSuffix(target: string) {
   const component = target.trim().split(/[\\/]/).at(-1)!
   const dot = component.lastIndexOf(".")
   if (dot <= 0 || dot === component.length - 1) return undefined
-  return component.slice(dot + 1).toLowerCase()
+  const suffix = component.slice(dot + 1).toLowerCase()
+  return targetFileSuffixes.has(suffix) ? suffix : undefined
 }
 
 function targetFileToken(target: string) {
-  return Boolean(targetFileSuffix(target)?.match(/[a-z]/))
+  const component = target.trim().split(/[\\/]/).at(-1)!
+  return Boolean(targetFileSuffix(target)) && (/[\\/]/.test(target) || !/[A-Z]/.test(component))
 }
 
 function directPathTarget(target: string, paths: readonly (readonly string[])[]) {
@@ -3904,7 +3961,8 @@ function containsTarget(longer: string, shorter: string) {
 }
 
 function normalizeTargetWord(word: string) {
-  if (word.endsWith("nection")) return `${word.slice(0, -7)}nect`
+  if (word.length > 5 && word.endsWith("ion")) return word.slice(0, -3)
+  if (word.length > 5 && word.endsWith("ate")) return word.slice(0, -1)
   if (word.length > 4 && word.endsWith("ies")) return `${word.slice(0, -3)}y`
   if (/(?:ses|xes|zes|ches|shes)$/.test(word)) return word.slice(0, -2)
   if (word.length > 3 && word.endsWith("s") && !word.endsWith("ss") && !word.endsWith("us") && !word.endsWith("is"))

@@ -206,6 +206,11 @@ const differentModifierSameHeadTargets = [
     first: "review authentication receipt routing: preserve origin IDs",
     second: "review billing receipt routing: verify settlement",
   },
+  {
+    title: "dependent clauses retain conflicting subject modifiers",
+    first: "investigate auth deployment and when it runs",
+    second: "investigate billing deployment and why it runs",
+  },
 ]
 
 const literalFilenameTargets = [
@@ -233,30 +238,29 @@ const literalFilenameTargets = [
 
 const suffixFilenameTargets = [
   {
-    title: "generic unlisted suffix matches a shortened path",
+    title: "an unlisted suffix does not establish file identity",
     first: "update src/file.test: preserve the test identity",
     second: "update file.test: document the fixture",
-    merged: "update src/file.test:\n1. preserve the test identity\n2. file.test: document the fixture",
   },
   {
-    title: "generic bare suffix matches a slash-qualified filename",
+    title: "curated bare suffix matches a slash-qualified filename",
     first: "update src/file.proto: preserve the document identity",
     second: "update file.proto: document details",
     merged: "update src/file.proto:\n1. preserve the document identity\n2. file.proto: document details",
   },
   {
-    title: "unlisted suffix matches a shortened path",
+    title: "curated suffix matches a shortened path",
     first: "update src/auth.proto: preserve schema identity",
     second: "update auth.proto: document the schema",
     merged: "update src/auth.proto:\n1. preserve schema identity\n2. auth.proto: document the schema",
   },
   {
-    title: "unlisted suffix stays literal",
+    title: "different curated suffixes stay distinct",
     first: "update auth.proto: preserve protocol identity",
     second: "update auth.ts: preserve implementation identity",
   },
   {
-    title: "unlisted suffix does not use prose inflection",
+    title: "an unlisted dotted word stays distinct from a curated suffix",
     first: "fix auth.proto: preserve the wire schema",
     second: "fix auth.protos: preserve generated documentation",
   },
@@ -268,6 +272,23 @@ const bareDottedTargets = [
     first: "fix Node.js runtime checks: keep async test",
     second: "fix Node runtime checks: cover async test",
     merged: "fix Node.js runtime checks:\n1. keep async test\n2. Node runtime checks: cover async test",
+  },
+  {
+    title: "v1.2 remains part of its natural target",
+    first: "upgrade v1.2 runtime",
+    second: "upgrade runtime",
+    merged: "upgrade v1.2 runtime:\n1. upgrade v1.2 runtime\n2. upgrade runtime",
+  },
+  {
+    title: "2.5s remains part of its natural target",
+    first: "upgrade 2.5s runtime",
+    second: "upgrade runtime",
+    merged: "upgrade 2.5s runtime:\n1. upgrade 2.5s runtime\n2. upgrade runtime",
+  },
+  {
+    title: "different version tokens do not become file identities",
+    first: "upgrade v1.2",
+    second: "upgrade 2.5s",
   },
   {
     title: "different bare filename extensions",
@@ -285,6 +306,18 @@ const bareDottedTargets = [
     second: "Please summarize queue.tsx",
   },
 ]
+
+const runtimeNameTarget = {
+  first: "upgrade Node.js runtime",
+  second: "upgrade Node runtime",
+  merged: "upgrade Node.js runtime:\n1. upgrade Node.js runtime\n2. upgrade Node runtime",
+}
+
+const packageNameTarget = {
+  first: "upgrade socket.io",
+  second: "upgrade socket",
+  merged: "upgrade socket.io:\n1. upgrade socket.io\n2. upgrade socket",
+}
 
 const containedCommandTargets = [
   {
@@ -355,7 +388,7 @@ const differentInvestigationPathReferences = {
   second: "investigate login delays in auth.ts",
 }
 
-const sameJobExtractionTargets = [
+const sameJobTailTargets = [
   {
     title: "investigation subject with a different tail",
     first: "investigate CI deployment and how it works",
@@ -364,10 +397,26 @@ const sameJobExtractionTargets = [
       "investigate CI deployment and how it works:\n1. investigate CI deployment and how it works\n2. investigate CI deployment and how it proceeds",
   },
   {
-    title: "websocket reconnection inflection",
+    title: "different interrogative tails leave the same cache subject intact",
+    first: "review API caching and when it expires",
+    second: "review API caching and why it refreshes",
+    merged:
+      "review API caching and when it expires:\n1. review API caching and when it expires\n2. review API caching and why it refreshes",
+  },
+]
+
+const sameJobWordForms = [
+  {
+    title: "websocket reconnection word formation",
     first: "fix websocket reconnect",
     second: "fix websocket reconnection",
     merged: "fix websocket reconnect:\n1. fix websocket reconnect\n2. fix websocket reconnection",
+  },
+  {
+    title: "a broader ion noun form matches its verb form",
+    first: "fix user activation",
+    second: "fix user activate",
+    merged: "fix user activation:\n1. fix user activation\n2. fix user activate",
   },
 ]
 
@@ -911,7 +960,7 @@ it.instance("request admission keeps path-like filenames literal", () =>
   }),
 )
 
-it.instance("consolidation matches general filename suffixes and keeps different suffixes apart", () =>
+it.instance("consolidation matches curated filenames and keeps other suffixes distinct", () =>
   Effect.gen(function* () {
     for (const delivery of ["steer", "queue"] as const) {
       for (const pair of suffixFilenameTargets) {
@@ -925,7 +974,7 @@ it.instance("consolidation matches general filename suffixes and keeps different
   }),
 )
 
-it.instance("request admission matches general filename suffixes and keeps different suffixes apart", () =>
+it.instance("request admission matches curated filenames and keeps other suffixes distinct", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
@@ -973,6 +1022,64 @@ it.instance("request admission uses natural words for bare dotted targets withou
           pair.merged ? { state: "merged", into: "bare-dotted-a" } : { state: "pending" },
         )
       }
+    }
+  }),
+)
+
+it.instance("consolidation keeps a dotted runtime name as a natural target", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      const items = yield* consolidateAdmitted(`${delivery} runtime name`, [
+        { delivery, text: runtimeNameTarget.first },
+        { delivery, text: runtimeNameTarget.second },
+      ])
+      expect(items.map(text)).toEqual([runtimeNameTarget.merged])
+    }
+  }),
+)
+
+it.instance("request admission keeps a dotted runtime name as a natural target", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      const session = yield* sessions.create({ title: `${delivery} runtime name` })
+      yield* request(session.id, delivery, "runtime-a", runtimeNameTarget.first)
+      yield* request(session.id, delivery, "runtime-b", runtimeNameTarget.second)
+      expect((yield* queue.list(session.id)).map(text)).toEqual([runtimeNameTarget.merged])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "runtime-b"))).toMatchObject({
+        state: "merged",
+        into: "runtime-a",
+      })
+    }
+  }),
+)
+
+it.instance("consolidation matches a dotted package name through natural containment", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      const items = yield* consolidateAdmitted(`${delivery} package name`, [
+        { delivery, text: packageNameTarget.first },
+        { delivery, text: packageNameTarget.second },
+      ])
+      expect(items.map(text)).toEqual([packageNameTarget.merged])
+    }
+  }),
+)
+
+it.instance("request admission matches a dotted package name through natural containment", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      const session = yield* sessions.create({ title: `${delivery} package name` })
+      yield* request(session.id, delivery, "package-a", packageNameTarget.first)
+      yield* request(session.id, delivery, "package-b", packageNameTarget.second)
+      expect((yield* queue.list(session.id)).map(text)).toEqual([packageNameTarget.merged])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "package-b"))).toMatchObject({
+        state: "merged",
+        into: "package-a",
+      })
     }
   }),
 )
@@ -1066,10 +1173,10 @@ it.instance("request admission matches a prose file reference from its other tar
   }),
 )
 
-it.instance("consolidation extracts the same job from different subject tails and inflections", () =>
+it.instance("consolidation extracts the same subject across dependent-clause tails", () =>
   Effect.gen(function* () {
     for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of sameJobExtractionTargets) {
+      for (const pair of sameJobTailTargets) {
         const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
           { delivery, text: pair.first },
           { delivery, text: pair.second },
@@ -1080,12 +1187,12 @@ it.instance("consolidation extracts the same job from different subject tails an
   }),
 )
 
-it.instance("request admission extracts the same job from different subject tails and inflections", () =>
+it.instance("request admission extracts the same subject across dependent-clause tails", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
     for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of sameJobExtractionTargets) {
+      for (const pair of sameJobTailTargets) {
         const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
         yield* request(session.id, delivery, "same-job-a", pair.first)
         yield* request(session.id, delivery, "same-job-b", pair.second)
@@ -1093,6 +1200,39 @@ it.instance("request admission extracts the same job from different subject tail
         expect(Option.getOrThrow(yield* queue.receipt(session.id, "same-job-b"))).toMatchObject({
           state: "merged",
           into: "same-job-a",
+        })
+      }
+    }
+  }),
+)
+
+it.instance("consolidation matches word forms through shared lexical roots", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of sameJobWordForms) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual([pair.merged])
+      }
+    }
+  }),
+)
+
+it.instance("request admission matches word forms through shared lexical roots", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of sameJobWordForms) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "word-form-a", pair.first)
+        yield* request(session.id, delivery, "word-form-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.merged])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "word-form-b"))).toMatchObject({
+          state: "merged",
+          into: "word-form-a",
         })
       }
     }
