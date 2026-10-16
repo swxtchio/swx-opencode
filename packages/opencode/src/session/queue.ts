@@ -3979,7 +3979,7 @@ function targetWords(target: string) {
             .flatMap((component) => component.match(/[a-z0-9]+/g) ?? [])
         }
         return part.split(/[\\/]/).flatMap((component) => {
-          // Keep unlisted suffix basenames whole so prose stemming cannot rewrite their identity.
+          // Keep unlisted suffix basenames literal so word-form normalization cannot rewrite their identity.
           if (component.includes(".")) return [component]
           return component.match(/[a-z0-9]+/g) ?? []
         })
@@ -4096,18 +4096,6 @@ function containsTarget(longer: string, shorter: string) {
 
 function normalizeTargetWord(word: string) {
   if (word.includes(".")) return word
-  if (word.length > 7 && word.endsWith("ion")) {
-    const root = word.slice(0, -3)
-    // The -ation and -ction boundaries are productive; -ssion and -stion roots are not.
-    if (root.length >= 5 && /(?:at|ct)$/.test(root)) return root
-  }
-  if (word.length > 5 && word.endsWith("ate")) {
-    // Only reduce productive -ate verbs to a consonant-final stem.
-    const root = word.slice(0, -1)
-    if (root.length >= 5 && root.endsWith("t")) return root
-  }
-  if (word.length > 6 && word.endsWith("ing")) return word.slice(0, -3)
-  if (word.length > 5 && word.endsWith("ed")) return word.slice(0, -2)
   if (word.length > 4 && word.endsWith("ies")) return `${word.slice(0, -3)}y`
   if (/(?:ses|xes|zes|ches|shes)$/.test(word)) return word.slice(0, -2)
   if (word.length > 3 && word.endsWith("s") && !word.endsWith("ss") && !word.endsWith("us") && !word.endsWith("is"))

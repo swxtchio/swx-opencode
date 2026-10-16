@@ -544,47 +544,110 @@ const sameJobTailTargets = [
   },
 ]
 
-const sameJobWordForms = [
+const pluralTargetPairs = [
   {
-    title: "websocket reconnecting and reconnection share a root",
-    first: "fix websocket reconnecting",
-    second: "fix websocket reconnection",
-    merged: "fix websocket reconnecting:\n1. fix websocket reconnecting\n2. fix websocket reconnection",
+    title: "templates and template",
+    first: "fix email templates",
+    second: "fix email template",
+    merged: "fix email templates:\n1. fix email templates\n2. fix email template",
   },
   {
-    title: "a past verb form and its base share a root",
-    first: "investigate network failed",
-    second: "investigate network fail",
-    merged: "investigate network failed:\n1. investigate network failed\n2. investigate network fail",
+    title: "classes and class",
+    first: "fix parser classes",
+    second: "fix parser class",
+    merged: "fix parser classes:\n1. fix parser classes\n2. fix parser class",
   },
   {
-    title: "activation and activate share a bounded -ate/-ion root",
-    first: "fix user activation",
-    second: "fix user activate",
-    merged: "fix user activation:\n1. fix user activation\n2. fix user activate",
+    title: "policies and policy",
+    first: "fix routing policies",
+    second: "fix routing policy",
+    merged: "fix routing policies:\n1. fix routing policies\n2. fix routing policy",
   },
   {
-    title: "normalized singleton migration roots match",
-    first: "fix migration",
-    second: "fix migrate",
-    merged: "fix migration:\n1. fix migration\n2. fix migrate",
+    title: "certificates and certificate",
+    first: "fix tls certificates",
+    second: "fix tls certificate",
+    merged: "fix tls certificates:\n1. fix tls certificates\n2. fix tls certificate",
   },
   {
-    title: "reconnecting and reconnection match with a trailing subject noun",
-    first: "fix websocket reconnecting handler",
-    second: "fix websocket reconnection handler",
-    merged:
-      "fix websocket reconnecting handler:\n1. fix websocket reconnecting handler\n2. fix websocket reconnection handler",
+    title: "activations and activation",
+    first: "fix user activations",
+    second: "fix user activation",
+    merged: "fix user activations:\n1. fix user activations\n2. fix user activation",
+  },
+  {
+    title: "updates and update",
+    first: "fix updates page",
+    second: "fix update page",
+    merged: "fix updates page:\n1. fix updates page\n2. fix update page",
+  },
+  {
+    title: "migrations and migration",
+    first: "fix database migrations",
+    second: "fix database migration",
+    merged: "fix database migrations:\n1. fix database migrations\n2. fix database migration",
+  },
+  {
+    title: "connections and connection",
+    first: "fix database connections",
+    second: "fix database connection",
+    merged: "fix database connections:\n1. fix database connections\n2. fix database connection",
+  },
+  {
+    title: "validations and validation",
+    first: "fix API validations",
+    second: "fix API validation",
+    merged: "fix API validations:\n1. fix API validations\n2. fix API validation",
+  },
+  {
+    title: "replications and replication",
+    first: "fix database replications",
+    second: "fix database replication",
+    merged: "fix database replications:\n1. fix database replications\n2. fix database replication",
   },
 ]
 
-const boundedStemControls = [
+const derivationalWordControls = [
+  { title: "heading and head", first: "fix heading style", second: "fix head style" },
+  { title: "listing and list", first: "fix listing page", second: "fix list page" },
+  { title: "landing and land", first: "fix landing page", second: "fix land page" },
+  { title: "building and build", first: "fix building page", second: "fix build page" },
+  { title: "product and production page", first: "fix product page", second: "fix production page" },
+  { title: "production and product build", first: "fix production build", second: "fix product build" },
+  { title: "abstract and abstraction class", first: "fix abstract class", second: "fix abstraction class" },
+  { title: "project and projection cache", first: "fix project cache", second: "fix projection cache" },
+  { title: "express and expression", first: "fix express handler", second: "fix expression handler" },
+  { title: "quest and question", first: "fix quest parser", second: "fix question parser" },
+  { title: "position and posit", first: "fix position argument", second: "fix posit argument" },
+  { title: "deployment and deploy", first: "fix deployment", second: "fix deploy" },
+  {
+    title: "user deployment and user deploy",
+    first: "fix user deployment",
+    second: "fix user deploy",
+  },
+  { title: "activation and activate", first: "fix user activation", second: "fix user activate" },
+  {
+    title: "activations pluralize to activation, not activate",
+    first: "fix user activations",
+    second: "fix user activate",
+  },
+  { title: "migration and migrate", first: "fix migration", second: "fix migrate" },
+  {
+    title: "reconnecting and reconnection",
+    first: "fix websocket reconnecting",
+    second: "fix websocket reconnection",
+  },
+  { title: "failed and fail", first: "investigate network failed", second: "investigate network fail" },
+  {
+    title: "reconnecting and reconnection before a shared head",
+    first: "fix websocket reconnecting handler",
+    second: "fix websocket reconnection handler",
+  },
   {
     title: "express parser and expression parser",
     first: "fix auth express parser",
     second: "fix auth expression parser",
   },
-  { title: "quest parser and question parser", first: "fix auth quest parser", second: "fix auth question parser" },
   { title: "port parser and portion parser", first: "fix auth port parser", second: "fix auth portion parser" },
   { title: "edit page and edition page", first: "fix auth edit page", second: "fix auth edition page" },
   { title: "region cache and reg cache", first: "fix auth region cache", second: "fix auth reg cache" },
@@ -1507,83 +1570,67 @@ it.instance("request admission extracts the same subject across dependent-clause
   }),
 )
 
-it.instance("consolidation matches word forms through shared lexical roots", () =>
+it.instance("consolidation merges regular plural target variants", () =>
   Effect.gen(function* () {
-    const actual: string[][] = []
     for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of sameJobWordForms) {
+      for (const pair of pluralTargetPairs) {
         const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
           { delivery, text: pair.first },
           { delivery, text: pair.second },
         ])
-        actual.push(items.map(text))
+        expect(items.map(text)).toEqual([pair.merged])
       }
     }
-    expect(actual).toEqual(["steer", "queue"].flatMap(() => sameJobWordForms.map((pair) => [pair.merged])))
   }),
 )
 
-it.instance("request admission matches word forms through shared lexical roots", () =>
+it.instance("request admission merges regular plural target variants", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
-    const actual: string[][] = []
-    const receipts: string[] = []
     for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of sameJobWordForms) {
+      for (const pair of pluralTargetPairs) {
         const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
         yield* request(session.id, delivery, "word-form-a", pair.first)
         yield* request(session.id, delivery, "word-form-b", pair.second)
-        actual.push((yield* queue.list(session.id)).map(text))
-        const receipt = Option.getOrThrow(yield* queue.receipt(session.id, "word-form-b"))
-        receipts.push(receipt.state === "merged" ? `${receipt.state}:${receipt.into}` : receipt.state)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.merged])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "word-form-b"))).toMatchObject({
+          state: "merged",
+          into: "word-form-a",
+        })
       }
     }
-    expect(actual).toEqual(["steer", "queue"].flatMap(() => sameJobWordForms.map((pair) => [pair.merged])))
-    expect(receipts).toEqual(["steer", "queue"].flatMap(() => sameJobWordForms.map(() => "merged:word-form-a")))
   }),
 )
 
-it.instance("consolidation keeps short false-friend stems distinct", () =>
+it.instance("consolidation keeps derivational word forms distinct", () =>
   Effect.gen(function* () {
-    const actual: string[][] = []
     for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of boundedStemControls) {
+      for (const pair of derivationalWordControls) {
         const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
           { delivery, text: pair.first },
           { delivery, text: pair.second },
         ])
-        actual.push(items.map(text))
+        expect(items.map(text)).toEqual([pair.first, pair.second])
       }
     }
-    expect(actual).toEqual(
-      ["steer", "queue"].flatMap(() => boundedStemControls.map((pair) => [pair.first, pair.second])),
-    )
   }),
 )
 
-it.instance("request admission keeps short false-friend stems distinct", () =>
+it.instance("request admission keeps derivational word forms distinct", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
-    const actual: string[][] = []
-    const receipts: string[][] = []
     for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of boundedStemControls) {
+      for (const pair of derivationalWordControls) {
         const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
         yield* request(session.id, delivery, "bounded-a", pair.first)
         yield* request(session.id, delivery, "bounded-b", pair.second)
-        actual.push((yield* queue.list(session.id)).map(text))
-        receipts.push([
-          Option.getOrThrow(yield* queue.receipt(session.id, "bounded-a")).state,
-          Option.getOrThrow(yield* queue.receipt(session.id, "bounded-b")).state,
-        ])
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.first, pair.second])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "bounded-a")).state).toBe("pending")
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "bounded-b")).state).toBe("pending")
       }
     }
-    expect(actual).toEqual(
-      ["steer", "queue"].flatMap(() => boundedStemControls.map((pair) => [pair.first, pair.second])),
-    )
-    expect(receipts).toEqual(["steer", "queue"].flatMap(() => boundedStemControls.map(() => ["pending", "pending"])))
   }),
 )
 
