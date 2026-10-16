@@ -2077,7 +2077,7 @@ test(
 
     expect(String(await failed())).toContain("retention producer exited")
     expect(readdirSync(scratch.path)).toEqual([])
-    const running = spawnSync("ps", ["-eo", "args="], { encoding: "utf8" })
+    const running = spawnSync("ps", ["-eo", "args="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })
     expect(running.status).toBe(0)
     expect(running.stdout.split("\n").filter((line) => line.includes(scratch.path))).toEqual([])
     // The failed template stays failed: a later same-key acquisition rejects without producing anything.
