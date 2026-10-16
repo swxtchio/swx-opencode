@@ -1038,6 +1038,116 @@ test("ctrl+e context follows each reasoning and tool part's rendered expansion",
   }
 }, 20_000)
 
+test("ctrl+e context includes visible tool errors and diagnostics", async () => {
+  const assistantID = "msg_tool_error_projection"
+  const diagnosticPath = path.join(directory, "visible-diagnostic.ts")
+  const messages = [
+    transcript,
+    {
+      info: {
+        id: assistantID,
+        sessionID,
+        role: "assistant",
+        parentID: transcript.info.id,
+        mode: "primary",
+        agent: "build",
+        modelID: "model",
+        providerID: "test",
+        path: { cwd: directory, root: directory },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        time: { created: 2, completed: 3 },
+      },
+      parts: [
+        {
+          id: "prt_inline_tool_error",
+          sessionID,
+          messageID: assistantID,
+          type: "tool",
+          callID: "call_inline_tool_error",
+          tool: "webfetch",
+          state: {
+            status: "error",
+            input: { url: "https://example.test" },
+            error: "expanded inline tool error token",
+            metadata: {},
+            time: { start: 2, end: 3 },
+          },
+        },
+        {
+          id: "prt_block_tool_error",
+          sessionID,
+          messageID: assistantID,
+          type: "tool",
+          callID: "call_block_tool_error",
+          tool: "bash",
+          state: {
+            status: "error",
+            input: { command: "failing-command" },
+            error: "visible BlockTool error token",
+            metadata: { output: "visible shell output token" },
+            time: { start: 2, end: 3 },
+          },
+        },
+        {
+          id: "prt_diagnostic_tool",
+          sessionID,
+          messageID: assistantID,
+          type: "tool",
+          callID: "call_diagnostic_tool",
+          tool: "write",
+          state: {
+            status: "completed",
+            input: { filePath: diagnosticPath, content: "const value = 1" },
+            output: "write output",
+            title: "Write diagnostic file",
+            metadata: {
+              diagnostics: {
+                [diagnosticPath]: [
+                  {
+                    severity: 1,
+                    range: { start: { line: 0, character: 0 } },
+                    message: "visible tool diagnostic token",
+                  },
+                ],
+              },
+            },
+            time: { start: 2, end: 3 },
+          },
+        },
+      ],
+    },
+  ]
+  const app = await startSession({ queue: [], messages })
+  try {
+    await until(
+      async () => {
+        const frame = (await screen(app)).join("\n")
+        return frame.includes("visible BlockTool error token") && frame.includes("visible tool diagnostic token")
+      },
+      "visible block error and diagnostics",
+    )
+    await app.renderer.mockInput.typeText("rewrite from visible tool errors")
+    app.renderer.mockInput.pressKey("e", { ctrl: true })
+    await until(() => app.enhancements.length === 1, "context with visible errors")
+    expect(app.enhancements[0]!.context).toContain("visible BlockTool error token")
+    expect(app.enhancements[0]!.context).toContain("Error [1:1] visible tool diagnostic token")
+    expect(app.enhancements[0]!.context).not.toContain("expanded inline tool error token")
+
+    await clickVisible(app, "WebFetch https://example.test")
+    await until(
+      async () => (await screen(app)).some((line) => line.includes("expanded inline tool error token")),
+      "expanded inline error",
+    )
+    app.dispatch("prompt.enhance")
+    await until(() => app.enhancements.length === 2, "context with the expanded inline error")
+    expect(app.enhancements[1]!.context).toContain("expanded inline tool error token")
+    expect(app.prompts).toHaveLength(0)
+  } finally {
+    await app.stop()
+  }
+}, 20_000)
+
 test("failed prompt enhancement leaves the composer draft untouched and shows an error", async () => {
   const app = await startSession({
     queue: [],

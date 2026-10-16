@@ -214,6 +214,8 @@ const sessionGlobalBindingCommands = [
 
 const sessionGlobalUnfocusedBindingCommands = ["session.first", "session.last"] as const
 
+type PresentationSegment = "content" | "inline-error" | `block-error:${string}` | `diagnostics:${string}`
+
 export const SessionContext = createContext<{
   width: number
   sessionID: string
@@ -223,7 +225,7 @@ export const SessionContext = createContext<{
   showTimestamps: () => boolean
   showDetails: () => boolean
   showGenericToolOutput: () => boolean
-  presentPart: (partID: string, text?: string) => void
+  presentPart: (partID: string, text?: string, segment?: PresentationSegment) => void
   diffWrapMode: () => "word" | "none"
   providers: () => ReadonlyMap<string, Provider>
   sync: ReturnType<typeof useSync>
@@ -271,10 +273,13 @@ export function Session() {
       .filter((x) => x.parentID === parentID || x.id === parentID)
       .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   })
-  const presentedParts = new Map<string, string>()
-  const presentPart = (partID: string, text?: string) => {
-    if (text) presentedParts.set(partID, text)
-    else presentedParts.delete(partID)
+  const presentedParts = new Map<string, Map<PresentationSegment, string>>()
+  const presentPart = (partID: string, text?: string, segment: PresentationSegment = "content") => {
+    const segments = presentedParts.get(partID) ?? new Map<PresentationSegment, string>()
+    if (text) segments.set(segment, text)
+    else segments.delete(segment)
+    if (!segments.size) return presentedParts.delete(partID)
+    presentedParts.set(partID, segments)
   }
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
   const messagesBeforeRevert = () => {
@@ -291,7 +296,9 @@ export function Session() {
       assistantMetadata: showAssistantMetadata(),
       providers: sync.data.provider,
     },
-    presentation: new Map(presentedParts),
+    presentation: new Map(
+      Array.from(presentedParts, ([partID, segments]) => [partID, Array.from(segments.values()).join("\n")] as const),
+    ),
   })
   const foregroundTasks = createMemo(() =>
     sync.data.capabilities.experimentalBackgroundSubagents ? activeForegroundTasks(sync, messages()) : [],
@@ -1970,7 +1977,7 @@ export function ToolPartView(props: { last: boolean; part: ToolPart; message: As
     get part() {
       return props.part
     },
-    present: (text?: string) => ctx.presentPart(props.part.id, text),
+    present: (text?: string, segment?: PresentationSegment) => ctx.presentPart(props.part.id, text, segment),
   }
 
   return (
@@ -2033,7 +2040,7 @@ type ToolProps = {
   tool: string
   output?: string
   part: ToolPart
-  present: (text?: string) => void
+  present: (text?: string, segment?: PresentationSegment) => void
 }
 
 function presentToolPart(props: ToolProps, content: () => string) {
@@ -2150,6 +2157,10 @@ function InlineTool(props: {
 
   const failed = createMemo(() => Boolean(error() && !denied()) || (stopped() && !unresolved()))
   const clickable = createMemo(() => Boolean(props.onClick || failed()))
+  createEffect(() =>
+    ctx.presentPart(props.part.id, failed() && errorExpanded() ? error() : undefined, "inline-error"),
+  )
+  onCleanup(() => ctx.presentPart(props.part.id, undefined, "inline-error"))
   const fg = createMemo(() => {
     if (unresolved()) return theme.textMuted
     if (props.color) return props.color
@@ -2279,10 +2290,20 @@ function BlockTool(props: {
   spinner?: boolean
 }) {
   const { theme } = useTheme()
+  const ctx = use()
   const sync = useSync()
   const renderer = useRenderer()
   const [hover, setHover] = createSignal(false)
   const error = createMemo(() => (props.part?.state.status === "error" ? props.part.state.error : undefined))
+  const errorSegment: PresentationSegment = `block-error:${props.title ?? ""}`
+  createEffect(() => {
+    if (!props.part) return
+    ctx.presentPart(props.part.id, error(), errorSegment)
+  })
+  onCleanup(() => {
+    if (!props.part) return
+    ctx.presentPart(props.part.id, undefined, errorSegment)
+  })
   const message = createMemo(() =>
     props.part ? sync.data.message[props.part.sessionID]?.find((item) => item.id === props.part?.messageID) : undefined,
   )
@@ -2450,7 +2471,11 @@ function Write(props: ToolProps) {
               content={code()}
             />
           </line_number>
-          <Diagnostics diagnostics={props.metadata.diagnostics} filePath={stringValue(props.input.filePath) ?? ""} />
+          <Diagnostics
+            diagnostics={props.metadata.diagnostics}
+            filePath={stringValue(props.input.filePath) ?? ""}
+            present={(text) => props.present(text, `diagnostics:${stringValue(props.input.filePath) ?? ""}`)}
+          />
         </BlockTool>
       </Match>
       <Match when={true}>
@@ -2792,7 +2817,11 @@ function Edit(props: ToolProps) {
               removedLineNumberBg={theme.diffRemovedLineNumberBg}
             />
           </box>
-          <Diagnostics diagnostics={props.metadata.diagnostics} filePath={stringValue(props.input.filePath) ?? ""} />
+          <Diagnostics
+            diagnostics={props.metadata.diagnostics}
+            filePath={stringValue(props.input.filePath) ?? ""}
+            present={(text) => props.present(text, `diagnostics:${stringValue(props.input.filePath) ?? ""}`)}
+          />
         </BlockTool>
       </Match>
       <Match when={true}>
@@ -2875,7 +2904,11 @@ function ApplyPatch(props: ToolProps) {
                 }
               >
                 <Diff diff={file.patch} filePath={file.filePath} />
-                <Diagnostics diagnostics={props.metadata.diagnostics} filePath={file.movePath ?? file.filePath} />
+                <Diagnostics
+                  diagnostics={props.metadata.diagnostics}
+                  filePath={file.movePath ?? file.filePath}
+                  present={(text) => props.present(text, `diagnostics:${file.movePath ?? file.filePath}`)}
+                />
               </Show>
             </BlockTool>
           )}
@@ -2968,7 +3001,7 @@ function Skill(props: ToolProps) {
   )
 }
 
-function Diagnostics(props: { diagnostics: unknown; filePath: string }) {
+function Diagnostics(props: { diagnostics: unknown; filePath: string; present?: (text?: string) => void }) {
   const { theme } = useTheme()
   const terminalEnvironment = useTuiTerminalEnvironment()
   const errors = createMemo(() => {
@@ -2978,6 +3011,17 @@ function Diagnostics(props: { diagnostics: unknown; filePath: string }) {
     )
     return parseDiagnostics(props.diagnostics, normalized)
   })
+  createEffect(() =>
+    props.present?.(
+      errors()
+        .map(
+          (diagnostic) =>
+            `Error [${diagnostic.range.start.line + 1}:${diagnostic.range.start.character + 1}] ${diagnostic.message}`,
+        )
+        .join("\n"),
+    ),
+  )
+  onCleanup(() => props.present?.())
 
   return (
     <Show when={errors().length}>
