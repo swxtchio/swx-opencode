@@ -730,16 +730,33 @@ test("a pending prompt added after inventory is revalidated before the first del
   const before = ownedCounts(store.filename, oldID)
   const startFile = path.join(store.directory, "queue-admission-start")
   const readyFile = path.join(store.directory, "queue-admission-ready")
-  await using admission = startProducer(store, { queueAfterSignal: { sessionID: oldID, startFile, readyFile } })
+  const writeStartedFile = path.join(store.directory, "queue-admission-ready-write-started")
+  const writeReleaseFile = path.join(store.directory, "queue-admission-ready-write-release")
+  await using admission = startProducer(store, {
+    queueAfterSignal: {
+      sessionID: oldID,
+      startFile,
+      readyFile,
+      readinessWriteGate: { createdFile: writeStartedFile, releaseFile: writeReleaseFile },
+    },
+  })
   await readMatchingLine(admission, "PRUNE_QUEUE_WAITING")
   const originalExec = Database.prototype.exec
   let injected = false
+  let readinessDuringWrite: string | undefined
   const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, sql: string) {
     if (sql === "BEGIN IMMEDIATE" && !injected) {
       injected = true
       writeFileSync(startFile, "admit\n")
       const deadline = Date.now() + 10_000
       const wait = new Int32Array(new SharedArrayBuffer(4))
+      while (!existsSync(writeStartedFile)) {
+        if (Date.now() >= deadline)
+          throw new Error(`queue producer ${admission.child.pid} did not reach its readiness write`)
+        Atomics.wait(wait, 0, 0, 5)
+      }
+      readinessDuringWrite = existsSync(readyFile) ? readFileSync(readyFile, "utf8") : undefined
+      writeFileSync(writeReleaseFile, "write\n")
       while (!existsSync(readyFile)) {
         if (Date.now() >= deadline) throw new Error(`queue producer ${admission.child.pid} did not publish readiness`)
         Atomics.wait(wait, 0, 0, 5)
@@ -752,6 +769,7 @@ test("a pending prompt added after inventory is revalidated before the first del
   try {
     const result = await invokeHandler(store, { before: cutoff, session: [oldID], apply: true })
     expect(injected).toBe(true)
+    expect(readinessDuringWrite).toBeUndefined()
     expect(result.report.action).toBe("refused")
     expect(result.report.changedRows).toBe(0)
     expect(result.report.refusalReasons).toContain("selection-changed-after-inventory")
@@ -760,12 +778,54 @@ test("a pending prompt added after inventory is revalidated before the first del
   } finally {
     exec.mockRestore()
     if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
+    if (!existsSync(writeReleaseFile)) writeFileSync(writeReleaseFile, "release\n")
     assertChildOutcome(await admission.finish(), 0)
   }
 
   const cleanControl = await invokeHandler(controlStore, { before: cutoff, session: [controlID], apply: true })
   expect(cleanControl.report.action).toBe("applied")
   expect(cleanControl.report.deletedSessionIDs).toEqual([controlID])
+})
+
+test("a failed queue producer publishes its complete readiness error atomically", async () => {
+  await using store = await producedStore([{}])
+  const startFile = path.join(store.directory, "failed-queue-admission-start")
+  const readyFile = path.join(store.directory, "failed-queue-admission-ready")
+  const writeStartedFile = path.join(store.directory, "failed-queue-admission-write-started")
+  const writeReleaseFile = path.join(store.directory, "failed-queue-admission-write-release")
+  await using failedAdmission = startProducer(store, {
+    queueAfterSignal: {
+      sessionID: "ses_missing",
+      startFile,
+      readyFile,
+      readinessWriteGate: { createdFile: writeStartedFile, releaseFile: writeReleaseFile },
+    },
+  })
+  let readinessDuringWrite: string | undefined
+  try {
+    await readMatchingLine(failedAdmission, "PRUNE_QUEUE_WAITING")
+    writeFileSync(startFile, "admit\n")
+    const deadline = Date.now() + 10_000
+    const wait = new Int32Array(new SharedArrayBuffer(4))
+    while (!existsSync(writeStartedFile)) {
+      if (Date.now() >= deadline) throw new Error("failed queue producer did not reach its readiness write")
+      Atomics.wait(wait, 0, 0, 5)
+    }
+    readinessDuringWrite = existsSync(readyFile) ? readFileSync(readyFile, "utf8") : undefined
+    writeFileSync(writeReleaseFile, "write\n")
+    expect(readinessDuringWrite).toBeUndefined()
+    while (!existsSync(readyFile)) {
+      if (Date.now() >= deadline) throw new Error("failed queue producer did not publish its readiness error")
+      Atomics.wait(wait, 0, 0, 5)
+    }
+    const readiness = JSON.parse(readFileSync(readyFile, "utf8")) as { ready: boolean; error?: string }
+    expect(readiness.ready).toBe(false)
+    expect(readiness.error?.length).toBeGreaterThan(0)
+  } finally {
+    if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
+    if (!existsSync(writeReleaseFile)) writeFileSync(writeReleaseFile, "release\n")
+  }
+  assertChildOutcome(await failedAdmission.finish(), "nonzero")
 })
 
 test("a live review hold is a liveness blocker, with a clean private control", async () => {

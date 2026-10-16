@@ -1,4 +1,5 @@
 // Writes prune fixtures through the Session, queue and durable-event producers.
+import { rename, rm } from "node:fs/promises"
 import { DateTime, Effect, Layer, Schema } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -43,7 +44,12 @@ const input = JSON.parse(serialized) as {
   touch?: string
   crossPart?: { sessionID: string; messageID: string }
   queue?: string
-  queueAfterSignal?: { sessionID: string; startFile: string; readyFile: string }
+  queueAfterSignal?: {
+    sessionID: string
+    startFile: string
+    readyFile: string
+    readinessWriteGate?: { createdFile: string; releaseFile: string }
+  }
   preparing?: string
   pendingV2?: string
   holdSessionID?: string
@@ -320,12 +326,38 @@ const result = await Effect.runPromise(
   ),
 ).catch(async (error) => {
   if (input.queueAfterSignal) {
-    await Bun.write(
+    await publishReadiness(
       input.queueAfterSignal.readyFile,
-      JSON.stringify({ ready: false, error: error instanceof Error ? error.message : String(error) }),
+      { ready: false, error: error instanceof Error ? error.message : String(error) },
+      input.queueAfterSignal.readinessWriteGate,
     )
   }
   throw error
 })
-if (input.queueAfterSignal) await Bun.write(input.queueAfterSignal.readyFile, JSON.stringify({ ready: true }))
+if (input.queueAfterSignal)
+  await publishReadiness(input.queueAfterSignal.readyFile, { ready: true }, input.queueAfterSignal.readinessWriteGate)
 if (!input.hold) console.log(JSON.stringify(result))
+
+async function publishReadiness(
+  readyFile: string,
+  result: { ready: boolean; error?: string },
+  gate?: { createdFile: string; releaseFile: string },
+) {
+  const temporaryFile = `${readyFile}.${process.pid}.tmp`
+  try {
+    await Bun.write(temporaryFile, "")
+    if (gate) {
+      await Bun.write(gate.createdFile, "created\n")
+      const deadline = Date.now() + 10_000
+      while (!(await Bun.file(gate.releaseFile).exists())) {
+        if (Date.now() >= deadline) throw new Error("readiness writer did not receive its release signal")
+        await Bun.sleep(5)
+      }
+    }
+    await Bun.write(temporaryFile, JSON.stringify(result))
+    await rename(temporaryFile, readyFile)
+  } catch (error) {
+    await rm(temporaryFile, { force: true })
+    throw error
+  }
+}
