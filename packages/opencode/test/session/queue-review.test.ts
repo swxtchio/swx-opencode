@@ -544,44 +544,106 @@ const sameJobTailTargets = [
   },
 ]
 
-const pluralTargetPair = (title: string, first: string, second: string) => ({
+const separateTargetWord = (title: string, first: string, second: string) => ({
   title,
   first,
   second,
-  merged: `${first}:\n1. ${first}\n2. ${second}`,
 })
 
-const pluralTargetPairs = [
-  pluralTargetPair("databases/database", "fix databases", "fix database"),
-  pluralTargetPair("database caches/cache", "fix the database caches", "fix the database cache"),
-  pluralTargetPair("image sizes/size", "fix image sizes", "fix image size"),
-  pluralTargetPair("API responses/response", "fix the api responses", "fix the api response"),
-  pluralTargetPair("test cases/case", "fix the test cases", "fix the test case"),
-  pluralTargetPair("releases/release notes", "fix releases notes", "fix release notes"),
-  pluralTargetPair("uses/use list", "fix the uses list", "fix the use list"),
-  pluralTargetPair("user licenses/license", "fix the user licenses", "fix the user license"),
-  pluralTargetPair("build phases/phase", "fix the build phases", "fix the build phase"),
-  pluralTargetPair("echo/echoes", "fix echo", "fix echoes"),
-  pluralTargetPair("veto/vetoes", "fix veto", "fix vetoes"),
-  pluralTargetPair("zero/zeroes", "fix zero", "fix zeroes"),
-  pluralTargetPair("classes/class", "fix parser classes", "fix parser class"),
-  pluralTargetPair("boxes/box", "fix shipping boxes", "fix shipping box"),
-  pluralTargetPair("churches/church", "fix churches", "fix church"),
-  pluralTargetPair("dishes/dish", "fix dishes", "fix dish"),
-  pluralTargetPair("addresses/address", "fix route addresses", "fix route address"),
-  pluralTargetPair("statuses/status", "fix statuses", "fix status"),
-  pluralTargetPair("aliases/alias", "fix dns aliases", "fix dns alias"),
-  pluralTargetPair("canvases/canvas", "fix canvases", "fix canvas"),
+const targetWordSeparationControls = [
+  separateTargetWord("cases/cas", "fix atomic cases", "fix atomic cas"),
+  separateTargetWord("databases/database", "fix databases", "fix database"),
+  separateTargetWord("database caches/cache", "fix the database caches", "fix the database cache"),
+  separateTargetWord("image sizes/size", "fix image sizes", "fix image size"),
+  separateTargetWord("API responses/response", "fix the api responses", "fix the api response"),
+  separateTargetWord("test cases/case", "fix the test cases", "fix the test case"),
+  separateTargetWord("releases/release notes", "fix releases notes", "fix release notes"),
+  separateTargetWord("uses/use list", "fix the uses list", "fix the use list"),
+  separateTargetWord("user licenses/license", "fix the user licenses", "fix the user license"),
+  separateTargetWord("build phases/phase", "fix the build phases", "fix the build phase"),
+  separateTargetWord("echo/echoes", "fix echo", "fix echoes"),
+  separateTargetWord("veto/vetoes", "fix veto", "fix vetoes"),
+  separateTargetWord("zero/zeroes", "fix zero", "fix zeroes"),
+  separateTargetWord("classes/class", "fix parser classes", "fix parser class"),
+  separateTargetWord("boxes/box", "fix shipping boxes", "fix shipping box"),
+  separateTargetWord("churches/church", "fix churches", "fix church"),
+  separateTargetWord("dishes/dish", "fix dishes", "fix dish"),
+  separateTargetWord("addresses/address", "fix route addresses", "fix route address"),
+  separateTargetWord("statuses/status", "fix statuses", "fix status"),
+  separateTargetWord("aliases/alias", "fix dns aliases", "fix dns alias"),
+  separateTargetWord("canvases/canvas", "fix canvases", "fix canvas"),
+  separateTargetWord("policy/policies", "fix network policy", "fix network policies"),
+  separateTargetWord(
+    "authentication redirect/redirects",
+    "fix authentication redirect: trace callback",
+    "fix authentication redirects: inspect login",
+  ),
+  separateTargetWord(
+    "authentication handler/handlers",
+    "fix authentication handler: trace callback",
+    "fix authentication handlers: inspect login",
+  ),
+  separateTargetWord(
+    "user profile form/forms",
+    "update user profile form: validate fields",
+    "update user profile forms: map settings",
+  ),
+  separateTargetWord(
+    "reconnect/reconnects",
+    "refactor reconnect queue: preserve order",
+    "refactor reconnects queue: preserve retry order",
+  ),
+  separateTargetWord(
+    "session queue/queues",
+    "refactor session queue: preserve order",
+    "refactor session queues: preserve receipts",
+  ),
+  separateTargetWord("poses/pos", "fix poses", "fix pos"),
+  separateTargetWord("doses/dos", "fix doses", "fix dos"),
+  separateTargetWord("bases/bas", "fix bases", "fix bas"),
+  separateTargetWord("phases/phas", "fix phases", "fix phas"),
+  separateTargetWord("states/stats", "fix states", "fix stats"),
+  separateTargetWord("modes/mods", "fix modes", "fix mods"),
+  separateTargetWord("planes/plans", "fix planes", "fix plans"),
+  separateTargetWord("pipes/pip", "fix pipes", "fix pip"),
+  separateTargetWord("sites/sits", "fix sites", "fix sits"),
+  separateTargetWord("tapes/taps", "fix tapes", "fix taps"),
+  separateTargetWord("pines/pins", "fix pines", "fix pins"),
+  separateTargetWord("rates/rats", "fix rates", "fix rats"),
+  separateTargetWord("hopes/hops", "fix hopes", "fix hops"),
+  separateTargetWord("cubes/cubs", "fix cubes", "fix cubs"),
+  separateTargetWord("nodes/nods", "fix nodes", "fix nods"),
+  separateTargetWord("cares/cars", "fix cares", "fix cars"),
+  separateTargetWord("scopes/scops", "fix scopes", "fix scops"),
+  separateTargetWord("themes/them", "fix auth themes", "fix auth them"),
+  separateTargetWord("this/thi", "fix this", "fix thi"),
+  separateTargetWord("news/new", "fix the news page", "fix the new page"),
 ]
 
-const pluralTargetSeparationControls = [
-  { title: "states and stats", first: "fix states", second: "fix stats" },
-  { title: "themes and them", first: "fix auth themes", second: "fix auth them" },
-]
+const literalTargetMerge = {
+  title: "same literal target",
+  first: "fix atomic cases: inspect the routing path",
+  second: "fix atomic cases: verify the fallback",
+  merged: "fix atomic cases:\n1. inspect the routing path\n2. verify the fallback",
+}
+
+const literalNonGenericTargetMerge = {
+  title: "uses remains a literal non-generic target",
+  first: "fix extra uses",
+  second: "fix uses",
+  merged: "fix extra uses:\n1. fix extra uses\n2. fix uses",
+}
+
+const literalGenericSubjectWords = ["this", "does", "whereas", "themselves", "ourselves", "yourselves"]
 
 const genericSubjectControls = [
   { title: "bug subject", first: "fix the bug in auth", second: "fix the bug in parser" },
   { title: "docs subject", first: "update the docs for the api", second: "update the docs for the cli" },
+  ...literalGenericSubjectWords.map((word) => ({
+    title: `${word} remains a generic-only subject`,
+    first: `fix extra ${word}`,
+    second: `fix ${word}`,
+  })),
 ]
 
 const derivationalWordControls = [
@@ -604,7 +666,7 @@ const derivationalWordControls = [
   },
   { title: "activation and activate", first: "fix user activation", second: "fix user activate" },
   {
-    title: "activations pluralize to activation, not activate",
+    title: "activations and activate remain different words",
     first: "fix user activations",
     second: "fix user activate",
   },
@@ -628,39 +690,6 @@ const derivationalWordControls = [
   { title: "port parser and portion parser", first: "fix auth port parser", second: "fix auth portion parser" },
   { title: "edit page and edition page", first: "fix auth edit page", second: "fix auth edition page" },
   { title: "region cache and reg cache", first: "fix auth region cache", second: "fix auth reg cache" },
-]
-
-const inflectionTargets = [
-  {
-    title: "redirects",
-    first: "fix authentication redirect: trace callback",
-    second: "fix authentication redirects: inspect login",
-    merged: "fix authentication redirect:\n1. trace callback\n2. authentication redirects: inspect login",
-  },
-  {
-    title: "handlers",
-    first: "fix authentication handler: trace callback",
-    second: "fix authentication handlers: inspect login",
-    merged: "fix authentication handler:\n1. trace callback\n2. authentication handlers: inspect login",
-  },
-  {
-    title: "forms",
-    first: "update user profile form: validate fields",
-    second: "update user profile forms: map settings",
-    merged: "update user profile form:\n1. validate fields\n2. user profile forms: map settings",
-  },
-  {
-    title: "reconnects",
-    first: "refactor reconnect queue: preserve order",
-    second: "refactor reconnects queue: preserve retry order",
-    merged: "refactor reconnect queue:\n1. preserve order\n2. reconnects queue: preserve retry order",
-  },
-  {
-    title: "queues",
-    first: "refactor session queue: preserve order",
-    second: "refactor session queues: preserve receipts",
-    merged: "refactor session queue:\n1. preserve order\n2. session queues: preserve receipts",
-  },
 ]
 
 const consolidateAdmitted = (title: string, values: readonly { delivery: SessionQueue.Delivery; text: string }[]) =>
@@ -979,39 +1008,6 @@ it.instance("request admission keeps different modifiers apart when the job-clas
         })
         expect(Option.getOrThrow(yield* queue.receipt(session.id, "modifier-b"))).toMatchObject({
           state: "pending",
-        })
-      }
-    }
-  }),
-)
-
-it.instance("consolidation matches shared identifiers across inflections in both delivery classes", () =>
-  Effect.gen(function* () {
-    for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of inflectionTargets) {
-        const consolidated = yield* consolidateAdmitted(pair.title, [
-          { delivery, text: pair.first },
-          { delivery, text: pair.second },
-        ])
-        expect(consolidated.map(text)).toEqual([pair.merged])
-      }
-    }
-  }),
-)
-
-it.instance("request admission matches shared identifiers across inflections in both delivery classes", () =>
-  Effect.gen(function* () {
-    const sessions = yield* Session.Service
-    const queue = yield* SessionQueue.Service
-    for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of inflectionTargets) {
-        const session = yield* sessions.create({ title: `${delivery} request ${pair.title}` })
-        yield* request(session.id, delivery, "inflection-a", pair.first)
-        yield* request(session.id, delivery, "inflection-b", pair.second)
-        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.merged])
-        expect(Option.getOrThrow(yield* queue.receipt(session.id, "inflection-b"))).toMatchObject({
-          state: "merged",
-          into: "inflection-a",
         })
       }
     }
@@ -1547,81 +1543,98 @@ it.instance("request admission extracts the same subject across dependent-clause
   }),
 )
 
-it.instance("consolidation merges only the reviewed plural target pairs", () =>
-  Effect.gen(function* () {
-    for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of pluralTargetPairs) {
-        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
-          { delivery, text: pair.first },
-          { delivery, text: pair.second },
-        ])
-        expect(items.map(text)).toEqual([pair.merged])
+it.instance(
+  "consolidation keeps plural and truncated target words distinct",
+  () =>
+    Effect.gen(function* () {
+      for (const delivery of ["steer", "queue"] as const) {
+        for (const pair of targetWordSeparationControls) {
+          const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+            { delivery, text: pair.first },
+            { delivery, text: pair.second },
+          ])
+          expect(items.map(text)).toEqual([pair.first, pair.second])
+        }
       }
-    }
-  }),
-  30_000,
+    }),
+  60_000,
 )
 
-it.instance("request admission merges only the reviewed plural target pairs", () =>
+it.instance(
+  "request admission keeps plural and truncated target words distinct",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      for (const delivery of ["steer", "queue"] as const) {
+        for (const pair of targetWordSeparationControls) {
+          const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+          yield* request(session.id, delivery, "target-word-a", pair.first)
+          yield* request(session.id, delivery, "target-word-b", pair.second)
+          expect((yield* queue.list(session.id)).map(text)).toEqual([pair.first, pair.second])
+          expect(Option.getOrThrow(yield* queue.receipt(session.id, "target-word-a")).state).toBe("pending")
+          expect(Option.getOrThrow(yield* queue.receipt(session.id, "target-word-b")).state).toBe("pending")
+        }
+      }
+    }),
+  60_000,
+)
+
+it.instance("consolidation still merges literal-identical target words", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      const items = yield* consolidateAdmitted(`${delivery} ${literalTargetMerge.title}`, [
+        { delivery, text: literalTargetMerge.first },
+        { delivery, text: literalTargetMerge.second },
+      ])
+      expect(items.map(text)).toEqual([literalTargetMerge.merged])
+    }
+  }),
+)
+
+it.instance("request admission still merges literal-identical target words", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
     for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of pluralTargetPairs) {
-        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
-        yield* request(session.id, delivery, "word-form-a", pair.first)
-        yield* request(session.id, delivery, "word-form-b", pair.second)
-        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.merged])
-        expect(Option.getOrThrow(yield* queue.receipt(session.id, "word-form-b"))).toMatchObject({
-          state: "merged",
-          into: "word-form-a",
-        })
-      }
+      const session = yield* sessions.create({ title: `${delivery} ${literalTargetMerge.title}` })
+      yield* request(session.id, delivery, "literal-target-a", literalTargetMerge.first)
+      yield* request(session.id, delivery, "literal-target-b", literalTargetMerge.second)
+      expect((yield* queue.list(session.id)).map(text)).toEqual([literalTargetMerge.merged])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "literal-target-b"))).toMatchObject({
+        state: "merged",
+        into: "literal-target-a",
+      })
     }
   }),
-  30_000,
 )
 
-it.instance("consolidation keeps non-sibilant plural targets distinct", () =>
+it.instance("consolidation treats uses as literal non-generic evidence", () =>
   Effect.gen(function* () {
-    const actual: string[][] = []
-    const expected: string[][] = []
     for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of pluralTargetSeparationControls) {
-        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
-          { delivery, text: pair.first },
-          { delivery, text: pair.second },
-        ])
-        actual.push(items.map(text))
-        expected.push([pair.first, pair.second])
-      }
+      const items = yield* consolidateAdmitted(`${delivery} ${literalNonGenericTargetMerge.title}`, [
+        { delivery, text: literalNonGenericTargetMerge.first },
+        { delivery, text: literalNonGenericTargetMerge.second },
+      ])
+      expect(items.map(text)).toEqual([literalNonGenericTargetMerge.merged])
     }
-    expect(actual).toEqual(expected)
   }),
 )
 
-it.instance("request admission keeps non-sibilant plural targets distinct", () =>
+it.instance("request admission treats uses as literal non-generic evidence", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const queue = yield* SessionQueue.Service
-    const actual: string[][] = []
-    const expected: string[][] = []
-    const receipts: string[][] = []
     for (const delivery of ["steer", "queue"] as const) {
-      for (const pair of pluralTargetSeparationControls) {
-        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
-        yield* request(session.id, delivery, "plural-control-a", pair.first)
-        yield* request(session.id, delivery, "plural-control-b", pair.second)
-        actual.push((yield* queue.list(session.id)).map(text))
-        expected.push([pair.first, pair.second])
-        receipts.push([
-          Option.getOrThrow(yield* queue.receipt(session.id, "plural-control-a")).state,
-          Option.getOrThrow(yield* queue.receipt(session.id, "plural-control-b")).state,
-        ])
-      }
+      const session = yield* sessions.create({ title: `${delivery} ${literalNonGenericTargetMerge.title}` })
+      yield* request(session.id, delivery, "literal-uses-a", literalNonGenericTargetMerge.first)
+      yield* request(session.id, delivery, "literal-uses-b", literalNonGenericTargetMerge.second)
+      expect((yield* queue.list(session.id)).map(text)).toEqual([literalNonGenericTargetMerge.merged])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "literal-uses-b"))).toMatchObject({
+        state: "merged",
+        into: "literal-uses-a",
+      })
     }
-    expect(actual).toEqual(expected)
-    expect(receipts).toEqual(expected.map(() => ["pending", "pending"]))
   }),
 )
 

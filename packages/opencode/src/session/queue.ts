@@ -4061,16 +4061,15 @@ function directPathTarget(target: string, paths: readonly (readonly string[])[])
 function targetIdentity(target: string) {
   const words = targetWords(target).map((word) => ({
     word,
-    generic: genericTargetWords.has(
-      !word.includes(".") && word.length > 3 && word.endsWith("s") && !word.endsWith("ss") && !word.endsWith("us")
-        ? word.slice(0, -1)
-        : word,
-    ),
+    generic: genericTargetWords.has(word),
   }))
   const nonGeneric = words.filter((item) => !item.generic).map((item) => item.word)
   return {
     head: words.at(-1)?.word,
-    evidence: words.slice(0, -1).filter((item) => !item.generic).map((item) => item.word),
+    evidence: words
+      .slice(0, -1)
+      .filter((item) => !item.generic)
+      .map((item) => item.word),
     nonGeneric,
   }
 }
@@ -4085,8 +4084,7 @@ function targetWordMatches(left: string, right: string) {
     const suffix = dotted.slice(dotted.indexOf(".") + 1)
     return /^[a-z][a-z0-9-]*$/.test(suffix) && dotted.slice(0, dotted.indexOf(".")) === plain
   }
-  const rightCandidates = targetWordCandidates(right)
-  return [...targetWordCandidates(left)].some((candidate) => rightCandidates.has(candidate))
+  return false
 }
 
 function pathSuffix(longer: readonly string[], shorter: readonly string[]) {
@@ -4103,31 +4101,6 @@ function containsTarget(longer: string, shorter: string) {
   return longerWords
     .slice(0, longerWords.length - shorterWords.length + 1)
     .some((_, index) => shorterWords.every((word, offset) => targetWordMatches(word, longerWords[index + offset]!)))
-}
-
-const targetEsPluralWordPairs = new Map([
-  ["echoes", "echo"],
-  ["vetoes", "veto"],
-  ["zeroes", "zero"],
-])
-
-function targetWordCandidates(word: string) {
-  const candidates = new Set([word])
-  if (word.includes(".")) return candidates
-  if (word.length > 3 && word.endsWith("ies")) {
-    candidates.add(word.slice(0, -1))
-    candidates.add(`${word.slice(0, -3)}y`)
-    return candidates
-  }
-  if (targetEsPluralWordPairs.has(word)) candidates.add(targetEsPluralWordPairs.get(word)!)
-  if (word.length > 3 && word.endsWith("es")) {
-    candidates.add(word.slice(0, -1))
-    if (/(?:s|x|z|ch|sh)es$/.test(word)) candidates.add(word.slice(0, -2))
-    return candidates
-  }
-  if (word.length > 3 && word.endsWith("s") && !word.endsWith("ss") && !word.endsWith("us"))
-    candidates.add(word.slice(0, -1))
-  return candidates
 }
 
 // A copy's queue times join the survivor's: step by step when both carry the
