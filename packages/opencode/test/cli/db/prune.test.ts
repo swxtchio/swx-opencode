@@ -54,6 +54,7 @@ type Create = {
   pendingV2?: boolean
   unfinished?: boolean
   runningTool?: boolean
+  ask?: boolean
 }
 
 type ChildResult = {
@@ -150,6 +151,7 @@ const ownedCounts = (filename: string, sessionID: string) => {
       ),
       provenance: count(db, "SELECT count(*) AS rows FROM session_prompt_provenance WHERE session_id = ?", sessionID),
       receipt: count(db, "SELECT count(*) AS rows FROM session_prompt_receipt WHERE session_id = ?", sessionID),
+      ask: count(db, "SELECT count(*) AS rows FROM session_ask WHERE session_id = ?", sessionID),
       share: count(db, "SELECT count(*) AS rows FROM session_share WHERE session_id = ?", sessionID),
       eventSequence: count(db, "SELECT count(*) AS rows FROM event_sequence WHERE aggregate_id = ?", sessionID),
       event: count(db, "SELECT count(*) AS rows FROM event WHERE aggregate_id = ?", sessionID),
@@ -353,6 +355,7 @@ test("CLI apply deletes only the selected whole old Session and reclaims allocat
     queueAlias: 0,
     provenance: 0,
     receipt: 0,
+    ask: 0,
     share: 0,
     eventSequence: 0,
     event: 0,
@@ -635,6 +638,52 @@ test("a durable V2 input refuses explicit deletion while a clean control deletes
 
 test("an unfinished assistant turn refuses explicit deletion while a clean control deletes", () =>
   verifyPendingWork({ unfinished: true }, "assistant-or-tool-work-in-flight"))
+
+test("an outstanding supervised ask refuses deletion, and once settled it is deleted with its Session", async () => {
+  await using store = await producedStore([{ ask: true, payloadBytes: 512 * 1024 }, { payloadBytes: 512 * 1024 }])
+  const asked = await produce(store, { create: { ask: true, payloadBytes: 512 * 1024 } })
+  const control = await produce(store, { create: { payloadBytes: 512 * 1024 } })
+  const askedID = asked.created[0]!.id
+  const controlID = control.created[0]!.id
+  const cutoffAt = Date.now() - 5
+  backdateSession(store.filename, askedID, cutoffAt - 1_000)
+  backdateSession(store.filename, controlID, cutoffAt - 1_000)
+  const cutoff = new Date(cutoffAt).toISOString()
+  const before = ownedCounts(store.filename, askedID)
+  expect(before.ask).toBe(1)
+
+  // The producer's ask, reopened as one a server still waits on.
+  const db = new Database(store.filename)
+  const settled = db
+    .query<{ decision: string; time_settled: number }, [string]>(
+      "SELECT decision, time_settled FROM session_ask WHERE session_id = ?",
+    )
+    .get(askedID)!
+  db.query("UPDATE session_ask SET decision = NULL, time_settled = NULL, time_created = ? WHERE session_id = ?").run(
+    cutoffAt - 1_000,
+    askedID,
+  )
+  db.close()
+  const refused = await invokeHandler(store, { before: cutoff, session: [askedID], apply: true })
+  expect(refused.report.action).toBe("refused")
+  expect(refused.report.changedRows).toBe(0)
+  expect(refused.report.excludedSessions.find((entry) => entry.sessionID === askedID)?.reasons).toContain(
+    "supervised-ask-pending",
+  )
+  expect(ownedCounts(store.filename, askedID)).toEqual(before)
+  const controlResult = await invokeHandler(store, { before: cutoff, session: [controlID], apply: true })
+  expect(controlResult.report.deletedSessionIDs).toEqual([controlID])
+
+  const reopened = new Database(store.filename)
+  reopened
+    .query("UPDATE session_ask SET decision = ?, time_settled = ? WHERE session_id = ?")
+    .run(settled.decision, cutoffAt - 1_000, askedID)
+  reopened.close()
+  const applied = await invokeHandler(store, { before: cutoff, session: [askedID], apply: true })
+  expect(applied.report.action).toBe("applied")
+  expect(applied.report.deletedSessionIDs).toEqual([askedID])
+  expect(ownedCounts(store.filename, askedID)).toMatchObject({ session: 0, ask: 0 })
+})
 
 test(
   "a persisted running tool Part stays protected after its assistant turn completes",

@@ -673,6 +673,35 @@ test("unknown event ownership, malformed event data, and new Session tables rema
   }
 })
 
+test("a Session with an outstanding supervised ask stays ineligible until the ask is settled", async () => {
+  await using store = await producedStore([1])
+  const sessionID = store.trees[0]!.rootSessionID
+  const db = new Database(store.filename)
+  try {
+    const proof = evidence([sessionID], finalSequence(db, [sessionID]), store.filename)
+    expect(inventory(access(db), proof, store.now).trees[0]).toMatchObject({ eligible: true, reasons: [] })
+    // The producer's ask, reopened as one a server still waits on.
+    const settled = db
+      .query<{ decision: string; time_settled: number }, [string]>(
+        "SELECT decision, time_settled FROM session_ask WHERE session_id = ?",
+      )
+      .get(sessionID)!
+    db.query("UPDATE session_ask SET decision = NULL, time_settled = NULL WHERE session_id = ?").run(sessionID)
+    const refused = inventory(access(db), proof, store.now).trees[0]!
+    expect(refused.eligible).toBe(false)
+    expect(refused.reasons).toContain("supervised-ask-pending")
+
+    db.query("UPDATE session_ask SET decision = ?, time_settled = ? WHERE session_id = ?").run(
+      settled.decision,
+      settled.time_settled,
+      sessionID,
+    )
+    expect(inventory(access(db), proof, store.now).trees[0]).toMatchObject({ eligible: true, reasons: [] })
+  } finally {
+    db.close()
+  }
+})
+
 test(
   "apply redacts every Session-produced copy in restartable batches and preserves metric values",
   async () => {
@@ -734,6 +763,10 @@ test(
         ...db.query<{ baseline: string }, []>("SELECT baseline FROM session_context_epoch").all().map((row) => row.baseline),
         ...db.query<{ content: string }, []>("SELECT content FROM todo").all().map((row) => row.content),
         ...db.query<{ title: string }, []>("SELECT title FROM session").all().map((row) => row.title),
+        ...db
+          .query<{ request: string; decision: string }, []>("SELECT request, decision FROM session_ask")
+          .all()
+          .flatMap((row) => [row.request, row.decision]),
       ].join("\n")
     for (const sentinel of [
       "retention title sentinel",
@@ -742,6 +775,8 @@ test(
       "v2 context sentinel",
       "todo sentinel",
       "context epoch sentinel",
+      "ask question sentinel",
+      "ask answer sentinel",
     ]) {
       expect(rawCopies(first)).toContain(sentinel)
     }
