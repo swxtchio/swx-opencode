@@ -76,7 +76,19 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const db = (yield* Database.Service).db
-    const unavailable = (requestID: string) => () => new UnavailableError({ requestID, reason: "store-unavailable" })
+    // SQL failures surface as defects, so every cause but an interruption becomes an explicit store failure.
+    const unavailable =
+      (requestID: string) =>
+      <A, E, R>(self: Effect.Effect<A, E, R>): Effect.Effect<A, UnavailableError, R> =>
+        self.pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : Effect.logWarning("ask ledger store failed", { requestID, cause: Cause.pretty(cause) }).pipe(
+                  Effect.andThen(Effect.fail(new UnavailableError({ requestID, reason: "store-unavailable" }))),
+                ),
+          ),
+        )
 
     const admit = Effect.fn("AskLedger.admit")(function* (input: Parameters<Interface["admit"]>[0]) {
       const settings = AskEmit.current()
@@ -143,7 +155,7 @@ const layer = Layer.effect(
         .from(SessionAskTable)
         .where(and(eq(SessionAskTable.id, id), eq(SessionAskTable.directory, directory)))
         .get()
-        .pipe(Effect.mapError(unavailable(id)))
+        .pipe(unavailable(id))
     })
 
     const owner = (row: Row) => EventWriter.liveness(db, row.writer_id)
@@ -166,7 +178,7 @@ const layer = Layer.effect(
             }),
           { behavior: "immediate" },
         )
-        .pipe(Effect.mapError(unavailable(input.id)))
+        .pipe(unavailable(input.id))
     })
 
     const pending = Effect.fn("AskLedger.pending")(function* (kind: SessionAsk.Kind) {
@@ -183,7 +195,7 @@ const layer = Layer.effect(
         )
         .orderBy(asc(SessionAskTable.id))
         .all()
-        .pipe(Effect.mapError(unavailable(kind)))
+        .pipe(unavailable(kind))
       const holders = yield* Effect.forEach(rows, (row) => owner(row))
       return rows.filter((_, index) => holders[index] === "self" || holders[index] === "gone")
     })
