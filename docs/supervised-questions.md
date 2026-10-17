@@ -13,8 +13,7 @@ An ask is one of:
 - a **permission request** that the permission rules leave as `ask`. An operation the rules allow or deny is
   decided by the rules and never emitted.
 
-Without the flag nothing changes: no ask is recorded or emitted, and `opencode run` keeps refusing questions, plan
-exits and permission requests as before.
+Without the flag nothing changes: no ask is recorded or emitted.
 
 ## Launching
 
@@ -26,18 +25,6 @@ OPENCODE_SERVER_PASSWORD=... opencode serve --port 4096 \
 - `--questions emit` requires `--questions-command`, and `--questions-command` requires `--questions emit`.
 - The command must be an executable path or a name on `PATH`. It is checked at startup.
 - Only argv sets either option. Project or global config cannot enable emission or choose its command.
-
-`opencode run` takes the same options:
-
-- `opencode run --questions emit --questions-command <cmd> "<message>"` runs locally and listens on
-  `127.0.0.1` so the answer route exists. Pass `--port` to fix the port. It prints
-  `questions are emitted; answer them on <url>` to stderr. For each ask it prints a `question asked:` or
-  `permission requested:` line with the request ID, then waits for the answer.
-- `opencode run --attach <url> --questions emit "<message>"` leaves asks to the server it attaches to. That server
-  must run with `--questions emit`, and `--questions-command` is refused here because the transport belongs to the
-  server.
-- `--auto` (and its aliases) is refused with `--questions emit`, which emits every permission request instead of
-  approving it. `--questions emit` is refused for the interactive split-footer mode.
 
 ## The receiver
 
@@ -148,7 +135,7 @@ model as feedback).
 
 ## Humans
 
-The human routes keep working: the TUI, `opencode run --mini`, and the SDK's `question.reply`, `question.reject` and
+The human routes keep working: the TUI and the SDK's `question.reply`, `question.reject` and
 `permission.reply` settle the same ask as the answer route, and whichever is first wins. They return `true` when
 their call settled the ask and their usual not-found error otherwise, including when the ask was already settled.
 Every settlement publishes the usual `question.replied`, `question.rejected` or `permission.replied` event, so an

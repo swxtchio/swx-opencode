@@ -3,9 +3,9 @@ export * as AskEmit from "./emit"
 import { Cause, Effect, Exit } from "effect"
 import type { SessionAsk } from "@opencode-ai/schema/session-ask"
 
-// `--questions emit` (swxtchio/swx-opencode#286). Only `serve` and `run` set
-// this, from the operator's own argv, so neither project config nor anything a
-// model writes can enable emission or choose where it goes.
+// `--questions emit` (swxtchio/swx-opencode#286). Only `serve` sets this, from
+// the operator's own argv, so neither project config nor anything a model
+// writes can enable emission or choose where it goes.
 export type Settings = {
   // An executable run directly, never through a shell, with one ask's JSON on stdin.
   readonly command: string

@@ -189,7 +189,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Features
 
-- **#288** `opencode serve` and `opencode run` take `--questions emit --questions-command <cmd>`
+- **#288** `opencode serve` takes `--questions emit --questions-command <cmd>`
   (swxtchio/swx-opencode#286): question choices and free text, plan acceptance and permission asks are recorded in
   the `session_ask` ledger (migration `20261017192742`), emitted as JSON to the operator's command, and stay pending
   until settled once by the new `POST /question/:id/answer` and `/permission/:id/answer` routes or a human reply.

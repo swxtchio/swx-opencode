@@ -1,7 +1,7 @@
 import type { Argv, InferredOptionTypes } from "yargs"
 
-// `--questions emit` (swxtchio/swx-opencode#286): the operator's choice, on `serve` and `run`, to deliver every ask a
-// model raises to a supervisor command instead of leaving it to a human-only modal. Only argv sets it.
+// `--questions emit` (swxtchio/swx-opencode#286): the operator's choice, on `serve`, to deliver every ask a model
+// raises to a supervisor command instead of leaving it to a human-only modal. Only argv sets it.
 const options = {
   questions: {
     type: "string" as const,

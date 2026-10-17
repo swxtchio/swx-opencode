@@ -26,7 +26,6 @@ import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@openc
 import { NamedError } from "@opencode-ai/core/util/error"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
-import { resolveQuestionCommand, withQuestionOptions } from "../questions"
 
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
 
@@ -146,7 +145,7 @@ export const RunCommand = effectCmd({
   // The handler also chdirs (preserving the legacy order: chdir → file resolution).
   directory: (args) => (args.dir && !args.attach ? path.resolve(process.cwd(), args.dir) : process.cwd()),
   builder: (yargs: Argv) =>
-    withQuestionOptions(yargs)
+    yargs
       .positional("message", {
         describe: "message to send",
         type: "string",
@@ -286,8 +285,6 @@ export const RunCommand = effectCmd({
       const rawMessage = [...args.message, ...(args["--"] || [])].join(" ")
       const interactive = args.mini
       const auto = args.auto || args.yolo || args["dangerously-skip-permissions"]
-      // --questions emit: asks reach the operator's supervisor and wait for an answer rather than being refused here.
-      const supervised = args.questions === "emit"
       const thinking = interactive ? (args.thinking ?? true) : (args.thinking ?? false)
       const die = (message: string): never => {
         UI.error(message)
@@ -335,21 +332,6 @@ export const RunCommand = effectCmd({
       if (interactive && !process.stdout.isTTY) {
         die("--mini requires a TTY stdout")
       }
-
-      if (supervised && interactive) {
-        die("--questions emit requires a non-interactive run")
-      }
-
-      if (supervised && auto) {
-        die("--auto cannot be used with --questions emit, which emits every permission request for an answer")
-      }
-
-      if (args.attach && args["questions-command"] !== undefined) {
-        die("--questions-command belongs to the attached server; start it with opencode serve --questions emit")
-      }
-
-      const questions = args.attach ? undefined : resolveQuestionCommand(args)
-      if (questions && "error" in questions) die(questions.error)
 
       if (interactive) {
         try {
@@ -458,26 +440,25 @@ export const RunCommand = effectCmd({
         process.exit(1)
       }
 
-      const rules: PermissionV1.Ruleset =
-        interactive || supervised
-          ? []
-          : [
-              {
-                permission: "question",
-                action: "deny",
-                pattern: "*",
-              },
-              {
-                permission: "plan_enter",
-                action: "deny",
-                pattern: "*",
-              },
-              {
-                permission: "plan_exit",
-                action: "deny",
-                pattern: "*",
-              },
-            ]
+      const rules: PermissionV1.Ruleset = interactive
+        ? []
+        : [
+            {
+              permission: "question",
+              action: "deny",
+              pattern: "*",
+            },
+            {
+              permission: "plan_enter",
+              action: "deny",
+              pattern: "*",
+            },
+            {
+              permission: "plan_exit",
+              action: "deny",
+              pattern: "*",
+            },
+          ]
 
       function title() {
         if (args.title === undefined) return
@@ -843,28 +824,9 @@ export const RunCommand = effectCmd({
               break
             }
 
-            if (supervised && event.type === "question.asked") {
-              if (!sessions.has(event.properties.sessionID)) continue
-              const headers = event.properties.questions.map((item) => item.header).join(", ")
-              UI.println(
-                UI.Style.TEXT_WARNING_BOLD + "?",
-                UI.Style.TEXT_NORMAL + `question asked: ${headers} (${event.properties.id}); waiting for its answer`,
-              )
-              continue
-            }
-
             if (event.type === "permission.asked") {
               const permission = event.properties
               if (!sessions.has(permission.sessionID)) continue
-
-              if (supervised) {
-                UI.println(
-                  UI.Style.TEXT_WARNING_BOLD + "!",
-                  UI.Style.TEXT_NORMAL +
-                    `permission requested: ${permission.permission} (${permission.patterns.join(", ")}) (${permission.id}); waiting for its answer`,
-                )
-                continue
-              }
 
               if (auto) {
                 await client.permission.reply({
@@ -1038,19 +1000,6 @@ export const RunCommand = effectCmd({
         return await execute(sdk)
       }
 
-      if (questions && "command" in questions) {
-        // The emitted asks name this listener as the place to answer them, so the run drives its Session through the
-        // same listener: one service graph holds both the waiting tool and the route that answers it.
-        const { Server } = await import("@/server/server")
-        const { AskEmit } = await import("@/ask/emit")
-        const server = await Server.listen({ hostname: "127.0.0.1", port: args.port ?? 0 })
-        AskEmit.configure({ command: questions.command, server: server.url.origin })
-        UI.println(UI.Style.TEXT_INFO_BOLD + "~  " + `questions are emitted; answer them on ${server.url.origin}`)
-        return await execute(
-          createOpencodeClient({ baseUrl: server.url.origin, directory, headers: ServerAuth.headers() }),
-        )
-      }
-
       const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
         const { Server } = await import("@/server/server")
         const request = new Request(input, init)
@@ -1122,8 +1071,5 @@ export async function runMini(input: MiniCommandInput) {
     "dangerously-skip-permissions": false,
     dangerouslySkipPermissions: false,
     demo: input.demo ?? false,
-    questions: undefined,
-    "questions-command": undefined,
-    questionsCommand: undefined,
   })
 }

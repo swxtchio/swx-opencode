@@ -228,7 +228,7 @@ const table = sqliteTable("session", {
 
 ## Supervised Asks (fork)
 
-- `--questions emit` (#286, `docs/supervised-questions.md`) is set only from `serve`/`run` argv into `AskEmit`
+- `--questions emit` (#286, `docs/supervised-questions.md`) is set only from `serve` argv into `AskEmit`
   (`packages/opencode/src/ask/emit.ts`); never read it from config. With it off, `Question` and `Permission` keep
   their stock in-memory paths and write no `session_ask` row.
 - Every emitted ask is settled once through the ledger (`packages/opencode/src/ask/ledger.ts`, immediate
