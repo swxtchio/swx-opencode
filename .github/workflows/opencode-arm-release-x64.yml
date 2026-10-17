@@ -1,0 +1,148 @@
+name: native x64 release proof
+
+on:
+  pull_request:
+    branches:
+      - swxtch
+
+concurrency:
+  group: native-x64-release-proof-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_COMMIT: 0ff0dfbca1f01765f6bd41d0379d9b97f1cf8d23
+  OPENCODE_VERSION: 1.18.32-swxtch.0ff0dfbc
+  TURBO_TELEMETRY_DISABLED: 1
+  DO_NOT_TRACK: 1
+
+jobs:
+  release-proof:
+    if: github.repository == 'swxtchio/swx-opencode'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout proof harness
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Checkout pinned release source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: 0ff0dfbca1f01765f6bd41d0379d9b97f1cf8d23
+          path: source
+          fetch-depth: 0
+
+      - name: Verify native runner and install pinned source dependencies
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          bun -e 'if (process.platform !== "linux" || process.arch !== "x64") throw new Error(`not a native linux-x64 runner: ${process.platform}-${process.arch}`); console.log(`Bun ${Bun.version} ${process.platform}-${process.arch}`)'
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
+          git -C source merge-base --is-ancestor 4b87478ddf "$SOURCE_COMMIT"
+          package_version=$(node -p "require('./source/packages/opencode/package.json').version")
+          short_sha=$(git -C source rev-parse --short=8 HEAD)
+          test "${package_version}-swxtch.${short_sha}" = "$OPENCODE_VERSION"
+          sha256sum source/bun.lock | tee "$RUNNER_TEMP/bun.lock.sha256"
+          bun install --cwd source --frozen-lockfile --os=linux --cpu=x64
+
+      - name: Pin build data and build native linux-x64
+        working-directory: source
+        env:
+          MODELS_DEV_API_JSON: ${{ runner.temp }}/models.dev.json
+          OPENCODE_BUILD_DIST: ${{ runner.temp }}/opencode-dist
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --silent --show-error --max-time 180 \
+            https://models.dev/api.json --output "$MODELS_DEV_API_JSON"
+          sha256sum "$MODELS_DEV_API_JSON" | tee "$RUNNER_TEMP/models.dev.sha256"
+          env -u OPENCODE_RELEASE -u OPENCODE_CHANNEL -u OPENCODE_BUMP -u GH_REPO \
+            OPENCODE_VERSION="$OPENCODE_VERSION" \
+            MODELS_DEV_API_JSON="$MODELS_DEV_API_JSON" \
+            OPENCODE_BUILD_DIST="$OPENCODE_BUILD_DIST" \
+            bun run packages/opencode/script/build.ts --single --skip-install 2>&1 | tee "$RUNNER_TEMP/build.log"
+          test -x "$OPENCODE_BUILD_DIST/opencode-linux-x64/bin/opencode"
+          test ! -e "$OPENCODE_BUILD_DIST/opencode-linux-arm64/bin/opencode"
+          test -z "$(git status --porcelain)"
+
+      - name: Package and attest extracted x64 archive
+        working-directory: source
+        env:
+          OPENCODE_BUILD_DIST: ${{ runner.temp }}/opencode-dist
+        run: |
+          set -euo pipefail
+          asset_dir="$RUNNER_TEMP/release-assets"
+          extracted="$RUNNER_TEMP/release-extracted"
+          proof="$RUNNER_TEMP/native-x64-proof"
+          mkdir -p "$asset_dir" "$extracted" "$proof"
+          bin="$OPENCODE_BUILD_DIST/opencode-linux-x64/bin"
+          shopt -s nullglob
+          sidecars=("$bin"/libfff_c-*.so)
+          test "${#sidecars[@]}" -eq 1
+          sidecar_name=$(basename "${sidecars[0]}")
+          file "$bin/opencode" "${sidecars[0]}"
+          tar -czf "$asset_dir/opencode-linux-x64.tar.gz" -C "$bin" opencode "$sidecar_name"
+          (cd "$asset_dir" && sha256sum opencode-linux-x64.tar.gz > opencode-linux-x64.tar.gz.sha256 && sha256sum -c opencode-linux-x64.tar.gz.sha256)
+          entries=$(tar -tzf "$asset_dir/opencode-linux-x64.tar.gz" | sort)
+          expected=$(printf '%s\n' opencode "$sidecar_name" | sort)
+          test "$entries" = "$expected"
+          tar -xzf "$asset_dir/opencode-linux-x64.tar.gz" -C "$extracted"
+          file "$extracted/opencode" "$extracted/$sidecar_name"
+          version_output=$("$extracted/opencode" --version)
+          test "$version_output" = "$OPENCODE_VERSION"
+          printf '%s\n' "$version_output" | tee "$RUNNER_TEMP/x64-version.txt"
+          OPENCODE_VERSION="$OPENCODE_VERSION" bun run packages/opencode/script/release-probe.ts \
+            x64 "$extracted/opencode" "$proof" 2>&1 | tee "$RUNNER_TEMP/native-x64-proof.log"
+          python3 - "$RUNNER_TEMP" "$SOURCE_COMMIT" "$OPENCODE_VERSION" "$sidecar_name" <<'PY'
+          import hashlib, json, pathlib, subprocess, sys
+          root = pathlib.Path(sys.argv[1])
+          source = sys.argv[2]
+          version = sys.argv[3]
+          sidecar = sys.argv[4]
+          archive = root / "release-assets/opencode-linux-x64.tar.gz"
+          evidence = json.loads((root / "native-x64-proof/evidence.json").read_text())
+          lock = (root / "bun.lock.sha256").read_text().split()[0]
+          models = (root / "models.dev.sha256").read_text().split()[0]
+          metadata = {
+              "source_commit": source,
+              "version": version,
+              "target": "linux-x64",
+              "build_classification": "native target build and runtime on ubuntu-latest x86_64",
+              "runner_arch": subprocess.check_output(["uname", "-m"], text=True).strip(),
+              "bun_version": subprocess.check_output(["bun", "--version"], text=True).strip(),
+              "bun_lock_sha256": lock,
+              "models_dev_sha256": models,
+              "archive": archive.name,
+              "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+              "binary_version": (root / "x64-version.txt").read_text().strip(),
+              "fff_sidecar": sidecar,
+              "proof": evidence,
+          }
+          (root / "x64-provenance.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          print(json.dumps(metadata, indent=2))
+          PY
+
+      - name: Upload x64 archive, checksum, and execution evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-linux-x64-release-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/release-assets/opencode-linux-x64.tar.gz
+            ${{ runner.temp }}/release-assets/opencode-linux-x64.tar.gz.sha256
+            ${{ runner.temp }}/native-x64-proof/evidence.json
+            ${{ runner.temp }}/native-x64-proof/opencode-server.log
+            ${{ runner.temp }}/native-x64-proof.log
+            ${{ runner.temp }}/x64-version.txt
+            ${{ runner.temp }}/x64-provenance.json
+            ${{ runner.temp }}/build.log
+            ${{ runner.temp }}/bun.lock.sha256
+            ${{ runner.temp }}/models.dev.sha256
+          if-no-files-found: error
+          retention-days: 14
