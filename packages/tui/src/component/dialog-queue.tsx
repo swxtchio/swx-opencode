@@ -100,7 +100,24 @@ export function DialogQueue(props: { sessionID: string }) {
     const list = items()
     const index = list.findIndex((item) => item.id === id)
     const neighbour = list[index + step]
-    if (index < 0 || !neighbour || neighbour.delivery !== list[index]!.delivery) return
+    if (index < 0) {
+      toast.show({ variant: "info", message: "That queued prompt is no longer available." })
+      return
+    }
+    if (!neighbour) {
+      toast.show({
+        variant: "info",
+        message:
+          step < 0
+            ? "This prompt is already earliest in its delivery group."
+            : "This prompt is already latest in its delivery group.",
+      })
+      return
+    }
+    if (neighbour.delivery !== list[index]!.delivery) {
+      toast.show({ variant: "info", message: "Prompts cannot move across delivery types." })
+      return
+    }
     const order = list.map((item) => item.id)
     order[index] = neighbour.id
     order[index + step] = id
@@ -132,6 +149,20 @@ export function DialogQueue(props: { sessionID: string }) {
 
   // The list may still change until the hold is confirmed, so it is edited only then.
   const locked = () => hold() !== "held"
+  const explainLocked = () => {
+    active()
+    toast.show({
+      variant: "warning",
+      message:
+        hold() === "pending"
+          ? "Delivery is not paused yet; wait for the hold to be confirmed."
+          : "Delivery is NOT paused because the hold failed.",
+    })
+  }
+  const explainUnavailable = (message: string) => () => {
+    active()
+    toast.show({ variant: "info", message })
+  }
 
   // Mouse use anywhere on the view, scrolling included, counts as activity.
   return (
@@ -154,6 +185,8 @@ export function DialogQueue(props: { sessionID: string }) {
             command: "dialog.queue.delete",
             title: "delete",
             disabled: locked,
+            onDisabledTrigger: explainLocked,
+            onUnavailableTrigger: explainUnavailable("No queued prompt is selected."),
             onTrigger: (option) => {
               active()
               void checked(sdk.client.session.queue.remove({ sessionID: props.sessionID, id: option.value })).catch(
@@ -165,6 +198,8 @@ export function DialogQueue(props: { sessionID: string }) {
             command: "dialog.queue.move_up",
             title: "earlier",
             disabled: locked,
+            onDisabledTrigger: explainLocked,
+            onUnavailableTrigger: explainUnavailable("No queued prompt is selected."),
             onTrigger: (option) => {
               active()
               move(option.value, -1)
@@ -174,6 +209,8 @@ export function DialogQueue(props: { sessionID: string }) {
             command: "dialog.queue.move_down",
             title: "later",
             disabled: locked,
+            onDisabledTrigger: explainLocked,
+            onUnavailableTrigger: explainUnavailable("No queued prompt is selected."),
             onTrigger: (option) => {
               active()
               move(option.value, 1)
@@ -183,11 +220,31 @@ export function DialogQueue(props: { sessionID: string }) {
             command: "dialog.queue.consolidate",
             title: "consolidate",
             disabled: locked,
+            onDisabledTrigger: explainLocked,
+            onUnavailableTrigger: explainUnavailable("Nothing to consolidate."),
             onTrigger: () => {
               active()
-              void checked(sdk.client.session.queue.consolidate({ sessionID: props.sessionID })).catch(
-                failed("consolidate"),
+              const before = new Map(
+                items().map(
+                  (item) => [item.id, { text: preview(item), origins: JSON.stringify(item.origins) }] as const,
+                ),
               )
+              void checked(sdk.client.session.queue.consolidate({ sessionID: props.sessionID }))
+                .then((result) => {
+                  if (!result.data) {
+                    toast.show({ variant: "info", message: "Nothing to consolidate." })
+                    return
+                  }
+                  const merged = result.data.some((item) => {
+                    const old = before.get(item.id)
+                    return (
+                      old !== undefined && (old.text !== preview(item) || old.origins !== JSON.stringify(item.origins))
+                    )
+                  })
+                  sync.queue.listed(props.sessionID, result.data)
+                  if (!merged) toast.show({ variant: "info", message: "Nothing to consolidate." })
+                })
+                .catch(failed("consolidate"))
             },
           },
         ]}

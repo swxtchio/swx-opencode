@@ -342,12 +342,7 @@ export interface Interface {
    * with nothing changed, when any of them is not pending.
    */
   readonly reorder: (sessionID: SessionID, itemIDs: readonly ItemID[]) => Effect.Effect<Option.Option<Item[]>>
-  /**
-   * Keeps the first of identical pending items, then merges similar commands of
-   * one category into the first of them as numbered steps; see `consolidation`.
-   * `markers` are the configured machine-message markers, whose messages never
-   * merge as commands. Returns the resulting pending list.
-   */
+  /** Keeps related pending work together without crossing delivery classes; see `consolidation`. */
   readonly consolidate: (
     sessionID: SessionID,
     markers?: ConfigV1.Info["machine_message_markers"],
@@ -3319,49 +3314,47 @@ function elapsed(ms: number) {
 }
 
 /**
- * The consolidate button's plan over pending items in promotion order (#212).
- * Identical items, in any category, collapse into the first: it keeps its
- * place, takes the newest copy's admission time, and keeps every copy's queue
- * time. Then commands that share a category, a leading verb (any case) and a
- * target, the next word, merge into the first of them as `<verb> <target>:` and
- * numbered steps in promotion order, each step keeping its own queue times. A
- * command is a prompt of one plain text part, `<verb> <target> [step]`; a bare
- * `<verb> <target>` is its own step, and a merged command parses back into its
- * own steps, so a later consolidation adds to them. A machine message (one
- * `markers` or the built-in envelopes mark) is never a command. Commands merge
- * only with the same agent and options, which their steps then share. The model
- * and variant a prompt was sent with decide nothing, since a pending prompt runs
- * at the session's selection when it is delivered.
+ * Keep each delivery class and recipient context intact; the earliest item
+ * keeps its place, and merged command steps follow admission order.
  */
 export function consolidation(items: readonly Item[], markers?: ConfigV1.Info["machine_message_markers"]) {
-  const copies = Map.groupBy(items, (item) => copyKey(item, markers))
-  const kept = [...copies.values()].map((group) => ({
-    item: {
-      ...group[0]!,
-      time: { created: Math.max(...group.map((copy) => copy.time.created)) },
-      origins: group.slice(1).reduce((origins, copy) => repeated(origins, copy.origins), group[0]!.origins),
-    },
-    collapsed: group.length > 1,
-  }))
-  const groups = Map.groupBy(
-    kept.flatMap((entry) => {
-      const command =
-        marked(entry.item.input, markers) || humanComposer(entry.item.input, markers)
-          ? undefined
-          : parseCommand(entry.item.input)
-      if (!command) return []
-      return [{ item: entry.item, command, key: commandKey(entry.item, command) }]
-    }),
-    (entry) => entry.key,
+  const copies = copyGroups(items, markers)
+  const kept = copies.map((group) => ({ item: group.item, collapsed: group.sources.length > 1 }))
+  const commands = kept.flatMap((entry) => {
+    if (marked(entry.item.input, markers) || humanComposer(entry.item.input, markers)) return []
+    const command = parseCommand(entry.item.input)
+    return command ? [{ item: entry.item, command, key: commandKey(entry.item, command) }] : []
+  })
+  const groups = Map.groupBy(commands, (entry) => entry.key)
+  const merges = [...groups.values()].flatMap((group) =>
+    group
+      .reduce<Array<(typeof group)[number][]>>((batches, entry) => {
+        const batch = batches.find((candidate) =>
+          candidate.every((other) => sameCommand(other.item, other.command, entry.item, entry.command)),
+        )
+        if (batch) batch.push(entry)
+        else batches.push([entry])
+        return batches
+      }, [])
+      .filter((batch) => batch.length > 1),
   )
-  const merges = [...groups.values()].filter((group) => group.length > 1)
   const mergedAway = new Set(merges.flatMap((group) => group.slice(1).map((entry) => entry.item.id)))
   const heads = new Map(
     merges.map((group) => {
       const first = group[0]!
       const text = [
         `${first.command.verb} ${first.command.target}:`,
-        ...group.flatMap((entry) => entry.command.steps).map((step, index) => `${index + 1}. ${step}`),
+        ...group
+          .flatMap((entry) =>
+            entry.command.steps.map((step) => {
+              if (normalizeTarget(entry.command.target) === normalizeTarget(first.command.target)) return step
+              if (normalizeText(step) === normalizeText(plainText(entry.item.input) ?? "")) return step
+              const target = `${entry.command.target}:`
+              if (normalizeText(step).startsWith(normalizeText(target))) return step
+              return `${target} ${step}`
+            }),
+          )
+          .map((step, index) => `${index + 1}. ${step}`),
       ].join("\n")
       return [
         first.item.id,
@@ -3385,9 +3378,9 @@ export function consolidation(items: readonly Item[], markers?: ConfigV1.Info["m
   return {
     // Which items each survivor took in, copies first, then merged commands.
     into: [
-      ...[...copies.values()]
-        .filter((group) => group.length > 1)
-        .map((group) => ({ into: group[0]!.id, items: group.slice(1).map((copy) => copy.id) })),
+      ...copies
+        .filter((group) => group.sources.length > 1)
+        .map((group) => ({ into: group.item.id, items: group.sources.slice(1).map((source) => source.id) })),
       ...merges.map((group) => ({ into: group[0]!.item.id, items: group.slice(1).map((entry) => entry.item.id) })),
     ],
     removed: items.filter((item) => !survivors.has(item.id) || mergedAway.has(item.id)).map((item) => item.id),
@@ -3397,6 +3390,68 @@ export function consolidation(items: readonly Item[], markers?: ConfigV1.Info["m
       return entry.collapsed && !mergedAway.has(entry.item.id) ? [entry.item] : []
     }),
   }
+}
+
+function copyGroups(items: readonly Item[], markers?: ConfigV1.Info["machine_message_markers"]) {
+  const exact = [...Map.groupBy(items, (item) => copyKey(item, markers)).values()].map((sources) => ({
+    item: {
+      ...sources[0]!,
+      time: { created: Math.max(...sources.map((source) => source.time.created)) },
+      origins: sources.slice(1).reduce((origins, source) => repeated(origins, source.origins), sources[0]!.origins),
+    },
+    sources,
+    order: items.indexOf(sources[0]!),
+  }))
+  const candidates = exact.flatMap((entry) => {
+    const text = plainText(entry.item.input)
+    if (!text || marked(entry.item.input, markers) || humanComposer(entry.item.input, markers)) return []
+    const normalized = normalizeText(text)
+    if (!normalized) return []
+    return [{ entry, text, normalized, context: copyContextKey(entry.item), command: parseCommand(entry.item.input) }]
+  })
+  const grouped = new Set<(typeof exact)[number]>()
+  const merged = [...Map.groupBy(candidates, (candidate) => candidate.context).values()].flatMap((group) => {
+    const ordered = group.toSorted(
+      (left, right) => right.normalized.length - left.normalized.length || left.entry.order - right.entry.order,
+    )
+    return ordered.flatMap((candidate) => {
+      if (grouped.has(candidate.entry)) return []
+      // Same-job command prefixes keep ordered steps; other prefixes retain their longest text.
+      const matching = ordered.filter((other) => {
+        if (grouped.has(other.entry) || !textPrefix(other.normalized, candidate.normalized)) return false
+        if (other.normalized === candidate.normalized) return true
+        if (!other.command || !candidate.command) return true
+        if (sameCommand(other.entry.item, other.command, candidate.entry.item, candidate.command)) return false
+        return targetText(targetSubject(other.command.target)) === targetText(targetSubject(candidate.command.target))
+      })
+      matching.forEach((other) => grouped.add(other.entry))
+      if (matching.length === 1) return [candidate.entry]
+      const originals = matching.toSorted((left, right) => left.entry.order - right.entry.order)
+      const first = originals[0]!.entry
+      return [
+        {
+          item: {
+            ...first.item,
+            input: {
+              ...first.item.input,
+              parts: first.item.input.parts.map((part) =>
+                part.type === "text" && !part.synthetic && !pendingOriginal(part)
+                  ? { ...part, text: candidate.text }
+                  : part,
+              ),
+            },
+            time: { created: Math.max(...originals.map((original) => original.entry.item.time.created)) },
+            origins: originals.flatMap((original) => original.entry.item.origins),
+          },
+          sources: originals.flatMap((original) => original.entry.sources),
+          order: first.order,
+        },
+      ]
+    })
+  })
+  return [...exact.filter((entry) => !grouped.has(entry)), ...merged].toSorted(
+    (left, right) => left.order - right.order,
+  )
 }
 
 /**
@@ -3455,7 +3510,7 @@ export function admission(pending: readonly Item[], added: Item, markers?: Confi
         )
           return false
         const other = parseCommand(item.input)
-        return other !== undefined && commandKey(item, other) === commandKey(added, command)
+        return other !== undefined && sameCommand(item, other, added, command)
       })
     : undefined
   return { absorbed: absorbed.map((item) => item.id), superseded: superseded.map((item) => item.id), into: into?.id }
@@ -3468,16 +3523,24 @@ function envelopeOf(item: Item) {
 }
 
 function copyKey(item: Item, markers?: ConfigV1.Info["machine_message_markers"]) {
-  const key = JSON.stringify(withoutUndefined(comparable(item.input)))
+  const key = JSON.stringify([item.delivery, withoutUndefined(comparable(item.input))])
   return humanComposer(item.input, markers) ? `${key}\n${item.id}` : key
 }
 
-// Commands merge within one delivery, verb (any case) and target, and with the
-// same agent and options.
+// The key keeps commands with different delivery or request context apart.
 function commandKey(item: Item, command: { readonly verb: string; readonly target: string }) {
   const normalized = comparable(item.input)
   const context = withoutUndefined({ ...normalized, parts: [{ ...normalized.parts[0], text: "" }] })
-  return JSON.stringify([item.delivery, command.verb.toLowerCase(), command.target, context])
+  return JSON.stringify([item.delivery, command.verb.toLowerCase(), context])
+}
+
+function sameCommand(
+  leftItem: Item,
+  left: { readonly verb: string; readonly target: string },
+  rightItem: Item,
+  right: { readonly verb: string; readonly target: string },
+) {
+  return commandKey(leftItem, left) === commandKey(rightItem, right) && targetMatches(left.target, right.target)
 }
 
 // What two inputs are compared by: never their transport IDs, nor the model and
@@ -3495,6 +3558,549 @@ function marked(input: SessionPromptQueue.QueuedInput, markers?: ConfigV1.Info["
     return true
   const text = input.parts.flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : [])).join("")
   return MachineMessage.classify(text, markers) !== undefined
+}
+
+const conversationalLeads = new Set([
+  "a",
+  "an",
+  "can",
+  "could",
+  "do",
+  "does",
+  "did",
+  "how",
+  "i",
+  "it",
+  "please",
+  "should",
+  "that",
+  "the",
+  "these",
+  "they",
+  "this",
+  "those",
+  "we",
+  "what",
+  "when",
+  "where",
+  "which",
+  "who",
+  "why",
+  "would",
+  "you",
+])
+
+// Common nouns and grammatical words do not identify a target by themselves.
+const genericTargetWords = new Set([
+  "a",
+  "about",
+  "after",
+  "all",
+  "also",
+  "additional",
+  "although",
+  "am",
+  "an",
+  "any",
+  "and",
+  "app",
+  "application",
+  "area",
+  "are",
+  "as",
+  "at",
+  "bad",
+  "be",
+  "because",
+  "been",
+  "before",
+  "being",
+  "between",
+  "both",
+  "but",
+  "by",
+  "broken",
+  "bug",
+  "buggy",
+  "can",
+  "cannot",
+  "could",
+  "change",
+  "changes",
+  "class",
+  "code",
+  "codebase",
+  "component",
+  "current",
+  "did",
+  "do",
+  "does",
+  "deprecated",
+  "directory",
+  "doc",
+  "docs",
+  "documentation",
+  "duplicate",
+  "during",
+  "each",
+  "either",
+  "existing",
+  "extra",
+  "else",
+  "ever",
+  "every",
+  "few",
+  "failure",
+  "failures",
+  "feature",
+  "flaky",
+  "for",
+  "file",
+  "files",
+  "from",
+  "full",
+  "further",
+  "had",
+  "has",
+  "have",
+  "he",
+  "her",
+  "here",
+  "hers",
+  "herself",
+  "him",
+  "himself",
+  "his",
+  "failing",
+  "failed",
+  "flow",
+  "folder",
+  "function",
+  "general",
+  "get",
+  "got",
+  "hence",
+  "how",
+  "inaccurate",
+  "in",
+  "into",
+  "is",
+  "it",
+  "its",
+  "itself",
+  "incorrect",
+  "index",
+  "issue",
+  "invalid",
+  "i",
+  "if",
+  "just",
+  "line",
+  "lines",
+  "many",
+  "may",
+  "main",
+  "me",
+  "might",
+  "method",
+  "more",
+  "most",
+  "missing",
+  "must",
+  "my",
+  "myself",
+  "neither",
+  "module",
+  "much",
+  "no",
+  "nor",
+  "not",
+  "nothing",
+  "now",
+  "new",
+  "of",
+  "once",
+  "on",
+  "or",
+  "other",
+  "others",
+  "our",
+  "ours",
+  "ourselves",
+  "old",
+  "package",
+  "part",
+  "per",
+  "primary",
+  "problem",
+  "project",
+  "prompt",
+  "rather",
+  "repo",
+  "repository",
+  "related",
+  "same",
+  "shall",
+  "she",
+  "secondary",
+  "section",
+  "simple",
+  "since",
+  "slow",
+  "so",
+  "source",
+  "specific",
+  "src",
+  "stale",
+  "such",
+  "step",
+  "steps",
+  "than",
+  "that",
+  "system",
+  "suite",
+  "themselves",
+  "them",
+  "then",
+  "there",
+  "task",
+  "these",
+  "the",
+  "they",
+  "this",
+  "test",
+  "tests",
+  "those",
+  "thing",
+  "things",
+  "though",
+  "through",
+  "ts",
+  "tsx",
+  "too",
+  "under",
+  "until",
+  "up",
+  "upon",
+  "js",
+  "jsx",
+  "json",
+  "md",
+  "us",
+  "very",
+  "was",
+  "we",
+  "were",
+  "what",
+  "whatever",
+  "when",
+  "whenever",
+  "where",
+  "whereas",
+  "wherever",
+  "whether",
+  "which",
+  "whichever",
+  "while",
+  "who",
+  "whoever",
+  "whom",
+  "whose",
+  "why",
+  "py",
+  "rs",
+  "go",
+  "java",
+  "kt",
+  "swift",
+  "css",
+  "html",
+  "xml",
+  "yaml",
+  "yml",
+  "toml",
+  "sh",
+  "sql",
+  "will",
+  "with",
+  "within",
+  "without",
+  "would",
+  "you",
+  "your",
+  "yours",
+  "yourself",
+  "yourselves",
+  "to",
+  "unused",
+  "updated",
+  "vulnerable",
+  "work",
+  "wrong",
+])
+
+function plainText(input: SessionPromptQueue.QueuedInput) {
+  const parts = input.parts.filter((part) => !pendingOriginal(part))
+  if (parts.length !== 1 || parts[0]?.type !== "text" || parts[0].synthetic) return
+  return parts[0].text
+}
+
+function copyContextKey(item: Item) {
+  const input = comparable(item.input)
+  return JSON.stringify([
+    item.delivery,
+    withoutUndefined({
+      ...input,
+      parts: input.parts.map((part) => (part.type === "text" ? { ...part, text: "" } : part)),
+    }),
+  ])
+}
+
+function normalizeText(text: string) {
+  return text.trim().toLowerCase().replace(/\s+/g, " ")
+}
+
+function textPrefix(shorter: string, longer: string) {
+  return shorter === longer || (longer.startsWith(shorter) && !/[a-z0-9_]/i.test(longer[shorter.length]!))
+}
+
+function normalizeTarget(target: string) {
+  return target
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[.,;:!?]+$/g, "")
+    .replace(/^(?:(?:a|an|the)\s+)+/, "")
+}
+
+const targetComplements = new Set([
+  "about",
+  "after",
+  "as",
+  "at",
+  "before",
+  "by",
+  "for",
+  "from",
+  "in",
+  "into",
+  "of",
+  "on",
+  "over",
+  "through",
+  "to",
+  "under",
+  "with",
+  "within",
+  "without",
+])
+
+const targetClauseConjunctions = new Set(["and", "but", "or"])
+const targetClauseOpeners = new Set(["how", "what", "when", "where", "whether", "which", "who", "why"])
+
+const targetFileSuffixes = new Set([
+  "ts",
+  "tsx",
+  "js",
+  "jsx",
+  "mjs",
+  "cjs",
+  "py",
+  "go",
+  "rs",
+  "sh",
+  "md",
+  "json",
+  "yaml",
+  "yml",
+  "toml",
+  "proto",
+  "sql",
+  "c",
+  "h",
+  "cpp",
+  "hpp",
+  "rb",
+  "php",
+  "java",
+  "kt",
+  "swift",
+  "vue",
+  "svelte",
+  "css",
+  "scss",
+  "html",
+  "env",
+  "cfg",
+  "ini",
+  "lock",
+])
+
+function targetSubject(target: string) {
+  const normalized = normalizeTarget(target)
+  if (targetPaths(target).length > 0) return normalized
+  const subject = target
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[.,;:!?]+$/g, "")
+    .replace(/^(?:(?:a|an|the)\s+)+/i, "")
+  const commaParts = subject.split(/,\s*/)
+  const commaBoundary = commaParts.findIndex((part, index) => {
+    if (index === 0) return false
+    const words = normalizeTarget(part).split(" ")
+    const opener = targetClauseConjunctions.has(words[0]!) ? words[1] : words[0]
+    return targetClauseOpeners.has(opener!)
+  })
+  if (commaBoundary > 0) return commaParts.slice(0, commaBoundary).join(", ").trim()
+  const words = normalized.split(" ")
+  const boundary = words.findIndex(
+    (word, index) =>
+      targetComplements.has(word) || (targetClauseConjunctions.has(word) && targetClauseOpeners.has(words[index + 1]!)),
+  )
+  if (boundary <= 0) return subject
+  return subject.split(" ").slice(0, boundary).join(" ")
+}
+
+function targetText(target: string) {
+  return normalizeTarget(target)
+}
+
+function targetWords(target: string) {
+  const paths = new Set(targetPaths(target).map((path) => path.join("/")))
+  return (
+    targetText(target)
+      .match(/[a-z0-9_.-]+(?:[\\/][a-z0-9_.-]+)*/g)
+      ?.flatMap((part) => {
+        const path = part.replace(/\\/g, "/")
+        if (paths.has(path)) {
+          return part
+            .slice(0, part.lastIndexOf("."))
+            .split(/[\\/]/)
+            .flatMap((component) => component.match(/[a-z0-9]+/g) ?? [])
+        }
+        return part.split(/[\\/]/).flatMap((component) => {
+          // Keep unlisted suffix basenames literal so word-form normalization cannot rewrite their identity.
+          if (component.includes(".")) return [component]
+          return component.match(/[a-z0-9]+/g) ?? []
+        })
+      }) ?? []
+  )
+}
+
+function targetMatches(left: string, right: string) {
+  const leftPaths = targetPaths(left)
+  const rightPaths = targetPaths(right)
+  if (Boolean(leftPaths.length) !== Boolean(rightPaths.length)) return false
+  if (leftPaths.length > 0 && rightPaths.length > 0) {
+    const samePaths =
+      leftPaths.every((leftPath) =>
+        rightPaths.some((rightPath) => pathSuffix(leftPath, rightPath) || pathSuffix(rightPath, leftPath)),
+      ) &&
+      rightPaths.every((rightPath) =>
+        leftPaths.some((leftPath) => pathSuffix(leftPath, rightPath) || pathSuffix(rightPath, leftPath)),
+      )
+    if (!samePaths) return false
+    if (directPathTarget(left, leftPaths) && directPathTarget(right, rightPaths)) return true
+  }
+  const leftText = targetText(left)
+  const rightText = targetText(right)
+  if (leftText === rightText) return true
+  const leftSubject = targetSubject(left)
+  const rightSubject = targetSubject(right)
+  const leftSubjectText = targetText(leftSubject)
+  const rightSubjectText = targetText(rightSubject)
+  const leftIdentity = targetIdentity(leftSubject)
+  const rightIdentity = targetIdentity(rightSubject)
+  if (containsTarget(leftSubjectText, rightSubjectText) && rightIdentity.nonGeneric.length > 0) return true
+  if (containsTarget(rightSubjectText, leftSubjectText) && leftIdentity.nonGeneric.length > 0) return true
+  if (!leftIdentity.head || !rightIdentity.head || !targetWordMatches(leftIdentity.head, rightIdentity.head))
+    return false
+  if (leftIdentity.evidence.length === 0 || rightIdentity.evidence.length === 0) {
+    return (
+      leftIdentity.nonGeneric.length === 1 &&
+      rightIdentity.nonGeneric.length === 1 &&
+      targetWordMatches(leftIdentity.nonGeneric[0]!, rightIdentity.nonGeneric[0]!)
+    )
+  }
+  return (
+    leftIdentity.evidence.every((word) => rightIdentity.evidence.some((other) => targetWordMatches(word, other))) ||
+    rightIdentity.evidence.every((word) => leftIdentity.evidence.some((other) => targetWordMatches(word, other)))
+  )
+}
+
+function targetPaths(target: string) {
+  const normalized = normalizeTarget(target)
+  const tokens = normalized.match(/[a-z0-9_.-]+(?:[\\/][a-z0-9_.-]+)*/g) ?? []
+  return tokens
+    .filter(
+      (token) =>
+        targetFileToken(token) &&
+        // A bare JavaScript name in a subject is ambiguous; slash paths and exact file targets remain literal.
+        (targetFileSuffix(token) !== "js" || token.includes("/") || normalized === token),
+    )
+    .map((token) => token.split(/[\\/]/))
+}
+
+function targetFileSuffix(target: string) {
+  const component = normalizeTarget(target).split(/[\\/]/).at(-1)!
+  const dot = component.lastIndexOf(".")
+  if (dot <= 0 || dot === component.length - 1) return undefined
+  const suffix = component.slice(dot + 1).toLowerCase()
+  return targetFileSuffixes.has(suffix) ? suffix : undefined
+}
+
+function targetFileToken(target: string) {
+  return Boolean(targetFileSuffix(target))
+}
+
+function directPathTarget(target: string, paths: readonly (readonly string[])[]) {
+  const normalized = normalizeTarget(target).replace(/\\/g, "/")
+  return paths.length === 1 && normalized === paths[0]!.join("/")
+}
+
+function targetIdentity(target: string) {
+  const words = targetWords(target).map((word) => ({
+    word,
+    generic: genericTargetWords.has(word),
+  }))
+  const nonGeneric = words.filter((item) => !item.generic).map((item) => item.word)
+  return {
+    head: words.at(-1)?.word,
+    evidence: words
+      .slice(0, -1)
+      .filter((item) => !item.generic)
+      .map((item) => item.word),
+    nonGeneric,
+  }
+}
+
+// A dotted natural name can share its base with an undotted subject without equating two dotted identities.
+function targetWordMatches(left: string, right: string) {
+  if (left === right) return true
+  if (left.includes(".") || right.includes(".")) {
+    if (left.includes(".") === right.includes(".")) return false
+    const dotted = left.includes(".") ? left : right
+    const plain = left.includes(".") ? right : left
+    const suffix = dotted.slice(dotted.indexOf(".") + 1)
+    return /^[a-z][a-z0-9-]*$/.test(suffix) && dotted.slice(0, dotted.indexOf(".")) === plain
+  }
+  return false
+}
+
+function pathSuffix(longer: readonly string[], shorter: readonly string[]) {
+  return (
+    shorter.length <= longer.length &&
+    shorter.every((component, index) => component === longer[longer.length - shorter.length + index])
+  )
+}
+
+function containsTarget(longer: string, shorter: string) {
+  const longerWords = targetWords(longer)
+  const shorterWords = targetWords(shorter)
+  if (shorterWords.length === 0 || shorterWords.length >= longerWords.length) return false
+  return longerWords
+    .slice(0, longerWords.length - shorterWords.length + 1)
+    .some((_, index) => shorterWords.every((word, offset) => targetWordMatches(word, longerWords[index + offset]!)))
 }
 
 // A copy's queue times join the survivor's: step by step when both carry the
@@ -3515,17 +4121,38 @@ function parseCommand(input: SessionPromptQueue.QueuedInput) {
   input = { ...input, parts: input.parts.filter((part) => !pendingOriginal(part)) }
   const part = input.parts[0]
   if (input.parts.length !== 1 || part?.type !== "text" || part.synthetic) return undefined
-  const match = /^\s*(\S+)\s+(\S+?)[:,]?(?:\s+(\S[\s\S]*?))?\s*$/.exec(part.text)
-  if (!match) return undefined
-  // A bare `<verb> <target>` is a step of its own.
-  if (match[3] === undefined) return { verb: match[1]!, target: match[2]!, steps: [`${match[1]} ${match[2]}`] }
-  const rest = match[3].trim()
-  const lines = rest.split("\n")
+  const match = /^\s*(\S+)\s+([\s\S]*?)\s*$/.exec(part.text)
+  if (!match || conversationalLeads.has(match[1]!.toLowerCase())) return undefined
+  const verb = match[1]!
+  const rest = match[2]!.trim()
+  if (!rest) return undefined
+  // Keep the whole subject phrase; punctuation, options, and a leading file token separate later instructions.
+  const separator = /:\s|:$|\.\s+|[!?]\s+|;\s+|\n|\s+(?=--\S)/.exec(rest)
+  const candidate = separator ? undefined : /^(?:[^\s\\/]+[\\/])*[^\s\\/]+\.[a-z0-9]+(?=\s+\S)/i.exec(rest)
+  // A bare .js token with trailing words can be a runtime name, so preserve that complete subject.
+  const fileCandidate =
+    candidate &&
+    targetFileToken(candidate[0]) &&
+    (targetFileSuffix(candidate[0]) !== "js" || candidate[0].includes("/"))
+      ? candidate
+      : undefined
+  const fileEnd = fileCandidate ? fileCandidate.index + fileCandidate[0].length : undefined
+  const end = separator?.index ?? fileEnd ?? rest.length
+  const commandTarget = rest.slice(0, end).trim()
+  const remainder = separator
+    ? rest.slice(separator.index + separator[0].length).trim()
+    : fileEnd !== undefined
+      ? rest.slice(fileEnd).trim()
+      : undefined
+  if (!commandTarget) return undefined
+  const step = remainder
+  if (!step) return { verb, target: commandTarget, steps: [`${verb} ${commandTarget}`] }
+  const lines = step.split("\n")
   const numbered = lines.length > 1 && lines.every((line) => /^\d+\.\s+\S/.test(line))
   return {
-    verb: match[1]!,
-    target: match[2]!,
-    steps: numbered ? lines.map((line) => line.replace(/^\d+\.\s+/, "")) : [rest],
+    verb,
+    target: commandTarget,
+    steps: numbered ? lines.map((line) => line.replace(/^\d+\.\s+/, "")) : [step],
   }
 }
 

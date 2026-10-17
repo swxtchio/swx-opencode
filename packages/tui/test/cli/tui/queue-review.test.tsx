@@ -221,6 +221,26 @@ async function setup(
 
 const steer = item("que_1", "steer", "steer the running turn", 2)
 const queued = item("que_2", "queue", "queued for later", 3)
+const lockedQueue = item("que_locked", "queue", "queued work", 3)
+
+const actionTriggers = [
+  {
+    title: "delete",
+    trigger: (view: Awaited<ReturnType<typeof setup>>) => view.app.mockInput.pressKey("d", { ctrl: true }),
+  },
+  {
+    title: "earlier",
+    trigger: (view: Awaited<ReturnType<typeof setup>>) => view.app.mockInput.pressArrow("up", { meta: true }),
+  },
+  {
+    title: "later",
+    trigger: (view: Awaited<ReturnType<typeof setup>>) => view.app.mockInput.pressArrow("down", { meta: true }),
+  },
+  {
+    title: "consolidate",
+    trigger: (view: Awaited<ReturnType<typeof setup>>) => view.app.mockInput.pressKey("o", { ctrl: true }),
+  },
+]
 
 test("the row under the prompt counts pending prompts by category, not transcript messages", async () => {
   const view = await setup([steer, queued])
@@ -351,6 +371,123 @@ test("the consolidate button asks the server to consolidate the pending prompts"
   await wait(() => view.queued("consolidate").length === 2)
 })
 
+for (const action of actionTriggers) {
+  test(`locked ${action.title} action explains the hold state for keys and action-row activation`, async () => {
+    for (const hold of ["pending", "failed"] as const) {
+      for (const trigger of ["keyboard", "row"] as const) {
+        const pending = hold === "pending" ? later() : undefined
+        const view = await setup([steer, lockedQueue], (path) => {
+          if (!path.endsWith("/queue/hold")) return undefined
+          if (pending) return pending.response
+          return Promise.resolve(json({ name: "Unavailable" }, { status: 503 }))
+        })
+        await view.open()
+        const lock = hold === "pending" ? "pausing delivery" : "delivery NOT paused"
+        await wait(async () => (await view.frame()).includes(lock))
+        if (trigger === "keyboard") action.trigger(view)
+        else await view.click(action.title)
+
+        const reason =
+          hold === "pending" ? "Delivery is not paused yet" : "Delivery is NOT paused because the hold failed"
+        expect(await view.frame()).toContain(reason)
+        expect(view.queued("remove")).toEqual([])
+        expect(view.queued("reorder")).toEqual([])
+        expect(view.queued("consolidate")).toEqual([])
+        pending?.answer(json([steer, lockedQueue]))
+        view.app.renderer.destroy()
+        cleanup = undefined
+      }
+    }
+  })
+}
+
+test("a consolidation response updates the reviewed list with merged content", async () => {
+  const merged: SessionPromptQueueItem = {
+    ...steer,
+    input: { ...steer.input, parts: [{ type: "text", text: "merged queue instructions" }] },
+    origins: [...steer.origins, ...queued.origins],
+  }
+  const view = await setup([steer, queued], (path) =>
+    path.endsWith("/queue/consolidate") ? Promise.resolve(json([merged])) : undefined,
+  )
+  await view.open()
+  await view.click("consolidate")
+  await wait(() => view.queued("consolidate").length === 1)
+  expect(await view.frame()).toContain("merged queue instructions")
+  expect(await view.frame()).not.toContain("Nothing to consolidate")
+})
+
+test("a consolidation that only adds provenance is still shown as a merge", async () => {
+  const recent = item("que_recent", "steer", "same", Date.now())
+  const repeated = item("que_repeated", "steer", "same", Date.now() + 1)
+  const merged = { ...recent, origins: [...recent.origins, ...repeated.origins] }
+  const view = await setup([recent, repeated], (path) =>
+    path.endsWith("/queue/consolidate") ? Promise.resolve(json([merged])) : undefined,
+  )
+  await view.open()
+  await view.click("consolidate")
+  await wait(() => view.queued("consolidate").length === 1)
+  expect(await view.frame()).toContain("2 merged")
+  expect(await view.frame()).not.toContain("Nothing to consolidate")
+})
+
+test("consolidating an unchanged queue explains that there is nothing to merge", async () => {
+  const view = await setup([steer])
+  await view.open()
+  await view.click("consolidate")
+  await wait(() => view.queued("consolidate").length === 1)
+  expect(await view.frame()).toContain("Nothing to consolidate")
+  expect(await view.frame()).toContain("steer the running turn")
+})
+
+test("a move that would cross delivery classes explains why it cannot change the selected prompt", async () => {
+  const view = await setup([steer, queued])
+  await view.open()
+  view.app.mockInput.pressArrow("down", { meta: true })
+  expect(await view.frame()).toContain("Prompts cannot move across delivery types")
+  expect(view.queued("reorder")).toEqual([])
+})
+
+test("moving the first prompt earlier explains that it is already at the edge", async () => {
+  const view = await setup([steer])
+  await view.open()
+  view.app.mockInput.pressArrow("up", { meta: true })
+  expect(await view.frame()).toContain("already earliest in its delivery group")
+  expect(view.queued("reorder")).toEqual([])
+})
+
+test("moving the last prompt later explains that it is already at the edge", async () => {
+  const view = await setup([queued])
+  await view.open()
+  view.app.mockInput.pressArrow("down", { meta: true })
+  expect(await view.frame()).toContain("already latest in its delivery group")
+  expect(view.queued("reorder")).toEqual([])
+})
+
+test("an action with no selected prompt explains why it cannot run", async () => {
+  const view = await setup([])
+  DialogQueue.show(view.dialog, sessionID)
+  await wait(() => view.queued("hold").length === 1)
+  await wait(async () => (await view.frame()).includes("(delivery paused)"))
+  await view.click("delete")
+  expect(await view.frame()).toContain("No queued prompt is selected")
+  expect(view.queued("remove")).toEqual([])
+})
+
+test("consolidating an empty queue explains that there is nothing to consolidate", async () => {
+  const view = await setup([])
+  DialogQueue.show(view.dialog, sessionID)
+  await wait(() => view.queued("hold").length === 1)
+  await wait(
+    async () =>
+      (await view.frame()).includes("(pausing delivery…)") || (await view.frame()).includes("(delivery paused)"),
+  )
+  await view.click("consolidate")
+  expect(await view.frame()).toContain("Nothing to consolidate")
+  expect(await view.frame()).not.toContain("No queued prompt is selected")
+  expect(view.queued("consolidate")).toEqual([])
+})
+
 // A response the test releases when it chooses.
 function later() {
   let answer!: (response: Response) => void
@@ -419,6 +556,7 @@ test("a renewal the server refuses says delivery is not paused and locks edits u
   view.app.mockInput.pressKey("x")
   await settle(() => view.queued("hold").length === 2)
   await shows("delivery NOT paused")
+  expect(await view.frame()).toContain("Could not keep pausing delivery")
   view.app.mockInput.pressKey("d", { ctrl: true })
   view.app.mockInput.pressKey("o", { ctrl: true })
   expect(view.queued("remove")).toEqual([])

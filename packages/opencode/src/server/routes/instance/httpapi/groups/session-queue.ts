@@ -153,7 +153,7 @@ export const SessionQueueApi = HttpApi.make("sessionQueue").add(
           identifier: "session.queue.consolidate",
           summary: "Consolidate queued prompts",
           description:
-            "Keep one of identical pending prompts, and merge pending commands of one delivery that share their leading verb and target into one command with numbered steps, in delivery order.",
+            "Consolidate pending prompts only within one delivery class: merge plain text whose case and whitespace normalized text is equal or one is a prefix of the other, and merge compatible commands with the same leading verb and a containing or distinctive-token-overlapping target into numbered steps in delivery order.",
         }),
       ),
       HttpApiEndpoint.get("receipt", SessionQueuePaths.receipt, {

@@ -140,6 +140,18 @@ async function producedStore(sizes: number[], options: { scratch?: string; timeo
 }
 
 const producedTemplates = new Map<string, ReturnType<typeof produceStore>>()
+
+class RetentionProducerTimeout extends Error {
+  constructor(
+    readonly pid: number,
+    readonly timeout: number,
+    readonly signal: string | null,
+  ) {
+    super(`retention producer timed out after ${timeout}ms (pid ${pid}, signal ${signal ?? "<absent>"})`)
+    this.name = "RetentionProducerTimeout"
+  }
+}
+
 afterAll(() =>
   Promise.all(
     Array.from(producedTemplates.values(), (template) =>
@@ -173,14 +185,24 @@ async function produceStore(sizes: number[], scratch: string, timeout: number) {
         stderr: "pipe",
         cwd: path.join(import.meta.dir, "../../.."),
         env: { ...process.env, OPENCODE_DB: filename },
-        timeout,
       },
     )
+    let timedOut = false
+    let forceKill: ReturnType<typeof setTimeout> | undefined
+    const deadline = setTimeout(() => {
+      timedOut = true
+      producer.kill("SIGTERM")
+      forceKill = setTimeout(() => producer.kill("SIGKILL"), 250)
+    }, timeout)
     const [stdout, stderr, code] = await Promise.all([
       new Response(producer.stdout).text(),
       new Response(producer.stderr).text(),
       producer.exited,
-    ])
+    ]).finally(() => {
+      clearTimeout(deadline)
+      if (forceKill) clearTimeout(forceKill)
+    })
+    if (timedOut) throw new RetentionProducerTimeout(producer.pid, timeout, producer.signalCode ?? null)
     if (code !== 0) throw new Error(`retention producer exited ${code}: ${stderr}`)
     // Copies take the database file alone, which holds every committed write because the producer closed the
     // store on exit, checkpointing and deleting its WAL. Any WAL left behind means it did not, and could hold
@@ -2064,7 +2086,7 @@ test(
 )
 
 test(
-  "a producer that fails removes its own template directory, leaves no producer running and spares other fixtures",
+  "a producer deadline kills its child, removes its template directory and spares other fixtures",
   async () => {
     await using scratch = await tmpdir()
     await using before = await producedStore([1])
@@ -2075,13 +2097,16 @@ test(
         (error: unknown) => error,
       )
 
-    expect(String(await failed())).toContain("retention producer exited")
+    const failure = await failed()
+    expect(failure).toBeInstanceOf(RetentionProducerTimeout)
+    if (!(failure instanceof RetentionProducerTimeout)) throw new Error("producer deadline was not identified")
+    expect(failure.timeout).toBe(1)
+    expect(failure.signal).not.toBeNull()
+    expect(failure.pid).toBeGreaterThan(0)
+    expect(() => process.kill(failure.pid, 0)).toThrow()
     expect(readdirSync(scratch.path)).toEqual([])
-    const running = spawnSync("ps", ["-eo", "args="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })
-    expect(running.status).toBe(0)
-    expect(running.stdout.split("\n").filter((line) => line.includes(scratch.path))).toEqual([])
+    expect(await failed()).toBe(failure)
     // The failed template stays failed: a later same-key acquisition rejects without producing anything.
-    expect(String(await failed())).toContain("retention producer exited")
     expect(readdirSync(scratch.path)).toEqual([])
 
     await using after = await producedStore([1])
