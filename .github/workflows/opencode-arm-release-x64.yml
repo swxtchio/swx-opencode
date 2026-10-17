@@ -171,13 +171,13 @@ jobs:
           backup="$RUNNER_TEMP/wait-logger-original"
           mkdir -p "$backup"
           restore_wait_logger_source() {
-            for file in "${files[@]}"; do cp "$backup/$file" "source/$file"; done
+            for file in "${files[@]}"; do cp "$backup/$file" "$file"; done
           }
           trap restore_wait_logger_source EXIT
           for file in "${files[@]}"; do
             mkdir -p "$backup/$(dirname "$file")"
-            git -C source show "HEAD:$file" > "$backup/$file"
-            cp "$GITHUB_WORKSPACE/$file" "source/$file"
+            git show "HEAD:$file" > "$backup/$file"
+            cp "$GITHUB_WORKSPACE/$file" "$file"
           done
           overlay_hash=$(git diff --binary -- "${files[@]}" | sha256sum)
           printf '%s\n' "${overlay_hash%% *}" > "$RUNNER_TEMP/wait-logging-overlay.sha256"
