@@ -1,6 +1,10 @@
-const startFile = requireMarker(Bun.env.RELEASE_PROBE_WAIT_START_FILE)
-const releaseFile = requireMarker(Bun.env.RELEASE_PROBE_WAIT_RELEASE_FILE)
+type Scenario = "completed" | "failed" | "interrupted"
+
+const suppressedScenario = requireScenario(Bun.env.RELEASE_PROBE_WAIT_SUPPRESS_SCENARIO)
 const nativeFetch = globalThis.fetch
+const scenarioSessions = new Map<string, Scenario>()
+const released = new Set<Scenario>()
+const releaseWaiters = new Map<Scenario, Set<() => void>>()
 
 globalThis.fetch = new Proxy(nativeFetch, {
   apply(target, thisArg, args) {
@@ -13,23 +17,73 @@ async function gatedFetch(fetcher: typeof globalThis.fetch, input: RequestInfo |
   const request = input instanceof Request ? input : undefined
   const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url)
   const method = init?.method ?? request?.method ?? "GET"
-  if (method === "POST" && url.pathname.startsWith("/api/session/") && url.pathname.endsWith("/wait")) {
-    if ((await Bun.file(startFile).exists()) && !(await Bun.file(releaseFile).exists()))
-      await awaitRelease(releaseFile, init?.signal ?? request?.signal)
+  const sessionID = /^\/api\/session\/([^/]+)\/(prompt|wait|interrupt)$/.exec(url.pathname)?.[1]
+  if (method === "POST" && url.pathname.endsWith("/prompt") && sessionID) {
+    const scenario = promptScenario(init?.body)
+    if (scenario === suppressedScenario) scenarioSessions.set(sessionID, scenario)
   }
-  return fetcher(input, init)
+  if (method === "POST" && url.pathname.endsWith("/wait") && sessionID && scenarioSessions.get(sessionID) === suppressedScenario)
+    await waitForRelease(suppressedScenario, init?.signal ?? request?.signal)
+
+  const response = await fetcher(input, init)
+  if (response.status === 204 && method === "POST") {
+    const providerRelease = /^\/control\/release\/(completed|failed)$/.exec(url.pathname)?.[1]
+    if (providerRelease === suppressedScenario) releaseScenario(suppressedScenario)
+    if (url.pathname.endsWith("/interrupt") && sessionID && scenarioSessions.get(sessionID) === "interrupted")
+      releaseScenario("interrupted")
+  }
+  return response
 }
 
-function requireMarker(input: string | undefined) {
-  if (!input) throw new Error("Wait-dispatch preloader requires its start and release markers")
-  return input
+function requireScenario(input: string | undefined): Scenario {
+  if (input === "completed" || input === "failed" || input === "interrupted") return input
+  throw new Error(`Wait-dispatch preloader requires a valid suppression scenario, got ${input}`)
 }
 
-async function awaitRelease(releaseFile: string, signal?: AbortSignal | null) {
-  const deadline = Date.now() + 20_000
-  while (!(await Bun.file(releaseFile).exists())) {
-    if (signal?.aborted) throw signal.reason ?? new Error("wait dispatch was aborted before producer receipt")
-    if (Date.now() >= deadline) throw new Error("wait-dispatch suppression exceeded its bound")
-    await new Promise((resolve) => setTimeout(resolve, 25))
+function promptScenario(body: BodyInit | null | undefined): Scenario | undefined {
+  if (typeof body !== "string") return undefined
+  try {
+    const prompt = (JSON.parse(body) as { prompt?: { text?: unknown }; resume?: unknown }).prompt?.text
+    if (typeof prompt !== "string") return undefined
+    const selected = (["completed", "failed", "interrupted"] as const).find((scenario) => prompt.includes(`case:${scenario}`))
+    if (selected && (JSON.parse(body) as { resume?: unknown }).resume !== false) return selected
+    return undefined
+  } catch {
+    return undefined
   }
+}
+
+function waitForRelease(scenario: Scenario, signal?: AbortSignal | null) {
+  if (released.has(scenario)) return Promise.resolve()
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("wait dispatch suppression aborted"))
+  return new Promise<void>((resolve, reject) => {
+    const waiters = releaseWaiters.get(scenario) ?? new Set<() => void>()
+    let timer: Timer | undefined
+    const cleanup = () => {
+      if (timer) clearTimeout(timer)
+      signal?.removeEventListener("abort", onAbort)
+      waiters.delete(onRelease)
+      if (waiters.size === 0) releaseWaiters.delete(scenario)
+    }
+    const onRelease = () => {
+      cleanup()
+      resolve()
+    }
+    const onAbort = () => {
+      cleanup()
+      reject(signal?.reason ?? new Error("wait dispatch suppression aborted"))
+    }
+    waiters.add(onRelease)
+    releaseWaiters.set(scenario, waiters)
+    signal?.addEventListener("abort", onAbort, { once: true })
+    timer = setTimeout(() => {
+      cleanup()
+      reject(new Error(`wait dispatch remained suppressed beyond its bound: ${scenario}`))
+    }, 30_000)
+  })
+}
+
+function releaseScenario(scenario: Scenario) {
+  released.add(scenario)
+  for (const release of releaseWaiters.get(scenario) ?? []) release()
 }

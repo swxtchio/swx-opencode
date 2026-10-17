@@ -93,6 +93,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = x86_64
+          command -v strace
           bun -e 'if (process.platform !== "linux" || process.arch !== "x64") throw new Error(`not a native linux-x64 runner: ${process.platform}-${process.arch}`); console.log(`Bun ${Bun.version} ${process.platform}-${process.arch}`)'
           test "$(bun --version)" = "$BUN_VERSION"
           test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
@@ -265,8 +266,9 @@ jobs:
             ${{ runner.temp }}/native-x64-proof/evidence.json
             ${{ runner.temp }}/native-x64-proof/opencode-server.log
             ${{ runner.temp }}/native-x64-proof.log
-            ${{ runner.temp }}/native-x64-wait-red-tool.log
-            ${{ runner.temp }}/native-x64-wait-red-continuation.log
+            ${{ runner.temp }}/native-x64-wait-red-completed.log
+            ${{ runner.temp }}/native-x64-wait-red-failed.log
+            ${{ runner.temp }}/native-x64-wait-red-interrupted.log
             ${{ runner.temp }}/x64-version.txt
             ${{ runner.temp }}/x64-provenance.json
             ${{ runner.temp }}/build.log

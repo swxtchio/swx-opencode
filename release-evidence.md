@@ -49,6 +49,11 @@ The VM14 all-target build also emitted an x64 cross-target candidate with archiv
 - After restarting the ARM and x64 servers on their same isolated databases, the admitted user and terminal assistant messages remained readable by message ID. History replay after the admission sequence returned the same durable event IDs in strictly increasing exclusive-sequence order.
 - On both architectures, two different absolute `OPENCODE_DB` paths over a conflicting `XDG_DATA_HOME` printed their explicit paths; `db 'SELECT 1'` opened two distinct physical stores and no conflicting XDG database. With `OPENCODE_DB` unset, `db path` matched the `latest` channel default under `XDG_DATA_HOME`.
 
+### Round-3 held-wait producer receipt
+
+- Each main held-wait request carries a unique header derived from the real prompt-admission receipt (session ID, message ID, admitted sequence, and request ID). Before releasing a tool/provider hold or sending interrupt, the probe requires the matching `POST /api/session/{sessionID}/wait` and header to appear in a syscall trace of the producer process, then reads the admitted message back through `GET /api/session/{sessionID}/message/{messageID}` and checks its server response identity.
+- The absence-red test selectively delays only the main `completed`, `failed`, or `interrupted` wait until the real provider-release or interrupt response, while independent admit-only pending requests still reach the server. Each attack fails at the missing producer request receipt; the normal full release-probe run exercises the restored green path.
+
 ### Regression absence proof
 
 In the authorized staging source, `V2Session.wait` was temporarily replaced with the unconditional `OperationUnavailableError({ operation: "wait" })` body from `f1f278999cac`. The bounded core run returned 27 failures and 4 unaffected passes; the five HTTP wait/terminal-event cases returned 5 failures. The release-probe script itself failed at the newly created Session's HTTP 503 `Session wait outcome is not observable`. No external process kill was used as a test result. The source was restored byte-for-byte, the staging tree read clean, and the focused core/HTTP tests passed again.
