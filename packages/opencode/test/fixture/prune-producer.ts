@@ -39,7 +39,7 @@ type Create = {
   pendingV2?: boolean
   unfinished?: boolean
   runningTool?: boolean
-  // A question answered under `--questions emit`, leaving its settled ledger row.
+  // A question answered under `--questions-command`, leaving its settled ledger row.
   ask?: boolean
 }
 

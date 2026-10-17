@@ -3,7 +3,7 @@
 // The store is opened through the production Database layer, so it carries the migrated schema and this
 // process's writer registration, which names a process that is gone once the script exits.
 // Each Session gets a V1 user and assistant turn with text and step-finish parts, a V2 step with usage, a
-// V2 context update, a todo list, a Context Epoch and a question answered under `--questions emit`, each holding a
+// V2 context update, a todo list, a Context Epoch and a question answered under `--questions-command`, each holding a
 // "sentinel" string retention must redact.
 // It prints one JSON line naming the trees it wrote, the usage each step reported, and the clock window the
 // writes fall in.

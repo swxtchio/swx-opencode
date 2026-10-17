@@ -6,7 +6,7 @@ import type { SessionSchema } from "./schema"
 import { SessionTable } from "./sql"
 
 // Fork-owned supervisor ask ledger (swxtchio/swx-opencode#286). Written only
-// under `--questions emit`: one row per question or permission request the
+// under `--questions-command`: one row per question or permission request the
 // process emitted, pending until time_settled. decision is the first
 // resolver's, and a later answer reports it instead of acting. writer_id is the
 // event_writer_process that held the waiting tool, so an answer after that

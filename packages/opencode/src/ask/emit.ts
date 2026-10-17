@@ -3,7 +3,7 @@ export * as AskEmit from "./emit"
 import { Cause, Effect, Exit } from "effect"
 import type { SessionAsk } from "@opencode-ai/schema/session-ask"
 
-// `--questions emit` (swxtchio/swx-opencode#286). Only `serve` sets this, from
+// `--questions-command` (swxtchio/swx-opencode#286). Only `serve` sets this, from
 // the operator's own argv, so neither project config nor anything a model
 // writes can enable emission or choose where it goes.
 export type Settings = {

@@ -1,5 +1,6 @@
-// Permission requests under `--questions emit` (swxtchio/swx-opencode#286): an ask that the rules leave to a human is
-// recorded and emitted, and its once/always/reject reply keeps its existing effect while being settled exactly once.
+// Permission requests under `--questions-command` (swxtchio/swx-opencode#286): an ask that the rules leave to a human
+// is recorded and emitted, and its once/always/reject reply keeps its existing effect while being settled exactly
+// once.
 import { describe, expect } from "bun:test"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Database } from "@opencode-ai/core/database/database"
@@ -68,7 +69,7 @@ const failure = <A, E, R>(self: Effect.Effect<A, E, R>) =>
     Effect.map((exit) => (Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined)),
   )
 
-describe("permission requests under --questions emit", () => {
+describe("permission requests under --questions-command", () => {
   it.live("emits the request with its approval scope, and a once reply lets only that call proceed", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped({ git: true })

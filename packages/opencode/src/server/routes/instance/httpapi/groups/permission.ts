@@ -54,7 +54,7 @@ export const PermissionApi = HttpApi.make("permission")
             summary: "Answer permission request",
             description:
               "Approve or deny a permission request, reporting whether this answer settled it or an earlier one had. " +
-              "Under `--questions emit` this also settles a request whose server restarted while it was pending.",
+              "Under `--questions-command` this also settles a request whose server restarted while it was pending.",
           }),
         ),
       )

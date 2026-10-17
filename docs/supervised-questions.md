@@ -1,7 +1,7 @@
-# Supervised questions (`--questions emit`)
+# Supervised questions (`--questions-command`)
 
 Fork feature, swxtchio/swx-opencode#286. A supervisor such as firstmate runs OpenCode where no human watches the
-pane. With `--questions emit`, every ask a model raises is delivered to a command the operator chooses, stays
+pane. With `--questions-command`, every ask a model raises is delivered to a command the operator chooses, stays
 pending, and is settled by the first answer that arrives, from the supervisor or from a human.
 
 An ask is one of:
@@ -19,12 +19,12 @@ Without the flag nothing changes: no ask is recorded or emitted.
 
 ```sh
 OPENCODE_SERVER_PASSWORD=... opencode serve --port 4096 \
-  --questions emit --questions-command /usr/local/bin/opencode-ask-receiver
+  --questions-command /usr/local/bin/opencode-ask-receiver
 ```
 
-- `--questions emit` requires `--questions-command`, and `--questions-command` requires `--questions emit`.
+- Setting `--questions-command` turns emission on; without it nothing is emitted.
 - The command must be an executable path or a name on `PATH`. It is checked at startup.
-- Only argv sets either option. Project or global config cannot enable emission or choose its command.
+- Only argv sets the option. Project or global config cannot enable emission or choose its command.
 
 ## The receiver
 

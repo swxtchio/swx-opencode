@@ -1,4 +1,4 @@
-// Test helpers for `--questions emit` (swxtchio/swx-opencode#286): the operator's receiver command and the JSON
+// Test helpers for `--questions-command` (swxtchio/swx-opencode#286): the operator's receiver command and the JSON
 // requests a supervisor sends back.
 import { chmod } from "node:fs/promises"
 import path from "node:path"

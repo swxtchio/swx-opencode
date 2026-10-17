@@ -3164,7 +3164,7 @@ export class Question extends HeyApiClient {
   /**
    * Answer question request
    *
-   * Answer or reject a question request, reporting whether this answer settled it or an earlier one had. Under `--questions emit` this also settles a request whose server restarted while it was pending.
+   * Answer or reject a question request, reporting whether this answer settled it or an earlier one had. Under `--questions-command` this also settles a request whose server restarted while it was pending.
    */
   public answer<ThrowOnError extends boolean = false>(
     parameters: {
@@ -3276,7 +3276,7 @@ export class Permission extends HeyApiClient {
   /**
    * Answer permission request
    *
-   * Approve or deny a permission request, reporting whether this answer settled it or an earlier one had. Under `--questions emit` this also settles a request whose server restarted while it was pending.
+   * Approve or deny a permission request, reporting whether this answer settled it or an earlier one had. Under `--questions-command` this also settles a request whose server restarted while it was pending.
    */
   public answer<ThrowOnError extends boolean = false>(
     parameters: {

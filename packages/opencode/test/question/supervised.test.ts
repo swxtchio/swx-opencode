@@ -1,4 +1,4 @@
-// Question lifecycle under `--questions emit` (swxtchio/swx-opencode#286): the question tool's ask is recorded and
+// Question lifecycle under `--questions-command` (swxtchio/swx-opencode#286): the question tool's ask is recorded and
 // emitted, stays pending until a decision, and is settled once by whichever resolver answers first.
 import { describe, expect } from "bun:test"
 import { Database } from "@opencode-ai/core/database/database"
@@ -99,7 +99,7 @@ const failure = <A, E, R>(self: Effect.Effect<A, E, R>) =>
     Effect.map((exit) => (Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined)),
   )
 
-describe("question lifecycle under --questions emit", () => {
+describe("question lifecycle under --questions-command", () => {
   it.live("emits the question tool's ask, keeps it pending, and applies the receiver's answer", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped({ git: true })
@@ -193,32 +193,34 @@ describe("question lifecycle under --questions emit", () => {
     }),
   )
 
-  it.live("a settlement that lost the race inside the ledger's transaction reports the winner and changes nothing", () =>
-    Effect.gen(function* () {
-      const dir = yield* tmpdirScoped({ git: true })
-      yield* Effect.gen(function* () {
-        const question = yield* Question.Service
-        const ledger = yield* AskLedger.Service
-        const { receiver, sessionID } = yield* supervised()
-        const fiber = yield* askWithTool(sessionID, "call_transaction")
-        const [emitted] = yield* receiver.read(1)
+  it.live(
+    "a settlement that lost the race inside the ledger's transaction reports the winner and changes nothing",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        yield* Effect.gen(function* () {
+          const question = yield* Question.Service
+          const ledger = yield* AskLedger.Service
+          const { receiver, sessionID } = yield* supervised()
+          const fiber = yield* askWithTool(sessionID, "call_transaction")
+          const [emitted] = yield* receiver.read(1)
 
-        // Both resolvers passed decide's read of a pending ask; the transaction decides between them.
-        const first = yield* ledger.settle({
-          id: emitted.id,
-          decision: { type: "answered", answers: [["Red"], ["first"]] },
-          recovered: false,
-        })
-        const second = yield* ledger.settle({ id: emitted.id, decision: { type: "rejected" }, recovered: false })
-        expect(first.won).toBe(true)
-        expect(second.won).toBe(false)
-        expect(second.row.decision).toEqual({ type: "answered", answers: [["Red"], ["first"]] })
-        const stored = yield* ledger.find(emitted.id)
-        expect(stored?.decision).toEqual({ type: "answered", answers: [["Red"], ["first"]] })
-        yield* Fiber.interrupt(fiber)
-        expect(yield* question.list()).toEqual([])
-      }).pipe(provideInstance(dir))
-    }),
+          // Both resolvers passed decide's read of a pending ask; the transaction decides between them.
+          const first = yield* ledger.settle({
+            id: emitted.id,
+            decision: { type: "answered", answers: [["Red"], ["first"]] },
+            recovered: false,
+          })
+          const second = yield* ledger.settle({ id: emitted.id, decision: { type: "rejected" }, recovered: false })
+          expect(first.won).toBe(true)
+          expect(second.won).toBe(false)
+          expect(second.row.decision).toEqual({ type: "answered", answers: [["Red"], ["first"]] })
+          const stored = yield* ledger.find(emitted.id)
+          expect(stored?.decision).toEqual({ type: "answered", answers: [["Red"], ["first"]] })
+          yield* Fiber.interrupt(fiber)
+          expect(yield* question.list()).toEqual([])
+        }).pipe(provideInstance(dir))
+      }),
   )
 
   it.live("an unknown request or another directory's answer fails and leaves the pending ask untouched", () =>

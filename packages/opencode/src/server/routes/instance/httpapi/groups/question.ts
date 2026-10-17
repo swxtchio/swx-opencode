@@ -67,7 +67,7 @@ export const QuestionApi = HttpApi.make("question")
             summary: "Answer question request",
             description:
               "Answer or reject a question request, reporting whether this answer settled it or an earlier one had. " +
-              "Under `--questions emit` this also settles a request whose server restarted while it was pending.",
+              "Under `--questions-command` this also settles a request whose server restarted while it was pending.",
           }),
         ),
       )

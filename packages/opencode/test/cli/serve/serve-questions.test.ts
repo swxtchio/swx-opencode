@@ -1,4 +1,4 @@
-// Subprocess tests for `opencode serve --questions emit` (swxtchio/swx-opencode#286): a detached server with no
+// Subprocess tests for `opencode serve --questions-command` (swxtchio/swx-opencode#286): a detached server with no
 // human pane emits each ask to the operator's command, keeps it pending, and settles it from the answer route,
 // across a server restart on the same database.
 import { describe, expect } from "bun:test"
@@ -30,14 +30,14 @@ const questions = [
   },
 ]
 
-describe("opencode serve --questions emit (subprocess)", () => {
+describe("opencode serve --questions-command (subprocess)", () => {
   cliIt.live(
     "emits a question, keeps it pending, and an answer from the emitted route continues the turn",
     ({ opencode, home, llm }) =>
       Effect.gen(function* () {
         const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
         const server = yield* opencode.serve({
-          extraArgs: ["--questions", "emit", "--questions-command", receiver.path],
+          extraArgs: ["--questions-command", receiver.path],
         })
         yield* llm.tool("question", { questions })
         yield* llm.text("banner done")
@@ -125,7 +125,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
       Effect.gen(function* () {
         const receiver = yield* writeReceiver(home, "cat >> '$OUT'\nexit 3")
         const server = yield* opencode.serve({
-          extraArgs: ["--questions", "emit", "--questions-command", receiver.path],
+          extraArgs: ["--questions-command", receiver.path],
         })
         yield* llm.tool("question", { questions: [questions[1]] })
         yield* llm.text("done")
@@ -165,7 +165,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
         )
         const receiver = yield* writeReceiver(home, `cat >> '$OUT'\nread line < '${fifo}'`)
         const server = yield* opencode.serve({
-          extraArgs: ["--questions", "emit", "--questions-command", receiver.path],
+          extraArgs: ["--questions-command", receiver.path],
         })
         yield* llm.tool("question", { questions: [questions[1]] })
         yield* llm.text("done")
@@ -191,7 +191,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
       Effect.gen(function* () {
         const env = { OPENCODE_DB: path.join(home, "restart.db") }
         const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
-        const extraArgs = ["--questions", "emit", "--questions-command", receiver.path]
+        const extraArgs = ["--questions-command", receiver.path]
         yield* llm.tool("question", { questions: [questions[1]] })
         yield* llm.text("continued after restart")
 
@@ -258,7 +258,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
       Effect.gen(function* () {
         const env = { OPENCODE_DB: path.join(home, "shared.db") }
         const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
-        const extraArgs = ["--questions", "emit", "--questions-command", receiver.path]
+        const extraArgs = ["--questions-command", receiver.path]
         yield* llm.tool("question", { questions: [questions[1]] })
         yield* llm.text("done")
         const owner = yield* opencode.serve({ extraArgs, env })
@@ -300,7 +300,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
         yield* llm.tool("question", { questions: [questions[1]] })
         yield* llm.text("done")
         const server = yield* opencode.serve({
-          extraArgs: ["--questions", "emit", "--questions-command", receiver.path],
+          extraArgs: ["--questions-command", receiver.path],
           env: { OPENCODE_DB: file },
         })
         const sessionID = yield* startTurn(server.url, home)
@@ -342,7 +342,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
           OPENCODE_CONFIG_CONTENT: JSON.stringify({ ...testProviderConfig(llm.url), permission: { bash: "ask" } }),
         }
         const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
-        const extraArgs = ["--questions", "emit", "--questions-command", receiver.path]
+        const extraArgs = ["--questions-command", receiver.path]
         yield* llm.tool("bash", { command: `touch ${marker}`, description: "Create a marker" })
         yield* llm.text("will retry")
 
@@ -380,7 +380,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
       Effect.gen(function* () {
         const env = { OPENCODE_DB: path.join(home, "plan.db"), OPENCODE_EXPERIMENTAL_PLAN_MODE: "1" }
         const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
-        const extraArgs = ["--questions", "emit", "--questions-command", receiver.path]
+        const extraArgs = ["--questions-command", receiver.path]
         yield* llm.tool("plan_exit", {})
         yield* llm.text("building")
 
@@ -433,7 +433,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
         yield* llm.tool("question", { questions: [questions[1]] })
         yield* llm.text("done")
         const server = yield* opencode.serve({
-          extraArgs: ["--questions", "emit", "--questions-command", receiver.path],
+          extraArgs: ["--questions-command", receiver.path],
           env,
         })
         const sessionID = yield* startTurn(server.url, home)
@@ -458,7 +458,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
       Effect.gen(function* () {
         const env = { OPENCODE_DB: path.join(home, "moved-on.db") }
         const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
-        const extraArgs = ["--questions", "emit", "--questions-command", receiver.path]
+        const extraArgs = ["--questions-command", receiver.path]
         yield* llm.tool("question", { questions: [questions[1]] })
         yield* llm.text("went on without the answer")
 
@@ -495,6 +495,16 @@ describe("opencode serve --questions emit (subprocess)", () => {
         expect(yield* llm.calls).toBe(2)
       }),
     120_000,
+  )
+
+  cliIt.live("refuses to start when the questions command is not an executable", ({ opencode, home }) =>
+    Effect.gen(function* () {
+      const missing = path.join(home, "no-such-receiver")
+      const result = yield* opencode.spawn(["serve", "--port", "0", "--questions-command", missing])
+      opencode.expectExit(result, 1, "serve with a missing questions command")
+      expect(result.stderr).toContain(`--questions-command is not an executable: ${missing}`)
+      expect(result.stdout).not.toContain("listening")
+    }),
   )
 })
 

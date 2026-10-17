@@ -7,7 +7,7 @@ import { PermissionV1 } from "./v1/permission"
 
 // Fork-owned supervisor delivery of model-raised asks (swxtchio/swx-opencode#286).
 // An ask is a question tool request, a plan acceptance (a question the
-// plan_exit tool raises) or a permission request. With `--questions emit` each
+// plan_exit tool raises) or a permission request. With `--questions-command` each
 // one is recorded durably, emitted to the operator's command, and settled once
 // by whichever resolver answers it first.
 
