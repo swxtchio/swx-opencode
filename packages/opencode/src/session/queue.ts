@@ -4009,13 +4009,6 @@ function targetMatches(left: string, right: string) {
   const rightSubject = targetSubject(right)
   const leftSubjectText = targetText(leftSubject)
   const rightSubjectText = targetText(rightSubject)
-  const leftSubjectWords = targetWords(leftSubjectText)
-  const rightSubjectWords = targetWords(rightSubjectText)
-  if (
-    leftSubjectWords.length === rightSubjectWords.length &&
-    leftSubjectWords.every((word, index) => targetWordMatches(word, rightSubjectWords[index]!))
-  )
-    return true
   const leftIdentity = targetIdentity(leftSubject)
   const rightIdentity = targetIdentity(rightSubject)
   if (containsTarget(leftSubjectText, rightSubjectText) && rightIdentity.nonGeneric.length > 0) return true
@@ -4123,6 +4116,11 @@ function targetWordCandidates(word: string) {
     return candidates
   }
   if (targetEsPluralWordPairs.has(word)) candidates.add(targetEsPluralWordPairs.get(word)!)
+  if (word.length > 3 && word.endsWith("es")) {
+    candidates.add(word.slice(0, -1))
+    candidates.add(word.slice(0, -2))
+    return candidates
+  }
   if (word.length > 3 && word.endsWith("s") && !word.endsWith("ss") && !word.endsWith("us"))
     candidates.add(word.slice(0, -1))
   return candidates

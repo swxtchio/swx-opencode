@@ -558,12 +558,23 @@ const pluralTargetPairs = [
   pluralTargetPair("API responses/response", "fix the api responses", "fix the api response"),
   pluralTargetPair("test cases/case", "fix the test cases", "fix the test case"),
   pluralTargetPair("releases/release notes", "fix releases notes", "fix release notes"),
-  pluralTargetPair("uses/use list", "fix the uses list", "fix the use list"),
+  pluralTargetPair("uses/use", "fix auth uses", "fix auth use"),
   pluralTargetPair("user licenses/license", "fix the user licenses", "fix the user license"),
   pluralTargetPair("build phases/phase", "fix the build phases", "fix the build phase"),
   pluralTargetPair("echo/echoes", "fix echo", "fix echoes"),
   pluralTargetPair("veto/vetoes", "fix veto", "fix vetoes"),
   pluralTargetPair("zero/zeroes", "fix zero", "fix zeroes"),
+  pluralTargetPair("classes/class", "fix parser classes", "fix parser class"),
+  pluralTargetPair("boxes/box", "fix shipping boxes", "fix shipping box"),
+  pluralTargetPair("churches/church", "fix churches", "fix church"),
+  pluralTargetPair("dishes/dish", "fix dishes", "fix dish"),
+  pluralTargetPair("aliases/alias", "fix dns aliases", "fix dns alias"),
+  pluralTargetPair("canvases/canvas", "fix canvases", "fix canvas"),
+]
+
+const genericSubjectControls = [
+  { title: "bug subject", first: "fix the bug in auth", second: "fix the bug in parser" },
+  { title: "docs subject", first: "update the docs for the api", second: "update the docs for the cli" },
 ]
 
 const derivationalWordControls = [
@@ -1562,6 +1573,49 @@ it.instance("request admission merges only the reviewed plural target pairs", ()
     }
   }),
   30_000,
+)
+
+it.instance("consolidation keeps different generic subjects separate", () =>
+  Effect.gen(function* () {
+    const actual: string[][] = []
+    const expected: string[][] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of genericSubjectControls) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        actual.push(items.map(text))
+        expected.push([pair.first, pair.second])
+      }
+    }
+    expect(actual).toEqual(expected)
+  }),
+)
+
+it.instance("request admission keeps different generic subjects separate", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const actual: string[][] = []
+    const expected: string[][] = []
+    const receipts: string[][] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of genericSubjectControls) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "generic-subject-a", pair.first)
+        yield* request(session.id, delivery, "generic-subject-b", pair.second)
+        actual.push((yield* queue.list(session.id)).map(text))
+        expected.push([pair.first, pair.second])
+        receipts.push([
+          Option.getOrThrow(yield* queue.receipt(session.id, "generic-subject-a")).state,
+          Option.getOrThrow(yield* queue.receipt(session.id, "generic-subject-b")).state,
+        ])
+      }
+    }
+    expect(actual).toEqual(expected)
+    expect(receipts).toEqual(expected.map(() => ["pending", "pending"]))
+  }),
 )
 
 it.instance("consolidation keeps derivational word forms distinct", () =>
