@@ -123,6 +123,8 @@ import type {
   PartUpdateResponses,
   PathGetErrors,
   PathGetResponses,
+  PermissionAnswerErrors,
+  PermissionAnswerResponses,
   PermissionListErrors,
   PermissionListResponses,
   PermissionReplyErrors,
@@ -170,6 +172,8 @@ import type {
   PtyUpdateErrors,
   PtyUpdateResponses,
   QuestionAnswer,
+  QuestionAnswerErrors,
+  QuestionAnswerResponses,
   QuestionListErrors,
   QuestionListResponses,
   QuestionRejectErrors,
@@ -179,6 +183,7 @@ import type {
   QuestionV2Reply,
   SessionAbortErrors,
   SessionAbortResponses,
+  SessionAskQuestionAnswer,
   SessionChildrenErrors,
   SessionChildrenResponses,
   SessionCommandErrors,
@@ -3155,6 +3160,45 @@ export class Question extends HeyApiClient {
       ...params,
     })
   }
+
+  /**
+   * Answer question request
+   *
+   * Answer or reject a question request, reporting whether this answer settled it or an earlier one had. Under `--questions emit` this also settles a request whose server restarted while it was pending.
+   */
+  public answer<ThrowOnError extends boolean = false>(
+    parameters: {
+      requestID: string
+      directory?: string
+      workspace?: string
+      sessionAskQuestionAnswer?: SessionAskQuestionAnswer
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "requestID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "sessionAskQuestionAnswer", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<QuestionAnswerResponses, QuestionAnswerErrors, ThrowOnError>({
+      url: "/question/{requestID}/answer",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
 }
 
 export class Permission extends HeyApiClient {
@@ -3219,6 +3263,47 @@ export class Permission extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<PermissionReplyResponses, PermissionReplyErrors, ThrowOnError>({
       url: "/permission/{requestID}/reply",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Answer permission request
+   *
+   * Approve or deny a permission request, reporting whether this answer settled it or an earlier one had. Under `--questions emit` this also settles a request whose server restarted while it was pending.
+   */
+  public answer<ThrowOnError extends boolean = false>(
+    parameters: {
+      requestID: string
+      directory?: string
+      workspace?: string
+      reply?: "once" | "always" | "reject"
+      message?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "requestID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "reply" },
+            { in: "body", key: "message" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<PermissionAnswerResponses, PermissionAnswerErrors, ThrowOnError>({
+      url: "/permission/{requestID}/answer",
       ...options,
       ...params,
       headers: {

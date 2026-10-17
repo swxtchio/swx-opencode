@@ -4793,6 +4793,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "AskUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskUnavailableError"
+                }
+              }
+            }
           }
         },
         "description": "Provide answers to a question request from the AI assistant.",
@@ -4894,6 +4904,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "AskUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskUnavailableError"
+                }
+              }
+            }
           }
         },
         "description": "Reject a question request from the AI assistant.",
@@ -4902,6 +4922,105 @@
           {
             "lang": "js",
             "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.question.reject({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/question/{requestID}/answer": {
+      "post": {
+        "tags": ["question"],
+        "operationId": "question.answer",
+        "parameters": [
+          {
+            "name": "requestID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^que"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "How the answer settled the question request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionAskResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "QuestionNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QuestionNotFoundError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "AskUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskUnavailableError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Answer or reject a question request, reporting whether this answer settled it or an earlier one had. Under `--questions emit` this also settles a request whose server restarted while it was pending.",
+        "summary": "Answer question request",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionAskQuestionAnswer"
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.question.answer({\n  ...\n})"
           }
         ]
       }
@@ -5033,6 +5152,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "AskUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskUnavailableError"
+                }
+              }
+            }
           }
         },
         "description": "Approve or deny a permission request from the AI assistant.",
@@ -5061,6 +5190,116 @@
           {
             "lang": "js",
             "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.permission.reply({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/permission/{requestID}/answer": {
+      "post": {
+        "tags": ["permission"],
+        "operationId": "permission.answer",
+        "parameters": [
+          {
+            "name": "requestID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^per"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "How the answer settled the permission request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionAskResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "PermissionNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PermissionNotFoundError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "AskUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskUnavailableError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Approve or deny a permission request, reporting whether this answer settled it or an earlier one had. Under `--questions emit` this also settles a request whose server restarted while it was pending.",
+        "summary": "Answer permission request",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "reply": {
+                    "type": "string",
+                    "enum": ["once", "always", "reject"]
+                  },
+                  "message": {
+                    "type": "string"
+                  }
+                },
+                "required": ["reply"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.permission.answer({\n  ...\n})"
           }
         ]
       }
@@ -7999,6 +8238,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "AskUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskUnavailableError"
+                }
+              }
+            }
           }
         },
         "description": "Approve or deny a permission request from the AI assistant.",
@@ -9106,7 +9355,7 @@
             }
           }
         },
-        "description": "Keep one of identical pending prompts, and merge pending commands of one delivery that share their leading verb and target into one command with numbered steps, in delivery order.",
+        "description": "Consolidate pending prompts only within one delivery class: merge plain text whose case and whitespace normalized text is equal or one is a prefix of the other, and merge compatible commands with the same leading verb and a containing or distinctive-token-overlapping target into numbered steps in delivery order.",
         "summary": "Consolidate queued prompts",
         "x-codeSamples": [
           {
@@ -24464,6 +24713,156 @@
           }
         },
         "required": ["_tag", "requestID", "message"],
+        "additionalProperties": false
+      },
+      "AskUnavailableError": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["AskUnavailableError"]
+          },
+          "requestID": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string",
+            "enum": ["store-unavailable", "owned-by-live-process", "waiter-lost"]
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": ["_tag", "requestID", "reason", "message"],
+        "additionalProperties": false
+      },
+      "SessionAskQuestionAnswer": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "answers": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/QuestionAnswer"
+                },
+                "description": "Answers in order of questions; each is the selected labels or custom text"
+              }
+            },
+            "required": ["answers"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "reject": {
+                "type": "boolean",
+                "enum": [true]
+              }
+            },
+            "required": ["reject"],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "SessionAskDisposition": {
+        "type": "string",
+        "enum": ["settled", "duplicate"]
+      },
+      "SessionAskAnswered": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["answered"]
+          },
+          "answers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QuestionAnswer"
+            }
+          }
+        },
+        "required": ["type", "answers"],
+        "additionalProperties": false
+      },
+      "SessionAskRejected": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["rejected"]
+          }
+        },
+        "required": ["type"],
+        "additionalProperties": false
+      },
+      "SessionAskReplied": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["replied"]
+          },
+          "reply": {
+            "type": "string",
+            "enum": ["once", "always", "reject"]
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": ["type", "reply"],
+        "additionalProperties": false
+      },
+      "SessionAskCancelled": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["cancelled"]
+          }
+        },
+        "required": ["type"],
+        "additionalProperties": false
+      },
+      "SessionAskDecision": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/SessionAskAnswered"
+          },
+          {
+            "$ref": "#/components/schemas/SessionAskRejected"
+          },
+          {
+            "$ref": "#/components/schemas/SessionAskReplied"
+          },
+          {
+            "$ref": "#/components/schemas/SessionAskCancelled"
+          }
+        ]
+      },
+      "SessionAskResult": {
+        "type": "object",
+        "properties": {
+          "requestID": {
+            "type": "string"
+          },
+          "sessionID": {
+            "type": "string",
+            "pattern": "^ses"
+          },
+          "disposition": {
+            "$ref": "#/components/schemas/SessionAskDisposition"
+          },
+          "decision": {
+            "$ref": "#/components/schemas/SessionAskDecision"
+          },
+          "recovered": {
+            "type": "boolean"
+          }
+        },
+        "required": ["requestID", "sessionID", "disposition", "decision", "recovered"],
         "additionalProperties": false
       },
       "PermissionRequest": {

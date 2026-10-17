@@ -2612,6 +2612,55 @@ export type QuestionNotFoundError = {
   message: string
 }
 
+export type AskUnavailableError = {
+  _tag: "AskUnavailableError"
+  requestID: string
+  reason: "store-unavailable" | "owned-by-live-process" | "waiter-lost"
+  message: string
+}
+
+export type SessionAskQuestionAnswer =
+  | {
+      /**
+       * Answers in order of questions; each is the selected labels or custom text
+       */
+      answers: Array<QuestionAnswer>
+    }
+  | {
+      reject: true
+    }
+
+export type SessionAskDisposition = "settled" | "duplicate"
+
+export type SessionAskAnswered = {
+  type: "answered"
+  answers: Array<QuestionAnswer>
+}
+
+export type SessionAskRejected = {
+  type: "rejected"
+}
+
+export type SessionAskReplied = {
+  type: "replied"
+  reply: "once" | "always" | "reject"
+  message?: string
+}
+
+export type SessionAskCancelled = {
+  type: "cancelled"
+}
+
+export type SessionAskDecision = SessionAskAnswered | SessionAskRejected | SessionAskReplied | SessionAskCancelled
+
+export type SessionAskResult = {
+  requestID: string
+  sessionID: string
+  disposition: SessionAskDisposition
+  decision: SessionAskDecision
+  recovered: boolean
+}
+
 export type PermissionRequest = {
   id: string
   sessionID: string
@@ -9441,6 +9490,10 @@ export type QuestionReplyErrors = {
    * QuestionNotFoundError
    */
   404: QuestionNotFoundError
+  /**
+   * AskUnavailableError
+   */
+  503: AskUnavailableError
 }
 
 export type QuestionReplyError = QuestionReplyErrors[keyof QuestionReplyErrors]
@@ -9475,6 +9528,10 @@ export type QuestionRejectErrors = {
    * QuestionNotFoundError
    */
   404: QuestionNotFoundError
+  /**
+   * AskUnavailableError
+   */
+  503: AskUnavailableError
 }
 
 export type QuestionRejectError = QuestionRejectErrors[keyof QuestionRejectErrors]
@@ -9487,6 +9544,44 @@ export type QuestionRejectResponses = {
 }
 
 export type QuestionRejectResponse = QuestionRejectResponses[keyof QuestionRejectResponses]
+
+export type QuestionAnswerData = {
+  body?: SessionAskQuestionAnswer
+  path: {
+    requestID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/question/{requestID}/answer"
+}
+
+export type QuestionAnswerErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * QuestionNotFoundError
+   */
+  404: QuestionNotFoundError
+  /**
+   * AskUnavailableError
+   */
+  503: AskUnavailableError
+}
+
+export type QuestionAnswerError = QuestionAnswerErrors[keyof QuestionAnswerErrors]
+
+export type QuestionAnswerResponses = {
+  /**
+   * How the answer settled the question request
+   */
+  200: SessionAskResult
+}
+
+export type QuestionAnswerResponse = QuestionAnswerResponses[keyof QuestionAnswerResponses]
 
 export type PermissionListData = {
   body?: never
@@ -9540,6 +9635,10 @@ export type PermissionReplyErrors = {
    * PermissionNotFoundError
    */
   404: PermissionNotFoundError
+  /**
+   * AskUnavailableError
+   */
+  503: AskUnavailableError
 }
 
 export type PermissionReplyError = PermissionReplyErrors[keyof PermissionReplyErrors]
@@ -9552,6 +9651,47 @@ export type PermissionReplyResponses = {
 }
 
 export type PermissionReplyResponse = PermissionReplyResponses[keyof PermissionReplyResponses]
+
+export type PermissionAnswerData = {
+  body?: {
+    reply: "once" | "always" | "reject"
+    message?: string
+  }
+  path: {
+    requestID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/permission/{requestID}/answer"
+}
+
+export type PermissionAnswerErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * PermissionNotFoundError
+   */
+  404: PermissionNotFoundError
+  /**
+   * AskUnavailableError
+   */
+  503: AskUnavailableError
+}
+
+export type PermissionAnswerError = PermissionAnswerErrors[keyof PermissionAnswerErrors]
+
+export type PermissionAnswerResponses = {
+  /**
+   * How the answer settled the permission request
+   */
+  200: SessionAskResult
+}
+
+export type PermissionAnswerResponse = PermissionAnswerResponses[keyof PermissionAnswerResponses]
 
 export type ProviderListData = {
   body?: never
@@ -10670,6 +10810,10 @@ export type PermissionRespondErrors = {
    * NotFoundError | PermissionNotFoundError
    */
   404: NotFoundError | PermissionNotFoundError
+  /**
+   * AskUnavailableError
+   */
+  503: AskUnavailableError
 }
 
 export type PermissionRespondError = PermissionRespondErrors[keyof PermissionRespondErrors]
