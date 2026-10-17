@@ -1,6 +1,6 @@
 # OpenCode fork release evidence
 
-Refs #269
+Refs #269; #283
 
 Evidence snapshot: 2026-10-17. The release is published at [v1.18.32-swxtch.0ff0dfbc](https://github.com/swxtchio/swx-opencode/releases/tag/v1.18.32-swxtch.0ff0dfbc); the producer issue is swxtchio/swx-opencode#269 and the handoff PR remains draft #282.
 
@@ -45,14 +45,30 @@ The VM14 all-target build also emitted an x64 cross-target candidate with archiv
 
 - At the release source revision, `bun test test/session-runner.test.ts -t 'SessionV2.wait'` passed 31 tests and `bun test test/database/path.test.ts` passed 1 test from `packages/core`.
 - From `packages/opencode`, the five required `httpapi-session.test.ts` cases passed: completed native wait, admit-only pending, terminal event replay after HTTP disconnect, failed terminal tool, and interrupted wait after tool cleanup. `bun test test/cli/smokes/read-only.test.ts -t 'db path:'` passed its CLI boundary check.
-- The extracted ARM and native x64 archives each passed the full `release-probe.ts` HTTP battery: newly created Session `idle`; admit-only `pending` with its message ID; `completed` with `admittedSeq` equal to the admission receipt and an `assistantMessageID` resolving to the terminal assistant; terminal-tool `failed`; and `interrupted` after persisted tool cleanup. The completion waiter remained unresolved while the Bash tool was running and while the final provider continuation was held.
+- The published ARM and native x64 archives passed the earlier idle/pending/outcome/history/database behavior battery. Those release binaries predate the round-4 wait lifecycle log records, so the round-3 syscall trace is not counted as proof that the main wait handler registered or resolved; the round-4 held-wait result below is from instrumented same-source rebuilds, with published x64 bytes executed separately.
 - After restarting the ARM and x64 servers on their same isolated databases, the admitted user and terminal assistant messages remained readable by message ID. History replay after the admission sequence returned the same durable event IDs in strictly increasing exclusive-sequence order.
 - On both architectures, two different absolute `OPENCODE_DB` paths over a conflicting `XDG_DATA_HOME` printed their explicit paths; `db 'SELECT 1'` opened two distinct physical stores and no conflicting XDG database. With `OPENCODE_DB` unset, `db path` matched the `latest` channel default under `XDG_DATA_HOME`.
 
-### Round-3 held-wait producer receipt
+### Round-4 producer-internal held-wait attestation
 
-- Each main held-wait request carries a unique header derived from the real prompt-admission receipt (session ID, message ID, admitted sequence, and request ID). Before releasing a tool/provider hold or sending interrupt, the probe requires the matching `POST /api/session/{sessionID}/wait` and header to appear in a syscall trace of the producer process, then reads the admitted message back through `GET /api/session/{sessionID}/message/{messageID}` and checks its server response identity.
-- The absence-red test selectively delays only the main `completed`, `failed`, or `interrupted` wait until the real provider-release or interrupt response, while independent admit-only pending requests still reach the server. Each attack fails at the missing producer request receipt; the normal full release-probe run exercises the restored green path.
+- The round-3 socket trace is no longer an acceptance signal. `SessionRunCoordinator.join` inserts a server-generated wait ID with session/message/admitted-sequence identity into its process-local waiter registry before awaiting active execution, then emits `session.wait.registered`; `SessionV2.wait` emits `session.wait.resolved` with that same identity and the final outcome. The structured records use the existing core logger and contain no prompt text or credentials.
+- `packages/opencode/script/release-probe.ts` reads the isolated producer log at `XDG_DATA_HOME/opencode/log/opencode.log`. Before each held-phase release or interrupt it requires a registration record matching the admitted message and sequence; after the HTTP result it requires a resolution record with the same server wait ID, session, message, sequence, and outcome. The positive path does not use socket bytes, request headers, payload fields, or client-local pending state.
+- The focused HTTP-boundary test, `logs producer wait registration and resolution for a held HTTP wait`, observed registration while the provider was held and resolution after release with one wait ID and admitted sequence. Running the same test with `OPENCODE_LOG_LEVEL=ERROR` produced its bounded missing-registration failure, demonstrating that absent log emission cannot pass.
+- On native ARM64, the full idle/pending/completed/failed/interrupted/restart/database battery passed against a proof-only rebuild of tag source `0ff0dfbca1f01765f6bd41d0379d9b97f1cf8d23` with the wait-log overlay from commits `bbffec0e22` and `8d6fa2b441`. The overlay SHA-256 was `4ea320236a9cc2e83e080999f2f1971feac3bec0480bb43ffe115aea1c2462d2`, computed from `git diff --binary` over the three core wait files; the build used Bun 1.4.2, `--single --skip-install`, and the exact tag version.
+
+| Target and outcome | Session ID | Admitted message ID | Server wait ID | admittedSeq |
+| --- | --- | --- | --- | ---: |
+| ARM64 — completed | `ses_eb5c33bafffe40EcYk86eo9YE3` | `msg_14a3cc45d001YPCSLP5oYjvRYs` | `c750e8cf-8b22-4168-992e-35d2f11383a3` | 1 |
+| ARM64 — failed | `ses_eb5c3317cffedr7l7lim6Pfd6T` | `msg_14a3cce9e001DlmgzrHBMJ1bvy` | `d850b8a4-efcd-4a58-a540-387f46e5b105` | 1 |
+| ARM64 — interrupted | `ses_eb5c32830ffefl2DK9BYlb6eQ6` | `msg_14a3cd7e0001GzKmANx7Sq7lJb` | `cd70ecb0-6e67-448f-9296-180a3976f9b2` | 1 |
+| x64 — completed | `ses_eb5db86f6ffeg76jcEJ9xm0OX4` | `msg_14a247918001GUApign08gKRz0` | `649d0a21-7530-4840-b34b-62ededf4fb6a` | 1 |
+| x64 — failed | `ses_eb5db7630ffe5jSIJFE5qsmzRD` | `msg_14a2489e3001l3d353nM6DpQxK` | `b139f6ad-6a84-4e54-8667-8cd6d4322d50` | 1 |
+| x64 — interrupted | `ses_eb5db6f4effeR72eBVODt7GhaE` | `msg_14a2490c0001W1T1JQRpfHvQwf` | `c241ab37-cf63-4640-9877-fc676bfae95f` | 1 |
+
+- The native x64 held-wait battery ran in Actions run [39038343804](https://github.com/swxtchio/swx-opencode/actions/runs/39038343804) at proof-harness head `0e76aea1dcf411303f981d5bfe8de24654ff3f83` on a proof-only same-source rebuild: tag source `0ff0dfbca1f01765f6bd41d0379d9b97f1cf8d23` plus the same wait-log overlay SHA-256 `4ea320236a9cc2e83e080999f2f1971feac3bec0480bb43ffe115aea1c2462d2`; the instrumented proof archive SHA-256 was `aa9321780a83d78ea381cba6b1eaed30158a575c21d158687378b98b40c08c5f`. The workflow artifact is [opencode-linux-x64-round4-proof-39038343804](https://github.com/swxtchio/swx-opencode/actions/runs/39038343804/artifacts/12103391749).
+- In that same x64 run, the workflow separately downloaded and executed the published archive: archive SHA-256 `ce5e6ee0b627f477d5873373bf535a932ba40c02863dc7fd9f45ea81e40e718f`, executable SHA-256 `10e0ae91a4c6f7391a7c1f31e64f27cd8a00e3f7094372137b92ab08ba2d602c`, FFF sidecar SHA-256 `977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5`, and exact tag-version read-back; FFF search and explicit database path/`SELECT 1` also passed. The released x64 binary has no round-4 wait-log instrumentation, so a separate socket-only absence-red ran the held probe against those published bytes: `strace` recorded a complete main-wait POST with its HTTP header terminator, but the probe rejected it for lacking a producer registration record.
+- The other removal-reds passed in the same x64 workflow: completed/failed/interrupted main-wait withholding and the client-fabricated partial header prefix (including `X-Release-Probe-Wait-Receipt` but no terminating blank line) both failed at the missing producer registration. The syscall traces are retained only as attack-shape evidence, never as successful attestation.
+- The x64-attribution residue is tracked in [swxtchio/swx-opencode#283](https://github.com/swxtchio/swx-opencode/issues/283); this PR records its x64 proof-attribution resolution and leaves the separate release-body and root-document placement items there.
 
 ### Regression absence proof
 
