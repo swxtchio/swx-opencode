@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 
 import fs from "node:fs/promises"
-import { randomUUID } from "node:crypto"
 import path from "node:path"
 import { abortAllRequests, requestText, startRequest } from "./release-probe-requests"
 import { runProcess, spawnProcess } from "./release-probe-process"
@@ -21,6 +20,14 @@ type Message = {
 type HistoryEvent = { id: string; type: string; durable?: { seq: number } }
 type ApiResult = { status: number; body: unknown; text: string }
 type AdmissionReceipt = { status: number; sessionID: string; id: string; admittedSeq: number }
+type WaitLogInput = {
+  event: "session.wait.registered" | "session.wait.resolved"
+  sessionID: string
+  admittedSeq: number
+  messageID: string
+  waitID?: string
+  outcome?: string
+}
 type WaitResult = {
   type: string
   admittedSeq?: number
@@ -45,6 +52,7 @@ const state = path.join(proofRoot, "xdg-state")
 const cache = path.join(proofRoot, "xdg-cache")
 const temporary = path.join(proofRoot, "tmp")
 const database = path.join(proofRoot, "session.sqlite")
+const serverLogFile = path.join(data, "opencode", "log", "opencode.log")
 const expectedVersion = Bun.env.OPENCODE_VERSION
 if (!expectedVersion) throw new Error("OPENCODE_VERSION is required for the release attestation")
 
@@ -190,12 +198,14 @@ const opencodeEnvironment: Record<string, string | undefined> = {
   OPENCODE_DISABLE_MODELS_FETCH: "1",
   OPENCODE_DISABLE_AUTOUPDATE: "1",
   OPENCODE_PURE: "1",
+  OPENCODE_LOG_LEVEL: "INFO",
 }
 delete opencodeEnvironment.OPENCODE_DISABLE_FFF
 delete opencodeEnvironment.BUN_OPTIONS
 delete opencodeEnvironment.RELEASE_PROBE_WAIT_START_FILE
 delete opencodeEnvironment.RELEASE_PROBE_WAIT_RELEASE_FILE
 delete opencodeEnvironment.RELEASE_PROBE_WAIT_SUPPRESS_SCENARIO
+delete opencodeEnvironment.RELEASE_PROBE_SERVER_TRACE
 
 let serverUrl = ""
 let serverExitCode: number | undefined
@@ -348,29 +358,37 @@ async function until<T>(label: string, read: () => Promise<T | undefined>, budge
   throw new Error(`Timed out waiting for ${label}`)
 }
 
+async function waitLogRecord(input: WaitLogInput) {
+  return until(
+    `producer log ${input.event} for ${input.sessionID}`,
+    async () => {
+      const logs = await fs.readFile(serverLogFile, "utf8").catch(() => "")
+      return logs.split(/\r?\n/).find(
+        (line) =>
+          line.includes(`event=${input.event}`) &&
+          line.includes(`session_id=${input.sessionID}`) &&
+          line.includes(`admitted_seq=${input.admittedSeq}`) &&
+          line.includes(`message_id=${input.messageID}`) &&
+          (input.waitID === undefined || line.includes(`wait_id=${input.waitID}`)) &&
+          (input.outcome === undefined || line.includes(`outcome=${input.outcome}`)),
+      )
+    },
+    10_000,
+  )
+}
+
 async function startServer() {
   const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("probe") })
   const port = probe.port
   await probe.stop(true)
-  const traceFile = path.join(proofRoot, `opencode-server-${serverNumber++}.trace`)
-  const command = [
-    "strace",
-    "-f",
-    "-s",
-    "8192",
-    "-e",
-    "trace=read,readv,recvfrom,recvmsg",
-    "-o",
-    traceFile,
-    binary,
-    "serve",
-    "--pure",
-    "--print-logs",
-    "--hostname",
-    "127.0.0.1",
-    "--port",
-    String(port),
-  ]
+  const traceFile =
+    Bun.env.RELEASE_PROBE_SERVER_TRACE === "1"
+      ? path.join(proofRoot, `opencode-server-${serverNumber++}.trace`)
+      : undefined
+  const serverArgs = [binary, "serve", "--pure", "--print-logs", "--hostname", "127.0.0.1", "--port", String(port)]
+  const command = traceFile
+    ? ["strace", "-f", "-s", "8192", "-e", "trace=read,readv,recvfrom,recvmsg", "-o", traceFile, ...serverArgs]
+    : serverArgs
   const serverProcess = spawnProcess(command, { cwd: workspace, env: opencodeEnvironment })
   let stdout = ""
   let stderr = ""
@@ -474,16 +492,10 @@ function findTool(messages: Message[], name?: string) {
     .find((content) => content.type === "tool" && (name === undefined || content.name === name))
 }
 
-function startWait(sessionID: string, admission: AdmissionReceipt) {
+function startWait(sessionID: string) {
   if (!server) throw new Error("Cannot start a wait request without a running producer")
   const state: { settled: boolean; response?: ApiResult; error?: string } = { settled: false }
-  const receiptID = randomUUID()
-  const receiptHeader = `${sessionID}:${admission.id}:${admission.admittedSeq}:${receiptID}`
-  const request = apiRequest(
-    `/api/session/${sessionID}/wait`,
-    { method: "POST", headers: { "x-release-probe-wait-receipt": receiptHeader } },
-    120_000,
-  )
+  const request = apiRequest(`/api/session/${sessionID}/wait`, { method: "POST" }, 120_000)
   const promise = request.result
     .then(parseApiResult)
     .then((response) => {
@@ -494,7 +506,7 @@ function startWait(sessionID: string, admission: AdmissionReceipt) {
       state.settled = true
       state.error = String(error)
     })
-  return { state, promise, receiptID, receiptHeader, traceFile: server.traceFile, abort: request.abort, done: request.done }
+  return { state, promise, abort: request.abort, done: request.done }
 }
 
 async function assertRunningWaitPending(
@@ -513,22 +525,19 @@ async function assertRunningWaitPending(
   const producerMessage = (messageReadback.body as { data?: Message } | undefined)?.data
   if (messageReadback.status !== 200 || producerMessage?.id !== admission.id || producerMessage.type !== "user")
     throw new Error(`Producer message readback did not match the held admission during ${phase}: ${JSON.stringify(messageReadback)}`)
-  let producerTraceLine: string
+  let registrationLine: string
   try {
-    producerTraceLine = await until(
-      `producer to receive the main wait request during ${phase}`,
-      async () => {
-        const trace = await fs.readFile(waiter.traceFile, "utf8").catch(() => "")
-        const lower = trace.toLowerCase()
-        const route = `/api/session/${sessionID}/wait`.toLowerCase()
-        const receipt = `x-release-probe-wait-receipt: ${waiter.receiptHeader}`.toLowerCase()
-        return trace.split(/\r?\n/).find((line) => line.toLowerCase().includes(route) && line.toLowerCase().includes(receipt))
-      },
-      10_000,
-    )
+    registrationLine = await waitLogRecord({
+      event: "session.wait.registered",
+      sessionID,
+      admittedSeq: admission.admittedSeq,
+      messageID: admission.id,
+    })
   } catch (error) {
-    throw new Error(`No producer-side wait request receipt during ${phase}: ${String(error)}`)
+    throw new Error(`No producer wait registration before releasing the hold for sessionID=${sessionID} admitted_seq=${admission.admittedSeq} during ${phase}: ${String(error)}`)
   }
+  const waitID = /(?:^|\s)wait_id=([^\s]+)/.exec(registrationLine)?.[1]
+  if (!waitID) throw new Error(`Producer wait registration omitted wait_id for ${sessionID}: ${registrationLine}`)
   if (waiter.state.settled) throw new Error(`wait returned before ${phase}: ${JSON.stringify(waiter.state.response)}`)
   return {
     phase,
@@ -541,15 +550,12 @@ async function assertRunningWaitPending(
       id: producerMessage.id,
       type: producerMessage.type,
     },
-    producer_wait_request_receipt: {
-      observer: "server-process-strace",
-      request_id: waiter.receiptID,
+    producer_wait_registration: {
+      wait_id: waitID,
       sessionID,
       messageID: admission.id,
       admittedSeq: admission.admittedSeq,
-      trace_line: producerTraceLine
-        .replace(/Authorization: Basic [^\\"]+/i, "Authorization: Basic <redacted>")
-        .replace(/x-opencode-directory: [^\\"]+/i, "x-opencode-directory: <redacted>"),
+      record: registrationLine,
     },
     main_wait_client_unsettled: waiter.state.settled === false,
   }
@@ -591,7 +597,7 @@ async function completedOutcome() {
     return tool?.state?.status === "running" ? tool : undefined
   })
   await fs.writeFile(path.join(workspace, "completed-tool-held"), "held")
-  const waiter = startWait(session.id, admission)
+  const waiter = startWait(session.id)
   const toolHoldReceipt = await assertRunningWaitPending(
     session.id,
     admission,
@@ -614,6 +620,8 @@ async function completedOutcome() {
     waiter,
     "the final provider continuation is held",
   )
+  if (toolHoldReceipt.producer_wait_registration.wait_id !== continuationHoldReceipt.producer_wait_registration.wait_id)
+    throw new Error("completed wait registered different producer wait IDs across its held phases")
   await fs.writeFile(path.join(workspace, "completed-continuation-release"), "release")
   await releaseProviderGate("completed")
 
@@ -624,6 +632,14 @@ async function completedOutcome() {
   const result = (response.body as { data: WaitResult }).data
   if (result.type !== "completed" || result.admittedSeq !== admission.admittedSeq || !result.assistantMessageID)
     throw new Error(`completed wait result mismatch: ${JSON.stringify({ result, admission })}`)
+  const waitResolution = await waitLogRecord({
+    event: "session.wait.resolved",
+    sessionID: session.id,
+    admittedSeq: admission.admittedSeq,
+    messageID: admission.id,
+    waitID: toolHoldReceipt.producer_wait_registration.wait_id,
+    outcome: result.type,
+  })
 
   const allMessages = await messages(session.id)
   const user = allMessages.find((message) => message.id === admission.id)
@@ -645,6 +661,7 @@ async function completedOutcome() {
     held_tool_status: heldTool.state?.status,
     settled_tool_status: settledTool.state?.status,
     held_phase_wait_evidence: [toolHoldReceipt, continuationHoldReceipt],
+    wait_resolution: waitResolution,
     userMessageID: user.id,
     assistantMessageID: assistant.id,
     history: events,
@@ -682,7 +699,7 @@ async function failedOutcome() {
     const tool = findTool(await messages(session.id), "not_registered")
     return tool?.state?.status === "error" ? tool : undefined
   })
-  const waiter = startWait(session.id, admission)
+  const waiter = startWait(session.id)
   const waitEvidence = await assertRunningWaitPending(
     session.id,
     admission,
@@ -696,6 +713,14 @@ async function failedOutcome() {
   const result = response?.body ? (response.body as { data: WaitResult }).data : undefined
   if (response?.status !== 200 || result?.type !== "failed" || result.admittedSeq !== admission.admittedSeq)
     throw new Error(`failed wait result mismatch: ${JSON.stringify({ response, admission })}`)
+  const waitResolution = await waitLogRecord({
+    event: "session.wait.resolved",
+    sessionID: session.id,
+    admittedSeq: admission.admittedSeq,
+    messageID: admission.id,
+    waitID: waitEvidence.producer_wait_registration.wait_id,
+    outcome: result.type,
+  })
   const history = await apiJson<{ data: HistoryEvent[]; hasMore: boolean }>(`/api/session/${session.id}/history?limit=100`)
   if (!history.data.some((event) => event.type.toLowerCase().includes("tool.failed")))
     throw new Error("failed tool terminal event was not persisted")
@@ -704,6 +729,7 @@ async function failedOutcome() {
     admission,
     result,
     wait_evidence: waitEvidence,
+    wait_resolution: waitResolution,
     failed_tool_status: failedTool.state?.status,
     terminal_event_persisted: true,
   }
@@ -718,7 +744,7 @@ async function interruptedOutcome() {
     return tool?.state?.status === "running" ? tool : undefined
   })
   await fs.writeFile(path.join(workspace, "interrupted-tool-held"), "held")
-  const waiter = startWait(session.id, admission)
+  const waiter = startWait(session.id)
   const waitEvidence = await assertRunningWaitPending(
     session.id,
     admission,
@@ -733,6 +759,14 @@ async function interruptedOutcome() {
   const result = response?.body ? (response.body as { data: WaitResult }).data : undefined
   if (response?.status !== 200 || result?.type !== "interrupted" || result.admittedSeq !== admission.admittedSeq)
     throw new Error(`interrupted wait result mismatch: ${JSON.stringify({ response, admission })}`)
+  const waitResolution = await waitLogRecord({
+    event: "session.wait.resolved",
+    sessionID: session.id,
+    admittedSeq: admission.admittedSeq,
+    messageID: admission.id,
+    waitID: waitEvidence.producer_wait_registration.wait_id,
+    outcome: result.type,
+  })
   const allMessages = await messages(session.id)
   const tool = findTool(allMessages, "bash")
   if (tool?.state?.status !== "error" || !tool.state.error?.message?.toLowerCase().includes("interrupt"))
@@ -745,6 +779,7 @@ async function interruptedOutcome() {
     admission,
     result,
     wait_evidence: waitEvidence,
+    wait_resolution: waitResolution,
     tool_cleanup: tool.state.error.message,
     terminal_event_persisted: true,
   }

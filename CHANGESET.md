@@ -38,7 +38,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Fork maintenance and CI
 
-- **#282** Add a bounded native linux-x64 release-probe workflow that builds the pinned CLI and retains the archive, checksum, and Session wait/restart/database evidence. _Fork-only._
+- **#282** Add producer-internal V2 Session wait registration/resolution logs and a bounded native linux-x64 proof workflow. The held-wait battery runs on a same-source instrumented rebuild; a separate downloaded-published-bytes run retains the release archive checksum, version, sidecar and database read-back. _Fork-only._
 - **#268** Raise the unit CI step budget from 20 to 30 minutes (swxtchio/swx-opencode#231): the step consumed 1,010s of its
   1,200s limit on the #260 merge head and timed out on the #237 head with every test passing. No check is loosened.
 - **#150** The repository-read-only `fff-platform-validation.yml` builds and runs compiled FFF distributions on native Windows x64 and ARM64 runners, computes and checks Nix node_modules hashes on native Linux and macOS runners, retains runner evidence, and builds OpenCode with Nix after each hash matches. _Fork-only._

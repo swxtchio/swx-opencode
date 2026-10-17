@@ -1,6 +1,9 @@
+import { connect, type Socket } from "node:net"
+
 type Scenario = "completed" | "failed" | "interrupted"
 
 const suppressedScenario = requireScenario(Bun.env.RELEASE_PROBE_WAIT_SUPPRESS_SCENARIO)
+const attack = Bun.env.RELEASE_PROBE_WAIT_ATTACK ?? "late-dispatch"
 const nativeFetch = globalThis.fetch
 const scenarioSessions = new Map<string, Scenario>()
 const released = new Set<Scenario>()
@@ -22,8 +25,15 @@ async function gatedFetch(fetcher: typeof globalThis.fetch, input: RequestInfo |
     const scenario = promptScenario(init?.body)
     if (scenario === suppressedScenario) scenarioSessions.set(sessionID, scenario)
   }
-  if (method === "POST" && url.pathname.endsWith("/wait") && sessionID && scenarioSessions.get(sessionID) === suppressedScenario)
-    await waitForRelease(suppressedScenario, init?.signal ?? request?.signal)
+  if (method === "POST" && url.pathname.endsWith("/wait") && sessionID && scenarioSessions.get(sessionID) === suppressedScenario) {
+    const signal = init?.signal ?? request?.signal
+    const partial = attack === "partial-prefix" ? await sendPartialWaitPrefix(url, init?.headers, signal) : undefined
+    try {
+      await waitForRelease(suppressedScenario, signal)
+    } finally {
+      partial?.destroy()
+    }
+  }
 
   const response = await fetcher(input, init)
   if (response.status === 204 && method === "POST") {
@@ -38,6 +48,51 @@ async function gatedFetch(fetcher: typeof globalThis.fetch, input: RequestInfo |
 function requireScenario(input: string | undefined): Scenario {
   if (input === "completed" || input === "failed" || input === "interrupted") return input
   throw new Error(`Wait-dispatch preloader requires a valid suppression scenario, got ${input}`)
+}
+
+function sendPartialWaitPrefix(url: URL, initHeaders?: HeadersInit, signal?: AbortSignal | null) {
+  return new Promise<Socket>((resolve, reject) => {
+    const socket = connect({ host: url.hostname, port: Number(url.port) })
+    let finished = false
+    let timer: Timer | undefined
+    const cleanup = () => {
+      if (timer) clearTimeout(timer)
+      socket.off("connect", onConnect)
+      socket.off("error", onError)
+      signal?.removeEventListener("abort", onAbort)
+    }
+    const fail = (error: Error) => {
+      if (finished) return
+      finished = true
+      cleanup()
+      socket.destroy()
+      reject(error)
+    }
+    const onConnect = () => {
+      if (finished) return
+      finished = true
+      cleanup()
+      const headers = new Headers(initHeaders)
+      socket.on("error", () => {})
+      socket.write(
+        [
+          `POST ${url.pathname} HTTP/1.1`,
+          `Host: ${url.host}`,
+          `Authorization: ${headers.get("authorization") ?? ""}`,
+          `X-OpenCode-Directory: ${headers.get("x-opencode-directory") ?? ""}`,
+          "X-Release-Probe-Wait-Receipt: client-fabricated",
+          "Content-Length: 0",
+        ].join("\r\n") + "\r\n",
+      )
+      resolve(socket)
+    }
+    const onError = (error: Error) => fail(error)
+    const onAbort = () => fail(signal?.reason instanceof Error ? signal.reason : new Error("partial wait prefix aborted"))
+    timer = setTimeout(() => fail(new Error(`timed out connecting partial wait prefix to ${url.host}`)), 5_000)
+    socket.once("connect", onConnect)
+    socket.once("error", onError)
+    signal?.addEventListener("abort", onAbort, { once: true })
+  })
 }
 
 function promptScenario(body: BodyInit | null | undefined): Scenario | undefined {
