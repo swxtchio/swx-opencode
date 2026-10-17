@@ -4,6 +4,12 @@ on:
   pull_request:
     branches:
       - swxtch
+    paths:
+      - .github/workflows/opencode-arm-release-x64.yml
+      - .github/actions/setup-bun/**
+      - packages/opencode/script/release-probe.ts
+      - package.json
+      - bun.lock
 
 concurrency:
   group: native-x64-release-proof-${{ github.event.pull_request.number || github.ref }}

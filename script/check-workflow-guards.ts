@@ -63,7 +63,7 @@ const ALLOWED_ACTIONS = new Map([["setup-bun", "761c61a6a87fd34a"]])
  */
 const ALLOWED_ENVELOPES = new Map([
   ["fff-platform-validation.yml", "7c3c7fc7328f12b6"],
-  ["opencode-arm-release-x64.yml", "6bd0a39b1a526ea7"],
+  ["opencode-arm-release-x64.yml", "f2a62fcbd5dc00be"],
   ["test.yml", "0e4560dca190d1b3"],
   ["typecheck.yml", "783bae590157a011"],
 ])
