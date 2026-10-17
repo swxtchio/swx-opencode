@@ -30,6 +30,7 @@ const it = testEffect(
   AppNodeBuilder.build(
     LayerNode.group([
       Question.node,
+      AskLedger.node,
       Session.node,
       Agent.node,
       Truncate.node,
@@ -188,6 +189,34 @@ describe("question lifecycle under --questions emit", () => {
         if (winner.type === "answered")
           expect(Exit.isSuccess(outcome) && outcome.value.metadata.answers).toEqual(winner.answers)
         if (winner.type === "rejected") expect(Exit.isFailure(outcome)).toBe(true)
+      }).pipe(provideInstance(dir))
+    }),
+  )
+
+  it.live("a settlement that lost the race inside the ledger's transaction reports the winner and changes nothing", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      yield* Effect.gen(function* () {
+        const question = yield* Question.Service
+        const ledger = yield* AskLedger.Service
+        const { receiver, sessionID } = yield* supervised()
+        const fiber = yield* askWithTool(sessionID, "call_transaction")
+        const [emitted] = yield* receiver.read(1)
+
+        // Both resolvers passed decide's read of a pending ask; the transaction decides between them.
+        const first = yield* ledger.settle({
+          id: emitted.id,
+          decision: { type: "answered", answers: [["Red"], ["first"]] },
+          recovered: false,
+        })
+        const second = yield* ledger.settle({ id: emitted.id, decision: { type: "rejected" }, recovered: false })
+        expect(first.won).toBe(true)
+        expect(second.won).toBe(false)
+        expect(second.row.decision).toEqual({ type: "answered", answers: [["Red"], ["first"]] })
+        const stored = yield* ledger.find(emitted.id)
+        expect(stored?.decision).toEqual({ type: "answered", answers: [["Red"], ["first"]] })
+        yield* Fiber.interrupt(fiber)
+        expect(yield* question.list()).toEqual([])
       }).pipe(provideInstance(dir))
     }),
   )
