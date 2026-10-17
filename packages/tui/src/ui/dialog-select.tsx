@@ -42,6 +42,8 @@ export interface DialogSelectProps<T> {
     side?: "left" | "right"
     hidden?: boolean
     disabled?: boolean | ((option: DialogSelectOption<T> | undefined) => boolean)
+    onDisabledTrigger?: () => void
+    onUnavailableTrigger?: () => void
     onTrigger: (option: DialogSelectOption<T>) => void
   }[]
   footerHints?: {
@@ -437,14 +439,7 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
           name: item.command,
           title: item.title,
           category: "Dialog",
-          run() {
-            if (props.locked) return
-            if (isActionDisabled(item)) return
-            setStore("input", "keyboard")
-            const option = selected()
-            if (!option) return
-            item.onTrigger(option)
-          },
+          run: () => triggerAction(item),
         })),
       ],
       bindings: [
@@ -500,12 +495,19 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
   const left = createMemo(() => visibleActions().filter((item) => item.side !== "right"))
   const right = createMemo(() => visibleActions().filter((item) => item.side === "right"))
 
-  function triggerAction(item: VisibleAction | undefined) {
+  function triggerAction(item: Action | VisibleAction | undefined) {
     if (props.locked) return
-    if (!item || !isActionItem(item) || isActionDisabled(item)) return
+    if (!item || !("onTrigger" in item)) return
     setStore("input", "keyboard")
+    if (isActionDisabled(item)) {
+      item.onDisabledTrigger?.()
+      return
+    }
     const option = selected()
-    if (!option) return
+    if (!option) {
+      item.onUnavailableTrigger?.()
+      return
+    }
     item.onTrigger(option)
   }
 

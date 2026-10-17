@@ -177,6 +177,531 @@ const request = (
     })
   })
 
+const jobClassControls = [
+  { title: "handler", first: "fix authentication handler", second: "fix billing handler" },
+  { title: "crash", first: "fix the parser crash", second: "fix the tokenizer crash" },
+]
+
+const sharedFirstNounControls = [
+  { title: "session queue", first: "refactor the session queue", second: "refactor the session projector" },
+  { title: "workspace queue", first: "rename the workspace queue", second: "rename the workspace projector" },
+]
+
+const differentModifierSameHeadTargets = [
+  {
+    title: "intermittent failures",
+    first: "fix intermittent authentication failures",
+    second: "fix intermittent billing failures",
+  },
+  {
+    title: "profile pages",
+    first: "update user profile page",
+    second: "update admin profile page",
+  },
+  {
+    title: "redirect loops",
+    first: "fix login redirect loop",
+    second: "fix signup redirect loop",
+  },
+  {
+    title: "connection pooling",
+    first: "add postgres connection pooling",
+    second: "add redis connection pooling",
+  },
+  {
+    title: "service clients",
+    first: "refactor billing service client",
+    second: "refactor auth service client",
+  },
+  {
+    title: "receipt routing",
+    first: "review authentication receipt routing: preserve origin IDs",
+    second: "review billing receipt routing: verify settlement",
+  },
+  {
+    title: "dependent clauses retain conflicting subject modifiers",
+    first: "investigate auth deployment and when it runs",
+    second: "investigate billing deployment and why it runs",
+  },
+  {
+    title: "lowercase node.js retains different subsystem subjects",
+    first: "fix node.js authentication handler",
+    second: "fix node.js billing handler",
+  },
+  {
+    title: "comma clauses retain conflicting subject modifiers",
+    first: "investigate auth deployment, how it works",
+    second: "investigate billing deployment, how it works",
+  },
+  {
+    title: "comma clauses retain conflicting subject nouns",
+    first: "investigate CI deployment, how it works",
+    second: "investigate CI rollback, how it works",
+  },
+]
+
+const literalFilenameTargets = [
+  {
+    title: "tool file siblings",
+    first: "update packages/core/src/tool/tool.ts: preserve the singular module",
+    second: "update packages/core/src/tool/tools.ts: preserve the plural module",
+  },
+  {
+    title: "route handler siblings",
+    first: "update packages/opencode/src/server/routes/api/session.ts: preserve route identity",
+    second: "update packages/opencode/src/server/routes/api/sessions.ts: preserve route identity",
+  },
+  {
+    title: "short file target",
+    first: "update packages/core/src/tool/tool.ts: preserve the singular module",
+    second: "update tools.ts: preserve the standalone module",
+  },
+  {
+    title: "file extensions",
+    first: "update src/session/queue.ts: preserve the TypeScript module",
+    second: "update src/session/queue.tsx: preserve the JSX module",
+  },
+]
+
+const suffixFilenameTargets = [
+  {
+    title: "unlisted suffix basenames use literal identity after case normalization",
+    first: "fix auth tool.test: preserve the module",
+    second: "fix auth tools.TEST: verify the schema",
+  },
+  {
+    title: "unlisted suffix basenames stay literal under a path prefix",
+    first: "fix src/tool.test: preserve the module",
+    second: "fix src/tools.test: verify the schema",
+  },
+  {
+    title: "unlisted suffix basenames do not singularize before identity",
+    first: "fix auth.graphql: preserve the schema",
+    second: "fix auths.graphql: verify the schema",
+  },
+  {
+    title: "an ing suffix does not singularize an unlisted dotted basename",
+    first: "fix auth redirecting.test: preserve the route",
+    second: "fix auth redirect.test: verify the route",
+  },
+  {
+    title: "an unlisted dotted filename retains literal path containment",
+    first: "update src/File.TEST: preserve the test identity",
+    second: "update file.test: document the fixture",
+    merged: "update src/File.TEST:\n1. preserve the test identity\n2. file.test: document the fixture",
+  },
+  {
+    title: "curated bare suffix matches a slash-qualified filename",
+    first: "update src/file.proto: preserve the document identity",
+    second: "update file.proto: document details",
+    merged: "update src/file.proto:\n1. preserve the document identity\n2. file.proto: document details",
+  },
+  {
+    title: "curated suffix matches a shortened path",
+    first: "update src/auth.proto: preserve schema identity",
+    second: "update auth.proto: document the schema",
+    merged: "update src/auth.proto:\n1. preserve schema identity\n2. auth.proto: document the schema",
+  },
+  {
+    title: "different curated suffixes stay distinct",
+    first: "update auth.proto: preserve protocol identity",
+    second: "update auth.ts: preserve implementation identity",
+  },
+  {
+    title: "an unlisted dotted word stays distinct from a curated suffix",
+    first: "fix auth.proto: preserve the wire schema",
+    second: "fix auth.protos: preserve generated documentation",
+  },
+  {
+    title: "different unlisted dotted suffixes stay literal",
+    first: "fix auth.graphql: preserve the query schema",
+    second: "fix auth.graphqls: preserve the schema documentation",
+  },
+]
+
+const bareDottedTargets = [
+  {
+    title: "Node.js natural subject",
+    first: "fix Node.js runtime checks: keep async test",
+    second: "fix Node runtime checks: cover async test",
+    merged: "fix Node.js runtime checks:\n1. keep async test\n2. Node runtime checks: cover async test",
+  },
+  {
+    title: "Next.js remains a natural target name",
+    first: "fix Next.js routing bug: preserve fallback",
+    second: "fix Next routing bug: add retry",
+    merged: "fix Next.js routing bug:\n1. preserve fallback\n2. Next routing bug: add retry",
+  },
+  {
+    title: "vue.js remains a natural target name",
+    first: "fix vue.js reactivity bug: preserve the proxy",
+    second: "fix vue reactivity bug: trace the observer",
+    merged: "fix vue.js reactivity bug:\n1. preserve the proxy\n2. vue reactivity bug: trace the observer",
+  },
+  {
+    title: "v1.2 remains part of its natural target",
+    first: "upgrade v1.2 runtime",
+    second: "upgrade runtime",
+    merged: "upgrade v1.2 runtime:\n1. upgrade v1.2 runtime\n2. upgrade runtime",
+  },
+  {
+    title: "2.5s remains part of its natural target",
+    first: "upgrade 2.5s runtime",
+    second: "upgrade runtime",
+    merged: "upgrade 2.5s runtime:\n1. upgrade 2.5s runtime\n2. upgrade runtime",
+  },
+  {
+    title: "different version tokens do not become file identities",
+    first: "upgrade v1.2",
+    second: "upgrade 2.5s",
+  },
+  {
+    title: "different bare filename extensions",
+    first: "fix queue.ts",
+    second: "fix queue.tsx",
+  },
+  {
+    title: "bare dotted suffix changes a word-boundary target",
+    first: "fix login",
+    second: "fix login.tsx",
+  },
+  {
+    title: "plain-text filename suffix is not a word prefix",
+    first: "Please summarize queue.ts",
+    second: "Please summarize queue.tsx",
+  },
+]
+
+const runtimeNameTarget = {
+  first: "upgrade node.js runtime",
+  second: "upgrade node runtime",
+  merged: "upgrade node.js runtime:\n1. upgrade node.js runtime\n2. upgrade node runtime",
+}
+
+const dottedRuntimeControls = [
+  {
+    title: "express.js authentication and billing handlers stay separate",
+    first: "fix express.js authentication handler",
+    second: "fix express.js billing handler",
+  },
+  {
+    title: "nuxt.js authentication and billing handlers stay separate",
+    first: "fix nuxt.js authentication handler",
+    second: "fix nuxt.js billing handler",
+  },
+  {
+    title: "d3.js chart and axis handlers stay separate",
+    first: "fix d3.js chart handler",
+    second: "fix d3.js axis handler",
+  },
+]
+
+const dottedRuntimeSameJobTargets = [
+  {
+    title: "express.js and express keep the same subject",
+    first: "fix express.js authentication handler",
+    second: "fix express authentication handler",
+    merged:
+      "fix express.js authentication handler:\n1. fix express.js authentication handler\n2. fix express authentication handler",
+  },
+  {
+    title: "nuxt.js and nuxt keep the same subject",
+    first: "fix nuxt.js authentication handler",
+    second: "fix nuxt authentication handler",
+    merged:
+      "fix nuxt.js authentication handler:\n1. fix nuxt.js authentication handler\n2. fix nuxt authentication handler",
+  },
+  {
+    title: "d3.js and d3 keep the same subject",
+    first: "fix d3.js chart handler",
+    second: "fix d3 chart handler",
+    merged: "fix d3.js chart handler:\n1. fix d3.js chart handler\n2. fix d3 chart handler",
+  },
+]
+
+const caseInsensitiveFilenameTargets = [
+  {
+    title: "no-colon uppercase filename retains its identity",
+    first: "update Auth.ts preserve the schema",
+    second: "update auth.ts verify the route",
+    merged: "update Auth.ts:\n1. preserve the schema\n2. verify the route",
+  },
+  {
+    title: "uppercase path suffix matches its lowercase basename",
+    first: "update src/Auth.ts: preserve origin IDs",
+    second: "update auth.ts: verify settlement",
+    merged: "update src/Auth.ts:\n1. preserve origin IDs\n2. auth.ts: verify settlement",
+  },
+  {
+    title: "uppercase extension keeps different files distinct",
+    first: "update Auth.TS: preserve the TypeScript module",
+    second: "update Auth.TSX: preserve the JSX module",
+  },
+  {
+    title: "a slash-qualified and bare JavaScript path share file identity",
+    first: "update src/node.js: parse options",
+    second: "update node.js: format tokens",
+    merged: "update src/node.js:\n1. parse options\n2. node.js: format tokens",
+  },
+]
+
+const packageNameTarget = {
+  first: "upgrade socket.io",
+  second: "upgrade socket",
+  merged: "upgrade socket.io:\n1. upgrade socket.io\n2. upgrade socket",
+}
+
+const containedCommandTargets = [
+  {
+    title: "parser",
+    first: "fix the parser",
+    second: "fix parser crash",
+    merged: "fix the parser:\n1. fix the parser\n2. fix parser crash",
+  },
+  {
+    title: "authentication redirect",
+    first: "fix authentication",
+    second: "fix authentication redirect",
+    merged: "fix authentication:\n1. fix authentication\n2. fix authentication redirect",
+  },
+  {
+    title: "login page",
+    first: "fix the login page",
+    second: "fix login",
+    merged: "fix the login page:\n1. fix the login page\n2. fix login",
+  },
+  {
+    title: "login page complement",
+    first: "fix the login page for mobile",
+    second: "fix login",
+    merged: "fix the login page for mobile:\n1. fix the login page for mobile\n2. fix login",
+  },
+  {
+    title: "dotted prose target",
+    first: "fix v1.2 authentication handler",
+    second: "fix authentication handler",
+    merged: "fix v1.2 authentication handler:\n1. fix v1.2 authentication handler\n2. fix authentication handler",
+  },
+  {
+    title: "trailing punctuation",
+    first: "Fix the flaky auth test.",
+    second: "fix flaky auth test",
+    merged: "Fix the flaky auth test.:\n1. Fix the flaky auth test.\n2. fix flaky auth test",
+  },
+  {
+    title: "punctuation-normalized containment",
+    first: "fix the flaky auth-test page.",
+    second: "fix auth test",
+    merged: "fix the flaky auth-test page.:\n1. fix the flaky auth-test page.\n2. fix auth test",
+  },
+]
+
+const punctuationNormalizedTargets = [
+  {
+    first: "Fix the test suite.",
+    second: "fix test suite",
+    merged: "Fix the test suite.:\n1. Fix the test suite.\n2. fix test suite",
+  },
+]
+
+const sameWorkProseFileReference = {
+  first: "fix login.ts",
+  second: "fix the login handler in login.ts",
+  merged: "fix login.ts:\n1. fix login.ts\n2. fix the login handler in login.ts",
+}
+
+const embeddedPathTargets = {
+  first: "fix the auth handler in src/login.ts",
+  second: "fix the auth handler in src/billing.ts",
+}
+
+const differentInvestigationPathReferences = {
+  first: "investigate why the CI is slow in src/auth.ts",
+  second: "investigate login delays in auth.ts",
+}
+
+const sameJobTailTargets = [
+  {
+    title: "investigation subject with a different tail",
+    first: "investigate CI deployment and how it works",
+    second: "investigate CI deployment and how it proceeds",
+    merged:
+      "investigate CI deployment and how it works:\n1. investigate CI deployment and how it works\n2. investigate CI deployment and how it proceeds",
+  },
+  {
+    title: "different interrogative tails leave the same cache subject intact",
+    first: "review API caching and when it expires",
+    second: "review API caching and why it refreshes",
+    merged:
+      "review API caching and when it expires:\n1. review API caching and when it expires\n2. review API caching and why it refreshes",
+  },
+  {
+    title: "comma-led dependent clauses leave the same deployment subject intact",
+    first: "investigate CI deployment, how it works",
+    second: "investigate CI deployment, how it proceeds",
+    merged:
+      "investigate CI deployment, how it works:\n1. investigate CI deployment, how it works\n2. investigate CI deployment, how it proceeds",
+  },
+]
+
+const separateTargetWord = (title: string, first: string, second: string) => ({
+  title,
+  first,
+  second,
+})
+
+const targetWordSeparationControls = [
+  separateTargetWord("cases/cas", "fix atomic cases", "fix atomic cas"),
+  separateTargetWord("databases/database", "fix databases", "fix database"),
+  separateTargetWord("database caches/cache", "fix the database caches", "fix the database cache"),
+  separateTargetWord("image sizes/size", "fix image sizes", "fix image size"),
+  separateTargetWord("API responses/response", "fix the api responses", "fix the api response"),
+  separateTargetWord("test cases/case", "fix the test cases", "fix the test case"),
+  separateTargetWord("releases/release notes", "fix releases notes", "fix release notes"),
+  separateTargetWord("uses/use list", "fix the uses list", "fix the use list"),
+  separateTargetWord("user licenses/license", "fix the user licenses", "fix the user license"),
+  separateTargetWord("build phases/phase", "fix the build phases", "fix the build phase"),
+  separateTargetWord("echo/echoes", "fix echo", "fix echoes"),
+  separateTargetWord("veto/vetoes", "fix veto", "fix vetoes"),
+  separateTargetWord("zero/zeroes", "fix zero", "fix zeroes"),
+  separateTargetWord("classes/class", "fix parser classes", "fix parser class"),
+  separateTargetWord("boxes/box", "fix shipping boxes", "fix shipping box"),
+  separateTargetWord("churches/church", "fix churches", "fix church"),
+  separateTargetWord("dishes/dish", "fix dishes", "fix dish"),
+  separateTargetWord("addresses/address", "fix route addresses", "fix route address"),
+  separateTargetWord("statuses/status", "fix statuses", "fix status"),
+  separateTargetWord("aliases/alias", "fix dns aliases", "fix dns alias"),
+  separateTargetWord("canvases/canvas", "fix canvases", "fix canvas"),
+  separateTargetWord("policy/policies", "fix network policy", "fix network policies"),
+  separateTargetWord(
+    "authentication redirect/redirects",
+    "fix authentication redirect: trace callback",
+    "fix authentication redirects: inspect login",
+  ),
+  separateTargetWord(
+    "authentication handler/handlers",
+    "fix authentication handler: trace callback",
+    "fix authentication handlers: inspect login",
+  ),
+  separateTargetWord(
+    "user profile form/forms",
+    "update user profile form: validate fields",
+    "update user profile forms: map settings",
+  ),
+  separateTargetWord(
+    "reconnect/reconnects",
+    "refactor reconnect queue: preserve order",
+    "refactor reconnects queue: preserve retry order",
+  ),
+  separateTargetWord(
+    "session queue/queues",
+    "refactor session queue: preserve order",
+    "refactor session queues: preserve receipts",
+  ),
+  separateTargetWord("poses/pos", "fix poses", "fix pos"),
+  separateTargetWord("doses/dos", "fix doses", "fix dos"),
+  separateTargetWord("bases/bas", "fix bases", "fix bas"),
+  separateTargetWord("phases/phas", "fix phases", "fix phas"),
+  separateTargetWord("states/stats", "fix states", "fix stats"),
+  separateTargetWord("modes/mods", "fix modes", "fix mods"),
+  separateTargetWord("planes/plans", "fix planes", "fix plans"),
+  separateTargetWord("pipes/pip", "fix pipes", "fix pip"),
+  separateTargetWord("sites/sits", "fix sites", "fix sits"),
+  separateTargetWord("tapes/taps", "fix tapes", "fix taps"),
+  separateTargetWord("pines/pins", "fix pines", "fix pins"),
+  separateTargetWord("rates/rats", "fix rates", "fix rats"),
+  separateTargetWord("hopes/hops", "fix hopes", "fix hops"),
+  separateTargetWord("cubes/cubs", "fix cubes", "fix cubs"),
+  separateTargetWord("nodes/nods", "fix nodes", "fix nods"),
+  separateTargetWord("cares/cars", "fix cares", "fix cars"),
+  separateTargetWord("scopes/scops", "fix scopes", "fix scops"),
+  separateTargetWord("themes/them", "fix auth themes", "fix auth them"),
+  separateTargetWord("this/thi", "fix this", "fix thi"),
+  separateTargetWord("news/new", "fix the news page", "fix the new page"),
+]
+
+const literalTargetMerge = {
+  title: "same literal target",
+  first: "fix atomic cases: inspect the routing path",
+  second: "fix atomic cases: verify the fallback",
+  merged: "fix atomic cases:\n1. inspect the routing path\n2. verify the fallback",
+}
+
+const literalNonGenericTargetMerge = {
+  title: "uses remains a literal non-generic target",
+  first: "fix extra uses",
+  second: "fix uses",
+  merged: "fix extra uses:\n1. fix extra uses\n2. fix uses",
+}
+
+const literalGenericSubjectWords = ["this", "does", "whereas", "themselves", "ourselves", "yourselves"]
+
+const genericSubjectControls = [
+  { title: "bug subject", first: "fix the bug in auth", second: "fix the bug in parser" },
+  { title: "docs subject", first: "update the docs for the api", second: "update the docs for the cli" },
+  ...literalGenericSubjectWords.map((word) => ({
+    title: `${word} remains a generic-only subject`,
+    first: `fix extra ${word}`,
+    second: `fix ${word}`,
+  })),
+]
+
+const derivationalWordControls = [
+  { title: "heading and head", first: "fix heading style", second: "fix head style" },
+  { title: "listing and list", first: "fix listing page", second: "fix list page" },
+  { title: "landing and land", first: "fix landing page", second: "fix land page" },
+  { title: "building and build", first: "fix building page", second: "fix build page" },
+  { title: "product and production page", first: "fix product page", second: "fix production page" },
+  { title: "production and product build", first: "fix production build", second: "fix product build" },
+  { title: "abstract and abstraction class", first: "fix abstract class", second: "fix abstraction class" },
+  { title: "project and projection cache", first: "fix project cache", second: "fix projection cache" },
+  { title: "express and expression", first: "fix express handler", second: "fix expression handler" },
+  { title: "quest and question", first: "fix quest parser", second: "fix question parser" },
+  { title: "position and posit", first: "fix position argument", second: "fix posit argument" },
+  { title: "deployment and deploy", first: "fix deployment", second: "fix deploy" },
+  {
+    title: "user deployment and user deploy",
+    first: "fix user deployment",
+    second: "fix user deploy",
+  },
+  { title: "activation and activate", first: "fix user activation", second: "fix user activate" },
+  {
+    title: "activations and activate remain different words",
+    first: "fix user activations",
+    second: "fix user activate",
+  },
+  { title: "migration and migrate", first: "fix migration", second: "fix migrate" },
+  {
+    title: "reconnecting and reconnection",
+    first: "fix websocket reconnecting",
+    second: "fix websocket reconnection",
+  },
+  { title: "failed and fail", first: "investigate network failed", second: "investigate network fail" },
+  {
+    title: "reconnecting and reconnection before a shared head",
+    first: "fix websocket reconnecting handler",
+    second: "fix websocket reconnection handler",
+  },
+  {
+    title: "express parser and expression parser",
+    first: "fix auth express parser",
+    second: "fix auth expression parser",
+  },
+  { title: "port parser and portion parser", first: "fix auth port parser", second: "fix auth portion parser" },
+  { title: "edit page and edition page", first: "fix auth edit page", second: "fix auth edition page" },
+  { title: "region cache and reg cache", first: "fix auth region cache", second: "fix auth reg cache" },
+]
+
+const consolidateAdmitted = (title: string, values: readonly { delivery: SessionQueue.Delivery; text: string }[]) =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title })
+    const admitted = yield* Effect.forEach(values, (value) => admit(session.id, value.delivery, value.text))
+    expect(yield* queue.list(session.id)).toHaveLength(admitted.length)
+    return yield* queue.consolidate(session.id)
+  })
+
 it.instance(
   "a preparation that fails or is interrupted after a merge made its reservation stale removes nothing",
   () =>
@@ -217,7 +742,7 @@ it.instance(
 )
 
 it.instance(
-  "a copy consolidated into a prompt that then joins a command follows it to the command",
+  "a copy in another delivery class stays pending while same-class commands consolidate",
   () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
@@ -226,21 +751,1377 @@ it.instance(
       yield* admit(session.id, "steer", "run lint")
       yield* request(session.id, "steer", "req-b", "run lint --fix")
       yield* request(session.id, "queue", "req-c", "run lint --fix")
-      const [merged, ...rest] = yield* queue.consolidate(session.id)
-      expect([text(merged!), rest]).toEqual(["run lint:\n1. run lint\n2. --fix", []])
+      const result = yield* queue.consolidate(session.id)
+      expect(result.map((item) => [item.delivery, text(item)])).toEqual([
+        ["steer", "run lint:\n1. run lint\n2. --fix"],
+        ["queue", "run lint --fix"],
+      ])
       expect(Option.getOrThrow(yield* queue.receipt(session.id, "req-b"))).toEqual({
         state: "pending",
-        itemID: merged!.id,
+        itemID: result[0]!.id,
       })
-      expect(Option.getOrThrow(yield* queue.receipt(session.id, "req-c"))).toEqual({ state: "merged", into: "req-b" })
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "req-c"))).toEqual({
+        state: "pending",
+        itemID: result[1]!.id,
+      })
       yield* promoter(session.id, [])("steer")
-      expect(Option.getOrThrow(yield* queue.receipt(session.id, "req-c"))).toMatchObject({
-        state: "merged",
-        into: "req-b",
-        messageID: expect.any(String),
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "req-c"))).toEqual({
+        state: "pending",
+        itemID: result[1]!.id,
       })
     }),
   30_000,
+)
+
+it.instance("command targets match across verb and whitespace case changes", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("case and whitespace", [
+      { delivery: "queue", text: "  RUN   AUTH  " },
+      { delivery: "queue", text: "run auth --fix" },
+    ])
+    expect(items.map(text)).toEqual(["RUN AUTH:\n1. RUN AUTH\n2. --fix"])
+  }),
+)
+
+it.instance("command targets ignore leading articles and adjective differences", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("articles and adjectives", [
+      { delivery: "queue", text: "fix the flaky authentication handler: keep null guards" },
+      { delivery: "queue", text: "fix an authentication handler: add regression coverage" },
+    ])
+    expect(items.map(text)).toEqual([
+      "fix the flaky authentication handler:\n1. keep null guards\n2. an authentication handler: add regression coverage",
+    ])
+  }),
+)
+
+it.instance("no-colon commands match whole subjects across unlisted modifiers", () =>
+  Effect.gen(function* () {
+    const cases = [
+      {
+        title: "intermittent authentication failures",
+        prompts: ["fix intermittent authentication failures", "fix authentication failures"],
+        merged:
+          "fix intermittent authentication failures:\n1. fix intermittent authentication failures\n2. fix authentication failures",
+      },
+      {
+        title: "sporadic login redirects",
+        prompts: ["repair sporadic login redirects", "repair login redirects"],
+        merged: "repair sporadic login redirects:\n1. repair sporadic login redirects\n2. repair login redirects",
+      },
+    ]
+    for (const test of cases) {
+      const items = yield* consolidateAdmitted(
+        test.title,
+        test.prompts.map((text) => ({ delivery: "queue" as const, text })),
+      )
+      expect(items.map(text)).toEqual([test.merged])
+    }
+  }),
+)
+
+it.instance("request admission matches whole no-colon subjects and keeps shared modifiers separate", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const positive = yield* sessions.create({ title: "no-colon request subject match" })
+    yield* request(positive.id, "queue", "subject-a", "fix intermittent authentication failures")
+    yield* request(positive.id, "queue", "subject-b", "fix authentication failures")
+    expect((yield* queue.list(positive.id)).map(text)).toEqual([
+      "fix intermittent authentication failures:\n1. fix intermittent authentication failures\n2. fix authentication failures",
+    ])
+    expect(Option.getOrThrow(yield* queue.receipt(positive.id, "subject-b"))).toMatchObject({
+      state: "merged",
+      into: "subject-a",
+    })
+
+    const different = yield* sessions.create({ title: "no-colon shared modifier control" })
+    yield* request(different.id, "queue", "different-a", "fix intermittent authentication failures")
+    yield* request(different.id, "queue", "different-b", "fix intermittent billing timeouts")
+    expect((yield* queue.list(different.id)).map(text)).toEqual([
+      "fix intermittent authentication failures",
+      "fix intermittent billing timeouts",
+    ])
+    expect(Option.getOrThrow(yield* queue.receipt(different.id, "different-a"))).toMatchObject({ state: "pending" })
+    expect(Option.getOrThrow(yield* queue.receipt(different.id, "different-b"))).toMatchObject({ state: "pending" })
+  }),
+)
+
+it.instance("shared first nouns with different job classes stay separate", () =>
+  Effect.gen(function* () {
+    const prompts = [
+      "refactor the session queue",
+      "refactor the session projector",
+      "rename the workspace queue",
+      "rename the workspace projector",
+    ]
+    for (const delivery of ["steer", "queue"] as const) {
+      const items = yield* consolidateAdmitted(
+        `shared modifiers and first nouns ${delivery}`,
+        prompts.map((text) => ({ delivery, text })),
+      )
+      expect(items.map(text)).toEqual(prompts)
+    }
+  }),
+)
+
+it.instance("request admission keeps different job classes apart on shared first nouns", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of sharedFirstNounControls) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title} control` })
+        yield* request(session.id, delivery, "shared-a", pair.first)
+        yield* request(session.id, delivery, "shared-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.first, pair.second])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "shared-a"))).toMatchObject({ state: "pending" })
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "shared-b"))).toMatchObject({ state: "pending" })
+      }
+    }
+  }),
+)
+
+it.instance("a shared job-class head noun does not merge different work during consolidation", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of jobClassControls) {
+        const consolidated = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(consolidated.map(text)).toEqual([pair.first, pair.second])
+      }
+    }
+  }),
+)
+
+it.instance("request admission does not merge different work on a shared job-class head noun", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of jobClassControls) {
+        const session = yield* sessions.create({ title: `${delivery} request ${pair.title}` })
+        yield* request(session.id, delivery, "head-a", pair.first)
+        yield* request(session.id, delivery, "head-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.first, pair.second])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "head-a"))).toMatchObject({ state: "pending" })
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "head-b"))).toMatchObject({ state: "pending" })
+      }
+    }
+  }),
+)
+
+it.instance("consolidation keeps containment ahead of job-class head equality", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of containedCommandTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} contained ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual([pair.merged])
+      }
+    }
+  }),
+)
+
+it.instance("request admission keeps containment ahead of job-class head equality", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of containedCommandTargets) {
+        const session = yield* sessions.create({ title: `${delivery} contained ${pair.title}` })
+        yield* request(session.id, delivery, "contained-a", pair.first)
+        yield* request(session.id, delivery, "contained-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.merged])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "contained-b"))).toMatchObject({
+          state: "merged",
+          into: "contained-a",
+        })
+      }
+    }
+  }),
+)
+
+it.instance("consolidation normalizes trailing punctuation on an exact generic target", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of punctuationNormalizedTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} punctuation target`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual([pair.merged])
+      }
+    }
+  }),
+)
+
+it.instance("request admission normalizes trailing punctuation on an exact generic target", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of punctuationNormalizedTargets) {
+        const session = yield* sessions.create({ title: `${delivery} punctuation target` })
+        yield* request(session.id, delivery, "punctuation-a", pair.first)
+        yield* request(session.id, delivery, "punctuation-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.merged])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "punctuation-b"))).toMatchObject({
+          state: "merged",
+          into: "punctuation-a",
+        })
+      }
+    }
+  }),
+)
+
+it.instance("consolidation keeps different modifiers apart when the job-class head is shared", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of differentModifierSameHeadTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual([pair.first, pair.second])
+      }
+    }
+  }),
+)
+
+it.instance("request admission keeps different modifiers apart when the job-class head is shared", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of differentModifierSameHeadTargets) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title} control` })
+        yield* request(session.id, delivery, "modifier-a", pair.first)
+        yield* request(session.id, delivery, "modifier-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.first, pair.second])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "modifier-a"))).toMatchObject({
+          state: "pending",
+        })
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "modifier-b"))).toMatchObject({
+          state: "pending",
+        })
+      }
+    }
+  }),
+)
+
+it.instance("colon targets stop at the short subject before a trailing note", () =>
+  Effect.gen(function* () {
+    const cases = [
+      {
+        title: "different parser duties",
+        prompts: [
+          "add tests for the parser. Note: preserve AST coverage",
+          "add docs for the parser. Note: update usage guidance",
+        ],
+      },
+      {
+        title: "different sentence subjects",
+        prompts: ["add parser tests. Note: preserve AST coverage", "add router docs. Note: update usage guidance"],
+      },
+    ]
+    for (const test of cases) {
+      const items = yield* consolidateAdmitted(
+        test.title,
+        test.prompts.map((text) => ({ delivery: "queue" as const, text })),
+      )
+      expect(items.map(text)).toEqual(test.prompts)
+    }
+  }),
+)
+
+it.instance("grammatical target words do not merge unrelated work in consolidation", () =>
+  Effect.gen(function* () {
+    const cases = [
+      ["investigate how CI deploys: check runner", "investigate how login redirects: trace callback"],
+      [
+        "investigate CI deployment and how it works: inspect runner",
+        "investigate login redirects and how it fails: trace callback",
+      ],
+      ["investigate why the CI is red:", "investigate why the login is slow:"],
+      ["investigate how CI deployment works: inspect runner", "investigate how login routing works: trace callback"],
+      ["investigate why CI deployment fails: inspect runner", "investigate why login routing fails: trace callback"],
+      [
+        "investigate where CI deployment breaks: inspect runner",
+        "investigate where login routing breaks: trace callback",
+      ],
+    ]
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const [first, second] of cases) {
+        const items = yield* consolidateAdmitted(`different interrogative targets ${delivery}`, [
+          { delivery, text: first! },
+          { delivery, text: second! },
+        ])
+        expect(items.map(text)).toEqual([first, second])
+      }
+    }
+
+    const positive = yield* consolidateAdmitted("same deployment target", [
+      { delivery: "queue", text: "investigate how CI deployment works: inspect runner" },
+      { delivery: "queue", text: "investigate whether CI deployment works: trace callback" },
+    ])
+    expect(positive.map(text)).toEqual([
+      "investigate how CI deployment works:\n1. inspect runner\n2. whether CI deployment works: trace callback",
+    ])
+  }),
+)
+
+it.instance("request admission ignores grammatical target overlap and keeps a same-job positive", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const requests = [
+      {
+        first: "investigate CI deployment and how it works: inspect runner",
+        second: "investigate login redirects and how it fails: trace callback",
+      },
+      {
+        first: "investigate how CI deployment works: inspect runner",
+        second: "investigate how login routing works: trace callback",
+      },
+      {
+        first: "investigate why CI deployment fails: inspect runner",
+        second: "investigate why login routing fails: trace callback",
+      },
+      {
+        first: "investigate where CI deployment breaks: inspect runner",
+        second: "investigate where login routing breaks: trace callback",
+      },
+    ]
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of requests) {
+        const different = yield* sessions.create({ title: `${delivery} grammatical request boundary ${pair.first}` })
+        yield* request(different.id, delivery, "grammar-a", pair.first)
+        yield* request(different.id, delivery, "grammar-b", pair.second)
+        expect((yield* queue.list(different.id)).map(text)).toEqual([pair.first, pair.second])
+        expect(Option.getOrThrow(yield* queue.receipt(different.id, "grammar-a"))).toMatchObject({ state: "pending" })
+        expect(Option.getOrThrow(yield* queue.receipt(different.id, "grammar-b"))).toMatchObject({ state: "pending" })
+      }
+    }
+
+    for (const delivery of ["steer", "queue"] as const) {
+      const same = yield* sessions.create({ title: `${delivery} grammatical target positive` })
+      yield* request(same.id, delivery, "same-a", "investigate how CI deployment works: inspect runner")
+      yield* request(same.id, delivery, "same-b", "investigate whether CI deployment works: trace callback")
+      expect((yield* queue.list(same.id)).map(text)).toEqual([
+        "investigate how CI deployment works:\n1. inspect runner\n2. whether CI deployment works: trace callback",
+      ])
+      expect(Option.getOrThrow(yield* queue.receipt(same.id, "same-b"))).toMatchObject({
+        state: "merged",
+        into: "same-a",
+      })
+    }
+  }),
+)
+
+it.instance("command targets match when one path contains the other", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("path suffix", [
+      { delivery: "queue", text: "update packages/opencode/src/session/queue.ts: retain receipts" },
+      { delivery: "queue", text: "UPDATE src/session/queue.ts: preserve original IDs" },
+    ])
+    expect(items.map(text)).toEqual([
+      "update packages/opencode/src/session/queue.ts:\n1. retain receipts\n2. src/session/queue.ts: preserve original IDs",
+    ])
+  }),
+)
+
+it.instance("consolidation keeps path-like filenames literal", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of literalFilenameTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual([pair.first, pair.second])
+      }
+    }
+  }),
+)
+
+it.instance("request admission keeps path-like filenames literal", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of literalFilenameTargets) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "file-a", pair.first)
+        yield* request(session.id, delivery, "file-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.first, pair.second])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "file-a"))).toMatchObject({ state: "pending" })
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "file-b"))).toMatchObject({ state: "pending" })
+      }
+    }
+  }),
+)
+
+it.instance("consolidation normalizes case before classifying file identity", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of caseInsensitiveFilenameTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual(pair.merged ? [pair.merged] : [pair.first, pair.second])
+      }
+    }
+  }),
+)
+
+it.instance("request admission normalizes case before classifying file identity", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of caseInsensitiveFilenameTargets) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "case-file-a", pair.first)
+        yield* request(session.id, delivery, "case-file-b", pair.second)
+        const expected = pair.merged ? [pair.merged] : [pair.first, pair.second]
+        expect((yield* queue.list(session.id)).map(text)).toEqual(expected)
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "case-file-b"))).toMatchObject(
+          pair.merged ? { state: "merged", into: "case-file-a" } : { state: "pending" },
+        )
+      }
+    }
+  }),
+)
+
+it.instance("consolidation matches curated filenames and keeps other suffixes distinct", () =>
+  Effect.gen(function* () {
+    const actual: string[][] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of suffixFilenameTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        actual.push(items.map(text))
+      }
+    }
+    expect(actual).toEqual(
+      ["steer", "queue"].flatMap(() =>
+        suffixFilenameTargets.map((pair) => (pair.merged ? [pair.merged] : [pair.first, pair.second])),
+      ),
+    )
+  }),
+)
+
+it.instance("request admission matches curated filenames and keeps other suffixes distinct", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const actual: string[][] = []
+    const receipts: string[] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of suffixFilenameTargets) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "suffix-a", pair.first)
+        yield* request(session.id, delivery, "suffix-b", pair.second)
+        actual.push((yield* queue.list(session.id)).map(text))
+        const receipt = Option.getOrThrow(yield* queue.receipt(session.id, "suffix-b"))
+        receipts.push(receipt.state === "merged" ? `${receipt.state}:${receipt.into}` : receipt.state)
+      }
+    }
+    expect(actual).toEqual(
+      ["steer", "queue"].flatMap(() =>
+        suffixFilenameTargets.map((pair) => (pair.merged ? [pair.merged] : [pair.first, pair.second])),
+      ),
+    )
+    expect(receipts).toEqual(
+      ["steer", "queue"].flatMap(() =>
+        suffixFilenameTargets.map((pair) => (pair.merged ? "merged:suffix-a" : "pending")),
+      ),
+    )
+  }),
+)
+
+it.instance("bare dotted targets match on natural words, while filename extensions stay distinct", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of bareDottedTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual(pair.merged ? [pair.merged] : [pair.first, pair.second])
+      }
+    }
+  }),
+)
+
+it.instance("request admission uses natural words for bare dotted targets without merging filename extensions", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of bareDottedTargets) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "bare-dotted-a", pair.first)
+        yield* request(session.id, delivery, "bare-dotted-b", pair.second)
+        const expected = pair.merged ? [pair.merged] : [pair.first, pair.second]
+        expect((yield* queue.list(session.id)).map(text)).toEqual(expected)
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "bare-dotted-b"))).toMatchObject(
+          pair.merged ? { state: "merged", into: "bare-dotted-a" } : { state: "pending" },
+        )
+      }
+    }
+  }),
+)
+
+it.instance("consolidation keeps a dotted runtime name as a natural target", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      const items = yield* consolidateAdmitted(`${delivery} runtime name`, [
+        { delivery, text: runtimeNameTarget.first },
+        { delivery, text: runtimeNameTarget.second },
+      ])
+      expect(items.map(text)).toEqual([runtimeNameTarget.merged])
+    }
+  }),
+)
+
+it.instance("request admission keeps a dotted runtime name as a natural target", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      const session = yield* sessions.create({ title: `${delivery} runtime name` })
+      yield* request(session.id, delivery, "runtime-a", runtimeNameTarget.first)
+      yield* request(session.id, delivery, "runtime-b", runtimeNameTarget.second)
+      expect((yield* queue.list(session.id)).map(text)).toEqual([runtimeNameTarget.merged])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "runtime-b"))).toMatchObject({
+        state: "merged",
+        into: "runtime-a",
+      })
+    }
+  }),
+)
+
+it.instance("dotted runtime names retain different subjects in every delivery class", () =>
+  Effect.gen(function* () {
+    const actual: string[][] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of dottedRuntimeControls) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        actual.push(items.map(text))
+      }
+    }
+    expect(actual).toEqual(
+      ["steer", "queue"].flatMap(() => dottedRuntimeControls.map((pair) => [pair.first, pair.second])),
+    )
+  }),
+)
+
+it.instance("request admission retains dotted runtime subjects in every delivery class", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const actual: string[][] = []
+    const receipts: string[][] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of dottedRuntimeControls) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "runtime-control-a", pair.first)
+        yield* request(session.id, delivery, "runtime-control-b", pair.second)
+        actual.push((yield* queue.list(session.id)).map(text))
+        receipts.push([
+          Option.getOrThrow(yield* queue.receipt(session.id, "runtime-control-a")).state,
+          Option.getOrThrow(yield* queue.receipt(session.id, "runtime-control-b")).state,
+        ])
+      }
+    }
+    expect(actual).toEqual(
+      ["steer", "queue"].flatMap(() => dottedRuntimeControls.map((pair) => [pair.first, pair.second])),
+    )
+    expect(receipts).toEqual(["steer", "queue"].flatMap(() => dottedRuntimeControls.map(() => ["pending", "pending"])))
+  }),
+)
+
+it.instance("dotted runtime names match their undotted subject in every delivery class", () =>
+  Effect.gen(function* () {
+    const actual: string[][] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of dottedRuntimeSameJobTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        actual.push(items.map(text))
+      }
+    }
+    expect(actual).toEqual(["steer", "queue"].flatMap(() => dottedRuntimeSameJobTargets.map((pair) => [pair.merged])))
+  }),
+)
+
+it.instance("request admission matches dotted runtime subjects in every delivery class", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const actual: string[][] = []
+    const receipts: string[] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of dottedRuntimeSameJobTargets) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "runtime-match-a", pair.first)
+        yield* request(session.id, delivery, "runtime-match-b", pair.second)
+        actual.push((yield* queue.list(session.id)).map(text))
+        const receipt = Option.getOrThrow(yield* queue.receipt(session.id, "runtime-match-b"))
+        receipts.push(receipt.state === "merged" ? `${receipt.state}:${receipt.into}` : receipt.state)
+      }
+    }
+    expect(actual).toEqual(["steer", "queue"].flatMap(() => dottedRuntimeSameJobTargets.map((pair) => [pair.merged])))
+    expect(receipts).toEqual(
+      ["steer", "queue"].flatMap(() => dottedRuntimeSameJobTargets.map(() => "merged:runtime-match-a")),
+    )
+  }),
+)
+
+it.instance("consolidation matches a dotted package name through natural containment", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      const items = yield* consolidateAdmitted(`${delivery} package name`, [
+        { delivery, text: packageNameTarget.first },
+        { delivery, text: packageNameTarget.second },
+      ])
+      expect(items.map(text)).toEqual([packageNameTarget.merged])
+    }
+  }),
+)
+
+it.instance("request admission matches a dotted package name through natural containment", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      const session = yield* sessions.create({ title: `${delivery} package name` })
+      yield* request(session.id, delivery, "package-a", packageNameTarget.first)
+      yield* request(session.id, delivery, "package-b", packageNameTarget.second)
+      expect((yield* queue.list(session.id)).map(text)).toEqual([packageNameTarget.merged])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "package-b"))).toMatchObject({
+        state: "merged",
+        into: "package-a",
+      })
+    }
+  }),
+)
+
+it.instance("prose path references do not consolidate different command work", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      const items = yield* consolidateAdmitted(`${delivery} investigation path references`, [
+        { delivery, text: differentInvestigationPathReferences.first },
+        { delivery, text: differentInvestigationPathReferences.second },
+      ])
+      expect(items.map(text)).toEqual([
+        differentInvestigationPathReferences.first,
+        differentInvestigationPathReferences.second,
+      ])
+    }
+  }),
+)
+
+it.instance("embedded slash paths remain evidence when filenames differ", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      const items = yield* consolidateAdmitted(`${delivery} embedded path evidence`, [
+        { delivery, text: embeddedPathTargets.first },
+        { delivery, text: embeddedPathTargets.second },
+      ])
+      expect(items.map(text)).toEqual([embeddedPathTargets.first, embeddedPathTargets.second])
+    }
+  }),
+)
+
+it.instance("request admission keeps embedded slash paths as differing file evidence", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      const session = yield* sessions.create({ title: `${delivery} embedded path evidence` })
+      yield* request(session.id, delivery, "embedded-path-a", embeddedPathTargets.first)
+      yield* request(session.id, delivery, "embedded-path-b", embeddedPathTargets.second)
+      expect((yield* queue.list(session.id)).map(text)).toEqual([embeddedPathTargets.first, embeddedPathTargets.second])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "embedded-path-a"))).toMatchObject({ state: "pending" })
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "embedded-path-b"))).toMatchObject({ state: "pending" })
+    }
+  }),
+)
+
+it.instance("request admission does not consolidate different work because prose paths share a suffix", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      const session = yield* sessions.create({ title: `${delivery} separate investigation path references` })
+      yield* request(session.id, delivery, "investigation-a", differentInvestigationPathReferences.first)
+      yield* request(session.id, delivery, "investigation-b", differentInvestigationPathReferences.second)
+      expect((yield* queue.list(session.id)).map(text)).toEqual([
+        differentInvestigationPathReferences.first,
+        differentInvestigationPathReferences.second,
+      ])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "investigation-a"))).toMatchObject({ state: "pending" })
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "investigation-b"))).toMatchObject({ state: "pending" })
+    }
+  }),
+)
+
+it.instance("consolidation matches a prose file reference from its other target words", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      const items = yield* consolidateAdmitted(`${delivery} login file target words`, [
+        { delivery, text: sameWorkProseFileReference.first },
+        { delivery, text: sameWorkProseFileReference.second },
+      ])
+      expect(items.map(text)).toEqual([sameWorkProseFileReference.merged])
+    }
+  }),
+)
+
+it.instance("request admission matches a prose file reference from its other target words", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      const session = yield* sessions.create({ title: `${delivery} login file target words` })
+      yield* request(session.id, delivery, "login-file-a", sameWorkProseFileReference.first)
+      yield* request(session.id, delivery, "login-file-b", sameWorkProseFileReference.second)
+      expect((yield* queue.list(session.id)).map(text)).toEqual([sameWorkProseFileReference.merged])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "login-file-b"))).toMatchObject({
+        state: "merged",
+        into: "login-file-a",
+      })
+    }
+  }),
+)
+
+it.instance("consolidation extracts the same subject across dependent-clause tails", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of sameJobTailTargets) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual([pair.merged])
+      }
+    }
+  }),
+)
+
+it.instance("request admission extracts the same subject across dependent-clause tails", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of sameJobTailTargets) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "same-job-a", pair.first)
+        yield* request(session.id, delivery, "same-job-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.merged])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "same-job-b"))).toMatchObject({
+          state: "merged",
+          into: "same-job-a",
+        })
+      }
+    }
+  }),
+)
+
+it.instance(
+  "consolidation keeps plural and truncated target words distinct",
+  () =>
+    Effect.gen(function* () {
+      for (const delivery of ["steer", "queue"] as const) {
+        for (const pair of targetWordSeparationControls) {
+          const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+            { delivery, text: pair.first },
+            { delivery, text: pair.second },
+          ])
+          expect(items.map(text)).toEqual([pair.first, pair.second])
+        }
+      }
+    }),
+  60_000,
+)
+
+it.instance(
+  "request admission keeps plural and truncated target words distinct",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      for (const delivery of ["steer", "queue"] as const) {
+        for (const pair of targetWordSeparationControls) {
+          const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+          yield* request(session.id, delivery, "target-word-a", pair.first)
+          yield* request(session.id, delivery, "target-word-b", pair.second)
+          expect((yield* queue.list(session.id)).map(text)).toEqual([pair.first, pair.second])
+          expect(Option.getOrThrow(yield* queue.receipt(session.id, "target-word-a")).state).toBe("pending")
+          expect(Option.getOrThrow(yield* queue.receipt(session.id, "target-word-b")).state).toBe("pending")
+        }
+      }
+    }),
+  60_000,
+)
+
+it.instance("consolidation still merges literal-identical target words", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      const items = yield* consolidateAdmitted(`${delivery} ${literalTargetMerge.title}`, [
+        { delivery, text: literalTargetMerge.first },
+        { delivery, text: literalTargetMerge.second },
+      ])
+      expect(items.map(text)).toEqual([literalTargetMerge.merged])
+    }
+  }),
+)
+
+it.instance("request admission still merges literal-identical target words", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      const session = yield* sessions.create({ title: `${delivery} ${literalTargetMerge.title}` })
+      yield* request(session.id, delivery, "literal-target-a", literalTargetMerge.first)
+      yield* request(session.id, delivery, "literal-target-b", literalTargetMerge.second)
+      expect((yield* queue.list(session.id)).map(text)).toEqual([literalTargetMerge.merged])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "literal-target-b"))).toMatchObject({
+        state: "merged",
+        into: "literal-target-a",
+      })
+    }
+  }),
+)
+
+it.instance("consolidation treats uses as literal non-generic evidence", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      const items = yield* consolidateAdmitted(`${delivery} ${literalNonGenericTargetMerge.title}`, [
+        { delivery, text: literalNonGenericTargetMerge.first },
+        { delivery, text: literalNonGenericTargetMerge.second },
+      ])
+      expect(items.map(text)).toEqual([literalNonGenericTargetMerge.merged])
+    }
+  }),
+)
+
+it.instance("request admission treats uses as literal non-generic evidence", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      const session = yield* sessions.create({ title: `${delivery} ${literalNonGenericTargetMerge.title}` })
+      yield* request(session.id, delivery, "literal-uses-a", literalNonGenericTargetMerge.first)
+      yield* request(session.id, delivery, "literal-uses-b", literalNonGenericTargetMerge.second)
+      expect((yield* queue.list(session.id)).map(text)).toEqual([literalNonGenericTargetMerge.merged])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "literal-uses-b"))).toMatchObject({
+        state: "merged",
+        into: "literal-uses-a",
+      })
+    }
+  }),
+)
+
+it.instance("consolidation keeps different generic subjects separate", () =>
+  Effect.gen(function* () {
+    const actual: string[][] = []
+    const expected: string[][] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of genericSubjectControls) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        actual.push(items.map(text))
+        expected.push([pair.first, pair.second])
+      }
+    }
+    expect(actual).toEqual(expected)
+  }),
+)
+
+it.instance("request admission keeps different generic subjects separate", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const actual: string[][] = []
+    const expected: string[][] = []
+    const receipts: string[][] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of genericSubjectControls) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "generic-subject-a", pair.first)
+        yield* request(session.id, delivery, "generic-subject-b", pair.second)
+        actual.push((yield* queue.list(session.id)).map(text))
+        expected.push([pair.first, pair.second])
+        receipts.push([
+          Option.getOrThrow(yield* queue.receipt(session.id, "generic-subject-a")).state,
+          Option.getOrThrow(yield* queue.receipt(session.id, "generic-subject-b")).state,
+        ])
+      }
+    }
+    expect(actual).toEqual(expected)
+    expect(receipts).toEqual(expected.map(() => ["pending", "pending"]))
+  }),
+)
+
+it.instance("consolidation keeps derivational word forms distinct", () =>
+  Effect.gen(function* () {
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of derivationalWordControls) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        expect(items.map(text)).toEqual([pair.first, pair.second])
+      }
+    }
+  }),
+)
+
+it.instance("request admission keeps derivational word forms distinct", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of derivationalWordControls) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "bounded-a", pair.first)
+        yield* request(session.id, delivery, "bounded-b", pair.second)
+        expect((yield* queue.list(session.id)).map(text)).toEqual([pair.first, pair.second])
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "bounded-a")).state).toBe("pending")
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, "bounded-b")).state).toBe("pending")
+      }
+    }
+  }),
+)
+
+it.instance("command delivery retains the later target when similar paths consolidate", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "preserve every command target" })
+    yield* admit(session.id, "queue", "update packages/app/src/auth/login.ts: keep redirect checks")
+    yield* admit(session.id, "queue", "update src/auth/login.ts: add login fallback")
+
+    const items = yield* queue.consolidate(session.id)
+    const merged =
+      "update packages/app/src/auth/login.ts:\n1. keep redirect checks\n2. src/auth/login.ts: add login fallback"
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual([merged])
+    expect(items.map(text)).toEqual([merged])
+  }),
+)
+
+it.instance("command targets match on a distinctive token when neither contains the other", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("distinctive target", [
+      { delivery: "queue", text: "review authentication receipt routing: preserve origin IDs" },
+      { delivery: "queue", text: "review receipt routing in authentication: verify settlement" },
+    ])
+    expect(items.map(text)).toEqual([
+      "review authentication receipt routing:\n1. preserve origin IDs\n2. receipt routing in authentication: verify settlement",
+    ])
+  }),
+)
+
+it.instance("generic target words alone do not merge different command work", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("different targets", [
+      { delivery: "queue", text: "fix the login bug: disable the redirect loop" },
+      { delivery: "queue", text: "fix the signup bug: add the welcome email" },
+    ])
+    expect(items.map(text)).toEqual([
+      "fix the login bug: disable the redirect loop",
+      "fix the signup bug: add the welcome email",
+    ])
+  }),
+)
+
+it.instance("steer consolidation bounds partial command suffix windows", () =>
+  Effect.gen(function* () {
+    const prompts = ["fix billing login auth", "fix auth handler"]
+    const items = yield* consolidateAdmitted(
+      "steer partial suffix target",
+      prompts.map((text) => ({ delivery: "steer" as const, text })),
+    )
+    expect(items.map(text)).toEqual(prompts)
+  }),
+)
+
+it.instance("queue consolidation bounds partial command suffix windows", () =>
+  Effect.gen(function* () {
+    const prompts = ["fix billing login auth", "fix auth handler"]
+    const items = yield* consolidateAdmitted(
+      "queue partial suffix target",
+      prompts.map((text) => ({ delivery: "queue" as const, text })),
+    )
+    expect(items.map(text)).toEqual(prompts)
+  }),
+)
+
+it.instance("steer request admission bounds partial command suffix windows", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "steer request partial suffix target" })
+    const prompts = ["fix billing login auth", "fix auth handler"]
+    yield* Effect.forEach(prompts, (text, index) => request(session.id, "steer", `steer-target-${index}`, text))
+    expect((yield* queue.list(session.id)).map(text)).toEqual(prompts)
+    const receipts = yield* Effect.forEach(prompts, (_, index) => queue.receipt(session.id, `steer-target-${index}`))
+    expect(receipts.map((receipt) => Option.getOrThrow(receipt).state)).toEqual(["pending", "pending"])
+  }),
+)
+
+it.instance("queue request admission bounds partial command suffix windows", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "queue request partial suffix target" })
+    const prompts = ["fix billing login auth", "fix auth handler"]
+    yield* Effect.forEach(prompts, (text, index) => request(session.id, "queue", `queue-target-${index}`, text))
+    expect((yield* queue.list(session.id)).map(text)).toEqual(prompts)
+    const receipts = yield* Effect.forEach(prompts, (_, index) => queue.receipt(session.id, `queue-target-${index}`))
+    expect(receipts.map((receipt) => Option.getOrThrow(receipt).state)).toEqual(["pending", "pending"])
+  }),
+)
+
+it.instance("an exact generic command target still matches after article normalization", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "generic target equality" })
+    yield* admit(session.id, "queue", "fix the bug: preserve the first request")
+    yield* admit(session.id, "queue", "FIX a bug: preserve the second request")
+
+    const items = yield* queue.consolidate(session.id)
+    const merged = "fix the bug:\n1. preserve the first request\n2. preserve the second request"
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual([merged])
+    expect(items.map(text)).toEqual([merged])
+  }),
+)
+
+it.instance("a shared path directory does not match different file targets", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "different files under a shared directory" })
+    const expected = [
+      "update src/login/auth.ts: keep redirect checks",
+      "update tests/login/signup.ts: add signup coverage",
+    ]
+    yield* admit(session.id, "queue", expected[0]!)
+    yield* admit(session.id, "queue", expected[1]!)
+
+    const items = yield* queue.consolidate(session.id)
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual(expected)
+    expect(items.map(text)).toEqual(expected)
+  }),
+)
+
+it.instance("a shared file extension alone does not identify a command target", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("different files", [
+      { delivery: "queue", text: "update alpha.ts: preserve the first module" },
+      { delivery: "queue", text: "update beta.ts: preserve the second module" },
+    ])
+    expect(items.map(text)).toEqual([
+      "update alpha.ts: preserve the first module",
+      "update beta.ts: preserve the second module",
+    ])
+  }),
+)
+
+it.instance("plain text copies match after case and whitespace normalization", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("normalized text", [
+      { delivery: "queue", text: "Please summarize the queue" },
+      { delivery: "queue", text: " please   SUMMARIZE THE queue " },
+    ])
+    expect(items.map(text)).toEqual(["Please summarize the queue"])
+    expect(items[0]!.origins).toHaveLength(2)
+  }),
+)
+
+it.instance("normalized command copies consolidate before command parsing", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "normalized command copies" })
+    yield* admit(session.id, "queue", "RUN   THE   SUITE")
+    yield* admit(session.id, "queue", " run the suite ")
+
+    expect(yield* queue.list(session.id)).toHaveLength(2)
+    const items = yield* queue.consolidate(session.id)
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual(["RUN   THE   SUITE"])
+    expect(items.map(text)).toEqual(["RUN   THE   SUITE"])
+  }),
+)
+
+it.instance("same-target command prefixes retain ordered steps through delivery", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "same-target command prefix" })
+    yield* admit(session.id, "queue", "run lint")
+    yield* admit(session.id, "queue", "run lint --fix")
+
+    expect(yield* queue.list(session.id)).toHaveLength(2)
+    const items = yield* queue.consolidate(session.id)
+    const merged = "run lint:\n1. run lint\n2. --fix"
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual([merged])
+    expect(items.map(text)).toEqual([merged])
+  }),
+)
+
+it.instance("command text prefixes retain the longer instruction through delivery", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "command text prefix" })
+    yield* admit(session.id, "queue", "run the suite")
+    yield* admit(session.id, "queue", "run the suite with coverage")
+
+    expect(yield* queue.list(session.id)).toHaveLength(2)
+    const items = yield* queue.consolidate(session.id)
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual(["run the suite with coverage"])
+    expect(items.map(text)).toEqual(["run the suite with coverage"])
+  }),
+)
+
+it.instance("plain text prefixes retain the longer instruction and both queue origins", () =>
+  Effect.gen(function* () {
+    const prompts = ["Please summarize the queue", "please summarize the queue in detail"]
+    const items = yield* consolidateAdmitted(
+      "prefix text",
+      prompts.map((text) => ({ delivery: "queue" as const, text })),
+    )
+    expect(items.map(text)).toEqual([prompts[1]])
+    expect(items[0]!.origins).toHaveLength(2)
+  }),
+)
+
+it.instance("prefix text consolidation settles request receipts through delivery", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "prefix text receipts" })
+    const prompts = ["Please summarize the queue", "Please summarize the queue in detail"]
+    yield* request(session.id, "queue", "prefix-a", prompts[0]!)
+    yield* request(session.id, "queue", "prefix-b", prompts[1]!)
+    expect(yield* queue.list(session.id)).toHaveLength(2)
+    const [merged] = yield* queue.consolidate(session.id)
+    expect([text(merged!), merged!.origins.length]).toEqual([prompts[1], 2])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "prefix-b"))).toEqual({
+      state: "merged",
+      into: "prefix-a",
+    })
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual([prompts[1]])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "prefix-b"))).toMatchObject({
+      state: "merged",
+      into: "prefix-a",
+      messageID: expect.any(String),
+    })
+  }),
+)
+
+it.instance("plain text with distinct work stays separate without a prefix relation", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("different text", [
+      { delivery: "queue", text: "Please summarize the queue" },
+      { delivery: "queue", text: "Please summarize the prompt" },
+    ])
+    expect(items.map(text)).toEqual(["Please summarize the queue", "Please summarize the prompt"])
+  }),
+)
+
+it.instance("exact copies stay in their delivery class while normalized same-class prompts still merge", () =>
+  Effect.gen(function* () {
+    const separate = yield* consolidateAdmitted("exact delivery separation", [
+      { delivery: "steer", text: "Please check the queue" },
+      { delivery: "queue", text: "Please check the queue" },
+    ])
+    expect(separate.map((item) => [item.delivery, text(item)])).toEqual([
+      ["steer", "Please check the queue"],
+      ["queue", "Please check the queue"],
+    ])
+    const merged = yield* consolidateAdmitted("normalized same-class copies", [
+      { delivery: "steer", text: "Please check the queue" },
+      { delivery: "steer", text: " please   CHECK THE queue " },
+    ])
+    expect(merged.map((item) => [item.delivery, text(item)])).toEqual([["steer", "Please check the queue"]])
+  }),
+)
+
+it.instance("normalized prompt equality stays in its delivery class", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("normalized delivery separation", [
+      { delivery: "steer", text: "Please summarize the queue" },
+      { delivery: "queue", text: " please   SUMMARIZE THE queue " },
+    ])
+    expect(items.map((item) => [item.delivery, text(item)])).toEqual([
+      ["steer", "Please summarize the queue"],
+      ["queue", " please   SUMMARIZE THE queue "],
+    ])
+  }),
+)
+
+it.instance("prompt prefixes stay in their delivery class", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("prefix delivery separation", [
+      { delivery: "steer", text: "Please summarize the queue" },
+      { delivery: "queue", text: "Please summarize the queue in detail" },
+    ])
+    expect(items.map((item) => [item.delivery, text(item)])).toEqual([
+      ["steer", "Please summarize the queue"],
+      ["queue", "Please summarize the queue in detail"],
+    ])
+  }),
+)
+
+it.instance("similar commands stay in their delivery class", () =>
+  Effect.gen(function* () {
+    const items = yield* consolidateAdmitted("command delivery separation", [
+      { delivery: "steer", text: "update packages/opencode/src/session/queue.ts: retain provenance" },
+      { delivery: "queue", text: "UPDATE src/session/queue.ts: preserve receipts" },
+    ])
+    expect(items.map((item) => [item.delivery, text(item)])).toEqual([
+      ["steer", "update packages/opencode/src/session/queue.ts: retain provenance"],
+      ["queue", "UPDATE src/session/queue.ts: preserve receipts"],
+    ])
+  }),
+)
+
+it.instance("receipt-bearing requests keep different modifiers apart on a shared target", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "receipt command match" })
+    yield* request(session.id, "queue", "auth-a", "review authentication receipt routing: preserve origin IDs")
+    yield* request(session.id, "queue", "auth-b", "review billing receipt routing: verify settlement")
+    const items = yield* queue.list(session.id)
+    expect(items.map(text)).toEqual([
+      "review authentication receipt routing: preserve origin IDs",
+      "review billing receipt routing: verify settlement",
+    ])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "auth-a"))).toMatchObject({ state: "pending" })
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "auth-b"))).toMatchObject({ state: "pending" })
+  }),
+)
+
+it.instance("receipt-bearing requests merge contained targets for the same job", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "receipt command containment" })
+    yield* request(session.id, "queue", "auth-a", "review authentication receipt routing: preserve origin IDs")
+    yield* request(session.id, "queue", "auth-b", "review receipt routing in authentication: verify settlement")
+    expect((yield* queue.list(session.id)).map(text)).toEqual([
+      "review authentication receipt routing:\n1. preserve origin IDs\n2. receipt routing in authentication: verify settlement",
+    ])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "auth-b"))).toMatchObject({
+      state: "merged",
+      into: "auth-a",
+    })
+  }),
+)
+
+it.instance("request admission ignores a shared path directory when file targets differ", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "receipt command path boundary" })
+    yield* request(session.id, "queue", "path-a", "update src/login/auth.ts: preserve the redirect")
+    yield* request(session.id, "queue", "path-b", "update tests/login/signup.ts: cover registration")
+
+    expect((yield* queue.list(session.id)).map(text)).toEqual([
+      "update src/login/auth.ts: preserve the redirect",
+      "update tests/login/signup.ts: cover registration",
+    ])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "path-a"))).toMatchObject({ state: "pending" })
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "path-b"))).toMatchObject({ state: "pending" })
+    const expected = [
+      "update src/login/auth.ts: preserve the redirect",
+      "update tests/login/signup.ts: cover registration",
+    ]
+    expect((yield* queue.consolidate(session.id)).map(text)).toEqual(expected)
+    const written: string[] = []
+    yield* promoter(session.id, written)("queue")
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual(expected)
+  }),
+)
+
+it.instance("configured critical markers still protect matching receipt-bearing commands", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "protected command marker" })
+    const markers = { critical: [{ type: "prefix" as const, value: "fix auth.ts" }] }
+    const inputs = [
+      {
+        sessionID: session.id,
+        delivery: "queue" as const,
+        requestID: "protected-a",
+        parts: [{ type: "text" as const, text: "fix auth.ts: preserve the first origin" }],
+      },
+      {
+        sessionID: session.id,
+        delivery: "queue" as const,
+        requestID: "protected-b",
+        parts: [{ type: "text" as const, text: "fix auth.ts: preserve the second origin" }],
+      },
+    ]
+    yield* Effect.forEach(inputs, (input) => queue.request(input, markers))
+    expect((yield* queue.list(session.id)).map(text)).toEqual(inputs.map((input) => input.parts[0]!.text))
+    expect((yield* queue.consolidate(session.id, markers)).map(text)).toEqual(
+      inputs.map((input) => input.parts[0]!.text),
+    )
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "protected-a")).state).toBe("pending")
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "protected-b")).state).toBe("pending")
+  }),
+)
+
+it.instance("configured critical markers also protect free-text prefix matching", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "protected text marker" })
+    const markers = { critical: [{ type: "prefix" as const, value: "Please" }] }
+    const prompts = ["Please summarize the queue", "Please summarize the queue in detail"]
+    yield* Effect.forEach(prompts, (text) => admit(session.id, "queue", text))
+    expect((yield* queue.consolidate(session.id, markers)).map(text)).toEqual(prompts)
+  }),
 )
 
 it.instance(
@@ -600,7 +2481,7 @@ it.instance(
 )
 
 it.instance(
-  "consolidate keeps one of identical prompts and merges similar commands into ordered steps",
+  "consolidate keeps copies within their delivery class and merges similar commands into ordered steps",
   () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
@@ -622,6 +2503,7 @@ it.instance(
         ["steer", "review auth.ts: check the naming"],
         ["steer", "fix login.ts: tidy the imports"],
         ["steer", "run the full suite"],
+        ["queue", "run the full suite"],
         ["queue", "fix auth.ts: queued step"],
       ])
 
@@ -633,10 +2515,12 @@ it.instance(
 
       yield* promote("steer")
       yield* promote("queue")
+      yield* promote("queue")
       expect(written).toEqual([
         "fix auth.ts:\n1. handle a null token\n2. add a regression test\n3. update the docs",
         "review auth.ts: check the naming",
         "fix login.ts: tidy the imports",
+        "run the full suite",
         "run the full suite",
         "fix auth.ts: queued step",
       ])

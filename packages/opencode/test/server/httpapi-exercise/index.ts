@@ -1590,8 +1590,8 @@ const scenarios: Scenario[] = [
         const session = yield* ctx.session({ title: "Queue consolidate session" })
         // Admission already absorbs identical copies, and joins commands only when they name requests,
         // so two commands without request IDs are what is left for consolidate to merge.
-        const item = yield* ctx.queued(session.id, { text: "fix parser first" })
-        yield* ctx.queued(session.id, { text: "fix parser second" })
+        const item = yield* ctx.queued(session.id, { text: "fix parser: first" })
+        yield* ctx.queued(session.id, { text: "fix parser: second" })
         return { session, item }
       }),
     )
