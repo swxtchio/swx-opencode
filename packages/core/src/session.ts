@@ -728,8 +728,11 @@ const layer = Layer.effect(
             })
             return result
           }
+          // Registration metadata is diagnostic only; do not turn a failed snapshot into a failed wait.
           const beforeJoin = yield* waitProjection(sessionID).pipe(
-            Effect.catchTag("Session.OperationUnavailableError", () => Effect.succeed(undefined)),
+            Effect.catchCause((cause) =>
+              Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.succeed(undefined),
+            ),
           )
           const currentInput = beforeJoin?.native
             ? (beforeJoin.latestPromoted ??
