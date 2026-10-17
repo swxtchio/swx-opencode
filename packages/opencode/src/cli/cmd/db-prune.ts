@@ -46,6 +46,7 @@ const ownedSessionTables = new Set([
   "session_prompt_queue_alias",
   "session_prompt_provenance",
   "session_prompt_receipt",
+  "session_ask",
   "session_share",
   "event_sequence",
   "event",
@@ -76,6 +77,7 @@ const requiredColumns: Record<string, string[]> = {
   session_prompt_queue_alias: ["id", "item_id"],
   session_prompt_provenance: ["message_id", "session_id"],
   session_prompt_receipt: ["session_id", "state", "time_created", "time_updated"],
+  session_ask: ["id", "session_id", "time_created", "time_settled"],
   session_share: ["session_id", "time_created", "time_updated"],
   event_sequence: ["aggregate_id", "seq"],
   event: ["aggregate_id", "type"],
@@ -139,6 +141,14 @@ const activitySources: {
     columns: [
       { name: "time_created", optional: false },
       { name: "time_updated", optional: false },
+    ],
+  },
+  {
+    table: "session_ask",
+    scope: "session_id",
+    columns: [
+      { name: "time_created", optional: false },
+      { name: "time_settled", optional: true },
     ],
   },
   {
@@ -504,6 +514,7 @@ function deleteSessions(db: SqliteAccess, sessionIDs: readonly string[]) {
     `DELETE FROM session_prompt_queue_sequence WHERE session_id IN (${placeholders})`,
     `DELETE FROM session_prompt_receipt WHERE session_id IN (${placeholders})`,
     `DELETE FROM session_prompt_provenance WHERE session_id IN (${placeholders})`,
+    `DELETE FROM session_ask WHERE session_id IN (${placeholders})`,
     `DELETE FROM session_input WHERE session_id IN (${placeholders})`,
     `DELETE FROM session_context_epoch WHERE session_id IN (${placeholders})`,
     `DELETE FROM todo WHERE session_id IN (${placeholders})`,
@@ -687,6 +698,7 @@ function sessionWorkFailures(db: SqliteAccess, sessionID: string) {
         invalidV2Delivery: number
         pendingReceipt: number
         invalidReceipt: number
+        pendingAsk: number
         activeRetention: number
       },
       [string]
@@ -706,6 +718,7 @@ function sessionWorkFailures(db: SqliteAccess, sessionID: string) {
         (SELECT count(*) FROM session_input WHERE session_id = ?1 AND delivery NOT IN ('steer', 'queue')) AS invalidV2Delivery,
         (SELECT count(*) FROM session_prompt_receipt WHERE session_id = ?1 AND state = 'pending') AS pendingReceipt,
         (SELECT count(*) FROM session_prompt_receipt WHERE session_id = ?1 AND state NOT IN ('pending', 'withdrawn', 'delivered', 'merged', 'superseded', 'deleted')) AS invalidReceipt,
+        (SELECT count(*) FROM session_ask WHERE session_id = ?1 AND time_settled IS NULL) AS pendingAsk,
         (SELECT count(*) FROM event_retention WHERE aggregate_id = ?1 AND state IN ('scanning', 'redacting')) AS activeRetention`,
     )
     .get(sessionID)
@@ -718,6 +731,7 @@ function sessionWorkFailures(db: SqliteAccess, sessionID: string) {
   if (row.malformedV1Queue) failures.add("v1-queue-state-unreadable")
   if (row.pendingV2) failures.add("v2-input-pending")
   if (row.invalidV2Delivery || row.invalidReceipt) failures.add("session-input-state-unreadable")
+  if (row.pendingAsk) failures.add("supervised-ask-pending")
   if (row.activeRetention) failures.add("session-retention-in-flight")
   return [...failures]
 }

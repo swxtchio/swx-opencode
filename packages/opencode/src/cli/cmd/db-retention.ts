@@ -229,6 +229,8 @@ const redactionPlan = [
   { table: "session_context_epoch", scope: "session_id", cursor: "session_id", value: "snapshot", kind: "context" },
   { table: "todo", scope: "session_id", cursor: "position", value: "content", kind: "text" },
   { table: "session_share", scope: "session_id", cursor: "session_id", value: "url", kind: "delete" },
+  // Settled supervisor asks (#286) keep question text and answers and no metrics, so they go whole.
+  { table: "session_ask", scope: "session_id", cursor: "id", value: "request", kind: "delete" },
   { table: "session", scope: "id", cursor: "id", value: "title", kind: "session" },
 ] as const
 
@@ -338,6 +340,8 @@ const copyTables = [
   { copy: "session_share.id", table: "session_share", scope: "session_id", value: "id" },
   { copy: "session_share.url", table: "session_share", scope: "session_id", value: "url" },
   { copy: "session_share.secret", table: "session_share", scope: "session_id", value: "secret" },
+  { copy: "session_ask.request", table: "session_ask", scope: "session_id", value: "request" },
+  { copy: "session_ask.decision", table: "session_ask", scope: "session_id", value: "decision" },
 ] as const
 
 const requiredRetentionTables = new Set([
@@ -372,6 +376,7 @@ const activityColumns = [
   },
   { table: "todo", scope: "session_id", required: ["time_created", "time_updated"], optional: [] },
   { table: "session_share", scope: "session_id", required: ["time_created", "time_updated"], optional: [] },
+  { table: "session_ask", scope: "session_id", required: ["time_created"], optional: ["time_settled"] },
   { table: "event_aggregate_writer", scope: "aggregate_id", required: ["time_last_append"], optional: [] },
 ] as const
 
@@ -912,6 +917,12 @@ function sessionWorkFailures(db: SqliteAccess, sessionIDs: readonly string[]) {
     ...sessionIDs,
   )?.rows
   if (queueRows) reasons.add("v1-prompt-queue-row-present")
+  const pendingAsks = oneRow<{ rows: number }>(
+    db,
+    `SELECT count(*) AS rows FROM session_ask WHERE session_id IN (${ids}) AND time_settled IS NULL`,
+    ...sessionIDs,
+  )?.rows
+  if (pendingAsks) reasons.add("supervised-ask-pending")
   const inputs = oneRow<{ rows: number; pending: number }>(
     db,
     `SELECT count(*) AS rows, coalesce(sum(promoted_seq IS NULL), 0) AS pending FROM session_input WHERE session_id IN (${ids})`,
