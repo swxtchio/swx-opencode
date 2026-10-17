@@ -412,6 +412,43 @@ describe("opencode serve --questions emit (subprocess)", () => {
       }),
     120_000,
   )
+
+  cliIt.live(
+    "a store upgraded from before the ledger records, lists and settles emitted asks",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const file = path.join(home, "upgraded.db")
+        const env = { OPENCODE_DB: file }
+        const old = yield* opencode.serve({ env })
+        old.kill()
+        yield* Effect.promise(() => old.exited)
+        const sqlite = new Database(file)
+        sqlite.run("DROP TABLE session_ask")
+        sqlite.run("DELETE FROM migration WHERE id = '20261017192742_session_ask'")
+        sqlite.close()
+
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        yield* llm.tool("question", { questions: [questions[1]] })
+        yield* llm.text("done")
+        const server = yield* opencode.serve({
+          extraArgs: ["--questions", "emit", "--questions-command", receiver.path],
+          env,
+        })
+        const sessionID = yield* startTurn(server.url, home)
+        const [emitted] = yield* receiver.read(1)
+        const listed = yield* json(HttpClientRequest.get(`${server.url}/question`), home)
+        expect(listed.body.map((item: { id: string }) => item.id)).toEqual([emitted.id])
+        const settled = yield* json(
+          HttpClientRequest.post(`${server.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Hello"]] }),
+          ),
+          home,
+        )
+        expect(settled.body).toMatchObject({ disposition: "settled", sessionID })
+        yield* toolPart(server.url, home, sessionID, emitted.origin.callID, "completed")
+      }),
+    90_000,
+  )
 })
 
 const startTurn = Effect.fn("startTurn")(function* (url: string, directory: string, agent?: string) {

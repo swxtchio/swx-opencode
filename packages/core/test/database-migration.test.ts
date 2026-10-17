@@ -26,6 +26,7 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import sessionMetadataMigration from "@opencode-ai/core/database/migration/20260511173437_session-metadata"
+import sessionAskMigration from "@opencode-ai/core/database/migration/20261017192742_session_ask"
 import type { SqlClient as SqlClientService } from "effect/unstable/sql/SqlClient"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
@@ -128,10 +129,7 @@ describe("DatabaseMigration", () => {
       }
     })
 
-    const open = () =>
-      Effect.runPromise(
-        inspect.pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped),
-      )
+    const open = () => Effect.runPromise(inspect.pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped))
 
     expect(await open()).toEqual({ auto_vacuum: { auto_vacuum: 2 }, session: { name: "session" } })
     expect(await open()).toEqual({ auto_vacuum: { auto_vacuum: 2 }, session: { name: "session" } })
@@ -189,10 +187,7 @@ describe("DatabaseMigration", () => {
         ),
       }
     })
-    const open = () =>
-      Effect.runPromise(
-        inspect.pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped),
-      )
+    const open = () => Effect.runPromise(inspect.pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped))
     const after = {
       auto_vacuum: { auto_vacuum: 1 },
       journal_mode_seen: { mode: "wal" },
@@ -266,6 +261,52 @@ describe("DatabaseMigration", () => {
           { name: "session_message_session_time_created_id_idx" },
           { name: "session_message_session_type_seq_idx" },
         ])
+      }),
+    )
+  })
+
+  test("adds the supervisor ask ledger to an upgraded store, owned by its Session", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* DatabaseMigration.apply(db)
+        // A store migrated before the ledger existed.
+        yield* db.run(sql`DROP TABLE session_ask`)
+        yield* db.run(sql`DELETE FROM migration WHERE id = ${sessionAskMigration.id}`)
+        yield* db.run(sql`
+          INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+          VALUES ('proj_ask', '/repo', 1, 1, '[]')
+        `)
+        yield* db.run(sql`
+          INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+          VALUES ('ses_ask', 'proj_ask', 'ask', '/repo', 'ask', '1', 1, 1)
+        `)
+
+        yield* DatabaseMigration.apply(db)
+        expect(yield* db.all(sql`SELECT name, "notnull" FROM pragma_table_info('session_ask') ORDER BY cid`)).toEqual([
+          { name: "id", notnull: 0 },
+          { name: "session_id", notnull: 1 },
+          { name: "kind", notnull: 1 },
+          { name: "directory", notnull: 1 },
+          { name: "tool", notnull: 0 },
+          { name: "request", notnull: 1 },
+          { name: "writer_id", notnull: 1 },
+          { name: "decision", notnull: 0 },
+          { name: "recovered", notnull: 1 },
+          { name: "time_created", notnull: 1 },
+          { name: "time_settled", notnull: 0 },
+        ])
+        yield* db.run(sql`PRAGMA foreign_keys = ON`)
+        yield* db.run(sql`
+          INSERT INTO session_ask (id, session_id, kind, directory, request, writer_id, time_created)
+          VALUES ('que_ask', 'ses_ask', 'question', '/repo', '{}', 'writer', 1)
+        `)
+        expect(yield* db.get(sql`SELECT recovered, time_settled FROM session_ask`)).toEqual({
+          recovered: 0,
+          time_settled: null,
+        })
+        yield* db.run(sql`DELETE FROM session WHERE id = 'ses_ask'`)
+        expect(yield* db.get(sql`SELECT count(*) AS count FROM session_ask`)).toEqual({ count: 0 })
       }),
     )
   })
