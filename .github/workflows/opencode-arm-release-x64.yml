@@ -6,21 +6,41 @@ on:
       - swxtch
     paths:
       - .github/workflows/opencode-arm-release-x64.yml
-      - .github/actions/setup-bun/**
       - packages/opencode/script/release-probe.ts
-      - package.json
-      - bun.lock
+      - packages/opencode/script/release-probe-process.ts
+      - packages/opencode/script/release-probe-requests.ts
+      - packages/opencode/script/release-probe-target.ts
+      - packages/opencode/script/release-probe-delay-wait.preload.ts
+      - packages/opencode/test/release-probe-tools.test.ts
+      - packages/opencode/test/release-probe-wait-absence.test.ts
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to rebuild and verify
+        required: true
+        type: string
+        default: v1.18.32-swxtch.0ff0dfbc
+      source_commit:
+        description: Optional full commit SHA to verify against the selected tag
+        required: false
+        type: string
+      version:
+        description: Optional OPENCODE_VERSION to verify against the selected source
+        required: false
+        type: string
+  repository_dispatch:
+    types:
+      - opencode-arm-release-proof
 
 concurrency:
-  group: native-x64-release-proof-${{ github.event.pull_request.number || github.ref }}
+  group: native-x64-release-proof-${{ github.event.pull_request.number || inputs.release_tag || github.event.client_payload.release_tag || github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 env:
-  SOURCE_COMMIT: 0ff0dfbca1f01765f6bd41d0379d9b97f1cf8d23
-  OPENCODE_VERSION: 1.18.32-swxtch.0ff0dfbc
+  RELEASE_PROBE_DEFAULT_TAG: v1.18.32-swxtch.0ff0dfbc
   TURBO_TELEMETRY_DISABLED: 1
   DO_NOT_TRACK: 1
 
@@ -36,28 +56,85 @@ jobs:
       - name: Checkout proof harness
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Setup Bun
-        uses: ./.github/actions/setup-bun
+      - name: Setup Node for source-pinned Bun installer
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
 
-      - name: Checkout pinned release source
+      - name: Checkout selected release source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: 0ff0dfbca1f01765f6bd41d0379d9b97f1cf8d23
+          ref: ${{ inputs.source_commit || github.event.client_payload.source_commit || inputs.release_tag || github.event.client_payload.release_tag || 'v1.18.32-swxtch.0ff0dfbc' }}
           path: source
           fetch-depth: 0
 
-      - name: Verify native runner and install pinned source dependencies
+      - name: Resolve Bun version from selected source
+        id: source-bun
+        working-directory: source
+        run: |
+          set -euo pipefail
+          bun_version=$(node -p "require('./package.json').packageManager.match(/^bun@([^+]+)/)?.[1] || ''")
+          test -n "$bun_version"
+          echo "version=$bun_version" >> "$GITHUB_OUTPUT"
+          echo "url=https://github.com/oven-sh/bun/releases/download/bun-v${bun_version}/bun-linux-x64-baseline.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Install Bun pinned by selected source
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ !steps.source-bun.outputs.url && steps.source-bun.outputs.version || '' }}
+          bun-download-url: ${{ steps.source-bun.outputs.url }}
+
+      - name: Resolve and verify release inputs
+        env:
+          RELEASE_SOURCE_DIR: ${{ github.workspace }}/source
+        run: bun run packages/opencode/script/release-probe-target.ts
+
+      - name: Verify native runner and install selected source dependencies
         run: |
           set -euo pipefail
           test "$(uname -m)" = x86_64
           bun -e 'if (process.platform !== "linux" || process.arch !== "x64") throw new Error(`not a native linux-x64 runner: ${process.platform}-${process.arch}`); console.log(`Bun ${Bun.version} ${process.platform}-${process.arch}`)'
+          test "$(bun --version)" = "$BUN_VERSION"
           test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
           git -C source merge-base --is-ancestor 4b87478ddf "$SOURCE_COMMIT"
-          package_version=$(node -p "require('./source/packages/opencode/package.json').version")
-          short_sha=$(git -C source rev-parse --short=8 HEAD)
-          test "${package_version}-swxtch.${short_sha}" = "$OPENCODE_VERSION"
           sha256sum source/bun.lock | tee "$RUNNER_TEMP/bun.lock.sha256"
           bun install --cwd source --frozen-lockfile --os=linux --cpu=x64
+
+      - name: Typecheck and test release proof tooling
+        run: |
+          set -euo pipefail
+          files=(
+            packages/opencode/script/release-probe.ts
+            packages/opencode/script/release-probe-delay-wait.preload.ts
+            packages/opencode/script/release-probe-process.ts
+            packages/opencode/script/release-probe-requests.ts
+            packages/opencode/script/release-probe-target.ts
+            packages/opencode/test/release-probe-tools.test.ts
+            packages/opencode/test/release-probe-wait-absence.test.ts
+          )
+          tracked_files=()
+          untracked_files=()
+          backup="$RUNNER_TEMP/release-probe-original"
+          mkdir -p "$backup"
+          restore_proof_tools() {
+            for file in "${tracked_files[@]}"; do cp "$backup/$file" "source/$file"; done
+            for file in "${untracked_files[@]}"; do rm -f "source/$file"; done
+          }
+          trap restore_proof_tools EXIT
+          for file in "${files[@]}"; do
+            if git -C source cat-file -e "HEAD:$file" 2>/dev/null; then
+              mkdir -p "$backup/$(dirname "$file")"
+              git -C source show "HEAD:$file" > "$backup/$file"
+              tracked_files+=("$file")
+            else
+              untracked_files+=("$file")
+            fi
+            cp "$GITHUB_WORKSPACE/$file" "source/$file"
+          done
+          (cd source/packages/opencode && bun run typecheck && bun test test/release-probe-tools.test.ts)
+          restore_proof_tools
+          trap - EXIT
+          test -z "$(git -C source status --porcelain)"
 
       - name: Pin build data and build native linux-x64
         working-directory: source
@@ -105,23 +182,26 @@ jobs:
           printf '%s\n' "$version_output" | tee "$RUNNER_TEMP/x64-version.txt"
           OPENCODE_VERSION="$OPENCODE_VERSION" bun run packages/opencode/script/release-probe.ts \
             x64 "$extracted/opencode" "$proof" 2>&1 | tee "$RUNNER_TEMP/native-x64-proof.log"
-          python3 - "$RUNNER_TEMP" "$SOURCE_COMMIT" "$OPENCODE_VERSION" "$sidecar_name" <<'PY'
+          python3 - "$RUNNER_TEMP" "$RELEASE_TAG" "$SOURCE_COMMIT" "$OPENCODE_VERSION" "$BUN_VERSION" "$sidecar_name" <<'PY'
           import hashlib, json, pathlib, subprocess, sys
           root = pathlib.Path(sys.argv[1])
-          source = sys.argv[2]
-          version = sys.argv[3]
-          sidecar = sys.argv[4]
+          tag = sys.argv[2]
+          source = sys.argv[3]
+          version = sys.argv[4]
+          bun_version = sys.argv[5]
+          sidecar = sys.argv[6]
           archive = root / "release-assets/opencode-linux-x64.tar.gz"
           evidence = json.loads((root / "native-x64-proof/evidence.json").read_text())
           lock = (root / "bun.lock.sha256").read_text().split()[0]
           models = (root / "models.dev.sha256").read_text().split()[0]
           metadata = {
+              "release_tag": tag,
               "source_commit": source,
               "version": version,
               "target": "linux-x64",
               "build_classification": "native target build and runtime on ubuntu-latest x86_64",
               "runner_arch": subprocess.check_output(["uname", "-m"], text=True).strip(),
-              "bun_version": subprocess.check_output(["bun", "--version"], text=True).strip(),
+              "bun_version": bun_version,
               "bun_lock_sha256": lock,
               "models_dev_sha256": models,
               "archive": archive.name,
@@ -134,6 +214,47 @@ jobs:
           print(json.dumps(metadata, indent=2))
           PY
 
+      - name: Prove held-wait dispatch suppression is rejected
+        working-directory: source/packages/opencode
+        env:
+          RELEASE_PROBE_BINARY: ${{ runner.temp }}/release-extracted/opencode
+          RELEASE_PROBE_ARCH: x64
+          OPENCODE_VERSION: ${{ env.OPENCODE_VERSION }}
+          RELEASE_PROBE_RED_EVIDENCE_DIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          files=(
+            script/release-probe.ts
+            script/release-probe-delay-wait.preload.ts
+            script/release-probe-process.ts
+            script/release-probe-requests.ts
+            script/release-probe-target.ts
+            test/release-probe-wait-absence.test.ts
+          )
+          tracked_files=()
+          untracked_files=()
+          backup="$RUNNER_TEMP/wait-absence-original"
+          mkdir -p "$backup"
+          restore_wait_proof() {
+            for file in "${tracked_files[@]}"; do cp "$backup/$file" "$GITHUB_WORKSPACE/source/packages/opencode/$file"; done
+            for file in "${untracked_files[@]}"; do rm -f "$GITHUB_WORKSPACE/source/packages/opencode/$file"; done
+          }
+          trap restore_wait_proof EXIT
+          for file in "${files[@]}"; do
+            if git -C "$GITHUB_WORKSPACE/source" cat-file -e "HEAD:packages/opencode/$file" 2>/dev/null; then
+              mkdir -p "$backup/$(dirname "$file")"
+              git -C "$GITHUB_WORKSPACE/source" show "HEAD:packages/opencode/$file" > "$backup/$file"
+              tracked_files+=("$file")
+            else
+              untracked_files+=("$file")
+            fi
+            cp "$GITHUB_WORKSPACE/packages/opencode/$file" "$GITHUB_WORKSPACE/source/packages/opencode/$file"
+          done
+          bun test test/release-probe-wait-absence.test.ts
+          restore_wait_proof
+          trap - EXIT
+          test -z "$(git -C "$GITHUB_WORKSPACE/source" status --porcelain)"
+
       - name: Upload x64 archive, checksum, and execution evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -144,6 +265,8 @@ jobs:
             ${{ runner.temp }}/native-x64-proof/evidence.json
             ${{ runner.temp }}/native-x64-proof/opencode-server.log
             ${{ runner.temp }}/native-x64-proof.log
+            ${{ runner.temp }}/native-x64-wait-red-tool.log
+            ${{ runner.temp }}/native-x64-wait-red-continuation.log
             ${{ runner.temp }}/x64-version.txt
             ${{ runner.temp }}/x64-provenance.json
             ${{ runner.temp }}/build.log

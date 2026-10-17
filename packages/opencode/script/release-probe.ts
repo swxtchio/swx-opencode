@@ -2,6 +2,8 @@
 
 import fs from "node:fs/promises"
 import path from "node:path"
+import { abortAllRequests, requestText, startRequest } from "./release-probe-requests"
+import { runProcess, spawnProcess } from "./release-probe-process"
 
 type Scenario = "completed" | "failed" | "interrupted"
 type Message = {
@@ -17,6 +19,7 @@ type Message = {
 }
 type HistoryEvent = { id: string; type: string; durable?: { seq: number } }
 type ApiResult = { status: number; body: unknown; text: string }
+type AdmissionReceipt = { status: number; sessionID: string; id: string; admittedSeq: number }
 type WaitResult = {
   type: string
   admittedSeq?: number
@@ -188,6 +191,9 @@ const opencodeEnvironment: Record<string, string | undefined> = {
   OPENCODE_PURE: "1",
 }
 delete opencodeEnvironment.OPENCODE_DISABLE_FFF
+delete opencodeEnvironment.BUN_OPTIONS
+delete opencodeEnvironment.RELEASE_PROBE_WAIT_START_FILE
+delete opencodeEnvironment.RELEASE_PROBE_WAIT_RELEASE_FILE
 
 let serverUrl = ""
 let serverExitCode: number | undefined
@@ -226,9 +232,11 @@ try {
 } finally {
   for (const name of ["completed", "failed", "interrupted"])
     await fs.writeFile(path.join(workspace, `${name}-tool-release`), "release")
+  await fs.writeFile(path.join(workspace, "completed-continuation-release"), "release")
   completedGate.release()
   failedGate.release()
   try {
+    await abortAllRequests()
     if (server) await server.stop()
   } finally {
     await llm.stop(true)
@@ -293,23 +301,31 @@ function toolResponse(scenario: Scenario) {
   ])
 }
 
-async function apiRaw(route: string, init: RequestInit = {}, timed = true): Promise<ApiResult> {
+async function apiRaw(route: string, init: RequestInit = {}, timeoutMs = 15_000): Promise<ApiResult> {
+  return parseApiResult(
+    await requestText(`${serverUrl}${route}`, apiInit(init), timeoutMs, `${init.method ?? "GET"} ${route}`),
+  )
+}
+
+function apiRequest(route: string, init: RequestInit, timeoutMs: number) {
+  return startRequest(`${serverUrl}${route}`, apiInit(init), timeoutMs, `${init.method ?? "GET"} ${route}`)
+}
+
+function apiInit(init: RequestInit) {
   const headers = new Headers(init.headers)
   headers.set("authorization", authorization)
   headers.set("x-opencode-directory", workspace)
-  const response = await fetch(`${serverUrl}${route}`, {
-    ...init,
-    headers,
-    ...(timed ? { signal: AbortSignal.timeout(15_000) } : {}),
-  })
-  const text = await response.text()
+  return { ...init, headers }
+}
+
+function parseApiResult(response: { status: number; text: string }): ApiResult {
   let body: unknown
   try {
-    body = text.length ? JSON.parse(text) : undefined
+    body = response.text.length ? JSON.parse(response.text) : undefined
   } catch {
     body = undefined
   }
-  return { status: response.status, body, text }
+  return { status: response.status, body, text: response.text }
 }
 
 async function apiJson<T>(route: string, init: RequestInit = {}): Promise<T> {
@@ -334,22 +350,22 @@ async function startServer() {
   const port = probe.port
   await probe.stop(true)
   const command = [binary, "serve", "--pure", "--print-logs", "--hostname", "127.0.0.1", "--port", String(port)]
-  const process = Bun.spawn(command, { cwd: workspace, env: opencodeEnvironment, stdout: "pipe", stderr: "pipe" })
+  const serverProcess = spawnProcess(command, { cwd: workspace, env: opencodeEnvironment })
   let stdout = ""
   let stderr = ""
   let modelCatalog = "not requested yet"
-  const stdoutDone = new Response(process.stdout).text().then((value) => (stdout = value))
-  const stderrDone = new Response(process.stderr).text().then((value) => (stderr = value))
+  const stdoutDone = serverProcess.stdout.then((value) => (stdout = value))
+  const stderrDone = serverProcess.stderr.then((value) => (stderr = value))
   serverUrl = `http://127.0.0.1:${port}`
   serverExitCode = undefined
-  void process.exited.then((code) => (serverExitCode = code))
+  void serverProcess.child.exited.then((code) => (serverExitCode = code))
   try {
     await until(
       "authenticated configured V2 model",
       async () => {
         if (serverExitCode !== undefined) throw new Error(`OpenCode exited before readiness (${serverExitCode})`)
         try {
-          const result = await apiRaw("/api/model")
+          const result = await apiRaw("/api/model", {}, 5_000)
           modelCatalog = `status=${result.status} body=${JSON.stringify(result.body).slice(0, 4000)}`
           if (result.status === 401) throw new Error("OpenCode server rejected Basic authentication")
           if (result.status !== 200) return undefined
@@ -364,51 +380,36 @@ async function startServer() {
       120_000,
     )
   } catch (error) {
-    if (serverExitCode === undefined) process.kill("SIGTERM")
-    try {
-      await withTimeout(process.exited, 30_000, "OpenCode startup cleanup")
-    } catch {
-      process.kill("SIGKILL")
-      await process.exited
-    }
+    await serverProcess.stop("OpenCode startup cleanup")
     await Promise.all([stdoutDone, stderrDone])
     await Bun.write(path.join(proofRoot, "opencode-startup-failure.log"), `${stdout}\n${stderr}`)
     throw new Error(`${String(error)}\nmodel_catalog=${modelCatalog}\n${stderr}`)
   }
   return {
-    process,
     async stop() {
-      if (serverExitCode === undefined) process.kill("SIGTERM")
-      try {
-        await withTimeout(process.exited, 30_000, "OpenCode server shutdown")
-      } catch {
-        process.kill("SIGKILL")
-        await process.exited
-      }
+      await serverProcess.stop("OpenCode server shutdown")
       await Promise.all([stdoutDone, stderrDone])
       await fs.appendFile(path.join(proofRoot, "opencode-server.log"), stdout + stderr)
     },
   }
 }
 
-async function withTimeout<T>(promise: Promise<T>, budgetMs: number, label: string) {
-  let timer: Timer | undefined
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), budgetMs)
-      }),
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
+async function providerState() {
+  const response = await requestText(`http://127.0.0.1:${llm.port}/control/state`, {}, 15_000, "provider control state")
+  if (response.status < 200 || response.status >= 300)
+    throw new Error(`provider control returned HTTP ${response.status}: ${response.text}`)
+  return JSON.parse(response.text) as typeof stateful
 }
 
-async function providerState() {
-  const response = await fetch(`http://127.0.0.1:${llm.port}/control/state`)
-  if (!response.ok) throw new Error(`provider control returned HTTP ${response.status}`)
-  return (await response.json()) as typeof stateful
+async function releaseProviderGate(scenario: "completed" | "failed") {
+  const response = await requestText(
+    `http://127.0.0.1:${llm.port}/control/release/${scenario}`,
+    { method: "POST" },
+    15_000,
+    `provider ${scenario} gate release`,
+  )
+  if (response.status !== 204)
+    throw new Error(`provider ${scenario} gate release returned HTTP ${response.status}: ${response.text}`)
 }
 
 async function providerUntil(label: string, predicate: (value: typeof stateful) => boolean) {
@@ -427,13 +428,16 @@ async function createSession() {
   return response.data
 }
 
-async function admit(sessionID: string, text: string, resume = true) {
-  const response = await apiJson<{ data: { id: string; admittedSeq: number } }>(`/api/session/${sessionID}/prompt`, {
+async function admit(sessionID: string, text: string, resume = true): Promise<AdmissionReceipt> {
+  const response = await apiRaw(`/api/session/${sessionID}/prompt`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ prompt: { text }, resume }),
   })
-  return response.data
+  const data = (response.body as { data?: { id?: unknown; admittedSeq?: unknown } } | undefined)?.data
+  if (response.status !== 200 || typeof data?.id !== "string" || typeof data.admittedSeq !== "number")
+    throw new Error(`Prompt admission receipt mismatch: ${JSON.stringify(response)}`)
+  return { status: response.status, sessionID, id: data.id, admittedSeq: data.admittedSeq }
 }
 
 async function messages(sessionID: string) {
@@ -448,9 +452,11 @@ function findTool(messages: Message[], name?: string) {
     .find((content) => content.type === "tool" && (name === undefined || content.name === name))
 }
 
-async function startWait(sessionID: string) {
+function startWait(sessionID: string) {
   const state: { settled: boolean; response?: ApiResult; error?: string } = { settled: false }
-  const promise = apiRaw(`/api/session/${sessionID}/wait`, { method: "POST" }, false)
+  const request = apiRequest(`/api/session/${sessionID}/wait`, { method: "POST" }, 120_000)
+  const promise = request.result
+    .then(parseApiResult)
     .then((response) => {
       state.settled = true
       state.response = response
@@ -459,13 +465,50 @@ async function startWait(sessionID: string) {
       state.settled = true
       state.error = String(error)
     })
-  return { state, promise }
+  return { state, promise, abort: request.abort, done: request.done }
 }
 
-async function assertRunningWaitPending(sessionID: string, waiter: Awaited<ReturnType<typeof startWait>>, phase: string) {
-  const active = await apiJson<{ data: Record<string, { type: string }> }>("/api/session/active")
-  if (active.data[sessionID]?.type !== "running") throw new Error(`Session was not positively active while ${phase}`)
+async function assertRunningWaitPending(
+  sessionID: string,
+  admission: AdmissionReceipt,
+  waiter: ReturnType<typeof startWait>,
+  phase: string,
+) {
+  if (admission.status !== 200 || admission.sessionID !== sessionID || !admission.id || !Number.isInteger(admission.admittedSeq))
+    throw new Error(`No producer admission receipt for ${phase}: ${JSON.stringify(admission)}`)
+  const active = await apiRaw("/api/session/active")
+  const activeData = (active.body as { data?: Record<string, { type: string }> } | undefined)?.data
+  if (active.status !== 200 || activeData?.[sessionID]?.type !== "running")
+    throw new Error(`Session was not positively active while ${phase}: ${JSON.stringify(active)}`)
+  let producerReceipt: Awaited<ReturnType<typeof pendingOutcome>>
+  try {
+    producerReceipt = await pendingOutcome(`case:pending producer receipt during ${phase}`)
+  } catch (error) {
+    throw new Error(`No producer-side pending wait receipt during ${phase}: ${String(error)}`)
+  }
+  if (
+    producerReceipt.admission.status !== 200 ||
+    producerReceipt.status !== 200 ||
+    producerReceipt.result.type !== "pending" ||
+    producerReceipt.result.admittedSeq !== producerReceipt.admission.admittedSeq ||
+    producerReceipt.result.messageID !== producerReceipt.admission.id
+  )
+    throw new Error(`Producer pending receipt did not match its admission during ${phase}: ${JSON.stringify(producerReceipt)}`)
   if (waiter.state.settled) throw new Error(`wait returned before ${phase}: ${JSON.stringify(waiter.state.response)}`)
+  return {
+    phase,
+    main_session_id: sessionID,
+    active_status: active.status,
+    active_type: activeData[sessionID].type,
+    admission_receipt: admission,
+    producer_pending_wait_receipt: {
+      sessionID: producerReceipt.sessionID,
+      admission: producerReceipt.admission,
+      status: producerReceipt.status,
+      result: producerReceipt.result,
+    },
+    main_wait_client_unsettled: waiter.state.settled === false,
+  }
 }
 
 async function idleOutcome() {
@@ -476,12 +519,21 @@ async function idleOutcome() {
   return { sessionID: session.id, status: response.status, result: (response.body as { data: WaitResult }).data }
 }
 
-async function pendingOutcome() {
+async function pendingOutcome(text = "case:pending do not resume") {
+  return pendingOutcomeWithText(text)
+}
+
+async function pendingOutcomeWithText(text: string) {
   const session = await createSession()
-  const admission = await admit(session.id, "case:pending do not resume", false)
+  const admission = await admit(session.id, text, false)
   const response = await apiRaw(`/api/session/${session.id}/wait`, { method: "POST" })
-  const result = (response.body as { data: WaitResult }).data
-  if (response.status !== 200 || result.type !== "pending" || result.admittedSeq !== admission.admittedSeq || result.messageID !== admission.id)
+  const result = (response.body as { data?: WaitResult } | undefined)?.data
+  if (
+    response.status !== 200 ||
+    result?.type !== "pending" ||
+    result.admittedSeq !== admission.admittedSeq ||
+    result.messageID !== admission.id
+  )
     throw new Error(`native admit-only wait mismatch: ${JSON.stringify({ response, admission })}`)
   return { sessionID: session.id, admission, status: response.status, result }
 }
@@ -494,8 +546,14 @@ async function completedOutcome() {
     const tool = findTool(await messages(session.id), "bash")
     return tool?.state?.status === "running" ? tool : undefined
   })
-  const waiter = await startWait(session.id)
-  await assertRunningWaitPending(session.id, waiter, "the local Bash tool is held")
+  await fs.writeFile(path.join(workspace, "completed-tool-held"), "held")
+  const waiter = startWait(session.id)
+  const toolHoldReceipt = await assertRunningWaitPending(
+    session.id,
+    admission,
+    waiter,
+    "the local Bash tool is held",
+  )
 
   await fs.writeFile(path.join(workspace, "completed-tool-release"), "release")
   const continuation = await providerUntil("final provider continuation to be held", (state) => state.completedContinuationStarted)
@@ -505,10 +563,17 @@ async function completedOutcome() {
   })
   if (!continuation.requests.some((request) => request.scenario === "completed" && request.ordinal === 2 && request.hasToolResult))
     throw new Error("provider continuation did not receive the settled tool result")
-  await assertRunningWaitPending(session.id, waiter, "the final provider continuation is held")
-  await fetch(`http://127.0.0.1:${llm.port}/control/release/completed`, { method: "POST" })
+  await fs.writeFile(path.join(workspace, "completed-continuation-held"), "held")
+  const continuationHoldReceipt = await assertRunningWaitPending(
+    session.id,
+    admission,
+    waiter,
+    "the final provider continuation is held",
+  )
+  await fs.writeFile(path.join(workspace, "completed-continuation-release"), "release")
+  await releaseProviderGate("completed")
 
-  await withTimeout(waiter.promise, 120_000, "completed native wait")
+  await waiter.promise
   if (waiter.state.error) throw new Error(`completed wait request failed: ${waiter.state.error}`)
   const response = waiter.state.response
   if (!response || response.status !== 200) throw new Error(`completed wait HTTP response mismatch: ${JSON.stringify(response)}`)
@@ -535,8 +600,7 @@ async function completedOutcome() {
     result,
     held_tool_status: heldTool.state?.status,
     settled_tool_status: settledTool.state?.status,
-    wait_pending_while_tool_held: true,
-    wait_pending_while_provider_continuation_held: true,
+    held_phase_wait_evidence: [toolHoldReceipt, continuationHoldReceipt],
     userMessageID: user.id,
     assistantMessageID: assistant.id,
     history: events,
@@ -574,10 +638,15 @@ async function failedOutcome() {
     const tool = findTool(await messages(session.id), "not_registered")
     return tool?.state?.status === "error" ? tool : undefined
   })
-  const waiter = await startWait(session.id)
-  await assertRunningWaitPending(session.id, waiter, "the failed tool's provider continuation is held")
-  await fetch(`http://127.0.0.1:${llm.port}/control/release/failed`, { method: "POST" })
-  await withTimeout(waiter.promise, 120_000, "failed native wait")
+  const waiter = startWait(session.id)
+  const waitEvidence = await assertRunningWaitPending(
+    session.id,
+    admission,
+    waiter,
+    "the failed tool's provider continuation is held",
+  )
+  await releaseProviderGate("failed")
+  await waiter.promise
   if (waiter.state.error) throw new Error(`failed wait request failed: ${waiter.state.error}`)
   const response = waiter.state.response
   const result = response?.body ? (response.body as { data: WaitResult }).data : undefined
@@ -586,7 +655,14 @@ async function failedOutcome() {
   const history = await apiJson<{ data: HistoryEvent[]; hasMore: boolean }>(`/api/session/${session.id}/history?limit=100`)
   if (!history.data.some((event) => event.type.toLowerCase().includes("tool.failed")))
     throw new Error("failed tool terminal event was not persisted")
-  return { sessionID: session.id, admission, result, failed_tool_status: failedTool.state?.status, terminal_event_persisted: true }
+  return {
+    sessionID: session.id,
+    admission,
+    result,
+    wait_evidence: waitEvidence,
+    failed_tool_status: failedTool.state?.status,
+    terminal_event_persisted: true,
+  }
 }
 
 async function interruptedOutcome() {
@@ -597,11 +673,17 @@ async function interruptedOutcome() {
     const tool = findTool(await messages(session.id), "bash")
     return tool?.state?.status === "running" ? tool : undefined
   })
-  const waiter = await startWait(session.id)
-  await assertRunningWaitPending(session.id, waiter, "the interruptible Bash tool is held")
+  await fs.writeFile(path.join(workspace, "interrupted-tool-held"), "held")
+  const waiter = startWait(session.id)
+  const waitEvidence = await assertRunningWaitPending(
+    session.id,
+    admission,
+    waiter,
+    "the interruptible Bash tool is held",
+  )
   const interrupt = await apiRaw(`/api/session/${session.id}/interrupt`, { method: "POST" })
   if (interrupt.status !== 204) throw new Error(`interrupt returned HTTP ${interrupt.status}: ${interrupt.text}`)
-  await withTimeout(waiter.promise, 120_000, "interrupted native wait cleanup")
+  await waiter.promise
   if (waiter.state.error) throw new Error(`interrupted wait request failed: ${waiter.state.error}`)
   const response = waiter.state.response
   const result = response?.body ? (response.body as { data: WaitResult }).data : undefined
@@ -614,7 +696,14 @@ async function interruptedOutcome() {
   const history = await apiJson<{ data: HistoryEvent[]; hasMore: boolean }>(`/api/session/${session.id}/history?limit=100`)
   if (!history.data.some((event) => event.type.toLowerCase().includes("tool.failed")))
     throw new Error("interrupted tool cleanup event was not persisted")
-  return { sessionID: session.id, admission, result, tool_cleanup: tool.state.error.message, terminal_event_persisted: true }
+  return {
+    sessionID: session.id,
+    admission,
+    result,
+    wait_evidence: waitEvidence,
+    tool_cleanup: tool.state.error.message,
+    terminal_event_persisted: true,
+  }
 }
 
 async function databaseSelection() {
@@ -656,11 +745,12 @@ async function databaseSelection() {
 }
 
 async function runBinary(args: string[], cwd: string, env: Record<string, string | undefined>) {
-  const process = Bun.spawn([binary, ...args], { cwd, env, stdout: "pipe", stderr: "pipe" })
-  const stdout = new Response(process.stdout).text()
-  const stderr = new Response(process.stderr).text()
-  const exit = await withTimeout(process.exited, 120_000, `binary command ${args.join(" ")}`)
-  const result = { exit, stdout: await stdout, stderr: await stderr }
+  const result = await runProcess([binary, ...args], {
+    cwd,
+    env,
+    timeoutMs: 120_000,
+    label: `binary command ${args.join(" ")}`,
+  })
   if (result.exit !== 0) throw new Error(`binary command ${args.join(" ")} exited ${result.exit}: ${result.stderr}`)
   return result
 }
