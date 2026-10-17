@@ -189,6 +189,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Features
 
+- **#287** Repair the composer regressions in `swxtchio/swx-opencode#285`: session-owned recall and retained-history search, append-only picker selection, and invocation-time enhancement model selection. The owning code is `packages/tui/src/prompt/history.tsx`, `routes/session/dialog-timeline.tsx`, and `component/prompt/index.tsx`; producer-driven regressions are in `packages/tui/test/routes/session/queue-review.test.tsx`. _Fork-only._
 - **#272** Search timeline prompts with recognized composer provenance, excluding machine markers and appended text.
   Unknown or unmarked history fails closed; firstmate terminal sends still share `tui-composer` origin until
   `swxtchio/swx-firstmate#2185` adds their machine marker. Busy composer Enter waits for the run's idle boundary and

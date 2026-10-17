@@ -4,16 +4,17 @@ import { useSync } from "../../context/sync"
 import { DialogSelect, type DialogSelectOption } from "../../ui/dialog-select"
 import type { Config, Message, Part, TextPart } from "@opencode-ai/sdk/v2"
 import { Locale } from "../../util/locale"
-import { DialogMessage } from "./dialog-message"
 import { useDialog } from "../../ui/dialog"
-import type { PromptInfo } from "../../component/prompt/history"
+import type { PromptHistoryEntry } from "../../prompt/history"
+import { expandPastedTextPlaceholders } from "../../prompt/part"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { classify } from "@opencode-ai/schema/session-machine-message"
 
 export function DialogTimeline(props: {
   sessionID: string
   onMove: (messageID: string) => void
-  setPrompt?: (prompt: PromptInfo) => void
+  appendPrompt: (text: string) => void
+  history: readonly PromptHistoryEntry[]
 }) {
   const sync = useSync()
   const dialog = useDialog()
@@ -28,11 +29,21 @@ export function DialogTimeline(props: {
       messages: sync.data.message[props.sessionID] ?? [],
       parts: sync.data.part,
       markers: sync.data.config.machine_message_markers,
-      setPrompt: props.setPrompt,
+      history: props.history,
     }),
   )
 
-  return <DialogSelect onMove={(option) => props.onMove(option.value)} title="Timeline" options={options()} />
+  return (
+    <DialogSelect
+      onMove={(option) => option.value.messageID && props.onMove(option.value.messageID)}
+      onSelect={(option) => {
+        dialog.clear()
+        props.appendPrompt(option.value.text)
+      }}
+      title="Timeline"
+      options={options()}
+    />
+  )
 }
 
 export function timelineOptions(input: {
@@ -40,11 +51,11 @@ export function timelineOptions(input: {
   messages: Message[]
   parts: Record<string, Part[]>
   markers?: Config["machine_message_markers"]
-  setPrompt?: (prompt: PromptInfo) => void
+  history?: readonly PromptHistoryEntry[]
 }) {
-  const result: DialogSelectOption<string>[] = []
+  const result: DialogSelectOption<{ text: string; messageID?: string }>[] = []
   for (const message of input.messages) {
-    if (message.role !== "user") continue
+    if (message.role !== "user" || message.sessionID !== input.sessionID) continue
     const parts = input.parts[message.id] ?? []
     const groups = parts.flatMap((part) => {
       if (part.type !== "text") return []
@@ -75,7 +86,8 @@ export function timelineOptions(input: {
             const hasComposerTransport =
               item.input.origin === "tui-composer" ||
               item.input.parts.some(
-                (part) => part.type === "text" && part.metadata?.[SessionPromptQueue.TuiComposerOriginMetadataKey] === true,
+                (part) =>
+                  part.type === "text" && part.metadata?.[SessionPromptQueue.TuiComposerOriginMetadataKey] === true,
               )
             return appended || machineClassified(text) || !hasComposerTransport
           })
@@ -89,14 +101,20 @@ export function timelineOptions(input: {
         .map((part) => part.text)
         .join("")
         .replace(/\n/g, " "),
-      value: message.id,
+      value: { messageID: message.id, text: visibleText.map((part) => part.text).join("") },
       footer: Locale.time(message.time.created),
-      onSelect: (dialog) => {
-        dialog.replace(() => (
-          <DialogMessage messageID={message.id} sessionID={input.sessionID} setPrompt={input.setPrompt} />
-        ))
-      },
     })
+  }
+  for (const entry of input.history ?? []) {
+    if (entry.sessionID !== input.sessionID || entry.origin !== "tui-composer" || entry.machineAppended) continue
+    const text = expandPastedTextPlaceholders(entry.input, entry.parts)
+    if (!text.trim() || classify(text, input.markers)) continue
+    if (
+      entry.parts.some((part) => part.type === "text" && part.metadata?.[SessionPromptQueue.TuiPromptAppendMetadataKey])
+    )
+      continue
+    if (result.some((option) => option.value.text === text)) continue
+    result.push({ title: text.replace(/\n/g, " "), value: { text } })
   }
   return result.reverse()
 }
