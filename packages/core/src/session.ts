@@ -2,6 +2,7 @@ export * as SessionV2 from "./session"
 export * from "./session/schema"
 
 import { Cause, DateTime, Effect, Equal, Exit, Layer, Schema, Context, Stream } from "effect"
+import { randomUUID } from "node:crypto"
 import { ListAnchor } from "@opencode-ai/schema/session"
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, like, lt, lte, or, type SQL } from "drizzle-orm"
 import { ProjectV2 } from "./project"
@@ -705,6 +706,7 @@ const layer = Layer.effect(
       }),
       wait: Effect.fn("V2Session.wait")(function* (sessionID) {
         yield* result.get(sessionID)
+        const waitID = randomUUID()
         let outcome: WaitOutcome | undefined
         while (true) {
           if (!(yield* execution.active).has(sessionID)) {
@@ -712,9 +714,36 @@ const layer = Layer.effect(
             if ((yield* execution.active).has(sessionID)) continue
             const result = waitResult(projection, outcome)
             if (result === undefined) return yield* waitUnavailable()
+            const currentInput = projection.native
+              ? (projection.latestPromoted ??
+                (projection.pending?.id === projection.latestInput?.id ? projection.latestInput : undefined))
+              : undefined
+            yield* Effect.logInfo("Session wait resolved", {
+              event: "session.wait.resolved",
+              wait_id: waitID,
+              session_id: sessionID,
+              admitted_seq: ("admittedSeq" in result ? result.admittedSeq : undefined) ?? currentInput?.admitted_seq,
+              message_id: ("messageID" in result ? result.messageID : undefined) ?? currentInput?.id,
+              outcome: result.type,
+            })
             return result
           }
-          const exit = yield* execution.join(sessionID)
+          // Registration metadata is diagnostic only; do not turn a failed snapshot into a failed wait.
+          const beforeJoin = yield* waitProjection(sessionID).pipe(
+            Effect.catchCause((cause) =>
+              Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.succeed(undefined),
+            ),
+          )
+          const currentInput = beforeJoin?.native
+            ? (beforeJoin.latestPromoted ??
+              (beforeJoin.pending?.id === beforeJoin.latestInput?.id ? beforeJoin.latestInput : undefined))
+            : undefined
+          const exit = yield* execution.join(sessionID, {
+            waitID,
+            sessionID,
+            admittedSeq: currentInput?.admitted_seq,
+            messageID: currentInput?.id,
+          })
           if (exit === undefined) continue
           const settled = yield* waitProjection(sessionID)
           const admittedSeq = settled.native

@@ -5,6 +5,7 @@ import { LayerNode } from "../effect/layer-node"
 import { Node } from "../effect/app-node"
 import { SessionRunner } from "./runner/index"
 import { SessionSchema } from "./schema"
+import type { WaitRegistration } from "./run-coordinator"
 
 export interface Interface {
   /** Snapshots active execution owned by this process. */
@@ -12,7 +13,10 @@ export interface Interface {
   /** Starts execution while idle or joins the active execution. */
   readonly resume: (sessionID: SessionSchema.ID) => Effect.Effect<void, SessionRunner.RunError>
   /** Joins one active drain without starting execution. */
-  readonly join: (sessionID: SessionSchema.ID) => Effect.Effect<Exit.Exit<void, SessionRunner.RunError> | undefined>
+  readonly join: (
+    sessionID: SessionSchema.ID,
+    registration?: WaitRegistration,
+  ) => Effect.Effect<Exit.Exit<void, SessionRunner.RunError> | undefined>
   /** Registers newly recorded work. Repeated wakeups may coalesce. */
   readonly wake: (sessionID: SessionSchema.ID) => Effect.Effect<void>
   /** Interrupt active work owned by this process. Idle interruption is a no-op. */

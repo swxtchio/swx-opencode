@@ -2,6 +2,13 @@ export * as SessionRunCoordinator from "./run-coordinator"
 
 import { Deferred, Effect, Exit, Fiber, FiberSet, Scope } from "effect"
 
+export type WaitRegistration = {
+  readonly waitID: string
+  readonly sessionID: string
+  readonly admittedSeq?: number
+  readonly messageID?: string
+}
+
 /** Serializes execution for each key while allowing different keys to run concurrently. */
 export interface Coordinator<Key, E> {
   /** Snapshots keys with an execution owned by this coordinator. */
@@ -9,7 +16,7 @@ export interface Coordinator<Key, E> {
   /** Starts execution while idle or joins the active execution. */
   readonly run: (key: Key) => Effect.Effect<void, E>
   /** Joins one active drain without starting execution. */
-  readonly join: (key: Key) => Effect.Effect<Exit.Exit<void, E> | undefined>
+  readonly join: (key: Key, registration?: WaitRegistration) => Effect.Effect<Exit.Exit<void, E> | undefined>
   /** Registers one coalesced follow-up after newly recorded work. */
   readonly wake: (key: Key) => Effect.Effect<void>
   /** Stops active execution and waits for its cleanup. */
@@ -29,6 +36,7 @@ export const make = <Key, E>(options: {
 }): Effect.Effect<Coordinator<Key, E>, never, Scope.Scope> =>
   Effect.gen(function* () {
     const active = new Map<Key, Entry<E>>()
+    const waiters = new Map<Key, Map<string, WaitRegistration>>()
     const fork = yield* FiberSet.makeRuntime<never, void, never>()
 
     const makeEntry = (): Entry<E> => ({
@@ -89,10 +97,42 @@ export const make = <Key, E>(options: {
         return restore(Deferred.await(next.done))
       })
 
-    const join = (key: Key) =>
+    const join = (key: Key, registration?: WaitRegistration) =>
       Effect.suspend(() => {
         const settled = active.get(key)?.settled
-        return settled === undefined ? Effect.succeed(undefined) : Deferred.await(settled)
+        if (settled === undefined) return Effect.succeed(undefined)
+        if (registration === undefined) return Deferred.await(settled)
+
+        const current = waiters.get(key) ?? new Map<string, WaitRegistration>()
+        current.set(registration.waitID, registration)
+        waiters.set(key, current)
+        return Effect.gen(function* () {
+          yield* Effect.logInfo("Session wait registered", {
+            event: "session.wait.registered",
+            wait_id: registration.waitID,
+            session_id: registration.sessionID,
+            admitted_seq: registration.admittedSeq,
+            message_id: registration.messageID,
+            waiter_count: current.size,
+          })
+          const exit = yield* Deferred.await(settled)
+          yield* Effect.logInfo("Session wait join resolved", {
+            event: "session.wait.join_resolved",
+            wait_id: registration.waitID,
+            session_id: registration.sessionID,
+            admitted_seq: registration.admittedSeq,
+            message_id: registration.messageID,
+            outcome: Exit.isSuccess(exit) ? "success" : "failure",
+          })
+          return exit
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              current.delete(registration.waitID)
+              if (current.size === 0) waiters.delete(key)
+            }),
+          ),
+        )
       })
 
     const wake = (key: Key) =>
