@@ -4,11 +4,13 @@
 import { describe, expect } from "bun:test"
 import { constants } from "node:fs"
 import { open } from "node:fs/promises"
+import { Database } from "bun:sqlite"
 import path from "node:path"
 import { Duration, Effect, Schedule } from "effect"
 import { HttpClient, HttpClientRequest } from "effect/unstable/http"
-import { json, writeReceiver } from "../../lib/ask-receiver"
+import { json, watchEvents, writeReceiver } from "../../lib/ask-receiver"
 import { cliIt, deadline, testModelID } from "../../lib/cli-process"
+import { testProviderConfig } from "../../lib/test-provider"
 
 const questions = [
   {
@@ -61,6 +63,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
         const listed = yield* json(HttpClientRequest.get(`${server.url}/question`), home)
         expect(listed.body.map((item: { id: string }) => item.id)).toEqual([emitted.id])
         expect(yield* llm.calls).toBe(1)
+        const events = yield* watchEvents(server.url, home)
 
         // The receiver answers from the payload alone: two selections, then custom text.
         const answers = [
@@ -82,6 +85,11 @@ describe("opencode serve --questions emit (subprocess)", () => {
           recovered: false,
         })
 
+        // An attached human's prompt is cleared by the same event a human reply publishes.
+        const replied = yield* events.until(
+          (event) => event.type === "question.replied" && event.properties.requestID === emitted.id,
+        )
+        expect(replied.properties).toMatchObject({ sessionID, answers })
         yield* llm.wait(2)
         const part = yield* toolPart(server.url, home, sessionID, emitted.origin.callID, "completed")
         expect(part.state.metadata.answers).toEqual(answers)
@@ -198,6 +206,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
         const second = yield* opencode.serve({ extraArgs, env })
         const listed = yield* json(HttpClientRequest.get(`${second.url}/question`), home)
         expect(listed.body.map((item: { id: string }) => item.id)).toEqual([emitted.id])
+        const events = yield* watchEvents(second.url, home)
 
         const settled = yield* json(
           HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
@@ -214,6 +223,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
         })
         const part = yield* toolPart(second.url, home, sessionID, emitted.origin.callID, "completed")
         expect(part.state.output).toContain(`"What should the banner say?"="Welcome back"`)
+        yield* events.until((event) => event.type === "question.replied" && event.properties.requestID === emitted.id)
         yield* llm.wait(2)
         expect(JSON.stringify((yield* llm.inputs)[1])).toContain("Welcome back")
         yield* assistantText(second.url, home, sessionID, "continued after restart")
@@ -241,9 +251,170 @@ describe("opencode serve --questions emit (subprocess)", () => {
       }),
     120_000,
   )
+
+  cliIt.live(
+    "an answer that reaches another live server on the same database is refused and settles nothing",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const env = { OPENCODE_DB: path.join(home, "shared.db") }
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        const extraArgs = ["--questions", "emit", "--questions-command", receiver.path]
+        yield* llm.tool("question", { questions: [questions[1]] })
+        yield* llm.text("done")
+        const owner = yield* opencode.serve({ extraArgs, env })
+        const other = yield* opencode.serve({ extraArgs, env })
+        const sessionID = yield* startTurn(owner.url, home)
+        const [emitted] = yield* receiver.read(1)
+
+        const refused = yield* json(
+          HttpClientRequest.post(`${other.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Hello"]] }),
+          ),
+          home,
+        )
+        expect(refused.status).toBe(503)
+        expect(refused.body).toMatchObject({
+          _tag: "AskUnavailableError",
+          requestID: emitted.id,
+          reason: "owned-by-live-process",
+        })
+
+        const settled = yield* json(
+          HttpClientRequest.post(`${owner.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Hello"]] }),
+          ),
+          home,
+        )
+        expect(settled.body).toMatchObject({ disposition: "settled", recovered: false })
+        yield* toolPart(owner.url, home, sessionID, emitted.origin.callID, "completed")
+      }),
+    90_000,
+  )
+
+  cliIt.live(
+    "an answer whose ledger cannot be read is an explicit failure, and the ask stays answerable",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const file = path.join(home, "store.db")
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        yield* llm.tool("question", { questions: [questions[1]] })
+        yield* llm.text("done")
+        const server = yield* opencode.serve({
+          extraArgs: ["--questions", "emit", "--questions-command", receiver.path],
+          env: { OPENCODE_DB: file },
+        })
+        const sessionID = yield* startTurn(server.url, home)
+        const [emitted] = yield* receiver.read(1)
+        const answer = json(
+          HttpClientRequest.post(`${server.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Hello"]] }),
+          ),
+          home,
+        )
+
+        const sqlite = new Database(file)
+        sqlite.run("ALTER TABLE session_ask RENAME TO session_ask_unavailable")
+        const failed = yield* answer
+        sqlite.run("ALTER TABLE session_ask_unavailable RENAME TO session_ask")
+        sqlite.close()
+        expect(failed.status).toBe(503)
+        expect(failed.body).toMatchObject({
+          _tag: "AskUnavailableError",
+          requestID: emitted.id,
+          reason: "store-unavailable",
+        })
+
+        expect((yield* answer).body).toMatchObject({ disposition: "settled" })
+        yield* toolPart(server.url, home, sessionID, emitted.origin.callID, "completed")
+      }),
+    90_000,
+  )
+
+  cliIt.live(
+    "a permission granted after a restart reports the call as not run and lets the model retry it",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const marker = path.join(home, "granted-marker")
+        const env = {
+          OPENCODE_DB: path.join(home, "permission.db"),
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({ ...testProviderConfig(llm.url), permission: { bash: "ask" } }),
+        }
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        const extraArgs = ["--questions", "emit", "--questions-command", receiver.path]
+        yield* llm.tool("bash", { command: `touch ${marker}`, description: "Create a marker" })
+        yield* llm.text("will retry")
+
+        const first = yield* opencode.serve({ extraArgs, env })
+        const sessionID = yield* startTurn(first.url, home)
+        const [emitted] = yield* receiver.read(1)
+        expect(emitted.kind).toBe("permission")
+        first.kill()
+        yield* Effect.promise(() => first.exited)
+
+        const second = yield* opencode.serve({ extraArgs, env })
+        const settled = yield* json(
+          HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ reply: "once" }),
+          ),
+          home,
+        )
+        expect(settled.body).toMatchObject({
+          disposition: "settled",
+          decision: { type: "replied", reply: "once" },
+          recovered: true,
+        })
+        const part = yield* toolPart(second.url, home, sessionID, emitted.origin.callID, "error")
+        expect(part.state.error).toContain("did not run")
+        yield* llm.wait(2)
+        expect(JSON.stringify((yield* llm.inputs)[1])).toContain("Call the tool again to perform it")
+        expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+      }),
+    120_000,
+  )
+
+  cliIt.live(
+    "a plan accepted after a restart switches to the build agent once",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const env = { OPENCODE_DB: path.join(home, "plan.db"), OPENCODE_EXPERIMENTAL_PLAN_MODE: "1" }
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        const extraArgs = ["--questions", "emit", "--questions-command", receiver.path]
+        yield* llm.tool("plan_exit", {})
+        yield* llm.text("building")
+
+        const first = yield* opencode.serve({ extraArgs, env })
+        const sessionID = yield* startTurn(first.url, home, "plan")
+        const [emitted] = yield* receiver.read(1)
+        expect(emitted.origin.tool).toBe("plan_exit")
+        first.kill()
+        yield* Effect.promise(() => first.exited)
+
+        const second = yield* opencode.serve({ extraArgs, env })
+        const answer = json(
+          HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Yes"]] }),
+          ),
+          home,
+        )
+        expect((yield* answer).body).toMatchObject({ disposition: "settled", recovered: true })
+        const part = yield* toolPart(second.url, home, sessionID, emitted.origin.callID, "completed")
+        expect(part.state.title).toBe("Switching to build agent")
+        yield* llm.wait(2)
+        expect(JSON.stringify((yield* llm.inputs)[1])).toContain("has been approved, you can now edit files")
+        yield* assistantText(second.url, home, sessionID, "building")
+
+        expect((yield* answer).body).toMatchObject({ disposition: "duplicate" })
+        const builds = (yield* messages(second.url, home, sessionID)).filter(
+          (message) => message.info.role === "user" && message.info.agent === "build",
+        )
+        expect(builds).toHaveLength(1)
+        expect(yield* llm.calls).toBe(2)
+      }),
+    120_000,
+  )
 })
 
-const startTurn = Effect.fn("startTurn")(function* (url: string, directory: string) {
+const startTurn = Effect.fn("startTurn")(function* (url: string, directory: string, agent?: string) {
   const created = yield* json(
     HttpClientRequest.post(`${url}/session`).pipe(HttpClientRequest.bodyJsonUnsafe({ title: "supervised" })),
     directory,
@@ -252,7 +423,11 @@ const startTurn = Effect.fn("startTurn")(function* (url: string, directory: stri
   const [providerID, modelID] = testModelID.split("/")
   const sent = yield* json(
     HttpClientRequest.post(`${url}/session/${sessionID}/prompt_async`).pipe(
-      HttpClientRequest.bodyJsonUnsafe({ model: { providerID, modelID }, parts: [{ type: "text", text: "ask me" }] }),
+      HttpClientRequest.bodyJsonUnsafe({
+        model: { providerID, modelID },
+        ...(agent ? { agent } : {}),
+        parts: [{ type: "text", text: "ask me" }],
+      }),
     ),
     directory,
   )

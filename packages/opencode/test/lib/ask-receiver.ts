@@ -46,3 +46,38 @@ export const json = Effect.fn("json")(function* (request: HttpClientRequest.Http
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return { status: response.status, body: (yield* response.json) as any }
 })
+
+// Subscribes to a server's instance event stream, so a test can wait for an event an answer publishes.
+export const watchEvents = Effect.fn("watchEvents")(function* (url: string, directory: string) {
+  const controller = new AbortController()
+  yield* Effect.addFinalizer(() => Effect.sync(() => controller.abort()))
+  const response = yield* Effect.promise(() =>
+    fetch(`${url}/event?directory=${encodeURIComponent(directory)}`, { signal: controller.signal }),
+  )
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const seen: any[] = []
+  const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader()
+  void (async () => {
+    let buffer = ""
+    for (;;) {
+      const next = await reader.read().catch(() => ({ done: true as const, value: undefined }))
+      if (next.done) return
+      buffer += next.value
+      const lines = buffer.split("\n")
+      buffer = lines.pop() ?? ""
+      for (const line of lines) if (line.startsWith("data:")) seen.push(JSON.parse(line.slice(5)))
+    }
+  })()
+  return {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    until: (predicate: (event: any) => boolean) =>
+      Effect.sync(() => seen.find(predicate)).pipe(
+        Effect.filterOrFail(
+          (event) => event !== undefined,
+          () => new Error("event not published"),
+        ),
+        Effect.retry(Schedule.spaced("50 millis")),
+        Effect.timeout(Duration.millis(deadline(20_000))),
+      ),
+  }
+})
