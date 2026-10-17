@@ -129,7 +129,10 @@ describe("DatabaseMigration", () => {
       }
     })
 
-    const open = () => Effect.runPromise(inspect.pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped))
+    const open = () =>
+      Effect.runPromise(
+        inspect.pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped),
+      )
 
     expect(await open()).toEqual({ auto_vacuum: { auto_vacuum: 2 }, session: { name: "session" } })
     expect(await open()).toEqual({ auto_vacuum: { auto_vacuum: 2 }, session: { name: "session" } })
@@ -187,7 +190,10 @@ describe("DatabaseMigration", () => {
         ),
       }
     })
-    const open = () => Effect.runPromise(inspect.pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped))
+    const open = () =>
+      Effect.runPromise(
+        inspect.pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped),
+      )
     const after = {
       auto_vacuum: { auto_vacuum: 1 },
       journal_mode_seen: { mode: "wal" },
