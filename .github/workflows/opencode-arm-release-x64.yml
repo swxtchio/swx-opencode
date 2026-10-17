@@ -73,7 +73,6 @@ jobs:
           test -z "$(git status --porcelain)"
 
       - name: Package and attest extracted x64 archive
-        working-directory: source
         env:
           OPENCODE_BUILD_DIST: ${{ runner.temp }}/opencode-dist
         run: |
