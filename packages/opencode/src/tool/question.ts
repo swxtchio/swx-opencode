@@ -25,20 +25,25 @@ export const QuestionTool = Tool.define<typeof Parameters, Metadata, Question.Se
             sessionID: ctx.sessionID,
             questions: params.questions,
             tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
+            producer: "question",
           })
-
-          const formatted = params.questions
-            .map((q, i) => `"${q.question}"="${answers[i]?.length ? answers[i].join(", ") : "Unanswered"}"`)
-            .join(", ")
-
-          return {
-            title: `Asked ${params.questions.length} question${params.questions.length > 1 ? "s" : ""}`,
-            output: `User has answered your questions: ${formatted}. You can now continue with the user's answers in mind.`,
-            metadata: {
-              answers,
-            },
-          }
+          return answered(params.questions, answers)
         }).pipe(Effect.orDie),
     }
   }),
 )
+
+// The tool's result for its answers; a call recovered after a restart reports the same.
+export function answered(questions: ReadonlyArray<{ question: string }>, answers: ReadonlyArray<Question.Answer>) {
+  const formatted = questions
+    .map((q, i) => `"${q.question}"="${answers[i]?.length ? answers[i].join(", ") : "Unanswered"}"`)
+    .join(", ")
+
+  return {
+    title: `Asked ${questions.length} question${questions.length > 1 ? "s" : ""}`,
+    output: `User has answered your questions: ${formatted}. You can now continue with the user's answers in mind.`,
+    metadata: {
+      answers,
+    },
+  }
+}

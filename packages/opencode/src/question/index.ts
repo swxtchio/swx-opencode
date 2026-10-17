@@ -5,6 +5,9 @@ import { SessionID } from "@/session/schema"
 import { QuestionID } from "./schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { QuestionV1 } from "@opencode-ai/schema/question-v1"
+import type { SessionAsk } from "@opencode-ai/schema/session-ask"
+import { AskEmit } from "@/ask/emit"
+import { AskLedger } from "@/ask/ledger"
 
 export const Option = QuestionV1.Option
 export type Option = typeof Option.Type
@@ -50,12 +53,16 @@ export interface Interface {
     sessionID: SessionID
     questions: ReadonlyArray<Info>
     tool?: Tool
+    // The producing tool's name, reported to a supervisor and used to recover the call after a restart.
+    producer?: string
   }) => Effect.Effect<ReadonlyArray<Answer>, RejectedError>
   readonly reply: (input: {
     requestID: QuestionID
     answers: ReadonlyArray<Answer>
-  }) => Effect.Effect<void, NotFoundError>
-  readonly reject: (requestID: QuestionID) => Effect.Effect<void, NotFoundError>
+  }) => Effect.Effect<AskLedger.Resolution, NotFoundError | AskLedger.UnavailableError>
+  readonly reject: (
+    requestID: QuestionID,
+  ) => Effect.Effect<AskLedger.Resolution, NotFoundError | AskLedger.UnavailableError>
   readonly list: () => Effect.Effect<ReadonlyArray<Request>>
 }
 
@@ -65,6 +72,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
+    const ledger = yield* AskLedger.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Question.state")(function* () {
         const state = {
@@ -74,6 +82,7 @@ const layer = Layer.effect(
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
             for (const item of state.pending.values()) {
+              yield* ledger.cancel(item.info.id)
               yield* Deferred.fail(item.deferred, new RejectedError())
             }
             state.pending.clear()
@@ -88,6 +97,7 @@ const layer = Layer.effect(
       sessionID: SessionID
       questions: ReadonlyArray<Info>
       tool?: Tool
+      producer?: string
     }) {
       const pending = (yield* InstanceState.get(state)).pending
       const id = QuestionID.ascending()
@@ -100,62 +110,106 @@ const layer = Layer.effect(
         questions: input.questions,
         tool: input.tool,
       }
+      // Waiting before the ask is recorded or published, so no resolver can find it without its waiter.
       pending.set(id, { info, deferred })
-      yield* events.publish(Event.Asked, info)
-
-      return yield* Effect.ensuring(
-        Deferred.await(deferred),
-        Effect.sync(() => {
-          pending.delete(id)
-        }),
+      return yield* Effect.gen(function* () {
+        yield* ledger.admit({ id, sessionID: input.sessionID, kind: "question", tool: input.producer, request: info })
+        yield* events.publish(Event.Asked, info)
+        // A turn aborted while waiting ends the ask, so no later answer is applied to it.
+        return yield* Deferred.await(deferred).pipe(Effect.onInterrupt(() => ledger.cancel(id)))
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            pending.delete(id)
+          }),
+        ),
       )
     })
+
+    const settle = Effect.fn("Question.settle")(function* (
+      requestID: QuestionID,
+      decision: typeof SessionAsk.Answered.Type | typeof SessionAsk.Rejected.Type,
+    ) {
+      const pending = (yield* InstanceState.get(state)).pending
+      const deliver = Effect.fn("Question.deliver")(function* (existing: PendingEntry) {
+        pending.delete(requestID)
+        yield* Effect.logInfo(decision.type, { requestID })
+        yield* publish(existing.info.sessionID, requestID, decision)
+        if (decision.type === "answered") yield* Deferred.succeed(existing.deferred, decision.answers)
+        if (decision.type === "rejected") yield* Deferred.fail(existing.deferred, new RejectedError())
+      })
+      const unknown = Effect.fn("Question.unknown")(function* () {
+        yield* Effect.logWarning("answer for unknown request", { requestID })
+        return yield* new NotFoundError({ requestID })
+      })
+
+      if (!AskEmit.current()) {
+        const existing = pending.get(requestID)
+        if (!existing) return yield* unknown()
+        yield* deliver(existing)
+        return {
+          requestID,
+          sessionID: existing.info.sessionID,
+          disposition: "settled",
+          decision,
+          recovered: false,
+        } satisfies AskLedger.Resolution
+      }
+
+      const outcome = yield* ledger.decide({ id: requestID, decision, live: () => pending.has(requestID) })
+      if (outcome.type === "unknown") return yield* unknown()
+      if (outcome.type === "duplicate") return outcome.resolution
+      const existing = pending.get(requestID)
+      if (existing) {
+        yield* deliver(existing)
+        return outcome.resolution
+      }
+      // A live ask that stopped waiting after this answer won has nothing left to deliver to.
+      if (!outcome.resolution.recover) return outcome.resolution
+      yield* Effect.logInfo(decision.type, { requestID, recovered: true })
+      yield* publish(outcome.resolution.sessionID, requestID, decision)
+      return outcome.resolution
+    })
+
+    const publish = (
+      sessionID: SessionID,
+      requestID: QuestionID,
+      decision: typeof SessionAsk.Answered.Type | typeof SessionAsk.Rejected.Type,
+    ) =>
+      decision.type === "answered"
+        ? events.publish(Event.Replied, { sessionID, requestID, answers: decision.answers.map((a) => [...a]) })
+        : events.publish(Event.Rejected, { sessionID, requestID })
 
     const reply = Effect.fn("Question.reply")(function* (input: {
       requestID: QuestionID
       answers: ReadonlyArray<Answer>
     }) {
-      const pending = (yield* InstanceState.get(state)).pending
-      const existing = pending.get(input.requestID)
-      if (!existing) {
-        yield* Effect.logWarning("reply for unknown request", { requestID: input.requestID })
-        return yield* new NotFoundError({ requestID: input.requestID })
-      }
-      pending.delete(input.requestID)
-      yield* Effect.logInfo("replied", { requestID: input.requestID, answers: input.answers })
-      yield* events.publish(Event.Replied, {
-        sessionID: existing.info.sessionID,
-        requestID: existing.info.id,
-        answers: input.answers.map((a) => [...a]),
-      })
-      yield* Deferred.succeed(existing.deferred, input.answers)
+      return yield* settle(input.requestID, { type: "answered", answers: input.answers.map((a) => [...a]) })
     })
 
     const reject = Effect.fn("Question.reject")(function* (requestID: QuestionID) {
-      const pending = (yield* InstanceState.get(state)).pending
-      const existing = pending.get(requestID)
-      if (!existing) {
-        yield* Effect.logWarning("reject for unknown request", { requestID })
-        return yield* new NotFoundError({ requestID })
-      }
-      pending.delete(requestID)
-      yield* Effect.logInfo("rejected", { requestID })
-      yield* events.publish(Event.Rejected, {
-        sessionID: existing.info.sessionID,
-        requestID: existing.info.id,
-      })
-      yield* Deferred.fail(existing.deferred, new RejectedError())
+      return yield* settle(requestID, { type: "rejected" })
     })
 
     const list = Effect.fn("Question.list")(function* () {
       const pending = (yield* InstanceState.get(state)).pending
-      return Array.from(pending.values(), (x) => x.info)
+      const live = Array.from(pending.values(), (x) => x.info)
+      if (!AskEmit.current()) return live
+      // Under emission the ledger is the registry, so an ask a restarted server still owes an answer stays listed.
+      return yield* ledger.pending("question").pipe(
+        Effect.map((rows) => rows.map((row) => row.request as Request)),
+        Effect.catchTag("SessionAsk.UnavailableError", (error) =>
+          Effect.logWarning("ask ledger unreadable; listing live questions", { error: error.message }).pipe(
+            Effect.as(live),
+          ),
+        ),
+      )
     })
 
     return Service.of({ ask, reply, reject, list })
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
+export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node, AskLedger.node] })
 
 export * as Question from "."

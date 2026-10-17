@@ -2941,7 +2941,11 @@ const custodyTurn = Effect.fn("test.custodyTurn")(function* (input: {
     ),
     Effect.provideService(
       Permission.Service,
-      Permission.Service.of({ ask: () => Effect.void, reply: () => Effect.void, list: () => Effect.succeed([]) }),
+      Permission.Service.of({
+        ask: () => Effect.void,
+        reply: () => Effect.die(new Error("unexpected permission reply")),
+        list: () => Effect.succeed([]),
+      }),
     ),
     Effect.provideService(
       MCP.Service,

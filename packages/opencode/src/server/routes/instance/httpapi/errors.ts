@@ -182,6 +182,18 @@ export class PermissionNotFoundError extends Schema.TaggedErrorClass<PermissionN
   { httpApiStatus: 404 },
 ) {}
 
+// An answer whose request state could not be established, or whose request is waited on by another live process
+// (swxtchio/swx-opencode#286). Nothing was settled.
+export class AskUnavailableError extends Schema.TaggedErrorClass<AskUnavailableError>()(
+  "AskUnavailableError",
+  {
+    requestID: Schema.String,
+    reason: Schema.Literals(["store-unavailable", "owned-by-live-process", "waiter-lost"]),
+    message: Schema.String,
+  },
+  { httpApiStatus: 503 },
+) {}
+
 export class McpServerNotFoundError extends Schema.TaggedErrorClass<McpServerNotFoundError>()(
   "McpServerNotFoundError",
   {
