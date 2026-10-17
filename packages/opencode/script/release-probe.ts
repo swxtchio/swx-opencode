@@ -205,6 +205,11 @@ delete opencodeEnvironment.BUN_OPTIONS
 delete opencodeEnvironment.RELEASE_PROBE_WAIT_START_FILE
 delete opencodeEnvironment.RELEASE_PROBE_WAIT_RELEASE_FILE
 delete opencodeEnvironment.RELEASE_PROBE_WAIT_SUPPRESS_SCENARIO
+delete opencodeEnvironment.RELEASE_PROBE_WAIT_ATTACK
+delete opencodeEnvironment.RELEASE_PROBE_SOCKET_ONLY_BINARY
+delete opencodeEnvironment.RELEASE_PROBE_BINARY
+delete opencodeEnvironment.RELEASE_PROBE_ARCH
+delete opencodeEnvironment.RELEASE_PROBE_RED_EVIDENCE_DIR
 delete opencodeEnvironment.RELEASE_PROBE_SERVER_TRACE
 
 let serverUrl = ""
