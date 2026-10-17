@@ -1038,6 +1038,19 @@ export const RunCommand = effectCmd({
         return await execute(sdk)
       }
 
+      if (questions && "command" in questions) {
+        // The emitted asks name this listener as the place to answer them, so the run drives its Session through the
+        // same listener: one service graph holds both the waiting tool and the route that answers it.
+        const { Server } = await import("@/server/server")
+        const { AskEmit } = await import("@/ask/emit")
+        const server = await Server.listen({ hostname: "127.0.0.1", port: args.port ?? 0 })
+        AskEmit.configure({ command: questions.command, server: server.url.origin })
+        UI.println(UI.Style.TEXT_INFO_BOLD + "~  " + `questions are emitted; answer them on ${server.url.origin}`)
+        return await execute(
+          createOpencodeClient({ baseUrl: server.url.origin, directory, headers: ServerAuth.headers() }),
+        )
+      }
+
       const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
         const { Server } = await import("@/server/server")
         const request = new Request(input, init)
@@ -1051,18 +1064,6 @@ export const RunCommand = effectCmd({
         fetch: fetchFn,
         directory,
       })
-      if (questions && "command" in questions) {
-        // The emitted asks name this listener as the place to answer them, so the run drives its Session through the
-        // same listener: one service graph holds both the waiting tool and the route that answers it.
-        const { Server } = await import("@/server/server")
-        const { AskEmit } = await import("@/ask/emit")
-        const server = await Server.listen({ hostname: "127.0.0.1", port: args.port ?? 0 })
-        AskEmit.configure({ command: questions.command, server: server.url.origin })
-        UI.println(UI.Style.TEXT_INFO_BOLD + "~  " + `questions are emitted; answer them on ${server.url.origin}`)
-        return await execute(
-          createOpencodeClient({ baseUrl: server.url.origin, directory, headers: ServerAuth.headers() }),
-        )
-      }
       await execute(sdk)
     })
   }),
