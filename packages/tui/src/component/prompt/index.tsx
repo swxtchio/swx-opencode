@@ -328,8 +328,14 @@ export function Prompt(props: PromptProps) {
   createEffect(
     on(
       () => props.sessionID,
+      () => history.reset(),
+    ),
+  )
+
+  createEffect(
+    on(
+      () => props.sessionID,
       () => {
-        history.reset()
         setStore("placeholder", randomIndex(list().length))
       },
       { defer: true },

@@ -19,6 +19,7 @@ import { TuiEvent } from "@opencode-ai/schema/tui-event"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Global } from "@opencode-ai/core/global"
 import path from "node:path"
+import { readdir } from "node:fs/promises"
 import { tmpdir } from "../../fixture/fixture"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
@@ -592,6 +593,102 @@ test("recall and search isolate sessions across switching and reopening shared c
     }
   }
 }, 30_000)
+
+test("a newly mounted composer starts at its session's newest history after another session recalled", async () => {
+  await using state = await tmpdir()
+  const a = "ses_mount_a"
+  const b = "ses_mount_b"
+  const first = "B first mount token"
+  const newest = "B newest mount token"
+  const other = "A mount token"
+  const app = await startSession({
+    state: state.path,
+    sessionID: b,
+    queue: [],
+    messagesBySession: {
+      [a]: [{ ...transcript, info: { ...transcript.info, sessionID: a } }],
+      [b]: [{ ...transcript, info: { ...transcript.info, sessionID: b } }],
+    },
+  })
+  try {
+    await until(async () => (await screen(app)).join("\n").includes("already in the transcript"), "B mounted")
+    for (const [index, text] of [first, newest].entries()) {
+      await app.renderer.mockInput.typeText(text)
+      app.renderer.mockInput.pressEnter()
+      await until(() => app.prompts.length === index + 1, "B's history producer")
+      app.prompts[index]!.answer(json(transcript))
+      await until(async () => !(await screen(app)).join("\n").includes("pending"), "B's completed send")
+    }
+    app.selectSession(a)
+    await until(async () => (await screen(app)).join("\n").includes(a), "A mounted")
+    await app.renderer.mockInput.typeText(other)
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 3, "A's history producer")
+    app.prompts[2]!.answer(json(transcript))
+    await until(async () => !(await screen(app)).join("\n").includes("pending"), "A's completed send")
+    app.renderer.mockInput.pressArrow("up")
+    await app.renderer.renderOnce()
+    expect(composer(app).plainText).toBe(other)
+
+    const previous = composer(app)
+    app.selectSession(b)
+    await until(async () => (await screen(app)).join("\n").includes(b), "B remounted")
+    await until(
+      () =>
+        app.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable &&
+        app.renderer.renderer.currentFocusedRenderable !== previous,
+      "the newly mounted B composer",
+    )
+    composer(app).gotoBufferEnd()
+    app.renderer.mockInput.pressKey("u", { ctrl: true })
+    await app.renderer.renderOnce()
+    expect(composer(app).plainText).toBe("")
+    app.renderer.mockInput.pressArrow("up")
+    await app.renderer.renderOnce()
+    expect(composer(app).plainText).toBe(newest)
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
+    await until(
+      async () =>
+        (await Bun.file(path.join(state.path, "model.json")).exists()) &&
+        !(await readdir(state.path)).some((name) => name.endsWith(".tmp")),
+      "the completed model-state writes before disposing shared state",
+    )
+  }
+}, 20_000)
+
+test("retained search reconstructs saved paste ranges without replacing literal placeholders or dollar tokens", async () => {
+  const literal = "漢字 literal [Pasted ~3 lines] "
+  const first = "retained-range-token $$ $& $` $'\noriginal second line\noriginal third line"
+  const expected = literal + first + " "
+  const app = await startSession({ queue: [] })
+  try {
+    await until(
+      async () => (await screen(app)).join("\n").includes("already in the transcript"),
+      "the producer session",
+    )
+    await app.renderer.mockInput.typeText(literal)
+    await app.renderer.mockInput.pasteBracketedText(first)
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the range-bearing composer send")
+    expect(app.prompts[0]!.parts.at(-1)?.text).toBe(expected)
+    app.prompts[0]!.answer(json(transcript))
+    await until(async () => !(await screen(app)).join("\n").includes("pending"), "the settled send")
+    expect((await screen(app)).join("\n")).not.toContain("retained-range-token")
+    expect(await searchHistory(app, "retained-range-token")).not.toContain("No results found")
+    app.renderer.mockInput.pressEnter()
+    await app.renderer.renderOnce()
+    expect(composer(app).plainText).toBe(expected)
+    expect(app.prompts).toHaveLength(1)
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 2, "the explicit later send")
+    expect(app.prompts[1]!.parts.at(-1)?.text).toBe(expected)
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
+  }
+}, 20_000)
 
 test("history from a new-session submission is owned by the created session", async () => {
   await using state = await tmpdir()

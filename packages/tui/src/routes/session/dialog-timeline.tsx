@@ -6,7 +6,7 @@ import type { Config, Message, Part, TextPart } from "@opencode-ai/sdk/v2"
 import { Locale } from "../../util/locale"
 import { useDialog } from "../../ui/dialog"
 import type { PromptHistoryEntry } from "../../prompt/history"
-import { expandPastedTextPlaceholders } from "../../prompt/part"
+import { expandTrackedPastedText } from "../../prompt/part"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { classify } from "@opencode-ai/schema/session-machine-message"
 
@@ -107,7 +107,14 @@ export function timelineOptions(input: {
   }
   for (const entry of input.history ?? []) {
     if (entry.sessionID !== input.sessionID || entry.origin !== "tui-composer" || entry.machineAppended) continue
-    const text = expandPastedTextPlaceholders(entry.input, entry.parts)
+    const text = expandTrackedPastedText(
+      entry.input,
+      entry.parts.flatMap((part) =>
+        part.type === "text" && part.source?.text
+          ? [{ start: part.source.text.start, end: part.source.text.end, text: part.text }]
+          : [],
+      ),
+    )
     if (!text.trim() || classify(text, input.markers)) continue
     if (
       entry.parts.some((part) => part.type === "text" && part.metadata?.[SessionPromptQueue.TuiPromptAppendMetadataKey])
