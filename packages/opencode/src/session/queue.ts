@@ -4061,7 +4061,11 @@ function directPathTarget(target: string, paths: readonly (readonly string[])[])
 function targetIdentity(target: string) {
   const words = targetWords(target).map((word) => ({
     word,
-    generic: [...targetWordCandidates(word)].some((candidate) => genericTargetWords.has(candidate)),
+    generic: genericTargetWords.has(
+      !word.includes(".") && word.length > 3 && word.endsWith("s") && !word.endsWith("ss") && !word.endsWith("us")
+        ? word.slice(0, -1)
+        : word,
+    ),
   }))
   const nonGeneric = words.filter((item) => !item.generic).map((item) => item.word)
   return {
@@ -4118,7 +4122,7 @@ function targetWordCandidates(word: string) {
   if (targetEsPluralWordPairs.has(word)) candidates.add(targetEsPluralWordPairs.get(word)!)
   if (word.length > 3 && word.endsWith("es")) {
     candidates.add(word.slice(0, -1))
-    candidates.add(word.slice(0, -2))
+    if (/(?:s|x|z|ch|sh)es$/.test(word)) candidates.add(word.slice(0, -2))
     return candidates
   }
   if (word.length > 3 && word.endsWith("s") && !word.endsWith("ss") && !word.endsWith("us"))

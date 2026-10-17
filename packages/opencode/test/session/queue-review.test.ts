@@ -558,7 +558,7 @@ const pluralTargetPairs = [
   pluralTargetPair("API responses/response", "fix the api responses", "fix the api response"),
   pluralTargetPair("test cases/case", "fix the test cases", "fix the test case"),
   pluralTargetPair("releases/release notes", "fix releases notes", "fix release notes"),
-  pluralTargetPair("uses/use", "fix auth uses", "fix auth use"),
+  pluralTargetPair("uses/use list", "fix the uses list", "fix the use list"),
   pluralTargetPair("user licenses/license", "fix the user licenses", "fix the user license"),
   pluralTargetPair("build phases/phase", "fix the build phases", "fix the build phase"),
   pluralTargetPair("echo/echoes", "fix echo", "fix echoes"),
@@ -568,8 +568,15 @@ const pluralTargetPairs = [
   pluralTargetPair("boxes/box", "fix shipping boxes", "fix shipping box"),
   pluralTargetPair("churches/church", "fix churches", "fix church"),
   pluralTargetPair("dishes/dish", "fix dishes", "fix dish"),
+  pluralTargetPair("addresses/address", "fix route addresses", "fix route address"),
+  pluralTargetPair("statuses/status", "fix statuses", "fix status"),
   pluralTargetPair("aliases/alias", "fix dns aliases", "fix dns alias"),
   pluralTargetPair("canvases/canvas", "fix canvases", "fix canvas"),
+]
+
+const pluralTargetSeparationControls = [
+  { title: "states and stats", first: "fix states", second: "fix stats" },
+  { title: "themes and them", first: "fix auth themes", second: "fix auth them" },
 ]
 
 const genericSubjectControls = [
@@ -1573,6 +1580,49 @@ it.instance("request admission merges only the reviewed plural target pairs", ()
     }
   }),
   30_000,
+)
+
+it.instance("consolidation keeps non-sibilant plural targets distinct", () =>
+  Effect.gen(function* () {
+    const actual: string[][] = []
+    const expected: string[][] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of pluralTargetSeparationControls) {
+        const items = yield* consolidateAdmitted(`${delivery} ${pair.title}`, [
+          { delivery, text: pair.first },
+          { delivery, text: pair.second },
+        ])
+        actual.push(items.map(text))
+        expected.push([pair.first, pair.second])
+      }
+    }
+    expect(actual).toEqual(expected)
+  }),
+)
+
+it.instance("request admission keeps non-sibilant plural targets distinct", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const actual: string[][] = []
+    const expected: string[][] = []
+    const receipts: string[][] = []
+    for (const delivery of ["steer", "queue"] as const) {
+      for (const pair of pluralTargetSeparationControls) {
+        const session = yield* sessions.create({ title: `${delivery} ${pair.title}` })
+        yield* request(session.id, delivery, "plural-control-a", pair.first)
+        yield* request(session.id, delivery, "plural-control-b", pair.second)
+        actual.push((yield* queue.list(session.id)).map(text))
+        expected.push([pair.first, pair.second])
+        receipts.push([
+          Option.getOrThrow(yield* queue.receipt(session.id, "plural-control-a")).state,
+          Option.getOrThrow(yield* queue.receipt(session.id, "plural-control-b")).state,
+        ])
+      }
+    }
+    expect(actual).toEqual(expected)
+    expect(receipts).toEqual(expected.map(() => ["pending", "pending"]))
+  }),
 )
 
 it.instance("consolidation keeps different generic subjects separate", () =>
