@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "f7b94b68-077f-43ec-862c-af9717d0cef6",
+  "id": "729f98b1-8be8-4882-96ae-9b8a7d560a2a",
   "prevIds": [
-    "5048c540-67ab-4585-90e3-6cd9948d0114"
+    "f7b94b68-077f-43ec-862c-af9717d0cef6"
   ],
   "ddl": [
     {
@@ -20,6 +20,10 @@
     },
     {
       "name": "event_writer_process",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_ask",
       "entityType": "tables"
     },
     {
@@ -293,6 +297,116 @@
       "name": "time_registered",
       "entityType": "columns",
       "table": "event_writer_process"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "session_ask"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_ask"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "kind",
+      "entityType": "columns",
+      "table": "session_ask"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "directory",
+      "entityType": "columns",
+      "table": "session_ask"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "tool",
+      "entityType": "columns",
+      "table": "session_ask"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "request",
+      "entityType": "columns",
+      "table": "session_ask"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "writer_id",
+      "entityType": "columns",
+      "table": "session_ask"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "decision",
+      "entityType": "columns",
+      "table": "session_ask"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "recovered",
+      "entityType": "columns",
+      "table": "session_ask"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "session_ask"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_settled",
+      "entityType": "columns",
+      "table": "session_ask"
     },
     {
       "type": "text",
@@ -2000,6 +2114,21 @@
       "onUpdate": "NO ACTION",
       "onDelete": "CASCADE",
       "nameExplicit": false,
+      "name": "fk_session_ask_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "session_ask"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
       "name": "fk_session_prompt_provenance_session_id_session_id_fk",
       "entityType": "fks",
       "table": "session_prompt_provenance"
@@ -2333,6 +2462,15 @@
     },
     {
       "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "session_ask_pk",
+      "table": "session_ask",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
         "message_id"
       ],
       "nameExplicit": false,
@@ -2492,6 +2630,38 @@
       "name": "session_share_pk",
       "table": "session_share",
       "entityType": "pks"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_ask_session_idx",
+      "entityType": "indexes",
+      "table": "session_ask"
+    },
+    {
+      "columns": [
+        {
+          "value": "directory",
+          "isExpression": false
+        },
+        {
+          "value": "time_settled",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_ask_directory_settled_idx",
+      "entityType": "indexes",
+      "table": "session_ask"
     },
     {
       "columns": [

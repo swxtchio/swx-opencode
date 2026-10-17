@@ -2,6 +2,7 @@ export * as EventWriter from "./writer"
 
 import { randomUUID } from "node:crypto"
 import { readFileSync } from "node:fs"
+import { eq } from "drizzle-orm"
 import { Effect } from "effect"
 import type { Database } from "../database/database"
 import { EventAggregateWriterTable, EventWriterProcessTable } from "./writer.sql"
@@ -55,6 +56,31 @@ export function register(db: DatabaseAccess) {
     .onConflictDoNothing()
     .run()
     .pipe(Effect.orDie, Effect.asVoid)
+}
+
+/**
+ * Whether the process registered as `writer` still runs. "unknown" means its record, the platform or a
+ * permission boundary cannot prove it gone, and callers must treat it as alive.
+ */
+export function liveness(db: DatabaseAccess, writer: string) {
+  if (writer === writerID) return Effect.succeed("self" as const)
+  return db
+    .select()
+    .from(EventWriterProcessTable)
+    .where(eq(EventWriterProcessTable.writer_id, writer))
+    .get()
+    .pipe(
+      Effect.orDie,
+      Effect.map((row) => {
+        if (!row?.boot_id || !row.start_ticks) return "unknown" as const
+        const current = readIdentity(row.pid)
+        if (!current) return "gone" as const
+        if (!current.bootID || !current.startTicks) return "unknown" as const
+        return current.bootID === row.boot_id && current.startTicks === row.start_ticks
+          ? ("alive" as const)
+          : ("gone" as const)
+      }),
+    )
 }
 
 /** Records, inside the caller's write transaction, that this process appended to the aggregate. */
