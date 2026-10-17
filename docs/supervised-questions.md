@@ -174,6 +174,9 @@ answer route settles them as usual, now with `recovered: true`:
   the model calls the tool again (an `always` grant is restored, so that retry is not asked again); `reject`
   refuses it as before.
 
+If the Session went on before the answer arrived, for example because it was prompted again after the restart,
+the answer is still recorded (`recovered: true`), but the old call is left as it is and nothing is continued.
+
 A refusal ends the turn as it would have live: a question rejection, a plan `No`, or a permission `reject` without a
 message leaves the Session idle unless `experimental.continue_loop_on_deny` is set. Nothing else is replayed: no
 provider request or other tool call is retried. A repeated answer after a restart is a `duplicate` as usual.

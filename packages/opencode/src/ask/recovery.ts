@@ -51,9 +51,14 @@ const layer = Layer.effect(
         return
       }
       const sessionID = row.session_id
-      const part = yield* findPart(sessionID, origin.messageID, origin.callID)
+      const found = yield* findPart(sessionID, origin.messageID, origin.callID)
+      const part = found.part
       if (!part || (row.kind === "question" && part.tool !== row.tool)) {
         yield* Effect.logWarning("recovered ask's tool call is missing", { id: row.id, callID: origin.callID })
+        return
+      }
+      if (!found.newest) {
+        yield* Effect.logWarning("recovered ask's Session went on without it", { id: row.id })
         return
       }
       // Checked before the outcome, which for an accepted plan is itself an effect.
@@ -136,15 +141,19 @@ const layer = Layer.effect(
       }
     })
 
+    // The asking call, and whether its message is still the Session's newest: a Session that went on without the
+    // answer has no turn left to continue.
     const findPart = Effect.fn("AskRecovery.findPart")(function* (
       sessionID: SessionID,
       messageID: string,
       callID: string,
     ) {
       const messages = yield* session.messages({ sessionID }).pipe(Effect.orElseSucceed(() => []))
-      return messages
-        .find((message) => message.info.id === MessageID.make(messageID))
-        ?.parts.find((part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === callID)
+      const index = messages.findIndex((message) => message.info.id === MessageID.make(messageID))
+      const part = messages[index]?.parts.find(
+        (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === callID,
+      )
+      return { part, newest: index === messages.length - 1 }
     })
 
     // Wakes the Session the way the queue's send-now does: the drain runs in the background, a failure is a

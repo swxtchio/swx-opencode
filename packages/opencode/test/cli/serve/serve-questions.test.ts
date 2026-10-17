@@ -90,7 +90,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
           (event) => event.type === "question.replied" && event.properties.requestID === emitted.id,
         )
         expect(replied.properties).toMatchObject({ sessionID, answers })
-        yield* llm.wait(2)
+        yield* llm.wait(2).pipe(Effect.timeout(Duration.millis(deadline(20_000))))
         const part = yield* toolPart(server.url, home, sessionID, emitted.origin.callID, "completed")
         expect(part.state.metadata.answers).toEqual(answers)
         expect(JSON.stringify((yield* llm.inputs)[1])).toContain(
@@ -143,7 +143,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
         )
         expect(settled.body.disposition).toBe("settled")
         yield* toolPart(server.url, home, sessionID, emitted.origin.callID, "completed")
-        yield* llm.wait(2)
+        yield* llm.wait(2).pipe(Effect.timeout(Duration.millis(deadline(20_000))))
       }),
     90_000,
   )
@@ -180,7 +180,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
         )
         expect(settled.body.disposition).toBe("settled")
         yield* toolPart(server.url, home, sessionID, emitted.origin.callID, "completed")
-        yield* llm.wait(2)
+        yield* llm.wait(2).pipe(Effect.timeout(Duration.millis(deadline(20_000))))
       }),
     90_000,
   )
@@ -224,7 +224,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
         const part = yield* toolPart(second.url, home, sessionID, emitted.origin.callID, "completed")
         expect(part.state.output).toContain(`"What should the banner say?"="Welcome back"`)
         yield* events.until((event) => event.type === "question.replied" && event.properties.requestID === emitted.id)
-        yield* llm.wait(2)
+        yield* llm.wait(2).pipe(Effect.timeout(Duration.millis(deadline(20_000))))
         expect(JSON.stringify((yield* llm.inputs)[1])).toContain("Welcome back")
         yield* assistantText(second.url, home, sessionID, "continued after restart")
         const after = yield* json(HttpClientRequest.get(`${second.url}/question`), home)
@@ -313,6 +313,8 @@ describe("opencode serve --questions emit (subprocess)", () => {
         )
 
         const sqlite = new Database(file)
+        // The server may hold the write lock for its own Session writes; wait for it rather than fail.
+        sqlite.run("PRAGMA busy_timeout = 10000")
         sqlite.run("ALTER TABLE session_ask RENAME TO session_ask_unavailable")
         const failed = yield* answer
         sqlite.run("ALTER TABLE session_ask_unavailable RENAME TO session_ask")
@@ -365,7 +367,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
         })
         const part = yield* toolPart(second.url, home, sessionID, emitted.origin.callID, "error")
         expect(part.state.error).toContain("did not run")
-        yield* llm.wait(2)
+        yield* llm.wait(2).pipe(Effect.timeout(Duration.millis(deadline(20_000))))
         expect(JSON.stringify((yield* llm.inputs)[1])).toContain("Call the tool again to perform it")
         expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
       }),
@@ -399,7 +401,7 @@ describe("opencode serve --questions emit (subprocess)", () => {
         expect((yield* answer).body).toMatchObject({ disposition: "settled", recovered: true })
         const part = yield* toolPart(second.url, home, sessionID, emitted.origin.callID, "completed")
         expect(part.state.title).toBe("Switching to build agent")
-        yield* llm.wait(2)
+        yield* llm.wait(2).pipe(Effect.timeout(Duration.millis(deadline(20_000))))
         expect(JSON.stringify((yield* llm.inputs)[1])).toContain("has been approved, you can now edit files")
         yield* assistantText(second.url, home, sessionID, "building")
 
@@ -448,6 +450,51 @@ describe("opencode serve --questions emit (subprocess)", () => {
         yield* toolPart(server.url, home, sessionID, emitted.origin.callID, "completed")
       }),
     90_000,
+  )
+
+  cliIt.live(
+    "an answer after the restarted Session went on without it is recorded but leaves the old call alone",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const env = { OPENCODE_DB: path.join(home, "moved-on.db") }
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        const extraArgs = ["--questions", "emit", "--questions-command", receiver.path]
+        yield* llm.tool("question", { questions: [questions[1]] })
+        yield* llm.text("went on without the answer")
+
+        const first = yield* opencode.serve({ extraArgs, env })
+        const sessionID = yield* startTurn(first.url, home)
+        const [emitted] = yield* receiver.read(1)
+        first.kill()
+        yield* Effect.promise(() => first.exited)
+
+        const second = yield* opencode.serve({ extraArgs, env })
+        const [providerID, modelID] = testModelID.split("/")
+        yield* json(
+          HttpClientRequest.post(`${second.url}/session/${sessionID}/prompt_async`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({
+              model: { providerID, modelID },
+              parts: [{ type: "text", text: "go on" }],
+            }),
+          ),
+          home,
+        )
+        yield* assistantText(second.url, home, sessionID, "went on without the answer")
+
+        const settled = yield* json(
+          HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Hello"]] }),
+          ),
+          home,
+        )
+        expect(settled.body).toMatchObject({ disposition: "settled", recovered: true })
+        const part = (yield* messages(second.url, home, sessionID))
+          .flatMap((message) => message.parts)
+          .find((item) => item.callID === emitted.origin.callID)
+        expect(part.state.status).not.toBe("completed")
+        expect(yield* llm.calls).toBe(2)
+      }),
+    120_000,
   )
 })
 
