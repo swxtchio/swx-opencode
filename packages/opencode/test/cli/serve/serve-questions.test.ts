@@ -3,10 +3,11 @@
 // across a server restart on the same database.
 import { describe, expect } from "bun:test"
 import { constants } from "node:fs"
-import { chmod, open } from "node:fs/promises"
+import { open } from "node:fs/promises"
 import path from "node:path"
 import { Duration, Effect, Schedule } from "effect"
 import { HttpClient, HttpClientRequest } from "effect/unstable/http"
+import { json, writeReceiver } from "../../lib/ask-receiver"
 import { cliIt, deadline, testModelID } from "../../lib/cli-process"
 
 const questions = [
@@ -240,47 +241,6 @@ describe("opencode serve --questions emit (subprocess)", () => {
       }),
     120_000,
   )
-})
-
-// The operator's receiver: a script run without arguments that appends each ask to a file.
-const writeReceiver = Effect.fn("writeReceiver")(function* (home: string, body: string) {
-  const out = path.join(home, `asks-${crypto.randomUUID()}.jsonl`)
-  const file = path.join(home, `receiver-${crypto.randomUUID()}.sh`)
-  yield* Effect.promise(async () => {
-    await Bun.write(file, `#!/bin/sh\n${body.replaceAll("$OUT", out)}\n`)
-    await chmod(file, 0o755)
-  })
-  return {
-    path: file,
-    // Waits until the receiver has been handed `count` asks.
-    read: (count: number) =>
-      Effect.promise(async () => {
-        const text = await Bun.file(out)
-          .text()
-          .catch(() => "")
-        return (
-          text
-            .split("\n")
-            .filter(Boolean)
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            .map((line) => JSON.parse(line) as any)
-        )
-      }).pipe(
-        Effect.filterOrFail(
-          (asks) => asks.length >= count,
-          () => new Error(`receiver has not received ${count} asks`),
-        ),
-        Effect.retry(Schedule.spaced("50 millis")),
-        Effect.timeout(Duration.millis(deadline(20_000))),
-      ),
-  }
-})
-
-const json = Effect.fn("json")(function* (request: HttpClientRequest.HttpClientRequest, directory: string) {
-  const client = yield* HttpClient.HttpClient
-  const response = yield* client.execute(request.pipe(HttpClientRequest.setUrlParam("directory", directory)))
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return { status: response.status, body: (yield* response.json) as any }
 })
 
 const startTurn = Effect.fn("startTurn")(function* (url: string, directory: string) {
