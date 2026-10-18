@@ -395,6 +395,14 @@ export function Session() {
       })
     },
   )
+  createResource(
+    () => (history.hasLegacy() ? route.sessionID : undefined),
+    async (sessionID) => {
+      const result = await sdk.client.session.messages({ sessionID, limit: 0 }).catch(() => undefined)
+      if (!result || result.error || !result.data || route.sessionID !== sessionID) return
+      history.recover(sessionID, result.data, sync.data.config.machine_message_markers)
+    },
+  )
   const offModelMessage = event.on("message.updated", (next) => {
     if (next.properties.sessionID !== route.sessionID) return
     if (next.properties.info.role !== "assistant" || !next.properties.info.time.completed) return
@@ -689,7 +697,7 @@ export function Session() {
               if (child) scroll.scrollBy(child.y - scroll.y - 1)
             }}
             sessionID={route.sessionID}
-            history={history.list(route.sessionID)}
+            history={history.list(route.sessionID, sync.data.config.machine_message_markers)}
             appendPrompt={(text) => {
               if (!prompt) return
               prompt.set({ ...prompt.current, input: prompt.current.input + text })

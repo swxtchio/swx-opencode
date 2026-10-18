@@ -97,9 +97,12 @@ async function startSession(
     sessionID?: string
     state?: string
     home?: boolean
+    continue?: boolean
     queue?: SessionPromptQueueItem[]
     messages?: unknown[]
     messagesBySession?: Record<string, unknown[]>
+    historyMessagesBySession?: Record<string, unknown[]>
+    sessions?: Session[]
     providers?: Provider[]
     revertMessageID?: string
     serverConfig?: Config
@@ -180,6 +183,7 @@ async function startSession(
     return json({ name: "NotFoundError", data: { message: "No such request" } }, { status: 404 })
   }
   const calls = createFetch((url) => {
+    if (url.pathname === "/session" && options.sessions) return json(options.sessions)
     if (url.pathname === "/config") return json(options.serverConfig ?? {})
     if (url.pathname === "/config/providers")
       return json({ providers: options.providers ?? [provider], default: { test: "model" } })
@@ -200,7 +204,16 @@ async function startSession(
           : {}),
       } as Session)
     const messageSessionID = url.pathname.match(/^\/session\/(ses_[^/]+)\/message$/)?.[1]
-    if (messageSessionID) return json(options.messagesBySession?.[messageSessionID] ?? options.messages ?? [transcript])
+    if (messageSessionID) {
+      return json(
+        (url.searchParams.get("limit") === "0"
+          ? options.historyMessagesBySession?.[messageSessionID]
+          : options.messagesBySession?.[messageSessionID]) ??
+          options.messagesBySession?.[messageSessionID] ??
+          options.messages ??
+          [transcript],
+      )
+    }
     if (url.pathname === `/session/${activeSessionID}/queue/release`) return new Response(null, { status: 204 })
     if (url.pathname.startsWith(`/session/${activeSessionID}/queue`)) return json(queue.items)
     if (url.pathname === `/session/${activeSessionID}/message`) return json(options.messages ?? [transcript])
@@ -261,7 +274,7 @@ async function startSession(
         config: options.tuiConfig ?? createTuiResolvedConfig({ plugin_enabled: {} }),
         fetch,
         events: events.source,
-        args: options.home ? {} : { sessionID: activeSessionID },
+        args: options.home ? (options.continue ? { continue: true } : {}) : { sessionID: activeSessionID },
         pluginHost: {
           // As the real host does, so the session_prompt slot renders the Prompt.
           async start(input) {
@@ -308,6 +321,70 @@ async function startSession(
       }
     },
   }
+}
+
+function promptMessage(prompt: HeldPrompt, promptSessionID: string, index: number, stock = false) {
+  const id = `msg_history_${index}`
+  return {
+    info: { ...transcript.info, id, sessionID: promptSessionID, time: { created: index + 1 } } as Message,
+    parts: prompt.parts.map((part, partIndex) => {
+      const next = {
+        ...part,
+        id: `prt_history_${index}_${partIndex}`,
+        sessionID: promptSessionID,
+        messageID: id,
+      }
+      if (stock) delete next.metadata
+      if (!stock && part.type === "text")
+        next.metadata = { ...(part.metadata ?? {}), [SessionPromptQueue.TuiComposerOriginMetadataKey]: true }
+      return next as Part
+    }),
+  }
+}
+
+function sessionInfo(id: string): Session {
+  return {
+    id,
+    title: "Resumed history session",
+    slug: "resumed-history-session",
+    projectID: "proj_test",
+    directory,
+    version: "1.0.0",
+    time: { created: 1, updated: 1 },
+  }
+}
+
+async function rewriteAsLegacyHistory(historyPath: string) {
+  const persisted = await Bun.file(historyPath).text()
+  const legacy = persisted
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const entry = JSON.parse(line) as Record<string, unknown>
+      delete entry.sessionID
+      delete entry.origin
+      return JSON.stringify(entry)
+    })
+    .join("\n")
+  await Bun.write(historyPath, legacy + "\n")
+  return legacy
+}
+
+async function submitHistoryPrompt(
+  app: Awaited<ReturnType<typeof startSession>>,
+  text: string,
+  promptSessionID: string,
+  index: number,
+  stock = false,
+  messageIndex = index,
+) {
+  await app.renderer.mockInput.typeText(text)
+  app.renderer.mockInput.pressEnter()
+  await until(() => app.prompts.length === index + 1, `prompt ${index + 1}`)
+  const message = promptMessage(app.prompts[index]!, promptSessionID, messageIndex, stock)
+  app.prompts[index]!.answer(json(message))
+  await until(async () => !(await screen(app)).join("\n").includes("pending"), `settled prompt ${index + 1}`)
+  return message
 }
 
 async function until(fn: () => boolean | Promise<boolean>, what: string) {
@@ -509,6 +586,10 @@ async function searchHistory(app: Awaited<ReturnType<typeof startSession>>, text
     const focused = app.renderer.renderer.currentFocusedRenderable
     return focused instanceof InputRenderable && focused.value === text
   }, "the search query")
+  await until(async () => {
+    const frame = (await screen(app)).join("\n")
+    return frame.includes("No results found") || frame.split(text).length > 2
+  }, "the matching or empty search result")
   return (await screen(app)).join("\n")
 }
 
@@ -589,6 +670,239 @@ test("recall and search isolate sessions across switching and reopening shared c
       expect(await searchHistory(reopened, other!)).toContain("No results found")
     } finally {
       await reopened.stop()
+    }
+  }
+}, 30_000)
+
+test("resuming an older session restores its persisted composer history outside the loaded transcript", async () => {
+  await using state = await tmpdir()
+  const id = "ses_history_resume"
+  const beforeResume = [
+    "resume-history-first-token",
+    "resume-history-middle-token",
+    "resume-history-latest-token",
+  ]
+  const machineBefore = "OBSERVER: resume-machine-before-token"
+  const machineAfter = "OBSERVER: resume-machine-after-token"
+  const messages: unknown[] = []
+  const producer = await startSession({ state: state.path, sessionID: id, queue: [] })
+  try {
+    await until(async () => (await screen(producer)).join("\n").includes(id), "the producer session")
+    for (const text of beforeResume) messages.push(await submitHistoryPrompt(producer, text, id, producer.prompts.length))
+    messages.push(await submitHistoryPrompt(producer, machineBefore, id, producer.prompts.length))
+    await until(
+      async () => (await Bun.file(path.join(state.path, "prompt-history.jsonl")).text()).includes(beforeResume.at(-1)!),
+      "the persisted composer prompts",
+    )
+  } finally {
+    producer.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await producer.stop()
+  }
+
+  const tagged = await startSession({
+    state: state.path,
+    sessionID: id,
+    queue: [],
+    messagesBySession: { [id]: [messages.at(-1)] },
+    historyMessagesBySession: { [id]: messages },
+  })
+  try {
+    await until(async () => (await screen(tagged)).join("\n").includes(id), "the tagged session reopen")
+    tagged.renderer.mockInput.pressArrow("up")
+    await tagged.renderer.renderOnce()
+    expect(composer(tagged).plainText).toBe(beforeResume.at(-1)!)
+    tagged.dispatch("prompt.clear")
+    expect(await searchHistory(tagged, beforeResume[0]!)).not.toContain("No results found")
+  } finally {
+    await tagged.stop()
+  }
+
+  const historyPath = path.join(state.path, "prompt-history.jsonl")
+  const legacy = await rewriteAsLegacyHistory(historyPath)
+  await Bun.write(historyPath, `${legacy}\n${JSON.stringify({ input: machineBefore, parts: [], mode: "normal" })}\n`)
+
+  const resumed = await startSession({
+    state: state.path,
+    sessionID: id,
+    home: true,
+    continue: true,
+    sessions: [sessionInfo(id)],
+    queue: [],
+    messagesBySession: { [id]: [messages.at(-1)] },
+    historyMessagesBySession: { [id]: messages },
+  })
+  try {
+    await until(async () => (await screen(resumed)).join("\n").includes(id), "the continued session")
+    const afterResume = await submitHistoryPrompt(resumed, "resume-history-after-token", id, 0, false, messages.length)
+    messages.push(afterResume)
+    resumed.appendPrompt(machineAfter)
+    await until(async () => (await screen(resumed)).join("\n").includes(machineAfter), "machine-appended text after resume")
+    resumed.renderer.mockInput.pressEnter()
+    await until(() => resumed.prompts.length === 2, "the post-resume append")
+    const appendedAfterResume = promptMessage(resumed.prompts[1]!, id, messages.length)
+    messages.push(appendedAfterResume)
+    resumed.prompts[1]!.answer(json(appendedAfterResume))
+    await until(async () => !(await screen(resumed)).join("\n").includes("pending"), "the settled post-resume append")
+
+    expect(await searchHistory(resumed, beforeResume[0]!)).not.toContain("No results found")
+    resumed.renderer.mockInput.pressEscape()
+    await until(() => resumed.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    expect(await searchHistory(resumed, machineBefore)).toContain("No results found")
+    resumed.renderer.mockInput.pressEscape()
+    await until(() => resumed.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    expect(await searchHistory(resumed, machineAfter)).toContain("No results found")
+    resumed.renderer.mockInput.pressEscape()
+    await until(() => resumed.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+
+    const recalled: string[] = []
+    for (const _ of [0, 1, 2, 3]) {
+      resumed.renderer.mockInput.pressArrow("up")
+      await resumed.renderer.renderOnce()
+      recalled.push(composer(resumed).plainText)
+    }
+    expect(recalled).toEqual(["resume-history-after-token", ...beforeResume.toReversed()])
+  } finally {
+    resumed.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await resumed.stop()
+  }
+}, 30_000)
+
+test("resumed composer recall and search omit marker-classified and machine-appended prompts", async () => {
+  await using state = await tmpdir()
+  const id = "ses_history_machine_filter"
+  const human = ["machine-filter-human-first", "machine-filter-human-second"]
+  const builtin = "OBSERVER: built-in-machine-history-token"
+  const configured = "CUSTOM-HOLD: configured-machine-history-token"
+  const appended = "machine-appended-history-token"
+  const serverConfig: Config = { machine_message_markers: { hold: [{ type: "prefix", value: "CUSTOM-HOLD:" }] } }
+  const messages: unknown[] = []
+  const producer = await startSession({ state: state.path, sessionID: id, queue: [], serverConfig })
+  try {
+    await until(async () => (await screen(producer)).join("\n").includes(id), "the producer session")
+    for (const text of [human[0]!, builtin, human[1]!, configured])
+      messages.push(await submitHistoryPrompt(producer, text, id, producer.prompts.length))
+    producer.appendPrompt(appended)
+    await until(async () => (await screen(producer)).join("\n").includes(appended), "the appended prompt")
+    producer.renderer.mockInput.pressEnter()
+    await until(() => producer.prompts.length === 5, "the appended prompt send")
+    const machineMessage = promptMessage(producer.prompts[4]!, id, messages.length)
+    messages.push(machineMessage)
+    producer.prompts[4]!.answer(json(machineMessage))
+    await until(async () => !(await screen(producer)).join("\n").includes("pending"), "the settled append")
+    await until(
+      async () => (await Bun.file(path.join(state.path, "prompt-history.jsonl")).text()).includes(human[1]!),
+      "the persisted human history",
+    )
+  } finally {
+    producer.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await producer.stop()
+  }
+
+  const resumed = await startSession({
+    state: state.path,
+    sessionID: id,
+    queue: [],
+    messagesBySession: { [id]: [messages.at(-1)] },
+    historyMessagesBySession: { [id]: messages },
+    serverConfig,
+  })
+  try {
+    await until(async () => (await screen(resumed)).join("\n").includes(id), "the resumed session")
+    for (const text of human) {
+      expect(await searchHistory(resumed, text)).not.toContain("No results found")
+      resumed.renderer.mockInput.pressEscape()
+      await until(() => resumed.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    }
+    for (const text of [builtin, configured, appended]) {
+      expect(await searchHistory(resumed, text)).toContain("No results found")
+      resumed.renderer.mockInput.pressEscape()
+      await until(() => resumed.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    }
+
+    const recalled: string[] = []
+    for (const _ of [0, 1]) {
+      resumed.renderer.mockInput.pressArrow("up")
+      await resumed.renderer.renderOnce()
+      recalled.push(composer(resumed).plainText)
+    }
+    expect(recalled).toEqual(human.toReversed())
+  } finally {
+    resumed.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await resumed.stop()
+  }
+}, 30_000)
+
+test("legacy history is attributed to the resumed session's transcript only", async () => {
+  await using state = await tmpdir()
+  const a = "ses_legacy_isolation_a"
+  const b = "ses_legacy_isolation_b"
+  const fresh = "ses_legacy_isolation_fresh"
+  const onlyA = "legacy-isolation-A-only-token"
+  const onlyB = "legacy-isolation-B-only-token"
+  const messagesA: unknown[] = []
+  const messagesB: unknown[] = []
+  for (const [id, text, messages] of [
+    [a, onlyA, messagesA],
+    [b, onlyB, messagesB],
+  ] as const) {
+    const producer = await startSession({ state: state.path, sessionID: id, queue: [] })
+    try {
+      await until(async () => (await screen(producer)).join("\n").includes(id), `session ${id}`)
+      messages.push(await submitHistoryPrompt(producer, text, id, 0, true))
+    } finally {
+      producer.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+      await producer.stop()
+    }
+  }
+
+  const historyPath = path.join(state.path, "prompt-history.jsonl")
+  await rewriteAsLegacyHistory(historyPath)
+
+  const empty = await startSession({
+    state: state.path,
+    sessionID: fresh,
+    queue: [],
+    messagesBySession: { [fresh]: [] },
+    historyMessagesBySession: { [fresh]: [] },
+  })
+  try {
+    await until(async () => (await screen(empty)).join("\n").includes(fresh), "the fresh session")
+    empty.renderer.mockInput.pressArrow("up")
+    await empty.renderer.renderOnce()
+    expect(composer(empty).plainText).toBe("")
+    expect(await searchHistory(empty, onlyA)).toContain("No results found")
+    empty.renderer.mockInput.pressEscape()
+    await until(() => empty.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    expect(await searchHistory(empty, onlyB)).toContain("No results found")
+  } finally {
+    await empty.stop()
+  }
+
+  for (const [id, own, other, messages] of [
+    [a, onlyA, onlyB, messagesA],
+    [b, onlyB, onlyA, messagesB],
+  ] as const) {
+    const resumed = await startSession({
+      state: state.path,
+      sessionID: id,
+      home: true,
+      continue: true,
+      sessions: [sessionInfo(id)],
+      queue: [],
+      messagesBySession: { [id]: [] },
+      historyMessagesBySession: { [id]: messages },
+    })
+    try {
+      await until(async () => (await screen(resumed)).join("\n").includes(id), `continued session ${id}`)
+      expect(await searchHistory(resumed, own)).not.toContain("No results found")
+      resumed.renderer.mockInput.pressEscape()
+      await until(() => resumed.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+      resumed.renderer.mockInput.pressArrow("up")
+      await resumed.renderer.renderOnce()
+      expect(composer(resumed).plainText).toBe(own)
+      expect(await searchHistory(resumed, other)).toContain("No results found")
+    } finally {
+      await resumed.stop()
     }
   }
 }, 30_000)
@@ -924,6 +1238,118 @@ test("timeline search uses queue-produced human provenance and excludes injected
     expect(composer(app).plainText).toContain("typed-history-token")
   } finally {
     await app.stop()
+  }
+}, 30_000)
+
+test("resumed composer recall excludes queue automation and cross-session legacy rows", async () => {
+  await using state = await tmpdir()
+  const fixture = await queueTimelineFixture(
+    await submitComposerPrompt("queue-produced-human-recall-token"),
+    await submitComposerPrompt("firstmate appended queue-history token", true),
+  )
+  const id = fixture.sessionID
+  const messages: unknown[] = [...fixture.messages]
+  const serverConfig: Config = { machine_message_markers: { hold: [{ type: "prefix", value: "CUSTOM-HOLD:" }] } }
+  const producer = await startSession({
+    state: state.path,
+    sessionID: id,
+    queue: [],
+    messages,
+    serverConfig,
+  })
+  try {
+    await until(async () => (await screen(producer)).join("\n").includes(id), "the queue session")
+    const human = await submitHistoryPrompt(producer, "queue-resume-local-human-token", id, 0)
+    messages.push(human)
+    producer.appendPrompt("queue-resume-local-machine-token")
+    await until(
+      async () => (await screen(producer)).join("\n").includes("queue-resume-local-machine-token"),
+      "the local queue-path append",
+    )
+    producer.renderer.mockInput.pressEnter()
+    await until(() => producer.prompts.length === 2, "the local append send")
+    const appended = promptMessage(producer.prompts[1]!, id, messages.length)
+    messages.push(appended)
+    producer.prompts[1]!.answer(json(appended))
+    await until(async () => !(await screen(producer)).join("\n").includes("pending"), "the settled local append")
+  } finally {
+    producer.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await producer.stop()
+  }
+
+  const legacyMachine = "legacy-app-history-token"
+  const source = await startSession({ state: state.path, sessionID: "ses_queue_legacy_source", queue: [] })
+  try {
+    await until(async () => (await screen(source)).join("\n").includes("ses_queue_legacy_source"), "the legacy source")
+    await submitHistoryPrompt(source, legacyMachine, "ses_queue_legacy_source", 0, true)
+  } finally {
+    source.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await source.stop()
+  }
+  await rewriteAsLegacyHistory(path.join(state.path, "prompt-history.jsonl"))
+
+  const resumed = await startSession({
+    state: state.path,
+    sessionID: id,
+    queue: [],
+    messagesBySession: { [id]: messages },
+    historyMessagesBySession: { [id]: messages },
+    serverConfig,
+  })
+  try {
+    await until(async () => (await screen(resumed)).join("\n").includes(id), "the reopened queue session")
+    const after = await submitHistoryPrompt(
+      resumed,
+      "queue-resume-after-human-token",
+      id,
+      0,
+      false,
+      messages.length,
+    )
+    messages.push(after)
+    const afterMachine = "queue-resume-after-machine-token"
+    resumed.appendPrompt(afterMachine)
+    await until(async () => (await screen(resumed)).join("\n").includes(afterMachine), "the post-resume append")
+    resumed.renderer.mockInput.pressEnter()
+    await until(() => resumed.prompts.length === 2, "the post-resume append send")
+    const afterMachineMessage = promptMessage(resumed.prompts[1]!, id, messages.length)
+    messages.push(afterMachineMessage)
+    resumed.prompts[1]!.answer(json(afterMachineMessage))
+    await until(async () => !(await screen(resumed)).join("\n").includes("pending"), "the settled post-resume append")
+
+    for (const text of [
+      "queue-produced-human-recall-token",
+      "direct-composer-history-token",
+      "queue-resume-local-human-token",
+      "queue-resume-after-human-token",
+    ]) {
+      expect(await searchHistory(resumed, text)).not.toContain("No results found")
+      resumed.renderer.mockInput.pressEscape()
+      await until(() => resumed.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    }
+    for (const text of [
+      "injected-history-token",
+      "injected-critical-history-token",
+      "configured-injected-history-token",
+      "firstmate appended queue-history token",
+      legacyMachine,
+      "queue-resume-local-machine-token",
+      afterMachine,
+    ]) {
+      expect(await searchHistory(resumed, text)).toContain("No results found")
+      resumed.renderer.mockInput.pressEscape()
+      await until(() => resumed.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    }
+    const recalled: string[] = []
+    for (const _ of [0, 1]) {
+      resumed.renderer.mockInput.pressArrow("up")
+      await resumed.renderer.renderOnce()
+      recalled.push(composer(resumed).plainText)
+    }
+    expect(recalled).toEqual(["queue-resume-after-human-token", "queue-resume-local-human-token"])
+  } finally {
+    resumed.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await resumed.stop()
   }
 }, 30_000)
 

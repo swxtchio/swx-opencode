@@ -9,21 +9,22 @@ const entry = (input: string, parts: PromptInfo["parts"] = []) => ({
 })
 
 describe("prompt history", () => {
-  test("unowned legacy entries cannot be assigned to the session opening history", () => {
+  test("retains valid ownerless history until transcript attribution", () => {
+    const legacy = { input: "legacy prompt", parts: [] }
     const kept = entry("owned prompt")
     expect(
       parsePromptHistory(
         [
-          { input: "legacy prompt", parts: [] },
-          { ...kept, sessionID: undefined },
           { ...kept, sessionID: "" },
+          { ...kept, sessionID: null },
           null,
+          legacy,
           kept,
         ]
           .map((item) => JSON.stringify(item))
           .join("\n"),
       ),
-    ).toEqual([kept])
+    ).toEqual([legacy, kept])
   })
   test("recovers valid JSONL entries around corruption", () => {
     expect(parsePromptHistory(`${JSON.stringify(entry("one"))}\nnot-json\n${JSON.stringify(entry("two"))}\n`)).toEqual([

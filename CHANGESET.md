@@ -75,6 +75,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#294** Restore older composer history only when the resumed Session transcript confirms each prompt, and exclude machine-marked composer entries from UP recall and Ctrl+r search (swxtchio/swx-opencode#293). _Fork-only._
 - **#276** Add `watcher.fff: false` to disable the FFF background watcher while retaining native file, directory, glob and content search; the index reflects the initial scan when watching is disabled (swxtchio/swx-opencode#274). _Fork-only._
 - **#271** Make `DialogQueue` explain locked and no-op results; `SessionQueue.consolidate` groups normalized or prefix-related prompts and compatible command targets only within one delivery class, preserving command steps and receipts (swxtchio/swx-opencode#270). _Fork-only._
 - **#266** Settle SDK tool-call custody durably before effects (swxtchio/swx-opencode#234): admitted tool writes are keyed on their execution rather than the raw call ID, so a retry that reuses a call ID can no longer adopt the failed attempt's admitted part; a tool call settles only for the owner that committed its outcome, an earlier outcome's publication is held across a retry's takeover, and V1 tool custody is pinned at its lifecycle boundaries. Cancelling after dispatch leaves no pending orphan. A shell command that ignores SIGTERM is force-killed when its run is aborted or interrupted, even after the call was settled elsewhere and its output write is refused (swxtchio/swx-opencode#267).
