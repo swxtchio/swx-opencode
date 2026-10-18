@@ -77,7 +77,7 @@ const requiredColumns: Record<string, string[]> = {
   session_prompt_queue_alias: ["id", "item_id"],
   session_prompt_provenance: ["message_id", "session_id"],
   session_prompt_receipt: ["session_id", "state", "time_created", "time_updated"],
-  session_ask: ["id", "session_id", "time_created", "time_settled", "time_applied"],
+  session_ask: ["id", "session_id", "time_created", "time_settled"],
   session_share: ["session_id", "time_created", "time_updated"],
   event_sequence: ["aggregate_id", "seq"],
   event: ["aggregate_id", "type"],
@@ -149,7 +149,6 @@ const activitySources: {
     columns: [
       { name: "time_created", optional: false },
       { name: "time_settled", optional: true },
-      { name: "time_applied", optional: true },
     ],
   },
   {

@@ -26,7 +26,7 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import sessionMetadataMigration from "@opencode-ai/core/database/migration/20260511173437_session-metadata"
-import sessionAskMigration from "@opencode-ai/core/database/migration/20261017233837_session_ask"
+import sessionAskMigration from "@opencode-ai/core/database/migration/20261018005127_session_ask"
 import type { SqlClient as SqlClientService } from "effect/unstable/sql/SqlClient"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
@@ -298,10 +298,10 @@ describe("DatabaseMigration", () => {
           { name: "request", notnull: 1 },
           { name: "writer_id", notnull: 1 },
           { name: "decision", notnull: 0 },
+          { name: "delivered", notnull: 1 },
           { name: "recovered", notnull: 1 },
           { name: "time_created", notnull: 1 },
           { name: "time_settled", notnull: 0 },
-          { name: "time_applied", notnull: 0 },
         ])
         yield* db.run(sql`PRAGMA foreign_keys = ON`)
         yield* db.run(sql`

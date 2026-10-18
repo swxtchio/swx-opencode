@@ -186,7 +186,7 @@ const layer = Layer.effect(
     // decision in memory while the ledger records another resolver's.
     const claim = (id: PermissionV1.ID, reply: PermissionV1.Reply) =>
       AskEmit.current()
-        ? ledger.settle({ id, decision: { type: "replied", reply }, recovered: false }).pipe(
+        ? ledger.settle({ id, decision: { type: "replied", reply }, delivered: true, recovered: false }).pipe(
             Effect.map((settled) => settled.won),
             Effect.catchTag("SessionAsk.UnavailableError", () => Effect.succeed(false)),
           )

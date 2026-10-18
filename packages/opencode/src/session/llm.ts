@@ -20,7 +20,7 @@ import { Permission } from "@/permission"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Wildcard } from "@/util/wildcard"
-import { SessionID } from "@/session/schema"
+import { MessageID, SessionID } from "@/session/schema"
 import { Auth } from "@/auth"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -36,6 +36,8 @@ export type StreamInput = {
   user: SessionV1.User
   sessionID: string
   parentSessionID?: string
+  // The assistant message this request produces. An approval the provider asks for while streaming belongs to it.
+  messageID?: string
   model: Provider.Model
   agent: Agent.Info
   permission?: PermissionV1.Ruleset
@@ -179,27 +181,7 @@ const live: Layer.Layer<
                 return Effect.void
               }),
             )
-            const toolPatterns = approvalTools.map((t: { name: string; args: string }) => {
-              try {
-                const parsed = JSON.parse(t.args) as Record<string, unknown>
-                const title = (parsed?.title ?? parsed?.name ?? "") as string
-                return title ? `${t.name}: ${title}` : t.name
-              } catch {
-                return t.name
-              }
-            })
-            const uniquePatterns = [...new Set(toolPatterns)] as string[]
-            await bridge.promise(
-              perm.ask({
-                id,
-                sessionID: SessionID.make(input.sessionID),
-                permission: "workflow_tool_approval",
-                patterns: uniquePatterns,
-                metadata: { tools: approvalTools },
-                always: uniquePatterns,
-                ruleset: [],
-              }),
-            )
+            await bridge.promise(perm.ask(workflowApproval(input, id, approvalTools)))
             for (const name of uniqueNames) approvedToolsForSession.add(name)
             workflowModel.sessionPreapprovedTools = [...(workflowModel.sessionPreapprovedTools ?? []), ...uniqueNames]
             return { approved: true }
@@ -398,6 +380,35 @@ const live: Layer.Layer<
 )
 
 export const hasToolCalls = LLMRequestPrep.hasToolCalls
+
+// The permission request a GitLab Duo workflow raises to run its tools. It has no tool part of its own, so it is
+// identified by its request within the assistant message being streamed, which a supervisor reports as its origin.
+export function workflowApproval(
+  input: Pick<StreamInput, "sessionID" | "messageID">,
+  id: PermissionV1.ID,
+  approvalTools: ReadonlyArray<{ name: string; args: string }>,
+): PermissionV1.AskInput {
+  const toolPatterns = approvalTools.map((t) => {
+    try {
+      const parsed = JSON.parse(t.args) as Record<string, unknown>
+      const title = (parsed?.title ?? parsed?.name ?? "") as string
+      return title ? `${t.name}: ${title}` : t.name
+    } catch {
+      return t.name
+    }
+  })
+  const uniquePatterns = [...new Set(toolPatterns)]
+  return {
+    id,
+    sessionID: SessionID.make(input.sessionID),
+    permission: "workflow_tool_approval",
+    patterns: uniquePatterns,
+    metadata: { tools: approvalTools },
+    always: uniquePatterns,
+    tool: input.messageID ? { messageID: MessageID.make(input.messageID), callID: id } : undefined,
+    ruleset: [],
+  }
+}
 
 export const node = LayerNode.make({
   service: Service,

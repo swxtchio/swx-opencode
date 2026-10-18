@@ -18,6 +18,7 @@ import { RuntimeFlags } from "../../src/effect/runtime-flags"
 import { Permission } from "../../src/permission"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
+import { LLM } from "../../src/session/llm"
 import { Session } from "../../src/session/session"
 import { provideInstance, tmpdirScoped } from "../fixture/fixture"
 import { writeReceiver } from "../lib/ask-receiver"
@@ -71,6 +72,30 @@ const ask = (sessionID: Session.Info["id"], command: string, callID: string, rul
 // Beyond the receiver's read deadline, so a red run fails on that deadline rather than on Bun's default.
 const timeout = deadline(30_000)
 
+// Waits on a fiber or a signal with a bound, so a decision that never arrives fails here and names what is missing.
+const within = <A, E, R>(self: Effect.Effect<A, E, R>, missing = "the waiting call never received its decision") =>
+  self.pipe(
+    Effect.timeoutOrElse({
+      duration: Duration.millis(deadline(10_000)),
+      orElse: () => Effect.die(new Error(missing)),
+    }),
+  )
+
+// Records the request of every permission.replied event published from here on.
+const repliedEvents = Effect.fn("repliedEvents")(function* () {
+  const events = yield* EventV2Bridge.Service
+  const replied: string[] = []
+  const unsubscribe = yield* events.listen((event) =>
+    event.type === Permission.Event.Replied.type
+      ? Effect.sync(() => {
+          replied.push((event.data as { requestID: string }).requestID)
+        })
+      : Effect.void,
+  )
+  yield* Effect.addFinalizer(() => unsubscribe)
+  return replied
+})
+
 const failure = <A, E, R>(self: Effect.Effect<A, E, R>) =>
   self.pipe(
     Effect.exit,
@@ -108,7 +133,7 @@ describe("permission requests under --questions-command", () => {
 
           const resolution = yield* permission.reply({ requestID: emitted.id, reply: "once" })
           expect(resolution).toMatchObject({ disposition: "settled", decision: { type: "replied", reply: "once" } })
-          yield* Fiber.join(first)
+          yield* within(Fiber.join(first))
 
           // once grants nothing beyond the call: the next matching call is asked again.
           const second = yield* ask(sessionID, "git log", "call_again")
@@ -117,7 +142,7 @@ describe("permission requests under --questions-command", () => {
           const duplicate = yield* permission.reply({ requestID: emitted.id, reply: "reject" })
           expect(duplicate).toMatchObject({ disposition: "duplicate", decision: { type: "replied", reply: "once" } })
           yield* permission.reply({ requestID: again.id, reply: "once" })
-          yield* Fiber.join(second)
+          yield* within(Fiber.join(second))
         }).pipe(provideInstance(dir))
       }),
     timeout,
@@ -136,13 +161,13 @@ describe("permission requests under --questions-command", () => {
           const [a, b] = yield* receiver.read(2)
 
           yield* permission.reply({ requestID: a.id, reply: "always" })
-          yield* Fiber.join(first)
-          yield* Fiber.join(second)
+          yield* within(Fiber.join(first))
+          yield* within(Fiber.join(second))
           const late = yield* permission.reply({ requestID: b.id, reply: "reject" })
           expect(late).toMatchObject({ disposition: "duplicate", decision: { type: "replied", reply: "always" } })
 
           // The grant stands: a later matching call proceeds without being emitted.
-          yield* Fiber.join(yield* ask(sessionID, "git show", "call_later"))
+          yield* within(Fiber.join(yield* ask(sessionID, "git show", "call_later")))
           expect(yield* receiver.read(2)).toHaveLength(2)
         }).pipe(provideInstance(dir))
       }),
@@ -162,10 +187,10 @@ describe("permission requests under --questions-command", () => {
           const [a, b] = yield* receiver.read(2)
 
           yield* permission.reply({ requestID: a.id, reply: "reject", message: "keep the notes" })
-          const refused = yield* failure(Fiber.join(first))
+          const refused = yield* failure(within(Fiber.join(first)))
           expect(refused).toBeInstanceOf(PermissionV1.CorrectedError)
           expect((refused as PermissionV1.CorrectedError).feedback).toBe("keep the notes")
-          expect(yield* failure(Fiber.join(second))).toBeInstanceOf(PermissionV1.RejectedError)
+          expect(yield* failure(within(Fiber.join(second)))).toBeInstanceOf(PermissionV1.RejectedError)
           const late = yield* permission.reply({ requestID: b.id, reply: "once" })
           expect(late).toMatchObject({ disposition: "duplicate", decision: { type: "replied", reply: "reject" } })
           expect(yield* permission.list()).toEqual([])
@@ -181,12 +206,18 @@ describe("permission requests under --questions-command", () => {
         const dir = yield* tmpdirScoped({ git: true })
         yield* Effect.gen(function* () {
           const { receiver, sessionID } = yield* supervised()
-          yield* Fiber.join(
-            yield* ask(sessionID, "ls", "call_allowed", [{ permission: "bash", pattern: "*", action: "allow" }]),
+          yield* within(
+            Fiber.join(
+              yield* ask(sessionID, "ls", "call_allowed", [{ permission: "bash", pattern: "*", action: "allow" }]),
+            ),
           )
           const denied = yield* failure(
-            Fiber.join(
-              yield* ask(sessionID, "rm -rf /", "call_denied", [{ permission: "bash", pattern: "*", action: "deny" }]),
+            within(
+              Fiber.join(
+                yield* ask(sessionID, "rm -rf /", "call_denied", [
+                  { permission: "bash", pattern: "*", action: "deny" },
+                ]),
+              ),
             ),
           )
           expect(denied).toBeInstanceOf(PermissionV1.DeniedError)
@@ -195,7 +226,7 @@ describe("permission requests under --questions-command", () => {
           const emitted = yield* receiver.read(1)
           expect(emitted.map((item) => item.permission.patterns)).toEqual([["make"]])
           yield* Permission.Service.use((permission) => permission.reply({ requestID: emitted[0].id, reply: "once" }))
-          yield* Fiber.join(waiting)
+          yield* within(Fiber.join(waiting))
         }).pipe(provideInstance(dir))
       }),
     timeout,
@@ -216,7 +247,7 @@ describe("permission requests under --questions-command", () => {
           expect((yield* permission.list()).map((item) => item.id)).toEqual([emitted.id])
           expect(waiting.pollUnsafe()).toBeUndefined()
           yield* permission.reply({ requestID: emitted.id, reply: "once" })
-          yield* Fiber.join(waiting)
+          yield* within(Fiber.join(waiting))
         }).pipe(provideInstance(dir))
       }),
     timeout,
@@ -239,7 +270,7 @@ describe("permission requests under --questions-command", () => {
               : Effect.void,
           )
           const fiber = yield* ask(sessionID, "make", "call_publishing")
-          yield* Deferred.await(entered)
+          yield* within(Deferred.await(entered), "the ask event was never published")
           const [emitted] = yield* receiver.read(1)
           yield* Fiber.interrupt(fiber)
           yield* unsubscribe
@@ -268,7 +299,7 @@ describe("permission requests under --questions-command", () => {
           expect(yield* failure(permission.reply({ requestID: emitted.id, reply: "once" }))).toBeDefined()
           yield* unsubscribe
 
-          yield* Fiber.join(waiting).pipe(Effect.timeout(Duration.millis(deadline(10_000))))
+          yield* within(Fiber.join(waiting))
         }).pipe(provideInstance(dir))
       }),
     timeout,
@@ -286,7 +317,7 @@ describe("permission requests under --questions-command", () => {
           const refused = yield* failure(
             permission.ask({
               sessionID,
-              permission: "workflow_tool_approval",
+              permission: "custom_approval",
               patterns: ["deploy"],
               metadata: {},
               always: ["deploy"],
@@ -301,4 +332,96 @@ describe("permission requests under --questions-command", () => {
       }),
     timeout,
   )
+
+  it.live(
+    "a GitLab Duo workflow approval is emitted with its message as origin and settled by its answer",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        yield* Effect.gen(function* () {
+          const permission = yield* Permission.Service
+          const { receiver, sessionID } = yield* supervised()
+          const id = PermissionV1.ID.ascending()
+          const request = LLM.workflowApproval({ sessionID, messageID: "msg_workflow" }, id, [
+            { name: "deploy", args: JSON.stringify({ title: "production" }) },
+          ])
+          const waiting = yield* permission.ask(request).pipe(Effect.forkScoped)
+          const [emitted] = yield* receiver.read(1)
+
+          expect(emitted).toMatchObject({
+            kind: "permission",
+            id,
+            origin: { messageID: "msg_workflow", callID: id },
+            permission: { permission: "workflow_tool_approval", patterns: ["deploy: production"] },
+          })
+          expect(yield* permission.reply({ requestID: id, reply: "once" })).toMatchObject({ disposition: "settled" })
+          yield* within(Fiber.join(waiting))
+        }).pipe(provideInstance(dir))
+      }),
+    timeout,
+  )
+
+  it.live(
+    "competing replies to one request settle it once: one event, the winner's outcome",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        yield* Effect.gen(function* () {
+          const permission = yield* Permission.Service
+          const replied = yield* repliedEvents()
+          const { receiver, sessionID } = yield* supervised()
+          const waiting = yield* ask(sessionID, "make", "call_race")
+          const [emitted] = yield* receiver.read(1)
+
+          const results = yield* Effect.all(
+            [
+              permission.reply({ requestID: emitted.id, reply: "once" }),
+              permission.reply({ requestID: emitted.id, reply: "reject" }),
+            ],
+            { concurrency: "unbounded" },
+          )
+          expect(results.map((result) => result.disposition).sort()).toEqual(["duplicate", "settled"])
+          const winner = results.find((result) => result.disposition === "settled")!.decision
+          expect(results.map((result) => result.decision)).toEqual([winner, winner])
+          const outcome = yield* within(Fiber.join(waiting)).pipe(Effect.exit)
+          expect(Exit.isSuccess(outcome)).toBe(winner.type === "replied" && winner.reply === "once")
+          expect(replied.filter((id) => id === emitted.id)).toHaveLength(1)
+        }).pipe(provideInstance(dir))
+      }),
+    timeout,
+  )
+
+  for (const cascade of ["reject", "always"] as const)
+    it.live(
+      `a reply racing an ${cascade} cascade settles each request once, as its waiter saw it`,
+      () =>
+        Effect.gen(function* () {
+          const dir = yield* tmpdirScoped({ git: true })
+          yield* Effect.gen(function* () {
+            const permission = yield* Permission.Service
+            const ledger = yield* AskLedger.Service
+            const replied = yield* repliedEvents()
+            const { receiver, sessionID } = yield* supervised()
+            const first = yield* ask(sessionID, "git status", "call_cascading")
+            const second = yield* ask(sessionID, "git diff", "call_claimed")
+            const [a, b] = yield* receiver.read(2)
+
+            const results = yield* Effect.all(
+              [
+                permission.reply({ requestID: a.id, reply: cascade }),
+                permission.reply({ requestID: b.id, reply: cascade === "reject" ? "once" : "reject" }),
+              ],
+              { concurrency: "unbounded" },
+            )
+            const recorded = (yield* ledger.find(b.id, "permission"))!.decision
+            expect(results[1].decision).toEqual(recorded!)
+            const outcome = yield* within(Fiber.join(second)).pipe(Effect.exit)
+            expect(Exit.isSuccess(outcome)).toBe(recorded?.type === "replied" && recorded.reply !== "reject")
+            yield* within(Fiber.join(first)).pipe(Effect.exit)
+            expect(replied.filter((id) => id === a.id)).toHaveLength(1)
+            expect(replied.filter((id) => id === b.id)).toHaveLength(1)
+          }).pipe(provideInstance(dir))
+        }),
+      timeout,
+    )
 })

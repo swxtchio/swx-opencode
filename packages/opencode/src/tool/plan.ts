@@ -6,6 +6,7 @@ import { Question } from "../question"
 import { Session } from "@/session/session"
 import { Provider } from "@/provider/provider"
 import { InstanceState } from "@/effect/instance-state"
+import { Database } from "@opencode-ai/core/database/database"
 import { MessageID, PartID, type SessionID } from "../session/schema"
 import EXIT_DESCRIPTION from "./plan-exit.txt"
 
@@ -17,6 +18,7 @@ export const PlanExitTool = Tool.define(
     const session = yield* Session.Service
     const question = yield* Question.Service
     const provider = yield* Provider.Service
+    const database = yield* Database.Service
 
     return {
       description: EXIT_DESCRIPTION,
@@ -42,7 +44,7 @@ export const PlanExitTool = Tool.define(
           })
 
           if (declined(answers)) yield* new Question.RejectedError()
-          return yield* approve({ session, provider }, ctx.sessionID, plan)
+          return yield* approve({ session, provider, database }, ctx.sessionID, plan)
         }).pipe(Effect.orDie),
     }
   }),
@@ -61,10 +63,11 @@ export const planPath = Effect.fn("PlanExitTool.planPath")(function* (
   return path.relative(instance.worktree, Session.plan(info, instance))
 })
 
-// Accepting the plan: the Session continues as the build agent, told to execute the plan. A call recovered after a
-// restart applies the same effect, once, through its settled ask.
+// Accepting the plan: the Session continues as the build agent, told to execute the plan. The build message and its
+// instruction are written in one transaction, so a failure never leaves the switch half-made; a call recovered after a
+// restart applies the same effect, once, inside the transaction that settles its ask.
 export const approve = Effect.fn("PlanExitTool.approve")(function* (
-  services: { session: Session.Interface; provider: Provider.Interface },
+  services: { session: Session.Interface; provider: Provider.Interface; database: Database.Interface },
   sessionID: SessionID,
   plan: string,
 ) {
@@ -83,15 +86,23 @@ export const approve = Effect.fn("PlanExitTool.approve")(function* (
     agent: "build",
     model,
   }
-  yield* services.session.updateMessage(msg)
-  yield* services.session.updatePart({
-    id: PartID.ascending(),
-    messageID: msg.id,
-    sessionID,
-    type: "text",
-    text: `The plan at ${plan} has been approved, you can now edit files. Execute the plan`,
-    synthetic: true,
-  } satisfies SessionV1.TextPart)
+  yield* services.database.db
+    .transaction(
+      () =>
+        Effect.gen(function* () {
+          yield* services.session.updateMessage(msg)
+          yield* services.session.updatePart({
+            id: PartID.ascending(),
+            messageID: msg.id,
+            sessionID,
+            type: "text",
+            text: `The plan at ${plan} has been approved, you can now edit files. Execute the plan`,
+            synthetic: true,
+          } satisfies SessionV1.TextPart)
+        }),
+      { behavior: "immediate" },
+    )
+    .pipe(Effect.orDie)
 
   return {
     title: "Switching to build agent",

@@ -112,6 +112,15 @@ const hold = Effect.fn("hold")(function* (type: string) {
   return { entered, release }
 })
 
+// Waits on a fiber or a signal with a bound, so a decision that never arrives fails here and names what is missing.
+const within = <A, E, R>(self: Effect.Effect<A, E, R>, missing = "the waiting call never received its decision") =>
+  self.pipe(
+    Effect.timeoutOrElse({
+      duration: Duration.millis(deadline(10_000)),
+      orElse: () => Effect.die(new Error(missing)),
+    }),
+  )
+
 const failure = <A, E, R>(self: Effect.Effect<A, E, R>) =>
   self.pipe(
     Effect.exit,
@@ -150,7 +159,7 @@ describe("question lifecycle under --questions-command", () => {
           ]
           const resolution = yield* question.reply({ requestID: emitted.id, answers })
           expect(resolution).toMatchObject({ disposition: "settled", decision: { type: "answered", answers } })
-          const result = yield* Fiber.join(fiber)
+          const result = yield* within(Fiber.join(fiber))
           expect(result.metadata.answers).toEqual(answers)
           expect(result.output).toContain(`"Which colors?"="Red, Blue", "Any note?"="Ship it on Friday"`)
           expect(yield* question.list()).toEqual([])
@@ -176,14 +185,14 @@ describe("question lifecycle under --questions-command", () => {
             disposition: "duplicate",
             decision: { type: "answered", answers: [["Red"], ["None"]] },
           })
-          expect((yield* Fiber.join(answered)).metadata.answers).toEqual([["Red"], ["None"]])
+          expect((yield* within(Fiber.join(answered))).metadata.answers).toEqual([["Red"], ["None"]])
 
           const rejected = yield* askWithTool(sessionID, "call_reject_first")
           const [, second] = yield* receiver.read(2)
           yield* question.reject(second.id)
           const lateAnswer = yield* question.reply({ requestID: second.id, answers: [["Blue"], ["None"]] })
           expect(lateAnswer).toMatchObject({ disposition: "duplicate", decision: { type: "rejected" } })
-          expect(yield* failure(Fiber.join(rejected))).toBeInstanceOf(Question.RejectedError)
+          expect(yield* failure(within(Fiber.join(rejected)))).toBeInstanceOf(Question.RejectedError)
         }).pipe(provideInstance(dir))
       }),
     timeout,
@@ -212,7 +221,7 @@ describe("question lifecycle under --questions-command", () => {
           expect(winners).toHaveLength(1)
           const winner = winners[0]!.decision
           expect(results.every((result) => JSON.stringify(result.decision) === JSON.stringify(winner))).toBe(true)
-          const outcome = yield* Fiber.join(fiber).pipe(Effect.exit)
+          const outcome = yield* within(Fiber.join(fiber)).pipe(Effect.exit)
           if (winner.type === "answered")
             expect(Exit.isSuccess(outcome) && outcome.value.metadata.answers).toEqual(winner.answers)
           if (winner.type === "rejected") expect(Exit.isFailure(outcome)).toBe(true)
@@ -237,9 +246,15 @@ describe("question lifecycle under --questions-command", () => {
           const first = yield* ledger.settle({
             id: emitted.id,
             decision: { type: "answered", answers: [["Red"], ["first"]] },
+            delivered: true,
             recovered: false,
           })
-          const second = yield* ledger.settle({ id: emitted.id, decision: { type: "rejected" }, recovered: false })
+          const second = yield* ledger.settle({
+            id: emitted.id,
+            decision: { type: "rejected" },
+            delivered: true,
+            recovered: false,
+          })
           expect(first.won).toBe(true)
           expect(second.won).toBe(false)
           expect(second.row.decision).toEqual({ type: "answered", answers: [["Red"], ["first"]] })
@@ -279,7 +294,7 @@ describe("question lifecycle under --questions-command", () => {
           expect((yield* question.list()).map((item) => item.id)).toEqual([emitted.id])
           expect(fiber.pollUnsafe()).toBeUndefined()
           yield* question.reply({ requestID: emitted.id, answers: [["Red"], ["None"]] })
-          expect((yield* Fiber.join(fiber)).metadata.answers).toEqual([["Red"], ["None"]])
+          expect((yield* within(Fiber.join(fiber))).metadata.answers).toEqual([["Red"], ["None"]])
         }).pipe(provideInstance(dir))
       }),
     timeout,
@@ -316,7 +331,7 @@ describe("question lifecycle under --questions-command", () => {
           const { receiver, sessionID } = yield* supervised()
           const held = yield* hold(Question.Event.Asked.type)
           const fiber = yield* askWithTool(sessionID, "call_publishing")
-          yield* Deferred.await(held.entered)
+          yield* within(Deferred.await(held.entered), "the ask event was never published")
           const [emitted] = yield* receiver.read(1)
           yield* Fiber.interrupt(fiber)
 
@@ -344,7 +359,7 @@ describe("question lifecycle under --questions-command", () => {
           )
           const fiber = yield* askWithTool(sessionID, "call_unpublished")
           const [emitted] = yield* receiver.read(1)
-          expect(yield* failure(Fiber.join(fiber))).toBeDefined()
+          expect(yield* failure(within(Fiber.join(fiber)))).toBeDefined()
           yield* unsubscribe
 
           expect(yield* ledger.find(emitted.id, "question")).toMatchObject({ decision: { type: "cancelled" } })
@@ -375,19 +390,19 @@ describe("question lifecycle under --questions-command", () => {
               behavior: "immediate",
             })
             .pipe(Effect.forkScoped)
-          yield* Deferred.await(locked)
+          yield* within(Deferred.await(locked), "the other writer never took the database")
           const replying = yield* question
             .reply({ requestID: emitted.id, answers: [["Blue"], ["None"]] })
             .pipe(Effect.forkScoped({ startImmediately: true }))
           const interrupting = yield* Fiber.interrupt(replying).pipe(Effect.forkScoped)
           yield* Deferred.succeed(unlock, undefined)
-          yield* Fiber.join(writer)
-          yield* Fiber.join(interrupting)
+          yield* within(Fiber.join(writer))
+          yield* within(Fiber.join(interrupting))
 
           expect(yield* ledger.find(emitted.id, "question")).toMatchObject({
             decision: { type: "answered", answers: [["Blue"], ["None"]] },
           })
-          const result = yield* Fiber.join(fiber).pipe(Effect.timeout(Duration.millis(deadline(10_000))))
+          const result = yield* within(Fiber.join(fiber))
           expect(result.metadata.answers).toEqual([["Blue"], ["None"]])
         }).pipe(provideInstance(dir))
       }),
@@ -411,7 +426,7 @@ describe("question lifecycle under --questions-command", () => {
           expect(yield* failure(question.reply({ requestID: emitted.id, answers: [["Blue"], ["None"]] }))).toBeDefined()
           yield* unsubscribe
 
-          const result = yield* Fiber.join(fiber).pipe(Effect.timeout(Duration.millis(deadline(10_000))))
+          const result = yield* within(Fiber.join(fiber))
           expect(result.metadata.answers).toEqual([["Blue"], ["None"]])
         }).pipe(provideInstance(dir))
       }),
@@ -521,7 +536,7 @@ describe("question lifecycle under --questions-command", () => {
 
           const settled = yield* question.reply({ requestID: emitted.id, answers: [["Blue"], ["None"]] })
           expect(settled.disposition).toBe("settled")
-          expect((yield* Fiber.join(fiber)).metadata.answers).toEqual([["Blue"], ["None"]])
+          expect((yield* within(Fiber.join(fiber))).metadata.answers).toEqual([["Blue"], ["None"]])
         }).pipe(provideInstance(dir))
       }),
     timeout,
@@ -545,7 +560,7 @@ describe("question lifecycle under --questions-command", () => {
             Effect.retry({ times: 100 }),
           )
           yield* question.reply({ requestID: pending[0]!.id, answers: [["Red"], ["None"]] })
-          yield* Fiber.join(fiber)
+          yield* within(Fiber.join(fiber))
 
           expect(yield* failure(question.reply({ requestID: pending[0]!.id, answers: [["Blue"]] }))).toBeInstanceOf(
             Question.NotFoundError,

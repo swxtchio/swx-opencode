@@ -8,7 +8,7 @@ import { SessionAskTable } from "@opencode-ai/core/session/ask.sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionAsk } from "@opencode-ai/schema/session-ask"
 import { and, asc, eq, isNull } from "drizzle-orm"
-import { Cause, Context, Effect, Layer, Schema } from "effect"
+import { Cause, Context, Effect, Layer, Schedule, Schema } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import type { SessionID } from "@/session/schema"
 import { AskEmit } from "./emit"
@@ -33,6 +33,8 @@ export type Resolution = {
   readonly sessionID: SessionID
   readonly disposition: SessionAsk.Disposition
   readonly decision: SessionAsk.Decision
+  // Whether recovery wrote the decision into the stored tool call. A decision settled with nothing to apply it to, or
+  // one its live waiter received, is never reported as recovered.
   readonly recovered: boolean
   // Set when the process that waited on the ask is gone. Nothing has acted on the answer yet, and a still-pending ask
   // is not settled: the caller hands the resolution to AskRecovery, which settles it and applies the accepted decision
@@ -52,17 +54,18 @@ export interface Interface {
   // The ask of this kind in this instance's directory, so another directory's ask is unknown here.
   readonly find: (id: string, kind: SessionAsk.Kind) => Effect.Effect<Row | undefined, UnavailableError>
   readonly owner: (row: Row) => Effect.Effect<"self" | "alive" | "gone" | "unknown">
-  // Settles a pending ask once. `won` is false when another resolver settled it first.
+  // Settles a pending ask once. `won` is false when another resolver settled it first. `delivered` records that the
+  // decision goes to the live waiter, `recovered` that recovery writes it into the stored call in the same transaction.
   readonly settle: (input: {
     id: string
     decision: SessionAsk.Decision
+    delivered: boolean
     recovered: boolean
   }) => Effect.Effect<{ won: boolean; row: Row }, UnavailableError>
-  // Marks a settled ask's decision as written into its stored tool call by recovery.
-  readonly applied: (id: string) => Effect.Effect<void, UnavailableError>
   // Settles an emitted ask with its first decision. `live` says whether this process still waits on it. Without a
-  // waiter, an ask whose owning process is gone is handed back for recovery, settled or not; a pending one this
-  // process owns lost its waiter and is cancelled; and a pending one another live process owns is refused.
+  // waiter, a pending ask whose owning process is gone is handed back for recovery, and so is one recovery already
+  // applied, whose continuation may have been lost; a decision a live waiter received is never handed back. A pending
+  // ask this process owns lost its waiter and is cancelled, and one another live process owns is refused.
   readonly decide: (input: {
     id: string
     kind: SessionAsk.Kind
@@ -72,7 +75,8 @@ export interface Interface {
     { type: "unknown" } | { type: "duplicate" | "won" | "recover"; resolution: Resolution },
     UnavailableError
   >
-  // Ends a still-pending ask whose waiter stopped waiting. A no-op unless emission is configured.
+  // Ends a still-pending ask whose waiter stopped waiting. A no-op unless emission is configured. The write is retried;
+  // while it cannot be recorded the ask is refused here, so an aborted ask never takes an answer.
   readonly cancel: (id: string) => Effect.Effect<void>
   // Pending asks of this directory that this process can settle: its own or a gone process's.
   readonly pending: (kind: SessionAsk.Kind) => Effect.Effect<ReadonlyArray<Row>, UnavailableError>
@@ -84,6 +88,8 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const db = (yield* Database.Service).db
+    // Asks whose cancellation could not be recorded yet. Process-wide like the writer identity the ledger records.
+    const abandoned = new Set<string>()
     // SQL failures surface as defects, so every cause but an interruption becomes an explicit store failure.
     const unavailable =
       (requestID: string) =>
@@ -178,10 +184,21 @@ const layer = Layer.effect(
               const row = yield* tx.select().from(SessionAskTable).where(eq(SessionAskTable.id, input.id)).get()
               if (!row) return yield* Effect.die(new Error(`Ask ${input.id} vanished while settling`))
               if (row.time_settled !== null) return { won: false, row }
-              const settled = { ...row, decision: input.decision, recovered: input.recovered, time_settled: Date.now() }
+              const settled = {
+                ...row,
+                decision: input.decision,
+                delivered: input.delivered,
+                recovered: input.recovered,
+                time_settled: Date.now(),
+              }
               yield* tx
                 .update(SessionAskTable)
-                .set({ decision: settled.decision, recovered: settled.recovered, time_settled: settled.time_settled })
+                .set({
+                  decision: settled.decision,
+                  delivered: settled.delivered,
+                  recovered: settled.recovered,
+                  time_settled: settled.time_settled,
+                })
                 .where(and(eq(SessionAskTable.id, input.id), isNull(SessionAskTable.time_settled)))
                 .run()
               return { won: true, row: settled }
@@ -189,15 +206,6 @@ const layer = Layer.effect(
           { behavior: "immediate" },
         )
         .pipe(unavailable(input.id))
-    })
-
-    const applied = Effect.fn("AskLedger.applied")(function* (id: string) {
-      yield* db
-        .update(SessionAskTable)
-        .set({ time_applied: Date.now(), recovered: true })
-        .where(eq(SessionAskTable.id, id))
-        .run()
-        .pipe(unavailable(id))
     })
 
     const pending = Effect.fn("AskLedger.pending")(function* (kind: SessionAsk.Kind) {
@@ -216,40 +224,47 @@ const layer = Layer.effect(
         .all()
         .pipe(unavailable(kind))
       const holders = yield* Effect.forEach(rows, (row) => owner(row))
-      return rows.filter((_, index) => holders[index] === "self" || holders[index] === "gone")
+      return rows.filter(
+        (row, index) => !abandoned.has(row.id) && (holders[index] === "self" || holders[index] === "gone"),
+      )
     })
 
     const decide = Effect.fn("AskLedger.decide")(function* (input: Parameters<Interface["decide"]>[0]) {
       const row = yield* find(input.id, input.kind)
       if (!row) return { type: "unknown" as const }
+      // An aborted ask whose cancellation was not recorded takes no answer: record it now, or refuse.
+      if (abandoned.has(input.id)) {
+        const ended = yield* settle({
+          id: input.id,
+          decision: { type: "cancelled" },
+          delivered: false,
+          recovered: false,
+        })
+        abandoned.delete(input.id)
+        return { type: "duplicate" as const, resolution: resolution(ended.row, "duplicate") }
+      }
       if (input.live()) {
-        const settled = yield* settle({ id: input.id, decision: input.decision, recovered: false })
+        const settled = yield* settle({ id: input.id, decision: input.decision, delivered: true, recovered: false })
         if (!settled.won) return { type: "duplicate" as const, resolution: resolution(settled.row, "duplicate") }
         return { type: "won" as const, resolution: resolution(settled.row, "settled") }
       }
       const holder = yield* owner(row)
       if (holder === "gone") {
-        // A settled ask is handed back too: its decision may never have reached the call before the process died.
-        if (row.time_settled !== null) {
-          const settled = resolution(row, "duplicate")
-          if (settled.decision.type === "cancelled") return { type: "duplicate" as const, resolution: settled }
-          return { type: "recover" as const, resolution: { ...settled, recover: row } }
-        }
-        return {
-          type: "recover" as const,
-          resolution: {
-            ...resolution(row, "settled"),
-            decision: input.decision,
-            recovered: true,
-            recover: row,
-          },
-        }
+        if (row.time_settled === null)
+          return {
+            type: "recover" as const,
+            resolution: { ...resolution(row, "settled"), decision: input.decision, recover: row },
+          }
+        // Recovery wrote this call, but the wake that continues it may have died with its process.
+        if (row.recovered)
+          return { type: "recover" as const, resolution: { ...resolution(row, "duplicate"), recover: row } }
+        return { type: "duplicate" as const, resolution: resolution(row, "duplicate") }
       }
       if (row.time_settled !== null) return { type: "duplicate" as const, resolution: resolution(row, "duplicate") }
       if (holder !== "self")
         return yield* new UnavailableError({ requestID: input.id, reason: "owned-by-live-process" })
       // This process recorded the ask but no longer waits on it, so no answer can reach the call: end it.
-      const ended = yield* settle({ id: input.id, decision: { type: "cancelled" }, recovered: false })
+      const ended = yield* settle({ id: input.id, decision: { type: "cancelled" }, delivered: false, recovered: false })
       return { type: "duplicate" as const, resolution: resolution(ended.row, "duplicate") }
     })
 
@@ -260,10 +275,19 @@ const layer = Layer.effect(
         .set({ decision: { type: "cancelled" }, time_settled: Date.now() })
         .where(and(eq(SessionAskTable.id, id), isNull(SessionAskTable.time_settled)))
         .run()
-        .pipe(Effect.catchCause((cause) => Effect.logWarning("ask cancel failed", { id, cause: Cause.pretty(cause) })))
+        .pipe(
+          unavailable(id),
+          Effect.retry({ times: 4, schedule: Schedule.exponential("25 millis") }),
+          Effect.catchTag("SessionAsk.UnavailableError", () =>
+            Effect.gen(function* () {
+              abandoned.add(id)
+              yield* Effect.logError("ask cancel not recorded; refusing its answers until it is", { id })
+            }),
+          ),
+        )
     })
 
-    return Service.of({ admit, find, owner, settle, applied, decide, cancel, pending })
+    return Service.of({ admit, find, owner, settle, decide, cancel, pending })
   }),
 )
 

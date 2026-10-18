@@ -427,7 +427,7 @@ describe("opencode serve --questions-command (subprocess)", () => {
         yield* Effect.promise(() => old.exited)
         const sqlite = new Database(file)
         sqlite.run("DROP TABLE session_ask")
-        sqlite.run("DELETE FROM migration WHERE id = '20261017233837_session_ask'")
+        sqlite.run("DELETE FROM migration WHERE id = '20261018005127_session_ask'")
         sqlite.close()
 
         const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
@@ -488,7 +488,7 @@ describe("opencode serve --questions-command (subprocess)", () => {
           ),
           home,
         )
-        expect(settled.body).toMatchObject({ disposition: "settled", recovered: true })
+        expect(settled.body).toMatchObject({ disposition: "settled", recovered: false })
         const part = (yield* messages(second.url, home, sessionID))
           .flatMap((message) => message.parts)
           .find((item) => item.callID === emitted.origin.callID)
@@ -540,30 +540,43 @@ describe("opencode serve --questions-command (subprocess)", () => {
   )
 
   cliIt.live(
-    "an answer settled just before its server died reaches the call after the restart",
+    "a permission granted live whose call ran is never rewritten after the restart",
     ({ opencode, home, llm }) =>
       Effect.gen(function* () {
-        const file = path.join(home, "settled.db")
+        const marker = path.join(home, "ran-marker")
+        const env = {
+          OPENCODE_DB: path.join(home, "executed.db"),
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({ ...testProviderConfig(llm.url), permission: { bash: "ask" } }),
+        }
         const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
         const extraArgs = ["--questions-command", receiver.path]
-        yield* llm.tool("question", { questions: [questions[1]] })
-        yield* llm.text("continued with the recorded answer")
-        const first = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        yield* llm.tool("bash", { command: `touch ${marker} && sleep 30`, description: "Run a long command" })
+        const first = yield* opencode.serve({ extraArgs, env })
         const sessionID = yield* startTurn(first.url, home)
         const [emitted] = yield* receiver.read(1)
+        const granted = yield* json(
+          HttpClientRequest.post(`${first.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ reply: "once" }),
+          ),
+          home,
+        )
+        expect(granted.body).toMatchObject({ disposition: "settled", recovered: false })
+        // The granted call is running: its marker exists, and it is still sleeping when its server dies.
+        yield* Effect.promise(() => Bun.file(marker).exists()).pipe(
+          Effect.filterOrFail(
+            (exists) => exists,
+            () => new Error("the granted call never ran"),
+          ),
+          Effect.retry(Schedule.spaced("50 millis")),
+          Effect.timeout(Duration.millis(deadline(20_000))),
+        )
         first.kill()
         yield* Effect.promise(() => first.exited)
-        // The ledger committed an answer, and the process died before the waiting call took it.
-        const sqlite = new Database(file)
-        sqlite
-          .query("UPDATE session_ask SET decision = ?, time_settled = ? WHERE id = ?")
-          .run(JSON.stringify({ type: "answered", answers: [["Recorded"]] }), Date.now(), emitted.id)
-        sqlite.close()
 
-        const second = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        const second = yield* opencode.serve({ extraArgs, env })
         const repeated = yield* json(
           HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
-            HttpClientRequest.bodyJsonUnsafe({ answers: [["Different"]] }),
+            HttpClientRequest.bodyJsonUnsafe({ reply: "once" }),
           ),
           home,
         )
@@ -571,12 +584,127 @@ describe("opencode serve --questions-command (subprocess)", () => {
           requestID: emitted.id,
           sessionID,
           disposition: "duplicate",
-          decision: { type: "answered", answers: [["Recorded"]] },
-          recovered: true,
+          decision: { type: "replied", reply: "once" },
+          recovered: false,
         })
-        const part = yield* toolPart(second.url, home, sessionID, emitted.origin.callID, "completed")
-        expect(part.state.output).toContain(`"What should the banner say?"="Recorded"`)
-        yield* assistantText(second.url, home, sessionID, "continued with the recorded answer")
+        const part = (yield* messages(second.url, home, sessionID))
+          .flatMap((message) => message.parts)
+          .find((item) => item.callID === emitted.origin.callID)
+        expect(part.state.status).toBe("running")
+        expect(yield* llm.calls).toBe(1)
+      }),
+    120_000,
+  )
+
+  cliIt.live(
+    "an answer after a restart whose call is gone is recorded but not reported as recovered",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const file = path.join(home, "gone.db")
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        const extraArgs = ["--questions-command", receiver.path]
+        yield* llm.tool("question", { questions: [questions[1]] })
+        const first = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        const sessionID = yield* startTurn(first.url, home)
+        const [emitted] = yield* receiver.read(1)
+        first.kill()
+        yield* Effect.promise(() => first.exited)
+        const sqlite = new Database(file)
+        sqlite
+          .query("DELETE FROM part WHERE session_id = ? AND json_extract(data, '$.callID') = ?")
+          .run(sessionID, emitted.origin.callID)
+        sqlite.close()
+
+        const second = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        const settled = yield* json(
+          HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Hello"]] }),
+          ),
+          home,
+        )
+        expect(settled.body).toMatchObject({ disposition: "settled", recovered: false })
+        const listed = yield* json(HttpClientRequest.get(`${second.url}/question`), home)
+        expect(listed.body).toEqual([])
+        expect(yield* llm.calls).toBe(1)
+      }),
+    120_000,
+  )
+
+  cliIt.live(
+    "an ask aborted while its cancellation cannot be recorded never takes an answer, even after a restart",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const file = path.join(home, "aborted.db")
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        const extraArgs = ["--questions-command", receiver.path]
+        yield* llm.tool("question", { questions: [questions[1]] })
+        const first = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        const sessionID = yield* startTurn(first.url, home)
+        const [emitted] = yield* receiver.read(1)
+        const sqlite = new Database(file)
+        sqlite.run("PRAGMA busy_timeout = 10000")
+        sqlite.run("CREATE TRIGGER hold_ask BEFORE UPDATE ON session_ask BEGIN SELECT RAISE(ABORT, 'ask held'); END")
+        yield* json(HttpClientRequest.post(`${first.url}/session/${sessionID}/abort`), home)
+        yield* toolPart(first.url, home, sessionID, emitted.origin.callID, "error")
+        const refused = yield* json(
+          HttpClientRequest.post(`${first.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Too late"]] }),
+          ),
+          home,
+        )
+        expect(refused.status).toBe(503)
+        expect(sqlite.query("SELECT time_settled FROM session_ask WHERE id = ?").get(emitted.id)).toEqual({
+          time_settled: null,
+        })
+        first.kill()
+        yield* Effect.promise(() => first.exited)
+        sqlite.run("DROP TRIGGER hold_ask")
+        sqlite.close()
+
+        const second = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        const late = yield* json(
+          HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Too late"]] }),
+          ),
+          home,
+        )
+        expect(late.body).toMatchObject({ disposition: "duplicate", decision: { type: "cancelled" }, recovered: false })
+        const part = yield* toolPart(second.url, home, sessionID, emitted.origin.callID, "error")
+        expect(part.state.error).not.toContain("Too late")
+        expect(yield* llm.calls).toBe(1)
+      }),
+    120_000,
+  )
+
+  cliIt.live(
+    "a plan accepted live whose build instruction cannot be written leaves no half-made switch",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const file = path.join(home, "plan-live.db")
+        const env = { OPENCODE_DB: file, OPENCODE_EXPERIMENTAL_PLAN_MODE: "1" }
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        yield* llm.tool("plan_exit", {})
+        yield* llm.text("stayed in plan")
+        const server = yield* opencode.serve({ extraArgs: ["--questions-command", receiver.path], env })
+        const sessionID = yield* startTurn(server.url, home, "plan")
+        const [emitted] = yield* receiver.read(1)
+        const sqlite = new Database(file)
+        sqlite.run("PRAGMA busy_timeout = 10000")
+        sqlite.run(
+          "CREATE TRIGGER hold_instruction BEFORE INSERT ON part WHEN NEW.data LIKE '%has been approved%' BEGIN SELECT RAISE(ABORT, 'instruction held'); END",
+        )
+        const accepted = yield* json(
+          HttpClientRequest.post(`${server.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Yes"]] }),
+          ),
+          home,
+        )
+        expect(accepted.body).toMatchObject({ disposition: "settled" })
+        yield* toolPart(server.url, home, sessionID, emitted.origin.callID, "error")
+        sqlite.run("DROP TRIGGER hold_instruction")
+        sqlite.close()
+        const list = yield* messages(server.url, home, sessionID)
+        expect(list.filter((message) => message.info.role === "user" && message.info.agent === "build")).toEqual([])
       }),
     120_000,
   )
@@ -614,8 +742,8 @@ describe("opencode serve --questions-command (subprocess)", () => {
         }
         sqlite.query("UPDATE part SET data = ? WHERE id = ?").run(JSON.stringify(data), stored.id)
         sqlite
-          .query("UPDATE session_ask SET decision = ?, time_settled = ?, time_applied = ?, recovered = 1 WHERE id = ?")
-          .run(JSON.stringify({ type: "answered", answers: [["Recovered"]] }), Date.now(), Date.now(), emitted.id)
+          .query("UPDATE session_ask SET decision = ?, time_settled = ?, recovered = 1 WHERE id = ?")
+          .run(JSON.stringify({ type: "answered", answers: [["Recovered"]] }), Date.now(), emitted.id)
         sqlite.close()
 
         const second = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })

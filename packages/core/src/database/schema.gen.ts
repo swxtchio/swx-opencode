@@ -50,10 +50,10 @@ export default {
           \`request\` text NOT NULL,
           \`writer_id\` text NOT NULL,
           \`decision\` text,
+          \`delivered\` integer DEFAULT false NOT NULL,
           \`recovered\` integer DEFAULT false NOT NULL,
           \`time_created\` integer NOT NULL,
           \`time_settled\` integer,
-          \`time_applied\` integer,
           CONSTRAINT \`fk_session_ask_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)

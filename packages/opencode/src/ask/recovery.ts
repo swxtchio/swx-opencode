@@ -21,10 +21,12 @@ import { AskLedger } from "./ledger"
 
 // An ask answered after the process that waited on it is gone (swxtchio/swx-opencode#286). In one transaction this
 // settles a still-pending ask and writes the outcome its producer would have produced into the stored call, so an
-// accepted answer is either applied or not settled at all. An ask that was settled before its process died is
-// handed here too, and gets its recorded decision if the call never received it. Where the live tool would have let
-// the turn go on, the Session is woken to continue. Only the asking call is recovered: nothing replays provider
-// work, and a permission-guarded call that never ran is not run here.
+// accepted answer is either applied or not settled at all. A call that already ended without the answer (its ask was
+// aborted) settles the ask as cancelled, and one that is gone or that its Session went on without is left alone: the
+// answer is recorded but not reported as recovered. Where the live tool would have let the turn go on, the Session
+// is woken to continue, and an ask recovery applied earlier is handed here again so a wake its process lost is
+// repeated. Only the asking call is recovered: nothing replays provider work, and a permission-guarded call that
+// never ran is not run here. A decision a live waiter received is never handed here.
 export interface Interface {
   // Applies a resolution the ledger handed back for recovery and returns the final one; any other is returned as is.
   readonly apply: (resolution: AskLedger.Resolution) => Effect.Effect<AskLedger.Resolution, AskLedger.UnavailableError>
@@ -58,36 +60,45 @@ const layer = Layer.effect(
         .transaction(
           () =>
             Effect.gen(function* () {
-              const claimed =
-                row.time_settled === null
-                  ? yield* ledger.settle({ id: row.id, decision: resolution.decision, recovered: true })
-                  : { won: false, row }
-              const current = claimed.row
-              const final: AskLedger.Resolution = claimed.won
-                ? settled
-                : {
-                    ...settled,
-                    disposition: "duplicate",
-                    decision: current.decision ?? { type: "cancelled" },
-                    recovered: current.recovered,
-                  }
-              const decision = current.decision
-              const idle = { final, row: current, won: claimed.won, written: false, wake: false }
-              if (!decision || decision.type === "cancelled") return idle
+              // Read again inside the transaction, which no other writer can enter.
+              const current = (yield* ledger.find(row.id, row.kind)) ?? row
               const target = yield* locate(current)
-              if (!target) return idle
-              const continues = continuesAfter(current, decision, stopOnDeny)
-              if (target.newest && unsettled(target.part)) {
-                yield* write(target.part, yield* produce(current, decision))
-                yield* ledger.applied(current.id)
-                return { ...idle, final: { ...final, recovered: true }, written: true, wake: continues }
+              if (current.time_settled !== null) {
+                const final: AskLedger.Resolution = {
+                  ...settled,
+                  disposition: "duplicate",
+                  decision: current.decision ?? { type: "cancelled" },
+                  recovered: current.recovered,
+                }
+                const idle = { final, row: current, won: false, wake: false }
+                if (!current.recovered || !current.decision || !target || target.continued) return idle
+                return { ...idle, wake: continuesAfter(current, current.decision, stopOnDeny) }
               }
-              // An earlier recovery wrote the call, but the wake that continues it may have been lost with its process.
-              if (current.time_applied !== null && !target.continued) return { ...idle, wake: continues }
-              if (target.newest)
-                yield* Effect.logWarning("recovered ask's tool call already has an outcome", { id: row.id })
-              else yield* Effect.logWarning("recovered ask's Session went on without it", { id: row.id })
-              return idle
+              const record = (decision: SessionAsk.Decision, recovered: boolean) =>
+                ledger.settle({ id: current.id, decision, delivered: false, recovered })
+              if (target && !unsettled(target.part)) {
+                yield* Effect.logWarning("recovered ask's tool call ended without it; cancelling", { id: row.id })
+                const ended = yield* record({ type: "cancelled" }, false)
+                return {
+                  final: { ...settled, disposition: "duplicate" as const, decision: { type: "cancelled" as const } },
+                  row: ended.row,
+                  won: false,
+                  wake: false,
+                }
+              }
+              if (!target?.newest) {
+                if (target) yield* Effect.logWarning("recovered ask's Session went on without it", { id: row.id })
+                const recorded = yield* record(resolution.decision, false)
+                return { final: { ...settled, recovered: false }, row: recorded.row, won: true, wake: false }
+              }
+              yield* write(target.part, yield* produce(current, resolution.decision))
+              const applied = yield* record(resolution.decision, true)
+              return {
+                final: { ...settled, recovered: true },
+                row: applied.row,
+                won: true,
+                wake: continuesAfter(current, resolution.decision, stopOnDeny),
+              }
             }),
           { behavior: "immediate" },
         )
@@ -105,13 +116,13 @@ const layer = Layer.effect(
       yield* Effect.logInfo("recovered ask", {
         id: row.id,
         won: result.won,
-        written: result.written,
+        recovered: result.final.recovered,
         wake: result.wake,
       })
       if (result.won) yield* publish(result.row)
       const decision = result.row.decision
       // An `always` grant outlives the call, so the model's retry is not asked again.
-      if ((result.won || result.written) && decision?.type === "replied" && decision.reply === "always")
+      if (result.won && decision?.type === "replied" && decision.reply === "always")
         yield* permission.grant(result.row.request as PermissionV1.Request)
       if (result.wake) yield* wake(result.row.session_id)
       return result.final
@@ -164,7 +175,7 @@ const layer = Layer.effect(
         const plan = yield* planPath(session, row.session_id)
         return {
           status: "completed",
-          ...(yield* approve({ session, provider }, row.session_id, plan)),
+          ...(yield* approve({ session, provider, database }, row.session_id, plan)),
         } satisfies Outcome
       }
       const request = row.request as Question.Request
@@ -249,11 +260,10 @@ function continuesAfter(row: AskLedger.Row, decision: SessionAsk.Decision, stopO
   return true
 }
 
-// A call still waiting when its process died is pending or running; one an in-process shutdown cleaned up carries
-// the interrupted disposition. A call with any other outcome has its own record and is never overwritten.
+// A call still waiting when its process died is pending or running. Any other outcome, an interrupted one included,
+// means the call stopped waiting and has its own record, which is never overwritten.
 function unsettled(part: SessionV1.ToolPart) {
-  if (part.state.status === "pending" || part.state.status === "running") return true
-  return part.state.status === "error" && part.state.metadata?.interrupted === true
+  return part.state.status === "pending" || part.state.status === "running"
 }
 
 export const node = LayerNode.make({

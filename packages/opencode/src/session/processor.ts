@@ -1033,7 +1033,7 @@ const layer = Layer.effect(
                 activeAssistantMessageID: ctx.assistantMessage.id,
               })
               const stream = llm
-                .stream(streamInput)
+                .stream({ ...streamInput, messageID: ctx.assistantMessage.id })
                 .pipe(Stream.tapCause((cause) => FailureOrigin.record(cause, { stage: "stream" })))
 
               yield* stream.pipe(
