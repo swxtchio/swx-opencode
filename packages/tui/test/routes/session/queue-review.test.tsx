@@ -2,7 +2,17 @@
 import { expect, test } from "bun:test"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { createTestRenderer } from "@opentui/core/testing"
-import type { Config, GlobalEvent, Message, Part, Provider, Session, SessionPromptQueueItem, SessionStatus } from "@opencode-ai/sdk/v2"
+import { InputRenderable, TextareaRenderable } from "@opentui/core"
+import type {
+  Config,
+  GlobalEvent,
+  Message,
+  Part,
+  Provider,
+  Session,
+  SessionPromptQueueItem,
+  SessionStatus,
+} from "@opencode-ai/sdk/v2"
 import { Effect } from "effect"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { TuiEvent } from "@opencode-ai/schema/tui-event"
@@ -85,8 +95,12 @@ type Apply = () => Response
 async function startSession(
   options: {
     sessionID?: string
+    state?: string
+    home?: boolean
     queue?: SessionPromptQueueItem[]
     messages?: unknown[]
+    messagesBySession?: Record<string, unknown[]>
+    providers?: Provider[]
     revertMessageID?: string
     serverConfig?: Config
     status?: SessionStatus
@@ -101,7 +115,8 @@ async function startSession(
   const setup = await createTestRenderer({ width: 160, height: 45, useThread: false, kittyKeyboard: true })
   // Sent prompts are appended to the prompt history under state; keep it out
   // of the user's own and of the next test's.
-  const state = await tmpdir()
+  const scratch = options.state ? undefined : await tmpdir()
+  const state = options.state ?? scratch!.path
   const events = createEventSource()
   // `merged` maps a request the queue merged to the request it went into.
   const queue = {
@@ -111,6 +126,7 @@ async function startSession(
   }
   const requests: string[] = []
   const paths: string[] = []
+  const executions: string[] = []
   const selections: unknown[] = []
   const enhancements: EnhancementRequest[] = []
   const prompts: HeldPrompt[] = []
@@ -165,7 +181,8 @@ async function startSession(
   }
   const calls = createFetch((url) => {
     if (url.pathname === "/config") return json(options.serverConfig ?? {})
-    if (url.pathname === "/config/providers") return json({ providers: [provider], default: { test: "model" } })
+    if (url.pathname === "/config/providers")
+      return json({ providers: options.providers ?? [provider], default: { test: "model" } })
     if (url.pathname === "/agent") return json([{ name: "build", mode: "primary", permission: [], options: {} }])
     if (url.pathname === "/session/status" && options.status) return json({ [activeSessionID]: options.status })
     const requestedSessionID = url.pathname.match(/^\/session\/(ses_[^/]+)$/)?.[1]
@@ -182,7 +199,8 @@ async function startSession(
           ? { revert: { messageID: options.revertMessageID } }
           : {}),
       } as Session)
-    if (/^\/session\/ses_[^/]+\/message$/.test(url.pathname)) return json(options.messages ?? [transcript])
+    const messageSessionID = url.pathname.match(/^\/session\/(ses_[^/]+)\/message$/)?.[1]
+    if (messageSessionID) return json(options.messagesBySession?.[messageSessionID] ?? options.messages ?? [transcript])
     if (url.pathname === `/session/${activeSessionID}/queue/release`) return new Response(null, { status: 204 })
     if (url.pathname.startsWith(`/session/${activeSessionID}/queue`)) return json(queue.items)
     if (url.pathname === `/session/${activeSessionID}/message`) return json(options.messages ?? [transcript])
@@ -193,6 +211,15 @@ async function startSession(
     const request = input instanceof Request ? input : new Request(input, init)
     const path = new URL(request.url).pathname
     paths.push(path)
+    if (request.method === "POST" && /\/(command|shell)$/.test(path)) executions.push(path)
+    if (path === "/session" && request.method === "POST")
+      return json({
+        id: activeSessionID,
+        directory,
+        projectID: "proj_test",
+        title: "Created session",
+        time: { created: 1, updated: 1 },
+      })
     if (path.startsWith(`/session/${activeSessionID}/queue/`)) requests.push(path.split("/").pop()!)
     if (path === `/session/${activeSessionID}` && request.method === "PATCH")
       selections.push(await request.clone().json())
@@ -234,7 +261,7 @@ async function startSession(
         config: options.tuiConfig ?? createTuiResolvedConfig({ plugin_enabled: {} }),
         fetch,
         events: events.source,
-        args: { sessionID: activeSessionID },
+        args: options.home ? {} : { sessionID: activeSessionID },
         pluginHost: {
           // As the real host does, so the session_prompt slot renders the Prompt.
           async start(input) {
@@ -245,9 +272,7 @@ async function startSession(
           async dispose() {},
         },
       })
-      .pipe(
-        Effect.provide(AppNodeBuilder.build(Global.node, [[Global.node, Global.layerWith({ state: state.path })]])),
-      ),
+      .pipe(Effect.provide(AppNodeBuilder.build(Global.node, [[Global.node, Global.layerWith({ state })]]))),
   )
   await ready
 
@@ -255,6 +280,7 @@ async function startSession(
     renderer: setup,
     requests,
     paths,
+    executions,
     selections,
     enhancements,
     commands: () =>
@@ -267,16 +293,18 @@ async function startSession(
     appendPrompt,
     selectSession,
     queue,
-    state: state.path,
+    state,
     dispatch: (command: string) => api?.keymap.dispatchCommand(command),
     async stop() {
       try {
+        setup.mockInput.pressEscape()
+        await setup.renderOnce()
         api?.keymap.dispatchCommand("prompt.clear")
         api?.keymap.dispatchCommand("app.exit")
         await task
       } finally {
         if (!setup.renderer.isDestroyed) setup.renderer.destroy()
-        await state[Symbol.asyncDispose]()
+        await scratch?.[Symbol.asyncDispose]()
       }
     },
   }
@@ -467,6 +495,293 @@ async function clickVisible(app: Awaited<ReturnType<typeof startSession>>, text:
 const composerLines = (lines: string[], text: string) =>
   lines.filter((line) => !line.includes("QUEUED") && line.includes(text))
 
+function composer(app: Awaited<ReturnType<typeof startSession>>) {
+  const focused = app.renderer.renderer.currentFocusedRenderable
+  expect(focused).toBeInstanceOf(TextareaRenderable)
+  return focused as TextareaRenderable
+}
+
+async function searchHistory(app: Awaited<ReturnType<typeof startSession>>, text: string) {
+  app.renderer.mockInput.pressKey("r", { ctrl: true })
+  await until(() => app.renderer.renderer.currentFocusedRenderable instanceof InputRenderable, "the search input focus")
+  await app.renderer.mockInput.typeText(text)
+  await until(() => {
+    const focused = app.renderer.renderer.currentFocusedRenderable
+    return focused instanceof InputRenderable && focused.value === text
+  }, "the search query")
+  return (await screen(app)).join("\n")
+}
+
+test("recall and search isolate sessions across switching and reopening shared composer history", async () => {
+  await using state = await tmpdir()
+  const a = "ses_history_a"
+  const b = "ses_history_b"
+  const first = "A-exclusive-history-token"
+  const second = "B-exclusive-history-token"
+  const draft = "A retained draft exclusive token"
+  const messagesBySession = { [a]: [{ ...transcript, info: { ...transcript.info, sessionID: a } }], [b]: [] }
+  const app = await startSession({ state: state.path, sessionID: a, queue: [], messagesBySession })
+  try {
+    await until(async () => (await screen(app)).join("\n").includes("already in the transcript"), "session A")
+    await app.renderer.mockInput.typeText(first)
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "A's producer")
+    app.prompts[0]!.answer(json(transcript))
+    await until(async () => !(await screen(app)).join("\n").includes("pending"), "the completed A send")
+    app.renderer.mockInput.pressArrow("up")
+    await app.renderer.renderOnce()
+    expect(composer(app).plainText).toBe(first)
+    app.dispatch("prompt.clear")
+    expect(await searchHistory(app, first)).not.toContain("No results found")
+    app.renderer.mockInput.pressEscape()
+    await until(() => app.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    await app.renderer.mockInput.typeText(draft)
+    app.dispatch("prompt.clear")
+
+    app.selectSession(b)
+    await until(async () => (await screen(app)).join("\n").includes(b), "fresh session B")
+    app.renderer.mockInput.pressArrow("up")
+    await app.renderer.renderOnce()
+    expect(composer(app).plainText).toBe("")
+    expect(await searchHistory(app, first)).toContain("No results found")
+    app.renderer.mockInput.pressEscape()
+    await until(() => app.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "B composer focus")
+    await app.renderer.mockInput.typeText(second)
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 2, "B's producer")
+    app.prompts[1]!.answer(json(transcript))
+    await until(async () => !(await screen(app)).join("\n").includes("pending"), "the completed B send")
+    app.renderer.mockInput.pressArrow("up")
+    await app.renderer.renderOnce()
+    expect(composer(app).plainText).toBe(second)
+    app.dispatch("prompt.clear")
+    expect(await searchHistory(app, second)).not.toContain("No results found")
+    app.renderer.mockInput.pressEscape()
+    app.selectSession(a)
+    await until(async () => (await screen(app)).join("\n").includes(a), "A selected again")
+    app.renderer.mockInput.pressArrow("up")
+    await app.renderer.renderOnce()
+    expect(composer(app).plainText).toBe(draft)
+    app.dispatch("prompt.clear")
+    expect(await searchHistory(app, second)).toContain("No results found")
+    app.renderer.mockInput.pressEscape()
+    await until(
+      async () => (await Bun.file(path.join(state.path, "prompt-history.jsonl")).text()).includes(second),
+      "persisted history",
+    )
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
+  }
+  for (const [id, own, other] of [
+    [a, draft, second],
+    [b, second, first],
+  ]) {
+    const reopened = await startSession({ state: state.path, sessionID: id, queue: [], messagesBySession })
+    try {
+      await until(async () => (await screen(reopened)).join("\n").includes(id!), "the reopened session")
+      reopened.renderer.mockInput.pressArrow("up")
+      await reopened.renderer.renderOnce()
+      expect(composer(reopened).plainText).toBe(own!)
+      reopened.dispatch("prompt.clear")
+      expect(await searchHistory(reopened, own!)).not.toContain("No results found")
+      reopened.renderer.mockInput.pressEscape()
+      expect(await searchHistory(reopened, other!)).toContain("No results found")
+    } finally {
+      await reopened.stop()
+    }
+  }
+}, 30_000)
+
+test("a newly mounted composer starts at its session's newest history after another session recalled", async () => {
+  await using state = await tmpdir()
+  const a = "ses_mount_a"
+  const b = "ses_mount_b"
+  const first = "B first mount token"
+  const newest = "B newest mount token"
+  const other = "A mount token"
+  const app = await startSession({
+    state: state.path,
+    sessionID: b,
+    queue: [],
+    messagesBySession: {
+      [a]: [],
+      [b]: [],
+    },
+  })
+  try {
+    await until(async () => {
+      const frame = (await screen(app)).join("\n")
+      return frame.includes(b) && frame.includes("Model")
+    }, "B mounted with its selected model")
+    for (const [index, text] of [first, newest].entries()) {
+      await app.renderer.mockInput.typeText(text)
+      app.renderer.mockInput.pressEnter()
+      await until(() => app.prompts.length === index + 1, "B's history producer")
+      app.prompts[index]!.answer(json(transcript))
+      await until(async () => !(await screen(app)).join("\n").includes("pending"), "B's completed send")
+    }
+    app.selectSession(a)
+    await until(async () => (await screen(app)).join("\n").includes(a), "A mounted")
+    await app.renderer.mockInput.typeText(other)
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 3, "A's history producer")
+    app.prompts[2]!.answer(json(transcript))
+    await until(async () => !(await screen(app)).join("\n").includes("pending"), "A's completed send")
+    app.renderer.mockInput.pressArrow("up")
+    await app.renderer.renderOnce()
+    expect(composer(app).plainText).toBe(other)
+
+    const previous = composer(app)
+    app.selectSession(b)
+    await until(async () => (await screen(app)).join("\n").includes(b), "B remounted")
+    await until(
+      () =>
+        app.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable &&
+        app.renderer.renderer.currentFocusedRenderable !== previous,
+      "the newly mounted B composer",
+    )
+    composer(app).gotoBufferEnd()
+    app.renderer.mockInput.pressKey("u", { ctrl: true })
+    await app.renderer.renderOnce()
+    expect(composer(app).plainText).toBe("")
+    app.renderer.mockInput.pressArrow("up")
+    await app.renderer.renderOnce()
+    expect(composer(app).plainText).toBe(newest)
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
+  }
+}, 20_000)
+
+test("retained search reconstructs saved paste ranges without replacing literal placeholders or dollar tokens", async () => {
+  const literal = "漢字 literal [Pasted ~3 lines] "
+  const first = "retained-range-token $$ $& $` $'\noriginal second line\noriginal third line"
+  const expected = literal + first + " "
+  const app = await startSession({ queue: [] })
+  try {
+    await until(
+      async () => (await screen(app)).join("\n").includes("already in the transcript"),
+      "the producer session",
+    )
+    await app.renderer.mockInput.typeText(literal)
+    await app.renderer.mockInput.pasteBracketedText(first)
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the range-bearing composer send")
+    expect(app.prompts[0]!.parts.at(-1)?.text).toBe(expected)
+    app.prompts[0]!.answer(json(transcript))
+    await until(async () => !(await screen(app)).join("\n").includes("pending"), "the settled send")
+    expect((await screen(app)).join("\n")).not.toContain("retained-range-token")
+    expect(await searchHistory(app, "retained-range-token")).not.toContain("No results found")
+    app.renderer.mockInput.pressEnter()
+    await app.renderer.renderOnce()
+    expect(composer(app).plainText).toBe(expected)
+    expect(app.prompts).toHaveLength(1)
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 2, "the explicit later send")
+    expect(app.prompts[1]!.parts.at(-1)?.text).toBe(expected)
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
+  }
+}, 20_000)
+
+test("history from a new-session submission is owned by the created session", async () => {
+  await using state = await tmpdir()
+  const app = await startSession({ state: state.path, home: true, queue: [] })
+  const text = "new-session-owned-history-token"
+  try {
+    await until(() => app.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "the home composer")
+    await app.renderer.mockInput.typeText(text)
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the new session send")
+    app.prompts[0]!.answer(json(transcript))
+    await until(async () => (await screen(app)).join("\n").includes(sessionID), "the created session")
+    await until(async () => !(await screen(app)).join("\n").includes("pending"), "the settled prompt")
+    app.renderer.mockInput.pressArrow("up")
+    await app.renderer.renderOnce()
+    expect(composer(app).plainText).toBe(text)
+    app.dispatch("prompt.clear")
+    expect(await searchHistory(app, text)).not.toContain("No results found")
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
+  }
+}, 20_000)
+
+test("search reaches unrendered recall history and ENTER appends original multiline text without sending", async () => {
+  await using state = await tmpdir()
+  const original = "older-unrendered-history-token\noriginal second line"
+  const marked = "CUSTOM-HOLD: unrendered-machine-token"
+  const seeded = await startSession({ state: state.path, queue: [] })
+  try {
+    await until(
+      async () => (await screen(seeded)).join("\n").includes("already in the transcript"),
+      "the producer session",
+    )
+    for (const [index, text] of [marked, original].entries()) {
+      await seeded.renderer.mockInput.pasteBracketedText(text)
+      seeded.renderer.mockInput.pressEnter()
+      await until(() => seeded.prompts.length === index + 1, "history production")
+      seeded.prompts[index]!.answer(json(transcript))
+      await until(async () => !(await screen(seeded)).join("\n").includes("pending"), "settled send")
+    }
+    await until(
+      async () =>
+        (await Bun.file(path.join(state.path, "prompt-history.jsonl")).text()).includes("original second line"),
+      "the retained prompt",
+    )
+  } finally {
+    seeded.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await seeded.stop()
+  }
+  const app = await startSession({
+    state: state.path,
+    queue: [],
+    serverConfig: { machine_message_markers: { hold: [{ type: "prefix", value: "CUSTOM-HOLD:" }] } },
+  })
+  try {
+    await until(
+      async () => (await screen(app)).join("\n").includes("already in the transcript"),
+      "only the newer loaded transcript",
+    )
+    expect((await screen(app)).join("\n")).not.toContain("older-unrendered-history-token")
+    app.renderer.mockInput.pressArrow("up")
+    await app.renderer.renderOnce()
+    expect(composer(app).plainText).toBe(original)
+    app.dispatch("prompt.clear")
+    expect(await searchHistory(app, "unrendered-machine-token")).toContain("No results found")
+    app.renderer.mockInput.pressEscape()
+    await until(
+      () => app.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable,
+      "the editable draft",
+    )
+    await app.renderer.mockInput.typeText("existing draft ")
+    await app.renderer.mockInput.pasteBracketedText("one\ntwo\nthree")
+    await until(async () => (await screen(app)).join("\n").includes("[Pasted ~3 lines]"), "the draft's tracked paste")
+    const existing = composer(app).plainText
+    app.renderer.mockInput.pressKey("a", { ctrl: true })
+    app.renderer.mockInput.pressArrow("right")
+    expect(composer(app).cursorOffset).toBeLessThan(composer(app).plainText.length)
+    expect(await searchHistory(app, "older-unrendered-history-token")).not.toContain("No results found")
+    app.renderer.mockInput.pressEnter()
+    await app.renderer.renderOnce()
+    expect(composer(app).plainText).toBe(existing + original)
+    expect((await screen(app)).join("\n")).not.toContain("Timeline")
+    await app.renderer.mockInput.typeText(" plus my edit")
+    expect(composer(app).plainText).toBe(existing + original + " plus my edit")
+    expect(app.prompts).toHaveLength(0)
+    expect(app.executions).toEqual([])
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "explicit later submit")
+    expect(app.prompts[0]!.parts.at(-1)?.text).toBe("existing draft one\ntwo\nthree " + original + " plus my edit")
+    expect(app.prompts[0]!.parts.at(-1)?.metadata?.[SessionPromptQueue.TuiPromptAppendMetadataKey]).toBeUndefined()
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
+  }
+}, 30_000)
+
 async function submitComposerPrompt(text: string, appended = false) {
   const app = await startSession({ queue: [], status: { type: "busy" } })
   try {
@@ -522,9 +837,7 @@ test("timeline search uses queue-produced human provenance and excludes injected
   const candidates = timelineOptions({
     sessionID: fixture.sessionID,
     messages: fixtureMessages.map((message) => message.info as unknown as Message),
-    parts: Object.fromEntries(
-      fixtureMessages.map((message) => [message.info.id, message.parts as unknown as Part[]]),
-    ),
+    parts: Object.fromEntries(fixtureMessages.map((message) => [message.info.id, message.parts as unknown as Part[]])),
     markers: { hold: [{ type: "prefix", value: "CUSTOM-HOLD:" }] },
   })
   const titles = candidates.map((candidate) => candidate.title)
@@ -574,7 +887,10 @@ test("timeline search uses queue-produced human provenance and excludes injected
     await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the reopened timeline")
     await Bun.sleep(10)
     await app.renderer.mockInput.typeText("pre-upgrade-history-token")
-    await until(async () => (await screen(app)).some((line) => line.includes("No results found")), "unknown history exclusion")
+    await until(
+      async () => (await screen(app)).some((line) => line.includes("No results found")),
+      "unknown history exclusion",
+    )
     app.renderer.mockInput.pressEnter()
     expect((await screen(app)).some((line) => line.includes("Message Actions"))).toBe(false)
     app.renderer.mockInput.pressEscape()
@@ -582,7 +898,10 @@ test("timeline search uses queue-produced human provenance and excludes injected
     await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the reopened timeline")
     await Bun.sleep(10)
     await app.renderer.mockInput.typeText("legacy-app-history-token")
-    await until(async () => (await screen(app)).some((line) => line.includes("No results found")), "originless queue exclusion")
+    await until(
+      async () => (await screen(app)).some((line) => line.includes("No results found")),
+      "originless queue exclusion",
+    )
     app.renderer.mockInput.pressEnter()
     expect((await screen(app)).some((line) => line.includes("Message Actions"))).toBe(false)
     app.renderer.mockInput.pressEscape()
@@ -591,20 +910,18 @@ test("timeline search uses queue-produced human provenance and excludes injected
     await Bun.sleep(10)
     await app.renderer.mockInput.typeText("direct-composer-history-token")
     app.renderer.mockInput.pressEnter()
-    await until(
-      async () => (await screen(app)).some((line) => line.includes("Message Actions")),
-      "direct composer message actions",
-    )
+    await app.renderer.renderOnce()
+    expect(app.prompts).toHaveLength(0)
+    expect(composer(app).plainText).toContain("direct-composer-history-token")
     app.renderer.mockInput.pressEscape()
     app.renderer.mockInput.pressKey("r", { ctrl: true })
     await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the reopened timeline")
     await Bun.sleep(10)
     await app.renderer.mockInput.typeText("typed-history-token")
     app.renderer.mockInput.pressEnter()
-    await until(
-      async () => (await screen(app)).some((line) => line.includes("Message Actions")),
-      "the human message actions",
-    )
+    await app.renderer.renderOnce()
+    expect(app.prompts).toHaveLength(0)
+    expect(composer(app).plainText).toContain("typed-history-token")
   } finally {
     await app.stop()
   }
@@ -625,7 +942,10 @@ test("timeline fails closed for a queue-produced prompt without composer origin"
     await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the timeline dialog")
     await Bun.sleep(10)
     app.renderer.mockInput.typeText("legacy-app-history-token")
-    await until(async () => (await screen(app)).some((line) => line.includes("No results found")), "originless prompt exclusion")
+    await until(
+      async () => (await screen(app)).some((line) => line.includes("No results found")),
+      "originless prompt exclusion",
+    )
     app.renderer.mockInput.pressEnter()
     expect((await screen(app)).some((line) => line.includes("Message Actions"))).toBe(false)
   } finally {
@@ -762,6 +1082,102 @@ test("ctrl+e keeps its line-end action in a managed dialog input", async () => {
 
     expect((await screen(app)).join("\n")).toContain("renamed Queue session tail")
     expect(app.enhancements).toHaveLength(0)
+    expect(app.prompts).toHaveLength(0)
+  } finally {
+    await app.stop()
+  }
+}, 20_000)
+
+test("ctrl+e without an override follows the live non-Google session model and later model changes", async () => {
+  const app = await startSession({
+    queue: [],
+    providers: [
+      {
+        ...provider,
+        models: {
+          ...provider.models,
+          second: { ...provider.models.model!, id: "second", name: "Second Model", variants: {} },
+        },
+      },
+    ],
+    enhance: (payload) => json(payload.draft),
+  })
+  try {
+    await until(async () => (await screen(app)).join("\n").includes("already in the transcript"), "session model")
+    await app.renderer.mockInput.typeText("editable current-model draft")
+    app.renderer.mockInput.pressKey("e", { ctrl: true })
+    await until(() => app.enhancements.length === 1, "current-model request")
+    expect(app.enhancements[0]!.model).toBe("test/model")
+    await until(() => app.commands().includes("prompt.enhance"), "completed enhancement")
+    app.dispatch("model.list")
+    await until(() => app.renderer.renderer.currentFocusedRenderable instanceof InputRenderable, "model picker focus")
+    await app.renderer.mockInput.typeText("Second Model")
+    await until(async () => (await screen(app)).join("\n").includes("Second Model"), "the second model option")
+    app.renderer.mockInput.pressEnter()
+    await until(
+      () => app.selections.some((selection) => (selection as { model?: { id: string } }).model?.id === "second"),
+      "selected second model",
+    )
+    await until(
+      () => app.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable,
+      "draft focus after model change",
+    )
+    app.renderer.mockInput.pressKey("e", { ctrl: true })
+    await until(() => app.enhancements.length === 2, "changed-model request")
+    expect(app.enhancements[1]!.model).toBe("test/second")
+    expect(app.prompts).toHaveLength(0)
+  } finally {
+    await app.stop()
+  }
+}, 20_000)
+
+test("ctrl+e explicit overrides win even when the override equals the approved fallback", async () => {
+  for (const model of ["test/explicit-enhance", "google/gemini-3.8-flash"]) {
+    const app = await startSession({
+      queue: [],
+      tuiConfig: createTuiResolvedConfig({ plugin_enabled: {}, prompt_enhance_model: model }),
+    })
+    try {
+      await until(
+        async () => (await screen(app)).join("\n").includes("already in the transcript"),
+        "non-Google current model",
+      )
+      await app.renderer.mockInput.typeText("override draft")
+      app.renderer.mockInput.pressKey("e", { ctrl: true })
+      await until(() => app.enhancements.length === 1, "override request")
+      expect(app.enhancements[0]!.model).toBe(model)
+      expect(app.prompts).toHaveLength(0)
+    } finally {
+      await app.stop()
+    }
+  }
+}, 20_000)
+
+test("ctrl+e uses approved Flash only without a resolved current model and preserves a failed draft", async () => {
+  const app = await startSession({
+    queue: [],
+    providers: [{ ...provider, models: {} }],
+    messages: [],
+    enhance: () => json({ name: "InternalServerError", message: "fallback provider unavailable" }, { status: 500 }),
+  })
+  try {
+    await until(async () => (await screen(app)).join("\n").includes(sessionID), "session without a provider")
+    await until(
+      () => app.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable,
+      "the fallback composer focus",
+    )
+    await app.renderer.mockInput.typeText("keep fallback failure editable")
+    await until(() => app.commands().includes("prompt.enhance"), "the fallback enhancement command")
+    app.renderer.mockInput.pressKey("e", { ctrl: true })
+    await until(() => app.enhancements.length === 1, "fallback request")
+    expect(app.enhancements[0]!.model).toBe("google/gemini-3.8-flash")
+    await until(
+      async () => (await screen(app)).join("\n").includes("Failed to enhance prompt"),
+      "fallback failure notice",
+    )
+    expect(composer(app).plainText).toBe("keep fallback failure editable")
+    await app.renderer.mockInput.typeText(" still editing")
+    expect(composer(app).plainText).toBe("keep fallback failure editable still editing")
     expect(app.prompts).toHaveLength(0)
   } finally {
     await app.stop()
@@ -1006,13 +1422,10 @@ test("ctrl+e context follows each reasoning and tool part's rendered expansion",
 
     await clickVisible(app, "Thought: Local thought")
     await clickVisible(app, "Click to expand")
-    await until(
-      async () => {
-        const frame = (await screen(app)).join("\n")
-        return frame.includes("expanded reasoning visible in the session") && frame.includes("shell-tail-visible-token")
-      },
-      "expanded reasoning and shell output",
-    )
+    await until(async () => {
+      const frame = (await screen(app)).join("\n")
+      return frame.includes("expanded reasoning visible in the session") && frame.includes("shell-tail-visible-token")
+    }, "expanded reasoning and shell output")
     app.dispatch("prompt.enhance")
     await until(() => app.enhancements.length === 2, "expanded part context")
     expect(app.enhancements[1]!.context).toContain("expanded reasoning visible in the session")
@@ -1028,7 +1441,10 @@ test("ctrl+e context follows each reasoning and tool part's rendered expansion",
     expect(app.enhancements[2]!.context).toContain("generic line 1")
     expect(app.enhancements[2]!.context).not.toContain("generic-tail-visible-token")
     await clickVisible(app, "Click to expand")
-    await until(async () => (await screen(app)).some((line) => line.includes("generic-tail-visible-token")), "expanded generic output")
+    await until(
+      async () => (await screen(app)).some((line) => line.includes("generic-tail-visible-token")),
+      "expanded generic output",
+    )
     app.dispatch("prompt.enhance")
     await until(() => app.enhancements.length === 4, "expanded generic part context")
     expect(app.enhancements[3]!.context).toContain("generic-tail-visible-token")
@@ -1150,18 +1566,15 @@ test("ctrl+e context includes visible tool errors and diagnostics", async () => 
   ]
   const app = await startSession({ queue: [], messages })
   try {
-    await until(
-      async () => {
-        const frame = (await screen(app)).join("\n")
-        return (
-          frame.includes("visible BlockTool error token") &&
-          frame.includes("visible tool diagnostic token") &&
-          frame.includes("Patch failed") &&
-          frame.includes("Todo update failed")
-        )
-      },
-      "visible block error and diagnostics",
-    )
+    await until(async () => {
+      const frame = (await screen(app)).join("\n")
+      return (
+        frame.includes("visible BlockTool error token") &&
+        frame.includes("visible tool diagnostic token") &&
+        frame.includes("Patch failed") &&
+        frame.includes("Todo update failed")
+      )
+    }, "visible block error and diagnostics")
     await app.renderer.mockInput.typeText("rewrite from visible tool errors")
     app.renderer.mockInput.pressKey("e", { ctrl: true })
     await until(() => app.enhancements.length === 1, "context with visible errors")

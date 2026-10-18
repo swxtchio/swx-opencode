@@ -146,7 +146,7 @@ it.instance("loads the prompt enhancement model from the dedicated tui config", 
     Effect.gen(function* () {
       const fs = yield* FSUtil.Service
       const test = yield* TestInstance
-      expect((yield* getTuiConfig(test.directory)).prompt_enhance_model).toBe("google/gemini-4-argon")
+      expect((yield* getTuiConfig(test.directory)).prompt_enhance_model).toBeUndefined()
       yield* fs.writeJson(path.join(test.directory, "tui.json"), {
         prompt_enhance_model: "test/rewrite-model",
       })

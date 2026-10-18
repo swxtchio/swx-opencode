@@ -64,7 +64,7 @@ test("resolves host-neutral defaults", () => {
   expect(config.keybinds.has("terminal.suspend")).toBe(true)
   expect(config.keybinds.has("session.list")).toBe(true)
   expect(config.cursor).toBeUndefined()
-  expect(config.prompt_enhance_model).toBe("google/gemini-4-argon")
+  expect(config.prompt_enhance_model).toBeUndefined()
 })
 
 test("resolves overrides without mutating input", () => {

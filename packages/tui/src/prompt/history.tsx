@@ -27,18 +27,24 @@ export type PromptInfo = {
 
 export const MAX_HISTORY_ENTRIES = 50
 
+export type PromptHistoryEntry = PromptInfo & { sessionID: string; origin: "tui-composer" }
+
 export function parsePromptHistory(text: string) {
   return text
     .split("\n")
     .filter(Boolean)
     .map((line) => {
       try {
-        return JSON.parse(line) as PromptInfo
+        const entry = JSON.parse(line) as Partial<PromptHistoryEntry> | null
+        // Legacy home-wide entries cannot be attributed to the session opening them.
+        if (!entry || typeof entry.sessionID !== "string" || !entry.sessionID) return
+        if (typeof entry.input !== "string" || !Array.isArray(entry.parts)) return
+        return entry as PromptHistoryEntry
       } catch {
         return undefined
       }
     })
-    .filter((line): line is PromptInfo => line !== undefined)
+    .filter((line): line is PromptHistoryEntry => line !== undefined)
     .slice(-MAX_HISTORY_ENTRIES)
 }
 
@@ -63,28 +69,36 @@ export const { use: usePromptHistory, provider: PromptHistoryProvider } = create
 
     const [store, setStore] = createStore({
       index: 0,
-      history: [] as PromptInfo[],
+      history: [] as PromptHistoryEntry[],
     })
 
+    const list = (sessionID: string | undefined) => store.history.filter((item) => item.sessionID === sessionID)
+
     return {
-      move(direction: 1 | -1, input: string) {
-        if (!store.history.length) return undefined
-        const current = store.history.at(store.index)
+      list,
+      reset() {
+        setStore("index", 0)
+      },
+      move(sessionID: string | undefined, direction: 1 | -1, input: string): PromptInfo | undefined {
+        const history = list(sessionID)
+        if (!history.length) return undefined
+        const current = history.at(store.index)
         if (!current) return undefined
         if (current.input !== input && input.length) return
         setStore(
           produce((draft) => {
             const next = store.index + direction
-            if (Math.abs(next) > store.history.length) return
+            if (Math.abs(next) > history.length) return
             if (next > 0) return
             draft.index = next
           }),
         )
         if (store.index === 0) return { input: "", parts: [] }
-        return store.history.at(store.index)
+        return history.at(store.index)
       },
-      append(item: PromptInfo) {
-        const entry = structuredClone(unwrap(item))
+      append(sessionID: string | undefined, item: PromptInfo) {
+        if (!sessionID) return
+        const entry: PromptHistoryEntry = { ...structuredClone(unwrap(item)), sessionID, origin: "tui-composer" }
         if (isDuplicateEntry(store.history.at(-1), entry)) {
           setStore("index", 0)
           return
