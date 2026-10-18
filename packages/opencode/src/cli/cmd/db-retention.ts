@@ -376,7 +376,7 @@ const activityColumns = [
   },
   { table: "todo", scope: "session_id", required: ["time_created", "time_updated"], optional: [] },
   { table: "session_share", scope: "session_id", required: ["time_created", "time_updated"], optional: [] },
-  { table: "session_ask", scope: "session_id", required: ["time_created"], optional: ["time_settled"] },
+  { table: "session_ask", scope: "session_id", required: ["time_created"], optional: ["time_settled", "time_applied"] },
   { table: "event_aggregate_writer", scope: "aggregate_id", required: ["time_last_append"], optional: [] },
 ] as const
 

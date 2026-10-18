@@ -10,6 +10,7 @@ import { Duration, Effect, Schedule } from "effect"
 import { HttpClient, HttpClientRequest } from "effect/unstable/http"
 import { json, watchEvents, writeReceiver } from "../../lib/ask-receiver"
 import { cliIt, deadline, testModelID } from "../../lib/cli-process"
+import { raw } from "../../lib/llm-server"
 import { testProviderConfig } from "../../lib/test-provider"
 
 const questions = [
@@ -426,7 +427,7 @@ describe("opencode serve --questions-command (subprocess)", () => {
         yield* Effect.promise(() => old.exited)
         const sqlite = new Database(file)
         sqlite.run("DROP TABLE session_ask")
-        sqlite.run("DELETE FROM migration WHERE id = '20261017192742_session_ask'")
+        sqlite.run("DELETE FROM migration WHERE id = '20261017233837_session_ask'")
         sqlite.close()
 
         const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
@@ -495,6 +496,210 @@ describe("opencode serve --questions-command (subprocess)", () => {
         expect(yield* llm.calls).toBe(2)
       }),
     120_000,
+  )
+
+  cliIt.live(
+    "an answer after a restart whose call cannot be written settles nothing, and a retry applies it",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const file = path.join(home, "atomic.db")
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        const extraArgs = ["--questions-command", receiver.path]
+        yield* llm.tool("question", { questions: [questions[1]] })
+        yield* llm.text("continued once applied")
+        const first = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        const sessionID = yield* startTurn(first.url, home)
+        const [emitted] = yield* receiver.read(1)
+        first.kill()
+        yield* Effect.promise(() => first.exited)
+
+        const second = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        const answer = json(
+          HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Applied"]] }),
+          ),
+          home,
+        )
+        const sqlite = new Database(file)
+        sqlite.run("PRAGMA busy_timeout = 10000")
+        sqlite.run("CREATE TRIGGER hold_part BEFORE UPDATE ON part BEGIN SELECT RAISE(ABORT, 'part held'); END")
+        const failed = yield* answer
+        sqlite.run("DROP TRIGGER hold_part")
+        sqlite.close()
+        expect(failed.status).toBe(503)
+        expect(failed.body).toMatchObject({ requestID: emitted.id, reason: "store-unavailable" })
+        const listed = yield* json(HttpClientRequest.get(`${second.url}/question`), home)
+        expect(listed.body.map((item: { id: string }) => item.id)).toEqual([emitted.id])
+
+        expect((yield* answer).body).toMatchObject({ disposition: "settled", recovered: true })
+        const part = yield* toolPart(second.url, home, sessionID, emitted.origin.callID, "completed")
+        expect(part.state.output).toContain(`"What should the banner say?"="Applied"`)
+        yield* assistantText(second.url, home, sessionID, "continued once applied")
+      }),
+    120_000,
+  )
+
+  cliIt.live(
+    "an answer settled just before its server died reaches the call after the restart",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const file = path.join(home, "settled.db")
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        const extraArgs = ["--questions-command", receiver.path]
+        yield* llm.tool("question", { questions: [questions[1]] })
+        yield* llm.text("continued with the recorded answer")
+        const first = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        const sessionID = yield* startTurn(first.url, home)
+        const [emitted] = yield* receiver.read(1)
+        first.kill()
+        yield* Effect.promise(() => first.exited)
+        // The ledger committed an answer, and the process died before the waiting call took it.
+        const sqlite = new Database(file)
+        sqlite
+          .query("UPDATE session_ask SET decision = ?, time_settled = ? WHERE id = ?")
+          .run(JSON.stringify({ type: "answered", answers: [["Recorded"]] }), Date.now(), emitted.id)
+        sqlite.close()
+
+        const second = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        const repeated = yield* json(
+          HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Different"]] }),
+          ),
+          home,
+        )
+        expect(repeated.body).toEqual({
+          requestID: emitted.id,
+          sessionID,
+          disposition: "duplicate",
+          decision: { type: "answered", answers: [["Recorded"]] },
+          recovered: true,
+        })
+        const part = yield* toolPart(second.url, home, sessionID, emitted.origin.callID, "completed")
+        expect(part.state.output).toContain(`"What should the banner say?"="Recorded"`)
+        yield* assistantText(second.url, home, sessionID, "continued with the recorded answer")
+      }),
+    120_000,
+  )
+
+  cliIt.live(
+    "a recovered call whose continuation was lost with its server continues on the next answer",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const file = path.join(home, "wake.db")
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        const extraArgs = ["--questions-command", receiver.path]
+        yield* llm.tool("question", { questions: [questions[1]] })
+        yield* llm.text("continued after the lost wake")
+        const first = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        const sessionID = yield* startTurn(first.url, home)
+        const [emitted] = yield* receiver.read(1)
+        first.kill()
+        yield* Effect.promise(() => first.exited)
+        // A recovery committed the call's outcome, and its process died before the wake that continues the turn.
+        const sqlite = new Database(file)
+        const stored = sqlite
+          .query<
+            { id: string; data: string },
+            [string, string]
+          >("SELECT id, data FROM part WHERE session_id = ? AND json_extract(data, '$.callID') = ?")
+          .get(sessionID, emitted.origin.callID)!
+        const data = JSON.parse(stored.data)
+        data.state = {
+          status: "completed",
+          input: data.state.input,
+          output: 'User has answered your questions: "What should the banner say?"="Recovered".',
+          title: "Asked 1 question",
+          metadata: { answers: [["Recovered"]] },
+          time: { start: data.state.time.start, end: Date.now() },
+        }
+        sqlite.query("UPDATE part SET data = ? WHERE id = ?").run(JSON.stringify(data), stored.id)
+        sqlite
+          .query("UPDATE session_ask SET decision = ?, time_settled = ?, time_applied = ?, recovered = 1 WHERE id = ?")
+          .run(JSON.stringify({ type: "answered", answers: [["Recovered"]] }), Date.now(), Date.now(), emitted.id)
+        sqlite.close()
+
+        const second = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        const repeated = yield* json(
+          HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Recovered"]] }),
+          ),
+          home,
+        )
+        expect(repeated.body).toMatchObject({ disposition: "duplicate", recovered: true })
+        yield* assistantText(second.url, home, sessionID, "continued after the lost wake")
+        expect(JSON.stringify((yield* llm.inputs)[1])).toContain("Recovered")
+      }),
+    120_000,
+  )
+
+  cliIt.live(
+    "a doom loop ask is emitted with the call that repeated",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const notes = path.join(home, "notes.txt")
+        yield* Effect.promise(() => Bun.write(notes, "notes"))
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        const server = yield* opencode.serve({ extraArgs: ["--questions-command", receiver.path] })
+        // One response repeating the same call three times, the doom loop threshold.
+        const chunk = (delta: unknown, finish?: string) => ({
+          id: "chatcmpl-test",
+          object: "chat.completion.chunk",
+          choices: [{ delta, ...(finish ? { finish_reason: finish } : {}) }],
+        })
+        const call = (index: number) =>
+          chunk({
+            tool_calls: [
+              {
+                index,
+                id: `call_loop_${index}`,
+                type: "function",
+                function: { name: "read", arguments: JSON.stringify({ filePath: notes }) },
+              },
+            ],
+          })
+        yield* llm.push(
+          raw({ chunks: [chunk({ role: "assistant" }), call(0), call(1), call(2), chunk({}, "tool_calls")] }),
+        )
+        yield* llm.text("stopped looping")
+        const sessionID = yield* startTurn(server.url, home)
+        const [emitted] = yield* receiver.read(1)
+
+        expect(emitted).toMatchObject({ kind: "permission", sessionID, permission: { permission: "doom_loop" } })
+        expect(emitted.origin.messageID).toStartWith("msg_")
+        const part = yield* toolPart(server.url, home, sessionID, emitted.origin.callID, "running")
+        expect(part.tool).toBe("read")
+        const settled = yield* json(
+          HttpClientRequest.post(`${server.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ reply: "once" }),
+          ),
+          home,
+        )
+        expect(settled.body).toMatchObject({ disposition: "settled" })
+        yield* assistantText(server.url, home, sessionID, "stopped looping")
+      }),
+    90_000,
+  )
+
+  cliIt.live(
+    "a server bound to a wildcard address names its loopback URL to the receiver",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        const server = yield* opencode.serve({ hostname: "0.0.0.0", extraArgs: ["--questions-command", receiver.path] })
+        yield* llm.tool("question", { questions: [questions[1]] })
+        yield* llm.text("done")
+        yield* startTurn(server.url, home)
+        const [emitted] = yield* receiver.read(1)
+        expect(emitted.server).toBe(`http://127.0.0.1:${new URL(server.url).port}`)
+        const settled = yield* json(
+          HttpClientRequest.post(`${emitted.server}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Hello"]] }),
+          ),
+          home,
+        )
+        expect(settled.body).toMatchObject({ disposition: "settled" })
+      }),
+    90_000,
   )
 
   cliIt.live("refuses to start when the questions command is not an executable", ({ opencode, home }) =>

@@ -53,6 +53,7 @@ export default {
           \`recovered\` integer DEFAULT false NOT NULL,
           \`time_created\` integer NOT NULL,
           \`time_settled\` integer,
+          \`time_applied\` integer,
           CONSTRAINT \`fk_session_ask_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)

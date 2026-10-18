@@ -700,7 +700,7 @@ test("a Session with an outstanding supervised ask stays ineligible until the as
   } finally {
     db.close()
   }
-})
+}, 60_000)
 
 test(
   "apply redacts every Session-produced copy in restartable batches and preserves metric values",

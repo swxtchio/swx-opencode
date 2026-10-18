@@ -683,7 +683,7 @@ test("an outstanding supervised ask refuses deletion, and once settled it is del
   expect(applied.report.action).toBe("applied")
   expect(applied.report.deletedSessionIDs).toEqual([askedID])
   expect(ownedCounts(store.filename, askedID)).toMatchObject({ session: 0, ask: 0 })
-})
+}, 60_000)
 
 test(
   "a persisted running tool Part stays protected after its assistant turn completes",

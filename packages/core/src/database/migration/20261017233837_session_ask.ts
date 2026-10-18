@@ -2,7 +2,7 @@ import { Effect } from "effect"
 import type { DatabaseMigration } from "../migration"
 
 export default {
-  id: "20261017192742_session_ask",
+  id: "20261017233837_session_ask",
   up(tx) {
     return Effect.gen(function* () {
       yield* tx.run(`
@@ -18,6 +18,7 @@ export default {
           \`recovered\` integer DEFAULT false NOT NULL,
           \`time_created\` integer NOT NULL,
           \`time_settled\` integer,
+          \`time_applied\` integer,
           CONSTRAINT \`fk_session_ask_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)

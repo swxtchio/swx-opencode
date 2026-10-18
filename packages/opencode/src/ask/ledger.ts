@@ -19,12 +19,11 @@ export type Row = typeof SessionAskTable.$inferSelect
 // waited on by a process that cannot be reached from here. Nothing was settled.
 export class UnavailableError extends Schema.TaggedErrorClass<UnavailableError>()("SessionAsk.UnavailableError", {
   requestID: Schema.String,
-  reason: Schema.Literals(["store-unavailable", "owned-by-live-process", "waiter-lost"]),
+  reason: Schema.Literals(["store-unavailable", "owned-by-live-process"]),
 }) {
   override get message() {
     if (this.reason === "owned-by-live-process")
       return `Ask ${this.requestID} is waited on by another live process; answer it on that process's server`
-    if (this.reason === "waiter-lost") return `Ask ${this.requestID} is pending but its waiting tool is gone`
     return `Ask ${this.requestID} state could not be read or written`
   }
 }
@@ -35,7 +34,9 @@ export type Resolution = {
   readonly disposition: SessionAsk.Disposition
   readonly decision: SessionAsk.Decision
   readonly recovered: boolean
-  // Set when this answer settled an ask whose waiting process is gone: the caller applies it to the stored tool call.
+  // Set when the process that waited on the ask is gone. Nothing has acted on the answer yet, and a still-pending ask
+  // is not settled: the caller hands the resolution to AskRecovery, which settles it and applies the accepted decision
+  // to the stored tool call in one transaction, and returns the final resolution.
   readonly recover?: Row
 }
 
@@ -48,8 +49,8 @@ export interface Interface {
     tool?: string
     request: Row["request"]
   }) => Effect.Effect<void>
-  // The ask in this instance's directory, so another directory's ask is unknown here.
-  readonly find: (id: string) => Effect.Effect<Row | undefined, UnavailableError>
+  // The ask of this kind in this instance's directory, so another directory's ask is unknown here.
+  readonly find: (id: string, kind: SessionAsk.Kind) => Effect.Effect<Row | undefined, UnavailableError>
   readonly owner: (row: Row) => Effect.Effect<"self" | "alive" | "gone" | "unknown">
   // Settles a pending ask once. `won` is false when another resolver settled it first.
   readonly settle: (input: {
@@ -57,13 +58,20 @@ export interface Interface {
     decision: SessionAsk.Decision
     recovered: boolean
   }) => Effect.Effect<{ won: boolean; row: Row }, UnavailableError>
-  // Settles an emitted ask with its first decision. `live` says whether this process still waits on it; without a
-  // waiter the ask is settled only when its owning process is gone, and is then handed back for recovery.
+  // Marks a settled ask's decision as written into its stored tool call by recovery.
+  readonly applied: (id: string) => Effect.Effect<void, UnavailableError>
+  // Settles an emitted ask with its first decision. `live` says whether this process still waits on it. Without a
+  // waiter, an ask whose owning process is gone is handed back for recovery, settled or not; a pending one this
+  // process owns lost its waiter and is cancelled; and a pending one another live process owns is refused.
   readonly decide: (input: {
     id: string
+    kind: SessionAsk.Kind
     decision: SessionAsk.Decision
     live: () => boolean
-  }) => Effect.Effect<{ type: "unknown" } | { type: "duplicate" | "won"; resolution: Resolution }, UnavailableError>
+  }) => Effect.Effect<
+    { type: "unknown" } | { type: "duplicate" | "won" | "recover"; resolution: Resolution },
+    UnavailableError
+  >
   // Ends a still-pending ask whose waiter stopped waiting. A no-op unless emission is configured.
   readonly cancel: (id: string) => Effect.Effect<void>
   // Pending asks of this directory that this process can settle: its own or a gone process's.
@@ -148,12 +156,14 @@ const layer = Layer.effect(
       yield* AskEmit.send(settings.command, payload).pipe(Effect.forkDetach({ startImmediately: true }))
     })
 
-    const find = Effect.fn("AskLedger.find")(function* (id: string) {
+    const find = Effect.fn("AskLedger.find")(function* (id: string, kind: SessionAsk.Kind) {
       const directory = yield* InstanceState.directory
       return yield* db
         .select()
         .from(SessionAskTable)
-        .where(and(eq(SessionAskTable.id, id), eq(SessionAskTable.directory, directory)))
+        .where(
+          and(eq(SessionAskTable.id, id), eq(SessionAskTable.kind, kind), eq(SessionAskTable.directory, directory)),
+        )
         .get()
         .pipe(unavailable(id))
     })
@@ -181,6 +191,15 @@ const layer = Layer.effect(
         .pipe(unavailable(input.id))
     })
 
+    const applied = Effect.fn("AskLedger.applied")(function* (id: string) {
+      yield* db
+        .update(SessionAskTable)
+        .set({ time_applied: Date.now(), recovered: true })
+        .where(eq(SessionAskTable.id, id))
+        .run()
+        .pipe(unavailable(id))
+    })
+
     const pending = Effect.fn("AskLedger.pending")(function* (kind: SessionAsk.Kind) {
       const directory = yield* InstanceState.directory
       const rows = yield* db
@@ -201,22 +220,37 @@ const layer = Layer.effect(
     })
 
     const decide = Effect.fn("AskLedger.decide")(function* (input: Parameters<Interface["decide"]>[0]) {
-      const row = yield* find(input.id)
+      const row = yield* find(input.id, input.kind)
       if (!row) return { type: "unknown" as const }
+      if (input.live()) {
+        const settled = yield* settle({ id: input.id, decision: input.decision, recovered: false })
+        if (!settled.won) return { type: "duplicate" as const, resolution: resolution(settled.row, "duplicate") }
+        return { type: "won" as const, resolution: resolution(settled.row, "settled") }
+      }
+      const holder = yield* owner(row)
+      if (holder === "gone") {
+        // A settled ask is handed back too: its decision may never have reached the call before the process died.
+        if (row.time_settled !== null) {
+          const settled = resolution(row, "duplicate")
+          if (settled.decision.type === "cancelled") return { type: "duplicate" as const, resolution: settled }
+          return { type: "recover" as const, resolution: { ...settled, recover: row } }
+        }
+        return {
+          type: "recover" as const,
+          resolution: {
+            ...resolution(row, "settled"),
+            decision: input.decision,
+            recovered: true,
+            recover: row,
+          },
+        }
+      }
       if (row.time_settled !== null) return { type: "duplicate" as const, resolution: resolution(row, "duplicate") }
-      const live = input.live()
-      if (!live) {
-        const holder = yield* owner(row)
-        if (holder === "self") return yield* new UnavailableError({ requestID: input.id, reason: "waiter-lost" })
-        if (holder !== "gone")
-          return yield* new UnavailableError({ requestID: input.id, reason: "owned-by-live-process" })
-      }
-      const settled = yield* settle({ id: input.id, decision: input.decision, recovered: !live })
-      if (!settled.won) return { type: "duplicate" as const, resolution: resolution(settled.row, "duplicate") }
-      return {
-        type: "won" as const,
-        resolution: { ...resolution(settled.row, "settled"), ...(live ? {} : { recover: settled.row }) },
-      }
+      if (holder !== "self")
+        return yield* new UnavailableError({ requestID: input.id, reason: "owned-by-live-process" })
+      // This process recorded the ask but no longer waits on it, so no answer can reach the call: end it.
+      const ended = yield* settle({ id: input.id, decision: { type: "cancelled" }, recovered: false })
+      return { type: "duplicate" as const, resolution: resolution(ended.row, "duplicate") }
     })
 
     const cancel = Effect.fn("AskLedger.cancel")(function* (id: string) {
@@ -229,7 +263,7 @@ const layer = Layer.effect(
         .pipe(Effect.catchCause((cause) => Effect.logWarning("ask cancel failed", { id, cause: Cause.pretty(cause) })))
     })
 
-    return Service.of({ admit, find, owner, settle, decide, cancel, pending })
+    return Service.of({ admit, find, owner, settle, applied, decide, cancel, pending })
   }),
 )
 

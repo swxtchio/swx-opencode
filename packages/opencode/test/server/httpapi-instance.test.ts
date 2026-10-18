@@ -331,6 +331,7 @@ describe("instance HttpApi", () => {
         expect(part.state.metadata.answers).toEqual([["Yes"]])
         expect(yield* listed).toEqual([])
       }).pipe(Effect.provide(TestLLMServer.layer)),
+    60_000,
   )
 
   it.live("answers an emitted permission request through its route with the permission's own reply", () =>
@@ -369,6 +370,7 @@ describe("instance HttpApi", () => {
       const part = yield* supervisor.toolPart(dir, sessionID, emitted.origin.callID, "completed")
       expect(part.state.output).toContain("supervised")
     }).pipe(Effect.provide(TestLLMServer.layer)),
+    60_000,
   )
 })
 

@@ -47,14 +47,15 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
   }),
 )
 
-// Settles through the service, then applies a decision the service handed back for recovery. Shared with the
+// Settles through the service, and recovery settles and applies a decision the service handed back. Shared with the
 // deprecated session permission route.
 export const settlePermission = Effect.fn("PermissionHttpApi.settle")(function* (
   svc: Permission.Interface,
   recovery: AskRecovery.Interface,
   input: PermissionV1.ReplyInput,
 ) {
-  const settled = yield* svc.reply(input).pipe(
+  return yield* svc.reply(input).pipe(
+    Effect.flatMap(recovery.apply),
     Effect.catchTag("Permission.NotFoundError", (error) =>
       Effect.fail(
         new PermissionNotFoundError({
@@ -69,6 +70,4 @@ export const settlePermission = Effect.fn("PermissionHttpApi.settle")(function* 
       ),
     ),
   )
-  yield* recovery.apply(settled)
-  return settled
 })

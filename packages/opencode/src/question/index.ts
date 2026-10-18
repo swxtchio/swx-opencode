@@ -110,14 +110,21 @@ const layer = Layer.effect(
         questions: input.questions,
         tool: input.tool,
       }
+      // A supervised ask is recovered through its tool call after a restart, so one without a call is refused.
+      if (AskEmit.current() && !input.tool) {
+        yield* Effect.logError("supervised question refused: it has no tool call", { id, producer: input.producer })
+        return yield* new RejectedError()
+      }
       // Waiting before the ask is recorded or published, so no resolver can find it without its waiter.
       pending.set(id, { info, deferred })
       return yield* Effect.gen(function* () {
         yield* ledger.admit({ id, sessionID: input.sessionID, kind: "question", tool: input.producer, request: info })
         yield* events.publish(Event.Asked, info)
-        // A turn aborted while waiting ends the ask, so no later answer is applied to it.
-        return yield* Deferred.await(deferred).pipe(Effect.onInterrupt(() => ledger.cancel(id)))
+        return yield* Deferred.await(deferred)
       }).pipe(
+        // However the ask ends, aborted or failed at any step included, a still-pending ledger row is cancelled
+        // before the waiter is dropped, so no later answer finds the row without its waiter.
+        Effect.onExit(() => ledger.cancel(id)),
         Effect.ensuring(
           Effect.sync(() => {
             pending.delete(id)
@@ -131,12 +138,15 @@ const layer = Layer.effect(
       decision: typeof SessionAsk.Answered.Type | typeof SessionAsk.Rejected.Type,
     ) {
       const pending = (yield* InstanceState.get(state)).pending
+      const complete = (existing: PendingEntry) =>
+        decision.type === "answered"
+          ? Deferred.succeed(existing.deferred, decision.answers)
+          : Deferred.fail(existing.deferred, new RejectedError())
       const deliver = Effect.fn("Question.deliver")(function* (existing: PendingEntry) {
         pending.delete(requestID)
         yield* Effect.logInfo(decision.type, { requestID })
         yield* publish(existing.info.sessionID, requestID, decision)
-        if (decision.type === "answered") yield* Deferred.succeed(existing.deferred, decision.answers)
-        if (decision.type === "rejected") yield* Deferred.fail(existing.deferred, new RejectedError())
+        yield* complete(existing)
       })
       const unknown = Effect.fn("Question.unknown")(function* () {
         yield* Effect.logWarning("answer for unknown request", { requestID })
@@ -156,19 +166,24 @@ const layer = Layer.effect(
         } satisfies AskLedger.Resolution
       }
 
-      const outcome = yield* ledger.decide({ id: requestID, decision, live: () => pending.has(requestID) })
-      if (outcome.type === "unknown") return yield* unknown()
-      if (outcome.type === "duplicate") return outcome.resolution
-      const existing = pending.get(requestID)
-      if (existing) {
-        yield* deliver(existing)
-        return outcome.resolution
-      }
-      // A live ask that stopped waiting after this answer won has nothing left to deliver to.
-      if (!outcome.resolution.recover) return outcome.resolution
-      yield* Effect.logInfo(decision.type, { requestID, recovered: true })
-      yield* publish(outcome.resolution.sessionID, requestID, decision)
-      return outcome.resolution
+      // Settling and handing the answer to the waiter are one step, so a cancelled caller cannot leave a settled ask
+      // whose waiter never receives it. A resolution handed back for recovery is not settled yet.
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          const outcome = yield* ledger.decide({
+            id: requestID,
+            kind: "question",
+            decision,
+            live: () => pending.has(requestID),
+          })
+          if (outcome.type === "unknown") return yield* unknown()
+          if (outcome.type !== "won") return outcome.resolution
+          const existing = pending.get(requestID)
+          // The waiter receives the answer even when its event cannot be published.
+          if (existing) yield* deliver(existing).pipe(Effect.onError(() => complete(existing)))
+          return outcome.resolution
+        }),
+      )
     })
 
     const publish = (

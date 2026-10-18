@@ -188,7 +188,7 @@ export class AskUnavailableError extends Schema.TaggedErrorClass<AskUnavailableE
   "AskUnavailableError",
   {
     requestID: Schema.String,
-    reason: Schema.Literals(["store-unavailable", "owned-by-live-process", "waiter-lost"]),
+    reason: Schema.Literals(["store-unavailable", "owned-by-live-process"]),
     message: Schema.String,
   },
   { httpApiStatus: 503 },

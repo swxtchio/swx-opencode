@@ -449,6 +449,7 @@ const layer = Layer.effect(
               .ask({
                 ...req,
                 sessionID,
+                tool: { messageID: assistantMessage.id, callID: part.callID },
                 ruleset: Permission.merge(taskAgent.permission, session.permission ?? []),
               })
               .pipe(Effect.orDie),

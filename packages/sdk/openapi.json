@@ -24727,7 +24727,7 @@
           },
           "reason": {
             "type": "string",
-            "enum": ["store-unavailable", "owned-by-live-process", "waiter-lost"]
+            "enum": ["store-unavailable", "owned-by-live-process"]
           },
           "message": {
             "type": "string"

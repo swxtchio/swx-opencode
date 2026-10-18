@@ -13,11 +13,12 @@ export const questionHandlers = HttpApiBuilder.group(InstanceHttpApi, "question"
     const svc = yield* Question.Service
     const recovery = yield* AskRecovery.Service
 
-    // Every route settles through the service, then applies a decision the service handed back for recovery.
+    // Every route settles through the service, and recovery settles and applies a decision the service handed back.
     const settle = Effect.fn("QuestionHttpApi.settle")(function* (
       resolution: Effect.Effect<AskLedger.Resolution, Question.NotFoundError | AskLedger.UnavailableError>,
     ) {
-      const settled = yield* resolution.pipe(
+      return yield* resolution.pipe(
+        Effect.flatMap(recovery.apply),
         Effect.catchTag("Question.NotFoundError", (error) =>
           Effect.fail(
             new QuestionNotFoundError({
@@ -32,8 +33,6 @@ export const questionHandlers = HttpApiBuilder.group(InstanceHttpApi, "question"
           ),
         ),
       )
-      yield* recovery.apply(settled)
-      return settled
     })
 
     // The human routes keep their contract: true when this call settled the request, not found otherwise.

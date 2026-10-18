@@ -11,7 +11,9 @@ import { SessionTable } from "./sql"
 // resolver's, and a later answer reports it instead of acting. writer_id is the
 // event_writer_process that held the waiting tool, so an answer after that
 // process is gone can recover the stored tool call, while an answer reaching a
-// different live process is refused. directory scopes the answer route.
+// different live process is refused. time_applied marks a decision recovery
+// wrote into that call, in the transaction that wrote it. directory scopes the
+// answer route.
 export const SessionAskTable = sqliteTable(
   "session_ask",
   {
@@ -29,6 +31,7 @@ export const SessionAskTable = sqliteTable(
     recovered: integer({ mode: "boolean" }).notNull().default(false),
     time_created: integer().notNull(),
     time_settled: integer(),
+    time_applied: integer(),
   },
   (table) => [
     index("session_ask_session_idx").on(table.session_id),

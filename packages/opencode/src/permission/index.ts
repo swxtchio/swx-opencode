@@ -18,6 +18,8 @@ export interface Interface {
     input: PermissionV1.ReplyInput,
   ) => Effect.Effect<AskLedger.Resolution, PermissionV1.NotFoundError | AskLedger.UnavailableError>
   readonly list: () => Effect.Effect<ReadonlyArray<PermissionV1.Request>>
+  // Allows a request's `always` patterns for the rest of the instance, as an `always` reply does.
+  readonly grant: (request: PermissionV1.Request) => Effect.Effect<void>
 }
 
 interface PendingEntry {
@@ -101,6 +103,14 @@ const layer = Layer.effect(
         tool: request.tool,
       }
       yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
+      // A supervised ask is recovered through its tool call after a restart, so one without a call is refused.
+      if (AskEmit.current() && !info.tool) {
+        yield* Effect.logError("supervised permission refused: it has no tool call", {
+          id,
+          permission: info.permission,
+        })
+        return yield* new PermissionV1.RejectedError()
+      }
 
       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
       // Waiting before the ask is recorded or published, so no resolver can find it without its waiter.
@@ -108,9 +118,11 @@ const layer = Layer.effect(
       return yield* Effect.gen(function* () {
         yield* ledger.admit({ id, sessionID: info.sessionID, kind: "permission", request: info })
         yield* events.publish(Event.Asked, info)
-        // A turn aborted while waiting ends the ask, so no later answer is applied to it.
-        return yield* Deferred.await(deferred).pipe(Effect.onInterrupt(() => ledger.cancel(id)))
+        return yield* Deferred.await(deferred)
       }).pipe(
+        // However the ask ends, aborted or failed at any step included, a still-pending ledger row is cancelled
+        // before the waiter is dropped, so no later answer finds the row without its waiter.
+        Effect.onExit(() => ledger.cancel(id)),
         Effect.ensuring(
           Effect.sync(() => {
             pending.delete(id)
@@ -140,31 +152,35 @@ const layer = Layer.effect(
         } satisfies AskLedger.Resolution
       }
 
-      const outcome = yield* ledger.decide({ id: input.requestID, decision, live: () => pending.has(input.requestID) })
-      if (outcome.type === "unknown") return yield* new PermissionV1.NotFoundError({ requestID: input.requestID })
-      if (outcome.type === "duplicate") return outcome.resolution
-      const existing = pending.get(input.requestID)
-      if (existing) {
-        yield* deliver(existing, input)
-        return outcome.resolution
-      }
-      // A live ask that stopped waiting after this answer won has nothing left to deliver to.
-      if (!outcome.resolution.recover) return outcome.resolution
-      // The recovered call never ran; an `always` grant still applies, so the model's retry is not asked again.
-      if (input.reply === "always") {
-        const request = outcome.resolution.recover.request as PermissionV1.Request
-        const { approved } = yield* InstanceState.get(state)
-        for (const pattern of request.always) {
-          approved.push({ permission: request.permission, pattern, action: "allow" })
-        }
-      }
-      yield* events.publish(Event.Replied, {
-        sessionID: outcome.resolution.sessionID,
-        requestID: input.requestID,
-        reply: input.reply,
-      })
-      return outcome.resolution
+      // Settling and handing the reply to the waiter are one step, so a cancelled caller cannot leave a settled ask
+      // whose waiter never receives it. A resolution handed back for recovery is not settled yet.
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          const outcome = yield* ledger.decide({
+            id: input.requestID,
+            kind: "permission",
+            decision,
+            live: () => pending.has(input.requestID),
+          })
+          if (outcome.type === "unknown") return yield* new PermissionV1.NotFoundError({ requestID: input.requestID })
+          if (outcome.type !== "won") return outcome.resolution
+          const existing = pending.get(input.requestID)
+          if (existing) yield* deliver(existing, input)
+          return outcome.resolution
+        }),
+      )
     })
+
+    const grant = Effect.fn("Permission.grant")(function* (request: PermissionV1.Request) {
+      const { approved } = yield* InstanceState.get(state)
+      for (const pattern of request.always) {
+        approved.push({ permission: request.permission, pattern, action: "allow" })
+      }
+    })
+
+    // Under emission a won settlement reaches its waiter even when its event cannot be published.
+    const release = (event: Effect.Effect<void>, complete: Effect.Effect<void>) =>
+      AskEmit.current() ? event.pipe(Effect.ensuring(complete)) : event.pipe(Effect.andThen(complete))
 
     // Under emission a related request is settled only when its own ledger row is won, so it never takes one
     // decision in memory while the ledger records another resolver's.
@@ -179,35 +195,40 @@ const layer = Layer.effect(
     const deliver = Effect.fn("Permission.deliver")(function* (existing: PendingEntry, input: PermissionV1.ReplyInput) {
       const { approved, pending } = yield* InstanceState.get(state)
       pending.delete(input.requestID)
-      yield* events.publish(Event.Replied, {
+      const replied = events.publish(Event.Replied, {
         sessionID: existing.info.sessionID,
         requestID: existing.info.id,
         reply: input.reply,
       })
 
       if (input.reply === "reject") {
-        yield* Deferred.fail(
-          existing.deferred,
-          input.message
-            ? new PermissionV1.CorrectedError({ feedback: input.message })
-            : new PermissionV1.RejectedError(),
+        yield* release(
+          replied,
+          Deferred.fail(
+            existing.deferred,
+            input.message
+              ? new PermissionV1.CorrectedError({ feedback: input.message })
+              : new PermissionV1.RejectedError(),
+          ),
         )
 
         for (const [id, item] of pending.entries()) {
           if (item.info.sessionID !== existing.info.sessionID) continue
           if (!(yield* claim(id, "reject"))) continue
           pending.delete(id)
-          yield* events.publish(Event.Replied, {
-            sessionID: item.info.sessionID,
-            requestID: item.info.id,
-            reply: "reject",
-          })
-          yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
+          yield* release(
+            events.publish(Event.Replied, {
+              sessionID: item.info.sessionID,
+              requestID: item.info.id,
+              reply: "reject",
+            }),
+            Deferred.fail(item.deferred, new PermissionV1.RejectedError()),
+          )
         }
         return
       }
 
-      yield* Deferred.succeed(existing.deferred, undefined)
+      yield* release(replied, Deferred.succeed(existing.deferred, undefined))
       if (input.reply === "once") return
 
       for (const pattern of existing.info.always) {
@@ -226,12 +247,14 @@ const layer = Layer.effect(
         if (!ok) continue
         if (!(yield* claim(id, "always"))) continue
         pending.delete(id)
-        yield* events.publish(Event.Replied, {
-          sessionID: item.info.sessionID,
-          requestID: item.info.id,
-          reply: "always",
-        })
-        yield* Deferred.succeed(item.deferred, undefined)
+        yield* release(
+          events.publish(Event.Replied, {
+            sessionID: item.info.sessionID,
+            requestID: item.info.id,
+            reply: "always",
+          }),
+          Deferred.succeed(item.deferred, undefined),
+        )
       }
     })
 
@@ -250,7 +273,7 @@ const layer = Layer.effect(
       )
     })
 
-    return Service.of({ ask, reply, list })
+    return Service.of({ ask, reply, list, grant })
   }),
 )
 

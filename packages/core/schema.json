@@ -1,7 +1,7 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "729f98b1-8be8-4882-96ae-9b8a7d560a2a",
+  "id": "c91d5d1e-7ee0-4461-b4ff-e3474f7d359c",
   "prevIds": [
     "f7b94b68-077f-43ec-862c-af9717d0cef6"
   ],
@@ -405,6 +405,16 @@
       "default": null,
       "generated": null,
       "name": "time_settled",
+      "entityType": "columns",
+      "table": "session_ask"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_applied",
       "entityType": "columns",
       "table": "session_ask"
     },

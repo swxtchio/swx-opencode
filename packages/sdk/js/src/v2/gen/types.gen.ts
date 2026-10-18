@@ -2615,7 +2615,7 @@ export type QuestionNotFoundError = {
 export type AskUnavailableError = {
   _tag: "AskUnavailableError"
   requestID: string
-  reason: "store-unavailable" | "owned-by-live-process" | "waiter-lost"
+  reason: "store-unavailable" | "owned-by-live-process"
   message: string
 }
 
