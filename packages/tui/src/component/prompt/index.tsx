@@ -120,7 +120,6 @@ const money = new Intl.NumberFormat("en-US", {
   currency: "USD",
 })
 
-const DRAFT_RETENTION_MIN_CHARS = 20
 // A recall asks the server where a prompt is this often, until this backstop:
 // whether one still being sent is queued yet, which the server does on
 // arrival, and where one it could not keep went.
@@ -638,7 +637,7 @@ export function Prompt(props: PromptProps) {
       "prompt.submit",
       "prompt.editor",
       "prompt.editor_context.clear",
-      "prompt.stash",
+      "prompt.discard",
       "prompt.stash.pop",
       "prompt.stash.list",
       "prompt.skills",
@@ -701,7 +700,7 @@ export function Prompt(props: PromptProps) {
   })
 
   onCleanup(() => {
-    if (store.prompt.input) {
+    if (store.prompt.input && input.plainText) {
       stashed = { prompt: unwrap(store.prompt), cursor: input.cursorOffset }
     }
     setInputTarget(undefined)
@@ -812,21 +811,13 @@ export function Prompt(props: PromptProps) {
   const stashCommands = createMemo(() =>
     [
       {
-        title: "Stash prompt",
-        name: "prompt.stash",
+        title: "Discard draft",
+        name: "prompt.discard",
         category: "Prompt",
         enabled: !!store.prompt.input,
         run: () => {
           if (!store.prompt.input) return
-          stash.push({
-            input: store.prompt.input,
-            parts: store.prompt.parts,
-            ...(store.prompt.machineAppended ? { machineAppended: true } : {}),
-          })
-          input.extmarks.clear()
-          input.clear()
-          setStore("prompt", { input: "", parts: [] })
-          setStore("extmarkToPartIndex", new Map())
+          clearPrompt()
           dialog.clear()
         },
       },
@@ -1439,12 +1430,15 @@ export function Prompt(props: PromptProps) {
   }
 
   async function pasteInputText(text: string) {
+    const revision = promptRevision
     const normalizedText = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
     const pastedContent = normalizedText.trim()
     const filepath = pastedFilepath(pastedContent, terminalEnvironment.platform)
     const isUrl = /^(https?):\/\//.test(filepath)
     if (!isUrl) {
       const attachment = await readLocalAttachment(filepath)
+      // A clear while inspecting a pasted path must not reinsert the old draft.
+      if (input.isDestroyed || promptRevision !== revision) return
       const filename = path.basename(filepath)
       if (attachment?.type === "text") {
         pasteText(attachment.content, `[SVG: ${filename ?? "image"}]`)
@@ -1528,22 +1522,13 @@ export function Prompt(props: PromptProps) {
   }
 
   function clearPrompt() {
-    if (
-      !store.prompt.machineAppended &&
-      (store.prompt.input.trim().length >= DRAFT_RETENTION_MIN_CHARS || store.prompt.parts.length > 0)
-    ) {
-      history.append(props.sessionID, {
-        ...store.prompt,
-        mode: store.mode,
-      }, sync.data.config.machine_message_markers)
-    }
-    input.clear()
     input.extmarks.clear()
     setStore("prompt", {
       input: "",
       parts: [],
     })
     setStore("extmarkToPartIndex", new Map())
+    input.setText("")
   }
 
   async function enhancePrompt() {

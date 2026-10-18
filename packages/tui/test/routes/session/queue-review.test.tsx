@@ -219,7 +219,9 @@ async function startSession(
     const messageSessionID = url.pathname.match(/^\/session\/(ses_[^/]+)\/message$/)?.[1]
     if (messageSessionID) {
       if (url.searchParams.get("limit") === "0") historyReads.push(messageSessionID)
-      if (url.searchParams.get("limit") === "0") return json(options.historyMessagesBySession?.[messageSessionID] ?? [])
+      if (url.searchParams.get("limit") === "0") {
+        return json(options.historyMessagesBySession?.[messageSessionID] ?? [])
+      }
       return json(options.messagesBySession?.[messageSessionID] ?? options.messages ?? [transcript])
     }
     if (url.pathname === `/session/${activeSessionID}/queue/release`) return new Response(null, { status: 204 })
@@ -597,7 +599,20 @@ const composerLines = (lines: string[], text: string) =>
 function composer(app: Awaited<ReturnType<typeof startSession>>) {
   const focused = app.renderer.renderer.currentFocusedRenderable
   expect(focused).toBeInstanceOf(TextareaRenderable)
-  return focused as TextareaRenderable
+  const prompt = focused as TextareaRenderable
+  expect(prompt).not.toBeInstanceOf(InputRenderable)
+  expect("role" in prompt.traits && prompt.traits.role === "prompt").toBe(true)
+  return prompt
+}
+
+function composerFocused(app: Awaited<ReturnType<typeof startSession>>) {
+  const focused = app.renderer.renderer.currentFocusedRenderable
+  return (
+    focused instanceof TextareaRenderable &&
+    !(focused instanceof InputRenderable) &&
+    "role" in focused.traits &&
+    focused.traits.role === "prompt"
+  )
 }
 
 async function searchHistory(app: Awaited<ReturnType<typeof startSession>>, text: string) {
@@ -621,7 +636,7 @@ test("recall and search isolate sessions across switching and reopening shared c
   const b = "ses_history_b"
   const first = "A-exclusive-history-token"
   const second = "B-exclusive-history-token"
-  const draft = "A retained draft exclusive token"
+  const draft = "A never-sent draft exclusive token"
   const messagesBySession = { [a]: [{ ...transcript, info: { ...transcript.info, sessionID: a } }], [b]: [] }
   const app = await startSession({ state: state.path, sessionID: a, queue: [], messagesBySession })
   try {
@@ -637,9 +652,12 @@ test("recall and search isolate sessions across switching and reopening shared c
     app.dispatch("prompt.clear")
     expect(await searchHistory(app, first)).not.toContain("No results found")
     app.renderer.mockInput.pressEscape()
-    await until(() => app.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    await until(() => composerFocused(app), "composer focus")
     await app.renderer.mockInput.typeText(draft)
     app.dispatch("prompt.clear")
+    expect(await searchHistory(app, draft)).toContain("No results found")
+    app.renderer.mockInput.pressEscape()
+    await until(() => composerFocused(app), "composer focus")
 
     app.selectSession(b)
     await until(async () => (await screen(app)).join("\n").includes(b), "fresh session B")
@@ -648,7 +666,7 @@ test("recall and search isolate sessions across switching and reopening shared c
     expect(composer(app).plainText).toBe("")
     expect(await searchHistory(app, first)).toContain("No results found")
     app.renderer.mockInput.pressEscape()
-    await until(() => app.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "B composer focus")
+    await until(() => composerFocused(app), "B composer focus")
     await app.renderer.mockInput.typeText(second)
     app.renderer.mockInput.pressEnter()
     await until(() => app.prompts.length === 2, "B's producer")
@@ -664,7 +682,9 @@ test("recall and search isolate sessions across switching and reopening shared c
     await until(async () => (await screen(app)).join("\n").includes(a), "A selected again")
     app.renderer.mockInput.pressArrow("up")
     await app.renderer.renderOnce()
-    expect(composer(app).plainText).toBe(draft)
+    expect(composer(app).plainText).toBe(first)
+    expect(await searchHistory(app, draft)).toContain("No results found")
+    app.renderer.mockInput.pressEscape()
     app.dispatch("prompt.clear")
     expect(await searchHistory(app, second)).toContain("No results found")
     app.renderer.mockInput.pressEscape()
@@ -672,12 +692,13 @@ test("recall and search isolate sessions across switching and reopening shared c
       async () => (await Bun.file(path.join(state.path, "prompt-history.jsonl")).text()).includes(second),
       "persisted history",
     )
+    expect(await Bun.file(path.join(state.path, "prompt-history.jsonl")).text()).not.toContain(draft)
   } finally {
     app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
     await app.stop()
   }
   for (const [id, own, other] of [
-    [a, draft, second],
+    [a, first, second],
     [b, second, first],
   ]) {
     const reopened = await startSession({ state: state.path, sessionID: id, queue: [], messagesBySession })
@@ -686,6 +707,8 @@ test("recall and search isolate sessions across switching and reopening shared c
       reopened.renderer.mockInput.pressArrow("up")
       await reopened.renderer.renderOnce()
       expect(composer(reopened).plainText).toBe(own!)
+      if (id === a) expect(await searchHistory(reopened, draft)).toContain("No results found")
+      if (id === a) reopened.renderer.mockInput.pressEscape()
       reopened.dispatch("prompt.clear")
       expect(await searchHistory(reopened, own!)).not.toContain("No results found")
       reopened.renderer.mockInput.pressEscape()
@@ -693,6 +716,277 @@ test("recall and search isolate sessions across switching and reopening shared c
     } finally {
       await reopened.stop()
     }
+  }
+}, 30_000)
+
+test("Ctrl+r excludes a shell-mode composer submission from persisted history after reopening", async () => {
+  await using state = await tmpdir()
+  const text = "shell-mode-history-exclusion-token"
+  const historyPath = path.join(state.path, "prompt-history.jsonl")
+  const messagesBySession = { [sessionID]: [] }
+  const app = await startSession({
+    state: state.path,
+    sessionID,
+    queue: [],
+    messagesBySession,
+    historyMessagesBySession: messagesBySession,
+  })
+  try {
+    await until(
+      () => composerFocused(app),
+      "the composer",
+    )
+    app.renderer.mockInput.pressKey("!")
+    await app.renderer.mockInput.typeText(text)
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.executions.some((entry) => entry.endsWith("/shell")), "the shell-mode endpoint")
+    await until(async () => (await Bun.file(historyPath).text().catch(() => "")).includes(text), "the persisted shell history row")
+    const saved = (await Bun.file(historyPath).text())
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { input: string; mode?: string; sessionID?: string; origin?: string })
+      .find((entry) => entry.input === text)
+    expect(saved).toMatchObject({ input: text, mode: "shell", sessionID, origin: "tui-composer" })
+    expect(await searchHistory(app, text)).toContain("No results found")
+    app.renderer.mockInput.pressEscape()
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
+  }
+  const reopened = await startSession({
+    state: state.path,
+    sessionID,
+    queue: [],
+    messagesBySession,
+    historyMessagesBySession: messagesBySession,
+  })
+  try {
+    await until(
+      () => composerFocused(reopened),
+      "the reopened composer",
+    )
+    await until(async () => {
+      reopened.renderer.mockInput.pressArrow("up")
+      await reopened.renderer.renderOnce()
+      return composer(reopened).plainText === text
+    }, "the persisted shell entry loaded outside the timeline")
+    reopened.dispatch("prompt.clear")
+    expect(await searchHistory(reopened, text)).toContain("No results found")
+    reopened.renderer.mockInput.pressEscape()
+  } finally {
+    await reopened.stop()
+  }
+}, 30_000)
+
+test("clearing an unsent tracked-paste draft leaves no history or stash copy", async () => {
+  await using state = await tmpdir()
+  const clearDraft = "never-sent-clear-token"
+  const clearPaste = "never-sent-clear-expanded-paste-token\nsecond clear line\nthird clear line"
+  const clearPastedPayload = "never-sent-clear-expanded-paste-token"
+  const submitted = "submitted-history-survives-clear-reopen"
+  const historyPath = path.join(state.path, "prompt-history.jsonl")
+  const hydrationPath = path.join(state.path, "prompt-history-hydrated.json")
+  const stashPath = path.join(state.path, "prompt-stash.jsonl")
+  const messagesBySession = { [sessionID]: [] }
+  const app = await startSession({
+    state: state.path,
+    sessionID,
+    queue: [],
+    messagesBySession,
+    historyMessagesBySession: messagesBySession,
+  })
+  try {
+    await until(
+      () => composerFocused(app),
+      "the composer",
+    )
+    await until(() => app.historyReads.includes(sessionID), "the full transcript recovery read")
+    await until(() => Bun.file(hydrationPath).exists(), "history recovery completion")
+
+    const clearComposer = composer(app)
+    await app.renderer.mockInput.typeText(clearDraft)
+    await app.renderer.mockInput.pasteBracketedText(clearPaste)
+    await until(() => clearComposer.plainText.includes("[Pasted ~3 lines]"), "the tracked pasted-text summary")
+    expect(clearComposer.plainText).toContain(clearDraft)
+    app.renderer.mockInput.pressKey("c", { ctrl: true })
+    expect(composer(app).plainText).toBe("")
+    app.dispatch("input.undo")
+    expect(composer(app).plainText).toBe("")
+
+    expect(app.commands()).not.toContain("prompt.stash.pop")
+
+    expect(await searchHistory(app, "never-sent-clear-")).toContain("No results found")
+    app.renderer.mockInput.pressEscape()
+    await until(() => composerFocused(app), "composer focus")
+    expect(composer(app).plainText).toBe("")
+    await submitHistoryPrompt(app, submitted, sessionID, app.prompts.length)
+    await until(async () => (await Bun.file(historyPath).text().catch(() => "")).includes(submitted), "submitted history persistence")
+
+    const historyText = await Bun.file(historyPath).text().catch(() => "")
+    const hydrationText = await Bun.file(hydrationPath).text().catch(() => "")
+    const stashText = await Bun.file(stashPath).text().catch(() => "")
+    for (const text of [clearDraft, clearPaste, clearPastedPayload]) {
+      expect(historyText).not.toContain(text)
+      expect(hydrationText).not.toContain(text)
+      expect(stashText).not.toContain(text)
+    }
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
+  }
+  const reopened = await startSession({
+    state: state.path,
+    sessionID,
+    queue: [],
+    messagesBySession,
+    historyMessagesBySession: messagesBySession,
+  })
+  try {
+    await until(
+      () => composerFocused(reopened),
+      "the reopened composer",
+    )
+    await until(async () => (await Bun.file(historyPath).text().catch(() => "")).includes(submitted), "the reopened submitted-history row")
+    await until(async () => {
+      reopened.renderer.mockInput.pressArrow("up")
+      await reopened.renderer.renderOnce()
+      return composer(reopened).plainText === submitted
+    }, "submitted history recall after reopening")
+    expect(composer(reopened).plainText).toBe(submitted)
+    reopened.renderer.mockInput.pressKey("c", { ctrl: true })
+    expect(composer(reopened).plainText).toBe("")
+    expect(await searchHistory(reopened, "never-sent-clear-")).toContain("No results found")
+    reopened.renderer.mockInput.pressEscape()
+
+    const historyText = await Bun.file(historyPath).text().catch(() => "")
+    const hydrationText = await Bun.file(hydrationPath).text().catch(() => "")
+    const stashText = await Bun.file(stashPath).text().catch(() => "")
+    for (const text of [clearDraft, clearPaste, clearPastedPayload]) {
+      expect(historyText).not.toContain(text)
+      expect(hydrationText).not.toContain(text)
+      expect(stashText).not.toContain(text)
+    }
+    expect(historyText).toContain(submitted)
+    expect(reopened.commands()).not.toContain("prompt.stash.pop")
+  } finally {
+    await reopened.stop()
+  }
+}, 30_000)
+
+test("clearing while pasted text is being inspected does not restore it", async () => {
+  await using state = await tmpdir()
+  const draft = "never-sent-clear-race-token"
+  const paste = "never-sent-clear-race-expanded-token\nsecond race line\nthird race line"
+  const historyPath = path.join(state.path, "prompt-history.jsonl")
+  const hydrationPath = path.join(state.path, "prompt-history-hydrated.json")
+  const stashPath = path.join(state.path, "prompt-stash.jsonl")
+  const messagesBySession = { [sessionID]: [] }
+  const app = await startSession({
+    state: state.path,
+    sessionID,
+    queue: [],
+    messagesBySession,
+    historyMessagesBySession: messagesBySession,
+  })
+  try {
+    await until(() => composerFocused(app), "the composer")
+    await until(() => app.historyReads.includes(sessionID), "the full transcript recovery read")
+    await until(() => Bun.file(hydrationPath).exists(), "history recovery completion")
+
+    await app.renderer.mockInput.typeText(draft)
+    await app.renderer.mockInput.pasteBracketedText(paste)
+    app.renderer.mockInput.pressKey("c", { ctrl: true })
+    expect(composer(app).plainText).toBe("")
+    await Bun.sleep(20)
+    expect(composer(app).plainText).toBe("")
+    expect(await searchHistory(app, "never-sent-clear-race-")).toContain("No results found")
+    app.renderer.mockInput.pressEscape()
+
+    for (const text of [draft, paste, "never-sent-clear-race-expanded-token"]) {
+      expect(await Bun.file(historyPath).text().catch(() => "")).not.toContain(text)
+      expect(await Bun.file(hydrationPath).text().catch(() => "")).not.toContain(text)
+      expect(await Bun.file(stashPath).text().catch(() => "")).not.toContain(text)
+    }
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
+  }
+}, 30_000)
+
+test("discarding an unsent tracked-paste draft leaves no history or stash copy", async () => {
+  await using state = await tmpdir()
+  const draft = "never-sent-discard-token"
+  const paste = "never-sent-discard-expanded-paste-token\nsecond discard line\nthird discard line"
+  const pastedPayload = "never-sent-discard-expanded-paste-token"
+  const historyPath = path.join(state.path, "prompt-history.jsonl")
+  const hydrationPath = path.join(state.path, "prompt-history-hydrated.json")
+  const stashPath = path.join(state.path, "prompt-stash.jsonl")
+  const messagesBySession = { [sessionID]: [] }
+  const app = await startSession({
+    state: state.path,
+    sessionID,
+    queue: [],
+    messagesBySession,
+    historyMessagesBySession: messagesBySession,
+    tuiConfig: createTuiResolvedConfig({ plugin_enabled: {}, keybinds: { prompt_discard: "ctrl+shift+d" } }),
+  })
+  try {
+    await until(() => composerFocused(app), "the composer")
+    await until(() => app.historyReads.includes(sessionID), "the full transcript recovery read")
+    await until(() => Bun.file(hydrationPath).exists(), "history recovery completion")
+
+    const draftComposer = composer(app)
+    await app.renderer.mockInput.typeText(draft)
+    await app.renderer.mockInput.pasteBracketedText(paste)
+    await until(() => draftComposer.plainText.includes("[Pasted ~3 lines]"), "the tracked pasted-text summary")
+    expect(draftComposer.plainText).toContain(draft)
+    expect(app.commands()).toContain("prompt.discard")
+    expect(app.commands()).not.toContain("prompt.stash")
+    app.renderer.mockInput.pressKey("d", { ctrl: true, shift: true })
+    expect(draftComposer.plainText).toBe("")
+    app.dispatch("input.undo")
+    expect(composer(app).plainText).toBe("")
+    expect(app.commands()).not.toContain("prompt.stash.pop")
+    expect(await searchHistory(app, "never-sent-discard-")).toContain("No results found")
+
+    const historyText = await Bun.file(historyPath).text().catch(() => "")
+    const hydrationText = await Bun.file(hydrationPath).text().catch(() => "")
+    const stashText = await Bun.file(stashPath).text().catch(() => "")
+    for (const text of [draft, paste, pastedPayload]) {
+      expect(historyText).not.toContain(text)
+      expect(hydrationText).not.toContain(text)
+      expect(stashText).not.toContain(text)
+    }
+    expect(app.prompts).toHaveLength(0)
+    app.renderer.mockInput.pressEscape()
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
+  }
+
+  const reopened = await startSession({
+    state: state.path,
+    sessionID,
+    queue: [],
+    messagesBySession,
+    historyMessagesBySession: messagesBySession,
+  })
+  try {
+    await until(() => composerFocused(reopened), "the reopened composer")
+    expect(composer(reopened).plainText).toBe("")
+    expect(await searchHistory(reopened, "never-sent-discard-")).toContain("No results found")
+
+    const historyText = await Bun.file(historyPath).text().catch(() => "")
+    const hydrationText = await Bun.file(hydrationPath).text().catch(() => "")
+    const stashText = await Bun.file(stashPath).text().catch(() => "")
+    for (const text of [draft, paste, pastedPayload]) {
+      expect(historyText).not.toContain(text)
+      expect(hydrationText).not.toContain(text)
+      expect(stashText).not.toContain(text)
+    }
+    expect(reopened.commands()).not.toContain("prompt.stash.pop")
+  } finally {
+    await reopened.stop()
   }
 }, 30_000)
 
