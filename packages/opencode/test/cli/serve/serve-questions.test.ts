@@ -490,6 +490,8 @@ describe("opencode serve --questions-command (subprocess)", () => {
         )
         expect(settled.status).toBe(409)
         expect(settled.body).toMatchObject({ _tag: "AskNotAppliedError", requestID: emitted.id, reason: "call-gone" })
+        const pending = yield* json(HttpClientRequest.get(`${second.url}/question`), home)
+        expect(pending.body.map((item: { id: string }) => item.id)).toEqual([emitted.id])
         const part = (yield* messages(second.url, home, sessionID))
           .flatMap((message) => message.parts)
           .find((item) => item.callID === emitted.origin.callID)
@@ -598,7 +600,7 @@ describe("opencode serve --questions-command (subprocess)", () => {
   )
 
   cliIt.live(
-    "an answer after a restart whose call is gone is refused as not applied, and the ask is closed",
+    "an answer after a restart whose call is gone is refused as not applied, and the ask stays pending",
     ({ opencode, home, llm }) =>
       Effect.gen(function* () {
         const file = path.join(home, "gone.db")
@@ -625,15 +627,17 @@ describe("opencode serve --questions-command (subprocess)", () => {
         )
         expect(settled.status).toBe(409)
         expect(settled.body).toMatchObject({ _tag: "AskNotAppliedError", requestID: emitted.id, reason: "call-gone" })
+        // The answer was not consumed: the ask is still pending, and another answer is refused the same way.
         const listed = yield* json(HttpClientRequest.get(`${second.url}/question`), home)
-        expect(listed.body).toEqual([])
+        expect(listed.body.map((item: { id: string }) => item.id)).toEqual([emitted.id])
         const repeated = yield* json(
           HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
-            HttpClientRequest.bodyJsonUnsafe({ answers: [["Hello"]] }),
+            HttpClientRequest.bodyJsonUnsafe({ reject: true }),
           ),
           home,
         )
-        expect(repeated.body).toMatchObject({ disposition: "duplicate", decision: { type: "cancelled" } })
+        expect(repeated.status).toBe(409)
+        expect(repeated.body).toMatchObject({ reason: "call-gone" })
         expect(yield* llm.calls).toBe(1)
       }),
     120_000,

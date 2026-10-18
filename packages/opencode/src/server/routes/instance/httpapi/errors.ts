@@ -194,8 +194,9 @@ export class AskUnavailableError extends Schema.TaggedErrorClass<AskUnavailableE
   { httpApiStatus: 503 },
 ) {}
 
-// An accepted answer that could not be applied (swxtchio/swx-opencode#286): `apply-failed` settled nothing and the ask
-// is still pending; `call-gone` closed the ask, whose call is gone or went on without it, with nothing applied.
+// An accepted answer that could not be applied (swxtchio/swx-opencode#286): the producer's effect failed
+// (`apply-failed`), or the ask's call is gone or went on without it (`call-gone`). Nothing was settled; the ask is still
+// pending.
 export class AskNotAppliedError extends Schema.TaggedErrorClass<AskNotAppliedError>()(
   "AskNotAppliedError",
   {

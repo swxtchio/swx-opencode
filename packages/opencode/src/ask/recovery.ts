@@ -22,8 +22,8 @@ import { AskLedger } from "./ledger"
 // An ask answered after the process that waited on it is gone (swxtchio/swx-opencode#286). In one transaction this
 // settles a still-pending ask and writes the outcome its producer would have produced into the stored call, so an
 // accepted answer is either applied or not settled at all: a producer effect that fails settles nothing. A call that
-// already ended without the answer (its ask was aborted) settles the ask as cancelled, and one that is gone or that its
-// Session went on without closes it as cancelled and fails the answer with `call-gone`, since nothing was applied. Where the live tool would have let the turn go on, the Session
+// already ended without the answer (its ask was aborted) settles the ask as cancelled. For one that is gone or that its
+// Session went on without, the answer fails with `call-gone` and nothing is settled, so the ask stays pending. Where the live tool would have let the turn go on, the Session
 // is woken to continue, and an ask recovery applied earlier is handed here again so a wake its process lost is
 // repeated. Only the asking call is recovered: nothing replays provider work, and a permission-guarded call that
 // never ran is not run here. A decision a live waiter received is never handed here.
@@ -89,12 +89,12 @@ const layer = Layer.effect(
                   gone: false,
                 }
               }
+              // Nothing can apply the answer, so nothing is settled: the ask stays pending and the answer is refused.
               if (!target?.newest) {
-                yield* Effect.logWarning("recovered ask's call is gone or its Session went on; closing it", {
+                yield* Effect.logWarning("recovered ask's call is gone or its Session went on; answer not applied", {
                   id: row.id,
                 })
-                const closed = yield* record({ type: "cancelled" }, false)
-                return { final: settled, row: closed.row, won: false, wake: false, gone: true }
+                return { final: settled, row: current, won: false, wake: false, gone: true }
               }
               const outcome = yield* produce(current, resolution.decision).pipe(
                 Effect.catchCause((cause) =>
