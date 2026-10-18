@@ -190,6 +190,9 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Features
 
+- **#297** Show the selected Ctrl+r history entry's complete original prompt in a wrapped, page-scrollable preview while
+  keeping all other entries as one-line summaries. ENTER still appends the selected original prompt to the existing
+  composer draft (swxtchio/swx-opencode#296). _Fork-only._
 - **#288** `opencode serve` takes `--questions-command <cmd>` (swxtchio/swx-opencode#286): question choices and
   free text, plan acceptance and permission asks are recorded in the `session_ask` ledger (migration
   `20261018005127`), emitted as JSON to the operator's command, and stay pending until settled once by the new
