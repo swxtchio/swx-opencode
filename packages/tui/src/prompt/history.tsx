@@ -302,6 +302,7 @@ function promptText(item: PromptInfo) {
 }
 
 function composerMessagePrompts(parts: Part[], markers: Config["machine_message_markers"] | undefined) {
+  // Machine marks, not composer origin, decide admission; unmarked pre-#272 automation may surface.
   const groups = [
     ...new Map(
       parts.flatMap((part) => {
@@ -315,12 +316,6 @@ function composerMessagePrompts(parts: Part[], markers: Config["machine_message_
     return groups.flatMap((group) => {
       if ((group.kind !== "human" && group.kind !== "individual") || !group.constituents.length) return []
       return group.constituents.flatMap((item) => {
-        const composer =
-          item.input.origin === "tui-composer" ||
-          item.input.parts.some(
-            (part) => part.type === "text" && part.metadata?.[SessionPromptQueue.TuiComposerOriginMetadataKey] === true,
-          )
-        if (!composer) return []
         const prompt = queuePrompt(item.input)
         return isHumanPrompt(prompt, markers) ? [prompt] : []
       })
@@ -328,7 +323,6 @@ function composerMessagePrompts(parts: Part[], markers: Config["machine_message_
 
   if (parts.some((part) => part.type === "text" && part.metadata?.sessionQueue !== undefined)) return []
   const prompt = messagePrompt(parts)
-  // Unmarked pre-#272 automation is intentionally admitted as human history.
   return isHumanPrompt(prompt, markers) ? [prompt] : []
 }
 

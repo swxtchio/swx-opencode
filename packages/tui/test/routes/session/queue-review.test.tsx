@@ -879,75 +879,62 @@ test("reopens recover human prompts erased from a tagged-only history cache", as
   }
 }, 30_000)
 
-test("rehydrates a session after another session's prompts evict its retained rows", async () => {
+test("rehydrates an evicted session after switching back without restarting", async () => {
   await using state = await tmpdir()
   const a = "ses_history_eviction_a"
   const b = "ses_history_eviction_b"
   const promptsB = Array.from({ length: 10 }, (_, index) => `eviction-B-${index}-human-token`)
   const promptsA = Array.from({ length: 60 }, (_, index) => `eviction-A-${index}-human-token`)
   const messagesB: unknown[] = []
+  const messagesA: unknown[] = []
   const historyPath = path.join(state.path, "prompt-history.jsonl")
-  const producerB = await startSession({
+  const app = await startSession({
     state: state.path,
     sessionID: b,
     queue: [],
-    historyMessagesBySession: { [b]: [] },
+    sessions: [sessionInfo(a), sessionInfo(b)],
+    messagesBySession: { [a]: [], [b]: [] },
+    historyMessagesBySession: { [a]: messagesA, [b]: messagesB },
   })
   try {
-    await until(async () => (await screen(producerB)).join("\n").includes(b), "session B")
+    await until(async () => (await screen(app)).join("\n").includes(b), "session B")
+    await until(() => app.historyReads.includes(b), "B's initial hydration")
     for (const text of promptsB)
-      messagesB.push(await submitHistoryPrompt(producerB, text, b, producerB.prompts.length))
+      messagesB.push(await submitHistoryPrompt(app, text, b, app.prompts.length))
     await until(async () => (await Bun.file(historyPath).text()).includes(promptsB.at(-1)!), "B's persisted prompts")
-  } finally {
-    producerB.prompts.forEach((prompt) => prompt.answer(json(transcript)))
-    await producerB.stop()
-  }
 
-  const producerA = await startSession({
-    state: state.path,
-    sessionID: a,
-    queue: [],
-    historyMessagesBySession: { [a]: [] },
-  })
-  try {
-    await until(async () => (await screen(producerA)).join("\n").includes(a), "session A")
-    for (const text of promptsA) await submitHistoryPrompt(producerA, text, a, producerA.prompts.length)
+    app.selectSession(a)
+    await until(async () => (await screen(app)).join("\n").includes(a), "session A")
+    await until(() => app.historyReads.includes(a), "A's initial hydration")
+    for (const text of promptsA) messagesA.push(await submitHistoryPrompt(app, text, a, app.prompts.length))
     await until(async () => {
       const cache = await Bun.file(historyPath).text()
       return cache.includes(promptsA.at(-1)!) && !cache.includes(promptsB[0]!)
     }, "A's traffic evicting B's cached prompts")
-  } finally {
-    producerA.prompts.forEach((prompt) => prompt.answer(json(transcript)))
-    await producerA.stop()
-  }
 
-  const resumed = await startSession({
-    state: state.path,
-    sessionID: b,
-    home: true,
-    continue: true,
-    sessions: [sessionInfo(b)],
-    queue: [],
-    messagesBySession: { [b]: [] },
-    historyMessagesBySession: { [b]: messagesB },
-  })
-  try {
-    await until(async () => (await screen(resumed)).join("\n").includes(b), "the narrow B resume")
-    await until(() => resumed.historyReads.includes(b), "B's rehydration after eviction")
+    const bReads = app.historyReads.filter((sessionID) => sessionID === b).length
+    app.selectSession(b)
+    await until(async () => (await screen(app)).join("\n").includes(b), "session B again")
+    await until(
+      () => app.historyReads.filter((sessionID) => sessionID === b).length > bReads,
+      "B's rehydration after eviction without a restart",
+    )
+    await until(async () => (await Bun.file(historyPath).text()).includes(promptsB[0]!), "B's restored cache rows")
     const recalled: string[] = []
     for (const _ of promptsB) {
-      resumed.renderer.mockInput.pressArrow("up")
-      await resumed.renderer.renderOnce()
-      recalled.push(composer(resumed).plainText)
+      app.renderer.mockInput.pressArrow("up")
+      await app.renderer.renderOnce()
+      recalled.push(composer(app).plainText)
     }
     expect(recalled).toEqual(promptsB.toReversed())
     for (const _ of promptsB) {
-      resumed.renderer.mockInput.pressArrow("down")
-      await resumed.renderer.renderOnce()
+      app.renderer.mockInput.pressArrow("down")
+      await app.renderer.renderOnce()
     }
-    expect(await searchHistory(resumed, promptsB[0]!)).not.toContain("No results found")
+    expect(await searchHistory(app, promptsB[0]!)).not.toContain("No results found")
   } finally {
-    await resumed.stop()
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
   }
 }, 120_000)
 
@@ -980,11 +967,19 @@ test("resumed history matches a composer-produced agent mention after tracked pa
       .map((line) => JSON.parse(line) as { input: string; parts: HeldPrompt["parts"] })
       .find((entry) => entry.input === original)
     if (!saved) throw new Error("The composer did not persist its pasted agent prompt")
-    const savedOffset = agentSourceStart(saved.parts)
-    const submittedOffset = agentSourceStart(sent.input.parts)
-    if (savedOffset === undefined || submittedOffset === undefined)
+    const savedRange = agentSourceRange(saved.parts)
+    const submittedRange = agentSourceRange(sent.input.parts)
+    if (!savedRange || !submittedRange)
       throw new Error("The producer omitted the pasted agent mention source offset")
-    expect(submittedOffset).toBeGreaterThan(savedOffset)
+    const expandedText = sent.input.parts
+      .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text ?? ""] : []))
+      .join("")
+    const expansion = expandedText.length - saved.input.length
+    expect(submittedRange).toEqual({
+      start: savedRange.start + expansion,
+      end: savedRange.end + expansion,
+      value: savedRange.value,
+    })
   } finally {
     producer.prompts.forEach((prompt) => prompt.answer(json(transcript)))
     await producer.stop()
@@ -1073,6 +1068,55 @@ test("malformed future queue metadata cannot fall back into composer history", a
     resumed.renderer.mockInput.pressArrow("up")
     await resumed.renderer.renderOnce()
     expect(composer(resumed).plainText).toBe(humanText)
+  } finally {
+    await resumed.stop()
+  }
+}, 30_000)
+
+test("queue-produced unmarked human constituents appear in recall and search without composer origin", async () => {
+  await using state = await tmpdir()
+  const text = "legacy-app-history-token"
+  const fixture = await queueTimelineFixture(
+    await submitComposerPrompt("queue-human-origin-anchor-token"),
+    await submitComposerPrompt("queue-human-origin-companion-token"),
+  )
+  const produced = fixture.messages.find((message) =>
+    message.parts.some((part) => {
+      if (part.type !== "text") return false
+      const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueue)
+      return (
+        Option.isSome(group) &&
+        group.value.constituents.some(
+          (item) =>
+            item.input.origin === undefined &&
+            item.input.parts.some((candidate) => candidate.type === "text" && candidate.text.includes(text)),
+        )
+      )
+    }),
+  )
+  if (!produced) throw new Error("The queue producer omitted its unmarked human constituent")
+  const id = fixture.sessionID
+  const historyPath = path.join(state.path, "prompt-history.jsonl")
+  const resumed = await startSession({
+    state: state.path,
+    sessionID: id,
+    home: true,
+    continue: true,
+    sessions: [sessionInfo(id)],
+    queue: [],
+    messagesBySession: { [id]: [] },
+    historyMessagesBySession: { [id]: [produced] },
+  })
+  try {
+    await until(async () => (await screen(resumed)).join("\n").includes(id), "the queue-human resume")
+    await until(() => resumed.historyReads.includes(id), "the full queue-human transcript")
+    await until(async () => (await Bun.file(historyPath).text()).includes(text), "the attributed queue-human row")
+    expect(await searchHistory(resumed, text)).not.toContain("No results found")
+    resumed.renderer.mockInput.pressEscape()
+    await until(() => resumed.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    resumed.renderer.mockInput.pressArrow("up")
+    await resumed.renderer.renderOnce()
+    expect(composer(resumed).plainText).toBe(text)
   } finally {
     await resumed.stop()
   }
@@ -1469,8 +1513,10 @@ async function submitComposerPrompt(text: string, appended = false) {
   }
 }
 
-function agentSourceStart(parts: HeldPrompt["parts"]) {
-  return parts.find((part) => part.type === "agent")?.source?.start
+function agentSourceRange(parts: HeldPrompt["parts"]) {
+  const source = parts.find((part) => part.type === "agent")?.source
+  if (source?.start === undefined || source.end === undefined || source.value === undefined) return
+  return { start: source.start, end: source.end, value: source.value }
 }
 
 async function submitPastedAgentPrompt() {
