@@ -145,8 +145,8 @@ model as feedback).
     agent could not be written. Nothing was settled and the ask is still pending: answer it again once the cause is
     fixed, or answer differently.
   - `call-gone`: after a restart, the stored tool call the ask belongs to is missing, though its message is still
-    there (or hidden by a revert that can be undone), so it may come back. Nothing was settled and the ask is still
-    pending; answer it again once the call is back.
+    there, so it may come back; or its message went missing while the Session has a revert pending. Nothing was
+    settled and the ask is still pending; answer it again once the call is back or the revert is resolved.
 
 `GET /question?directory=...` and `GET /permission?directory=...` list the outstanding asks this server can settle.
 
@@ -156,7 +156,9 @@ The human routes keep working: the TUI and the SDK's `question.reply`, `question
 `permission.reply` settle the same ask as the answer route, and whichever is first wins. They return `true` when
 their call settled the ask and their usual not-found error otherwise, including when the ask was already settled.
 Every settlement publishes the usual `question.replied`, `question.rejected` or `permission.replied` event, so an
-attached TUI drops an ask the supervisor answered.
+attached TUI drops an ask the supervisor answered. An ask closed without an answer (`cancelled` or `undelivered`)
+publishes the event a refusal does (`question.rejected`, or `permission.replied` with `reject`), exactly once, so no
+client keeps showing an ask that can no longer be answered.
 
 A TUI in auto-accept mode (started with `--auto`, or toggled on) answers permission requests itself as they arrive,
 and so wins against the supervisor. Leave it off in a pane the supervisor decides for.
@@ -192,11 +194,13 @@ When the asking call cannot take the answer, what happens depends on whether it 
   deleted, or its Session went on before the answer arrived (for example because it was prompted again after the
   restart). The answer closes the ask with the decision `undelivered` (`200`, `disposition: "settled"`,
   `recovered: false`): nothing is applied, the ask leaves the outstanding list, and prune and retention stop
-  refusing its Session. A later answer is a `duplicate` with that decision.
-- **It may come back**: the message is still there but its tool call is missing, or the message is hidden by a
-  revert that can be undone. The answer gets `409 call-gone`: nothing is applied or settled, and the ask stays pending
-  and listed for another answer once the call is back. Until then prune and retention keep refusing its Session;
-  deleting the Session removes the ask.
+  refusing its Session. A later answer is a `duplicate` with that decision. Closing it publishes the same event a
+  refusal does (`question.rejected`, or `permission.replied` with `reject`), so attached clients drop it.
+- **It may come back**: the message is still there but its tool call is missing. A pending revert does not hide
+  messages (they stay listed until its cleanup deletes them), but a message that went missing while a revert is
+  pending is treated the same way until the revert is resolved, after which an answer closes it as `undelivered`.
+  The answer gets `409 call-gone`: nothing is applied or settled, and the ask stays pending and listed for another
+  answer. Until then prune and retention keep refusing its Session; deleting the Session removes the ask.
 
 When the call already ended without an answer, because its ask was aborted, the ask is settled as `cancelled`.
 
