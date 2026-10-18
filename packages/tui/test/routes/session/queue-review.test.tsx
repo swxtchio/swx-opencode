@@ -778,6 +778,30 @@ test("Ctrl+r excludes a shell-mode composer submission from persisted history af
   }
 }, 30_000)
 
+test("typing during composer paste inspection keeps the pasted text", async () => {
+  await using state = await tmpdir()
+  const prefix = "typed-before-paste "
+  const suffix = "typed-during-paste"
+  const paste = "keystroke-during-paste-expanded-token\nsecond paste line\nthird paste line"
+  const app = await startSession({ state: state.path, sessionID, queue: [] })
+  try {
+    await until(() => composerFocused(app), "the composer")
+    const prompt = composer(app)
+    await app.renderer.mockInput.typeText(prefix)
+    await app.renderer.mockInput.pasteBracketedText(paste)
+    await app.renderer.mockInput.typeText(suffix)
+    await until(() => prompt.plainText.includes("[Pasted ~3 lines]"), "paste inspection completion")
+    expect(prompt.plainText).toContain(prefix + suffix)
+
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the composer submission")
+    expect(app.prompts[0]!.parts.some((part) => part.type === "text" && part.text?.includes(paste))).toBe(true)
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
+  }
+}, 30_000)
+
 test("clearing an unsent tracked-paste draft leaves no history or stash copy", async () => {
   await using state = await tmpdir()
   const clearDraft = "never-sent-clear-token"
