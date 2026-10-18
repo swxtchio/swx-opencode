@@ -186,3 +186,34 @@ export async function queueTimelineFixture(
     await Promise.all([filename, `${filename}-wal`, `${filename}-shm`].map((file) => rm(file, { force: true })))
   }
 }
+
+export async function promptHistoryFixture(composerInput: SessionPromptQueue.Input) {
+  const filename = path.join(process.cwd(), `.prompt-history-${randomUUID()}.db`)
+  try {
+    return await Effect.runPromise(
+      Effect.gen(function* () {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const session = yield* sessions.create({})
+        yield* prompt.prompt({
+          sessionID: session.id,
+          agent: composerInput.agent ?? "build",
+          model: composerInput.model ?? {
+            providerID: ProviderV2.ID.make("test"),
+            modelID: ModelV2.ID.make("model"),
+          },
+          origin: composerInput.origin,
+          noReply: true,
+          parts: composerInput.parts,
+        })
+        return { sessionID: session.id, messages: yield* MessageV2.stream(session.id) }
+      }).pipe(
+        withTmpdirInstance({ git: true, config: { formatter: false, lsp: false } }),
+        Effect.scoped,
+        Effect.provide(queueLayer(filename)),
+      ),
+    )
+  } finally {
+    await Promise.all([filename, `${filename}-wal`, `${filename}-shm`].map((file) => rm(file, { force: true })))
+  }
+}

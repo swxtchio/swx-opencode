@@ -396,11 +396,11 @@ export function Session() {
     },
   )
   createResource(
-    () => (history.hasLegacy() ? route.sessionID : undefined),
+    () => (history.needsRecovery(route.sessionID) ? route.sessionID : undefined),
     async (sessionID) => {
       const result = await sdk.client.session.messages({ sessionID, limit: 0 }).catch(() => undefined)
       if (!result || result.error || !result.data || route.sessionID !== sessionID) return
-      history.recover(sessionID, result.data, sync.data.config.machine_message_markers)
+      await history.recover(sessionID, result.data, sync.data.config.machine_message_markers)
     },
   )
   const offModelMessage = event.on("message.updated", (next) => {
