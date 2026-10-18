@@ -413,7 +413,9 @@ describe("permission requests under --questions-command", () => {
               ],
               { concurrency: "unbounded" },
             )
+            // Either the cascade or the request's own reply won it, and the ledger records that reply.
             const recorded = (yield* ledger.find(b.id, "permission"))!.decision
+            expect(recorded?.type).toBe("replied")
             expect(results[1].decision).toEqual(recorded!)
             const outcome = yield* within(Fiber.join(second)).pipe(Effect.exit)
             expect(Exit.isSuccess(outcome)).toBe(recorded?.type === "replied" && recorded.reply !== "reject")

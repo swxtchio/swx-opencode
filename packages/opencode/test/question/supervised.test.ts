@@ -307,11 +307,14 @@ describe("question lifecycle under --questions-command", () => {
         const dir = yield* tmpdirScoped({ git: true })
         yield* Effect.gen(function* () {
           const question = yield* Question.Service
+          const ledger = yield* AskLedger.Service
           const { receiver, sessionID } = yield* supervised()
           const fiber = yield* askWithTool(sessionID, "call_abort")
           const [emitted] = yield* receiver.read(1)
           yield* Fiber.interrupt(fiber)
 
+          // Recorded by the ask's own exit, before any answer: it is what a restarted server finds.
+          expect(yield* ledger.find(emitted.id, "question")).toMatchObject({ decision: { type: "cancelled" } })
           expect(yield* question.list()).toEqual([])
           const late = yield* question.reply({ requestID: emitted.id, answers: [["Red"], ["None"]] })
           expect(late).toMatchObject({ disposition: "duplicate", decision: { type: "cancelled" } })
