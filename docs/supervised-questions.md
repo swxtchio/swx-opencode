@@ -15,8 +15,9 @@ An ask is one of:
 
 Every emitted ask names its origin: the message and tool call that raised it, which is what an answer after a
 restart is applied to. A GitLab Duo workflow's tool approval is emitted like any other permission request; it has no
-tool call of its own, so its origin is its message and its request ID. An answer to it after a restart has no call to
-apply to, so it is refused with `409 call-gone` and the ask stays pending. An ask with no origin at all is refused,
+tool call of its own, so its origin is its message and its request ID. After a restart it has no call that could take
+a decision, so the first answer closes it as `undelivered` (see [After a restart](#after-a-restart)). An ask with no
+origin at all is refused,
 with an error in the server log; no producer raises one today.
 
 Without the flag nothing changes: no ask is recorded or emitted.
@@ -125,7 +126,9 @@ model as feedback).
   - `disposition: "settled"`: this answer settled the ask, and `decision` is it.
   - `disposition: "duplicate"`: an earlier answer, from a human or another resolver, already settled the ask, and
     `decision` is the winner's. A decision `{"type": "cancelled"}` means the tool stopped waiting before anyone
-    answered: its turn was aborted, the ask failed while it was being raised, or its instance was disposed.
+    answered: its turn was aborted, the ask failed while it was being raised, or its instance was disposed. A
+    decision `{"type": "undelivered"}` means the server that waited on the ask was gone and its call can never take a
+    decision; the ask was closed with nothing applied.
   - `recovered: true`: the server that waited on the ask was gone, and recovery wrote the decision into the stored
     call (see [After a restart](#after-a-restart)). A decision the live waiting call received reports
     `recovered: false`.
@@ -141,8 +144,9 @@ model as feedback).
   - `apply-failed`: the producer's effect for the answer failed, for example a plan `Yes` whose switch to the build
     agent could not be written. Nothing was settled and the ask is still pending: answer it again once the cause is
     fixed, or answer differently.
-  - `call-gone`: after a restart, the call the ask belongs to is gone, or its Session went on without it. Nothing
-    was settled and the ask is still pending; every answer to it, a rejection included, is refused the same way.
+  - `call-gone`: after a restart, the stored tool call the ask belongs to is missing, though its message is still
+    there (or hidden by a revert that can be undone), so it may come back. Nothing was settled and the ask is still
+    pending; answer it again once the call is back.
 
 `GET /question?directory=...` and `GET /permission?directory=...` list the outstanding asks this server can settle.
 
@@ -182,10 +186,18 @@ A plan accepted live works the same way: the switch to the build agent (its buil
 in the transaction that settles the `Yes`. If the switch fails, the answer gets `409 apply-failed`, nothing is
 settled, no build message is left behind, and the plan call keeps waiting for another answer.
 
-When the asking call is gone, or the Session went on before the answer arrived (for example because it was prompted
-again after the restart), the answer gets `409 call-gone`: nothing is applied or settled, and the answer is not
-consumed. The ask stays pending and listed, and `opencode db prune` and `opencode db retention` keep refusing its
-Session; deleting the Session removes it.
+When the asking call cannot take the answer, what happens depends on whether it can come back:
+
+- **It provably cannot**: the ask never had a tool call of its own (a GitLab Duo workflow approval), its message was
+  deleted, or its Session went on before the answer arrived (for example because it was prompted again after the
+  restart). The answer closes the ask with the decision `undelivered` (`200`, `disposition: "settled"`,
+  `recovered: false`): nothing is applied, the ask leaves the outstanding list, and prune and retention stop
+  refusing its Session. A later answer is a `duplicate` with that decision.
+- **It may come back**: the message is still there but its tool call is missing, or the message is hidden by a
+  revert that can be undone. The answer gets `409 call-gone`: nothing is applied or settled, and the ask stays pending
+  and listed for another answer once the call is back. Until then prune and retention keep refusing its Session;
+  deleting the Session removes the ask.
+
 When the call already ended without an answer, because its ask was aborted, the ask is settled as `cancelled`.
 
 A refusal ends the turn as it would have live: a question rejection, a plan `No`, or a permission `reject` without a
@@ -216,8 +228,11 @@ that process is gone; while it runs, or when its state cannot be proven, the ans
   answer and the build-agent message is written, but the aborted plan call ends without continuing the turn: the
   Session's next prompt runs as the build agent.
 - A server started without `--questions-command` neither lists nor settles recorded asks, and `opencode db prune`
-  and `opencode db retention` keep refusing their Sessions. To settle them, restart the server with
-  `--questions-command` on the same database and answer, or reject, each one it lists.
+  and `opencode db retention` keep refusing their Sessions. To clean them up, restart the server with
+  `--questions-command` on the same database and answer, or reject, each one it lists. Each answer settles its ask:
+  applied to its call, or closed as `undelivered` when the call can never take it. The exception is an ask whose
+  call is missing but may come back (`409 call-gone`), which stays listed until the call is back or its Session is
+  deleted.
 - An ask raised in a subagent's child Session is recovered in that child: its call gets the answer and the child
   continues to its end. The parent's `task` call waited in the old process and is not recovered, so the parent
   Session does not receive the child's result; prompt the parent again to go on.
