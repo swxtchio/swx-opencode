@@ -32,6 +32,7 @@ export interface DialogSelectProps<T> {
   onMove?: (option: DialogSelectOption<T>) => void
   onFilter?: (query: string) => void
   onSelect?: (option: DialogSelectOption<T>) => void
+  selectedText?: (option: DialogSelectOption<T>) => string
   skipFilter?: boolean
   renderFilter?: boolean
   locked?: boolean
@@ -212,9 +213,30 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
   })
 
   const dimensions = useTerminalDimensions()
-  const height = createMemo(() => Math.min(rows(), Math.floor(dimensions().height / 2) - 6))
-
   const selected = createMemo(() => flat()[store.selected])
+  const previewText = createMemo(() => {
+    const option = selected()
+    if (!option) return
+    return props.selectedText?.(option)
+  })
+  // Reserve the overlay and dialog chrome before splitting terminal rows between the list and preview.
+  const availableHeight = createMemo(() => {
+    const header = props.renderFilter === false ? 1 : 3
+    const footer = props.footer || visibleActions().length ? 1 : 0
+    const chrome = Math.ceil(dimensions().height / 4) + 1 + header + 3 + footer + 1 + 1
+    return Math.max(2, Math.floor(dimensions().height) - chrome)
+  })
+  const previewHeight = createMemo(() => {
+    if (previewText() === undefined) return 0
+    return Math.max(1, Math.min(Math.floor(dimensions().height / 3), availableHeight() - 1))
+  })
+  const height = createMemo(() => {
+    if (previewText() === undefined) return Math.min(rows(), Math.floor(dimensions().height / 2) - 6)
+    return Math.min(rows(), Math.max(1, availableHeight() - previewHeight()))
+  })
+  let preview: ScrollBoxRenderable | undefined
+
+  createEffect(on([selected, () => store.filter], () => preview?.scrollTo(0), { defer: true }))
 
   createEffect(
     on(
@@ -296,6 +318,15 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
     if (next < 0) next = flat().length - 1
     if (next >= flat().length) next = 0
     moveTo(next, true)
+  }
+
+  function page(direction: number) {
+    if (previewText() !== undefined && preview) {
+      preview.scrollBy(direction * Math.max(1, preview.height))
+      if (input && !input.isDestroyed) input.focus()
+      return
+    }
+    move(direction * 10)
   }
 
   function moveTo(next: number, center = false, preserve = true) {
@@ -397,7 +428,7 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
           category: "Dialog",
           run() {
             setStore("input", "keyboard")
-            move(-10)
+            page(-1)
           },
         },
         {
@@ -406,7 +437,7 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
           category: "Dialog",
           run() {
             setStore("input", "keyboard")
-            move(10)
+            page(1)
           },
         },
         {
@@ -716,6 +747,25 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
           </scrollbox>
         </Show>
       </box>
+      <Show when={previewText() !== undefined}>
+        <box flexShrink={1} paddingLeft={4} paddingRight={4}>
+          <text fg={theme.textMuted} attributes={TextAttributes.BOLD}>
+            Selected prompt
+          </text>
+          <scrollbox
+            paddingLeft={1}
+            paddingRight={1}
+            maxHeight={previewHeight()}
+            scrollbarOptions={{ visible: true }}
+            scrollAcceleration={scrollAcceleration()}
+            ref={(r: ScrollBoxRenderable) => (preview = r)}
+          >
+            <text fg={theme.text} wrapMode="char" width="100%">
+              {previewText() ?? ""}
+            </text>
+          </scrollbox>
+        </box>
+      </Show>
       <Show when={props.footer || visibleActions().length} fallback={<box flexShrink={0} />}>
         <box paddingRight={2} paddingLeft={4} flexDirection="row" justifyContent="space-between" flexShrink={0}>
           <box flexDirection="row" gap={2}>

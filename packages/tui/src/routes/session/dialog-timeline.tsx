@@ -42,6 +42,8 @@ export function DialogTimeline(props: {
       }}
       title="Timeline"
       options={options()}
+      selectedText={(option) => option.value.text}
+      footerHints={[{ title: "Scroll selected prompt", label: "PgUp/PgDn", side: "right" }]}
     />
   )
 }
