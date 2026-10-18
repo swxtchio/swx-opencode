@@ -6,7 +6,7 @@ import type { SessionAsk } from "@opencode-ai/schema/session-ask"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { AskUnavailableError, PermissionNotFoundError } from "../errors"
+import { AskNotAppliedError, AskUnavailableError, PermissionNotFoundError } from "../errors"
 
 export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permission", (handlers) =>
   Effect.gen(function* () {
@@ -68,6 +68,9 @@ export const settlePermission = Effect.fn("PermissionHttpApi.settle")(function* 
       Effect.fail(
         new AskUnavailableError({ requestID: error.requestID, reason: error.reason, message: error.message }),
       ),
+    ),
+    Effect.catchTag("SessionAsk.NotAppliedError", (error) =>
+      Effect.fail(new AskNotAppliedError({ requestID: error.requestID, reason: error.reason, message: error.message })),
     ),
   )
 })

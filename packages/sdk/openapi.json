@@ -4794,6 +4794,16 @@
               }
             }
           },
+          "409": {
+            "description": "AskNotAppliedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskNotAppliedError"
+                }
+              }
+            }
+          },
           "503": {
             "description": "AskUnavailableError",
             "content": {
@@ -4905,6 +4915,16 @@
               }
             }
           },
+          "409": {
+            "description": "AskNotAppliedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskNotAppliedError"
+                }
+              }
+            }
+          },
           "503": {
             "description": "AskUnavailableError",
             "content": {
@@ -4991,6 +5011,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/QuestionNotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "AskNotAppliedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskNotAppliedError"
                 }
               }
             }
@@ -5153,6 +5183,16 @@
               }
             }
           },
+          "409": {
+            "description": "AskNotAppliedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskNotAppliedError"
+                }
+              }
+            }
+          },
           "503": {
             "description": "AskUnavailableError",
             "content": {
@@ -5259,6 +5299,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/PermissionNotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "AskNotAppliedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskNotAppliedError"
                 }
               }
             }
@@ -8235,6 +8285,16 @@
                       "$ref": "#/components/schemas/PermissionNotFoundError"
                     }
                   ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "AskNotAppliedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskNotAppliedError"
                 }
               }
             }
@@ -24728,6 +24788,27 @@
           "reason": {
             "type": "string",
             "enum": ["store-unavailable", "owned-by-live-process"]
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": ["_tag", "requestID", "reason", "message"],
+        "additionalProperties": false
+      },
+      "AskNotAppliedError": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["AskNotAppliedError"]
+          },
+          "requestID": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string",
+            "enum": ["apply-failed", "call-gone"]
           },
           "message": {
             "type": "string"

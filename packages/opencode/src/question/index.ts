@@ -40,6 +40,7 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Que
 interface PendingEntry {
   info: Request
   deferred: Deferred.Deferred<ReadonlyArray<Answer>, RejectedError>
+  apply?: (answers: ReadonlyArray<Answer>) => Effect.Effect<void, unknown>
 }
 
 interface State {
@@ -55,14 +56,17 @@ export interface Interface {
     tool?: Tool
     // The producing tool's name, reported to a supervisor and used to recover the call after a restart.
     producer?: string
+    // Under emission, the producer's effect for an answer, run in the transaction that settles it: a failure leaves
+    // the ask pending instead of settled with nothing done.
+    apply?: (answers: ReadonlyArray<Answer>) => Effect.Effect<void, unknown>
   }) => Effect.Effect<ReadonlyArray<Answer>, RejectedError>
   readonly reply: (input: {
     requestID: QuestionID
     answers: ReadonlyArray<Answer>
-  }) => Effect.Effect<AskLedger.Resolution, NotFoundError | AskLedger.UnavailableError>
+  }) => Effect.Effect<AskLedger.Resolution, NotFoundError | AskLedger.UnavailableError | AskLedger.NotAppliedError>
   readonly reject: (
     requestID: QuestionID,
-  ) => Effect.Effect<AskLedger.Resolution, NotFoundError | AskLedger.UnavailableError>
+  ) => Effect.Effect<AskLedger.Resolution, NotFoundError | AskLedger.UnavailableError | AskLedger.NotAppliedError>
   readonly list: () => Effect.Effect<ReadonlyArray<Request>>
 }
 
@@ -98,6 +102,7 @@ const layer = Layer.effect(
       questions: ReadonlyArray<Info>
       tool?: Tool
       producer?: string
+      apply?: (answers: ReadonlyArray<Answer>) => Effect.Effect<void, unknown>
     }) {
       const pending = (yield* InstanceState.get(state)).pending
       const id = QuestionID.ascending()
@@ -116,7 +121,7 @@ const layer = Layer.effect(
         return yield* new RejectedError()
       }
       // Waiting before the ask is recorded or published, so no resolver can find it without its waiter.
-      pending.set(id, { info, deferred })
+      pending.set(id, { info, deferred, apply: input.apply })
       return yield* Effect.gen(function* () {
         yield* ledger.admit({ id, sessionID: input.sessionID, kind: "question", tool: input.producer, request: info })
         yield* events.publish(Event.Asked, info)
@@ -170,11 +175,14 @@ const layer = Layer.effect(
       // whose waiter never receives it. A resolution handed back for recovery is not settled yet.
       return yield* Effect.uninterruptible(
         Effect.gen(function* () {
+          const apply = pending.get(requestID)?.apply
+          const answers = decision.type === "answered" ? decision.answers : undefined
           const outcome = yield* ledger.decide({
             id: requestID,
             kind: "question",
             decision,
             live: () => pending.has(requestID),
+            apply: apply && answers ? () => apply(answers) : undefined,
           })
           if (outcome.type === "unknown") return yield* unknown()
           if (outcome.type !== "won") return outcome.resolution

@@ -2619,6 +2619,13 @@ export type AskUnavailableError = {
   message: string
 }
 
+export type AskNotAppliedError = {
+  _tag: "AskNotAppliedError"
+  requestID: string
+  reason: "apply-failed" | "call-gone"
+  message: string
+}
+
 export type SessionAskQuestionAnswer =
   | {
       /**
@@ -9491,6 +9498,10 @@ export type QuestionReplyErrors = {
    */
   404: QuestionNotFoundError
   /**
+   * AskNotAppliedError
+   */
+  409: AskNotAppliedError
+  /**
    * AskUnavailableError
    */
   503: AskUnavailableError
@@ -9529,6 +9540,10 @@ export type QuestionRejectErrors = {
    */
   404: QuestionNotFoundError
   /**
+   * AskNotAppliedError
+   */
+  409: AskNotAppliedError
+  /**
    * AskUnavailableError
    */
   503: AskUnavailableError
@@ -9566,6 +9581,10 @@ export type QuestionAnswerErrors = {
    * QuestionNotFoundError
    */
   404: QuestionNotFoundError
+  /**
+   * AskNotAppliedError
+   */
+  409: AskNotAppliedError
   /**
    * AskUnavailableError
    */
@@ -9636,6 +9655,10 @@ export type PermissionReplyErrors = {
    */
   404: PermissionNotFoundError
   /**
+   * AskNotAppliedError
+   */
+  409: AskNotAppliedError
+  /**
    * AskUnavailableError
    */
   503: AskUnavailableError
@@ -9676,6 +9699,10 @@ export type PermissionAnswerErrors = {
    * PermissionNotFoundError
    */
   404: PermissionNotFoundError
+  /**
+   * AskNotAppliedError
+   */
+  409: AskNotAppliedError
   /**
    * AskUnavailableError
    */
@@ -10810,6 +10837,10 @@ export type PermissionRespondErrors = {
    * NotFoundError | PermissionNotFoundError
    */
   404: NotFoundError | PermissionNotFoundError
+  /**
+   * AskNotAppliedError
+   */
+  409: AskNotAppliedError
   /**
    * AskUnavailableError
    */

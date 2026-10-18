@@ -194,6 +194,18 @@ export class AskUnavailableError extends Schema.TaggedErrorClass<AskUnavailableE
   { httpApiStatus: 503 },
 ) {}
 
+// An accepted answer that could not be applied (swxtchio/swx-opencode#286): `apply-failed` settled nothing and the ask
+// is still pending; `call-gone` closed the ask, whose call is gone or went on without it, with nothing applied.
+export class AskNotAppliedError extends Schema.TaggedErrorClass<AskNotAppliedError>()(
+  "AskNotAppliedError",
+  {
+    requestID: Schema.String,
+    reason: Schema.Literals(["apply-failed", "call-gone"]),
+    message: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {}
+
 export class McpServerNotFoundError extends Schema.TaggedErrorClass<McpServerNotFoundError>()(
   "McpServerNotFoundError",
   {

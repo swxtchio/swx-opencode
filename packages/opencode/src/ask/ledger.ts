@@ -8,7 +8,7 @@ import { SessionAskTable } from "@opencode-ai/core/session/ask.sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionAsk } from "@opencode-ai/schema/session-ask"
 import { and, asc, eq, isNull } from "drizzle-orm"
-import { Cause, Context, Effect, Layer, Schedule, Schema } from "effect"
+import { Cause, Context, Effect, Layer, Option, Schedule, Schema } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import type { SessionID } from "@/session/schema"
 import { AskEmit } from "./emit"
@@ -26,6 +26,35 @@ export class UnavailableError extends Schema.TaggedErrorClass<UnavailableError>(
       return `Ask ${this.requestID} is waited on by another live process; answer it on that process's server`
     return `Ask ${this.requestID} state could not be read or written`
   }
+}
+
+// The answer was accepted but could not be applied, so it is not reported as settled. With `apply-failed` the
+// producer's effect failed and nothing was settled: the ask stays pending for another answer. With `call-gone` the call
+// the ask belongs to is gone or its Session went on after a restart: the ask is closed as cancelled, nothing applied.
+export class NotAppliedError extends Schema.TaggedErrorClass<NotAppliedError>()("SessionAsk.NotAppliedError", {
+  requestID: Schema.String,
+  reason: Schema.Literals(["apply-failed", "call-gone"]),
+}) {
+  override get message() {
+    if (this.reason === "call-gone")
+      return `Ask ${this.requestID} belongs to a call that is gone or that its Session went on without; it was closed and the answer was not applied`
+    return `Ask ${this.requestID} could not apply the answer; nothing was settled and the ask is still pending`
+  }
+}
+
+// Passes a typed ledger failure through and turns any other cause but an interruption into an explicit store failure.
+export function settling(requestID: string) {
+  return <A, E, R>(self: Effect.Effect<A, E, R>): Effect.Effect<A, UnavailableError | NotAppliedError, R> =>
+    self.pipe(
+      Effect.catchCause((cause): Effect.Effect<never, UnavailableError | NotAppliedError> => {
+        if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt
+        const error = Option.getOrUndefined(Cause.findErrorOption(cause))
+        if (error instanceof UnavailableError || error instanceof NotAppliedError) return Effect.fail(error)
+        return Effect.logWarning("ask ledger store failed", { requestID, cause: Cause.pretty(cause) }).pipe(
+          Effect.andThen(Effect.fail(new UnavailableError({ requestID, reason: "store-unavailable" }))),
+        )
+      }),
+    )
 }
 
 export type Resolution = {
@@ -62,7 +91,9 @@ export interface Interface {
     delivered: boolean
     recovered: boolean
   }) => Effect.Effect<{ won: boolean; row: Row }, UnavailableError>
-  // Settles an emitted ask with its first decision. `live` says whether this process still waits on it. Without a
+  // Settles an emitted ask with its first decision. `live` says whether this process still waits on it; `apply` is the
+  // producer's effect for a live decision, run in the transaction that settles it, so the ask settles only once that
+  // effect succeeded and otherwise stays pending (`NotAppliedError`). Without a
   // waiter, a pending ask whose owning process is gone is handed back for recovery, and so is one recovery already
   // applied, whose continuation may have been lost; a decision a live waiter received is never handed back. A pending
   // ask this process owns lost its waiter and is cancelled, and one another live process owns is refused.
@@ -71,9 +102,10 @@ export interface Interface {
     kind: SessionAsk.Kind
     decision: SessionAsk.Decision
     live: () => boolean
+    apply?: () => Effect.Effect<void, unknown>
   }) => Effect.Effect<
     { type: "unknown" } | { type: "duplicate" | "won" | "recover"; resolution: Resolution },
-    UnavailableError
+    UnavailableError | NotAppliedError
   >
   // Ends a still-pending ask whose waiter stopped waiting. A no-op unless emission is configured. The write is retried;
   // until it lands, the ask stays unlisted and an answer to it records the cancellation or is refused (see `decide`).
@@ -233,7 +265,35 @@ const layer = Layer.effect(
       const row = yield* find(input.id, input.kind)
       if (!row) return { type: "unknown" as const }
       if (input.live()) {
-        const settled = yield* settle({ id: input.id, decision: input.decision, delivered: true, recovered: false })
+        const apply = input.apply
+        const settled = yield* db
+          .transaction(
+            () =>
+              Effect.gen(function* () {
+                const claimed = yield* settle({
+                  id: input.id,
+                  decision: input.decision,
+                  delivered: true,
+                  recovered: false,
+                })
+                if (claimed.won && apply)
+                  yield* apply().pipe(
+                    Effect.catchCause((cause) =>
+                      Effect.logWarning("ask answer could not be applied", {
+                        id: input.id,
+                        cause: Cause.pretty(cause),
+                      }).pipe(
+                        Effect.andThen(
+                          Effect.fail(new NotAppliedError({ requestID: input.id, reason: "apply-failed" })),
+                        ),
+                      ),
+                    ),
+                  )
+                return claimed
+              }),
+            { behavior: "immediate" },
+          )
+          .pipe(settling(input.id))
         if (!settled.won) return { type: "duplicate" as const, resolution: resolution(settled.row, "duplicate") }
         return { type: "won" as const, resolution: resolution(settled.row, "settled") }
       }

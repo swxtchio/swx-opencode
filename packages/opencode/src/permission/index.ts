@@ -16,7 +16,10 @@ export interface Interface {
   readonly ask: (input: PermissionV1.AskInput) => Effect.Effect<void, PermissionV1.Error>
   readonly reply: (
     input: PermissionV1.ReplyInput,
-  ) => Effect.Effect<AskLedger.Resolution, PermissionV1.NotFoundError | AskLedger.UnavailableError>
+  ) => Effect.Effect<
+    AskLedger.Resolution,
+    PermissionV1.NotFoundError | AskLedger.UnavailableError | AskLedger.NotAppliedError
+  >
   readonly list: () => Effect.Effect<ReadonlyArray<PermissionV1.Request>>
   // Allows a request's `always` patterns for the rest of the instance, as an `always` reply does.
   readonly grant: (request: PermissionV1.Request) => Effect.Effect<void>

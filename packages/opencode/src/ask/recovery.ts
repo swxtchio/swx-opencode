@@ -21,15 +21,17 @@ import { AskLedger } from "./ledger"
 
 // An ask answered after the process that waited on it is gone (swxtchio/swx-opencode#286). In one transaction this
 // settles a still-pending ask and writes the outcome its producer would have produced into the stored call, so an
-// accepted answer is either applied or not settled at all. A call that already ended without the answer (its ask was
-// aborted) settles the ask as cancelled, and one that is gone or that its Session went on without is left alone: the
-// answer is recorded but not reported as recovered. Where the live tool would have let the turn go on, the Session
+// accepted answer is either applied or not settled at all: a producer effect that fails settles nothing. A call that
+// already ended without the answer (its ask was aborted) settles the ask as cancelled, and one that is gone or that its
+// Session went on without closes it as cancelled and fails the answer with `call-gone`, since nothing was applied. Where the live tool would have let the turn go on, the Session
 // is woken to continue, and an ask recovery applied earlier is handed here again so a wake its process lost is
 // repeated. Only the asking call is recovered: nothing replays provider work, and a permission-guarded call that
 // never ran is not run here. A decision a live waiter received is never handed here.
 export interface Interface {
   // Applies a resolution the ledger handed back for recovery and returns the final one; any other is returned as is.
-  readonly apply: (resolution: AskLedger.Resolution) => Effect.Effect<AskLedger.Resolution, AskLedger.UnavailableError>
+  readonly apply: (
+    resolution: AskLedger.Resolution,
+  ) => Effect.Effect<AskLedger.Resolution, AskLedger.UnavailableError | AskLedger.NotAppliedError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/AskRecovery") {}
@@ -70,7 +72,7 @@ const layer = Layer.effect(
                   decision: current.decision ?? { type: "cancelled" },
                   recovered: current.recovered,
                 }
-                const idle = { final, row: current, won: false, wake: false }
+                const idle = { final, row: current, won: false, wake: false, gone: false }
                 if (!current.recovered || !current.decision || !target || target.continued) return idle
                 return { ...idle, wake: continuesAfter(current, current.decision, stopOnDeny) }
               }
@@ -84,41 +86,48 @@ const layer = Layer.effect(
                   row: ended.row,
                   won: false,
                   wake: false,
+                  gone: false,
                 }
               }
               if (!target?.newest) {
-                if (target) yield* Effect.logWarning("recovered ask's Session went on without it", { id: row.id })
-                const recorded = yield* record(resolution.decision, false)
-                return { final: { ...settled, recovered: false }, row: recorded.row, won: true, wake: false }
+                yield* Effect.logWarning("recovered ask's call is gone or its Session went on; closing it", {
+                  id: row.id,
+                })
+                const closed = yield* record({ type: "cancelled" }, false)
+                return { final: settled, row: closed.row, won: false, wake: false, gone: true }
               }
-              yield* write(target.part, yield* produce(current, resolution.decision))
+              const outcome = yield* produce(current, resolution.decision).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("recovered ask's answer could not be applied", {
+                    id: row.id,
+                    cause: Cause.pretty(cause),
+                  }).pipe(
+                    Effect.andThen(
+                      Effect.fail(new AskLedger.NotAppliedError({ requestID: row.id, reason: "apply-failed" })),
+                    ),
+                  ),
+                ),
+              )
+              yield* write(target.part, outcome)
               const applied = yield* record(resolution.decision, true)
               return {
                 final: { ...settled, recovered: true },
                 row: applied.row,
                 won: true,
                 wake: continuesAfter(current, resolution.decision, stopOnDeny),
+                gone: false,
               }
             }),
           { behavior: "immediate" },
         )
-        .pipe(
-          Effect.catchCause((cause) =>
-            Cause.hasInterruptsOnly(cause)
-              ? Effect.interrupt
-              : Effect.logWarning("ask recovery failed", { id: row.id, cause: Cause.pretty(cause) }).pipe(
-                  Effect.andThen(
-                    Effect.fail(new AskLedger.UnavailableError({ requestID: row.id, reason: "store-unavailable" })),
-                  ),
-                ),
-          ),
-        )
+        .pipe(AskLedger.settling(row.id))
       yield* Effect.logInfo("recovered ask", {
         id: row.id,
         won: result.won,
         recovered: result.final.recovered,
         wake: result.wake,
       })
+      if (result.gone) return yield* new AskLedger.NotAppliedError({ requestID: row.id, reason: "call-gone" })
       if (result.won) yield* publish(result.row)
       const decision = result.row.decision
       // An `always` grant outlives the call, so the model's retry is not asked again.

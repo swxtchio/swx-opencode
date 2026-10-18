@@ -3,7 +3,7 @@ import { Permission } from "@/permission"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
 import { SessionAsk } from "@opencode-ai/schema/session-ask"
-import { AskUnavailableError, PermissionNotFoundError } from "../errors"
+import { AskNotAppliedError, AskUnavailableError, PermissionNotFoundError } from "../errors"
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
 import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
@@ -34,7 +34,7 @@ export const PermissionApi = HttpApi.make("permission")
           query: WorkspaceRoutingQuery,
           payload: ReplyPayload,
           success: described(Schema.Boolean, "Permission processed successfully"),
-          error: [HttpApiError.BadRequest, PermissionNotFoundError, AskUnavailableError],
+          error: [HttpApiError.BadRequest, PermissionNotFoundError, AskUnavailableError, AskNotAppliedError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "permission.reply",
@@ -47,7 +47,7 @@ export const PermissionApi = HttpApi.make("permission")
           query: WorkspaceRoutingQuery,
           payload: ReplyPayload,
           success: described(SessionAsk.Result, "How the answer settled the permission request"),
-          error: [HttpApiError.BadRequest, PermissionNotFoundError, AskUnavailableError],
+          error: [HttpApiError.BadRequest, PermissionNotFoundError, AskUnavailableError, AskNotAppliedError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "permission.answer",

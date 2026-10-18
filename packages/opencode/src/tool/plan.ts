@@ -1,6 +1,6 @@
 import path from "path"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Effect, Schema } from "effect"
+import { Effect, Ref, Schema } from "effect"
 import * as Tool from "./tool"
 import { Question } from "../question"
 import { AskLedger } from "../ask/ledger"
@@ -27,6 +27,10 @@ export const PlanExitTool = Tool.define(
       execute: (_params: {}, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const plan = yield* planPath(session, ctx.sessionID)
+          const services = { session, provider, database }
+          // Under emission the switch is applied in the transaction that settles a Yes, so a switch that fails leaves
+          // the ask pending instead of settled with nothing done.
+          const switched = yield* Ref.make(false)
           const answers = yield* question
             .ask({
               sessionID: ctx.sessionID,
@@ -43,11 +47,16 @@ export const PlanExitTool = Tool.define(
               ],
               tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
               producer: "plan_exit",
+              apply: (answers) =>
+                declined(answers)
+                  ? Effect.void
+                  : approve(services, ctx.sessionID, plan).pipe(Effect.andThen(Ref.set(switched, true))),
             })
             .pipe(AskLedger.abortable(ctx.abort, () => new Question.RejectedError()))
 
           if (declined(answers)) yield* new Question.RejectedError()
-          return yield* approve({ session, provider, database }, ctx.sessionID, plan)
+          if (yield* Ref.get(switched)) return approved
+          return yield* approve(services, ctx.sessionID, plan)
         }).pipe(Effect.orDie),
     }
   }),
@@ -107,9 +116,11 @@ export const approve = Effect.fn("PlanExitTool.approve")(function* (
     )
     .pipe(Effect.orDie)
 
-  return {
-    title: "Switching to build agent",
-    output: "User approved switching to build agent. Wait for further instructions.",
-    metadata: {},
-  }
+  return approved
 })
+
+const approved = {
+  title: "Switching to build agent",
+  output: "User approved switching to build agent. Wait for further instructions.",
+  metadata: {},
+}

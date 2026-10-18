@@ -454,7 +454,7 @@ describe("opencode serve --questions-command (subprocess)", () => {
   )
 
   cliIt.live(
-    "an answer after the restarted Session went on without it is recorded but leaves the old call alone",
+    "an answer after the restarted Session went on without it is refused as not applied and leaves the old call alone",
     ({ opencode, home, llm }) =>
       Effect.gen(function* () {
         const env = { OPENCODE_DB: path.join(home, "moved-on.db") }
@@ -488,7 +488,8 @@ describe("opencode serve --questions-command (subprocess)", () => {
           ),
           home,
         )
-        expect(settled.body).toMatchObject({ disposition: "settled", recovered: false })
+        expect(settled.status).toBe(409)
+        expect(settled.body).toMatchObject({ _tag: "AskNotAppliedError", requestID: emitted.id, reason: "call-gone" })
         const part = (yield* messages(second.url, home, sessionID))
           .flatMap((message) => message.parts)
           .find((item) => item.callID === emitted.origin.callID)
@@ -597,7 +598,7 @@ describe("opencode serve --questions-command (subprocess)", () => {
   )
 
   cliIt.live(
-    "an answer after a restart whose call is gone is recorded but not reported as recovered",
+    "an answer after a restart whose call is gone is refused as not applied, and the ask is closed",
     ({ opencode, home, llm }) =>
       Effect.gen(function* () {
         const file = path.join(home, "gone.db")
@@ -622,9 +623,17 @@ describe("opencode serve --questions-command (subprocess)", () => {
           ),
           home,
         )
-        expect(settled.body).toMatchObject({ disposition: "settled", recovered: false })
+        expect(settled.status).toBe(409)
+        expect(settled.body).toMatchObject({ _tag: "AskNotAppliedError", requestID: emitted.id, reason: "call-gone" })
         const listed = yield* json(HttpClientRequest.get(`${second.url}/question`), home)
         expect(listed.body).toEqual([])
+        const repeated = yield* json(
+          HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Hello"]] }),
+          ),
+          home,
+        )
+        expect(repeated.body).toMatchObject({ disposition: "duplicate", decision: { type: "cancelled" } })
         expect(yield* llm.calls).toBe(1)
       }),
     120_000,
@@ -708,34 +717,93 @@ describe("opencode serve --questions-command (subprocess)", () => {
   )
 
   cliIt.live(
-    "a plan accepted live whose build instruction cannot be written leaves no half-made switch",
+    "a plan accepted live whose switch fails settles nothing, and a retried Yes switches once",
     ({ opencode, home, llm }) =>
       Effect.gen(function* () {
         const file = path.join(home, "plan-live.db")
         const env = { OPENCODE_DB: file, OPENCODE_EXPERIMENTAL_PLAN_MODE: "1" }
         const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
         yield* llm.tool("plan_exit", {})
-        yield* llm.text("stayed in plan")
+        yield* llm.text("building")
         const server = yield* opencode.serve({ extraArgs: ["--questions-command", receiver.path], env })
         const sessionID = yield* startTurn(server.url, home, "plan")
         const [emitted] = yield* receiver.read(1)
-        const sqlite = new Database(file)
-        sqlite.run("PRAGMA busy_timeout = 10000")
-        sqlite.run(
-          "CREATE TRIGGER hold_instruction BEFORE INSERT ON part WHEN NEW.data LIKE '%has been approved%' BEGIN SELECT RAISE(ABORT, 'instruction held'); END",
-        )
-        const accepted = yield* json(
+        const accept = json(
           HttpClientRequest.post(`${server.url}${emitted.answer.path}`).pipe(
             HttpClientRequest.bodyJsonUnsafe({ answers: [["Yes"]] }),
           ),
           home,
         )
-        expect(accepted.body).toMatchObject({ disposition: "settled" })
-        yield* toolPart(server.url, home, sessionID, emitted.origin.callID, "error")
+        const builds = messages(server.url, home, sessionID).pipe(
+          Effect.map((list) =>
+            list.filter((message) => message.info.role === "user" && message.info.agent === "build"),
+          ),
+        )
+        const sqlite = new Database(file)
+        sqlite.run("PRAGMA busy_timeout = 10000")
+        sqlite.run(
+          "CREATE TRIGGER hold_instruction BEFORE INSERT ON part WHEN NEW.data LIKE '%has been approved%' BEGIN SELECT RAISE(ABORT, 'instruction held'); END",
+        )
+        const failed = yield* accept
         sqlite.run("DROP TRIGGER hold_instruction")
         sqlite.close()
-        const list = yield* messages(server.url, home, sessionID)
-        expect(list.filter((message) => message.info.role === "user" && message.info.agent === "build")).toEqual([])
+        expect(failed.status).toBe(409)
+        expect(failed.body).toMatchObject({ _tag: "AskNotAppliedError", requestID: emitted.id, reason: "apply-failed" })
+        expect(yield* builds).toEqual([])
+        const listed = yield* json(HttpClientRequest.get(`${server.url}/question`), home)
+        expect(listed.body.map((item: { id: string }) => item.id)).toEqual([emitted.id])
+        const waiting = (yield* messages(server.url, home, sessionID))
+          .flatMap((message) => message.parts)
+          .find((part) => part.callID === emitted.origin.callID)
+        expect(waiting.state.status).toBe("running")
+
+        expect((yield* accept).body).toMatchObject({ disposition: "settled", decision: { answers: [["Yes"]] } })
+        yield* toolPart(server.url, home, sessionID, emitted.origin.callID, "completed")
+        expect(yield* builds).toHaveLength(1)
+        yield* assistantText(server.url, home, sessionID, "building")
+      }),
+    120_000,
+  )
+
+  cliIt.live(
+    "a plan accepted after a restart whose switch fails settles nothing, and a retry applies it",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const file = path.join(home, "plan-recovery.db")
+        const env = { OPENCODE_DB: file, OPENCODE_EXPERIMENTAL_PLAN_MODE: "1" }
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        const extraArgs = ["--questions-command", receiver.path]
+        yield* llm.tool("plan_exit", {})
+        yield* llm.text("building after the restart")
+        const first = yield* opencode.serve({ extraArgs, env })
+        const sessionID = yield* startTurn(first.url, home, "plan")
+        const [emitted] = yield* receiver.read(1)
+        first.kill()
+        yield* Effect.promise(() => first.exited)
+
+        const second = yield* opencode.serve({ extraArgs, env })
+        const accept = json(
+          HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Yes"]] }),
+          ),
+          home,
+        )
+        const sqlite = new Database(file)
+        sqlite.run("PRAGMA busy_timeout = 10000")
+        sqlite.run(
+          "CREATE TRIGGER hold_instruction BEFORE INSERT ON part WHEN NEW.data LIKE '%has been approved%' BEGIN SELECT RAISE(ABORT, 'instruction held'); END",
+        )
+        const failed = yield* accept
+        sqlite.run("DROP TRIGGER hold_instruction")
+        sqlite.close()
+        expect(failed.status).toBe(409)
+        expect(failed.body).toMatchObject({ _tag: "AskNotAppliedError", reason: "apply-failed" })
+        const listed = yield* json(HttpClientRequest.get(`${second.url}/question`), home)
+        expect(listed.body.map((item: { id: string }) => item.id)).toEqual([emitted.id])
+
+        expect((yield* accept).body).toMatchObject({ disposition: "settled", recovered: true })
+        yield* toolPart(second.url, home, sessionID, emitted.origin.callID, "completed")
+        yield* assistantText(second.url, home, sessionID, "building after the restart")
       }),
     120_000,
   )

@@ -6,7 +6,7 @@ import type { SessionAsk } from "@opencode-ai/schema/session-ask"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { AskUnavailableError, QuestionNotFoundError } from "../errors"
+import { AskNotAppliedError, AskUnavailableError, QuestionNotFoundError } from "../errors"
 
 export const questionHandlers = HttpApiBuilder.group(InstanceHttpApi, "question", (handlers) =>
   Effect.gen(function* () {
@@ -15,7 +15,10 @@ export const questionHandlers = HttpApiBuilder.group(InstanceHttpApi, "question"
 
     // Every route settles through the service, and recovery settles and applies a decision the service handed back.
     const settle = Effect.fn("QuestionHttpApi.settle")(function* (
-      resolution: Effect.Effect<AskLedger.Resolution, Question.NotFoundError | AskLedger.UnavailableError>,
+      resolution: Effect.Effect<
+        AskLedger.Resolution,
+        Question.NotFoundError | AskLedger.UnavailableError | AskLedger.NotAppliedError
+      >,
     ) {
       return yield* resolution.pipe(
         Effect.flatMap(recovery.apply),
@@ -30,6 +33,11 @@ export const questionHandlers = HttpApiBuilder.group(InstanceHttpApi, "question"
         Effect.catchTag("SessionAsk.UnavailableError", (error) =>
           Effect.fail(
             new AskUnavailableError({ requestID: error.requestID, reason: error.reason, message: error.message }),
+          ),
+        ),
+        Effect.catchTag("SessionAsk.NotAppliedError", (error) =>
+          Effect.fail(
+            new AskNotAppliedError({ requestID: error.requestID, reason: error.reason, message: error.message }),
           ),
         ),
       )
