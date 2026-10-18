@@ -2,6 +2,7 @@ import path from "path"
 import { onMount } from "solid-js"
 import { Option, Schema } from "effect"
 import { createStore, produce, unwrap } from "solid-js/store"
+import { createHash } from "node:crypto"
 import type { AgentPart, Config, FilePart, Message, Part, TextPart } from "@opencode-ai/sdk/v2"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { classify } from "@opencode-ai/schema/session-machine-message"
@@ -35,7 +36,11 @@ export type PromptHistoryEntry = PromptInfo & { sessionID: string; origin: "tui-
 type PromptHistoryRecord = PromptInfo & { sessionID?: string; origin?: string }
 type PromptHistoryRow = { key: number; entry: PromptHistoryRecord; raw?: string }
 type ParsedPromptHistoryRow = { entry: PromptHistoryRecord; raw?: string }
-const PromptHistoryHydration = Schema.Struct({ version: Schema.Literal(1), sessions: Schema.Array(Schema.String) })
+type PromptHistoryHydrationEntry = { sessionID: string; signatures: readonly string[] }
+const PromptHistoryHydration = Schema.Struct({
+  version: Schema.Literal(2),
+  sessions: Schema.Array(Schema.Struct({ sessionID: Schema.String, signatures: Schema.Array(Schema.String) })),
+})
 
 type HistoryMessage = { info: Message; parts: Part[] }
 
@@ -65,7 +70,55 @@ function parsePromptHistoryHydration(text: string) {
   if (Option.isNone(json)) return []
   const hydration = Schema.decodeUnknownOption(PromptHistoryHydration)(json.value)
   if (Option.isNone(hydration)) return []
-  return [...new Set(hydration.value.sessions.filter(Boolean))]
+  return [
+    ...new Map(
+      hydration.value.sessions
+        .filter((session) => session.sessionID)
+        .map((session) => [session.sessionID, session] as const),
+    ).values(),
+  ]
+}
+
+function retainedPromptHistoryHydration(rows: PromptHistoryRow[], sessionID: string): PromptHistoryHydrationEntry {
+  return {
+    sessionID,
+    signatures: rows.flatMap((row) =>
+      row.entry.sessionID === sessionID && row.entry.origin === "tui-composer"
+        ? [promptHistoryFingerprint(row.entry)]
+        : [],
+    ),
+  }
+}
+
+function updatePromptHistoryHydration(
+  sessions: PromptHistoryHydrationEntry[],
+  rows: PromptHistoryRow[],
+  sessionID: string,
+) {
+  return [...sessions.filter((session) => session.sessionID !== sessionID), retainedPromptHistoryHydration(rows, sessionID)]
+}
+
+function validatePromptHistoryHydration(sessions: PromptHistoryHydrationEntry[], rows: PromptHistoryRow[]) {
+  return sessions.filter((session) => {
+    const available = new Map<string, number>()
+    for (const row of rows) {
+      if (row.entry.sessionID !== session.sessionID || row.entry.origin !== "tui-composer") continue
+      const signature = promptHistoryFingerprint(row.entry)
+      available.set(signature, (available.get(signature) ?? 0) + 1)
+    }
+    return session.signatures.every((signature) => {
+      const count = available.get(signature) ?? 0
+      if (!count) return false
+      available.set(signature, count - 1)
+      return true
+    })
+  })
+}
+
+function promptHistoryFingerprint(entry: PromptHistoryRecord) {
+  return createHash("sha256")
+    .update(JSON.stringify([entry.mode, entry.machineAppended, promptSignature(promptText(entry), entry.parts)]))
+    .digest("hex")
 }
 
 function serializePromptHistoryRows(rows: Pick<PromptHistoryRow, "entry" | "raw">[]) {
@@ -95,7 +148,7 @@ export const { use: usePromptHistory, provider: PromptHistoryProvider } = create
       index: 0,
       ready: false,
       history: [] as PromptHistoryRow[],
-      hydrated: [] as string[],
+      hydrated: [] as PromptHistoryHydrationEntry[],
     })
 
     onMount(async () => {
@@ -107,12 +160,25 @@ export const { use: usePromptHistory, provider: PromptHistoryProvider } = create
       const loaded = parsed.map((row) => ({ ...row, key: nextKey++ }))
       const pending = store.history.map((row) => ({ key: nextKey++, entry: row.entry }))
       const history = [...loaded, ...pending].slice(-MAX_HISTORY_ENTRIES)
+      const previousHydration = parsePromptHistoryHydration(hydrationText)
+      const validated = validatePromptHistoryHydration(previousHydration, history)
+      const hydrated = [...new Set(pending.flatMap((row) => (row.entry.sessionID ? [row.entry.sessionID] : [])))].reduce(
+        (result, sessionID) =>
+          result.some((session) => session.sessionID === sessionID)
+            ? updatePromptHistoryHydration(result, history, sessionID)
+            : result,
+        validated,
+      )
       setStore("history", history)
-      setStore("hydrated", parsePromptHistoryHydration(hydrationText))
+      setStore("hydrated", hydrated)
 
       // Keep ownerless rows byte-for-byte until ordinary retention evicts them.
-      if (history.length > 0)
-        enqueue(() => writeText(historyPath, serializePromptHistoryRows(history))).catch(() => {})
+      if (history.length > 0 || JSON.stringify(previousHydration) !== JSON.stringify(hydrated))
+        enqueue(async () => {
+          if (JSON.stringify(previousHydration) !== JSON.stringify(hydrated))
+            await writeJsonAtomic(hydrationPath, { version: 2, sessions: hydrated })
+          if (history.length > 0) await writeText(historyPath, serializePromptHistoryRows(history))
+        }).catch(() => {})
       setStore("ready", true)
     })
 
@@ -127,7 +193,7 @@ export const { use: usePromptHistory, provider: PromptHistoryProvider } = create
 
     return {
       needsRecovery(sessionID: string | undefined) {
-        return !!sessionID && store.ready && !store.hydrated.includes(sessionID)
+        return !!sessionID && store.ready && !store.hydrated.some((session) => session.sessionID === sessionID)
       },
       list,
       async recover(sessionID: string, messages: HistoryMessage[], markers?: Config["machine_message_markers"]) {
@@ -136,12 +202,15 @@ export const { use: usePromptHistory, provider: PromptHistoryProvider } = create
           return composerMessagePrompts(message.parts, markers)
         })
         const history = mergePromptHistory(store.history, sessionID, prompts, () => nextKey++)
-        const hydrated = store.hydrated.includes(sessionID) ? store.hydrated : [...store.hydrated, sessionID]
+        const hydrated = validatePromptHistoryHydration(
+          updatePromptHistoryHydration(store.hydrated, history, sessionID),
+          history,
+        )
         setStore("history", history)
         setStore("index", 0)
         const persisted = await enqueue(() =>
-          writeText(historyPath, serializePromptHistoryRows(history)).then(() =>
-            writeJsonAtomic(hydrationPath, { version: 1, sessions: hydrated }),
+          writeJsonAtomic(hydrationPath, { version: 2, sessions: hydrated }).then(() =>
+            writeText(historyPath, serializePromptHistoryRows(history)),
           ),
         ).then(
           () => true,
@@ -194,11 +263,18 @@ export const { use: usePromptHistory, provider: PromptHistoryProvider } = create
         )
 
         if (!store.ready) return
-        if (trimmed) {
-          enqueue(() => writeText(historyPath, serializePromptHistoryRows(store.history))).catch(() => {})
-          return
-        }
-        enqueue(() => appendText(historyPath, JSON.stringify(entry) + "\n")).catch(() => {})
+        enqueue(async () => {
+          const current = store.hydrated
+          const updated = current.some((session) => session.sessionID === sessionID)
+            ? updatePromptHistoryHydration(current, store.history, sessionID)
+            : current
+          const hydrated = validatePromptHistoryHydration(updated, store.history)
+          const hydrationChanged = JSON.stringify(current) !== JSON.stringify(hydrated)
+          if (hydrationChanged) await writeJsonAtomic(hydrationPath, { version: 2, sessions: hydrated })
+          if (trimmed) await writeText(historyPath, serializePromptHistoryRows(store.history))
+          else await appendText(historyPath, JSON.stringify(entry) + "\n")
+          if (hydrationChanged) setStore("hydrated", hydrated)
+        }).catch(() => {})
       },
     }
   },

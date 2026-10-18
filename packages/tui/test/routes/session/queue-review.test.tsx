@@ -83,7 +83,14 @@ type HeldPrompt = {
   model?: { providerID: string; modelID: string }
   agent?: string
   variant?: string
-  parts: { type: string; text?: string; metadata?: Record<string, unknown>; synthetic?: boolean; ignored?: boolean }[]
+  parts: {
+    type: string
+    text?: string
+    metadata?: Record<string, unknown>
+    source?: { start?: number; end?: number; value?: string }
+    synthetic?: boolean
+    ignored?: boolean
+  }[]
   answer: (response: Response) => void
 }
 type EnhancementRequest = { model: string; draft: string; context: string }
@@ -872,6 +879,78 @@ test("reopens recover human prompts erased from a tagged-only history cache", as
   }
 }, 30_000)
 
+test("rehydrates a session after another session's prompts evict its retained rows", async () => {
+  await using state = await tmpdir()
+  const a = "ses_history_eviction_a"
+  const b = "ses_history_eviction_b"
+  const promptsB = Array.from({ length: 10 }, (_, index) => `eviction-B-${index}-human-token`)
+  const promptsA = Array.from({ length: 60 }, (_, index) => `eviction-A-${index}-human-token`)
+  const messagesB: unknown[] = []
+  const historyPath = path.join(state.path, "prompt-history.jsonl")
+  const producerB = await startSession({
+    state: state.path,
+    sessionID: b,
+    queue: [],
+    historyMessagesBySession: { [b]: [] },
+  })
+  try {
+    await until(async () => (await screen(producerB)).join("\n").includes(b), "session B")
+    for (const text of promptsB)
+      messagesB.push(await submitHistoryPrompt(producerB, text, b, producerB.prompts.length))
+    await until(async () => (await Bun.file(historyPath).text()).includes(promptsB.at(-1)!), "B's persisted prompts")
+  } finally {
+    producerB.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await producerB.stop()
+  }
+
+  const producerA = await startSession({
+    state: state.path,
+    sessionID: a,
+    queue: [],
+    historyMessagesBySession: { [a]: [] },
+  })
+  try {
+    await until(async () => (await screen(producerA)).join("\n").includes(a), "session A")
+    for (const text of promptsA) await submitHistoryPrompt(producerA, text, a, producerA.prompts.length)
+    await until(async () => {
+      const cache = await Bun.file(historyPath).text()
+      return cache.includes(promptsA.at(-1)!) && !cache.includes(promptsB[0]!)
+    }, "A's traffic evicting B's cached prompts")
+  } finally {
+    producerA.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await producerA.stop()
+  }
+
+  const resumed = await startSession({
+    state: state.path,
+    sessionID: b,
+    home: true,
+    continue: true,
+    sessions: [sessionInfo(b)],
+    queue: [],
+    messagesBySession: { [b]: [] },
+    historyMessagesBySession: { [b]: messagesB },
+  })
+  try {
+    await until(async () => (await screen(resumed)).join("\n").includes(b), "the narrow B resume")
+    await until(() => resumed.historyReads.includes(b), "B's rehydration after eviction")
+    const recalled: string[] = []
+    for (const _ of promptsB) {
+      resumed.renderer.mockInput.pressArrow("up")
+      await resumed.renderer.renderOnce()
+      recalled.push(composer(resumed).plainText)
+    }
+    expect(recalled).toEqual(promptsB.toReversed())
+    for (const _ of promptsB) {
+      resumed.renderer.mockInput.pressArrow("down")
+      await resumed.renderer.renderOnce()
+    }
+    expect(await searchHistory(resumed, promptsB[0]!)).not.toContain("No results found")
+  } finally {
+    await resumed.stop()
+  }
+}, 120_000)
+
 test("resumed history matches a composer-produced agent mention after tracked paste expansion", async () => {
   await using state = await tmpdir()
   const captured = await submitPastedAgentPrompt()
@@ -895,6 +974,17 @@ test("resumed history matches a composer-produced agent mention after tracked pa
     sent.prompt.answer(json(producedMessage))
     await until(async () => !(await screen(producer)).join("\n").includes("pending"), "the producer response")
     await until(async () => (await Bun.file(historyPath).text()).includes("paste-before-agent-first"), "persisted history")
+    const saved = (await Bun.file(historyPath).text())
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { input: string; parts: HeldPrompt["parts"] })
+      .find((entry) => entry.input === original)
+    if (!saved) throw new Error("The composer did not persist its pasted agent prompt")
+    const savedOffset = agentSourceStart(saved.parts)
+    const submittedOffset = agentSourceStart(sent.input.parts)
+    if (savedOffset === undefined || submittedOffset === undefined)
+      throw new Error("The producer omitted the pasted agent mention source offset")
+    expect(submittedOffset).toBeGreaterThan(savedOffset)
   } finally {
     producer.prompts.forEach((prompt) => prompt.answer(json(transcript)))
     await producer.stop()
@@ -921,6 +1011,68 @@ test("resumed history matches a composer-produced agent mention after tracked pa
       return composer(resumed).plainText === original
     }, "the recovered agent prompt")
     expect(await searchHistory(resumed, "paste-before-agent-first")).not.toContain("No results found")
+  } finally {
+    await resumed.stop()
+  }
+}, 30_000)
+
+test("malformed future queue metadata cannot fall back into composer history", async () => {
+  await using state = await tmpdir()
+  const humanText = "future-metadata-human-history-token"
+  const machineText = "future-metadata-malformed-history-token"
+  const fixture = await queueTimelineFixture(
+    await submitComposerPrompt(humanText),
+    await submitComposerPrompt(machineText),
+  )
+  const messageFor = (text: string) =>
+    fixture.messages.find((message) =>
+      message.parts.some((part) => {
+        if (part.type !== "text") return false
+        const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueue)
+        return (
+          Option.isSome(group) &&
+          group.value.constituents.some((item) =>
+            item.input.parts.some((candidate) => candidate.type === "text" && candidate.text.includes(text)),
+          )
+        )
+      }),
+    )
+  const human = messageFor(humanText)
+  const produced = messageFor(machineText)
+  if (!human || !produced) throw new Error("The queue producer omitted a composer-provenance message")
+  const malformed = {
+    ...produced,
+    parts: produced.parts.map((part) =>
+      part.type === "text" && part.metadata?.sessionQueue !== undefined
+        ? {
+            ...part,
+            metadata: {
+              ...part.metadata,
+              sessionQueue: { version: 2, sessionID: fixture.sessionID, kind: "human", constituents: [] },
+            },
+          }
+        : part,
+    ),
+  }
+  const resumed = await startSession({
+    state: state.path,
+    sessionID: fixture.sessionID,
+    queue: [],
+    messagesBySession: { [fixture.sessionID]: [] },
+    historyMessagesBySession: { [fixture.sessionID]: [human, malformed] },
+  })
+  try {
+    await until(async () => (await screen(resumed)).join("\n").includes(fixture.sessionID), "the future-metadata resume")
+    await until(() => resumed.historyReads.includes(fixture.sessionID), "the full transcript recovery")
+    expect(await searchHistory(resumed, humanText)).not.toContain("No results found")
+    resumed.renderer.mockInput.pressEscape()
+    await until(() => resumed.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    expect(await searchHistory(resumed, machineText)).toContain("No results found")
+    resumed.renderer.mockInput.pressEscape()
+    await until(() => resumed.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    resumed.renderer.mockInput.pressArrow("up")
+    await resumed.renderer.renderOnce()
+    expect(composer(resumed).plainText).toBe(humanText)
   } finally {
     await resumed.stop()
   }
@@ -1317,6 +1469,10 @@ async function submitComposerPrompt(text: string, appended = false) {
   }
 }
 
+function agentSourceStart(parts: HeldPrompt["parts"]) {
+  return parts.find((part) => part.type === "agent")?.source?.start
+}
+
 async function submitPastedAgentPrompt() {
   const app = await startSession({ queue: [], status: { type: "busy" } })
   try {
@@ -1361,7 +1517,7 @@ async function keepLatestTaggedHistory(historyPath: string, sessionID: string) {
 }
 
 async function clearHistoryHydration(statePath: string) {
-  await Bun.write(path.join(statePath, "prompt-history-hydrated.json"), JSON.stringify({ version: 1, sessions: [] }))
+  await Bun.write(path.join(statePath, "prompt-history-hydrated.json"), JSON.stringify({ version: 2, sessions: [] }))
 }
 
 async function queueTimelineFixture(
