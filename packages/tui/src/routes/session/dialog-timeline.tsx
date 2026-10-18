@@ -100,7 +100,13 @@ export function timelineOptions(input: {
     })
   }
   for (const entry of input.history ?? []) {
-    if (entry.sessionID !== input.sessionID || entry.origin !== "tui-composer" || entry.machineAppended) continue
+    if (
+      entry.sessionID !== input.sessionID ||
+      entry.origin !== "tui-composer" ||
+      entry.mode === "shell" ||
+      entry.machineAppended
+    )
+      continue
     const text = expandTrackedPastedText(
       entry.input,
       entry.parts.flatMap((part) =>
