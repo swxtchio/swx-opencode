@@ -121,6 +121,21 @@ const within = <A, E, R>(self: Effect.Effect<A, E, R>, missing = "the waiting ca
     }),
   )
 
+// Records the request of every question.rejected event published from here on.
+const rejectedEvents = Effect.fn("rejectedEvents")(function* () {
+  const events = yield* EventV2Bridge.Service
+  const rejected: string[] = []
+  const unsubscribe = yield* events.listen((event) =>
+    event.type === Question.Event.Rejected.type
+      ? Effect.sync(() => {
+          rejected.push((event.data as { requestID: string }).requestID)
+        })
+      : Effect.void,
+  )
+  yield* Effect.addFinalizer(() => unsubscribe)
+  return rejected
+})
+
 const failure = <A, E, R>(self: Effect.Effect<A, E, R>) =>
   self.pipe(
     Effect.exit,
@@ -308,6 +323,7 @@ describe("question lifecycle under --questions-command", () => {
         yield* Effect.gen(function* () {
           const question = yield* Question.Service
           const ledger = yield* AskLedger.Service
+          const rejected = yield* rejectedEvents()
           const { receiver, sessionID } = yield* supervised()
           const fiber = yield* askWithTool(sessionID, "call_abort")
           const [emitted] = yield* receiver.read(1)
@@ -318,6 +334,8 @@ describe("question lifecycle under --questions-command", () => {
           expect(yield* question.list()).toEqual([])
           const late = yield* question.reply({ requestID: emitted.id, answers: [["Red"], ["None"]] })
           expect(late).toMatchObject({ disposition: "duplicate", decision: { type: "cancelled" } })
+          // The close is announced once, so attached clients drop the ask.
+          expect(rejected.filter((id) => id === emitted.id)).toHaveLength(1)
         }).pipe(provideInstance(dir))
       }),
     timeout,
@@ -444,6 +462,7 @@ describe("question lifecycle under --questions-command", () => {
         yield* Effect.gen(function* () {
           const question = yield* Question.Service
           const ledger = yield* AskLedger.Service
+          const rejected = yield* rejectedEvents()
           const { receiver, sessionID } = yield* supervised()
           const id = QuestionID.ascending()
           const tool = { messageID: MessageID.make("msg_supervised"), callID: "call_orphan" }
@@ -460,6 +479,7 @@ describe("question lifecycle under --questions-command", () => {
           expect(late).toMatchObject({ disposition: "duplicate", decision: { type: "cancelled" } })
           expect(yield* ledger.find(id, "question")).toMatchObject({ decision: { type: "cancelled" } })
           expect(yield* question.list()).toEqual([])
+          expect(rejected.filter((item) => item === id)).toHaveLength(1)
         }).pipe(provideInstance(dir))
       }),
     timeout,

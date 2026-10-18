@@ -73,7 +73,7 @@ const layer = Layer.effect(
                   decision: current.decision ?? { type: "cancelled" },
                   recovered: current.recovered,
                 }
-                const idle = { final, row: current, won: false, wake: false, gone: false }
+                const idle = { final, row: current, won: false, closed: false, wake: false, gone: false }
                 if (!current.recovered || !current.decision || target.type !== "found" || target.continued) return idle
                 return { ...idle, wake: continuesAfter(current, current.decision, stopOnDeny) }
               }
@@ -86,15 +86,17 @@ const layer = Layer.effect(
                   final: { ...settled, disposition: "duplicate" as const, decision: { type: "cancelled" as const } },
                   row: ended.row,
                   won: false,
+                  closed: true,
                   wake: false,
                   gone: false,
                 }
               }
-              // The call may come back (its part is missing, or hidden by a revert that can be undone): nothing is settled,
-              // the ask stays pending and the answer is refused, so it can be answered again.
+              // The call may come back (its message is there but its part is missing), or its message went missing while a
+              // revert is pending: nothing is settled, the ask stays pending and the answer is refused, so it can be
+              // answered again.
               if (target.type === "absent" && !target.terminal) {
                 yield* Effect.logWarning("recovered ask's call is missing; answer not applied", { id: row.id })
-                return { final: settled, row: current, won: false, wake: false, gone: true }
+                return { final: settled, row: current, won: false, closed: false, wake: false, gone: true }
               }
               // The call provably cannot take the decision: it has no tool part of its own, its message was deleted, or
               // its Session went on. The ask is closed as undelivered, so it stops waiting on an answer.
@@ -107,6 +109,7 @@ const layer = Layer.effect(
                   final: { ...settled, decision: { type: "undelivered" as const }, recovered: false },
                   row: closed.row,
                   won: false,
+                  closed: true,
                   wake: false,
                   gone: false,
                 }
@@ -129,6 +132,7 @@ const layer = Layer.effect(
                 final: { ...settled, recovered: true },
                 row: applied.row,
                 won: true,
+                closed: false,
                 wake: continuesAfter(current, resolution.decision, stopOnDeny),
                 gone: false,
               }
@@ -143,7 +147,8 @@ const layer = Layer.effect(
         wake: result.wake,
       })
       if (result.gone) return yield* new AskLedger.NotAppliedError({ requestID: row.id, reason: "call-gone" })
-      if (result.won) yield* publish(result.row)
+      // A closed ask is announced too, so attached clients drop it.
+      if (result.won || result.closed) yield* publish(result.row)
       const decision = result.row.decision
       // An `always` grant outlives the call, so the model's retry is not asked again.
       if (result.won && decision?.type === "replied" && decision.reply === "always")
@@ -162,7 +167,9 @@ const layer = Layer.effect(
       const messages = yield* session.messages({ sessionID: row.session_id })
       const index = messages.findIndex((message) => message.info.id === MessageID.make(origin.messageID))
       if (index === -1) {
-        // A message a pending revert hides can come back when the revert is undone; any other is deleted for good.
+        // A pending revert does not hide messages; they stay listed until its cleanup deletes them. A message missing
+        // while a revert is pending is refused for now and closes once the revert is resolved; any other missing message
+        // was deleted for good.
         const info = yield* session.get(row.session_id)
         return { type: "absent" as const, terminal: info.revert === undefined }
       }
@@ -253,7 +260,13 @@ const layer = Layer.effect(
           requestID: (row.request as PermissionV1.Request).id,
           reply: decision.reply,
         })
-      return Effect.void
+      // An ask closed without an answer (cancelled or undelivered) is announced as a refusal.
+      if (row.kind === "question") return events.publish(Question.Event.Rejected, { sessionID, requestID: question })
+      return events.publish(Permission.Event.Replied, {
+        sessionID,
+        requestID: (row.request as PermissionV1.Request).id,
+        reply: "reject",
+      })
     }
 
     // Wakes the Session the way the queue's send-now does: the drain runs in the background, a failure is a

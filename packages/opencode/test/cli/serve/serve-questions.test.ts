@@ -481,6 +481,7 @@ describe("opencode serve --questions-command (subprocess)", () => {
           home,
         )
         yield* assistantText(second.url, home, sessionID, "went on without the answer")
+        const events = yield* watchEvents(second.url, home)
 
         const settled = yield* json(
           HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
@@ -495,6 +496,7 @@ describe("opencode serve --questions-command (subprocess)", () => {
           decision: { type: "undelivered" },
           recovered: false,
         })
+        yield* events.until((event) => event.type === "question.rejected" && event.properties.requestID === emitted.id)
         const pending = yield* json(HttpClientRequest.get(`${second.url}/question`), home)
         expect(pending.body).toEqual([])
         const part = (yield* messages(second.url, home, sessionID))
@@ -718,7 +720,14 @@ describe("opencode serve --questions-command (subprocess)", () => {
           ),
           home,
         )
+        const events = yield* watchEvents(second.url, home)
         const closed = yield* answer
+        yield* events.until(
+          (event) =>
+            event.type === "permission.replied" &&
+            event.properties.requestID === emitted.id &&
+            event.properties.reply === "reject",
+        )
         expect(closed.body).toEqual({
           requestID: emitted.id,
           sessionID,
@@ -754,6 +763,7 @@ describe("opencode serve --questions-command (subprocess)", () => {
         sqlite.close()
 
         const second = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        const events = yield* watchEvents(second.url, home)
         const closed = yield* json(
           HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
             HttpClientRequest.bodyJsonUnsafe({ answers: [["Hello"]] }),
@@ -765,6 +775,7 @@ describe("opencode serve --questions-command (subprocess)", () => {
           decision: { type: "undelivered" },
           recovered: false,
         })
+        yield* events.until((event) => event.type === "question.rejected" && event.properties.requestID === emitted.id)
         const listed = yield* json(HttpClientRequest.get(`${second.url}/question`), home)
         expect(listed.body).toEqual([])
       }),
@@ -805,6 +816,7 @@ describe("opencode serve --questions-command (subprocess)", () => {
         sqlite.close()
 
         const second = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        const events = yield* watchEvents(second.url, home)
         const late = yield* json(
           HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
             HttpClientRequest.bodyJsonUnsafe({ answers: [["Too late"]] }),
@@ -812,6 +824,7 @@ describe("opencode serve --questions-command (subprocess)", () => {
           home,
         )
         expect(late.body).toMatchObject({ disposition: "duplicate", decision: { type: "cancelled" }, recovered: false })
+        yield* events.until((event) => event.type === "question.rejected" && event.properties.requestID === emitted.id)
         const part = yield* toolPart(second.url, home, sessionID, emitted.origin.callID, "error")
         expect(part.state.error).not.toContain("Too late")
         expect(yield* llm.calls).toBe(1)

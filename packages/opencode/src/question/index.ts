@@ -86,7 +86,9 @@ const layer = Layer.effect(
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
             for (const item of state.pending.values()) {
-              yield* ledger.cancel(item.info.id)
+              yield* ledger
+                .cancel(item.info.id)
+                .pipe(Effect.flatMap((ended) => (ended ? closed(item.info) : Effect.void)))
               yield* Deferred.fail(item.deferred, new RejectedError())
             }
             state.pending.clear()
@@ -134,9 +136,15 @@ const layer = Layer.effect(
             pending.delete(id)
           }),
         ),
-        Effect.onExit(() => ledger.cancel(id)),
+        Effect.onExit(() => ledger.cancel(id).pipe(Effect.flatMap((ended) => (ended ? closed(info) : Effect.void)))),
       )
     })
+
+    // A supervised ask closed without an answer is announced like a rejection, so every attached client drops it.
+    const closed = (info: Request) =>
+      events
+        .publish(Event.Rejected, { sessionID: info.sessionID, requestID: info.id })
+        .pipe(Effect.catchCause((cause) => Effect.logWarning("ask close not published", { id: info.id, cause })))
 
     const settle = Effect.fn("Question.settle")(function* (
       requestID: QuestionID,
@@ -185,6 +193,7 @@ const layer = Layer.effect(
             apply: apply && answers ? () => apply(answers) : undefined,
           })
           if (outcome.type === "unknown") return yield* unknown()
+          if (outcome.type === "ended") yield* publish(outcome.resolution.sessionID, requestID, { type: "rejected" })
           if (outcome.type !== "won") return outcome.resolution
           const existing = pending.get(requestID)
           // The waiter receives the answer even when its event cannot be published.

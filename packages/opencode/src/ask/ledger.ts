@@ -96,7 +96,8 @@ export interface Interface {
   // effect succeeded and otherwise stays pending (`NotAppliedError`). Without a
   // waiter, a pending ask whose owning process is gone is handed back for recovery, and so is one recovery already
   // applied, whose continuation may have been lost; a decision a live waiter received is never handed back. A pending
-  // ask this process owns lost its waiter and is cancelled, and one another live process owns is refused.
+  // ask this process owns lost its waiter and is cancelled (`ended`: the caller publishes that it closed), and one
+  // another live process owns is refused.
   readonly decide: (input: {
     id: string
     kind: SessionAsk.Kind
@@ -104,12 +105,13 @@ export interface Interface {
     live: () => boolean
     apply?: () => Effect.Effect<void, unknown>
   }) => Effect.Effect<
-    { type: "unknown" } | { type: "duplicate" | "won" | "recover"; resolution: Resolution },
+    { type: "unknown" } | { type: "duplicate" | "won" | "recover" | "ended"; resolution: Resolution },
     UnavailableError | NotAppliedError
   >
-  // Ends a still-pending ask whose waiter stopped waiting. A no-op unless emission is configured. The write is retried;
-  // until it lands, the ask stays unlisted and an answer to it records the cancellation or is refused (see `decide`).
-  readonly cancel: (id: string) => Effect.Effect<void>
+  // Ends a still-pending ask whose waiter stopped waiting, and says whether this call closed it, so the caller
+  // publishes that once. A no-op unless emission is configured. The write is retried; until it lands, the ask stays
+  // unlisted and an answer to it records the cancellation or is refused (see `decide`).
+  readonly cancel: (id: string) => Effect.Effect<boolean>
   // Pending asks of this directory that this process can settle: a gone process's, or its own while `live` says it
   // still waits on them.
   readonly pending: (
@@ -315,21 +317,37 @@ const layer = Layer.effect(
       // This process recorded the ask but no longer waits on it, so no answer can reach the call: end it. This also
       // records an aborted ask's cancellation that could not be written, or refuses the answer while it still cannot.
       const ended = yield* settle({ id: input.id, decision: { type: "cancelled" }, delivered: false, recovered: false })
-      return { type: "duplicate" as const, resolution: resolution(ended.row, "duplicate") }
+      return {
+        type: ended.won ? ("ended" as const) : ("duplicate" as const),
+        resolution: resolution(ended.row, "duplicate"),
+      }
     })
 
     const cancel = Effect.fn("AskLedger.cancel")(function* (id: string) {
-      if (!AskEmit.current()) return
-      yield* db
-        .update(SessionAskTable)
-        .set({ decision: { type: "cancelled" }, time_settled: Date.now() })
-        .where(and(eq(SessionAskTable.id, id), isNull(SessionAskTable.time_settled)))
-        .run()
+      if (!AskEmit.current()) return false
+      return yield* db
+        .transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              const row = yield* tx.select().from(SessionAskTable).where(eq(SessionAskTable.id, id)).get()
+              // An ask that was never recorded, or that a resolver settled first, is not closed here.
+              if (!row || row.time_settled !== null) return false
+              yield* tx
+                .update(SessionAskTable)
+                .set({ decision: { type: "cancelled" }, time_settled: Date.now() })
+                .where(and(eq(SessionAskTable.id, id), isNull(SessionAskTable.time_settled)))
+                .run()
+              return true
+            }),
+          { behavior: "immediate" },
+        )
         .pipe(
           unavailable(id),
           Effect.retry({ times: 4, schedule: Schedule.exponential("25 millis") }),
           Effect.catchTag("SessionAsk.UnavailableError", () =>
-            Effect.logError("ask cancel not recorded; its answers are refused until it is", { id }),
+            Effect.logError("ask cancel not recorded; its answers are refused until it is", { id }).pipe(
+              Effect.as(false),
+            ),
           ),
         )
     })

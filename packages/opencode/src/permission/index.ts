@@ -65,7 +65,9 @@ const layer = Layer.effect(
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
             for (const item of state.pending.values()) {
-              yield* ledger.cancel(item.info.id)
+              yield* ledger
+                .cancel(item.info.id)
+                .pipe(Effect.flatMap((ended) => (ended ? closed(item.info) : Effect.void)))
               yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
             }
             state.pending.clear()
@@ -130,9 +132,15 @@ const layer = Layer.effect(
             pending.delete(id)
           }),
         ),
-        Effect.onExit(() => ledger.cancel(id)),
+        Effect.onExit(() => ledger.cancel(id).pipe(Effect.flatMap((ended) => (ended ? closed(info) : Effect.void)))),
       )
     })
+
+    // A supervised ask closed without an answer is announced like a refusal, so every attached client drops it.
+    const closed = (info: PermissionV1.Request) =>
+      events
+        .publish(Event.Replied, { sessionID: info.sessionID, requestID: info.id, reply: "reject" })
+        .pipe(Effect.catchCause((cause) => Effect.logWarning("ask close not published", { id: info.id, cause })))
 
     const reply = Effect.fn("Permission.reply")(function* (input: PermissionV1.ReplyInput) {
       const { pending } = yield* InstanceState.get(state)
@@ -166,6 +174,12 @@ const layer = Layer.effect(
             live: () => pending.has(input.requestID),
           })
           if (outcome.type === "unknown") return yield* new PermissionV1.NotFoundError({ requestID: input.requestID })
+          if (outcome.type === "ended")
+            yield* events.publish(Event.Replied, {
+              sessionID: outcome.resolution.sessionID,
+              requestID: input.requestID,
+              reply: "reject",
+            })
           if (outcome.type !== "won") return outcome.resolution
           const existing = pending.get(input.requestID)
           if (existing) yield* deliver(existing, input)

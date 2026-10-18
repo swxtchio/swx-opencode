@@ -260,6 +260,7 @@ describe("permission requests under --questions-command", () => {
         const dir = yield* tmpdirScoped({ git: true })
         yield* Effect.gen(function* () {
           const permission = yield* Permission.Service
+          const replied = yield* repliedEvents()
           const ledger = yield* AskLedger.Service
           const events = yield* EventV2Bridge.Service
           const { receiver, sessionID } = yield* supervised()
@@ -277,6 +278,8 @@ describe("permission requests under --questions-command", () => {
 
           expect(yield* ledger.find(emitted.id, "permission")).toMatchObject({ decision: { type: "cancelled" } })
           expect(yield* permission.list()).toEqual([])
+          // The close is announced once, as a refusal, so attached clients drop the request.
+          expect(replied.filter((id) => id === emitted.id)).toHaveLength(1)
         }).pipe(provideInstance(dir))
       }),
     timeout,
