@@ -22,9 +22,10 @@ import { AskLedger } from "./ledger"
 // An ask answered after the process that waited on it is gone (swxtchio/swx-opencode#286). In one transaction this
 // settles a still-pending ask and writes the outcome its producer would have produced into the stored call, so an
 // accepted answer is either applied or not settled at all: a producer effect that fails settles nothing. A call that
-// already ended without the answer (its ask was aborted) settles the ask as cancelled. For one that is gone or that its
-// Session went on without, the answer fails with `call-gone` and nothing is settled, so the ask stays pending. Where the live tool would have let the turn go on, the Session
-// is woken to continue, and an ask recovery applied earlier is handed here again so a wake its process lost is
+// already ended without the answer (its ask was aborted) settles the ask as cancelled. A call that may come back (its
+// part is missing) fails the answer with `call-gone` and settles nothing, so the ask stays pending; one that provably
+// cannot take a decision closes the ask as undelivered. Where the live tool would have let the turn go on, the
+// Session is woken to continue, and an ask recovery applied earlier is handed here again so a wake its process lost is
 // repeated. Only the asking call is recovered: nothing replays provider work, and a permission-guarded call that
 // never ran is not run here. A decision a live waiter received is never handed here.
 export interface Interface {
@@ -73,12 +74,12 @@ const layer = Layer.effect(
                   recovered: current.recovered,
                 }
                 const idle = { final, row: current, won: false, wake: false, gone: false }
-                if (!current.recovered || !current.decision || !target || target.continued) return idle
+                if (!current.recovered || !current.decision || target.type !== "found" || target.continued) return idle
                 return { ...idle, wake: continuesAfter(current, current.decision, stopOnDeny) }
               }
               const record = (decision: SessionAsk.Decision, recovered: boolean) =>
                 ledger.settle({ id: current.id, decision, delivered: false, recovered })
-              if (target && !unsettled(target.part)) {
+              if (target.type === "found" && !unsettled(target.part)) {
                 yield* Effect.logWarning("recovered ask's tool call ended without it; cancelling", { id: row.id })
                 const ended = yield* record({ type: "cancelled" }, false)
                 return {
@@ -89,12 +90,26 @@ const layer = Layer.effect(
                   gone: false,
                 }
               }
-              // Nothing can apply the answer, so nothing is settled: the ask stays pending and the answer is refused.
-              if (!target?.newest) {
-                yield* Effect.logWarning("recovered ask's call is gone or its Session went on; answer not applied", {
+              // The call may come back (its part is missing, or hidden by a revert that can be undone): nothing is settled,
+              // the ask stays pending and the answer is refused, so it can be answered again.
+              if (target.type === "absent" && !target.terminal) {
+                yield* Effect.logWarning("recovered ask's call is missing; answer not applied", { id: row.id })
+                return { final: settled, row: current, won: false, wake: false, gone: true }
+              }
+              // The call provably cannot take the decision: it has no tool part of its own, its message was deleted, or
+              // its Session went on. The ask is closed as undelivered, so it stops waiting on an answer.
+              if (target.type === "absent" || !target.newest) {
+                yield* Effect.logWarning("recovered ask's call cannot take a decision; closing it as undelivered", {
                   id: row.id,
                 })
-                return { final: settled, row: current, won: false, wake: false, gone: true }
+                const closed = yield* record({ type: "undelivered" }, false)
+                return {
+                  final: { ...settled, decision: { type: "undelivered" as const }, recovered: false },
+                  row: closed.row,
+                  won: false,
+                  wake: false,
+                  gone: false,
+                }
               }
               const outcome = yield* produce(current, resolution.decision).pipe(
                 Effect.catchCause((cause) =>
@@ -138,23 +153,26 @@ const layer = Layer.effect(
     })
 
     // The asking call and where its Session stands: whether its message is still the newest, which an accepted plan
-    // changes, and whether the model has answered since, which only a continued turn does.
+    // changes, and whether the model has answered since, which only a continued turn does. An absent call is
+    // `terminal` when it can never come back.
     const locate = Effect.fn("AskRecovery.locate")(function* (row: AskLedger.Row) {
       const origin = row.request.tool
-      if (!origin) {
-        yield* Effect.logWarning("recovered ask has no tool call", { id: row.id })
-        return
-      }
+      // An origin naming the request itself has no tool part of its own (a GitLab Duo workflow approval).
+      if (!origin || origin.callID === row.id) return { type: "absent" as const, terminal: true }
       const messages = yield* session.messages({ sessionID: row.session_id })
       const index = messages.findIndex((message) => message.info.id === MessageID.make(origin.messageID))
-      const part = messages[index]?.parts.find(
+      if (index === -1) {
+        // A message a pending revert hides can come back when the revert is undone; any other is deleted for good.
+        const info = yield* session.get(row.session_id)
+        return { type: "absent" as const, terminal: info.revert === undefined }
+      }
+      const part = messages[index].parts.find(
         (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === origin.callID,
       )
-      if (!part || (row.kind === "question" && part.tool !== row.tool)) {
-        yield* Effect.logWarning("recovered ask's tool call is missing", { id: row.id, callID: origin.callID })
-        return
-      }
+      if (!part || (row.kind === "question" && part.tool !== row.tool))
+        return { type: "absent" as const, terminal: false }
       return {
+        type: "found" as const,
         part,
         newest: index === messages.length - 1,
         continued: messages.slice(index + 1).some((message) => message.info.role === "assistant"),
@@ -262,7 +280,7 @@ const layer = Layer.effect(
 // Whether the live tool would have let the turn go on with this decision: a refusal ends it unless the operator
 // configured otherwise, and feedback on a refused permission always reaches the model.
 function continuesAfter(row: AskLedger.Row, decision: SessionAsk.Decision, stopOnDeny: boolean) {
-  if (decision.type === "cancelled") return false
+  if (decision.type === "cancelled" || decision.type === "undelivered") return false
   if (decision.type === "rejected") return !stopOnDeny
   if (decision.type === "replied") return decision.reply !== "reject" || decision.message !== undefined || !stopOnDeny
   if (row.tool === "plan_exit" && declined(decision.answers)) return !stopOnDeny

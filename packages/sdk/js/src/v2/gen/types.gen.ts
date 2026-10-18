@@ -2658,7 +2658,16 @@ export type SessionAskCancelled = {
   type: "cancelled"
 }
 
-export type SessionAskDecision = SessionAskAnswered | SessionAskRejected | SessionAskReplied | SessionAskCancelled
+export type SessionAskUndelivered = {
+  type: "undelivered"
+}
+
+export type SessionAskDecision =
+  | SessionAskAnswered
+  | SessionAskRejected
+  | SessionAskReplied
+  | SessionAskCancelled
+  | SessionAskUndelivered
 
 export type SessionAskResult = {
   requestID: string

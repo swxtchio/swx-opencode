@@ -29,15 +29,15 @@ export class UnavailableError extends Schema.TaggedErrorClass<UnavailableError>(
 }
 
 // The answer was accepted but could not be applied, so it is not reported as settled. With `apply-failed` the
-// producer's effect failed. With `call-gone` the call the ask belongs to is gone or its Session went on after a
-// restart. Either way nothing was settled and the ask stays pending.
+// producer's effect failed. With `call-gone` the call the ask belongs to is missing after a restart but may come back.
+// Either way nothing was settled and the ask stays pending.
 export class NotAppliedError extends Schema.TaggedErrorClass<NotAppliedError>()("SessionAsk.NotAppliedError", {
   requestID: Schema.String,
   reason: Schema.Literals(["apply-failed", "call-gone"]),
 }) {
   override get message() {
     if (this.reason === "call-gone")
-      return `Ask ${this.requestID} belongs to a call that is gone or that its Session went on without; the answer was not applied and the ask is still pending`
+      return `Ask ${this.requestID} belongs to a call that is missing; the answer was not applied and the ask is still pending`
     return `Ask ${this.requestID} could not apply the answer; nothing was settled and the ask is still pending`
   }
 }

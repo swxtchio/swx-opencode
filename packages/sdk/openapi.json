@@ -24907,6 +24907,17 @@
         "required": ["type"],
         "additionalProperties": false
       },
+      "SessionAskUndelivered": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["undelivered"]
+          }
+        },
+        "required": ["type"],
+        "additionalProperties": false
+      },
       "SessionAskDecision": {
         "anyOf": [
           {
@@ -24920,6 +24931,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionAskCancelled"
+          },
+          {
+            "$ref": "#/components/schemas/SessionAskUndelivered"
           }
         ]
       },

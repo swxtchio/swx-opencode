@@ -31,7 +31,12 @@ export const Replied = Schema.Struct({
 export const Cancelled = Schema.Struct({ type: Schema.Literal("cancelled") }).annotate({
   identifier: "SessionAskCancelled",
 })
-export const Decision = Schema.Union([Answered, Rejected, Replied, Cancelled]).annotate({
+// The asking process is gone and its call provably cannot take a decision: it never had a tool part of its own, its
+// message was deleted, or its Session went on. The ask is closed with nothing applied.
+export const Undelivered = Schema.Struct({ type: Schema.Literal("undelivered") }).annotate({
+  identifier: "SessionAskUndelivered",
+})
+export const Decision = Schema.Union([Answered, Rejected, Replied, Cancelled, Undelivered]).annotate({
   identifier: "SessionAskDecision",
 })
 export type Decision = typeof Decision.Type

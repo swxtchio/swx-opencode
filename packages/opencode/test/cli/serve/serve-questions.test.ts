@@ -454,7 +454,7 @@ describe("opencode serve --questions-command (subprocess)", () => {
   )
 
   cliIt.live(
-    "an answer after the restarted Session went on without it is refused as not applied and leaves the old call alone",
+    "an answer after the restarted Session went on without it closes the ask as undelivered and leaves the old call alone",
     ({ opencode, home, llm }) =>
       Effect.gen(function* () {
         const env = { OPENCODE_DB: path.join(home, "moved-on.db") }
@@ -488,10 +488,15 @@ describe("opencode serve --questions-command (subprocess)", () => {
           ),
           home,
         )
-        expect(settled.status).toBe(409)
-        expect(settled.body).toMatchObject({ _tag: "AskNotAppliedError", requestID: emitted.id, reason: "call-gone" })
+        expect(settled.body).toEqual({
+          requestID: emitted.id,
+          sessionID,
+          disposition: "settled",
+          decision: { type: "undelivered" },
+          recovered: false,
+        })
         const pending = yield* json(HttpClientRequest.get(`${second.url}/question`), home)
-        expect(pending.body.map((item: { id: string }) => item.id)).toEqual([emitted.id])
+        expect(pending.body).toEqual([])
         const part = (yield* messages(second.url, home, sessionID))
           .flatMap((message) => message.parts)
           .find((item) => item.callID === emitted.origin.callID)
@@ -600,7 +605,7 @@ describe("opencode serve --questions-command (subprocess)", () => {
   )
 
   cliIt.live(
-    "an answer after a restart whose call is gone is refused as not applied, and the ask stays pending",
+    "an answer after a restart whose call's part is missing is refused as not applied, and the ask stays pending",
     ({ opencode, home, llm }) =>
       Effect.gen(function* () {
         const file = path.join(home, "gone.db")
@@ -670,6 +675,100 @@ describe("opencode serve --questions-command (subprocess)", () => {
         expect(late.body).toMatchObject({ disposition: "duplicate", decision: { type: "cancelled" } })
       }),
     90_000,
+  )
+
+  cliIt.live(
+    "a GitLab Duo workflow approval answered after its server died closes as undelivered and stops blocking prune",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const file = path.join(home, "workflow.db")
+        const env = {
+          OPENCODE_DB: file,
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({ ...testProviderConfig(llm.url), permission: { bash: "ask" } }),
+        }
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        const extraArgs = ["--questions-command", receiver.path]
+        yield* llm.tool("bash", { command: "echo workflow", description: "Stand in for a workflow tool" })
+        const first = yield* opencode.serve({ extraArgs, env })
+        const sessionID = yield* startTurn(first.url, home)
+        const [emitted] = yield* receiver.read(1)
+        first.kill()
+        yield* Effect.promise(() => first.exited)
+        // A workflow approval's origin names its own request, since it has no tool part.
+        const sqlite = new Database(file)
+        sqlite.run("PRAGMA busy_timeout = 10000")
+        sqlite
+          .query(
+            "UPDATE session_ask SET request = json_set(request, '$.permission', 'workflow_tool_approval', '$.tool.callID', id) WHERE id = ?",
+          )
+          .run(emitted.id)
+        const outstanding = () =>
+          sqlite
+            .query<
+              { count: number },
+              [string]
+            >("SELECT count(*) AS count FROM session_ask WHERE session_id = ? AND time_settled IS NULL")
+            .get(sessionID)!.count
+        expect(outstanding()).toBe(1)
+
+        const second = yield* opencode.serve({ extraArgs, env })
+        const answer = json(
+          HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ reply: "once" }),
+          ),
+          home,
+        )
+        const closed = yield* answer
+        expect(closed.body).toEqual({
+          requestID: emitted.id,
+          sessionID,
+          disposition: "settled",
+          decision: { type: "undelivered" },
+          recovered: false,
+        })
+        expect(outstanding()).toBe(0)
+        sqlite.close()
+        const listed = yield* json(HttpClientRequest.get(`${second.url}/permission`), home)
+        expect(listed.body).toEqual([])
+        expect((yield* answer).body).toMatchObject({ disposition: "duplicate", decision: { type: "undelivered" } })
+      }),
+    120_000,
+  )
+
+  cliIt.live(
+    "an answer after a restart whose asking message was deleted closes the ask as undelivered",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const file = path.join(home, "deleted.db")
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        const extraArgs = ["--questions-command", receiver.path]
+        yield* llm.tool("question", { questions: [questions[1]] })
+        const first = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        yield* startTurn(first.url, home)
+        const [emitted] = yield* receiver.read(1)
+        first.kill()
+        yield* Effect.promise(() => first.exited)
+        const sqlite = new Database(file)
+        sqlite.run("PRAGMA foreign_keys = ON")
+        sqlite.query("DELETE FROM message WHERE id = ?").run(emitted.origin.messageID)
+        sqlite.close()
+
+        const second = yield* opencode.serve({ extraArgs, env: { OPENCODE_DB: file } })
+        const closed = yield* json(
+          HttpClientRequest.post(`${second.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Hello"]] }),
+          ),
+          home,
+        )
+        expect(closed.body).toMatchObject({
+          disposition: "settled",
+          decision: { type: "undelivered" },
+          recovered: false,
+        })
+        const listed = yield* json(HttpClientRequest.get(`${second.url}/question`), home)
+        expect(listed.body).toEqual([])
+      }),
+    120_000,
   )
 
   cliIt.live(
