@@ -213,15 +213,27 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
   })
 
   const dimensions = useTerminalDimensions()
-  const height = createMemo(() => Math.min(rows(), Math.floor(dimensions().height / 2) - 6))
-
   const selected = createMemo(() => flat()[store.selected])
   const previewText = createMemo(() => {
     const option = selected()
     if (!option) return
     return props.selectedText?.(option)
   })
-  const previewHeight = createMemo(() => Math.max(3, Math.floor(dimensions().height / 3)))
+  // Reserve the overlay and dialog chrome before splitting terminal rows between the list and preview.
+  const availableHeight = createMemo(() => {
+    const header = props.renderFilter === false ? 1 : 3
+    const footer = props.footer || visibleActions().length ? 1 : 0
+    const chrome = Math.ceil(dimensions().height / 4) + 1 + header + 3 + footer + 1 + 1
+    return Math.max(2, Math.floor(dimensions().height) - chrome)
+  })
+  const previewHeight = createMemo(() => {
+    if (previewText() === undefined) return 0
+    return Math.max(1, Math.min(Math.floor(dimensions().height / 3), availableHeight() - 1))
+  })
+  const height = createMemo(() => {
+    if (previewText() === undefined) return Math.min(rows(), Math.floor(dimensions().height / 2) - 6)
+    return Math.min(rows(), Math.max(1, availableHeight() - previewHeight()))
+  })
   let preview: ScrollBoxRenderable | undefined
 
   createEffect(on([selected, () => store.filter], () => preview?.scrollTo(0), { defer: true }))

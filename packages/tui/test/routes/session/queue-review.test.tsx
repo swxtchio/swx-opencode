@@ -1536,7 +1536,7 @@ test("search reaches unrendered recall history and ENTER appends original multil
   }
 }, 30_000)
 
-test("Ctrl+r renders the full selected prompt and keeps other history items as one-line summaries", async () => {
+test("Ctrl+r keeps selected prompt ends reachable in a full 160x45 history list", async () => {
   await using state = await tmpdir()
   const older = [
     "OLDER-PROMPT-START",
@@ -1554,13 +1554,14 @@ test("Ctrl+r renders the full selected prompt and keeps other history items as o
     ...Array.from({ length: 18 }, (_, index) => `newer prompt line ${index + 18}`),
     "NEWER-PROMPT-END-Z",
   ].join("\n")
+  const fillers = Array.from({ length: 20 }, (_, index) => `history filler prompt ${index}`)
   const seeded = await startSession({ state: state.path, queue: [] })
   try {
     await until(
       async () => (await screen(seeded)).join("\n").includes("already in the transcript"),
       "the producer session",
     )
-    for (const [index, text] of [older, newer].entries()) {
+    for (const [index, text] of [...fillers, older, newer].entries()) {
       await seeded.renderer.mockInput.pasteBracketedText(text)
       seeded.renderer.mockInput.pressEnter()
       await until(() => seeded.prompts.length === index + 1, "history production")
