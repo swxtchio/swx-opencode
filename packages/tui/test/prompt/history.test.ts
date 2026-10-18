@@ -1,9 +1,30 @@
 import { describe, expect, test } from "bun:test"
 import { isDuplicateEntry, MAX_HISTORY_ENTRIES, parsePromptHistory, type PromptInfo } from "../../src/prompt/history"
 
-const entry = (input: string, parts: PromptInfo["parts"] = []): PromptInfo => ({ input, parts })
+const entry = (input: string, parts: PromptInfo["parts"] = []) => ({
+  input,
+  parts,
+  sessionID: "ses_history",
+  origin: "tui-composer" as const,
+})
 
 describe("prompt history", () => {
+  test("unowned legacy entries cannot be assigned to the session opening history", () => {
+    const kept = entry("owned prompt")
+    expect(
+      parsePromptHistory(
+        [
+          { input: "legacy prompt", parts: [] },
+          { ...kept, sessionID: undefined },
+          { ...kept, sessionID: "" },
+          null,
+          kept,
+        ]
+          .map((item) => JSON.stringify(item))
+          .join("\n"),
+      ),
+    ).toEqual([kept])
+  })
   test("recovers valid JSONL entries around corruption", () => {
     expect(parsePromptHistory(`${JSON.stringify(entry("one"))}\nnot-json\n${JSON.stringify(entry("two"))}\n`)).toEqual([
       entry("one"),

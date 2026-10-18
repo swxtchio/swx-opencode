@@ -328,6 +328,13 @@ export function Prompt(props: PromptProps) {
   createEffect(
     on(
       () => props.sessionID,
+      () => history.reset(),
+    ),
+  )
+
+  createEffect(
+    on(
+      () => props.sessionID,
       () => {
         setStore("placeholder", randomIndex(list().length))
       },
@@ -966,7 +973,7 @@ export function Prompt(props: PromptProps) {
               return true
             }
 
-            const item = history.move(-1, input.plainText)
+            const item = history.move(props.sessionID, -1, input.plainText)
             if (!item) return false
             input.setText(item.input)
             setStore("prompt", item)
@@ -1002,7 +1009,7 @@ export function Prompt(props: PromptProps) {
               return false
             }
 
-            const item = history.move(1, input.plainText)
+            const item = history.move(props.sessionID, 1, input.plainText)
             if (!item) return false
             input.setText(item.input)
             setStore("prompt", item)
@@ -1372,7 +1379,7 @@ export function Prompt(props: PromptProps) {
         .finally(settled)
       if (editorParts.length > 0) editor.markSelectionSent()
     }
-    if (!store.prompt.machineAppended) history.append({ ...store.prompt, mode: currentMode })
+    if (!store.prompt.machineAppended) history.append(sessionID, { ...store.prompt, mode: currentMode })
     input.extmarks.clear()
     setStore("prompt", {
       input: "",
@@ -1524,7 +1531,7 @@ export function Prompt(props: PromptProps) {
       !store.prompt.machineAppended &&
       (store.prompt.input.trim().length >= DRAFT_RETENTION_MIN_CHARS || store.prompt.parts.length > 0)
     ) {
-      history.append({
+      history.append(props.sessionID, {
         ...store.prompt,
         mode: store.mode,
       })
@@ -1560,9 +1567,12 @@ export function Prompt(props: PromptProps) {
       const context = transcript
         ? promptEnhancementContext(transcript.messages, transcript.options, transcript.presentation)
         : ""
+      const currentModel = local.model.current()
       const response = await sdk.client.instance.prompt.enhance(
         {
-          model: tuiConfig.prompt_enhance_model,
+          model:
+            tuiConfig.prompt_enhance_model ??
+            (currentModel ? `${currentModel.providerID}/${currentModel.modelID}` : "google/gemini-3.8-flash"),
           draft,
           context,
         },

@@ -50,6 +50,7 @@ import { DialogAlert } from "../../ui/dialog-alert"
 import { TodoItem } from "../../component/todo-item"
 import { DialogMessage } from "./dialog-message"
 import type { PromptInfo } from "../../component/prompt/history"
+import { usePromptHistory } from "../../prompt/history"
 import { DialogConfirm } from "../../ui/dialog-confirm"
 import { DialogTimeline } from "./dialog-timeline"
 import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
@@ -244,6 +245,7 @@ function use() {
 }
 
 export function Session() {
+  const history = usePromptHistory()
   const setEpilogue = useEpilogue()
   const clipboard = useClipboard()
   const writeExport = async (file: string, content: string) => {
@@ -671,7 +673,7 @@ export function Session() {
       },
     },
     {
-      title: "Jump to message",
+      title: "Search prompt history",
       value: "session.timeline",
       category: "Session",
       slash: {
@@ -687,7 +689,12 @@ export function Session() {
               if (child) scroll.scrollBy(child.y - scroll.y - 1)
             }}
             sessionID={route.sessionID}
-            setPrompt={(promptInfo) => prompt?.set(promptInfo)}
+            history={history.list(route.sessionID)}
+            appendPrompt={(text) => {
+              if (!prompt) return
+              prompt.set({ ...prompt.current, input: prompt.current.input + text })
+              prompt.focus()
+            }}
           />
         ))
       },

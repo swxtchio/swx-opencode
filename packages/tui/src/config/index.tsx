@@ -51,7 +51,6 @@ export const Attention = Schema.Struct({
 }).annotate({ description: "Attention notification and sound settings" })
 
 const PromptSize = Schema.Int.check(Schema.isGreaterThan(0))
-export const PromptEnhanceModelDefault = "google/gemini-4-argon"
 const PromptEnhanceModel = Schema.String.check(Schema.isPattern(/^[^/]+\/.+$/)).annotate({
   description: "Provider and model ID used to enhance the current prompt draft, set at the root of tui.json",
 })
@@ -80,10 +79,7 @@ export const Info = Schema.Struct({
 })
 export type Info = Schema.Schema.Type<typeof Info>
 
-export type Resolved = Omit<
-  Info,
-  "attention" | "keybinds" | "leader_timeout" | "mouse" | "cursor" | "prompt_enhance_model"
-> & {
+export type Resolved = Omit<Info, "attention" | "keybinds" | "leader_timeout" | "mouse" | "cursor"> & {
   attention: {
     enabled: boolean
     notifications: boolean
@@ -95,7 +91,6 @@ export type Resolved = Omit<
   keybinds: TuiKeybind.BindingLookupView
   leader_timeout: number
   mouse: boolean
-  prompt_enhance_model: typeof PromptEnhanceModel.Type
   cursor?: {
     style: "block" | "underline" | "line" | "default"
     blinking: boolean
@@ -135,7 +130,6 @@ export function resolve(input: Info, options: ResolveOptions): Resolved {
     }),
     leader_timeout: input.leader_timeout ?? LeaderTimeoutDefault,
     mouse: input.mouse ?? true,
-    prompt_enhance_model: input.prompt_enhance_model ?? PromptEnhanceModelDefault,
     cursor: input.cursor
       ? {
           style: input.cursor.style ?? "block",
