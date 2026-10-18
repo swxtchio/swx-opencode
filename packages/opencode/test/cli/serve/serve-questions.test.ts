@@ -653,6 +653,8 @@ describe("opencode serve --questions-command (subprocess)", () => {
           home,
         )
         expect(refused.status).toBe(503)
+        const listed = yield* json(HttpClientRequest.get(`${first.url}/question`), home)
+        expect(listed.body).toEqual([])
         expect(sqlite.query("SELECT time_settled FROM session_ask WHERE id = ?").get(emitted.id)).toEqual({
           time_settled: null,
         })
