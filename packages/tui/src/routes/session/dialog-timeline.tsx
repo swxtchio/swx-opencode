@@ -57,21 +57,21 @@ export function timelineOptions(input: {
   for (const message of input.messages) {
     if (message.role !== "user" || message.sessionID !== input.sessionID) continue
     const parts = input.parts[message.id] ?? []
-    const groups = parts.flatMap((part) => {
-      if (part.type !== "text") return []
+    const queueParts = parts.filter(
+      (part): part is TextPart => part.type === "text" && part.metadata?.sessionQueue !== undefined,
+    )
+    const groups = queueParts.flatMap((part) => {
       const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueue)
       return Option.isSome(group) ? [group.value] : []
     })
+    if (groups.length !== queueParts.length) continue
     const visibleText = parts.filter(
       (part): part is TextPart => part.type === "text" && !part.synthetic && !part.ignored,
     )
     const machineAppended = parts.some(
       (part) => part.type === "text" && part.metadata?.[SessionPromptQueue.TuiPromptAppendMetadataKey] === true,
     )
-    const hasDirectComposerTransport = parts.some(
-      (part) => part.type === "text" && part.metadata?.[SessionPromptQueue.TuiComposerOriginMetadataKey] === true,
-    )
-    // Transport provenance is accepted only after append and machine markers have been checked.
+    // Missing composer provenance is human under the historical-input ruling; explicit machine marks still exclude.
     const machineClassified = (value: string) => classify(value, input.markers) !== undefined
     const unsearchable = groups.length
       ? groups.some((group) => {
@@ -83,18 +83,10 @@ export function timelineOptions(input: {
             const appended = item.input.parts.some(
               (part) => part.type === "text" && part.metadata?.[SessionPromptQueue.TuiPromptAppendMetadataKey] === true,
             )
-            const hasComposerTransport =
-              item.input.origin === "tui-composer" ||
-              item.input.parts.some(
-                (part) =>
-                  part.type === "text" && part.metadata?.[SessionPromptQueue.TuiComposerOriginMetadataKey] === true,
-              )
-            return appended || machineClassified(text) || !hasComposerTransport
+            return appended || machineClassified(text)
           })
         })
-      : machineAppended ||
-        machineClassified(visibleText.map((part) => part.text).join("")) ||
-        !hasDirectComposerTransport
+      : machineAppended || machineClassified(visibleText.map((part) => part.text).join(""))
     if (unsearchable || !visibleText.length) continue
     result.push({
       title: visibleText

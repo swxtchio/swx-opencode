@@ -973,7 +973,7 @@ export function Prompt(props: PromptProps) {
               return true
             }
 
-            const item = history.move(props.sessionID, -1, input.plainText)
+            const item = history.move(props.sessionID, -1, input.plainText, sync.data.config.machine_message_markers)
             if (!item) return false
             input.setText(item.input)
             setStore("prompt", item)
@@ -1009,7 +1009,7 @@ export function Prompt(props: PromptProps) {
               return false
             }
 
-            const item = history.move(props.sessionID, 1, input.plainText)
+            const item = history.move(props.sessionID, 1, input.plainText, sync.data.config.machine_message_markers)
             if (!item) return false
             input.setText(item.input)
             setStore("prompt", item)
@@ -1379,7 +1379,8 @@ export function Prompt(props: PromptProps) {
         .finally(settled)
       if (editorParts.length > 0) editor.markSelectionSent()
     }
-    if (!store.prompt.machineAppended) history.append(sessionID, { ...store.prompt, mode: currentMode })
+    if (!store.prompt.machineAppended)
+      history.append(sessionID, { ...store.prompt, mode: currentMode }, sync.data.config.machine_message_markers)
     input.extmarks.clear()
     setStore("prompt", {
       input: "",
@@ -1534,7 +1535,7 @@ export function Prompt(props: PromptProps) {
       history.append(props.sessionID, {
         ...store.prompt,
         mode: store.mode,
-      })
+      }, sync.data.config.machine_message_markers)
     }
     input.clear()
     input.extmarks.clear()
