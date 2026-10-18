@@ -33,6 +33,7 @@ import { NamedError } from "@opencode-ai/core/util/error"
 import { SessionProcessor } from "./processor"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
+import { AskLedger } from "@/ask/ledger"
 import { SessionStatus } from "./status"
 import { LLM } from "./llm"
 import { Shell } from "@opencode-ai/core/shell"
@@ -452,7 +453,10 @@ const layer = Layer.effect(
                 tool: { messageID: assistantMessage.id, callID: part.callID },
                 ruleset: Permission.merge(taskAgent.permission, session.permission ?? []),
               })
-              .pipe(Effect.orDie),
+              .pipe(
+                AskLedger.abortable(taskAbort.signal, () => new PermissionV1.RejectedError()),
+                Effect.orDie,
+              ),
         })
         .pipe(
           Effect.catchCause((cause) => {

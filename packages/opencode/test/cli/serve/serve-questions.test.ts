@@ -631,6 +631,35 @@ describe("opencode serve --questions-command (subprocess)", () => {
   )
 
   cliIt.live(
+    "an ask whose Session is aborted is cancelled and takes no later answer",
+    ({ opencode, home, llm }) =>
+      Effect.gen(function* () {
+        const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+        yield* llm.tool("question", { questions: [questions[1]] })
+        const server = yield* opencode.serve({ extraArgs: ["--questions-command", receiver.path] })
+        const sessionID = yield* startTurn(server.url, home)
+        const [emitted] = yield* receiver.read(1)
+        yield* json(HttpClientRequest.post(`${server.url}/session/${sessionID}/abort`), home)
+        yield* json(HttpClientRequest.get(`${server.url}/question`), home).pipe(
+          Effect.filterOrFail(
+            (listed) => listed.body.length === 0,
+            () => new Error("the aborted ask is still outstanding"),
+          ),
+          Effect.retry(Schedule.spaced("50 millis")),
+          Effect.timeout(Duration.millis(deadline(20_000))),
+        )
+        const late = yield* json(
+          HttpClientRequest.post(`${server.url}${emitted.answer.path}`).pipe(
+            HttpClientRequest.bodyJsonUnsafe({ answers: [["Too late"]] }),
+          ),
+          home,
+        )
+        expect(late.body).toMatchObject({ disposition: "duplicate", decision: { type: "cancelled" } })
+      }),
+    90_000,
+  )
+
+  cliIt.live(
     "an ask aborted while its cancellation cannot be recorded never takes an answer, even after a restart",
     ({ opencode, home, llm }) =>
       Effect.gen(function* () {

@@ -17,6 +17,7 @@ import type { Agent } from "@/agent/agent"
 import type { MessageV2 } from "./message-v2"
 import { Plugin } from "@/plugin"
 import { Permission } from "@/permission"
+import { AskLedger } from "@/ask/ledger"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Wildcard } from "@/util/wildcard"
@@ -181,7 +182,11 @@ const live: Layer.Layer<
                 return Effect.void
               }),
             )
-            await bridge.promise(perm.ask(workflowApproval(input, id, approvalTools)))
+            await bridge.promise(
+              perm
+                .ask(workflowApproval(input, id, approvalTools))
+                .pipe(AskLedger.abortable(input.abort, () => new PermissionV1.RejectedError())),
+            )
             for (const name of uniqueNames) approvedToolsForSession.add(name)
             workflowModel.sessionPreapprovedTools = [...(workflowModel.sessionPreapprovedTools ?? []), ...uniqueNames]
             return { approved: true }

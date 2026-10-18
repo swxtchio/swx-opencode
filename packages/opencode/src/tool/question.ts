@@ -1,6 +1,7 @@
 import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import { Question } from "../question"
+import { AskLedger } from "../ask/ledger"
 import DESCRIPTION from "./question.txt"
 
 export const Parameters = Schema.Struct({
@@ -21,12 +22,14 @@ export const QuestionTool = Tool.define<typeof Parameters, Metadata, Question.Se
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
         Effect.gen(function* () {
-          const answers = yield* question.ask({
-            sessionID: ctx.sessionID,
-            questions: params.questions,
-            tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
-            producer: "question",
-          })
+          const answers = yield* question
+            .ask({
+              sessionID: ctx.sessionID,
+              questions: params.questions,
+              tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
+              producer: "question",
+            })
+            .pipe(AskLedger.abortable(ctx.abort, () => new Question.RejectedError()))
           return answered(params.questions, answers)
         }).pipe(Effect.orDie),
     }

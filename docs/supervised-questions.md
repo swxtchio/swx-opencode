@@ -197,9 +197,9 @@ that process is gone; while it runs, or when its state cannot be proven, the ans
 - Stopping the server by a signal or a crash leaves its asks recoverable. Disposing an instance while the server
   keeps running (for example on a configuration reload) ends its waiting asks, which are then reported as
   `cancelled`.
-- An aborted ask is cancelled in the ledger. If that write fails it is retried; while it still cannot be recorded,
-  the server refuses answers to the ask (`503 store-unavailable`), and after a restart the aborted call's own
-  record settles the ask as `cancelled`.
+- Aborting a Session ends its waiting ask, which is cancelled in the ledger. If that write fails it is retried;
+  while it still cannot be recorded the ask is no longer listed and the server refuses answers to it
+  (`503 store-unavailable`), and after a restart the aborted call's own record settles the ask as `cancelled`.
 - A server started without `--questions-command` neither lists nor settles recorded asks, and `opencode db prune`
   and `opencode db retention` keep refusing their Sessions. To settle them, restart the server with
   `--questions-command` on the same database and answer, or reject, each one it lists.

@@ -3,6 +3,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import { Question } from "../question"
+import { AskLedger } from "../ask/ledger"
 import { Session } from "@/session/session"
 import { Provider } from "@/provider/provider"
 import { InstanceState } from "@/effect/instance-state"
@@ -26,22 +27,24 @@ export const PlanExitTool = Tool.define(
       execute: (_params: {}, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const plan = yield* planPath(session, ctx.sessionID)
-          const answers = yield* question.ask({
-            sessionID: ctx.sessionID,
-            questions: [
-              {
-                question: `Plan at ${plan} is complete. Would you like to switch to the build agent and start implementing?`,
-                header: "Build Agent",
-                custom: false,
-                options: [
-                  { label: "Yes", description: "Switch to build agent and start implementing the plan" },
-                  { label: "No", description: "Stay with plan agent to continue refining the plan" },
-                ],
-              },
-            ],
-            tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
-            producer: "plan_exit",
-          })
+          const answers = yield* question
+            .ask({
+              sessionID: ctx.sessionID,
+              questions: [
+                {
+                  question: `Plan at ${plan} is complete. Would you like to switch to the build agent and start implementing?`,
+                  header: "Build Agent",
+                  custom: false,
+                  options: [
+                    { label: "Yes", description: "Switch to build agent and start implementing the plan" },
+                    { label: "No", description: "Stay with plan agent to continue refining the plan" },
+                  ],
+                },
+              ],
+              tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
+              producer: "plan_exit",
+            })
+            .pipe(AskLedger.abortable(ctx.abort, () => new Question.RejectedError()))
 
           if (declined(answers)) yield* new Question.RejectedError()
           return yield* approve({ session, provider, database }, ctx.sessionID, plan)

@@ -120,14 +120,14 @@ const layer = Layer.effect(
         yield* events.publish(Event.Asked, info)
         return yield* Deferred.await(deferred)
       }).pipe(
-        // However the ask ends, aborted or failed at any step included, a still-pending ledger row is cancelled
-        // before the waiter is dropped, so no later answer finds the row without its waiter.
-        Effect.onExit(() => ledger.cancel(id)),
+        // However the ask ends, aborted or failed at any step included, the waiter is dropped and a still-pending
+        // ledger row is cancelled. An answer arriving in between finds no waiter and cancels the row itself.
         Effect.ensuring(
           Effect.sync(() => {
             pending.delete(id)
           }),
         ),
+        Effect.onExit(() => ledger.cancel(id)),
       )
     })
 
@@ -263,14 +263,16 @@ const layer = Layer.effect(
       const live = Array.from(pending.values(), (item) => item.info)
       if (!AskEmit.current()) return live
       // Under emission the ledger is the registry, so an ask a restarted server still owes an answer stays listed.
-      return yield* ledger.pending("permission").pipe(
-        Effect.map((rows) => rows.map((row) => row.request as PermissionV1.Request)),
-        Effect.catchTag("SessionAsk.UnavailableError", (error) =>
-          Effect.logWarning("ask ledger unreadable; listing live permissions", { error: error.message }).pipe(
-            Effect.as(live),
+      return yield* ledger
+        .pending("permission", (id) => live.some((info) => info.id === id))
+        .pipe(
+          Effect.map((rows) => rows.map((row) => row.request as PermissionV1.Request)),
+          Effect.catchTag("SessionAsk.UnavailableError", (error) =>
+            Effect.logWarning("ask ledger unreadable; listing live permissions", { error: error.message }).pipe(
+              Effect.as(live),
+            ),
           ),
-        ),
-      )
+        )
     })
 
     return Service.of({ ask, reply, list, grant })

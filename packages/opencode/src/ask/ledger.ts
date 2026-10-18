@@ -76,10 +76,14 @@ export interface Interface {
     UnavailableError
   >
   // Ends a still-pending ask whose waiter stopped waiting. A no-op unless emission is configured. The write is retried;
-  // while it cannot be recorded the ask is refused here, so an aborted ask never takes an answer.
+  // until it lands, the ask stays unlisted and an answer to it records the cancellation or is refused (see `decide`).
   readonly cancel: (id: string) => Effect.Effect<void>
-  // Pending asks of this directory that this process can settle: its own or a gone process's.
-  readonly pending: (kind: SessionAsk.Kind) => Effect.Effect<ReadonlyArray<Row>, UnavailableError>
+  // Pending asks of this directory that this process can settle: a gone process's, or its own while `live` says it
+  // still waits on them.
+  readonly pending: (
+    kind: SessionAsk.Kind,
+    live: (id: string) => boolean,
+  ) => Effect.Effect<ReadonlyArray<Row>, UnavailableError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/AskLedger") {}
@@ -88,8 +92,6 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const db = (yield* Database.Service).db
-    // Asks whose cancellation could not be recorded yet. Process-wide like the writer identity the ledger records.
-    const abandoned = new Set<string>()
     // SQL failures surface as defects, so every cause but an interruption becomes an explicit store failure.
     const unavailable =
       (requestID: string) =>
@@ -208,7 +210,7 @@ const layer = Layer.effect(
         .pipe(unavailable(input.id))
     })
 
-    const pending = Effect.fn("AskLedger.pending")(function* (kind: SessionAsk.Kind) {
+    const pending = Effect.fn("AskLedger.pending")(function* (kind: SessionAsk.Kind, live: (id: string) => boolean) {
       const directory = yield* InstanceState.directory
       const rows = yield* db
         .select()
@@ -224,25 +226,12 @@ const layer = Layer.effect(
         .all()
         .pipe(unavailable(kind))
       const holders = yield* Effect.forEach(rows, (row) => owner(row))
-      return rows.filter(
-        (row, index) => !abandoned.has(row.id) && (holders[index] === "self" || holders[index] === "gone"),
-      )
+      return rows.filter((row, index) => holders[index] === "gone" || (holders[index] === "self" && live(row.id)))
     })
 
     const decide = Effect.fn("AskLedger.decide")(function* (input: Parameters<Interface["decide"]>[0]) {
       const row = yield* find(input.id, input.kind)
       if (!row) return { type: "unknown" as const }
-      // An aborted ask whose cancellation was not recorded takes no answer: record it now, or refuse.
-      if (abandoned.has(input.id)) {
-        const ended = yield* settle({
-          id: input.id,
-          decision: { type: "cancelled" },
-          delivered: false,
-          recovered: false,
-        })
-        abandoned.delete(input.id)
-        return { type: "duplicate" as const, resolution: resolution(ended.row, "duplicate") }
-      }
       if (input.live()) {
         const settled = yield* settle({ id: input.id, decision: input.decision, delivered: true, recovered: false })
         if (!settled.won) return { type: "duplicate" as const, resolution: resolution(settled.row, "duplicate") }
@@ -263,7 +252,8 @@ const layer = Layer.effect(
       if (row.time_settled !== null) return { type: "duplicate" as const, resolution: resolution(row, "duplicate") }
       if (holder !== "self")
         return yield* new UnavailableError({ requestID: input.id, reason: "owned-by-live-process" })
-      // This process recorded the ask but no longer waits on it, so no answer can reach the call: end it.
+      // This process recorded the ask but no longer waits on it, so no answer can reach the call: end it. This also
+      // records an aborted ask's cancellation that could not be written, or refuses the answer while it still cannot.
       const ended = yield* settle({ id: input.id, decision: { type: "cancelled" }, delivered: false, recovered: false })
       return { type: "duplicate" as const, resolution: resolution(ended.row, "duplicate") }
     })
@@ -279,10 +269,7 @@ const layer = Layer.effect(
           unavailable(id),
           Effect.retry({ times: 4, schedule: Schedule.exponential("25 millis") }),
           Effect.catchTag("SessionAsk.UnavailableError", () =>
-            Effect.gen(function* () {
-              abandoned.add(id)
-              yield* Effect.logError("ask cancel not recorded; refusing its answers until it is", { id })
-            }),
+            Effect.logError("ask cancel not recorded; its answers are refused until it is", { id }),
           ),
         )
     })
@@ -298,6 +285,24 @@ function resolution(row: Row, disposition: SessionAsk.Disposition): Resolution {
     disposition,
     decision: row.decision ?? { type: "cancelled" },
     recovered: row.recovered,
+  }
+}
+
+// Under emission an ask ends when the call that raised it is aborted, so its row is cancelled instead of staying
+// answerable for a call that is gone. Tool executions are not interrupted by an abort, so without this an aborted
+// ask would wait forever. Without emission the producer keeps its stock behaviour.
+export function abortable<E2>(signal: AbortSignal | undefined, aborted: () => E2) {
+  return <A, E, R>(self: Effect.Effect<A, E, R>): Effect.Effect<A, E | E2, R> => {
+    if (!signal || !AskEmit.current()) return self
+    return Effect.raceFirst(
+      self,
+      Effect.callback<never, E2>((resume) => {
+        const end = () => resume(Effect.fail(aborted()))
+        if (signal.aborted) end()
+        else signal.addEventListener("abort", end, { once: true })
+        return Effect.sync(() => signal.removeEventListener("abort", end))
+      }),
+    )
   }
 }
 
