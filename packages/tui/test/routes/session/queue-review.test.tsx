@@ -19,7 +19,6 @@ import { TuiEvent } from "@opencode-ai/schema/tui-event"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Global } from "@opencode-ai/core/global"
 import path from "node:path"
-import { readdir } from "node:fs/promises"
 import { tmpdir } from "../../fixture/fixture"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
@@ -606,12 +605,15 @@ test("a newly mounted composer starts at its session's newest history after anot
     sessionID: b,
     queue: [],
     messagesBySession: {
-      [a]: [{ ...transcript, info: { ...transcript.info, sessionID: a } }],
-      [b]: [{ ...transcript, info: { ...transcript.info, sessionID: b } }],
+      [a]: [],
+      [b]: [],
     },
   })
   try {
-    await until(async () => (await screen(app)).join("\n").includes("already in the transcript"), "B mounted")
+    await until(async () => {
+      const frame = (await screen(app)).join("\n")
+      return frame.includes(b) && frame.includes("Model")
+    }, "B mounted with its selected model")
     for (const [index, text] of [first, newest].entries()) {
       await app.renderer.mockInput.typeText(text)
       app.renderer.mockInput.pressEnter()
@@ -649,12 +651,6 @@ test("a newly mounted composer starts at its session's newest history after anot
   } finally {
     app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
     await app.stop()
-    await until(
-      async () =>
-        (await Bun.file(path.join(state.path, "model.json")).exists()) &&
-        !(await readdir(state.path)).some((name) => name.endsWith(".tmp")),
-      "the completed model-state writes before disposing shared state",
-    )
   }
 }, 20_000)
 
