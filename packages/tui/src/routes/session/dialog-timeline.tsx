@@ -57,11 +57,14 @@ export function timelineOptions(input: {
   for (const message of input.messages) {
     if (message.role !== "user" || message.sessionID !== input.sessionID) continue
     const parts = input.parts[message.id] ?? []
-    const groups = parts.flatMap((part) => {
-      if (part.type !== "text") return []
+    const queueParts = parts.filter(
+      (part): part is TextPart => part.type === "text" && part.metadata?.sessionQueue !== undefined,
+    )
+    const groups = queueParts.flatMap((part) => {
       const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueue)
       return Option.isSome(group) ? [group.value] : []
     })
+    if (groups.length !== queueParts.length) continue
     const visibleText = parts.filter(
       (part): part is TextPart => part.type === "text" && !part.synthetic && !part.ignored,
     )

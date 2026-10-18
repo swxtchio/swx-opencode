@@ -1024,7 +1024,7 @@ test("resumed history matches a composer-produced agent mention after tracked pa
   }
 }, 30_000)
 
-test("malformed future queue metadata cannot fall back into composer history", async () => {
+test("malformed future queue metadata is rejected by timeline search and composer history", async () => {
   await using state = await tmpdir()
   const humanText = "future-metadata-human-history-token"
   const machineText = "future-metadata-malformed-history-token"
@@ -1062,6 +1062,25 @@ test("malformed future queue metadata cannot fall back into composer history", a
         : part,
     ),
   }
+  const timeline = await startSession({
+    state: state.path,
+    sessionID: fixture.sessionID,
+    queue: [],
+    messagesBySession: { [fixture.sessionID]: [human, malformed] },
+    historyMessagesBySession: { [fixture.sessionID]: [] },
+  })
+  try {
+    await until(async () => (await screen(timeline)).join("\n").includes(fixture.sessionID), "the malformed timeline")
+    await until(() => timeline.historyReads.includes(fixture.sessionID), "the empty history cache")
+    expect(await searchHistory(timeline, humanText)).not.toContain("No results found")
+    timeline.renderer.mockInput.pressEscape()
+    await until(() => timeline.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    expect(await searchHistory(timeline, machineText)).toContain("No results found")
+  } finally {
+    await timeline.stop()
+  }
+  await clearHistoryHydration(state.path)
+
   const resumed = await startSession({
     state: state.path,
     sessionID: fixture.sessionID,
