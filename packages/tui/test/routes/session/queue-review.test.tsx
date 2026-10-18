@@ -1589,22 +1589,7 @@ test("Ctrl+r keeps selected prompt ends reachable in a full 160x45 history list"
       "the selected prompt preview",
     )
 
-    const initial = (await screen(app)).join("\n")
-    expect(initial).toContain("NEWER-PROMPT-START")
-    expect(initial).not.toContain("NEWER-PROMPT-END-Z")
-    expect(initial).not.toContain("OLDER-PROMPT-MIDDLE")
-    expect(initial).not.toContain("OLDER-PROMPT-END-Z")
-    expect(initial.split("\n").filter((line) => line.includes("OLDER-PROMPT-START"))).toHaveLength(1)
-
-    app.renderer.mockInput.pressArrow("down")
-    await until(async () => (await screen(app)).join("\n").includes("OLDER-PROMPT-START"), "the older selection")
-    const selectedOlder = (await screen(app)).join("\n")
-    expect(selectedOlder).toContain("OLDER-PROMPT-START")
-    expect(selectedOlder).not.toContain("OLDER-PROMPT-END-Z")
-    expect(selectedOlder).not.toContain("NEWER-PROMPT-MIDDLE")
-    expect(selectedOlder).not.toContain("NEWER-PROMPT-END-Z")
-    expect(selectedOlder.split("\n").filter((line) => line.includes("NEWER-PROMPT-START"))).toHaveLength(1)
-
+    const previewText = (frame: string) => frame.slice(frame.indexOf("Selected prompt"))
     const scrollUntil = async (marker: string) => {
       let frame = (await screen(app)).join("\n")
       for (let page = 0; page < 8 && !frame.includes(marker); page++) {
@@ -1614,6 +1599,23 @@ test("Ctrl+r keeps selected prompt ends reachable in a full 160x45 history list"
       expect(frame).toContain(marker)
       return frame
     }
+
+    const initial = (await screen(app)).join("\n")
+    expect(initial).toContain("NEWER-PROMPT-START")
+    expect(initial).not.toContain("NEWER-PROMPT-END-Z")
+    expect(initial).not.toContain("OLDER-PROMPT-MIDDLE")
+    expect(initial).not.toContain("OLDER-PROMPT-END-Z")
+    expect(initial.split("\n").filter((line) => line.includes("OLDER-PROMPT-START"))).toHaveLength(1)
+
+    expect(await scrollUntil("NEWER-PROMPT-END-Z")).toContain("NEWER-PROMPT-END-Z")
+    app.renderer.mockInput.pressArrow("down")
+    await until(async () => previewText((await screen(app)).join("\n")).includes("OLDER-PROMPT-START"), "the older selection")
+    const selectedOlder = (await screen(app)).join("\n")
+    expect(previewText(selectedOlder)).toContain("OLDER-PROMPT-START")
+    expect(previewText(selectedOlder)).not.toContain("OLDER-PROMPT-END-Z")
+    expect(selectedOlder).not.toContain("NEWER-PROMPT-MIDDLE")
+    expect(selectedOlder).not.toContain("NEWER-PROMPT-END-Z")
+    expect(selectedOlder.split("\n").filter((line) => line.includes("NEWER-PROMPT-START"))).toHaveLength(1)
 
     expect(await scrollUntil("OLDER-PROMPT-MIDDLE")).toContain("OLDER-WIDE-BEGIN")
     expect(await scrollUntil("OLDER-WIDE-END")).toContain("OLDER-WIDE-END")
@@ -1628,7 +1630,8 @@ test("Ctrl+r keeps selected prompt ends reachable in a full 160x45 history list"
     await until(async () => (await screen(app)).some((line) => line.includes("Selected prompt")), "the filtered preview")
     const filtered = (await screen(app)).join("\n")
     expect(filtered).toContain("Selected prompt")
-    expect(filtered).not.toContain("NEWER-PROMPT-END-Z")
+    expect(previewText(filtered)).toContain("NEWER-PROMPT-START")
+    expect(previewText(filtered)).not.toContain("NEWER-PROMPT-END-Z")
     expect(filtered).not.toContain("OLDER-PROMPT-MIDDLE")
     expect(filtered).not.toContain("OLDER-PROMPT-END-Z")
     expect(await scrollUntil("NEWER-PROMPT-MIDDLE")).toContain("NEWER-WIDE-BEGIN")
