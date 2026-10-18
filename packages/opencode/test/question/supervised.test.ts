@@ -355,24 +355,38 @@ describe("question lifecycle under --questions-command", () => {
   )
 
   it.live(
-    "an answer interrupted after it settled the ask still reaches the waiting call",
+    "an answer interrupted while it settles the ask still reaches the waiting call",
     () =>
       Effect.gen(function* () {
         const dir = yield* tmpdirScoped({ git: true })
         yield* Effect.gen(function* () {
           const question = yield* Question.Service
+          const ledger = yield* AskLedger.Service
+          const db = (yield* Database.Service).db
           const { receiver, sessionID } = yield* supervised()
           const fiber = yield* askWithTool(sessionID, "call_settling")
           const [emitted] = yield* receiver.read(1)
-          const held = yield* hold(Question.Event.Replied.type)
+          // Another writer holds the database, so the answer, started at once, runs until its settlement waits for
+          // it; the interruption is requested there.
+          const locked = yield* Deferred.make<void>()
+          const unlock = yield* Deferred.make<void>()
+          const writer = yield* db
+            .transaction(() => Deferred.succeed(locked, undefined).pipe(Effect.andThen(Deferred.await(unlock))), {
+              behavior: "immediate",
+            })
+            .pipe(Effect.forkScoped)
+          yield* Deferred.await(locked)
           const replying = yield* question
             .reply({ requestID: emitted.id, answers: [["Blue"], ["None"]] })
-            .pipe(Effect.forkScoped)
-          yield* Deferred.await(held.entered)
+            .pipe(Effect.forkScoped({ startImmediately: true }))
           const interrupting = yield* Fiber.interrupt(replying).pipe(Effect.forkScoped)
-          yield* Deferred.succeed(held.release, undefined)
+          yield* Deferred.succeed(unlock, undefined)
+          yield* Fiber.join(writer)
           yield* Fiber.join(interrupting)
 
+          expect(yield* ledger.find(emitted.id, "question")).toMatchObject({
+            decision: { type: "answered", answers: [["Blue"], ["None"]] },
+          })
           const result = yield* Fiber.join(fiber).pipe(Effect.timeout(Duration.millis(deadline(10_000))))
           expect(result.metadata.answers).toEqual([["Blue"], ["None"]])
         }).pipe(provideInstance(dir))
