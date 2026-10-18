@@ -130,7 +130,10 @@ export async function queueTimelineFixture(
           yield* promote()
         const legacyID = MessageID.ascending()
         yield* queue.writeDirect({
-          admission: { sessionID: session.id, parts: [{ type: "text", text: "pre-upgrade-history-token" }] },
+          admission: {
+            sessionID: session.id,
+            parts: [{ type: "text", text: "pre-upgrade-unmarked-machine-token" }],
+          },
           prepare: () =>
             Effect.sync(() => ({
               info: {
@@ -147,7 +150,7 @@ export async function queueTimelineFixture(
                   id: PartID.ascending(),
                   sessionID: session.id,
                   messageID: legacyID,
-                  text: "pre-upgrade-history-token",
+                  text: "pre-upgrade-unmarked-machine-token",
                 },
               ],
             })),

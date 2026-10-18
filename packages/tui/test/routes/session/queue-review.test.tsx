@@ -879,7 +879,7 @@ test("reopens recover human prompts erased from a tagged-only history cache", as
   }
 }, 30_000)
 
-test("rehydrates an evicted session after switching back without restarting", async () => {
+test("rehydrates an evicted session after live B-A-B recovery without restarting", async () => {
   await using state = await tmpdir()
   const a = "ses_history_eviction_a"
   const b = "ses_history_eviction_b"
@@ -888,6 +888,17 @@ test("rehydrates an evicted session after switching back without restarting", as
   const messagesB: unknown[] = []
   const messagesA: unknown[] = []
   const historyPath = path.join(state.path, "prompt-history.jsonl")
+  await using source = await tmpdir()
+  const producer = await startSession({ state: source.path, sessionID: a, queue: [] })
+  try {
+    await until(async () => (await screen(producer)).join("\n").includes(a), "A's transcript producer")
+    for (const text of promptsA)
+      messagesA.push(await submitHistoryPrompt(producer, text, a, producer.prompts.length))
+  } finally {
+    producer.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await producer.stop()
+  }
+
   const app = await startSession({
     state: state.path,
     sessionID: b,
@@ -899,25 +910,27 @@ test("rehydrates an evicted session after switching back without restarting", as
   try {
     await until(async () => (await screen(app)).join("\n").includes(b), "session B")
     await until(() => app.historyReads.includes(b), "B's initial hydration")
-    for (const text of promptsB)
-      messagesB.push(await submitHistoryPrompt(app, text, b, app.prompts.length))
+    for (const text of promptsB) messagesB.push(await submitHistoryPrompt(app, text, b, app.prompts.length))
     await until(async () => (await Bun.file(historyPath).text()).includes(promptsB.at(-1)!), "B's persisted prompts")
 
+    const aReads = app.historyReads.filter((sessionID) => sessionID === a).length
     app.selectSession(a)
-    await until(async () => (await screen(app)).join("\n").includes(a), "session A")
-    await until(() => app.historyReads.includes(a), "A's initial hydration")
-    for (const text of promptsA) messagesA.push(await submitHistoryPrompt(app, text, a, app.prompts.length))
+    await until(async () => (await screen(app)).join("\n").includes(a), "session A again")
+    await until(
+      () => app.historyReads.filter((sessionID) => sessionID === a).length > aReads,
+      "A's transcript recovery after eviction",
+    )
     await until(async () => {
       const cache = await Bun.file(historyPath).text()
-      return cache.includes(promptsA.at(-1)!) && !cache.includes(promptsB[0]!)
-    }, "A's traffic evicting B's cached prompts")
+      return cache.includes(promptsA[10]!) && !cache.includes(promptsB[0]!)
+    }, "A's recovery evicting B's cached prompts")
 
     const bReads = app.historyReads.filter((sessionID) => sessionID === b).length
     app.selectSession(b)
     await until(async () => (await screen(app)).join("\n").includes(b), "session B again")
     await until(
       () => app.historyReads.filter((sessionID) => sessionID === b).length > bReads,
-      "B's rehydration after eviction without a restart",
+      "B's rehydration after recovery eviction without a restart",
     )
     await until(async () => (await Bun.file(historyPath).text()).includes(promptsB[0]!), "B's restored cache rows")
     const recalled: string[] = []
@@ -1073,9 +1086,10 @@ test("malformed future queue metadata cannot fall back into composer history", a
   }
 }, 30_000)
 
-test("queue-produced unmarked human constituents appear in recall and search without composer origin", async () => {
+test("queue-produced human and unmarked legacy machine prompts appear in recall and search", async () => {
   await using state = await tmpdir()
   const text = "legacy-app-history-token"
+  const machineText = "pre-upgrade-unmarked-machine-token"
   const fixture = await queueTimelineFixture(
     await submitComposerPrompt("queue-human-origin-anchor-token"),
     await submitComposerPrompt("queue-human-origin-companion-token"),
@@ -1095,6 +1109,10 @@ test("queue-produced unmarked human constituents appear in recall and search wit
     }),
   )
   if (!produced) throw new Error("The queue producer omitted its unmarked human constituent")
+  const machine = fixture.messages.find((message) =>
+    message.parts.some((part) => part.type === "text" && part.text === machineText),
+  )
+  if (!machine) throw new Error("The direct transcript producer omitted its unmarked legacy machine row")
   const id = fixture.sessionID
   const historyPath = path.join(state.path, "prompt-history.jsonl")
   const resumed = await startSession({
@@ -1105,7 +1123,7 @@ test("queue-produced unmarked human constituents appear in recall and search wit
     sessions: [sessionInfo(id)],
     queue: [],
     messagesBySession: { [id]: [] },
-    historyMessagesBySession: { [id]: [produced] },
+    historyMessagesBySession: { [id]: [machine, produced] },
   })
   try {
     await until(async () => (await screen(resumed)).join("\n").includes(id), "the queue-human resume")
@@ -1114,9 +1132,16 @@ test("queue-produced unmarked human constituents appear in recall and search wit
     expect(await searchHistory(resumed, text)).not.toContain("No results found")
     resumed.renderer.mockInput.pressEscape()
     await until(() => resumed.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
-    resumed.renderer.mockInput.pressArrow("up")
-    await resumed.renderer.renderOnce()
-    expect(composer(resumed).plainText).toBe(text)
+    expect(await searchHistory(resumed, machineText)).not.toContain("No results found")
+    resumed.renderer.mockInput.pressEscape()
+    await until(() => resumed.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    const recalled: string[] = []
+    for (const _ of [0, 1]) {
+      resumed.renderer.mockInput.pressArrow("up")
+      await resumed.renderer.renderOnce()
+      recalled.push(composer(resumed).plainText)
+    }
+    expect(recalled).toEqual([text, machineText])
   } finally {
     await resumed.stop()
   }
@@ -1598,7 +1623,7 @@ test("session rename remains available from its command menu", async () => {
   }
 }, 20_000)
 
-test("timeline search uses queue-produced human provenance and excludes injected user messages", async () => {
+test("timeline search admits unmarked prompts and excludes marked automation", async () => {
   const fixture = await queueTimelineFixture(
     await submitComposerPrompt("typed-history-token"),
     await submitComposerPrompt("firstmate appended history token", true),
@@ -1613,8 +1638,8 @@ test("timeline search uses queue-produced human provenance and excludes injected
   const titles = candidates.map((candidate) => candidate.title)
   expect(titles).toContain("typed-history-token")
   expect(titles).toContain("direct-composer-history-token")
-  expect(titles).not.toContain("legacy-app-history-token")
-  expect(titles).not.toContain("pre-upgrade-history-token")
+  expect(titles).toContain("legacy-app-history-token")
+  expect(titles).toContain("pre-upgrade-unmarked-machine-token")
   expect(titles).not.toContain("injected-history-token")
   expect(titles).not.toContain("injected-critical-history-token")
   expect(titles).not.toContain("configured-injected-history-token")
@@ -1633,48 +1658,16 @@ test("timeline search uses queue-produced human provenance and excludes injected
       async () => (await screen(app)).some((line) => line.includes("firstmate appended history token")),
       "the queue-produced transcript",
     )
-    app.renderer.mockInput.pressKey("r", { ctrl: true })
-    await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the timeline dialog")
-
-    await Bun.sleep(10)
-    app.renderer.mockInput.typeText("injected-critical-history-token")
-    await until(async () => (await screen(app)).some((line) => line.includes("No results found")), "no injection match")
-    app.renderer.mockInput.pressEnter()
-    expect((await screen(app)).some((line) => line.includes("Message Actions"))).toBe(false)
-    app.renderer.mockInput.pressEscape()
-    app.renderer.mockInput.pressKey("r", { ctrl: true })
-    await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the reopened timeline")
-    await Bun.sleep(10)
-    app.renderer.mockInput.typeText("configured-injected-history-token")
-    await until(
-      async () => (await screen(app)).some((line) => line.includes("No results found")),
-      "configured marker exclusion",
-    )
-    app.renderer.mockInput.pressEnter()
-    expect((await screen(app)).some((line) => line.includes("Message Actions"))).toBe(false)
-    app.renderer.mockInput.pressEscape()
-    app.renderer.mockInput.pressKey("r", { ctrl: true })
-    await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the reopened timeline")
-    await Bun.sleep(10)
-    await app.renderer.mockInput.typeText("pre-upgrade-history-token")
-    await until(
-      async () => (await screen(app)).some((line) => line.includes("No results found")),
-      "unknown history exclusion",
-    )
-    app.renderer.mockInput.pressEnter()
-    expect((await screen(app)).some((line) => line.includes("Message Actions"))).toBe(false)
-    app.renderer.mockInput.pressEscape()
-    app.renderer.mockInput.pressKey("r", { ctrl: true })
-    await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the reopened timeline")
-    await Bun.sleep(10)
-    await app.renderer.mockInput.typeText("legacy-app-history-token")
-    await until(
-      async () => (await screen(app)).some((line) => line.includes("No results found")),
-      "originless queue exclusion",
-    )
-    app.renderer.mockInput.pressEnter()
-    expect((await screen(app)).some((line) => line.includes("Message Actions"))).toBe(false)
-    app.renderer.mockInput.pressEscape()
+    for (const text of ["legacy-app-history-token", "pre-upgrade-unmarked-machine-token"]) {
+      expect(await searchHistory(app, text)).not.toContain("No results found")
+      app.renderer.mockInput.pressEscape()
+      await until(() => app.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    }
+    for (const text of ["injected-critical-history-token", "configured-injected-history-token"]) {
+      expect(await searchHistory(app, text)).toContain("No results found")
+      app.renderer.mockInput.pressEscape()
+      await until(() => app.renderer.renderer.currentFocusedRenderable instanceof TextareaRenderable, "composer focus")
+    }
     app.renderer.mockInput.pressKey("r", { ctrl: true })
     await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the reopened timeline")
     await Bun.sleep(10)
@@ -1810,7 +1803,7 @@ test("resumed composer recall excludes queue automation and cross-session legacy
   }
 }, 30_000)
 
-test("timeline fails closed for a queue-produced prompt without composer origin", async () => {
+test("timeline search admits a queue-produced prompt without composer origin", async () => {
   const fixture = await queueTimelineFixture(
     await submitComposerPrompt("typed-history-token"),
     await submitComposerPrompt("firstmate appended history token", true),
@@ -1821,16 +1814,7 @@ test("timeline fails closed for a queue-produced prompt without composer origin"
       async () => (await screen(app)).some((line) => line.includes("firstmate appended history token")),
       "the queue-produced transcript",
     )
-    app.renderer.mockInput.pressKey("r", { ctrl: true })
-    await until(async () => (await screen(app)).some((line) => line.includes("Timeline")), "the timeline dialog")
-    await Bun.sleep(10)
-    app.renderer.mockInput.typeText("legacy-app-history-token")
-    await until(
-      async () => (await screen(app)).some((line) => line.includes("No results found")),
-      "originless prompt exclusion",
-    )
-    app.renderer.mockInput.pressEnter()
-    expect((await screen(app)).some((line) => line.includes("Message Actions"))).toBe(false)
+    expect(await searchHistory(app, "legacy-app-history-token")).not.toContain("No results found")
   } finally {
     await app.stop()
   }
