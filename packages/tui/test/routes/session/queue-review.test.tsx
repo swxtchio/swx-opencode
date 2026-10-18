@@ -618,6 +618,29 @@ function composerFocused(app: Awaited<ReturnType<typeof startSession>>) {
   )
 }
 
+function observePasteCompletion(input: TextareaRenderable) {
+  const onPaste = input.onPaste
+  if (!onPaste) throw new Error("the composer has no paste handler")
+  let resolvePaste = () => {}
+  let rejectPaste: (error: unknown) => void = () => {}
+  const timeout = setTimeout(() => rejectPaste(new Error("timed out waiting for paste handler completion")), 10_000)
+  const completed = new Promise<void>((resolve, reject) => {
+    resolvePaste = () => {
+      clearTimeout(timeout)
+      resolve()
+    }
+    rejectPaste = (error) => {
+      clearTimeout(timeout)
+      reject(error)
+    }
+  })
+  // OpenTUI invokes onPaste synchronously, so retain its returned async completion here.
+  input.onPaste = (event) => {
+    void Promise.resolve(onPaste.call(input, event)).then(resolvePaste, rejectPaste)
+  }
+  return completed
+}
+
 async function searchHistory(app: Awaited<ReturnType<typeof startSession>>, text: string) {
   app.renderer.mockInput.pressKey("r", { ctrl: true })
   await until(() => app.renderer.renderer.currentFocusedRenderable instanceof InputRenderable, "the search input focus")
@@ -810,11 +833,40 @@ test("pasting local SVG and image paths inserts their content and attachments", 
   }
 }, 30_000)
 
+test("typing during composer paste inspection keeps the pasted text", async () => {
+  const app = await startSession({ queue: [] })
+  const prefix = "typed-before-paste "
+  const suffix = "typed-during-paste"
+  const paste = "typing-race-expanded-payload\nsecond paste line\nthird paste line"
+  try {
+    await until(() => composerFocused(app), "the composer")
+    const input = composer(app)
+    await app.renderer.mockInput.typeText(prefix)
+    const completed = observePasteCompletion(input)
+    const pasteInput = app.renderer.mockInput.pasteBracketedText(paste)
+    const typeInput = app.renderer.mockInput.typeText(suffix)
+    await Promise.all([pasteInput, typeInput])
+    await completed
+    expect(input.plainText).toContain(prefix + suffix)
+    expect(input.plainText).toContain("[Pasted ~3 lines]")
+
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the composer submission")
+    expect(app.prompts[0]!.parts.some((part) => part.type === "text" && part.text?.includes(paste))).toBe(true)
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
+  }
+}, 30_000)
+
 test("clearing an unsent tracked-paste draft leaves no history or stash copy", async () => {
   await using state = await tmpdir()
   const clearDraft = "never-sent-clear-token"
   const clearPaste = "never-sent-clear-expanded-paste-token\nsecond clear line\nthird clear line"
   const clearPastedPayload = "never-sent-clear-expanded-paste-token"
+  const raceDraft = "never-sent-clear-race-prefix"
+  const racePaste = "never-sent-clear-race-expanded-payload\nsecond race line\nthird race line"
+  const racePastedPayload = "never-sent-clear-race-expanded-payload"
   const submitted = "submitted-history-survives-clear-reopen"
   const historyPath = path.join(state.path, "prompt-history.jsonl")
   const hydrationPath = path.join(state.path, "prompt-history-hydrated.json")
@@ -854,10 +906,31 @@ test("clearing an unsent tracked-paste draft leaves no history or stash copy", a
     await submitHistoryPrompt(app, submitted, sessionID, app.prompts.length)
     await until(async () => (await Bun.file(historyPath).text().catch(() => "")).includes(submitted), "submitted history persistence")
 
+    await until(() => composerFocused(app), "the composer before the in-flight clear")
+    await app.renderer.mockInput.typeText(raceDraft)
+    const raceComposer = composer(app)
+    const pasteCompleted = observePasteCompletion(raceComposer)
+    const pasteInput = app.renderer.mockInput.pasteBracketedText(racePaste)
+    app.dispatch("prompt.clear")
+    await pasteInput
+    await pasteCompleted
+    const clearedInput = raceComposer.plainText
+    app.dispatch("session.new")
+    await until(() => raceComposer.isDestroyed && composerFocused(app), "the new home composer")
+    const homeComposer = composer(app)
+    const expandedHomeText = (homeComposer as TextareaRenderable & { getClipboardText(text: string): string }).getClipboardText(
+      homeComposer.plainText,
+    )
+    expect({ clearedInput, homeText: homeComposer.plainText, expandedHomeText }).toEqual({
+      clearedInput: "",
+      homeText: "",
+      expandedHomeText: "",
+    })
+
     const historyText = await Bun.file(historyPath).text().catch(() => "")
     const hydrationText = await Bun.file(hydrationPath).text().catch(() => "")
     const stashText = await Bun.file(stashPath).text().catch(() => "")
-    for (const text of [clearDraft, clearPaste, clearPastedPayload]) {
+    for (const text of [clearDraft, clearPaste, clearPastedPayload, raceDraft, racePaste, racePastedPayload]) {
       expect(historyText).not.toContain(text)
       expect(hydrationText).not.toContain(text)
       expect(stashText).not.toContain(text)
@@ -893,7 +966,7 @@ test("clearing an unsent tracked-paste draft leaves no history or stash copy", a
     const historyText = await Bun.file(historyPath).text().catch(() => "")
     const hydrationText = await Bun.file(hydrationPath).text().catch(() => "")
     const stashText = await Bun.file(stashPath).text().catch(() => "")
-    for (const text of [clearDraft, clearPaste, clearPastedPayload]) {
+    for (const text of [clearDraft, clearPaste, clearPastedPayload, raceDraft, racePaste, racePastedPayload]) {
       expect(historyText).not.toContain(text)
       expect(hydrationText).not.toContain(text)
       expect(stashText).not.toContain(text)
@@ -910,6 +983,9 @@ test("discarding an unsent tracked-paste draft leaves no history or stash copy",
   const draft = "never-sent-discard-token"
   const paste = "never-sent-discard-expanded-paste-token\nsecond discard line\nthird discard line"
   const pastedPayload = "never-sent-discard-expanded-paste-token"
+  const raceDraft = "never-sent-discard-race-prefix"
+  const racePaste = "never-sent-discard-race-expanded-payload\nsecond race line\nthird race line"
+  const racePastedPayload = "never-sent-discard-race-expanded-payload"
   const historyPath = path.join(state.path, "prompt-history.jsonl")
   const hydrationPath = path.join(state.path, "prompt-history-hydrated.json")
   const stashPath = path.join(state.path, "prompt-stash.jsonl")
@@ -951,6 +1027,35 @@ test("discarding an unsent tracked-paste draft leaves no history or stash copy",
     }
     expect(app.prompts).toHaveLength(0)
     app.renderer.mockInput.pressEscape()
+    await until(() => composerFocused(app), "the composer before the in-flight discard")
+    await app.renderer.mockInput.typeText(raceDraft)
+    const raceComposer = composer(app)
+    const pasteCompleted = observePasteCompletion(raceComposer)
+    const pasteInput = app.renderer.mockInput.pasteBracketedText(racePaste)
+    app.renderer.mockInput.pressKey("d", { ctrl: true, shift: true })
+    await pasteInput
+    await pasteCompleted
+    const discardedInput = raceComposer.plainText
+    app.dispatch("session.new")
+    await until(() => raceComposer.isDestroyed && composerFocused(app), "the new home composer")
+    const homeComposer = composer(app)
+    const expandedHomeText = (homeComposer as TextareaRenderable & { getClipboardText(text: string): string }).getClipboardText(
+      homeComposer.plainText,
+    )
+    expect({ discardedInput, homeText: homeComposer.plainText, expandedHomeText }).toEqual({
+      discardedInput: "",
+      homeText: "",
+      expandedHomeText: "",
+    })
+
+    const finalHistory = await Bun.file(historyPath).text().catch(() => "")
+    const finalHydration = await Bun.file(hydrationPath).text().catch(() => "")
+    const finalStash = await Bun.file(stashPath).text().catch(() => "")
+    for (const text of [raceDraft, racePaste, racePastedPayload]) {
+      expect(finalHistory).not.toContain(text)
+      expect(finalHydration).not.toContain(text)
+      expect(finalStash).not.toContain(text)
+    }
   } finally {
     app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
     await app.stop()
