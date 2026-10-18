@@ -1536,6 +1536,109 @@ test("search reaches unrendered recall history and ENTER appends original multil
   }
 }, 30_000)
 
+test("Ctrl+r renders the full selected prompt and keeps other history items as one-line summaries", async () => {
+  await using state = await tmpdir()
+  const older = [
+    "OLDER-PROMPT-START",
+    ...Array.from({ length: 18 }, (_, index) => `older prompt line ${index}`),
+    "OLDER-PROMPT-MIDDLE",
+    `OLDER-WIDE-BEGIN ${"w".repeat(240)} OLDER-WIDE-END`,
+    ...Array.from({ length: 18 }, (_, index) => `older prompt line ${index + 18}`),
+    "OLDER-PROMPT-END-Z",
+  ].join("\n")
+  const newer = [
+    "NEWER-PROMPT-START",
+    ...Array.from({ length: 18 }, (_, index) => `newer prompt line ${index}`),
+    "NEWER-PROMPT-MIDDLE",
+    `NEWER-WIDE-BEGIN ${"n".repeat(240)} NEWER-WIDE-END`,
+    ...Array.from({ length: 18 }, (_, index) => `newer prompt line ${index + 18}`),
+    "NEWER-PROMPT-END-Z",
+  ].join("\n")
+  const seeded = await startSession({ state: state.path, queue: [] })
+  try {
+    await until(
+      async () => (await screen(seeded)).join("\n").includes("already in the transcript"),
+      "the producer session",
+    )
+    for (const [index, text] of [older, newer].entries()) {
+      await seeded.renderer.mockInput.pasteBracketedText(text)
+      seeded.renderer.mockInput.pressEnter()
+      await until(() => seeded.prompts.length === index + 1, "history production")
+      seeded.prompts[index]!.answer(json(transcript))
+      await until(async () => !(await screen(seeded)).join("\n").includes("pending"), "settled send")
+    }
+    await until(
+      async () => (await Bun.file(path.join(state.path, "prompt-history.jsonl")).text()).includes("NEWER-PROMPT-END-Z"),
+      "the produced history",
+    )
+  } finally {
+    seeded.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await seeded.stop()
+  }
+
+  const app = await startSession({ state: state.path, queue: [] })
+  try {
+    await until(
+      async () => (await screen(app)).join("\n").includes("already in the transcript"),
+      "the history session",
+    )
+    app.renderer.mockInput.pressKey("r", { ctrl: true })
+    await until(
+      async () => (await screen(app)).join("\n").includes("Selected prompt"),
+      "the selected prompt preview",
+    )
+
+    const initial = (await screen(app)).join("\n")
+    expect(initial).toContain("NEWER-PROMPT-START")
+    expect(initial).not.toContain("NEWER-PROMPT-END-Z")
+    expect(initial).not.toContain("OLDER-PROMPT-MIDDLE")
+    expect(initial).not.toContain("OLDER-PROMPT-END-Z")
+    expect(initial.split("\n").filter((line) => line.includes("OLDER-PROMPT-START"))).toHaveLength(1)
+
+    app.renderer.mockInput.pressArrow("down")
+    await until(async () => (await screen(app)).join("\n").includes("OLDER-PROMPT-START"), "the older selection")
+    const selectedOlder = (await screen(app)).join("\n")
+    expect(selectedOlder).toContain("OLDER-PROMPT-START")
+    expect(selectedOlder).not.toContain("OLDER-PROMPT-END-Z")
+    expect(selectedOlder).not.toContain("NEWER-PROMPT-MIDDLE")
+    expect(selectedOlder).not.toContain("NEWER-PROMPT-END-Z")
+    expect(selectedOlder.split("\n").filter((line) => line.includes("NEWER-PROMPT-START"))).toHaveLength(1)
+
+    const scrollUntil = async (marker: string) => {
+      let frame = (await screen(app)).join("\n")
+      for (let page = 0; page < 8 && !frame.includes(marker); page++) {
+        await app.renderer.mockInput.pressKeys(["\x1b[57355u"])
+        frame = (await screen(app)).join("\n")
+      }
+      expect(frame).toContain(marker)
+      return frame
+    }
+
+    expect(await scrollUntil("OLDER-PROMPT-MIDDLE")).toContain("OLDER-WIDE-BEGIN")
+    expect(await scrollUntil("OLDER-WIDE-END")).toContain("OLDER-WIDE-END")
+    expect(await scrollUntil("OLDER-PROMPT-END-Z")).toContain("OLDER-PROMPT-END-Z")
+
+    expect(app.renderer.renderer.currentFocusedRenderable).toBeInstanceOf(InputRenderable)
+    await app.renderer.mockInput.typeText("NEWER-PROMPT-START")
+    await until(() => {
+      const focused = app.renderer.renderer.currentFocusedRenderable
+      return focused instanceof InputRenderable && focused.value === "NEWER-PROMPT-START"
+    }, "the filter query")
+    await until(async () => (await screen(app)).some((line) => line.includes("Selected prompt")), "the filtered preview")
+    const filtered = (await screen(app)).join("\n")
+    expect(filtered).toContain("Selected prompt")
+    expect(filtered).not.toContain("NEWER-PROMPT-END-Z")
+    expect(filtered).not.toContain("OLDER-PROMPT-MIDDLE")
+    expect(filtered).not.toContain("OLDER-PROMPT-END-Z")
+    expect(await scrollUntil("NEWER-PROMPT-MIDDLE")).toContain("NEWER-WIDE-BEGIN")
+    expect(await scrollUntil("NEWER-WIDE-END")).toContain("NEWER-WIDE-END")
+    expect(await scrollUntil("NEWER-PROMPT-END-Z")).toContain("NEWER-PROMPT-END-Z")
+  } finally {
+    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
+    await app.stop()
+  }
+}, 30_000)
+
 async function submitComposerPrompt(text: string, appended = false) {
   const app = await startSession({ queue: [], status: { type: "busy" } })
   try {
