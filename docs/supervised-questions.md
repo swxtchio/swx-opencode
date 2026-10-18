@@ -13,10 +13,11 @@ An ask is one of:
 - a **permission request** that the permission rules leave as `ask`. An operation the rules allow or deny is
   decided by the rules and never emitted.
 
-Every emitted ask belongs to the tool call that raised it, which is what an answer after a restart is applied to. An
-ask with no tool call cannot be recovered that way, so while emission is on it is refused, with an error in the
-server log, instead of being emitted. Today that is only the GitLab Duo workflow's tool approval, which is then
-declined.
+Every emitted ask names its origin: the message and tool call that raised it, which is what an answer after a
+restart is applied to. A GitLab Duo workflow's tool approval is emitted like any other permission request; it has no
+tool call of its own, so its origin is its message and its request ID, and an answer after a restart is recorded but
+has no call to apply to. An ask with no origin at all is refused, with an error in the server log; no producer raises
+one today.
 
 Without the flag nothing changes: no ask is recorded or emitted.
 
@@ -125,9 +126,9 @@ model as feedback).
   - `disposition: "duplicate"`: an earlier answer, from a human or another resolver, already settled the ask, and
     `decision` is the winner's. A decision `{"type": "cancelled"}` means the tool stopped waiting before anyone
     answered: its turn was aborted, the ask failed while it was being raised, or its instance was disposed.
-  - `recovered: true`: the server that waited on the ask was gone, and a decision was applied to the stored call
-    (see [After a restart](#after-a-restart)). A `duplicate` can carry it too, when this answer applied the winner's
-    decision.
+  - `recovered: true`: the server that waited on the ask was gone, and recovery wrote the decision into the stored
+    call (see [After a restart](#after-a-restart)). An answer recorded with no call to apply it to, and a decision
+    the live waiting call received, report `recovered: false`.
 - `404` `QuestionNotFoundError` or `PermissionNotFoundError`, naming `requestID`: no such ask in this directory. An
   ask raised in another directory is unknown here; check `answer.query.directory`.
 - `400`: malformed ID or body. `401`: missing or wrong credentials. Neither changes the ask.
@@ -157,7 +158,7 @@ list it with `GET /question`.
 
 The asks are kept in the server's database (`session_ask`, beside the Sessions), so they survive a restart that
 reuses the same data directory or `OPENCODE_DB`. After the restart the outstanding asks are listed again, and the
-answer route settles them as usual, now with `recovered: true`:
+answer route settles them as usual. When it writes the answer into the asking call, it reports `recovered: true`:
 
 - **Question**: the stored call completes with the answers, as if the tool had returned them, and the Session
   continues on its own.
@@ -167,23 +168,21 @@ answer route settles them as usual, now with `recovered: true`:
   the model calls the tool again (an `always` grant is restored, so that retry is not asked again); `reject`
   refuses it as before.
 
-Settling the ask and writing the call's outcome are one database transaction: an answer either does both or, with a
-`503 store-unavailable`, neither, and the ask stays pending for a retry.
+Settling the ask and writing the call's outcome, including an accepted plan's build-agent message, are one database
+transaction: an answer either does both or, with a `503 store-unavailable`, neither, and the ask stays pending for a
+retry. A plan accepted live writes its build-agent message and instruction in one transaction too.
 
-If the Session went on before the answer arrived, for example because it was prompted again after the restart,
-the answer is still recorded (`recovered: true`), but the old call is left as it is and nothing is continued.
+The answer is recorded but nothing is applied (`recovered: false`) when the asking call is gone, or when the Session
+went on before the answer arrived, for example because it was prompted again after the restart. When the call
+already ended without an answer, because its ask was aborted, the ask is settled as `cancelled`.
 
 A refusal ends the turn as it would have live: a question rejection, a plan `No`, or a permission `reject` without a
 message leaves the Session idle unless `experimental.continue_loop_on_deny` is set. Nothing else is replayed: no
 provider request or other tool call is retried.
 
-A repeated answer after a restart is a `duplicate` as usual, and repairs what the old server could not finish:
-
-- an ask that was settled, but whose server died before the waiting call received the answer, has the recorded
-  decision applied to its call now (the repeated answer's own content is ignored);
-- a recovered call whose server died before its Session continued is continued now.
-
-So when a Session is stuck behind an ask your supervisor already answered, answer it again after the restart.
+A repeated answer after a restart is a `duplicate` as usual. A decision the live waiting call received is never
+reapplied, since that call acted on it (a granted command may have run). The one thing a repeated answer repairs
+is a recovered call whose server died before its Session continued: that Session is continued now.
 
 ### When an ask can be recovered
 
@@ -192,11 +191,15 @@ that process is gone; while it runs, or when its state cannot be proven, the ans
 `503 owned-by-live-process`.
 
 - The check uses Linux procfs: the recorded process ID, its start time and the machine's boot ID. Recovery
-  therefore needs Linux, and every server on a database must run on the same machine. Do not share a database
-  across machines.
+  therefore needs Linux, and every server on a database must run on the same machine and in the same PID
+  namespace. Do not share a database across machines, or across containers that do not share a PID namespace: a
+  process ID read in another namespace can name an unrelated process or none.
 - Stopping the server by a signal or a crash leaves its asks recoverable. Disposing an instance while the server
   keeps running (for example on a configuration reload) ends its waiting asks, which are then reported as
   `cancelled`.
+- An aborted ask is cancelled in the ledger. If that write fails it is retried; while it still cannot be recorded,
+  the server refuses answers to the ask (`503 store-unavailable`), and after a restart the aborted call's own
+  record settles the ask as `cancelled`.
 - A server started without `--questions-command` neither lists nor settles recorded asks, and `opencode db prune`
   and `opencode db retention` keep refusing their Sessions. To settle them, restart the server with
   `--questions-command` on the same database and answer, or reject, each one it lists.

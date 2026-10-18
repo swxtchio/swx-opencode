@@ -191,10 +191,10 @@ Newest first. Each entry names the upstream range brought in.
 
 - **#288** `opencode serve` takes `--questions-command <cmd>` (swxtchio/swx-opencode#286): question choices and
   free text, plan acceptance and permission asks are recorded in the `session_ask` ledger (migration
-  `20261017233837`), emitted as JSON to the operator's command, and stay pending until settled once by the new
+  `20261018005127`), emitted as JSON to the operator's command, and stay pending until settled once by the new
   `POST /question/:id/answer` and `/permission/:id/answer` routes or a human reply. An answer after a restart
-  settles the ask and applies the decision to the stored call in one transaction, then continues the Session; asks
-  without a tool call are refused while emission is on. Prune and retention refuse Sessions with an outstanding ask.
+  settles the ask and applies the decision to the stored call in one transaction, then continues the Session; a
+  decision the live call received is never reapplied. Prune and retention refuse Sessions with an outstanding ask.
   Off by default; see `docs/supervised-questions.md`. _Fork-only._
 - **#272** Search timeline prompts with recognized composer provenance, excluding machine markers and appended text.
   Unknown or unmarked history fails closed; firstmate terminal sends still share `tui-composer` origin until

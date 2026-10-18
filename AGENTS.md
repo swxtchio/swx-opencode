@@ -234,9 +234,10 @@ const table = sqliteTable("session", {
 - Every emitted ask is settled once through the ledger (`packages/opencode/src/ask/ledger.ts`, immediate
   transaction). A new resolver path (route, cascade, cancel) must settle there and act only on a won settlement, or
   the ledger and the waiting tool disagree. A live settlement and its delivery to the waiter are one uninterruptible
-  step, and an ask's every exit cancels its still-pending row. An answer with no live waiter is applied only when
-  the owning `event_writer_process` is gone, by `AskRecovery` (`packages/opencode/src/ask/recovery.ts`), which
-  settles the row and writes that call's outcome in one transaction. Every emitted ask needs a tool call origin.
+  step marked `delivered`, and an ask's every exit cancels its still-pending row. An answer with no live waiter is
+  applied only when the owning `event_writer_process` is gone, by `AskRecovery`
+  (`packages/opencode/src/ask/recovery.ts`), which settles the row and writes that call's outcome in one transaction
+  and never touches a delivered decision. Every emitted ask needs an origin (message and call).
 
 ## Maintaining this file
 
