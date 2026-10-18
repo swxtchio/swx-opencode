@@ -50,8 +50,9 @@ const fakePlugin = Plugin.Service.of({
 
 const fakePermission = Permission.Service.of({
   ask: () => Effect.void,
-  reply: () => Effect.void,
+  reply: () => Effect.die(new Error("unexpected permission reply")),
   list: () => Effect.succeed([]),
+  grant: () => Effect.die(new Error("unexpected permission grant")),
 } satisfies Permission.Interface)
 
 const fakeTruncate = Truncate.Service.of({

@@ -2,7 +2,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { describe, expect } from "bun:test"
-import { Config, Context, Effect, FileSystem, Layer, Path } from "effect"
+import { Config, ConfigProvider, Context, Duration, Effect, FileSystem, Layer, Path, Schedule } from "effect"
 import { HttpClient, HttpClientRequest, HttpRouter, HttpServer } from "effect/unstable/http"
 import * as Socket from "effect/unstable/socket/Socket"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
@@ -16,6 +16,12 @@ import { HEADER as FenceHeader } from "../../src/server/shared/fence"
 import { resetDatabase } from "../fixture/db"
 import { tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
+import { AskEmit } from "../../src/ask/emit"
+import { ServerAuth } from "../../src/server/auth"
+import { writeReceiver } from "../lib/ask-receiver"
+import { deadline } from "../lib/deadline"
+import { TestLLMServer } from "../lib/llm-server"
+import { testProviderConfig } from "../lib/test-provider"
 
 // Flip the experimental workspaces flag so EventV2.run actually writes to
 // EventSequenceTable (the source of truth the fence middleware reads). Reset
@@ -262,4 +268,166 @@ describe("instance HttpApi", () => {
       )
     }),
   )
+
+  it.live(
+    "answers an emitted question only when authorized and in its own directory, and tells unknown from duplicate",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const supervisor = yield* supervised("secret")
+        const dir = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const other = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        yield* llm.tool("question", {
+          questions: [{ question: "Proceed?", header: "Go", options: [{ label: "Yes", description: "Go on" }] }],
+        })
+        yield* llm.text("done")
+
+        const sessionID = yield* supervisor.start(dir)
+        const [emitted] = yield* supervisor.receiver.read(1)
+        const listed = supervisor
+          .call("GET", "/question", dir)
+          .pipe(Effect.map((result) => (result.body as Array<{ id: string }>).map((item) => item.id)))
+        const answer = (body: unknown, directory = dir, id: string = emitted.id, authorized = true) =>
+          supervisor.call("POST", `/question/${id}/answer`, directory, body, authorized)
+
+        expect((yield* answer({ answers: [["Yes"]] }, dir, emitted.id, false)).status).toBe(401)
+        expect(yield* listed).toEqual([emitted.id])
+
+        const elsewhere = yield* answer({ answers: [["Yes"]] }, other)
+        expect(elsewhere.status).toBe(404)
+        expect(elsewhere.body).toMatchObject({ _tag: "QuestionNotFoundError", requestID: emitted.id })
+        expect(yield* listed).toEqual([emitted.id])
+
+        const unknownID = QuestionID.ascending()
+        const unknown = yield* answer({ answers: [["Yes"]] }, dir, unknownID)
+        expect(unknown.status).toBe(404)
+        expect(unknown.body).toMatchObject({ _tag: "QuestionNotFoundError", requestID: unknownID })
+        expect((yield* answer({ answers: [["Yes"]] }, dir, "not-a-question")).status).toBe(400)
+        expect(yield* listed).toEqual([emitted.id])
+
+        const settled = yield* answer({ answers: [["Yes"]] })
+        expect(settled.status).toBe(200)
+        expect(settled.body).toEqual({
+          requestID: emitted.id,
+          sessionID,
+          disposition: "settled",
+          decision: { type: "answered", answers: [["Yes"]] },
+          recovered: false,
+        })
+        const duplicate = yield* answer({ reject: true })
+        expect(duplicate.status).toBe(200)
+        expect(duplicate.body).toMatchObject({
+          disposition: "duplicate",
+          decision: { type: "answered", answers: [["Yes"]] },
+        })
+        const human = yield* supervisor.call("POST", `/question/${emitted.id}/reply`, dir, { answers: [["No"]] })
+        expect(human.status).toBe(404)
+        expect(human.body).toMatchObject({
+          requestID: emitted.id,
+          message: `Question request already settled: ${emitted.id}`,
+        })
+
+        const part = yield* supervisor.toolPart(dir, sessionID, emitted.origin.callID, "completed")
+        expect(part.state.metadata.answers).toEqual([["Yes"]])
+        expect(yield* listed).toEqual([])
+      }).pipe(Effect.provide(TestLLMServer.layer)),
+    60_000,
+  )
+
+  it.live("answers an emitted permission request through its route with the permission's own reply", () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      const supervisor = yield* supervised("secret")
+      const dir = yield* tmpdirScoped({
+        git: true,
+        config: { ...testProviderConfig(llm.url), permission: { bash: "ask" } },
+      })
+      const other = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+      yield* llm.tool("bash", { command: "echo supervised", description: "Echo" })
+      yield* llm.text("done")
+
+      const sessionID = yield* supervisor.start(dir)
+      const [emitted] = yield* supervisor.receiver.read(1)
+      expect(emitted.kind).toBe("permission")
+      expect(emitted.permission).toMatchObject({ permission: "bash", patterns: ["echo supervised"] })
+      const answer = (body: unknown, directory = dir) =>
+        supervisor.call("POST", `/permission/${emitted.id}/answer`, directory, body)
+
+      expect((yield* answer({ reply: "once" }, other)).status).toBe(404)
+      const unknownID = PermissionV1.ID.ascending()
+      const unknown = yield* supervisor.call("POST", `/permission/${unknownID}/answer`, dir, { reply: "once" })
+      expect(unknown.body).toMatchObject({ _tag: "PermissionNotFoundError", requestID: unknownID })
+
+      expect((yield* answer({ reply: "once" })).body).toMatchObject({
+        disposition: "settled",
+        decision: { type: "replied", reply: "once" },
+        recovered: false,
+      })
+      expect((yield* answer({ reply: "reject" })).body).toMatchObject({
+        disposition: "duplicate",
+        decision: { type: "replied", reply: "once" },
+      })
+      const part = yield* supervisor.toolPart(dir, sessionID, emitted.origin.callID, "completed")
+      expect(part.state.output).toContain("supervised")
+    }).pipe(Effect.provide(TestLLMServer.layer)),
+    60_000,
+  )
+})
+
+// A production route tree with configured authorization, emitting asks to a receiver in this process.
+const supervised = Effect.fn("supervised")(function* (password: string) {
+  const home = yield* tmpdirScoped()
+  const receiver = yield* writeReceiver(home, "cat >> '$OUT'")
+  AskEmit.configure({ command: receiver.path })
+  yield* Effect.addFinalizer(() => Effect.sync(() => AskEmit.configure(undefined)))
+  const handler = HttpRouter.toWebHandler(
+    HttpApiApp.routes.pipe(
+      Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ OPENCODE_SERVER_PASSWORD: password }))),
+    ),
+    { disableLogger: true },
+  )
+  yield* Effect.addFinalizer(() => Effect.promise(() => handler.dispose()))
+  const authorization = ServerAuth.header({ username: "opencode", password }) ?? ""
+  const call = (method: string, path: string, directory: string, body?: unknown, authorized = true) =>
+    Effect.promise(async () => {
+      const response = await handler.handler(
+        new Request(`http://localhost${path}`, {
+          method,
+          headers: {
+            "x-opencode-directory": directory,
+            "content-type": "application/json",
+            ...(authorized ? { authorization } : {}),
+          },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        }),
+        HttpApiApp.context,
+      )
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return { status: response.status, body: (await response.json().catch(() => undefined)) as any }
+    })
+  const start = Effect.fn("supervised.start")(function* (directory: string) {
+    const session = yield* call("POST", SessionPaths.create, directory, { title: "supervised" })
+    const prompt = yield* call("POST", `/session/${session.body.id}/prompt_async`, directory, {
+      model: { providerID: "test", modelID: "test-model" },
+      parts: [{ type: "text", text: "ask" }],
+    })
+    expect(prompt.status).toBeLessThan(300)
+    return session.body.id as string
+  })
+  const toolPart = (directory: string, sessionID: string, callID: string, status: string) =>
+    call("GET", `/session/${sessionID}/message`, directory).pipe(
+      Effect.map((result) =>
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (result.body as Array<{ parts: any[] }>)
+          .flatMap((message) => message.parts)
+          .find((part) => part.callID === callID),
+      ),
+      Effect.filterOrFail(
+        (part) => part?.state?.status === status,
+        () => new Error(`tool call ${callID} is not ${status}`),
+      ),
+      Effect.retry(Schedule.spaced("50 millis")),
+      Effect.timeout(Duration.millis(deadline(20_000))),
+    )
+  return { receiver, call, start, toolPart }
 })

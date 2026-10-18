@@ -1541,7 +1541,12 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
     ),
     Effect.provideService(
       Permission.Service,
-      Permission.Service.of({ ask: () => Effect.void, reply: () => Effect.void, list: () => Effect.succeed([]) }),
+      Permission.Service.of({
+        ask: () => Effect.void,
+        reply: () => Effect.die(new Error("unexpected permission reply")),
+        list: () => Effect.succeed([]),
+        grant: () => Effect.die(new Error("unexpected permission grant")),
+      }),
     ),
     Effect.provideService(
       MCP.Service,

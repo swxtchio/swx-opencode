@@ -3,10 +3,11 @@
 // The store is opened through the production Database layer, so it carries the migrated schema and this
 // process's writer registration, which names a process that is gone once the script exits.
 // Each Session gets a V1 user and assistant turn with text and step-finish parts, a V2 step with usage, a
-// V2 context update, a todo list and a Context Epoch, each holding a "sentinel" string retention must redact.
+// V2 context update, a todo list, a Context Epoch and a question answered under `--questions-command`, each holding a
+// "sentinel" string retention must redact.
 // It prints one JSON line naming the trees it wrote, the usage each step reported, and the clock window the
 // writes fall in.
-import { DateTime, Effect, Layer, Schema } from "effect"
+import { DateTime, Effect, Fiber, Layer, Schema } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -27,6 +28,8 @@ import { InstanceStore } from "@/project/instance-store"
 import { Session } from "@/session/session"
 import { MessageID, PartID, type SessionID } from "@/session/schema"
 import { Todo } from "@/session/todo"
+import { AskEmit } from "@/ask/emit"
+import { Question } from "@/question"
 
 const [filename, directory, spec] = process.argv.slice(2)
 if (!filename || !directory || !spec) throw new Error("usage: <db> <project directory> <tree sizes JSON>")
@@ -34,8 +37,12 @@ const sizes = JSON.parse(spec) as number[]
 
 const usage = { cost: 0.25, tokens: { input: 12, output: 17, reasoning: 3, cache: { read: 5, write: 7 } } }
 
+// The asks go nowhere; the ledger records them the same.
+AskEmit.configure({ command: Bun.which("true")! })
+
 const produce = Effect.gen(function* () {
   const session = yield* Session.Service
+  const question = yield* Question.Service
   const todo = yield* Todo.Service
   const events = yield* EventV2Bridge.Service
   const { db } = yield* Database.Service
@@ -133,6 +140,23 @@ const produce = Effect.gen(function* () {
       ),
       sessionID,
     )
+    const asked = yield* question
+      .ask({
+        sessionID: info.id,
+        questions: [{ question: "ask question sentinel", header: "Ask", options: [] }],
+        tool: { messageID: assistantID, callID: "retention-ask" },
+        producer: "question",
+      })
+      .pipe(Effect.forkScoped)
+    const [pending] = yield* question.list().pipe(
+      Effect.filterOrFail(
+        (items) => items.length === 1,
+        () => new Error("the question was not recorded"),
+      ),
+      Effect.retry({ times: 1000 }),
+    )
+    yield* question.reply({ requestID: pending!.id, answers: [["ask answer sentinel"]] })
+    yield* Fiber.join(asked)
     return info.id
   })
 
@@ -150,6 +174,7 @@ const produce = Effect.gen(function* () {
 const layer = AppNodeBuilder.build(
   LayerNode.group([
     Session.node,
+    Question.node,
     Todo.node,
     EventV2Bridge.node,
     SessionProjector.node,

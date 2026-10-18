@@ -5,6 +5,8 @@ import { ProviderTransform } from "@/provider/transform"
 import { MCP } from "@/mcp"
 import { McpCatalog } from "@/mcp/catalog"
 import { Permission } from "@/permission"
+import { AskLedger } from "@/ask/ledger"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Tool } from "@/tool/tool"
 import { ToolJsonSchema } from "@/tool/json-schema"
 import { ToolRegistry } from "@/tool/registry"
@@ -100,7 +102,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           tool: { messageID: input.processor.message.id, callID: options.toolCallId },
           ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
         })
-        .pipe(Effect.orDie),
+        .pipe(
+          AskLedger.abortable(options.abortSignal, () => new PermissionV1.RejectedError()),
+          Effect.orDie,
+        ),
   })
 
   // Nothing a call runs, its plugin hooks included, may start before its processor has durably admitted it. A call

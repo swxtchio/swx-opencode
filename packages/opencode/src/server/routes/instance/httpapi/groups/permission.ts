@@ -2,7 +2,8 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Permission } from "@/permission"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
-import { PermissionNotFoundError } from "../errors"
+import { SessionAsk } from "@opencode-ai/schema/session-ask"
+import { AskNotAppliedError, AskUnavailableError, PermissionNotFoundError } from "../errors"
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
 import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
@@ -33,12 +34,27 @@ export const PermissionApi = HttpApi.make("permission")
           query: WorkspaceRoutingQuery,
           payload: ReplyPayload,
           success: described(Schema.Boolean, "Permission processed successfully"),
-          error: [HttpApiError.BadRequest, PermissionNotFoundError],
+          error: [HttpApiError.BadRequest, PermissionNotFoundError, AskUnavailableError, AskNotAppliedError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "permission.reply",
             summary: "Respond to permission request",
             description: "Approve or deny a permission request from the AI assistant.",
+          }),
+        ),
+        HttpApiEndpoint.post("answer", `${root}/:requestID/answer`, {
+          params: { requestID: PermissionV1.ID },
+          query: WorkspaceRoutingQuery,
+          payload: ReplyPayload,
+          success: described(SessionAsk.Result, "How the answer settled the permission request"),
+          error: [HttpApiError.BadRequest, PermissionNotFoundError, AskUnavailableError, AskNotAppliedError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "permission.answer",
+            summary: "Answer permission request",
+            description:
+              "Approve or deny a permission request, reporting whether this answer settled it or an earlier one had. " +
+              "Under `--questions-command` this also settles a request whose server restarted while it was pending.",
           }),
         ),
       )
