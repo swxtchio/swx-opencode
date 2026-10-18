@@ -127,16 +127,22 @@ model as feedback).
     `decision` is the winner's. A decision `{"type": "cancelled"}` means the tool stopped waiting before anyone
     answered: its turn was aborted, the ask failed while it was being raised, or its instance was disposed.
   - `recovered: true`: the server that waited on the ask was gone, and recovery wrote the decision into the stored
-    call (see [After a restart](#after-a-restart)). An answer recorded with no call to apply it to, and a decision
-    the live waiting call received, report `recovered: false`.
+    call (see [After a restart](#after-a-restart)). A decision the live waiting call received reports
+    `recovered: false`.
 - `404` `QuestionNotFoundError` or `PermissionNotFoundError`, naming `requestID`: no such ask in this directory. An
   ask raised in another directory is unknown here; check `answer.query.directory`.
 - `400`: malformed ID or body. `401`: missing or wrong credentials. Neither changes the ask.
 - `503` `AskUnavailableError`, naming `requestID` and a `reason`. Nothing was settled:
   - `store-unavailable`: the ask's state could not be read or written, or, after a restart, the decision could not
-    be applied to the stored call. Retry.
+    be written to the stored call. Retry.
   - `owned-by-live-process`: another live server process, on the same database, waits on the ask. Answer on that
     server.
+- `409` `AskNotAppliedError`, naming `requestID` and a `reason`. The answer was not applied:
+  - `apply-failed`: the producer's effect for the answer failed, for example a plan `Yes` whose switch to the build
+    agent could not be written. Nothing was settled and the ask is still pending: answer it again once the cause is
+    fixed, or answer differently.
+  - `call-gone`: after a restart, the call the ask belongs to is gone, or its Session went on without it. The ask
+    was closed as `cancelled` and nothing was applied; a later answer is a `duplicate` with that decision.
 
 `GET /question?directory=...` and `GET /permission?directory=...` list the outstanding asks this server can settle.
 
@@ -169,12 +175,16 @@ answer route settles them as usual. When it writes the answer into the asking ca
   refuses it as before.
 
 Settling the ask and writing the call's outcome, including an accepted plan's build-agent message, are one database
-transaction: an answer either does both or, with a `503 store-unavailable`, neither, and the ask stays pending for a
-retry. A plan accepted live writes its build-agent message and instruction in one transaction too.
+transaction: an answer either does both or neither, with the ask still pending for a retry (`503 store-unavailable`
+when the call cannot be written, `409 apply-failed` when the plan switch fails).
 
-The answer is recorded but nothing is applied (`recovered: false`) when the asking call is gone, or when the Session
-went on before the answer arrived, for example because it was prompted again after the restart. When the call
-already ended without an answer, because its ask was aborted, the ask is settled as `cancelled`.
+A plan accepted live works the same way: the switch to the build agent (its build message and instruction) is written
+in the transaction that settles the `Yes`. If the switch fails, the answer gets `409 apply-failed`, nothing is
+settled, no build message is left behind, and the plan call keeps waiting for another answer.
+
+When the asking call is gone, or the Session went on before the answer arrived (for example because it was prompted
+again after the restart), the answer gets `409 call-gone`: the ask is closed as `cancelled` and nothing is applied.
+When the call already ended without an answer, because its ask was aborted, the ask is settled as `cancelled`.
 
 A refusal ends the turn as it would have live: a question rejection, a plan `No`, or a permission `reject` without a
 message leaves the Session idle unless `experimental.continue_loop_on_deny` is set. Nothing else is replayed: no
