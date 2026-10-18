@@ -22,6 +22,8 @@ import {
 } from "../middleware/workspace-routing"
 import {
   ApiNotFoundError,
+  AskNotAppliedError,
+  AskUnavailableError,
   PermissionNotFoundError,
   PromptRequestConflictError,
   PromptWithdrawnError,
@@ -406,7 +408,7 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: PermissionResponsePayload,
           success: described(Schema.Boolean, "Permission processed successfully"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError, PermissionNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, PermissionNotFoundError, AskUnavailableError, AskNotAppliedError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "permission.respond",

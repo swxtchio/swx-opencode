@@ -1,6 +1,6 @@
 // Writes prune fixtures through the Session, queue and durable-event producers.
 import { rename, rm } from "node:fs/promises"
-import { DateTime, Effect, Layer, Schema } from "effect"
+import { DateTime, Effect, Fiber, Layer, Schema } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -24,6 +24,8 @@ import { Session } from "@/session/session"
 import { SessionQueue } from "@/session/queue"
 import { Todo } from "@/session/todo"
 import { MessageID, PartID, SessionID } from "@/session/schema"
+import { AskEmit } from "@/ask/emit"
+import { Question } from "@/question"
 
 const [filename, directory, serialized] = process.argv.slice(2)
 if (!filename || !directory || !serialized) throw new Error("usage: <db> <project directory> <operation JSON>")
@@ -37,6 +39,8 @@ type Create = {
   pendingV2?: boolean
   unfinished?: boolean
   runningTool?: boolean
+  // A question answered under `--questions-command`, leaving its settled ledger row.
+  ask?: boolean
 }
 
 const input = JSON.parse(serialized) as {
@@ -89,6 +93,7 @@ if (input.holdAfterSignal) {
 
 const produce = Effect.gen(function* () {
   const sessions = yield* Session.Service
+  const question = yield* Question.Service
   const v2 = yield* SessionV2.Service
   const queue = yield* SessionQueue.Service
   const todo = yield* Todo.Service
@@ -194,6 +199,28 @@ const produce = Effect.gen(function* () {
         SessionV2.ID.make(sessionID),
       )
 
+      if (create.ask) {
+        // The ask goes nowhere; the ledger records it the same.
+        AskEmit.configure({ command: Bun.which("true")! })
+        const asked = yield* question
+          .ask({
+            sessionID,
+            questions: [{ question: "Prune this?", header: "Prune", options: [] }],
+            tool: { messageID: assistantID, callID: "prune-ask" },
+            producer: "question",
+          })
+          .pipe(Effect.forkScoped)
+        const [pending] = yield* question.list().pipe(
+          Effect.filterOrFail(
+            (items) => items.length === 1,
+            () => new Error("the question was not recorded"),
+          ),
+          Effect.retry({ times: 1000 }),
+        )
+        yield* question.reply({ requestID: pending!.id, answers: [["yes"]] })
+        yield* Fiber.join(asked)
+        AskEmit.configure(undefined)
+      }
       if (create.pendingV1) {
         yield* queue.admit({
           sessionID,
@@ -299,6 +326,7 @@ const produce = Effect.gen(function* () {
 const layer = AppNodeBuilder.build(
   LayerNode.group([
     Session.node,
+    Question.node,
     SessionQueue.node,
     SessionV2.node,
     SessionStore.node,

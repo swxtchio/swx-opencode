@@ -36,6 +36,7 @@ import { SessionPrompt } from "@/session/prompt"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { SessionQueue } from "@/session/queue"
+import { AskRecovery } from "@/ask/recovery"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
@@ -244,6 +245,7 @@ const app = LayerNode.group([
   EventV2Bridge.node,
   SessionRunState.node,
   SessionQueue.node,
+  AskRecovery.node,
   SessionProcessor.node,
   SessionCompaction.node,
   SessionRevert.node,

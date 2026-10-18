@@ -2,7 +2,8 @@ import { Question } from "@/question"
 import { QuestionID } from "@/question/schema"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
-import { QuestionNotFoundError } from "../errors"
+import { SessionAsk } from "@opencode-ai/schema/session-ask"
+import { AskNotAppliedError, AskUnavailableError, QuestionNotFoundError } from "../errors"
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
 import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
@@ -34,7 +35,7 @@ export const QuestionApi = HttpApi.make("question")
           query: WorkspaceRoutingQuery,
           payload: ReplyPayload,
           success: described(Schema.Boolean, "Question answered successfully"),
-          error: [HttpApiError.BadRequest, QuestionNotFoundError],
+          error: [HttpApiError.BadRequest, QuestionNotFoundError, AskUnavailableError, AskNotAppliedError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "question.reply",
@@ -46,12 +47,27 @@ export const QuestionApi = HttpApi.make("question")
           params: { requestID: QuestionID },
           query: WorkspaceRoutingQuery,
           success: described(Schema.Boolean, "Question rejected successfully"),
-          error: [HttpApiError.BadRequest, QuestionNotFoundError],
+          error: [HttpApiError.BadRequest, QuestionNotFoundError, AskUnavailableError, AskNotAppliedError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "question.reject",
             summary: "Reject question request",
             description: "Reject a question request from the AI assistant.",
+          }),
+        ),
+        HttpApiEndpoint.post("answer", `${root}/:requestID/answer`, {
+          params: { requestID: QuestionID },
+          query: WorkspaceRoutingQuery,
+          payload: SessionAsk.QuestionAnswer,
+          success: described(SessionAsk.Result, "How the answer settled the question request"),
+          error: [HttpApiError.BadRequest, QuestionNotFoundError, AskUnavailableError, AskNotAppliedError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "question.answer",
+            summary: "Answer question request",
+            description:
+              "Answer or reject a question request, reporting whether this answer settled it or an earlier one had. " +
+              "Under `--questions-command` this also settles a request whose server restarted while it was pending.",
           }),
         ),
       )

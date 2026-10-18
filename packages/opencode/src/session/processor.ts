@@ -669,6 +669,7 @@ const layer = Layer.effect(
               permission: "doom_loop",
               patterns: [value.name],
               sessionID: ctx.assistantMessage.sessionID,
+              tool: { messageID: ctx.assistantMessage.id, callID: value.id },
               metadata: { tool: value.name, input },
               always: [value.name],
               ruleset: agent.permission,
@@ -1032,7 +1033,7 @@ const layer = Layer.effect(
                 activeAssistantMessageID: ctx.assistantMessage.id,
               })
               const stream = llm
-                .stream(streamInput)
+                .stream({ ...streamInput, messageID: ctx.assistantMessage.id })
                 .pipe(Stream.tapCause((cause) => FailureOrigin.record(cause, { stage: "stream" })))
 
               yield* stream.pipe(

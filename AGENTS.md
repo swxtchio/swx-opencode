@@ -226,6 +226,19 @@ const table = sqliteTable("session", {
 - `opencode db retention` (`packages/opencode/src/cli/cmd/db-retention.ts`) redacts inactive Session trees only when every gate in `candidateFailures` passes, re-checked inside each batch's write lock.
 - Its cross-process liveness relies on `packages/core/src/event/writer.ts`: the Database layer registers each process, and `EventV2` records the writing process in the same transaction as every durable append. Keep Session writes on that path, and classify any new Session-owned table in the retention tool, or it refuses every tree.
 
+## Supervised Asks (fork)
+
+- `--questions-command` (#286, `docs/supervised-questions.md`) is set only from `serve` argv into `AskEmit`
+  (`packages/opencode/src/ask/emit.ts`); never read it from config. With it off, `Question` and `Permission` keep
+  their stock in-memory paths and write no `session_ask` row.
+- Every emitted ask is settled once through the ledger (`packages/opencode/src/ask/ledger.ts`, immediate
+  transaction). A new resolver path (route, cascade, cancel) must settle there and act only on a won settlement, or
+  the ledger and the waiting tool disagree. A live settlement and its delivery to the waiter are one uninterruptible
+  step marked `delivered`, and an ask's every exit cancels its still-pending row. An answer with no live waiter is
+  applied only when the owning `event_writer_process` is gone, by `AskRecovery`
+  (`packages/opencode/src/ask/recovery.ts`), which settles the row and writes that call's outcome in one transaction
+  and never touches a delivered decision. Every emitted ask needs an origin (message and call).
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

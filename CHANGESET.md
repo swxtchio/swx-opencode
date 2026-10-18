@@ -189,6 +189,14 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Features
 
+- **#288** `opencode serve` takes `--questions-command <cmd>` (swxtchio/swx-opencode#286): question choices and
+  free text, plan acceptance and permission asks are recorded in the `session_ask` ledger (migration
+  `20261018005127`), emitted as JSON to the operator's command, and stay pending until settled once by the new
+  `POST /question/:id/answer` and `/permission/:id/answer` routes or a human reply. An answer after a restart
+  settles the ask and applies the decision to the stored call in one transaction, then continues the Session; a
+  decision the live call received is never reapplied, an answer whose call can never take it closes the ask as
+  undelivered, and an answer that cannot be applied yet is a 409, never settled. Prune and retention refuse Sessions
+  with an outstanding ask. Off by default; see `docs/supervised-questions.md`. _Fork-only._
 - **#287** Repair the composer regressions in `swxtchio/swx-opencode#285`: session-owned recall and retained-history search, append-only picker selection, and invocation-time enhancement model selection. Home-screen drafts without a session owner are no longer retained for later recall. The owning code is `packages/tui/src/prompt/history.tsx`, `packages/tui/src/routes/session/dialog-timeline.tsx`, and `packages/tui/src/component/prompt/index.tsx`; producer-driven regressions are in `packages/tui/test/routes/session/queue-review.test.tsx`. _Fork-only._
 - **#272** Search timeline prompts with recognized composer provenance, excluding machine markers and appended text.
   Unknown or unmarked history fails closed; firstmate terminal sends still share `tui-composer` origin until

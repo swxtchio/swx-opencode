@@ -308,6 +308,22 @@ const scenarios: Scenario[] = [
       body: { reply: "once" },
     }))
     .json(404, object, "status"),
+  http.protected
+    .post("/permission/{requestID}/answer", "permission.answer.invalid")
+    .at((ctx) => ({
+      path: route("/permission/{requestID}/answer", { requestID: "per_httpapi" }),
+      headers: ctx.headers(),
+      body: { reply: "bad" },
+    }))
+    .status(400),
+  http.protected
+    .post("/permission/{requestID}/answer", "permission.answer")
+    .at((ctx) => ({
+      path: route("/permission/{requestID}/answer", { requestID: "per_httpapi" }),
+      headers: ctx.headers(),
+      body: { reply: "once" },
+    }))
+    .json(404, object, "status"),
   http.protected.get("/question", "question.list").json(200, array),
   http.protected
     .post("/question/{requestID}/reply", "question.reply.invalid")
@@ -330,6 +346,22 @@ const scenarios: Scenario[] = [
     .at((ctx) => ({
       path: route("/question/{requestID}/reject", { requestID: "que_httpapi_reject" }),
       headers: ctx.headers(),
+    }))
+    .json(404, object, "status"),
+  http.protected
+    .post("/question/{requestID}/answer", "question.answer.invalid")
+    .at((ctx) => ({
+      path: route("/question/{requestID}/answer", { requestID: "que_httpapi_answer" }),
+      headers: ctx.headers(),
+      body: { answers: "Yes" },
+    }))
+    .status(400),
+  http.protected
+    .post("/question/{requestID}/answer", "question.answer")
+    .at((ctx) => ({
+      path: route("/question/{requestID}/answer", { requestID: "que_httpapi_answer" }),
+      headers: ctx.headers(),
+      body: { answers: [["Yes"]] },
     }))
     .json(404, object, "status"),
   http.protected

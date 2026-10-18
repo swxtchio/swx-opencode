@@ -38,6 +38,8 @@ import {
 } from "../groups/session"
 import { PermissionNotFoundError, PromptRequestConflictError, PromptWithdrawnError } from "../errors"
 import * as SessionError from "./session-errors"
+import { settlePermission } from "./permission"
+import { AskRecovery } from "@/ask/recovery"
 import { SessionQueue } from "@/session/queue"
 
 const tryParseJson = (text: string) =>
@@ -57,6 +59,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const runState = yield* SessionRunState.Service
     const agentSvc = yield* Agent.Service
     const permissionSvc = yield* Permission.Service
+    const askRecovery = yield* AskRecovery.Service
     const statusSvc = yield* SessionStatus.Service
     const todoSvc = yield* Todo.Service
     const summary = yield* SessionSummary.Service
@@ -422,17 +425,15 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof PermissionResponsePayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* permissionSvc.reply({ requestID: ctx.params.permissionID, reply: ctx.payload.response }).pipe(
-        Effect.catchTag("Permission.NotFoundError", (error) =>
-          Effect.fail(
-            new PermissionNotFoundError({
-              requestID: String(error.requestID),
-              message: `Permission request not found: ${error.requestID}`,
-            }),
-          ),
-        ),
-      )
-      return true
+      const settled = yield* settlePermission(permissionSvc, askRecovery, {
+        requestID: ctx.params.permissionID,
+        reply: ctx.payload.response,
+      })
+      if (settled.disposition === "settled") return true
+      return yield* new PermissionNotFoundError({
+        requestID: settled.requestID,
+        message: `Permission request already settled: ${settled.requestID}`,
+      })
     })
 
     const deleteMessage = Effect.fn("SessionHttpApi.deleteMessage")(function* (ctx: {
