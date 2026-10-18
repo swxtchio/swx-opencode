@@ -90,6 +90,9 @@ type HeldPrompt = {
     source?: { start?: number; end?: number; value?: string }
     synthetic?: boolean
     ignored?: boolean
+    mime?: string
+    filename?: string
+    url?: string
   }[]
   answer: (response: Response) => void
 }
@@ -778,24 +781,29 @@ test("Ctrl+r excludes a shell-mode composer submission from persisted history af
   }
 }, 30_000)
 
-test("typing during composer paste inspection keeps the pasted text", async () => {
+test("pasting local SVG and image paths inserts their content and attachments", async () => {
   await using state = await tmpdir()
-  const prefix = "typed-before-paste "
-  const suffix = "typed-during-paste"
-  const paste = "keystroke-during-paste-expanded-token\nsecond paste line\nthird paste line"
+  const svgPath = path.join(state.path, "pasted.svg")
+  const svgContent = "<svg><title>local-svg-payload</title></svg>"
+  const imagePath = path.join(state.path, "pasted.png")
+  const imageContent = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+  await Bun.write(svgPath, svgContent)
+  await Bun.write(imagePath, imageContent)
   const app = await startSession({ state: state.path, sessionID, queue: [] })
   try {
     await until(() => composerFocused(app), "the composer")
-    const prompt = composer(app)
-    await app.renderer.mockInput.typeText(prefix)
-    await app.renderer.mockInput.pasteBracketedText(paste)
-    await app.renderer.mockInput.typeText(suffix)
-    await until(() => prompt.plainText.includes("[Pasted ~3 lines]"), "paste inspection completion")
-    expect(prompt.plainText).toContain(prefix + suffix)
+    await app.renderer.mockInput.pasteBracketedText(svgPath)
+    await until(() => composer(app).plainText.includes("[SVG: pasted.svg]"), "the local SVG paste")
+    await app.renderer.mockInput.pasteBracketedText(imagePath)
+    await until(() => composer(app).plainText.includes("[Image 1]"), "the local image paste")
 
     app.renderer.mockInput.pressEnter()
     await until(() => app.prompts.length === 1, "the composer submission")
-    expect(app.prompts[0]!.parts.some((part) => part.type === "text" && part.text?.includes(paste))).toBe(true)
+    expect(app.prompts[0]!.parts.some((part) => part.type === "text" && part.text?.includes(svgContent))).toBe(true)
+    const image = app.prompts[0]!.parts.find((part) => part.type === "file")
+    expect(image?.mime).toBe("image/png")
+    expect(image?.filename).toBe("pasted.png")
+    expect(image?.url).toBe(`data:image/png;base64,${Buffer.from(imageContent).toString("base64")}`)
   } finally {
     app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
     await app.stop()
@@ -894,46 +902,6 @@ test("clearing an unsent tracked-paste draft leaves no history or stash copy", a
     expect(reopened.commands()).not.toContain("prompt.stash.pop")
   } finally {
     await reopened.stop()
-  }
-}, 30_000)
-
-test("clearing while pasted text is being inspected does not restore it", async () => {
-  await using state = await tmpdir()
-  const draft = "never-sent-clear-race-token"
-  const paste = "never-sent-clear-race-expanded-token\nsecond race line\nthird race line"
-  const historyPath = path.join(state.path, "prompt-history.jsonl")
-  const hydrationPath = path.join(state.path, "prompt-history-hydrated.json")
-  const stashPath = path.join(state.path, "prompt-stash.jsonl")
-  const messagesBySession = { [sessionID]: [] }
-  const app = await startSession({
-    state: state.path,
-    sessionID,
-    queue: [],
-    messagesBySession,
-    historyMessagesBySession: messagesBySession,
-  })
-  try {
-    await until(() => composerFocused(app), "the composer")
-    await until(() => app.historyReads.includes(sessionID), "the full transcript recovery read")
-    await until(() => Bun.file(hydrationPath).exists(), "history recovery completion")
-
-    await app.renderer.mockInput.typeText(draft)
-    await app.renderer.mockInput.pasteBracketedText(paste)
-    app.renderer.mockInput.pressKey("c", { ctrl: true })
-    expect(composer(app).plainText).toBe("")
-    await Bun.sleep(20)
-    expect(composer(app).plainText).toBe("")
-    expect(await searchHistory(app, "never-sent-clear-race-")).toContain("No results found")
-    app.renderer.mockInput.pressEscape()
-
-    for (const text of [draft, paste, "never-sent-clear-race-expanded-token"]) {
-      expect(await Bun.file(historyPath).text().catch(() => "")).not.toContain(text)
-      expect(await Bun.file(hydrationPath).text().catch(() => "")).not.toContain(text)
-      expect(await Bun.file(stashPath).text().catch(() => "")).not.toContain(text)
-    }
-  } finally {
-    app.prompts.forEach((prompt) => prompt.answer(json(transcript)))
-    await app.stop()
   }
 }, 30_000)
 

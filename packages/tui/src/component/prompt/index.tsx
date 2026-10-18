@@ -323,7 +323,6 @@ export function Prompt(props: PromptProps) {
   })
   const [enhancing, setEnhancing] = createSignal(false)
   let promptRevision = 0
-  let promptClearRevision = 0
 
   createEffect(
     on(
@@ -669,14 +668,12 @@ export function Prompt(props: PromptProps) {
       input.blur()
     },
     set(prompt) {
-      if (!prompt.input) promptClearRevision++
       input.setText(prompt.input)
       setStore("prompt", prompt)
       restoreExtmarksFromParts(prompt.parts)
       input.gotoBufferEnd()
     },
     reset() {
-      promptClearRevision++
       input.clear()
       input.extmarks.clear()
       setStore("prompt", {
@@ -1433,15 +1430,13 @@ export function Prompt(props: PromptProps) {
   }
 
   async function pasteInputText(text: string) {
-    const clearRevision = promptClearRevision
     const normalizedText = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
     const pastedContent = normalizedText.trim()
     const filepath = pastedFilepath(pastedContent, terminalEnvironment.platform)
     const isUrl = /^(https?):\/\//.test(filepath)
     if (!isUrl) {
       const attachment = await readLocalAttachment(filepath)
-      // A clear while inspecting a pasted path must not reinsert the old draft.
-      if (input.isDestroyed || promptClearRevision !== clearRevision) return
+      if (input.isDestroyed) return
       const filename = path.basename(filepath)
       if (attachment?.type === "text") {
         pasteText(attachment.content, `[SVG: ${filename ?? "image"}]`)
@@ -1525,7 +1520,6 @@ export function Prompt(props: PromptProps) {
   }
 
   function clearPrompt() {
-    promptClearRevision++
     input.extmarks.clear()
     setStore("prompt", {
       input: "",
