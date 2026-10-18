@@ -33,25 +33,34 @@ export const MAX_HISTORY_ENTRIES = 50
 
 export type PromptHistoryEntry = PromptInfo & { sessionID: string; origin: "tui-composer" }
 type PromptHistoryRecord = PromptInfo & { sessionID?: string; origin?: string }
+type PromptHistoryRow = { key: number; entry: PromptHistoryRecord; raw?: string }
+type ParsedPromptHistoryRow = { entry: PromptHistoryRecord; raw?: string }
 
 type HistoryMessage = { info: Message; parts: Part[] }
 
-export function parsePromptHistory(text: string) {
+function parsePromptHistoryRows(text: string) {
   return text
     .split("\n")
     .filter(Boolean)
-    .map((line) => {
+    .flatMap((raw): ParsedPromptHistoryRow[] => {
       try {
-        const entry = JSON.parse(line) as Partial<PromptHistoryRecord> | null
-        if (!entry || typeof entry.input !== "string" || !Array.isArray(entry.parts)) return
-        if ("sessionID" in entry && (typeof entry.sessionID !== "string" || !entry.sessionID)) return
-        return entry as PromptHistoryRecord
+        const entry = JSON.parse(raw) as Partial<PromptHistoryRecord> | null
+        if (!entry || typeof entry.input !== "string" || !Array.isArray(entry.parts)) return []
+        if ("sessionID" in entry && (typeof entry.sessionID !== "string" || !entry.sessionID)) return []
+        return [{ entry: entry as PromptHistoryRecord, ...(entry.sessionID === undefined ? { raw } : {}) }]
       } catch {
-        return undefined
+        return []
       }
     })
-    .filter((line): line is PromptHistoryRecord => line !== undefined)
     .slice(-MAX_HISTORY_ENTRIES)
+}
+
+export function parsePromptHistory(text: string) {
+  return parsePromptHistoryRows(text).map((row) => row.entry)
+}
+
+function serializePromptHistoryRows(rows: Pick<PromptHistoryRow, "entry" | "raw">[]) {
+  return rows.map((row) => row.raw ?? JSON.stringify(row.entry)).join("\n") + "\n"
 }
 
 export function isDuplicateEntry(previous: PromptInfo | undefined, next: PromptInfo): boolean {
@@ -67,20 +76,20 @@ export const { use: usePromptHistory, provider: PromptHistoryProvider } = create
     let nextKey = 0
     const [store, setStore] = createStore({
       index: 0,
-      history: [] as { key: number; entry: PromptHistoryRecord }[],
+      history: [] as PromptHistoryRow[],
       recovered: {} as Record<string, Record<number, PromptHistoryEntry>>,
     })
 
     onMount(async () => {
-      const lines = parsePromptHistory(await readText(historyPath).catch(() => ""))
+      const lines = parsePromptHistoryRows(await readText(historyPath).catch(() => ""))
       setStore(
         "history",
-        lines.map((entry) => ({ key: nextKey++, entry })),
+        lines.map((row) => ({ ...row, key: nextKey++ })),
       )
 
-      // Keep older unowned rows available for transcript-based attribution.
+      // Keep ownerless rows byte-for-byte until ordinary retention evicts them.
       if (lines.length > 0)
-        writeText(historyPath, lines.map((line) => JSON.stringify(line)).join("\n") + "\n").catch(() => {})
+        writeText(historyPath, serializePromptHistoryRows(lines)).catch(() => {})
     })
 
     const list = (sessionID: string | undefined, markers?: Config["machine_message_markers"]) => {
@@ -103,20 +112,10 @@ export const { use: usePromptHistory, provider: PromptHistoryProvider } = create
       },
       list,
       recover(sessionID: string, messages: HistoryMessage[], markers?: Config["machine_message_markers"]) {
-        // Without fork prompt metadata, use standard user messages for stock-server compatibility.
-        const stock = !messages.some((message) =>
-          message.parts.some(
-            (part) =>
-              part.type === "text" &&
-              (part.metadata?.sessionQueue !== undefined ||
-                part.metadata?.[SessionPromptQueue.TuiComposerOriginMetadataKey] === true ||
-                part.metadata?.[SessionPromptQueue.TuiPromptAppendMetadataKey] === true),
-          ),
-        )
         const signatures = messages
           .flatMap((message) => {
             if (message.info.sessionID !== sessionID || message.info.role !== "user") return []
-            return composerMessageSignatures(message.parts, markers, stock)
+            return composerMessageSignatures(message.parts, markers)
           })
           .reduce((result, signature) => {
             result.set(signature, (result.get(signature) ?? 0) + 1)
@@ -180,7 +179,7 @@ export const { use: usePromptHistory, provider: PromptHistoryProvider } = create
         )
 
         if (trimmed) {
-          writeText(historyPath, store.history.map((row) => JSON.stringify(row.entry)).join("\n") + "\n").catch(() => {})
+          writeText(historyPath, serializePromptHistoryRows(store.history)).catch(() => {})
           return
         }
         appendText(historyPath, JSON.stringify(entry) + "\n").catch(() => {})
@@ -210,7 +209,7 @@ function promptText(item: PromptInfo) {
   )
 }
 
-function composerMessageSignatures(parts: Part[], markers: Config["machine_message_markers"] | undefined, stock: boolean) {
+function composerMessageSignatures(parts: Part[], markers: Config["machine_message_markers"] | undefined) {
   const groups = parts.flatMap((part) => {
     if (part.type !== "text") return []
     const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueue)
@@ -246,11 +245,10 @@ function composerMessageSignatures(parts: Part[], markers: Config["machine_messa
     )
   )
     return []
-  const composer = parts.some(
-    (part) => part.type === "text" && part.metadata?.[SessionPromptQueue.TuiComposerOriginMetadataKey] === true,
-  )
   const queueMetadata = parts.some((part) => part.type === "text" && part.metadata?.sessionQueue !== undefined)
-  if (!stock && (queueMetadata || !composer)) return []
+  if (queueMetadata) return []
+  // Legacy and stock responses have no transport marker. Admit each such message
+  // independently; unmarked pre-#272 automation cannot be distinguished from a human prompt.
   return [promptSignature(text, parts)]
 }
 
@@ -263,7 +261,10 @@ function attachmentSignatures(parts: readonly unknown[]) {
     if (!part || typeof part !== "object" || !("type" in part)) return []
     const value = part as Record<string, unknown>
     if (value.type === "file") return [{ type: value.type, mime: value.mime, filename: value.filename, url: value.url }]
-    if (value.type === "agent") return [{ type: value.type, name: value.name, source: value.source }]
+    if (value.type === "agent") {
+      const source = value.source && typeof value.source === "object" ? (value.source as Record<string, unknown>) : undefined
+      return [{ type: value.type, name: value.name, source: source?.value }]
+    }
     return []
   })
 }

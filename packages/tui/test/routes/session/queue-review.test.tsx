@@ -13,7 +13,7 @@ import type {
   SessionPromptQueueItem,
   SessionStatus,
 } from "@opencode-ai/sdk/v2"
-import { Effect } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { TuiEvent } from "@opencode-ai/schema/tui-event"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -23,6 +23,7 @@ import { tmpdir } from "../../fixture/fixture"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "../../fixture/tui-sdk"
 import { preserveMachineAppended } from "../../../src/prompt/part"
+import { MAX_HISTORY_ENTRIES } from "../../../src/prompt/history"
 import { timelineOptions } from "../../../src/routes/session/dialog-timeline"
 
 // The pending-prompt row in the running app's session prompt, and the
@@ -133,6 +134,7 @@ async function startSession(
   const selections: unknown[] = []
   const enhancements: EnhancementRequest[] = []
   const prompts: HeldPrompt[] = []
+  const historyReads: string[] = []
   const restored: unknown[] = []
   // The server publishes every change to the pending list.
   const publish = (next: SessionPromptQueueItem[]) => {
@@ -205,6 +207,7 @@ async function startSession(
       } as Session)
     const messageSessionID = url.pathname.match(/^\/session\/(ses_[^/]+)\/message$/)?.[1]
     if (messageSessionID) {
+      if (url.searchParams.get("limit") === "0") historyReads.push(messageSessionID)
       return json(
         (url.searchParams.get("limit") === "0"
           ? options.historyMessagesBySession?.[messageSessionID]
@@ -293,6 +296,7 @@ async function startSession(
     renderer: setup,
     requests,
     paths,
+    historyReads,
     executions,
     selections,
     enhancements,
@@ -335,11 +339,24 @@ function promptMessage(prompt: HeldPrompt, promptSessionID: string, index: numbe
         messageID: id,
       }
       if (stock) delete next.metadata
-      if (!stock && part.type === "text")
-        next.metadata = { ...(part.metadata ?? {}), [SessionPromptQueue.TuiComposerOriginMetadataKey]: true }
       return next as Part
     }),
   }
+}
+
+function hasComposerQueueProvenance(parts: Part[], agentName?: string) {
+  return parts.some((part) => {
+    if (part.type !== "text") return false
+    const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueue)
+    return (
+      Option.isSome(group) &&
+      group.value.constituents.some(
+        (item) =>
+          item.input.origin === "tui-composer" &&
+          (!agentName || item.input.parts.some((input) => input.type === "agent" && input.name === agentName)),
+      )
+    )
+  })
 }
 
 function sessionInfo(id: string): Session {
@@ -676,7 +693,13 @@ test("recall and search isolate sessions across switching and reopening shared c
 
 test("resuming an older session restores its persisted composer history outside the loaded transcript", async () => {
   await using state = await tmpdir()
-  const id = "ses_history_resume"
+  const forkFixture = await queueTimelineFixture(
+    await submitComposerPrompt("fork-stamped-current-human-token"),
+    await submitComposerPrompt("fork-stamped-auxiliary-human-token"),
+  )
+  const forkStampedMessage = forkFixture.messages.find((message) => hasComposerQueueProvenance(message.parts))
+  if (!forkStampedMessage) throw new Error("The queue fixture emitted no composer-provenance message")
+  const id = forkFixture.sessionID
   const beforeResume = [
     "resume-history-first-token",
     "resume-history-middle-token",
@@ -690,6 +713,7 @@ test("resuming an older session restores its persisted composer history outside 
     await until(async () => (await screen(producer)).join("\n").includes(id), "the producer session")
     for (const text of beforeResume) messages.push(await submitHistoryPrompt(producer, text, id, producer.prompts.length))
     messages.push(await submitHistoryPrompt(producer, machineBefore, id, producer.prompts.length))
+    messages.push(forkStampedMessage)
     await until(
       async () => (await Bun.file(path.join(state.path, "prompt-history.jsonl")).text()).includes(beforeResume.at(-1)!),
       "the persisted composer prompts",
@@ -703,7 +727,7 @@ test("resuming an older session restores its persisted composer history outside 
     state: state.path,
     sessionID: id,
     queue: [],
-    messagesBySession: { [id]: [messages.at(-1)] },
+    messagesBySession: { [id]: [forkStampedMessage] },
     historyMessagesBySession: { [id]: messages },
   })
   try {
@@ -728,7 +752,7 @@ test("resuming an older session restores its persisted composer history outside 
     continue: true,
     sessions: [sessionInfo(id)],
     queue: [],
-    messagesBySession: { [id]: [messages.at(-1)] },
+    messagesBySession: { [id]: [forkStampedMessage] },
     historyMessagesBySession: { [id]: messages },
   })
   try {
@@ -766,6 +790,113 @@ test("resuming an older session restores its persisted composer history outside 
     await resumed.stop()
   }
 }, 30_000)
+
+test("resumed history matches an agent mention after tracked paste expansion", async () => {
+  await using state = await tmpdir()
+  const pasted = "paste-before-agent-first paste-before-agent-second"
+  const expanded = `${pasted}@helper`
+  const input = await submitComposerPrompt(expanded)
+  const start = expanded.indexOf("@helper")
+  const composerInput = {
+    ...input,
+    parts: [...input.parts, { type: "agent", name: "helper", source: { start, end: start + 7, value: "@helper" } }],
+  }
+  const fixture = await queueTimelineFixture(composerInput, await submitComposerPrompt("agent-offset-auxiliary-token"))
+  const producedMessage = fixture.messages.find((message) => hasComposerQueueProvenance(message.parts, "helper"))
+  if (!producedMessage) throw new Error("The composer queue fixture emitted no helper agent prompt")
+  const composerConstituent = producedMessage.parts
+    .flatMap((part) => {
+      if (part.type !== "text") return []
+      const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueue)
+      return Option.isSome(group) ? group.value.constituents : []
+    })
+    .find((item) => item.input.origin === "tui-composer" && item.input.parts.some((part) => part.type === "agent"))
+  if (!composerConstituent) throw new Error("The queue producer omitted its composer agent constituent")
+  expect(composerConstituent.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")).toBe(
+    expanded,
+  )
+  const producedAgent = composerConstituent.input.parts.find((part) => part.type === "agent")
+  expect(producedAgent?.source?.start).toBe(start)
+  expect(producedMessage.info.sessionID).toBe(fixture.sessionID)
+
+  const id = fixture.sessionID
+  const placeholder = "[Pasted ~1 lines]"
+  const original = `${placeholder}@helper`
+  const historyEntry = {
+    input: original,
+    parts: [
+      { type: "text", text: pasted, source: { text: { start: 0, end: placeholder.length, value: placeholder } } },
+      {
+        type: "agent",
+        name: "helper",
+        source: { start: placeholder.length, end: placeholder.length + 7, value: "@helper" },
+      },
+    ],
+  }
+  await Bun.write(path.join(state.path, "prompt-history.jsonl"), JSON.stringify(historyEntry) + "\n")
+  const resumed = await startSession({
+    state: state.path,
+    sessionID: id,
+    home: true,
+    continue: true,
+    sessions: [sessionInfo(id)],
+    queue: [],
+    messagesBySession: { [id]: [] },
+    historyMessagesBySession: { [id]: [producedMessage] },
+  })
+  try {
+    await until(async () => (await screen(resumed)).join("\n").includes(id), "the offset session resume")
+    await until(() => resumed.historyReads.includes(id), "the full legacy transcript load")
+    await until(async () => {
+      resumed.renderer.mockInput.pressArrow("up")
+      await resumed.renderer.renderOnce()
+      return composer(resumed).plainText === original
+    }, "the recovered agent prompt")
+    expect(await searchHistory(resumed, "paste-before-agent-first")).not.toContain("No results found")
+  } finally {
+    await resumed.stop()
+  }
+}, 30_000)
+
+test("ownerless rows survive mount normalization and retention rewrites", async () => {
+  await using state = await tmpdir()
+  const id = "ses_history_ownerless_rewrite"
+  const historyPath = path.join(state.path, "prompt-history.jsonl")
+  const ownerlessLines = Array.from(
+    { length: MAX_HISTORY_ENTRIES - 1 },
+    (_, index) => ` { "input" : "ownerless-preserve-${index}","parts":[],"untouched":${index} } `,
+  )
+  const taggedInput = "existing tagged prompt"
+  const tagged = JSON.stringify({ input: taggedInput, parts: [], sessionID: id, origin: "tui-composer" })
+  await Bun.write(historyPath, [...ownerlessLines, tagged, "not-json"].join("\n") + "\n")
+
+  const app = await startSession({ state: state.path, sessionID: id, queue: [] })
+  const prompt = "tagged-row-trim-trigger"
+  try {
+    await until(
+      async () => !(await Bun.file(historyPath).text()).includes("not-json"),
+      "the mount-time history rewrite",
+    )
+    const mounted = (await Bun.file(historyPath).text()).trimEnd().split("\n")
+    expect(mounted.slice(0, ownerlessLines.length)).toEqual(ownerlessLines)
+
+    await app.renderer.mockInput.typeText(prompt)
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the composer persistence trigger")
+    await until(async () => {
+      const lines = (await Bun.file(historyPath).text()).trimEnd().split("\n")
+      return lines.length === MAX_HISTORY_ENTRIES && JSON.parse(lines.at(-1)!).input === prompt
+    }, "the retention rewrite")
+
+    const retained = (await Bun.file(historyPath).text()).trimEnd().split("\n")
+    expect(retained.slice(0, ownerlessLines.length - 1)).toEqual(ownerlessLines.slice(1))
+    expect(JSON.parse(retained[ownerlessLines.length - 1]!).input).toBe(taggedInput)
+    expect(JSON.parse(retained.at(-1)!).input).toBe(prompt)
+  } finally {
+    app.prompts.forEach((item) => item.answer(json(transcript)))
+    await app.stop()
+  }
+}, 20_000)
 
 test("resumed composer recall and search omit marker-classified and machine-appended prompts", async () => {
   await using state = await tmpdir()
@@ -1125,7 +1256,7 @@ async function queueTimelineFixture(
   return (await import(fixtureModulePath)).queueTimelineFixture(
     composerInput as SessionPromptQueue.Input,
     appendedInput as SessionPromptQueue.Input,
-  )
+  ) as Promise<{ sessionID: string; messages: { info: Message; parts: Part[] }[] }>
 }
 
 test("session rename remains available from its command menu", async () => {
