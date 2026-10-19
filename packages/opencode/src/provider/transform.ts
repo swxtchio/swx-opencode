@@ -827,7 +827,9 @@ export function variants(model: Provider.Model): Record<string, Record<string, a
   if (!model.capabilities.reasoning) return {}
 
   const id = model.id.toLowerCase()
-  const glm52 = ["glm-5.2", "glm-5-2", "glm-5p2"].some(
+  // GLM 5.2 and 5.3 expose the same low-level effort encoding; 5.3 spellings
+  // must not fall through to the generic no-variants branch below. (#305)
+  const glm5 = ["glm-5.2", "glm-5-2", "glm-5p2", "glm-5.3", "glm-5-3", "glm-5p3"].some(
     (name) => id.includes(name) || model.api.id.toLowerCase().includes(name),
   )
   if (
@@ -847,20 +849,20 @@ export function variants(model: Provider.Model): Record<string, Record<string, a
   }
   const adaptiveThinkingOmitted = anthropicOmitsThinking(model.api.id)
   const adaptiveEfforts = anthropicAdaptiveEfforts(model.api.id)
-  if (glm52 && model.api.npm === "@openrouter/ai-sdk-provider") {
+  if (glm5 && model.api.npm === "@openrouter/ai-sdk-provider") {
     // OpenRouter maps xhigh to GLM-5.2's native max effort.
     return {
       high: { reasoning: { effort: "high" } },
       xhigh: { reasoning: { effort: "xhigh" } },
     }
   }
-  if (glm52 && model.api.npm === "@ai-sdk/openai-compatible") {
+  if (glm5 && model.api.npm === "@ai-sdk/openai-compatible") {
     return {
       high: { reasoningEffort: "high" },
       max: { reasoningEffort: "max" },
     }
   }
-  if (glm52 && model.api.npm === "@ai-sdk/anthropic") {
+  if (glm5 && model.api.npm === "@ai-sdk/anthropic") {
     return {
       high: { effort: "high" },
       max: { effort: "max" },
@@ -881,7 +883,7 @@ export function variants(model: Provider.Model): Record<string, Record<string, a
     id.includes("deepseek-r1") ||
     id.includes("deepseek-v3") ||
     id.includes("minimax") ||
-    (id.includes("glm") && !glm52) ||
+    (id.includes("glm") && !glm5) ||
     id.includes("kimi") ||
     id.includes("k2p") ||
     id.includes("qwen") ||
