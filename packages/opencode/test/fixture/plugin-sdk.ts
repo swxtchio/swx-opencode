@@ -32,7 +32,6 @@ export async function installWorkspacePluginSdk(input: {
   let staging: string | undefined
 
   try {
-    await ensureDirectoryPath(ownerRoot, parent)
     if (input.unrelated) {
       // Keep fixture writes away from the installed entry until its parents are proven sandbox-owned.
       staging = path.join(ownerRoot, `.plugin-sdk-fixture-${randomUUID()}`)
@@ -49,7 +48,7 @@ export async function installWorkspacePluginSdk(input: {
       await input.unrelated.afterInstalled?.({ entry, device: staged.dev, inode: staged.ino })
     }
 
-    await ensureDirectoryPath(ownerRoot, parent)
+    if (!input.unrelated) await ensureDirectoryPath(ownerRoot, parent)
     if (!input.unrelated && (await isWorkspaceLink(entry, workspace))) return { entry, parent, target: workspace }
 
     await removeEntry(ownerRoot, parent, entry)

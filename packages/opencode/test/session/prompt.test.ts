@@ -12,7 +12,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { afterAll, expect, test } from "bun:test"
 import { Database as Sqlite } from "bun:sqlite"
 import { randomUUID } from "node:crypto"
-import { lstat, mkdir, readFile, readlink, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises"
+import { lstat, mkdir, readFile, readlink, readdir, realpath, rm, rmdir, symlink, unlink, writeFile } from "node:fs/promises"
 import { createRequire } from "node:module"
 import { pathToFileURL } from "node:url"
 import { Npm } from "@opencode-ai/core/npm"
@@ -985,6 +985,8 @@ async function createPluginSourceSurrogate(root: string) {
   await writeFile(path.join(packageDirectory, "src/index.ts"), "export const marker = 'protected source'\n")
   await writeFile(path.join(packageDirectory, "preserved.txt"), "protected bytes\n")
   await symlink("src/index.ts", path.join(packageDirectory, "source-link.ts"))
+  await mkdir(path.join(directory, "node_modules"))
+  await symlink(scope, path.join(directory, "node_modules/@opencode-ai"), "junction")
   await Promise.all(
     Array.from({ length: 41 }, (_, index) =>
       writeFile(path.join(packageDirectory, `protected-${index}.txt`), `protected ${index}\n`),
@@ -11606,7 +11608,27 @@ it.instance(
       const before = yield* Effect.promise(() => snapshotTree(source.directory))
       yield* Effect.addFinalizer(() => Effect.promise(() => rm(source.directory, { recursive: true, force: true })))
       yield* Effect.promise(async () => {
-        await mkdir(path.dirname(parent), { recursive: true })
+        await symlink(source.directory, dir, "junction")
+      })
+      expect((yield* Effect.promise(() => lstat(dir))).isSymbolicLink()).toBe(true)
+      expect(yield* Effect.promise(() => realpath(entry))).toBe(source.packageDirectory)
+      const workspace = path.resolve(import.meta.dir, "../../../plugin")
+      const prepared = yield* Effect.promise(() =>
+        installWorkspacePluginSdk({
+          sandboxRoot: tempRoot,
+          ownerRoot: instance.directory,
+          consumerDirectory: dir,
+          workspace,
+        }),
+      )
+      expect((yield* Effect.promise(() => lstat(dir))).isDirectory()).toBe(true)
+      expect(FSUtil.contains(instance.directory, yield* Effect.promise(() => realpath(dir)))).toBe(true)
+      expect(prepared.target).toBe(yield* Effect.promise(() => realpath(workspace)))
+      expect(yield* Effect.promise(() => snapshotTree(source.directory))).toEqual(before)
+      expect(yield* Effect.promise(() => Bun.file(path.join(source.directory, ".gitignore")).exists())).toBe(false)
+      yield* Effect.promise(async () => {
+        await unlink(entry)
+        await rmdir(parent)
         await symlink(source.scope, parent, "junction")
       })
       expect((yield* Effect.promise(() => lstat(parent))).isSymbolicLink()).toBe(true)
@@ -11662,6 +11684,12 @@ it.instance(
 
       yield* config.get()
       yield* awaitWithTimeout(Deferred.await(gate.entered), "Config did not start the scoped SDK install")
+      const localGitignore = path.join(dir, ".gitignore")
+      expect(yield* Effect.promise(() => Bun.file(localGitignore).exists())).toBe(true)
+      expect(yield* Effect.promise(() => readFile(localGitignore, "utf8"))).toContain("node_modules")
+      expect(FSUtil.contains(instance.directory, yield* Effect.promise(() => realpath(localGitignore)))).toBe(true)
+      expect(yield* Effect.promise(() => Bun.file(path.join(source.directory, ".gitignore")).exists())).toBe(false)
+      expect(yield* Effect.promise(() => snapshotTree(source.directory))).toEqual(before)
       expect(activity.requests).toBe(1)
       const direct = yield* npm.install(dir, { add: [{ name: "@opencode-ai/plugin" }] }).pipe(Effect.forkChild)
       yield* awaitWithTimeout(
@@ -11683,6 +11711,7 @@ it.instance(
       expect(unrelatedInstalled.module).toContain("wrong SDK")
 
       const directories = yield* config.directories()
+      expect(directories).toContain(dir)
       const resolvedDirectories = yield* Effect.promise(() =>
         Promise.all(directories.map((directory) => realpath(directory))),
       )
@@ -11869,8 +11898,8 @@ unix(
 
       expect(yield* Effect.promise(() => snapshotTree(source.directory))).toEqual(before)
       expect(FSUtil.contains(fixtureDirectory.fixtureRoot, fixtureDirectory.progress.stagingTarget)).toBe(true)
-      expect(FSUtil.contains(fixtureDirectory.fixtureRoot, fixtureDirectory.progress.parentTarget)).toBe(true)
-      expect(fixtureDirectory.progress.entryExists).toBe(false)
+      expect(FSUtil.contains(fixtureDirectory.fixtureRoot, fixtureDirectory.progress.parentTarget)).toBe(false)
+      expect(fixtureDirectory.progress.entryExists).toBe(true)
       expect(yield* Effect.promise(() => readdir(tempRoot))).not.toContain(path.basename(fixtureDirectory.fixtureRoot))
     }),
   30000,
