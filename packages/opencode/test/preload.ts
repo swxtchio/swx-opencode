@@ -86,6 +86,8 @@ delete process.env["OTEL_RESOURCE_ATTRIBUTES"]
 // would override the configs these tests write, such as the model they pin.
 delete process.env["OPENCODE_CONFIG"]
 delete process.env["OPENCODE_CONFIG_CONTENT"]
+delete process.env["OPENCODE_CONFIG_DIR"]
+delete process.env["OPENCODE_DISABLE_PROJECT_CONFIG"]
 
 // Use in-memory sqlite
 process.env["OPENCODE_DB"] = ":memory:"
