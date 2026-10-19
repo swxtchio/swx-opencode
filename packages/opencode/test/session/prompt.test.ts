@@ -329,7 +329,15 @@ const sdkReadiness = {
   unrelated: undefined as undefined | { dir: string; pkg: UnrelatedPackage },
   activity: undefined as
     | undefined
-    | { dir: string; requests: number; active: number; maxActive: number; secondRequested: Deferred.Deferred<void> },
+    | {
+        dir: string
+        requests: number
+        active: number
+        maxActive: number
+        completed: number
+        firstInstallSucceeded: boolean
+        secondRequested: Deferred.Deferred<void>
+      },
 }
 
 // Provider tests resolve the actual workspace export through a serialized install fixture.
@@ -353,9 +361,9 @@ const promptSdk = makeGlobalNode({
           if (dir !== Global.Path.config && (path.isAbsolute(relative) || relative.startsWith("..")))
             return yield* Effect.die(new Error(`SDK fixture refused ancestor configuration: ${dir}`))
           const activity = sdkReadiness.activity?.dir === dir ? sdkReadiness.activity : undefined
+          const request = activity ? ++activity.requests : 0
           if (activity) {
-            activity.requests++
-            if (activity.requests === 2) yield* Deferred.succeed(activity.secondRequested, undefined)
+            if (request === 2) yield* Deferred.succeed(activity.secondRequested, undefined)
           }
 
           yield* flock.withLock(
@@ -392,6 +400,10 @@ const promptSdk = makeGlobalNode({
                 const sdk = yield* Effect.promise(() => import(pathToFileURL(resolved).href))
                 if (typeof sdk.tool !== "function")
                   return yield* Effect.die(new Error("workspace plugin SDK is not ready"))
+                if (activity) {
+                  activity.completed++
+                  if (request === 1) activity.firstInstallSucceeded = true
+                }
               }).pipe(
                 Effect.ensuring(
                   Effect.sync(() => {
@@ -11606,8 +11618,13 @@ it.instance(
         requests: 0,
         active: 0,
         maxActive: 0,
+        completed: 0,
+        firstInstallSucceeded: false,
         secondRequested: yield* Deferred.make<void>(),
       }
+      let unrelatedInstalled:
+        | undefined
+        | { target: string; sameStagedDirectory: boolean; manifest: string; module: string }
       sdkReadiness.gate = gate
       sdkReadiness.activity = activity
       sdkReadiness.unrelated = {
@@ -11620,6 +11637,15 @@ it.instance(
             exports: "./index.js",
           },
           module: "export const tool = () => 'wrong SDK'\n",
+          afterInstalled: async ({ entry, device, inode }) => {
+            const installed = await lstat(entry)
+            unrelatedInstalled = {
+              target: await realpath(entry),
+              sameStagedDirectory: installed.dev === device && installed.ino === inode,
+              manifest: await readFile(path.join(entry, "package.json"), "utf8"),
+              module: await readFile(path.join(entry, "index.js"), "utf8"),
+            }
+          },
         },
       }
       const npm = yield* Npm.Service
@@ -11636,6 +11662,7 @@ it.instance(
 
       yield* config.get()
       yield* awaitWithTimeout(Deferred.await(gate.entered), "Config did not start the scoped SDK install")
+      expect(activity.requests).toBe(1)
       const direct = yield* npm.install(dir, { add: [{ name: "@opencode-ai/plugin" }] }).pipe(Effect.forkChild)
       yield* awaitWithTimeout(
         Deferred.await(activity.secondRequested),
@@ -11645,6 +11672,15 @@ it.instance(
       yield* awaitWithTimeout(config.waitForDependencies(), "Config SDK dependencies did not settle", "10 seconds")
       const directExit = yield* awaitWithTimeout(Fiber.await(direct), "direct SDK install did not settle", "10 seconds")
       expect(Exit.isSuccess(directExit)).toBe(true)
+      expect(activity.firstInstallSucceeded).toBe(true)
+      expect(activity.completed).toBeGreaterThanOrEqual(2)
+      expect(unrelatedInstalled).toBeDefined()
+      if (!unrelatedInstalled) throw new Error("Config install never placed the unrelated package at its entry")
+      expect(FSUtil.contains(instance.directory, unrelatedInstalled.target)).toBe(true)
+      expect(unrelatedInstalled.sameStagedDirectory).toBe(true)
+      expect(unrelatedInstalled.manifest).toContain('"version":"1.19.0"')
+      expect(unrelatedInstalled.manifest).toContain('"exports":"./index.js"')
+      expect(unrelatedInstalled.module).toContain("wrong SDK")
 
       const directories = yield* config.directories()
       const resolvedDirectories = yield* Effect.promise(() =>
@@ -11745,7 +11781,7 @@ it.instance(
 )
 
 unix(
-  "round5 SDK fixture subprocess death leaves linked source and enclosing scratch intact",
+  "round5 SDK fixture subprocess death reclaims enclosing scratch and preserves linked source",
   () =>
     Effect.gen(function* () {
       const instance = yield* TestInstance

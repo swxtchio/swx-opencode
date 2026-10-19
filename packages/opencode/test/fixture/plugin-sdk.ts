@@ -6,6 +6,7 @@ export type UnrelatedPackage = {
   manifest: Record<string, unknown>
   module: string
   afterManifest?: (input: { entry: string; staging: string }) => Promise<void>
+  afterInstalled?: (input: { entry: string; device: number; inode: number }) => Promise<void>
 }
 
 export async function installWorkspacePluginSdk(input: {
@@ -42,8 +43,10 @@ export async function installWorkspacePluginSdk(input: {
       await writeFile(path.join(staging, "index.js"), input.unrelated.module)
       await ensureDirectoryPath(ownerRoot, parent)
       await removeEntry(ownerRoot, parent, entry)
+      const staged = await lstat(staging)
       await rename(staging, entry)
       staging = undefined
+      await input.unrelated.afterInstalled?.({ entry, device: staged.dev, inode: staged.ino })
     }
 
     await ensureDirectoryPath(ownerRoot, parent)
