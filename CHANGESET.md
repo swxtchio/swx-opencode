@@ -253,6 +253,10 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Tests
 
+- **#301** Stage the unrelated plugin inside the disposable config owner, replace symlinked install parents
+  without following them, and serialize Config's detached SDK install with the fixture request. Require the consumer
+  to resolve and use the workspace SDK `tool` export; preserve a linked source surrogate through injected failure
+  and child termination. _Fork-only._
 - **#115** The declared-schema migration check keeps judging the real `script/migration.ts --check`, now behind a
   180s process-group backstop instead of a 30s test limit that a correct run exceeded under the suite's admitted
   concurrency (swxtchio/swx-opencode#117). A schema drift still fails, and a wedged check fails at the backstop.

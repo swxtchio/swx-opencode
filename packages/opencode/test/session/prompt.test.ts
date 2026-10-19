@@ -12,7 +12,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { afterAll, expect, test } from "bun:test"
 import { Database as Sqlite } from "bun:sqlite"
 import { randomUUID } from "node:crypto"
-import { mkdir, realpath, rm, symlink } from "node:fs/promises"
+import { lstat, mkdir, readFile, readlink, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { createRequire } from "node:module"
 import { pathToFileURL } from "node:url"
 import { Npm } from "@opencode-ai/core/npm"
@@ -85,6 +85,7 @@ import { ChildProcessSpawner } from "effect/unstable/process"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { provideInstanceEffect, TestInstance, tmpdirScoped } from "../fixture/fixture"
+import { installWorkspacePluginSdk, type UnrelatedPackage } from "../fixture/plugin-sdk"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -325,10 +326,14 @@ const blockingProcessor = processorWithCreate(() =>
 const runtimeFlags = RuntimeFlags.layer({ experimentalEventSystem: true })
 const sdkReadiness = {
   gate: undefined as undefined | { dir: string; entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  unrelated: undefined as undefined | { dir: string; pkg: UnrelatedPackage },
+  activity: undefined as
+    | undefined
+    | { dir: string; requests: number; active: number; maxActive: number; secondRequested: Deferred.Deferred<void> },
 }
 
-// Provider tests load the actual workspace SDK instead of racing external Arborist reify.
-// Config still owns and joins its dependency fiber; readiness requires a resolvable real SDK.
+// Provider tests resolve the actual workspace export through a serialized install fixture.
+// Config still owns and joins its dependency fiber; readiness requires a usable SDK export.
 const npmImplementation = Npm.node.implementation
 if (!npmImplementation) throw new Error("Npm implementation is missing")
 const promptSdk = makeGlobalNode({
@@ -337,37 +342,66 @@ const promptSdk = makeGlobalNode({
     Npm.Service,
     Effect.gen(function* () {
       const real = yield* Npm.Service
-      const afs = yield* FSUtil.Service
+      const flock = yield* EffectFlock.Service
       return Npm.Service.of({
         ...real,
         install: Effect.fn("test.workspacePluginSdk")(function* (dir, input) {
           if (input?.add.some((item) => item.name !== "@opencode-ai/plugin")) return yield* real.install(dir, input)
-          const gate = sdkReadiness.gate?.dir === dir ? sdkReadiness.gate : undefined
-          if (gate) {
-            sdkReadiness.gate = undefined
-            yield* Deferred.succeed(gate.entered, undefined)
-            yield* Deferred.await(gate.release)
-          }
           const ctx = yield* InstanceRef
           if (!ctx) return yield* Effect.die(new Error("SDK fixture has no instance owner"))
           const relative = path.relative(ctx.directory, dir)
           if (dir !== Global.Path.config && (path.isAbsolute(relative) || relative.startsWith("..")))
             return yield* Effect.die(new Error(`SDK fixture refused ancestor configuration: ${dir}`))
-          const workspace = path.resolve(import.meta.dir, "../../../plugin")
-          const entry = path.join(dir, "node_modules", "@opencode-ai", "plugin")
-          yield* Effect.promise(() => mkdir(path.dirname(entry), { recursive: true }))
-          if (yield* afs.existsSafe(entry)) {
-            const existing = yield* Effect.promise(() => realpath(entry))
-            if (existing !== (yield* Effect.promise(() => realpath(workspace))))
-              yield* Effect.promise(() => rm(entry, { recursive: true, force: true }))
+          const activity = sdkReadiness.activity?.dir === dir ? sdkReadiness.activity : undefined
+          if (activity) {
+            activity.requests++
+            if (activity.requests === 2) yield* Deferred.succeed(activity.secondRequested, undefined)
           }
-          if (!(yield* afs.existsSafe(entry))) yield* Effect.promise(() => symlink(workspace, entry, "junction"))
-          const resolved = createRequire(path.join(dir, "sdk-fixture.cjs")).resolve("@opencode-ai/plugin")
-          const target = yield* Effect.promise(() => realpath(path.join(workspace, "src/index.ts")))
-          if ((yield* Effect.promise(() => realpath(resolved))) !== target)
-            return yield* Effect.die(new Error("SDK fixture resolved a different plugin package"))
-          const sdk = yield* Effect.promise(() => import(pathToFileURL(resolved).href))
-          if (typeof sdk.tool !== "function") return yield* Effect.die(new Error("workspace plugin SDK is not ready"))
+
+          yield* flock.withLock(
+            Effect.gen(function* () {
+              if (activity) {
+                activity.active++
+                activity.maxActive = Math.max(activity.maxActive, activity.active)
+              }
+              yield* Effect.gen(function* () {
+                const gate = sdkReadiness.gate?.dir === dir ? sdkReadiness.gate : undefined
+                if (gate) {
+                  sdkReadiness.gate = undefined
+                  yield* Deferred.succeed(gate.entered, undefined)
+                  yield* Deferred.await(gate.release)
+                }
+
+                const unrelated = sdkReadiness.unrelated?.dir === dir ? sdkReadiness.unrelated.pkg : undefined
+                if (unrelated) sdkReadiness.unrelated = undefined
+                const workspace = path.resolve(import.meta.dir, "../../../plugin")
+                yield* Effect.promise(() =>
+                  installWorkspacePluginSdk({
+                    sandboxRoot: os.tmpdir(),
+                    ownerRoot: dir === Global.Path.config ? Global.Path.config : ctx.directory,
+                    consumerDirectory: dir,
+                    workspace,
+                    unrelated,
+                  }),
+                )
+
+                const resolved = createRequire(path.join(dir, "sdk-fixture.cjs")).resolve("@opencode-ai/plugin")
+                const target = yield* Effect.promise(() => realpath(path.join(workspace, "src/index.ts")))
+                if ((yield* Effect.promise(() => realpath(resolved))) !== target)
+                  return yield* Effect.die(new Error("SDK fixture resolved a different plugin package"))
+                const sdk = yield* Effect.promise(() => import(pathToFileURL(resolved).href))
+                if (typeof sdk.tool !== "function")
+                  return yield* Effect.die(new Error("workspace plugin SDK is not ready"))
+              }).pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    if (activity) activity.active--
+                  }),
+                ),
+              )
+            }),
+            `npm-install:${dir}`,
+          )
         }),
       })
     }),
@@ -926,6 +960,42 @@ const writeConfig = Effect.fn("test.writeConfig")(function* (dir: string, config
     JSON.stringify({ $schema: "https://opencode.ai/config.json", ...config }),
   )
 })
+
+async function createPluginSourceSurrogate(root: string) {
+  const directory = path.join(root, `sdk-source-${randomUUID()}`)
+  const scope = path.join(directory, "@opencode-ai")
+  const packageDirectory = path.join(scope, "plugin")
+  await mkdir(path.join(packageDirectory, "src"), { recursive: true })
+  await writeFile(
+    path.join(packageDirectory, "package.json"),
+    JSON.stringify({ name: "@opencode-ai/plugin", version: "1.18.32", type: "module", exports: "./src/index.ts" }),
+  )
+  await writeFile(path.join(packageDirectory, "src/index.ts"), "export const marker = 'protected source'\n")
+  await writeFile(path.join(packageDirectory, "preserved.txt"), "protected bytes\n")
+  await symlink("src/index.ts", path.join(packageDirectory, "source-link.ts"))
+  await Promise.all(
+    Array.from({ length: 41 }, (_, index) =>
+      writeFile(path.join(packageDirectory, `protected-${index}.txt`), `protected ${index}\n`),
+    ),
+  )
+  return { directory, scope, packageDirectory }
+}
+
+async function snapshotTree(root: string, directory = root): Promise<string[]> {
+  return (
+    await Promise.all(
+      (await readdir(directory, { withFileTypes: true })).map(async (entry) => {
+        const file = path.join(directory, entry.name)
+        const relative = path.relative(root, file)
+        if (entry.isSymbolicLink()) return [`link:${relative}:${await readlink(file)}`]
+        if (entry.isDirectory()) return [`directory:${relative}`, ...(await snapshotTree(root, file))]
+        return [`file:${relative}:${Buffer.from(await readFile(file)).toString("base64")}`]
+      }),
+    )
+  )
+    .flat()
+    .sort()
+}
 
 const useServerConfig = Effect.fn("test.useServerConfig")(function* (config: (url: string) => Partial<ConfigV1.Info>) {
   const { directory: dir } = yield* TestInstance
@@ -11496,14 +11566,93 @@ it.instance(
     Effect.gen(function* () {
       const instance = yield* TestInstance
       const dir = path.join(instance.directory, ".opencode")
-      const entry = path.join(dir, "node_modules/@opencode-ai/plugin")
-      yield* writeText(
-        path.join(entry, "package.json"),
-        JSON.stringify({ name: "@opencode-ai/plugin", version: "1.19.0", type: "module", exports: "./index.js" }),
-      )
-      yield* writeText(path.join(entry, "index.js"), "export const tool = () => 'wrong SDK'\n")
+      const parent = path.join(dir, "node_modules/@opencode-ai")
+      const entry = path.join(parent, "plugin")
+      const tempRoot = yield* Effect.promise(() => realpath(os.tmpdir()))
+      expect(process.env["OPENCODE_CONFIG"]).toBeUndefined()
+      expect(process.env["OPENCODE_CONFIG_CONTENT"]).toBeUndefined()
+      expect(process.env["OPENCODE_CONFIG_DIR"]).toBeUndefined()
+      expect(process.env["OPENCODE_DISABLE_PROJECT_CONFIG"]).toBeUndefined()
+      expect(
+        [
+          Global.Path.data,
+          Global.Path.cache,
+          Global.Path.config,
+          Global.Path.state,
+          Global.Path.tmp,
+          Global.Path.home,
+          process.env["OPENCODE_TEST_MANAGED_CONFIG_DIR"]!,
+          process.env["XDG_DATA_HOME"]!,
+          process.env["XDG_CACHE_HOME"]!,
+          process.env["XDG_CONFIG_HOME"]!,
+          process.env["XDG_STATE_HOME"]!,
+          instance.directory,
+        ].every((candidate) => FSUtil.contains(tempRoot, path.resolve(candidate))),
+      ).toBe(true)
+
+      const source = yield* Effect.promise(() => createPluginSourceSurrogate(tempRoot))
+      const before = yield* Effect.promise(() => snapshotTree(source.directory))
+      yield* Effect.addFinalizer(() => Effect.promise(() => rm(source.directory, { recursive: true, force: true })))
+      yield* Effect.promise(async () => {
+        await mkdir(path.dirname(parent), { recursive: true })
+        await symlink(source.scope, parent, "junction")
+      })
+      expect((yield* Effect.promise(() => lstat(parent))).isSymbolicLink()).toBe(true)
+      expect(yield* Effect.promise(() => realpath(entry))).toBe(source.packageDirectory)
+
+      const gate = { dir, entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      const activity = {
+        dir,
+        requests: 0,
+        active: 0,
+        maxActive: 0,
+        secondRequested: yield* Deferred.make<void>(),
+      }
+      sdkReadiness.gate = gate
+      sdkReadiness.activity = activity
+      sdkReadiness.unrelated = {
+        dir,
+        pkg: {
+          manifest: {
+            name: "@opencode-ai/plugin",
+            version: "1.19.0",
+            type: "module",
+            exports: "./index.js",
+          },
+          module: "export const tool = () => 'wrong SDK'\n",
+        },
+      }
       const npm = yield* Npm.Service
-      yield* npm.install(dir, { add: [{ name: "@opencode-ai/plugin" }] })
+      const config = yield* Config.Service
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(gate.release, undefined).pipe(Effect.asVoid, Effect.ignore)
+          yield* config.waitForDependencies().pipe(Effect.ignore)
+          if (sdkReadiness.gate === gate) sdkReadiness.gate = undefined
+          if (sdkReadiness.activity === activity) sdkReadiness.activity = undefined
+          if (sdkReadiness.unrelated?.dir === dir) sdkReadiness.unrelated = undefined
+        }),
+      )
+
+      yield* config.get()
+      yield* awaitWithTimeout(Deferred.await(gate.entered), "Config did not start the scoped SDK install")
+      const direct = yield* npm.install(dir, { add: [{ name: "@opencode-ai/plugin" }] }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(
+        Deferred.await(activity.secondRequested),
+        "direct SDK install did not overlap Config dependency setup",
+      )
+      yield* Deferred.succeed(gate.release, undefined)
+      yield* awaitWithTimeout(config.waitForDependencies(), "Config SDK dependencies did not settle", "10 seconds")
+      const directExit = yield* awaitWithTimeout(Fiber.await(direct), "direct SDK install did not settle", "10 seconds")
+      expect(Exit.isSuccess(directExit)).toBe(true)
+
+      const directories = yield* config.directories()
+      const resolvedDirectories = yield* Effect.promise(() =>
+        Promise.all(directories.map((directory) => realpath(directory))),
+      )
+      expect(resolvedDirectories.every((directory) => FSUtil.contains(tempRoot, directory))).toBe(true)
+      expect(activity.requests).toBeGreaterThanOrEqual(2)
+      expect(activity.maxActive).toBe(1)
       const actual = yield* Effect.promise(() =>
         realpath(createRequire(path.join(dir, "sdk-fixture.cjs")).resolve("@opencode-ai/plugin")),
       )
@@ -11516,6 +11665,177 @@ it.instance(
       )
       const sdk = yield* Effect.promise(() => import(pathToFileURL(actual).href))
       expect(typeof sdk.tool).toBe("function")
+      const definition = { description: "workspace SDK fixture", args: {}, execute: async () => "usable tool" }
+      expect(sdk.tool(definition)).toEqual(definition)
+      expect(sdk.tool.schema.string().safeParse("usable").success).toBe(true)
+      expect(yield* Effect.promise(() => snapshotTree(source.directory))).toEqual(before)
+    }),
+  30000,
+)
+
+it.instance(
+  "round5 SDK fixture failure preserves a linked source manifest and removes staged files",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const dir = path.join(instance.directory, ".opencode")
+      const parent = path.join(dir, "node_modules/@opencode-ai")
+      const entry = path.join(parent, "plugin")
+      const tempRoot = yield* Effect.promise(() => realpath(os.tmpdir()))
+      const source = yield* Effect.promise(() => createPluginSourceSurrogate(tempRoot))
+      const before = yield* Effect.promise(() => snapshotTree(source.directory))
+      yield* Effect.addFinalizer(() => Effect.promise(() => rm(source.directory, { recursive: true, force: true })))
+      const originalManifest = yield* Effect.promise(() =>
+        readFile(path.join(source.packageDirectory, "package.json"), "utf8"),
+      )
+      expect(originalManifest).toContain('"exports":"./src/index.ts"')
+      yield* Effect.promise(async () => {
+        await mkdir(parent, { recursive: true })
+        await symlink(source.packageDirectory, entry, "junction")
+      })
+      expect((yield* Effect.promise(() => lstat(entry))).isSymbolicLink()).toBe(true)
+      expect(yield* Effect.promise(() => realpath(entry))).toBe(source.packageDirectory)
+
+      let setupStarted = false
+      let stagedManifest = ""
+      let stagedModuleExists = true
+      const result = yield* awaitWithTimeout(
+        Effect.promise(() =>
+          installWorkspacePluginSdk({
+            sandboxRoot: tempRoot,
+            ownerRoot: instance.directory,
+            consumerDirectory: dir,
+            workspace: path.resolve(import.meta.dir, "../../../plugin"),
+            unrelated: {
+              manifest: {
+                name: "@opencode-ai/plugin",
+                version: "1.19.0",
+                type: "module",
+                exports: "./index.js",
+              },
+              module: "export const tool = () => 'wrong SDK'\n",
+              afterManifest: async ({ staging }) => {
+                setupStarted = true
+                stagedManifest = await readFile(path.join(staging, "package.json"), "utf8")
+                stagedModuleExists = await Bun.file(path.join(staging, "index.js")).exists()
+                throw new Error("injected SDK fixture setup failure")
+              },
+            },
+          }),
+        ).pipe(Effect.exit),
+        "SDK fixture failure injection did not settle",
+        "5 seconds",
+      )
+      expect(Exit.isFailure(result)).toBe(true)
+      if (Exit.isFailure(result)) expect(Cause.pretty(result.cause)).toContain("injected SDK fixture setup failure")
+      expect(setupStarted).toBe(true)
+      expect(stagedManifest).toContain('"exports":"./index.js"')
+      expect(stagedModuleExists).toBe(false)
+      const resolved = createRequire(path.join(dir, "sdk-fixture.cjs")).resolve("@opencode-ai/plugin")
+      expect(yield* Effect.promise(() => realpath(resolved))).toBe(path.join(source.packageDirectory, "src/index.ts"))
+      expect(yield* Effect.promise(() => readlink(entry))).toBe(source.packageDirectory)
+      expect(yield* Effect.promise(() => snapshotTree(source.directory))).toEqual(before)
+      expect(
+        (yield* Effect.promise(() => readdir(instance.directory))).some((name) =>
+          name.startsWith(".plugin-sdk-fixture-"),
+        ),
+      ).toBe(false)
+    }),
+  30000,
+)
+
+unix(
+  "round5 SDK fixture subprocess death leaves linked source and enclosing scratch intact",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const tempRoot = yield* Effect.promise(() => realpath(os.tmpdir()))
+      const source = yield* Effect.promise(() => createPluginSourceSurrogate(tempRoot))
+      const before = yield* Effect.promise(() => snapshotTree(source.directory))
+      yield* Effect.addFinalizer(() => Effect.promise(() => rm(source.directory, { recursive: true, force: true })))
+
+      const fixtureDirectory = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const fixtureRoot = yield* tmpdirScoped()
+          const dir = path.join(fixtureRoot, ".opencode")
+          const parent = path.join(dir, "node_modules/@opencode-ai")
+          const marker = path.join(fixtureRoot, "sdk-fixture-progress.json")
+          const workspace = path.join(fixtureRoot, "workspace-plugin")
+          yield* Effect.promise(async () => {
+            await mkdir(path.dirname(parent), { recursive: true })
+            await mkdir(workspace)
+            await symlink(source.scope, parent, "junction")
+          })
+
+          const helper = pathToFileURL(path.resolve(import.meta.dir, "../fixture/plugin-sdk.ts")).href
+          const script = `
+            import { installWorkspacePluginSdk } from ${JSON.stringify(helper)}
+            import { lstat, realpath } from "node:fs/promises"
+            import path from "node:path"
+            await installWorkspacePluginSdk({
+              sandboxRoot: ${JSON.stringify(tempRoot)},
+              ownerRoot: ${JSON.stringify(fixtureRoot)},
+              consumerDirectory: ${JSON.stringify(dir)},
+              workspace: ${JSON.stringify(workspace)},
+              unrelated: {
+                manifest: { name: "@opencode-ai/plugin", version: "1.19.0", type: "module", exports: "./index.js" },
+                module: "export const tool = () => 'wrong SDK'\\n",
+                afterManifest: async ({ entry, staging }) => {
+                  await Bun.write(${JSON.stringify(marker)}, JSON.stringify({
+                    entry,
+                    entryExists: await lstat(entry).then(() => true, () => false),
+                    parentTarget: await realpath(path.dirname(entry)),
+                    staging,
+                    stagingTarget: await realpath(staging),
+                  }))
+                  await new Promise(() => {})
+                },
+              },
+            })
+          `
+          const child = Bun.spawn([process.execPath, "-e", script], {
+            cwd: fixtureRoot,
+            env: { ...process.env },
+            stdin: "ignore",
+            stdout: "ignore",
+            stderr: "pipe",
+          })
+          yield* Effect.addFinalizer(() =>
+            Effect.promise(async () => {
+              if (child.exitCode === null) child.kill("SIGKILL")
+              await child.exited
+            }),
+          )
+          yield* pollWithTimeout(
+            Effect.promise(async () => ((await Bun.file(marker).exists()) ? true : undefined)),
+            "SDK fixture child did not publish setup progress",
+            "5 seconds",
+          )
+          const progress = JSON.parse(yield* Effect.promise(() => readFile(marker, "utf8"))) as {
+            entry: string
+            entryExists: boolean
+            parentTarget: string
+            staging: string
+            stagingTarget: string
+          }
+          expect(FSUtil.contains(fixtureRoot, progress.staging)).toBe(true)
+          expect(FSUtil.contains(fixtureRoot, progress.entry)).toBe(true)
+          child.kill("SIGKILL")
+          const exitCode = yield* awaitWithTimeout(
+            Effect.promise(() => child.exited),
+            "SDK fixture child did not exit",
+            "5 seconds",
+          )
+          expect(exitCode).not.toBe(0)
+          return { fixtureRoot, progress }
+        }),
+      )
+
+      expect(yield* Effect.promise(() => snapshotTree(source.directory))).toEqual(before)
+      expect(FSUtil.contains(fixtureDirectory.fixtureRoot, fixtureDirectory.progress.stagingTarget)).toBe(true)
+      expect(FSUtil.contains(fixtureDirectory.fixtureRoot, fixtureDirectory.progress.parentTarget)).toBe(true)
+      expect(fixtureDirectory.progress.entryExists).toBe(false)
+      expect(yield* Effect.promise(() => readdir(tempRoot))).not.toContain(path.basename(fixtureDirectory.fixtureRoot))
     }),
   30000,
 )
