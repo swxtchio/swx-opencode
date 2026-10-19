@@ -1431,7 +1431,25 @@ describe("session.llm.stream", () => {
           delta: Record<string, unknown>
           finishReason?: string
           lookup?: boolean
+          multiline?: boolean
         }> = [
+          { name: "multiline CRLF data", delta: { content: "multiline progress" }, multiline: true },
+          {
+            name: "OpenRouter reasoning_details encrypted",
+            delta: {
+              reasoning_details: [{ type: "reasoning.encrypted", data: "opaque reasoning progress", index: 0 }],
+            },
+          },
+          {
+            name: "OpenRouter reasoning_details text",
+            delta: { reasoning_details: [{ type: "reasoning.text", text: "structured reasoning progress", index: 0 }] },
+          },
+          {
+            name: "OpenRouter reasoning_details summary",
+            delta: {
+              reasoning_details: [{ type: "reasoning.summary", summary: "structured reasoning progress", index: 0 }],
+            },
+          },
           { name: "content", delta: { content: "text progress" } },
           { name: "reasoning", delta: { reasoning: "reasoning progress" } },
           { name: "reasoning_content", delta: { reasoning_content: "reasoning progress" } },
@@ -1459,25 +1477,30 @@ describe("session.llm.stream", () => {
           },
         ]
         const encoder = new TextEncoder()
-        const event = (delta: Record<string, unknown>, finishReason: string | null = null) =>
-          `data: ${JSON.stringify({
+        const event = (delta: Record<string, unknown>, finishReason: string | null = null, multiline = false) => {
+          const data = JSON.stringify({
             id: "chatcmpl-progress-fields",
             object: "chat.completion.chunk",
             created: 0,
             model: modelID,
             choices: [{ index: 0, delta, finish_reason: finishReason }],
-          })}\n\n`
+          })
+          if (!multiline) return `data: ${data}\n\n`
+          const splitAt = data.indexOf('"choices"')
+          return `data: ${data.slice(0, splitAt)}\r\ndata: ${data.slice(splitAt)}\r\n\r\n`
+        }
         const runChat = (input: {
           name: string
           delta: Record<string, unknown>
           finishReason?: string
           lookup?: boolean
+          multiline?: boolean
         }) =>
           Effect.gen(function* () {
             const release = deferred<void>()
             const initial = event({ role: "assistant" })
             const chunks = [
-              { data: event(input.delta), delay: 1_500 },
+              { data: event(input.delta, null, input.multiline), delay: 1_500 },
               { data: event({}, input.finishReason ?? "stop"), delay: 1_500 },
               { data: "data: [DONE]\n\n", delay: 0 },
             ]
@@ -1561,13 +1584,29 @@ describe("session.llm.stream", () => {
           expect(result.duration).toBeGreaterThan(2_500)
         }
 
-        const empty = yield* runChat({ name: "empty delta", delta: { content: "" } })
-        expect(Exit.isFailure(empty.exit)).toBe(true)
-        if (Exit.isFailure(empty.exit)) {
-          const error = Cause.squash(empty.exit.cause)
-          expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
-          if (error instanceof ProviderError.ResponseStreamError)
-            expect(error.message).toBe("SSE generation progress timed out")
+        for (const input of [
+          { name: "empty content delta", delta: { content: "" } },
+          {
+            name: "empty OpenRouter reasoning_details text",
+            delta: { reasoning_details: [{ type: "reasoning.text", text: "", index: 0 }] },
+          },
+          {
+            name: "empty OpenRouter reasoning_details summary",
+            delta: { reasoning_details: [{ type: "reasoning.summary", summary: "", index: 0 }] },
+          },
+          {
+            name: "empty OpenRouter reasoning_details encrypted",
+            delta: { reasoning_details: [{ type: "reasoning.encrypted", data: "", index: 0 }] },
+          },
+        ]) {
+          const empty = yield* runChat(input)
+          expect(Exit.isFailure(empty.exit)).toBe(true)
+          if (Exit.isFailure(empty.exit)) {
+            const error = Cause.squash(empty.exit.cause)
+            expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+            if (error instanceof ProviderError.ResponseStreamError)
+              expect(error.message).toBe("SSE generation progress timed out")
+          }
         }
       }),
     {
@@ -1598,6 +1637,151 @@ describe("session.llm.stream", () => {
       }),
     },
     60_000,
+  )
+
+  it.instance(
+    "keeps OpenRouter structured reasoning_details alive as generation progress",
+    () =>
+      Effect.gen(function* () {
+        const providerID = ProviderV2.ID.make("openrouter")
+        const modelID = ModelV2.ID.make("openrouter-progress-model")
+        const encoder = new TextEncoder()
+        const release = deferred<void>()
+        const event = (delta: Record<string, unknown>, finishReason: string | null = null) =>
+          `data: ${JSON.stringify({
+            id: "chatcmpl-openrouter-progress",
+            object: "chat.completion.chunk",
+            created: 0,
+            model: modelID,
+            choices: [{ index: 0, delta, finish_reason: finishReason }],
+          })}\n\n`
+        const chunks = [
+          {
+            data: event({ reasoning_details: [{ type: "reasoning.text", text: "structured thought", index: 0 }] }),
+            delay: 1_500,
+          },
+          {
+            data: event({ reasoning_details: [{ type: "reasoning.encrypted", data: "opaque thought", index: 0 }] }),
+            delay: 1_500,
+          },
+          {
+            data: event({
+              reasoning_details: [{ type: "reasoning.summary", summary: "structured summary", index: 0 }],
+            }),
+            delay: 1_500,
+          },
+          { data: event({ content: "answer" }, "stop"), delay: 0 },
+          { data: "data: [DONE]\n\n", delay: 0 },
+        ]
+        let index = 0
+        const request = waitRequest(
+          "/chat/completions",
+          new Response(
+            new ReadableStream<Uint8Array>(
+              {
+                start(controller) {
+                  controller.enqueue(encoder.encode(event({ role: "assistant" })))
+                },
+                async pull(controller) {
+                  const chunk = chunks[index]
+                  if (chunk === undefined) {
+                    controller.close()
+                    return
+                  }
+                  const shouldContinue = await Promise.race([
+                    release.promise.then(() => false),
+                    new Promise<true>((resolve) => setTimeout(() => resolve(true), chunk.delay)),
+                  ])
+                  if (!shouldContinue) {
+                    controller.close()
+                    return
+                  }
+                  index++
+                  controller.enqueue(encoder.encode(chunk.data))
+                },
+                cancel() {
+                  release.resolve()
+                },
+              },
+              { highWaterMark: 0 },
+            ),
+            { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } },
+          ),
+        )
+        const provider = yield* Provider.Service
+        const model = yield* provider.getModel(providerID, modelID)
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const sessionID = SessionID.make("session-openrouter-reasoning-progress")
+        const user = {
+          id: MessageID.ascending(),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID, modelID: model.id },
+        } satisfies SessionV1.User
+        yield* Effect.addFinalizer(() => Effect.sync(() => release.resolve()))
+        const started = performance.now()
+        const fiber = yield* LLM.Service.use((service) =>
+          service
+            .stream({
+              user,
+              sessionID,
+              model,
+              agent,
+              system: [],
+              messages: [{ role: "user", content: "Think, then answer." }],
+              tools: {},
+              retries: 0,
+            })
+            .pipe(Stream.runDrain),
+        ).pipe(Effect.forkScoped)
+        const capture = yield* awaitWithTimeout(
+          Effect.promise(() => request),
+          "OpenRouter request was not accepted",
+        )
+        const exit = yield* awaitWithTimeout(
+          Fiber.await(fiber),
+          "OpenRouter structured reasoning progress did not complete",
+          "10 seconds",
+        )
+
+        expect(capture.url.pathname.endsWith("/chat/completions")).toBe(true)
+        expect(capture.body.model).toBe(modelID)
+        expect(Exit.isSuccess(exit)).toBe(true)
+        expect(performance.now() - started).toBeGreaterThan(4_000)
+      }),
+    {
+      config: () => ({
+        enabled_providers: ["openrouter"],
+        provider: {
+          openrouter: {
+            options: {
+              apiKey: "test-key",
+              baseURL: `${state.server!.url.origin}/api/v1`,
+              chunkTimeout: 2_500,
+              headerTimeout: false,
+            },
+            models: {
+              "openrouter-progress-model": {
+                id: "openrouter-progress-model",
+                name: "OpenRouter Progress Model",
+                reasoning: true,
+                tool_call: false,
+                provider: { npm: "@openrouter/ai-sdk-provider" },
+                options: {},
+              },
+            },
+          },
+        },
+      }),
+    },
+    30_000,
   )
 
   const mistralFixture = { providerID: "mistral", modelID: "mistral-small-latest" }
