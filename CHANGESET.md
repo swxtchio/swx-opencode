@@ -38,6 +38,9 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Fork maintenance and CI
 
+- **#306** Recognize GLM-5.3 ids in the provider variant family match (swxtchio/swx-opencode#305): config-defined
+  GLM-5.3 models exposed no effort variants and were refused by effort-proof consumers; the match now covers
+  `glm-5.3|glm-5-3|glm-5p3` alongside 5.2. _Fork-only._
 - **#282** Add producer-internal V2 Session wait registration/resolution logs and a bounded native linux-x64 proof workflow. The held-wait battery runs on a same-source instrumented rebuild; a separate downloaded-published-bytes run retains the release archive checksum, version, sidecar and database read-back. _Fork-only._
 - **#268** Raise the unit CI step budget from 20 to 30 minutes (swxtchio/swx-opencode#231): the step consumed 1,010s of its
   1,200s limit on the #260 merge head and timed out on the #237 head with every test passing. No check is loosened.

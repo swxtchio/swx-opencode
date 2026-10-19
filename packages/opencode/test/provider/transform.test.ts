@@ -4511,6 +4511,39 @@ describe("ProviderTransform.variants", () => {
     })
   })
 
+  test("glm-5.3 returns native effort variants for openai-compatible providers (#305)", () => {
+    const model = createMockModel({
+      id: "fireworks/accounts/fireworks/models/glm-5p3-flash",
+      providerID: "fireworks",
+      api: {
+        id: "accounts/fireworks/models/glm-5p3-flash",
+        url: "https://api.fireworks.ai/inference/v1",
+        npm: "@ai-sdk/openai-compatible",
+      },
+    })
+    expect(ProviderTransform.variants(model)).toEqual({
+      high: { reasoningEffort: "high" },
+      max: { reasoningEffort: "max" },
+    })
+  })
+
+  test("recognizes GLM-5.3 provider model IDs and aliases (#305)", () => {
+    for (const id of ["glm-5.3", "glm-5-3", "accounts/fireworks/models/glm-5p3-flash", "umans-glm-5p3"]) {
+      const model = createMockModel({
+        id: `test/${id}`,
+        api: {
+          id,
+          url: "https://api.test.com",
+          npm: "@ai-sdk/openai-compatible",
+        },
+      })
+      expect(ProviderTransform.variants(model)).toEqual({
+        high: { reasoningEffort: "high" },
+        max: { reasoningEffort: "max" },
+      })
+    }
+  })
+
   test("glm-5.2 falls back to provider defaults for other packages", () => {
     const model = createMockModel({
       id: "test/glm-5.2",
