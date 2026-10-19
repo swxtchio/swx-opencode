@@ -1577,7 +1577,7 @@ itCleanupFault.live(
                 async pull(controller) {
                   const action = await Promise.race([
                     release.promise.then(() => "release" as const),
-                    new Promise<"keepalive">((resolve) => setTimeout(() => resolve("keepalive"), 20)),
+                    new Promise<"keepalive">((resolve) => setTimeout(() => resolve("keepalive"), 100)),
                   ])
                   if (action === "release") {
                     controller.close()
@@ -1687,7 +1687,7 @@ itCleanupFault.live(
             "swx-azure": {
               name: "swXtch Foundry",
               npm: "@ai-sdk/openai",
-              options: { apiKey: "test-key", baseURL: url, chunkTimeout: 100, headerTimeout: false },
+              options: { apiKey: "test-key", baseURL: url, chunkTimeout: 1_000, headerTimeout: false },
               models: {
                 "gpt-6.1-sol": {
                   id: "gpt-6.1-sol",

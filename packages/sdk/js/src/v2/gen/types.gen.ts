@@ -1880,7 +1880,7 @@ export type ProviderConfig = {
      */
     headerTimeout?: number | false
     /**
-     * Timeout in milliseconds between streamed SSE chunks for this provider (default: 300000). For OpenAI SSE streams, non-empty generation deltas reset the timeout; transport-only keepalives do not. Set to false to disable the timeout.
+     * Timeout in milliseconds between streamed SSE chunks for this provider (default: 300000). For OpenAI-compatible SSE streams, non-empty generation deltas reset the timeout; transport-only keepalives do not. Set to false to disable the timeout.
      */
     chunkTimeout?: number | false
     [key: string]: unknown | string | boolean | number | false | number | false | number | false | undefined

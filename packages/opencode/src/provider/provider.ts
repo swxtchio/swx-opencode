@@ -94,7 +94,7 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
       }
 
       sseBuffer += decoder.decode(part.value, { stream: true })
-      const frames = sseBuffer.split(/\r\n\r\n|\n\n|\r\r/)
+      const frames = sseBuffer.split(/(?:\r\n|\r|\n){2}/)
       sseBuffer = frames.pop() ?? ""
       for (const frame of frames) {
         const progress = openAIStreamFrameProgress(frame)
@@ -146,15 +146,26 @@ function openAIStreamFrameProgress(frame: string) {
   if (typeof value.delta === "string") return value.delta.length > 0
   if (!Array.isArray(value.choices)) return false
 
+  const hasText = (input: unknown) => {
+    if (typeof input === "string") return input.length > 0
+    if (!Array.isArray(input)) return false
+    return input.some((part) => {
+      if (!isRecord(part)) return false
+      if (part.type === "text") return typeof part.text === "string" && part.text.length > 0
+      return (
+        part.type === "thinking" &&
+        Array.isArray(part.thinking) &&
+        part.thinking.some(
+          (item) => isRecord(item) && item.type === "text" && typeof item.text === "string" && item.text.length > 0,
+        )
+      )
+    })
+  }
+
   return value.choices.some((choice) => {
     if (!isRecord(choice) || !isRecord(choice.delta)) return false
     const delta = choice.delta
-    if (
-      ["content", "reasoning", "reasoning_content", "reasoning_text", "refusal"].some((key) => {
-        const text = delta[key]
-        return typeof text === "string" && text.length > 0
-      })
-    )
+    if (["content", "reasoning", "reasoning_content", "reasoning_text", "refusal"].some((key) => hasText(delta[key])))
       return true
     if (
       Array.isArray(delta.tool_calls) &&

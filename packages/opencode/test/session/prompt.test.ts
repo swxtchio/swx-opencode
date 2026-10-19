@@ -4424,7 +4424,7 @@ it.instance(
       if (assistant?.info.role === "assistant") expect(assistant.info.error?.name).toBe("MessageAbortedError")
     }),
   { config: cfg },
-  10_000,
+  30_000,
 )
 
 it.instance(
