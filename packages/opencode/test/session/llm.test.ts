@@ -14,7 +14,7 @@ import { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 
-import { testEffect } from "../lib/effect"
+import { testEffect, awaitWithTimeout } from "../lib/effect"
 import type { Agent } from "../../src/agent/agent"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionID, MessageID } from "../../src/session/schema"
@@ -48,6 +48,29 @@ const openAIConfig = (model: ModelsDev.Provider["models"][string], baseURL: stri
           apiKey: "test-openai-key",
           baseURL,
         },
+      },
+    },
+  }
+}
+
+function foundryProviderConfig(baseURL: string, chunkTimeout: number): Partial<ConfigV1.Info> {
+  const model: ConfigModel = {
+    id: "gpt-6.1-sol",
+    name: "GPT-6.1 Sol",
+    reasoning: true,
+    tool_call: true,
+    provider: { npm: "@ai-sdk/openai" },
+    options: { reasoningEffort: "high", reasoningSummary: "auto" },
+  }
+  return {
+    model: "swx-azure/gpt-6.1-sol",
+    enabled_providers: ["swx-azure"],
+    provider: {
+      "swx-azure": {
+        name: "swXtch Foundry",
+        npm: "@ai-sdk/openai",
+        options: { apiKey: "test-key", baseURL, chunkTimeout, headerTimeout: false },
+        models: { "gpt-6.1-sol": model },
       },
     },
   }
@@ -758,6 +781,329 @@ function createEventResponse(chunks: unknown[], includeDone = false) {
 describe("session.llm.stream", () => {
   const vivgridFixture = { providerID: "vivgrid", modelID: "gemini-3.1-pro-preview" }
   const opencodeFixture = { providerID: "opencode-test", modelID: vivgridFixture.modelID }
+
+  it.instance(
+    "bounds Foundry Responses streams when keepalives continue without generation progress",
+    () =>
+      Effect.gen(function* () {
+        const providerID = ProviderV2.ID.make("swx-azure")
+        const modelID = ModelV2.ID.make("gpt-6.1-sol")
+        const providerRequestAborted = deferred<void>()
+        const responseCancelled = deferred<void>()
+        const release = deferred<void>()
+        const progress = deferred<void>()
+        const keepalives = { count: 0 }
+        const encoder = new TextEncoder()
+        const event = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`
+        let cancelled = false
+        const initial = [
+          {
+            type: "response.created",
+            response: {
+              id: "resp-stalled-generation",
+              created_at: Math.floor(Date.now() / 1000),
+              model: modelID,
+              service_tier: null,
+            },
+          },
+          {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { type: "reasoning", id: "rs-stalled-generation", encrypted_content: null },
+          },
+          {
+            type: "response.reasoning_summary_part.added",
+            item_id: "rs-stalled-generation",
+            summary_index: 0,
+          },
+          {
+            type: "response.reasoning_summary_text.delta",
+            item_id: "rs-stalled-generation",
+            summary_index: 0,
+            delta: "provider reasoning progressed before the stall",
+          },
+        ]
+          .map(event)
+          .join("")
+        const pending = deferred<Capture>()
+        state.queue.push({
+          path: "/responses",
+          resolve: pending.resolve,
+          response: (request) => {
+            request.signal.addEventListener("abort", () => providerRequestAborted.resolve(), { once: true })
+            return new Response(
+              new ReadableStream<Uint8Array>({
+                start(controller) {
+                  controller.enqueue(encoder.encode(initial))
+                },
+                async pull(controller) {
+                  const action = await Promise.race([
+                    release.promise.then(() => "release" as const),
+                    new Promise<"keepalive">((resolve) => setTimeout(() => resolve("keepalive"), 20)),
+                  ])
+                  if (action === "release") {
+                    if (!cancelled) controller.close()
+                    return
+                  }
+                  keepalives.count++
+                  controller.enqueue(encoder.encode(": keep-alive\n\n"))
+                },
+                cancel() {
+                  cancelled = true
+                  responseCancelled.resolve()
+                  release.resolve()
+                },
+              }),
+              { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } },
+            )
+          },
+        })
+        const provider = yield* Provider.Service
+        const configured = yield* provider.getProvider(providerID)
+        configured.options.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+          init?.signal?.addEventListener("abort", () => providerRequestAborted.resolve(), { once: true })
+          return fetch(input, init)
+        }
+        const model = yield* provider.getModel(providerID, modelID)
+        const sessionID = SessionID.make("session-foundry-stalled-generation")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const user = {
+          id: MessageID.ascending(),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID, modelID: model.id, variant: "high" },
+        } satisfies SessionV1.User
+        const fiber = yield* LLM.Service.use((service) =>
+          service
+            .stream({
+              user,
+              sessionID,
+              model,
+              agent,
+              system: [],
+              messages: [{ role: "user", content: "Produce a brief response." }],
+              tools: {},
+              retries: 0,
+            })
+            .pipe(
+              Stream.tap((item) =>
+                item.type === "reasoning-delta" ? Effect.sync(() => progress.resolve()) : Effect.void,
+              ),
+              Stream.runDrain,
+            ),
+        ).pipe(Effect.forkScoped)
+        yield* Effect.addFinalizer(() => Effect.sync(() => release.resolve()))
+
+        const capture = yield* awaitWithTimeout(
+          Effect.promise(() => pending.promise),
+          "Foundry provider request did not start",
+        )
+        expect(capture.url.pathname.endsWith("/responses")).toBe(true)
+        expect(capture.body.model).toBe("gpt-6.1-sol")
+        yield* awaitWithTimeout(
+          Effect.promise(() => progress.promise),
+          "Responses reasoning delta was not decoded",
+        )
+        const exit = yield* awaitWithTimeout(
+          Fiber.await(fiber),
+          "stalled provider attempt did not fail within its bound",
+          "2 seconds",
+        )
+
+        expect(keepalives.count).toBeGreaterThan(0)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(ProviderError.ResponseStreamError)
+        yield* awaitWithTimeout(
+          Effect.promise(() => providerRequestAborted.promise),
+          "provider fetch signal was not aborted",
+        )
+        yield* awaitWithTimeout(
+          Effect.promise(() => responseCancelled.promise),
+          "provider response body was not released",
+        )
+      }),
+    { config: () => foundryProviderConfig(`${state.server!.url.origin}/openai/v1`, 100) },
+    30_000,
+  )
+
+  it.instance(
+    "preserves slow Foundry reasoning progress with interleaved keepalives",
+    () =>
+      Effect.gen(function* () {
+        const providerID = ProviderV2.ID.make("swx-azure")
+        const modelID = ModelV2.ID.make("gpt-6.1-sol")
+        const encoder = new TextEncoder()
+        const event = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`
+        const reason = (delta: string) =>
+          event({
+            type: "response.reasoning_summary_text.delta",
+            item_id: "rs-slow-progress",
+            summary_index: 0,
+            delta,
+          })
+        const initial = [
+          {
+            type: "response.created",
+            response: {
+              id: "resp-slow-progress",
+              created_at: Math.floor(Date.now() / 1000),
+              model: modelID,
+              service_tier: null,
+            },
+          },
+          {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { type: "reasoning", id: "rs-slow-progress", encrypted_content: null },
+          },
+          {
+            type: "response.reasoning_summary_part.added",
+            item_id: "rs-slow-progress",
+            summary_index: 0,
+          },
+          {
+            type: "response.reasoning_summary_text.delta",
+            item_id: "rs-slow-progress",
+            summary_index: 0,
+            delta: "reason-1",
+          },
+        ]
+          .map(event)
+          .join("")
+        const tail = [
+          ": keep-alive\n\n",
+          reason("reason-2"),
+          ": keep-alive\n\n",
+          reason("reason-3"),
+          ": keep-alive\n\n",
+          reason("reason-4"),
+          ": keep-alive\n\n",
+          [
+            reason("reason-5"),
+            event({
+              type: "response.output_item.added",
+              output_index: 1,
+              item: { type: "message", id: "msg-slow-progress", status: "in_progress", role: "assistant", content: [] },
+            }),
+            event({
+              type: "response.content_part.added",
+              item_id: "msg-slow-progress",
+              output_index: 1,
+              content_index: 0,
+              part: { type: "output_text", text: "", annotations: [] },
+            }),
+            event({
+              type: "response.output_text.delta",
+              item_id: "msg-slow-progress",
+              output_index: 1,
+              content_index: 0,
+              delta: "done",
+              logprobs: null,
+            }),
+            event({
+              type: "response.completed",
+              response: {
+                incomplete_details: null,
+                service_tier: null,
+                usage: {
+                  input_tokens: 1,
+                  input_tokens_details: { cached_tokens: 0 },
+                  output_tokens: 1,
+                  output_tokens_details: { reasoning_tokens: 5 },
+                },
+              },
+            }),
+          ].join(""),
+        ]
+        let index = 0
+        const request = waitRequest(
+          "/responses",
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(encoder.encode(initial))
+              },
+              async pull(controller) {
+                const next = tail[index]
+                if (next === undefined) {
+                  controller.close()
+                  return
+                }
+                await new Promise((resolve) => setTimeout(resolve, 20))
+                index++
+                controller.enqueue(encoder.encode(next))
+              },
+            }),
+            { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } },
+          ),
+        )
+        const provider = yield* Provider.Service
+        const model = yield* provider.getModel(providerID, modelID)
+        const sessionID = SessionID.make("session-foundry-slow-progress")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const user = {
+          id: MessageID.ascending(),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID, modelID: model.id, variant: "high" },
+        } satisfies SessionV1.User
+        const started = performance.now()
+        let reasoningDeltas = 0
+        let firstTextAt: number | undefined
+        yield* awaitWithTimeout(
+          LLM.Service.use((service) =>
+            service
+              .stream({
+                user,
+                sessionID,
+                model,
+                agent,
+                system: [],
+                messages: [{ role: "user", content: "Reason slowly, then answer." }],
+                tools: {},
+                retries: 0,
+              })
+              .pipe(
+                Stream.tap((item) =>
+                  Effect.sync(() => {
+                    if (item.type === "reasoning-delta") reasoningDeltas++
+                    if (item.type === "text-delta") firstTextAt ??= performance.now() - started
+                  }),
+                ),
+                Stream.runDrain,
+              ),
+          ),
+          "slow Foundry reasoning stream did not complete",
+          "2 seconds",
+        )
+        const duration = performance.now() - started
+        const capture = yield* awaitWithTimeout(
+          Effect.promise(() => request),
+          "slow Responses request was not observed",
+        )
+
+        expect(capture.url.pathname.endsWith("/responses")).toBe(true)
+        expect(duration).toBeGreaterThan(100)
+        expect(reasoningDeltas).toBeGreaterThanOrEqual(5)
+        expect(firstTextAt).toBeGreaterThan(100)
+      }),
+    { config: () => foundryProviderConfig(`${state.server!.url.origin}/openai/v1`, 100) },
+    10_000,
+  )
 
   it.instance(
     "sends the parent session header for opencode providers",

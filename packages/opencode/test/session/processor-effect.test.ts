@@ -1496,6 +1496,216 @@ itCleanupFault.live(
   20_000,
 )
 
+itCleanupFault.live(
+  "session.processor retains the stalled Foundry error across retries and a one-shot persistence failure",
+  () =>
+    provideTmpdirServer(
+      ({ dir }) =>
+        Effect.gen(function* () {
+          cleanupFault.failed = false
+          const events = yield* EventV2Bridge.Service
+          const { processors, session, provider } = yield* boot()
+          const status = yield* SessionStatus.Service
+          const providerID = ProviderV2.ID.make("swx-azure")
+          const modelID = ModelV2.ID.make("gpt-6.1-sol")
+          const attempts = { requests: 0, aborted: 0, cancelled: 0, keepalives: 0 }
+          const eventErrors: Array<{ name: string; message?: string; code?: string }> = []
+          const off = yield* events.listen((event) => {
+            if (event.type !== Session.Event.Error.type) return Effect.void
+            const data = event.data as typeof Session.Event.Error.data.Type
+            if (data.error) {
+              const api = SessionV1.APIError.isInstance(data.error)
+              eventErrors.push({
+                name: data.error.name,
+                message: api ? data.error.data.message : undefined,
+                code: api ? data.error.data.metadata?.code : undefined,
+              })
+            }
+            return Effect.void
+          })
+          yield* Effect.addFinalizer(() => off)
+          yield* Effect.addFinalizer(() => Effect.sync(() => (cleanupFault.failed = false)))
+
+          const configured = yield* provider.getProvider(providerID)
+          configured.options.fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+            attempts.requests++
+            const release = defer<void>()
+            init?.signal?.addEventListener(
+              "abort",
+              () => {
+                attempts.aborted++
+                release.resolve()
+              },
+              { once: true },
+            )
+            const encoder = new TextEncoder()
+            const event = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`
+            const initial = [
+              {
+                type: "response.created",
+                response: {
+                  id: `resp-process-stall-${attempts.requests}`,
+                  created_at: Math.floor(Date.now() / 1000),
+                  model: "gpt-6.1-sol",
+                  service_tier: null,
+                },
+              },
+              {
+                type: "response.output_item.added",
+                output_index: 0,
+                item: { type: "reasoning", id: `rs-process-stall-${attempts.requests}`, encrypted_content: null },
+              },
+              {
+                type: "response.reasoning_summary_part.added",
+                item_id: `rs-process-stall-${attempts.requests}`,
+                summary_index: 0,
+              },
+              {
+                type: "response.reasoning_summary_text.delta",
+                item_id: `rs-process-stall-${attempts.requests}`,
+                summary_index: 0,
+                delta: "provider reasoning before the stall",
+              },
+            ]
+              .map(event)
+              .join("")
+            return new Response(
+              new ReadableStream<Uint8Array>({
+                start(controller) {
+                  controller.enqueue(encoder.encode(initial))
+                },
+                async pull(controller) {
+                  const action = await Promise.race([
+                    release.promise.then(() => "release" as const),
+                    new Promise<"keepalive">((resolve) => setTimeout(() => resolve("keepalive"), 20)),
+                  ])
+                  if (action === "release") {
+                    controller.close()
+                    return
+                  }
+                  attempts.keepalives++
+                  controller.enqueue(encoder.encode(": keep-alive\n\n"))
+                },
+                cancel() {
+                  attempts.cancelled++
+                  release.resolve()
+                },
+              }),
+              { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } },
+            )
+          }
+
+          const chat = yield* session.create({ title: "Stalled Foundry provider attempt" })
+          const parent = yield* session.updateMessage({
+            id: MessageID.ascending(),
+            role: "user",
+            sessionID: chat.id,
+            agent: "build",
+            model: { providerID, modelID },
+            time: { created: Date.now() },
+          })
+          yield* session.updatePart({
+            id: PartID.ascending(),
+            messageID: parent.id,
+            sessionID: chat.id,
+            type: "text",
+            text: "Write a short answer after reasoning.",
+          })
+          const root = path.resolve(dir)
+          const assistantMessage: SessionV1.Assistant = {
+            id: MessageID.ascending(),
+            role: "assistant",
+            sessionID: chat.id,
+            mode: "build",
+            agent: "build",
+            path: { cwd: root, root },
+            cost: 0,
+            tokens: { total: 0, input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            modelID,
+            providerID,
+            parentID: parent.id,
+            time: { created: Date.now() },
+            finish: "end_turn",
+          }
+          yield* session.updateMessage(assistantMessage)
+          const model = yield* provider.getModel(providerID, modelID)
+          const handle = yield* processors.create({ assistantMessage, sessionID: chat.id, model })
+          const input = {
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID, modelID, variant: "high" },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "Write a short answer after reasoning." }],
+            tools: {},
+          } satisfies LLM.StreamInput
+
+          const result = yield* awaitWithTimeout(
+            handle.process(input),
+            "processor did not terminalize the stalled Foundry attempts",
+            "90 seconds",
+          )
+          const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: assistantMessage.id })
+          const finalStatus = yield* status.get(chat.id)
+          yield* off
+
+          expect(cleanupFault.failed).toBe(true)
+          expect(result).toBe("stop")
+          expect(attempts.requests).toBe(6)
+          expect(attempts.aborted).toBe(attempts.requests)
+          expect(attempts.cancelled).toBe(attempts.requests)
+          expect(attempts.keepalives).toBeGreaterThan(0)
+          expect(finalStatus).toMatchObject({ type: "idle" })
+          expect(eventErrors[0]).toMatchObject({
+            name: "APIError",
+            message: "SSE generation progress timed out",
+            code: "ProviderResponseStreamError",
+          })
+          expect(eventErrors.filter((error) => error.code === "ProviderResponseStreamError")).toHaveLength(1)
+          expect(stored.info.role).toBe("assistant")
+          if (stored.info.role === "assistant") {
+            expect(stored.info.time.completed).toBeDefined()
+            expect(stored.info.error?.name).toBe("APIError")
+            if (SessionV1.APIError.isInstance(stored.info.error)) {
+              expect(stored.info.error.data.message).toBe("SSE generation progress timed out")
+              expect(stored.info.error.data.metadata?.code).toBe("ProviderResponseStreamError")
+            }
+          }
+        }),
+      {
+        config: (url) => ({
+          model: "swx-azure/gpt-6.1-sol",
+          enabled_providers: ["swx-azure"],
+          provider: {
+            "swx-azure": {
+              name: "swXtch Foundry",
+              npm: "@ai-sdk/openai",
+              options: { apiKey: "test-key", baseURL: url, chunkTimeout: 100, headerTimeout: false },
+              models: {
+                "gpt-6.1-sol": {
+                  id: "gpt-6.1-sol",
+                  name: "GPT-6.1 Sol",
+                  reasoning: true,
+                  tool_call: true,
+                  provider: { npm: "@ai-sdk/openai" },
+                  options: { reasoningEffort: "high", reasoningSummary: "auto" },
+                },
+              },
+            },
+          },
+        }),
+      },
+    ),
+  100_000,
+)
+
 itCleanupPartFailure.live(
   "session.processor effect tests preserve the provider error and finish remaining cleanup parts",
   () =>
