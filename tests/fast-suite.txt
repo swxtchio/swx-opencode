@@ -1,0 +1,13 @@
+# Keep this selection deterministic, fast, and behavior-covering.
+# Changes touching an excluded timing class require that class at the final gate via
+# firstmate's repository suite override; release builds require a passing full suite.
+
+packages/core/test/config/provider.test.ts
+packages/core/test/session-history.test.ts
+packages/core/test/session-projector.test.ts
+packages/core/test/session-run-coordinator.test.ts
+packages/opencode/test/config/config.test.ts
+packages/opencode/test/provider/transform.test.ts
+packages/tui/test/component/dialog-session-list.test.ts
+packages/client/test/promise.test.ts
+packages/sdk/js/test/session-history.test.ts

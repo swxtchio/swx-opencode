@@ -74,8 +74,8 @@ jobs:
         # for the same reason as there: a renamed file must fail, not vanish.
         working-directory: script
         run: |
-          ls sync-upstream.test.ts changeset-check.test.ts > /dev/null
-          bun test sync-upstream.test.ts changeset-check.test.ts
+          ls sync-upstream.test.ts changeset-check.test.ts fast-suite-runner.test.ts > /dev/null
+          bun test sync-upstream.test.ts changeset-check.test.ts fast-suite-runner.test.ts
 
       - name: Check the fork changeset
         # A PR against swxtch must add its entry to CHANGESET.md. Passed through
