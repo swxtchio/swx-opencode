@@ -3,12 +3,11 @@
 # turbo, exactly as the "Run unit tests" step of .github/workflows/test.yml runs
 # them. The root `npm test` / `bun test` refuse on purpose, so this is the
 # entrypoint for running everything from the root.
-# Direct `bun test` receives one already-validated path per manifest line. Forward
-# every supported Bun test option and leading environment assignment; run each
-# registered Turbo test task's declared `^build` prerequisites first. The selected
-# tasks currently declare no explicit input globs. Always run `posttest` after a
-# pretest/test attempt, including failures; JUnit-less nonzero exits remain attributed
-# refusals. The unexpected-file guard catches extra attributed suites.
+# Fast mode asks Turbo for each selected package's task graph. It prepares the task's
+# resolved prerequisites through Turbo, then runs that package's exact selected files
+# together through its scoped test task; packages without a task use `bun run test`.
+# Turbo/Bun own strict env, local config, script options, and one package lifecycle.
+# JUnit-less nonzero exits remain attributed refusals; extra or missing suites are rejected.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,18 +25,19 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     '       tests/run.sh --help' \
     '' \
     'With no selector, runs the complete per-package Turbo test suite and forwards all arguments to Turbo.' \
-    '--fast invokes each manifest entry with bun test directly from its owning package directory.' \
+    '--fast groups manifest entries by package and runs the exact selected files through its owning Turbo test task' \
+    'when registered, otherwise its package test script.' \
     'The manifest accepts blank lines and whole-line comments beginning with #; every other line must be one' \
     'committed, regular project-relative path matching packages/<package-path>/test/<path>.test.ts.' \
     'Manifest paths use / separators and cannot contain whitespace, backslashes, glob characters, inline comments,' \
     'absolute paths, or . / .. path components.' \
-    'The target and owning package must exist; scripts.test must be a direct bun test command.' \
-    'Fast mode bypasses scripts.test selectors but forwards supported Bun options and literal leading environment' \
-    'assignments. Registered Turbo test tasks run their declared ^build preparation through Turbo first; unsupported' \
-    'Turbo dependencies or explicit test inputs refuse instead of being silently skipped.' \
-    'Optional pretest/posttest hooks run directly around each target; posttest runs even after earlier failures.' \
-    'A nonzero target with no JUnit report is refused with its target attribution, not labeled an execution-set mismatch.' \
-    'Bun is invoked directly with the owning package bunfig.toml and exactly one manifest path.' \
+    'The target and owning package must exist; scripts.test must be a string test command with no static file selectors.' \
+    'Fast mode passes only the exact manifest files to one package invocation; the owning runner retains all script' \
+    'options, script environment assignments, strict Turbo env, package-local Turbo config, and declared preparation.' \
+    'A package-local turbo.json without a resolved owning test task is refused rather than bypassed by direct execution.' \
+    'Bun pretest/test/posttest lifecycle runs once per package: pretest failure stops the test, and posttest runs only' \
+    'after a successful test command; hook failures propagate through the task result.' \
+    'A nonzero target with no JUnit report is refused with target attribution, not labeled an execution-set mismatch.' \
     'Fast mode refuses if a selected file reports no active test cases.' \
     'Only --fast refuses a checkout with tracked or untracked changes; full mode preserves the original Turbo behavior.' \
     'A terminal verdict is printed on every exit.'
@@ -74,7 +74,7 @@ if ! command -v bun >/dev/null 2>&1; then
   printf '%s\n' 'tests/run.sh: verdict=refused mode='"$mode"' reason=bun-not-found exit_code=127'
   exit 127
 fi
-if [ "$mode" = full ] && [ ! -x node_modules/.bin/turbo ]; then
+if [ ! -x node_modules/.bin/turbo ]; then
   printf '%s\n' 'tests/run.sh: dependencies are not installed (no node_modules/.bin/turbo); run bun install first' >&2
   printf '%s\n' 'tests/run.sh: verdict=refused mode='"$mode"' reason=dependencies-not-installed exit_code=1'
   exit 1
@@ -176,20 +176,13 @@ while IFS= read -r line || [ -n "$line" ]; do
   if [ "$package_config_index" -eq "${#configured_packages[@]}" ]; then
     config_path="$config_dir/$package_config_index"
     if ! FAST_SUITE_ROOT="$root" FAST_SUITE_PACKAGE_ROOT="$package_root" \
-      FAST_SUITE_PACKAGE_JSON="$root/$package_root/package.json" \
-      FAST_SUITE_TURBO_JSON="$root/turbo.json" bun -e '
+      FAST_SUITE_PACKAGE_JSON="$root/$package_root/package.json" bun -e '
       const pkg = await Bun.file(process.env.FAST_SUITE_PACKAGE_JSON).json()
-      const turbo = await Bun.file(process.env.FAST_SUITE_TURBO_JSON).json()
       const fail = (message) => {
         console.error("tests/run.sh: " + message)
         process.exit(1)
       }
       if (typeof pkg.scripts?.test !== "string") fail("scripts.test must be a string")
-      for (const hook of ["pretest", "posttest"]) {
-        if (pkg.scripts[hook] !== undefined && typeof pkg.scripts[hook] !== "string") {
-          fail("package " + hook + " hook must be a string")
-        }
-      }
       const script = pkg.scripts.test
       const single = String.fromCharCode(39)
       const words = []
@@ -243,15 +236,9 @@ while IFS= read -r line || [ -n "$line" ]; do
       }
       if (quote || escaped) fail("scripts.test contains an unterminated quote or escape")
       if (started) words.push(word)
-      const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/
-      const environment = []
+      const assignment = /^[A-Za-z_][A-Za-z0-9_]*=/
       let command = 0
       while (command < words.length && assignment.test(words[command])) {
-        const value = words[command].slice(words[command].indexOf("=") + 1)
-        if (/[\u0000\r\n$`*?\[\]]/.test(value) || value.startsWith("~")) {
-          fail("scripts.test environment assignments must use literal, non-glob values")
-        }
-        environment.push(words[command])
         command += 1
       }
       if (words[command] !== "bun" || words[command + 1] !== "test") {
@@ -289,11 +276,14 @@ while IFS= read -r line || [ -n "$line" ]; do
         "--timings",
       ])
       const optionalValueOptions = new Set(["--bail", "--parallel"])
-      const options = []
+      const selectors = []
       for (let index = command + 2; index < words.length; index += 1) {
         const argument = words[index]
         if (argument === "--") fail("scripts.test must not forward arguments after --")
-        if (!argument.startsWith("-")) continue
+        if (!argument.startsWith("-")) {
+          selectors.push(argument)
+          continue
+        }
         const equals = argument.indexOf("=")
         const option = equals === -1 ? argument : argument.slice(0, equals)
         if (option === "--reporter-outfile" || option === "--dots") {
@@ -302,104 +292,87 @@ while IFS= read -r line || [ -n "$line" ]; do
         if (option === "--reporter") {
           const reporter = equals === -1 ? words[index + 1] : argument.slice(equals + 1)
           if (reporter !== "junit") fail("scripts.test reporter must be junit in fast mode")
-          options.push(argument)
           if (equals === -1) {
-            options.push(reporter)
             index += 1
           }
           continue
         }
-        if (booleanOptions.has(option)) {
-          options.push(argument)
-          continue
-        }
+        if (booleanOptions.has(option)) continue
         if (valueOptions.has(option)) {
           const value = equals === -1 ? words[index + 1] : argument.slice(equals + 1)
           if (value === undefined || value === "") fail("scripts.test option " + option + " requires a value")
-          options.push(argument)
-          if (equals === -1) {
-            options.push(value)
-            index += 1
-          }
+          if (equals === -1) index += 1
           continue
         }
         if (optionalValueOptions.has(option)) {
-          if (equals !== -1) {
-            options.push(argument)
-            continue
-          }
-          options.push(argument)
-          if (/^\d+$/.test(words[index + 1] ?? "")) {
-            options.push(words[index + 1])
-            index += 1
-          }
+          if (equals === -1 && /^\d+$/.test(words[index + 1] ?? "")) index += 1
           continue
         }
         fail("unsupported scripts.test Bun option: " + option)
       }
-      if (typeof turbo.tasks !== "object" || turbo.tasks === null || Array.isArray(turbo.tasks)) {
-        fail("turbo.json tasks must be an object")
+      if (selectors.length > 0) {
+        fail("scripts.test contains file selectors; fast mode requires the manifest to define the exact file set")
       }
-      const task = turbo.tasks[String(pkg.name) + "#test"] ?? turbo.tasks.test
-      const preparationDirectories = []
-      if (task !== undefined) {
-        if (typeof task !== "object" || task === null || Array.isArray(task)) fail("Turbo test task must be an object")
-        const inputs = task.inputs
-        if (inputs !== undefined && (!Array.isArray(inputs) || inputs.length > 0)) {
-          fail("fast mode cannot honor explicit Turbo test inputs")
+      const localTurboConfig =
+        process.env.FAST_SUITE_ROOT + "/" + process.env.FAST_SUITE_PACKAGE_ROOT + "/turbo.json"
+      const hasLocalTurboConfig = await Bun.file(localTurboConfig).exists()
+      const dryRun = Bun.spawnSync(
+        ["bun", "turbo", "run", "test", "--filter=./" + process.env.FAST_SUITE_PACKAGE_ROOT, "--dry=json"],
+        { cwd: process.env.FAST_SUITE_ROOT, stdout: "pipe", stderr: "pipe" },
+      )
+      if (dryRun.exitCode !== 0) {
+        fail(
+          "could not resolve the owning Turbo test task" +
+            (hasLocalTurboConfig ? " with package-local turbo.json" : "") +
+            ": " +
+            new TextDecoder().decode(dryRun.stderr),
+        )
+      }
+      const plan = JSON.parse(new TextDecoder().decode(dryRun.stdout))
+      if (!Array.isArray(plan.tasks)) fail("Turbo dry-run did not provide a task plan")
+      const targetTask = plan.tasks.find(
+        (candidate) =>
+          candidate.directory === process.env.FAST_SUITE_PACKAGE_ROOT &&
+          typeof candidate.taskId === "string" &&
+          candidate.taskId.endsWith("#test"),
+      )
+      if (!targetTask && hasLocalTurboConfig) {
+        fail("package-local turbo.json exists but Turbo did not resolve its test task; refusing direct fallback")
+      }
+      if (!targetTask && plan.tasks.length > 0) {
+        fail("Turbo dry-run did not resolve the owning test task for " + process.env.FAST_SUITE_PACKAGE_ROOT)
+      }
+      const preparation = []
+      if (targetTask) {
+        if (!Array.isArray(targetTask.dependencies) || targetTask.dependencies.some((dependency) => typeof dependency !== "string")) {
+          fail("Turbo dry-run dependencies must be task ids")
         }
-        const dependencies = task.dependsOn ?? []
-        if (!Array.isArray(dependencies) || dependencies.some((dependency) => typeof dependency !== "string")) {
-          fail("Turbo test task dependencies must be strings")
-        }
-        if (dependencies.some((dependency) => dependency !== "^build")) {
-          fail("unsupported Turbo test task dependency: " + dependencies.find((dependency) => dependency !== "^build"))
-        }
-        if (dependencies.includes("^build")) {
-          const dryRun = Bun.spawnSync(
-            ["bun", "turbo", "run", "test", "--filter=./" + process.env.FAST_SUITE_PACKAGE_ROOT, "--dry=json"],
-            { cwd: process.env.FAST_SUITE_ROOT, stdout: "pipe", stderr: "pipe" },
-          )
-          if (dryRun.exitCode !== 0) {
-            fail("could not resolve Turbo-declared build dependencies: " + new TextDecoder().decode(dryRun.stderr))
+        const taskById = new Map(plan.tasks.map((candidate) => [candidate.taskId, candidate]))
+        for (const dependencyID of targetTask.dependencies) {
+          const dependency = taskById.get(dependencyID)
+          if (!dependency) fail("Turbo dry-run omitted dependency task " + dependencyID)
+          if (dependency.command === "<NONEXISTENT>") continue
+          if (typeof dependency.command !== "string") fail("Turbo dependency has no resolved command: " + dependencyID)
+          if (typeof dependency.taskId !== "string") fail("Turbo dependency has an invalid task id: " + dependencyID)
+          const separator = dependency.taskId.lastIndexOf("#")
+          if (separator < 1) fail("Turbo dependency has an invalid task id: " + dependencyID)
+          const taskName = dependency.taskId.slice(separator + 1)
+          if (
+            typeof dependency.directory !== "string" ||
+            dependency.directory.startsWith("/") ||
+            dependency.directory.split("/").includes("..")
+          ) {
+            fail("Turbo dependency has an unsupported workspace directory: " + dependencyID)
           }
-          const plan = JSON.parse(new TextDecoder().decode(dryRun.stdout))
-          if (!Array.isArray(plan.tasks)) fail("Turbo dry-run did not provide a task plan")
-          const targetTask = plan.tasks.find((candidate) => candidate.taskId === String(pkg.name) + "#test")
-          if (!targetTask) fail("Turbo dry-run omitted the owning test task for " + process.env.FAST_SUITE_PACKAGE_ROOT)
-          if (!Array.isArray(targetTask.dependencies) || targetTask.dependencies.some((dependency) => typeof dependency !== "string")) {
-            fail("Turbo dry-run dependencies must be task ids")
+          if (taskName.includes("|") || dependency.directory.includes("|")) {
+            fail("Turbo dependency contains a reserved field delimiter: " + dependencyID)
           }
-          const taskById = new Map(plan.tasks.map((candidate) => [candidate.taskId, candidate]))
-          for (const dependencyID of targetTask.dependencies) {
-            const dependency = taskById.get(dependencyID)
-            if (!dependency) fail("Turbo dry-run omitted dependency task " + dependencyID)
-            if (dependency.command === "<NONEXISTENT>") continue
-            if (typeof dependency.taskId !== "string" || dependency.taskId.slice(dependency.taskId.lastIndexOf("#") + 1) !== "build") {
-              fail("Turbo test dependency is not a build task: " + dependencyID)
-            }
-            if (
-              typeof dependency.directory !== "string" ||
-              !dependency.directory.startsWith("packages/") ||
-              dependency.directory.split("/").includes("..")
-            ) {
-              fail("Turbo build dependency has an unsupported workspace directory: " + dependencyID)
-            }
-            preparationDirectories.push(dependency.directory)
-          }
+          preparation.push(taskName + "|" + dependency.directory)
         }
       }
-      const fields = [
-        pkg.scripts.pretest === undefined ? "0" : "1",
-        pkg.scripts.posttest === undefined ? "0" : "1",
-        String(environment.length),
-        ...environment,
-        String(options.length),
-        ...options,
-        String(new Set(preparationDirectories).size),
-        ...new Set(preparationDirectories),
-      ]
-      if (fields.some((field) => /[\u0000\r\n]/.test(field))) fail("scripts.test fields cannot contain newline characters")
+      const prepared = Array.from(new Set(preparation))
+      const fields = [targetTask ? "1" : "0", String(prepared.length), ...prepared]
+      if (fields.some((field) => /[\u0000\r\n]/.test(field))) fail("Turbo task fields cannot contain newline characters")
       process.stdout.write(fields.join("\n") + "\n")
     ' > "$config_path"; then
       printf 'tests/run.sh: could not read the owning package test settings on line %d: %s\n' "$line_number" "$line" >&2
@@ -427,27 +400,24 @@ if [ "$target_count" -eq 0 ]; then
   exit 1
 fi
 
-# A tracked .test.ts file can contain no registered cases, so check Bun's per-file JUnit results.
-declare -a turbo_build_filters=()
-seen_turbo_build_filters=$'\n'
+# Prepare the union of selected test tasks' resolved prerequisites once. Turbo still
+# owns each preparation task's environment, local config, and dependency ordering.
+declare -a turbo_prep_requests=()
+seen_turbo_prep_requests=$'\n'
 index=0
 while [ "$index" -lt "$target_count" ]; do
   package_config=()
   while IFS= read -r field; do package_config+=("$field"); done < "${package_config_paths[index]}"
-  script_env_count=${package_config[2]}
-  script_option_count_index=$((3 + script_env_count))
-  script_option_count=${package_config[script_option_count_index]}
-  turbo_prep_count_index=$((script_option_count_index + 1 + script_option_count))
-  turbo_prep_count=${package_config[turbo_prep_count_index]}
-  turbo_prep_index=$((turbo_prep_count_index + 1))
+  turbo_prep_count=${package_config[1]}
+  turbo_prep_index=2
   turbo_prep_offset=0
   while [ "$turbo_prep_offset" -lt "$turbo_prep_count" ]; do
-    filter="--filter=./${package_config[turbo_prep_index]}"
-    case "$seen_turbo_build_filters" in
-      *$'\n'"$filter"$'\n'*) ;;
+    request=${package_config[turbo_prep_index]}
+    case "$seen_turbo_prep_requests" in
+      *$'\n'"$request"$'\n'*) ;;
       *)
-        seen_turbo_build_filters+="$filter"$'\n'
-        turbo_build_filters+=("$filter")
+        seen_turbo_prep_requests+="$request"$'\n'
+        turbo_prep_requests+=("$request")
         ;;
     esac
     turbo_prep_index=$((turbo_prep_index + 1))
@@ -455,91 +425,118 @@ while [ "$index" -lt "$target_count" ]; do
   done
   index=$((index + 1))
 done
-if [ "${#turbo_build_filters[@]}" -gt 0 ]; then
+
+declare -a turbo_prep_tasks=()
+seen_turbo_prep_tasks=$'\n'
+for request in "${turbo_prep_requests[@]}"; do
+  prep_task=${request%%|*}
+  case "$seen_turbo_prep_tasks" in
+    *$'\n'"$prep_task"$'\n'*) ;;
+    *)
+      seen_turbo_prep_tasks+="$prep_task"$'\n'
+      turbo_prep_tasks+=("$prep_task")
+      ;;
+  esac
+done
+for prep_task in "${turbo_prep_tasks[@]}"; do
+  declare -a prep_filters=()
+  seen_prep_filters=$'\n'
+  for request in "${turbo_prep_requests[@]}"; do
+    if [ "${request%%|*}" != "$prep_task" ]; then continue; fi
+    filter="--filter=./${request#*|}"
+    case "$seen_prep_filters" in
+      *$'\n'"$filter"$'\n'*) ;;
+      *)
+        seen_prep_filters+="$filter"$'\n'
+        prep_filters+=("$filter")
+        ;;
+    esac
+  done
   preparation_status=0
-  GITHUB_ACTIONS=false bun turbo run build "${turbo_build_filters[@]}" || preparation_status=$?
+  GITHUB_ACTIONS=false bun turbo run "$prep_task" "${prep_filters[@]}" --force || preparation_status=$?
   if [ "$preparation_status" -ne 0 ]; then
-    printf '%s\n' 'tests/run.sh: Turbo-declared build preparation failed for fast-suite targets' >&2
+    printf 'tests/run.sh: Turbo-declared preparation task failed: %s\n' "$prep_task" >&2
     printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=turbo-preparation-failed exit_code=1'
     exit 1
   fi
-fi
+done
 
+# Keep each owning package's selected files in one task invocation so package-level
+# preparation and the Bun pretest/test/posttest lifecycle match its scoped Turbo run.
 fast_status=0
 coverage_invalid=0
 execution_set_invalid=0
 attributed_refusal=0
 attributed_failure_target=
 attributed_failure_phase=
+seen_run_packages=$'\n'
 index=0
 while [ "$index" -lt "$target_count" ]; do
   package_root=${package_paths[index]}
-  target=${test_paths[index]}
+  case "$seen_run_packages" in
+    *$'\n'"$package_root"$'\n'*)
+      index=$((index + 1))
+      continue
+      ;;
+  esac
+  seen_run_packages+="$package_root"$'\n'
   package_config=()
   while IFS= read -r field; do package_config+=("$field"); done < "${package_config_paths[index]}"
-  has_pretest=${package_config[0]}
-  has_posttest=${package_config[1]}
-  script_env_count=${package_config[2]}
-  script_env=("${package_config[@]:3:script_env_count}")
-  script_option_count_index=$((3 + script_env_count))
-  script_option_count=${package_config[script_option_count_index]}
-  script_options_index=$((script_option_count_index + 1))
-  script_options=("${package_config[@]:script_options_index:script_option_count}")
-  target_status=0
-  target_failure_phase=
-  test_invoked=1
-  if [ "$has_pretest" = 1 ]; then
-    pretest_status=0
-    GITHUB_ACTIONS=false bun --cwd="$root/$package_root" run pretest || pretest_status=$?
-    if [ "$pretest_status" -ne 0 ]; then
-      target_status=$pretest_status
-      target_failure_phase="pretest"
-      test_invoked=0
-    fi
-  fi
-  report_args=(--reporter=junit --reporter-outfile="$report_file")
-  selected_path="./$target"
-  # Bun resolves bunfig.toml and relative preload paths from its own working directory.
-  if [ "$test_invoked" -eq 1 ]; then
-    test_status=0
-    env GITHUB_ACTIONS=false "${script_env[@]}" bun --cwd="$root/$package_root" test \
-      "${script_options[@]}" "${report_args[@]}" "$selected_path" || test_status=$?
-    if [ "$test_status" -ne 0 ] && [ "$target_status" -eq 0 ]; then
-      target_status=$test_status
-      target_failure_phase="test"
-    fi
-  fi
-  # Run posttest after the pretest/test attempt even when an earlier step failed.
-  if [ "$has_posttest" = 1 ]; then
-    posttest_status=0
-    GITHUB_ACTIONS=false bun --cwd="$root/$package_root" run posttest || posttest_status=$?
-    if [ "$posttest_status" -ne 0 ] && [ "$target_status" -eq 0 ]; then
-      target_status=$posttest_status
-      target_failure_phase="posttest"
-    fi
-  fi
+  has_turbo_task=${package_config[0]}
 
-  if [ "$test_invoked" -eq 1 ] && [ -s "$report_file" ]; then
+  selected_targets=()
+  selected_paths=()
+  candidate_index=0
+  while [ "$candidate_index" -lt "$target_count" ]; do
+    if [ "${package_paths[candidate_index]}" = "$package_root" ]; then
+      selected_targets+=("${test_paths[candidate_index]}")
+      selected_paths+=("./${test_paths[candidate_index]}")
+    fi
+    candidate_index=$((candidate_index + 1))
+  done
+  target_label="${selected_targets[*]}"
+
+  target_status=0
+  target_failure_phase="package-test"
+  report_args=(--reporter=junit --reporter-outfile="$report_file")
+  test_status=0
+  if [ "$has_turbo_task" = 1 ]; then
+    GITHUB_ACTIONS=false bun turbo run test "--filter=./$package_root" --only --force -- \
+      "${report_args[@]}" "${selected_paths[@]}" || test_status=$?
+  else
+    GITHUB_ACTIONS=false bun --cwd="$root/$package_root" run test -- \
+      "${report_args[@]}" "${selected_paths[@]}" || test_status=$?
+  fi
+  if [ "$test_status" -ne 0 ]; then target_status=$test_status; fi
+
+  if [ -s "$report_file" ]; then
     report_status=0
-    FAST_SUITE_REPORT="$report_file" FAST_SUITE_TARGET="$target" bun -e '
+    printf -v selected_target_lines '%s\n' "${selected_targets[@]}"
+    FAST_SUITE_REPORT="$report_file" FAST_SUITE_TARGETS="$selected_target_lines" bun -e '
       const report = await Bun.file(process.env.FAST_SUITE_REPORT).text()
-      const target = process.env.FAST_SUITE_TARGET
+      const targets = process.env.FAST_SUITE_TARGETS.split("\n").filter(Boolean)
+      const expected = new Set(targets)
       const suites = Array.from(report.matchAll(/<testsuite\b([^>]*)>/g), ([, text]) => {
         const attributes = Object.fromEntries(
           Array.from(text.matchAll(/([A-Za-z][A-Za-z0-9_-]*)="([^"]*)"/g), (match) => [match[1], match[2]]),
         )
         return { file: attributes.file, tests: Number(attributes.tests), skipped: Number(attributes.skipped ?? 0) }
       })
-      const unexpected = Array.from(new Set(suites.map((suite) => suite.file))).filter((file) => file !== target)
-      if (unexpected.length) {
-        console.error("tests/run.sh: Bun executed files outside manifest entry " + target + ": " + unexpected.map((file) => String(file ?? "<unattributed>")).join(", "))
+      const actual = new Set(suites.map((suite) => suite.file))
+      const unexpected = Array.from(actual).filter((file) => !expected.has(file))
+      const missing = targets.filter((target) => !actual.has(target))
+      if (unexpected.length || missing.length) {
+        if (unexpected.length) {
+          console.error("tests/run.sh: Bun executed files outside the selected manifest entries: " + unexpected.map((file) => String(file ?? "<unattributed>")).join(", "))
+        }
+        if (missing.length) console.error("tests/run.sh: Bun did not report selected manifest entries: " + missing.join(", "))
         process.exit(2)
       }
-      const active = suites.some(
-        (suite) => suite.file === target && Number.isFinite(suite.tests) && suite.tests > suite.skipped,
+      const inactive = targets.filter(
+        (target) => !suites.some((suite) => suite.file === target && Number.isFinite(suite.tests) && suite.tests > suite.skipped),
       )
-      if (!active) {
-        console.error("tests/run.sh: Bun reported no active test cases for: " + target)
+      if (inactive.length) {
+        console.error("tests/run.sh: Bun reported no active test cases for: " + inactive.join(", "))
         process.exit(3)
       }
       ' || report_status=$?
@@ -551,18 +548,18 @@ while [ "$index" -lt "$target_count" ]; do
       fi
       target_status=1
     fi
-  elif [ "$test_invoked" -eq 1 ] && [ "$target_status" -eq 0 ]; then
+  elif [ "$target_status" -eq 0 ]; then
     coverage_invalid=1
     target_status=1
   elif [ "$target_status" -ne 0 ]; then
     attributed_refusal=1
     if [ -z "$attributed_failure_target" ]; then
-      attributed_failure_target=$target
+      attributed_failure_target=$target_label
       attributed_failure_phase=$target_failure_phase
     fi
   fi
   if [ "$target_status" -ne 0 ] && [ -s "$report_file" ]; then
-    printf 'tests/run.sh: JUnit report for %s:\n' "$target" >&2
+    printf 'tests/run.sh: JUnit report for %s:\n' "$target_label" >&2
     while IFS= read -r report_line || [ -n "$report_line" ]; do
       printf '%s\n' "$report_line" >&2
     done < "$report_file"

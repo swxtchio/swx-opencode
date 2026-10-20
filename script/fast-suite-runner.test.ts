@@ -4,6 +4,7 @@ import {
   copyFileSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -15,10 +16,10 @@ import { dirname, join } from "node:path"
 const scratch = mkdtempSync(join(tmpdir(), "fast-suite-runner-"))
 afterAll(() => rmSync(scratch, { recursive: true, force: true }))
 
-// GOAL: prove fast mode honors owning-package test options and Turbo preparation while running
-// exact targets; refusals preserve attributed failures and reject unexpected JUnit files.
+// GOAL: compare fast-mode package traces with owning Turbo/package-script runs over exact files;
+// refusals preserve attributed failures and reject any JUnit execution-set mismatch.
 test(
-  "tests/run.sh preserves package preparation and test options for exact fast targets",
+  "tests/run.sh matches owning package preparation, options, and lifecycle for exact fast targets",
   () => {
     const root = join(scratch, "repo")
     const marker = join(scratch, "executed.txt")
@@ -31,6 +32,7 @@ test(
     const runner = join(root, "tests", "run.sh")
     const manifest = join(root, "tests", "fast-suite.txt")
     const packageRoot = join(root, "packages", "example")
+    const packageTurboConfig = join(packageRoot, "turbo.json")
     const packageTests = join(packageRoot, "test")
     const dependencyRoot = join(root, "packages", "dependency")
     const directPackageRoot = join(root, "packages", "direct")
@@ -56,6 +58,29 @@ ${selectedSecondPath}
 ${directPath}
 ${directSecondPath}
 `
+    const exampleTurboConfig = {
+      extends: ["//"],
+      tasks: {
+        test: {
+          dependsOn: ["^build"],
+          outputs: [],
+          passThroughEnv: [
+            "FAST_SUITE_MARKER",
+            "FAST_SUITE_PACKAGE_PRELOAD_LOG",
+            "FAST_SUITE_HOOK_LOG",
+            "FAST_SUITE_BUILD_LOG",
+            "FAST_SUITE_BUN_LOG",
+            "FAST_SUITE_REAL_BUN",
+            "FAST_SUITE_FAIL_PRETEST",
+            "FAST_SUITE_FAIL_POSTTEST",
+            "FAST_SUITE_FORCE_EXTRA_FILE",
+            "PATH",
+            "HOME",
+            "TMPDIR",
+          ],
+        },
+      },
+    }
     const gitEnv = {
       ...process.env,
       GIT_AUTHOR_NAME: "Runner fixture",
@@ -78,6 +103,9 @@ ${directSecondPath}
         FAST_SUITE_REAL_BUN: process.execPath,
         FAST_SUITE_FAIL_PRETEST: "0",
         FAST_SUITE_FAIL_POSTTEST: "0",
+        FAST_SUITE_FAIL_BUILD: "0",
+        FAST_SUITE_UNDECLARED: "ambient-only",
+        FAST_SUITE_REAL_TURBO: realpathSync(join(import.meta.dir, "..", "node_modules", ".bin", "turbo")),
         PATH: `${join(root, "bin")}:${process.env.PATH}`,
       },
       stdout: "pipe" as const,
@@ -121,13 +149,16 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
       }),
     )
     writeFileSync(join(root, "bunfig.toml"), '[test]\nroot = "./do-not-run-tests-from-root"\n')
-    writeFileSync(join(root, ".gitignore"), "packages/example/test/untracked.test.ts\n")
+    writeFileSync(join(root, ".gitignore"), ".turbo/\npackages/example/test/untracked.test.ts\n")
     writeFileSync(
       join(root, "turbo.json"),
       JSON.stringify({
         tasks: {
-          build: { outputs: [] },
-          "@fixture/example#test": { outputs: [], dependsOn: ["^build"] },
+          build: {
+            outputs: [],
+            env: ["FAST_SUITE_FAIL_BUILD"],
+            passThroughEnv: ["FAST_SUITE_BUILD_LOG", "FAST_SUITE_REAL_BUN", "PATH"],
+          },
         },
       }),
     )
@@ -146,6 +177,7 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
       },
     }
     writeFileSync(join(packageRoot, "package.json"), JSON.stringify(examplePackage))
+    writeFileSync(packageTurboConfig, JSON.stringify(exampleTurboConfig))
     writeFileSync(
       join(dependencyRoot, "package.json"),
       JSON.stringify({
@@ -160,6 +192,7 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
       [
         'import { appendFileSync } from "node:fs"',
         'appendFileSync(process.env.FAST_SUITE_BUILD_LOG!, "dependency-build\\n")',
+        'if (process.env.FAST_SUITE_FAIL_BUILD === "1") process.exit(1)',
         "",
       ].join("\n"),
     )
@@ -170,7 +203,7 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         private: true,
         type: "module",
         scripts: {
-          test: "FAST_SUITE_CONFIG_KIND=direct-package FAST_SUITE_CONFIG_VALUE=direct bun test --timeout 5000 --max-concurrency=1 ./test/direct.test.ts ./test/direct.test.tsx",
+          test: "FAST_SUITE_CONFIG_KIND=direct-package FAST_SUITE_CONFIG_VALUE=\"direct\\path\" bun test --timeout 5000 --max-concurrency=1",
         },
       }),
     )
@@ -236,6 +269,7 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         '  expect(process.env.FAST_SUITE_PRELOAD).toBe(process.cwd())',
         '  expect(process.env.FAST_SUITE_CONFIG_KIND).toBe("package")',
         '  expect(process.env.FAST_SUITE_CONFIG_VALUE).toBe("example\\\\suite")',
+        '  expect(process.env.FAST_SUITE_UNDECLARED).toBeUndefined()',
         '  expect(readFileSync(process.env.FAST_SUITE_BUILD_LOG!, "utf8")).toContain("dependency-build")',
         '  appendFileSync(process.env.FAST_SUITE_MARKER!, "selected-configured\\n")',
         '  appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "selected\\n")',
@@ -275,6 +309,7 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         '  expect(process.env.FAST_SUITE_PRELOAD).toBe(process.cwd())',
         '  expect(process.env.FAST_SUITE_CONFIG_KIND).toBe("package")',
         '  expect(process.env.FAST_SUITE_CONFIG_VALUE).toBe("example\\\\suite")',
+        '  expect(process.env.FAST_SUITE_UNDECLARED).toBeUndefined()',
         '  appendFileSync(process.env.FAST_SUITE_MARKER!, "second-configured\\n")',
         '  appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "selected-second\\n")',
         "})",
@@ -289,7 +324,8 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         'test("uses the direct package test environment and preload", () => {',
         '  expect(process.env.FAST_SUITE_PRELOAD).toBe(process.cwd())',
         '  expect(process.env.FAST_SUITE_CONFIG_KIND).toBe("direct-package")',
-        '  expect(process.env.FAST_SUITE_CONFIG_VALUE).toBe("direct")',
+        '  expect(process.env.FAST_SUITE_CONFIG_VALUE).toBe("direct\\\\path")',
+        '  expect(process.env.FAST_SUITE_UNDECLARED).toBe("ambient-only")',
         '  appendFileSync(process.env.FAST_SUITE_MARKER!, "direct-configured\\n")',
         "})",
         "",
@@ -303,7 +339,8 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         'test("uses direct package test options and preload for each target", () => {',
         '  expect(process.env.FAST_SUITE_PRELOAD).toBe(process.cwd())',
         '  expect(process.env.FAST_SUITE_CONFIG_KIND).toBe("direct-package")',
-        '  expect(process.env.FAST_SUITE_CONFIG_VALUE).toBe("direct")',
+        '  expect(process.env.FAST_SUITE_CONFIG_VALUE).toBe("direct\\\\path")',
+        '  expect(process.env.FAST_SUITE_UNDECLARED).toBe("ambient-only")',
         '  appendFileSync(process.env.FAST_SUITE_MARKER!, "direct-second-configured\\n")',
         "})",
         "",
@@ -409,45 +446,8 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
       turbo,
       `#!/usr/bin/env bash
 set -euo pipefail
-root="\${FAST_SUITE_FIXTURE_ROOT:?}"
 printf '%s\\n' "$*" >> "\${FAST_TURBO_LOG:?}"
-if [ "\${1:-}" = run ] && [ "\${2:-}" = test ] && [ "\${3:-}" = --filter=./packages/example ] && [ "\${4:-}" = --dry=json ]; then
-  printf '%s\\n' '{"tasks":[{"taskId":"@fixture/example#test","dependencies":["@fixture/dependency#build"]},{"taskId":"@fixture/dependency#build","directory":"packages/dependency","command":"bun ./build.ts"}]}'
-  exit 0
-fi
-if [ "\${1:-}" = run ] && [ "\${2:-}" = build ]; then
-  for argument in "$@"; do
-    if [ "$argument" = "--filter=./packages/dependency" ]; then
-      (cd "$root/packages/dependency" && bun run build)
-    fi
-  done
-  exit "$?"
-fi
-package=
-read_targets=0
-targets=()
-for argument in "$@"; do
-  if [ "$argument" = "--" ]; then
-    read_targets=1
-    continue
-  fi
-  if [ "$read_targets" -eq 1 ]; then
-    targets+=("$argument")
-    continue
-  fi
-  case "$argument" in
-    --filter=./*) package="\${argument#--filter=./}" ;;
-  esac
-done
-if [ "$1" = test ] && [ -n "$package" ]; then
-  (cd "$root/$package" && bun run test -- "\${targets[@]}")
-  exit "$?"
-fi
-if [ "$#" -eq 1 ] && [ "$1" = test ]; then
-  (cd "$root/packages/example" && bun run test)
-  exit "$?"
-fi
-exit 97
+exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
 `,
     )
     chmodSync(turbo, 0o755)
@@ -473,37 +473,149 @@ exit 97
     expect(Bun.spawnSync(["git", "add", "."], { cwd: root, env: gitEnv }).exitCode).toBe(0)
     expect(Bun.spawnSync(["git", "commit", "-qm", "runner fixture"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
 
+    const oracleOptions = { ...runOptions, env: { ...runOptions.env, GITHUB_ACTIONS: "false" } }
+    const turboOracleReport = join(scratch, "turbo-oracle.xml")
+    const turboOracle = Bun.spawnSync(
+      [
+        "bun",
+        "turbo",
+        "run",
+        "test",
+        "--filter=./packages/example",
+        "--force",
+        "--",
+        "--reporter=junit",
+        `--reporter-outfile=${turboOracleReport}`,
+        `./${selectedPath.slice(packagePath.length + 1)}`,
+        `./${selectedSecondPath.slice(packagePath.length + 1)}`,
+      ],
+      oracleOptions,
+    )
+    if (turboOracle.exitCode !== 0) console.error(turboOracle.stdout.toString(), turboOracle.stderr.toString())
+    expect(turboOracle.exitCode).toBe(0)
+    const turboOracleHooks = readFileSync(hookLog, "utf8").trim().split("\n")
+    const turboOracleTrace = {
+      markers: readFileSync(marker, "utf8").trim().split("\n").sort(),
+      preloads: readFileSync(packagePreloadLog, "utf8").trim().split("\n"),
+      hookStart: turboOracleHooks[0],
+      hookTests: turboOracleHooks.slice(1, -1).sort(),
+      hookEnd: turboOracleHooks.at(-1),
+      builds: readFileSync(buildLog, "utf8").trim().split("\n"),
+    }
+    expect(turboOracleTrace.markers).toEqual(["second-configured", "selected-configured"])
+    expect(turboOracleTrace.preloads).toEqual(["preload", "preload"])
+    expect(turboOracleTrace.hookStart).toBe("pretest")
+    expect(turboOracleTrace.hookTests).toEqual(["selected", "selected-second"])
+    expect(turboOracleTrace.hookEnd).toBe("posttest")
+    expect(turboOracleTrace.builds).toEqual(["dependency-build"])
+
+    writeFileSync(marker, "")
+    writeFileSync(directPreloadLog, "")
+    const directOracleReport = join(scratch, "direct-oracle.xml")
+    const directOracle = Bun.spawnSync(
+      [
+        "bun",
+        `--cwd=${directPackageRoot}`,
+        "run",
+        "test",
+        "--",
+        "--reporter=junit",
+        `--reporter-outfile=${directOracleReport}`,
+        `./${directPath.slice("packages/direct/".length)}`,
+        `./${directSecondPath.slice("packages/direct/".length)}`,
+      ],
+      oracleOptions,
+    )
+    if (directOracle.exitCode !== 0) console.error(directOracle.stdout.toString(), directOracle.stderr.toString())
+    expect(directOracle.exitCode).toBe(0)
+    const directOracleTrace = {
+      markers: readFileSync(marker, "utf8").trim().split("\n").sort(),
+      preloads: readFileSync(directPreloadLog, "utf8").trim().split("\n"),
+    }
+    expect(directOracleTrace.markers).toEqual(["direct-configured", "direct-second-configured"])
+    expect(directOracleTrace.preloads).toEqual(["preload"])
+
+    rmSync(turboOracleReport, { force: true })
+    rmSync(directOracleReport, { force: true })
+    rmSync(join(root, ".turbo"), { recursive: true, force: true })
+    writeFileSync(marker, "")
+    writeFileSync(packagePreloadLog, "")
+    writeFileSync(directPreloadLog, "")
+    writeFileSync(hookLog, "")
+    writeFileSync(buildLog, "")
+    writeFileSync(bunArgsLog, "")
+    writeFileSync(turboLog, "")
+
     const fast = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
     if (fast.exitCode !== 0) console.error(fast.stdout.toString(), fast.stderr.toString())
     expect(fast.exitCode).toBe(0)
     expect(fast.stdout.toString().trim().endsWith("verdict=completed mode=fast target_count=4 exit_code=0")).toBe(true)
-    expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual([
+    const fastMarkers = readFileSync(marker, "utf8").trim().split("\n").sort()
+    expect(fastMarkers).toEqual([
       "direct-configured",
       "direct-second-configured",
       "second-configured",
       "selected-configured",
     ])
+    const fastPackageHooks = readFileSync(hookLog, "utf8").trim().split("\n")
+    expect({
+      markers: fastMarkers.filter((entry) => !entry.startsWith("direct-")),
+      preloads: readFileSync(packagePreloadLog, "utf8").trim().split("\n"),
+      hookStart: fastPackageHooks[0],
+      hookTests: fastPackageHooks.slice(1, -1).sort(),
+      hookEnd: fastPackageHooks.at(-1),
+      builds: readFileSync(buildLog, "utf8").trim().split("\n"),
+    }).toEqual(turboOracleTrace)
+    expect({
+      markers: fastMarkers.filter((entry) => entry.startsWith("direct-")),
+      preloads: readFileSync(directPreloadLog, "utf8").trim().split("\n"),
+    }).toEqual(directOracleTrace)
     expect(readdirSync(root).filter((name) => name.startsWith(".fast-suite-report."))).toEqual([])
-    expect(readFileSync(turboLog, "utf8").trim().split("\n")).toEqual([
-      "run test --filter=./packages/example --dry=json",
-      "run build --filter=./packages/dependency",
-    ])
+    const turboInvocations = readFileSync(turboLog, "utf8").trim().split("\n")
+    expect(turboInvocations[0]).toBe("run test --filter=./packages/example --dry=json")
+    expect(turboInvocations[1]).toBe("run test --filter=./packages/direct --dry=json")
+    expect(turboInvocations[2]).toBe("run build --filter=./packages/dependency --force")
+    expect(turboInvocations[3]).toContain("run test --filter=./packages/example --only --force -- --reporter=junit")
+    expect(turboInvocations[3]).toContain("./test/selected.test.ts")
+    expect(turboInvocations[3]).toContain("./test/selected-second.test.ts")
     expect(readFileSync(buildLog, "utf8").trim().split("\n")).toEqual(["dependency-build"])
     expect(readFileSync(packagePreloadLog, "utf8").trim().split("\n")).toEqual(["preload", "preload"])
-    expect(readFileSync(directPreloadLog, "utf8").trim().split("\n")).toEqual(["preload", "preload"])
+    expect(readFileSync(directPreloadLog, "utf8").trim().split("\n")).toEqual(["preload"])
     const bunTestArgs = readFileSync(bunArgsLog, "utf8")
     expect(bunTestArgs).toContain("--parallel=2\n")
     expect(bunTestArgs).toContain("--timeout\n5000\n")
     expect(bunTestArgs).toContain("--only-failures\n")
     expect(bunTestArgs).toContain("--max-concurrency=1\n")
-    expect(readFileSync(hookLog, "utf8").trim().split("\n")).toEqual([
-      "pretest",
-      "selected",
-      "posttest",
-      "pretest",
-      "selected-second",
-      "posttest",
-    ])
+    expect(fastPackageHooks[0]).toBe("pretest")
+    expect(fastPackageHooks.slice(1, -1).sort()).toEqual(["selected", "selected-second"])
+    expect(fastPackageHooks.at(-1)).toBe("posttest")
+
+    writeFileSync(packageTurboConfig, JSON.stringify({ extends: ["//"], tasks: {} }))
+    expect(Bun.spawnSync(["git", "add", "packages/example/turbo.json"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "remove the package-local test task"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    const beforeMissingLocalTask = readFileSync(marker, "utf8")
+    const missingLocalTask = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(missingLocalTask.exitCode).toBe(1)
+    expect(
+      missingLocalTask.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=invalid-fast-manifest exit_code=1"),
+    ).toBe(true)
+    expect(missingLocalTask.stderr.toString()).toContain("package-local turbo.json")
+    expect(readFileSync(marker, "utf8")).toBe(beforeMissingLocalTask)
+    writeFileSync(packageTurboConfig, JSON.stringify(exampleTurboConfig))
+    expect(Bun.spawnSync(["git", "add", "packages/example/turbo.json"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "restore the package-local test task"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+
+    writeFileSync(marker, "")
+    writeFileSync(buildLog, "")
+    runOptions.env.FAST_SUITE_FAIL_BUILD = "1"
+    const failedPreparation = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(failedPreparation.exitCode).toBe(1)
+    expect(
+      failedPreparation.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=turbo-preparation-failed exit_code=1"),
+    ).toBe(true)
+    expect(readFileSync(marker, "utf8")).toBe("")
+    expect(readFileSync(buildLog, "utf8").trim().split("\n")).toEqual(["dependency-build"])
+    runOptions.env.FAST_SUITE_FAIL_BUILD = "0"
 
     const unexpectedFileScript = exampleTestScript.replace("FAST_SUITE_FORCE_EXTRA_FILE=0", "FAST_SUITE_FORCE_EXTRA_FILE=1")
     writeFileSync(
@@ -521,7 +633,7 @@ exit 97
     expect(
       unexpectedFile.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=execution-set-mismatch exit_code=1"),
     ).toBe(true)
-    expect(unexpectedFile.stderr.toString()).toContain("Bun executed files outside manifest entry")
+    expect(unexpectedFile.stderr.toString()).toContain("Bun executed files outside the selected manifest entries")
     expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual(["selected-configured", "unlisted"])
     expect(readdirSync(root).filter((name) => name.startsWith(".fast-suite-report."))).toEqual([])
 
@@ -544,7 +656,7 @@ exit 97
     expect(shortTimeout.exitCode).toBe(1)
     expect(shortTimeout.stdout.toString().trim().endsWith("verdict=completed mode=fast target_count=1 exit_code=1")).toBe(true)
     expect(shortTimeout.stderr.toString().toLowerCase()).toContain("timeout")
-    expect(readFileSync(hookLog, "utf8").trim().split("\n")).toEqual(["pretest", "posttest"])
+    expect(readFileSync(hookLog, "utf8").trim().split("\n")).toEqual(["pretest"])
     expect(readdirSync(root).filter((name) => name.startsWith(".fast-suite-report."))).toEqual([])
 
     writeFileSync(join(packageRoot, "package.json"), JSON.stringify(examplePackage))
@@ -566,9 +678,9 @@ exit 97
         .trim()
         .endsWith("verdict=refused mode=fast reason=target-failed-without-junit exit_code=1"),
     ).toBe(true)
-    expect(failedPretest.stderr.toString()).toContain("failed during pretest without JUnit attribution")
+    expect(failedPretest.stderr.toString()).toContain("failed during package-test without JUnit attribution")
     expect(readFileSync(marker, "utf8")).toBe("")
-    expect(readFileSync(hookLog, "utf8").trim().split("\n")).toEqual(["pretest", "posttest"])
+    expect(readFileSync(hookLog, "utf8").trim().split("\n")).toEqual(["pretest"])
 
     runOptions.env.FAST_SUITE_FAIL_PRETEST = "0"
     runOptions.env.FAST_SUITE_FAIL_POSTTEST = "1"
@@ -587,7 +699,7 @@ exit 97
     expect(Bun.spawnSync(["git", "add", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
     expect(Bun.spawnSync(["git", "commit", "-qm", "restore fast targets"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
 
-    writeFileSync(join(root, ".gitignore"), "packages/example/test/untracked.test.ts\ntests/fast-suite.txt\n")
+    writeFileSync(join(root, ".gitignore"), ".turbo/\npackages/example/test/untracked.test.ts\ntests/fast-suite.txt\n")
     expect(Bun.spawnSync(["git", "add", ".gitignore"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
     expect(
       Bun.spawnSync(["git", "rm", "--cached", "--", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode,
@@ -603,7 +715,7 @@ exit 97
         .trim()
         .endsWith("verdict=refused mode=fast reason=fast-manifest-unavailable exit_code=1"),
     ).toBe(true)
-    writeFileSync(join(root, ".gitignore"), "packages/example/test/untracked.test.ts\n")
+    writeFileSync(join(root, ".gitignore"), ".turbo/\npackages/example/test/untracked.test.ts\n")
     expect(Bun.spawnSync(["git", "add", ".gitignore", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
     expect(Bun.spawnSync(["git", "commit", "-qm", "restore the tracked manifest"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
 
@@ -690,22 +802,20 @@ exit 97
       "failing",
       "selected-configured",
     ])
-    expect(readFileSync(hookLog, "utf8").trim().split("\n")).toEqual([
-      "pretest",
-      "posttest",
-      "pretest",
-      "selected",
-      "posttest",
-    ])
+    expect(readFileSync(hookLog, "utf8").trim().split("\n")).toEqual(["pretest", "selected"])
 
     writeFileSync(manifest, validManifest)
     expect(Bun.spawnSync(["git", "add", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
     expect(Bun.spawnSync(["git", "commit", "-qm", "restore fast target"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
     rmSync(untrackedTarget)
     writeFileSync(marker, "")
+    writeFileSync(hookLog, "")
     const fullFailure = Bun.spawnSync(["bash", runner], runOptions)
     expect(fullFailure.exitCode).not.toBe(0)
     expect(fullFailure.stdout.toString().trim().endsWith("verdict=completed mode=full exit_code=1")).toBe(true)
+    const fullHooks = readFileSync(hookLog, "utf8").trim().split("\n")
+    expect(fullHooks[0]).toBe("pretest")
+    expect(fullHooks).not.toContain("posttest")
     const fullRuns = readFileSync(marker, "utf8").trim().split("\n").sort()
     expect(fullRuns).toEqual([
       "failing",

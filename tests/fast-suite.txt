@@ -2,9 +2,10 @@
 # Full-suite/CI Turbo task gaps include TUI, Client, JS SDK, codemode, effect-drizzle-sqlite,
 # httpapi-codegen, http-recorder, llm, and sdk-next; see #317.
 # Core has a registered @opencode-ai/core#test Turbo task and is also selected for fast coverage.
-# Fast mode forwards supported test-script options and literal env assignments, prepares registered Turbo `^build`
-# tasks, and runs only each exact selected file. No selected test task declares explicit input globs; unsupported
-# dependencies or inputs refuse instead of being silently skipped. Posttest runs after pretest/test failures too.
+# Fast mode groups exact selected files by package and runs one owning Turbo test task with those file arguments;
+# packages without a task use their package test script. Turbo supplies strict env, package-local config, and declared
+# preparation. Bun's package lifecycle is preserved: pretest failure stops test/posttest, and test failure skips
+# posttest; hook failures still propagate. A package-local turbo.json without a resolved test task is refused.
 # Changes touching an excluded timing class require that class at the final gate via
 # firstmate's repository suite override; release builds require a passing full suite.
 
