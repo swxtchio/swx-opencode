@@ -175,7 +175,8 @@ while IFS= read -r line || [ -n "$line" ]; do
   done
   if [ "$package_config_index" -eq "${#configured_packages[@]}" ]; then
     config_path="$config_dir/$package_config_index"
-    if ! FAST_SUITE_PACKAGE_JSON="$root/$package_root/package.json" \
+    if ! FAST_SUITE_ROOT="$root" FAST_SUITE_PACKAGE_ROOT="$package_root" \
+      FAST_SUITE_PACKAGE_JSON="$root/$package_root/package.json" \
       FAST_SUITE_TURBO_JSON="$root/turbo.json" bun -e '
       const pkg = await Bun.file(process.env.FAST_SUITE_PACKAGE_JSON).json()
       const turbo = await Bun.file(process.env.FAST_SUITE_TURBO_JSON).json()
@@ -336,8 +337,11 @@ while IFS= read -r line || [ -n "$line" ]; do
         }
         fail("unsupported scripts.test Bun option: " + option)
       }
-      const task = turbo.tasks?.[String(pkg.name) + "#test"] ?? turbo.tasks?.test
-      let prepareBuild = "0"
+      if (typeof turbo.tasks !== "object" || turbo.tasks === null || Array.isArray(turbo.tasks)) {
+        fail("turbo.json tasks must be an object")
+      }
+      const task = turbo.tasks[String(pkg.name) + "#test"] ?? turbo.tasks.test
+      const preparationDirectories = []
       if (task !== undefined) {
         if (typeof task !== "object" || task === null || Array.isArray(task)) fail("Turbo test task must be an object")
         const inputs = task.inputs
@@ -351,7 +355,39 @@ while IFS= read -r line || [ -n "$line" ]; do
         if (dependencies.some((dependency) => dependency !== "^build")) {
           fail("unsupported Turbo test task dependency: " + dependencies.find((dependency) => dependency !== "^build"))
         }
-        if (dependencies.includes("^build")) prepareBuild = "1"
+        if (dependencies.includes("^build")) {
+          const dryRun = Bun.spawnSync(
+            ["bun", "turbo", "run", "test", "--filter=./" + process.env.FAST_SUITE_PACKAGE_ROOT, "--dry=json"],
+            { cwd: process.env.FAST_SUITE_ROOT, stdout: "pipe", stderr: "pipe" },
+          )
+          if (dryRun.exitCode !== 0) {
+            fail("could not resolve Turbo-declared build dependencies: " + new TextDecoder().decode(dryRun.stderr))
+          }
+          const plan = JSON.parse(new TextDecoder().decode(dryRun.stdout))
+          if (!Array.isArray(plan.tasks)) fail("Turbo dry-run did not provide a task plan")
+          const targetTask = plan.tasks.find((candidate) => candidate.taskId === String(pkg.name) + "#test")
+          if (!targetTask) fail("Turbo dry-run omitted the owning test task for " + process.env.FAST_SUITE_PACKAGE_ROOT)
+          if (!Array.isArray(targetTask.dependencies) || targetTask.dependencies.some((dependency) => typeof dependency !== "string")) {
+            fail("Turbo dry-run dependencies must be task ids")
+          }
+          const taskById = new Map(plan.tasks.map((candidate) => [candidate.taskId, candidate]))
+          for (const dependencyID of targetTask.dependencies) {
+            const dependency = taskById.get(dependencyID)
+            if (!dependency) fail("Turbo dry-run omitted dependency task " + dependencyID)
+            if (dependency.command === "<NONEXISTENT>") continue
+            if (typeof dependency.taskId !== "string" || dependency.taskId.slice(dependency.taskId.lastIndexOf("#") + 1) !== "build") {
+              fail("Turbo test dependency is not a build task: " + dependencyID)
+            }
+            if (
+              typeof dependency.directory !== "string" ||
+              !dependency.directory.startsWith("packages/") ||
+              dependency.directory.split("/").includes("..")
+            ) {
+              fail("Turbo build dependency has an unsupported workspace directory: " + dependencyID)
+            }
+            preparationDirectories.push(dependency.directory)
+          }
+        }
       }
       const fields = [
         pkg.scripts.pretest === undefined ? "0" : "1",
@@ -360,7 +396,8 @@ while IFS= read -r line || [ -n "$line" ]; do
         ...environment,
         String(options.length),
         ...options,
-        prepareBuild,
+        String(new Set(preparationDirectories).size),
+        ...new Set(preparationDirectories),
       ]
       if (fields.some((field) => /[\u0000\r\n]/.test(field))) fail("scripts.test fields cannot contain newline characters")
       process.stdout.write(fields.join("\n") + "\n")
@@ -400,9 +437,12 @@ while [ "$index" -lt "$target_count" ]; do
   script_env_count=${package_config[2]}
   script_option_count_index=$((3 + script_env_count))
   script_option_count=${package_config[script_option_count_index]}
-  turbo_prepare_index=$((script_option_count_index + 1 + script_option_count))
-  if [ "${package_config[turbo_prepare_index]}" = 1 ]; then
-    filter="--filter=./${package_paths[index]}^..."
+  turbo_prep_count_index=$((script_option_count_index + 1 + script_option_count))
+  turbo_prep_count=${package_config[turbo_prep_count_index]}
+  turbo_prep_index=$((turbo_prep_count_index + 1))
+  turbo_prep_offset=0
+  while [ "$turbo_prep_offset" -lt "$turbo_prep_count" ]; do
+    filter="--filter=./${package_config[turbo_prep_index]}"
     case "$seen_turbo_build_filters" in
       *$'\n'"$filter"$'\n'*) ;;
       *)
@@ -410,7 +450,9 @@ while [ "$index" -lt "$target_count" ]; do
         turbo_build_filters+=("$filter")
         ;;
     esac
-  fi
+    turbo_prep_index=$((turbo_prep_index + 1))
+    turbo_prep_offset=$((turbo_prep_offset + 1))
+  done
   index=$((index + 1))
 done
 if [ "${#turbo_build_filters[@]}" -gt 0 ]; then

@@ -27,7 +27,7 @@ test(
     const directPreloadLog = join(scratch, "direct-preloads.txt")
     const hookLog = join(scratch, "hooks.txt")
     const buildLog = join(scratch, "dependency-builds.txt")
-    const bunArgsLog = join(scratch, "bun-test-argv.txt")
+    const bunArgsLog = join(scratch, "bun-invocation-argv.txt")
     const runner = join(root, "tests", "run.sh")
     const manifest = join(root, "tests", "fast-suite.txt")
     const packageRoot = join(root, "packages", "example")
@@ -411,9 +411,13 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
 set -euo pipefail
 root="\${FAST_SUITE_FIXTURE_ROOT:?}"
 printf '%s\\n' "$*" >> "\${FAST_TURBO_LOG:?}"
+if [ "\${1:-}" = run ] && [ "\${2:-}" = test ] && [ "\${3:-}" = --filter=./packages/example ] && [ "\${4:-}" = --dry=json ]; then
+  printf '%s\\n' '{"tasks":[{"taskId":"@fixture/example#test","dependencies":["@fixture/dependency#build"]},{"taskId":"@fixture/dependency#build","directory":"packages/dependency","command":"bun ./build.ts"}]}'
+  exit 0
+fi
 if [ "\${1:-}" = run ] && [ "\${2:-}" = build ]; then
   for argument in "$@"; do
-    if [ "$argument" = "--filter=./packages/example^..." ]; then
+    if [ "$argument" = "--filter=./packages/dependency" ]; then
       (cd "$root/packages/dependency" && bun run build)
     fi
   done
@@ -480,7 +484,10 @@ exit 97
       "selected-configured",
     ])
     expect(readdirSync(root).filter((name) => name.startsWith(".fast-suite-report."))).toEqual([])
-    expect(readFileSync(turboLog, "utf8").trim().split("\n")).toEqual(["run build --filter=./packages/example^..."])
+    expect(readFileSync(turboLog, "utf8").trim().split("\n")).toEqual([
+      "run test --filter=./packages/example --dry=json",
+      "run build --filter=./packages/dependency",
+    ])
     expect(readFileSync(buildLog, "utf8").trim().split("\n")).toEqual(["dependency-build"])
     expect(readFileSync(packagePreloadLog, "utf8").trim().split("\n")).toEqual(["preload", "preload"])
     expect(readFileSync(directPreloadLog, "utf8").trim().split("\n")).toEqual(["preload", "preload"])
