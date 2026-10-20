@@ -20,15 +20,13 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     '       tests/run.sh --help' \
     '' \
     'With no selector, runs the complete per-package Turbo test suite and forwards all arguments to Turbo.' \
-    '--fast invokes each entry in tests/fast-suite.txt separately through its owning package test task or script.' \
+    '--fast invokes each manifest entry with bun test directly from its owning package directory.' \
     'The manifest accepts blank lines and whole-line comments beginning with #; every other line must be one' \
     'committed, regular project-relative path matching packages/<package-path>/test/<path>.test.ts.' \
     'Manifest paths use / separators and cannot contain whitespace, backslashes, glob characters, inline comments,' \
     'absolute paths, or . / .. path components.' \
     'The target and its owning package must exist in the checkout, and the owning package must define a test script.' \
-    'Fast mode uses a registered package Turbo task and its build dependencies, or the package test script' \
-    'when no task is registered.' \
-    'Both dispatch paths preserve package scripts and bunfig preloads.' \
+    'Fast mode bypasses package scripts.test and Turbo; Bun loads the owning package bunfig.toml preloads.' \
     'Fast mode refuses if a selected file reports no active test cases.' \
     'Fast mode refuses a checkout with tracked or untracked changes; full mode preserves the original Turbo behavior.' \
     'A terminal verdict is printed on every exit.'
@@ -65,7 +63,7 @@ if ! command -v bun >/dev/null 2>&1; then
   printf '%s\n' 'tests/run.sh: verdict=refused mode='"$mode"' reason=bun-not-found exit_code=127'
   exit 127
 fi
-if [ ! -x node_modules/.bin/turbo ]; then
+if [ "$mode" = full ] && [ ! -x node_modules/.bin/turbo ]; then
   printf '%s\n' 'tests/run.sh: dependencies are not installed (no node_modules/.bin/turbo); run bun install first' >&2
   printf '%s\n' 'tests/run.sh: verdict=refused mode='"$mode"' reason=dependencies-not-installed exit_code=1'
   exit 1
@@ -87,7 +85,6 @@ if [ ! -f "$manifest" ] || [ -L "$manifest" ] || [ ! -r "$manifest" ] \
 fi
 
 declare -a package_paths=()
-declare -a package_modes=()
 declare -a test_paths=()
 seen=$'\n'
 target_count=0
@@ -150,18 +147,10 @@ while IFS= read -r line || [ -n "$line" ]; do
     manifest_invalid=1
     break
   fi
-  package_mode=
-  if ! package_mode="$(
-    FAST_SUITE_PACKAGE_JSON="$root/$package_root/package.json" \
-      FAST_SUITE_TURBO_JSON="$root/turbo.json" \
-      bun -e '
-        const pkg = await Bun.file(process.env.FAST_SUITE_PACKAGE_JSON).json()
-        if (typeof pkg.scripts?.test !== "string") process.exit(1)
-        const config = await Bun.file(process.env.FAST_SUITE_TURBO_JSON).json()
-        const task = String(pkg.name) + "#test"
-        process.stdout.write(config.tasks?.test || config.tasks?.[task] ? "turbo" : "package")
-      '
-  )"; then
+  if ! FAST_SUITE_PACKAGE_JSON="$root/$package_root/package.json" bun -e '
+    const pkg = await Bun.file(process.env.FAST_SUITE_PACKAGE_JSON).json()
+    if (typeof pkg.scripts?.test !== "string") process.exit(1)
+  ' >/dev/null; then
     printf 'tests/run.sh: could not resolve the owning package test command on line %d: %s\n' "$line_number" "$line" >&2
     manifest_invalid=1
     break
@@ -169,7 +158,6 @@ while IFS= read -r line || [ -n "$line" ]; do
 
   seen+="$line"$'\n'
   package_paths+=("$package_root")
-  package_modes+=("$package_mode")
   test_paths+=("test/$test_file")
   target_count=$((target_count + 1))
 done < "$manifest"
@@ -189,26 +177,22 @@ report_file="$root/.fast-suite-report.$$.xml"
 trap 'rm -f -- "$report_file"' EXIT
 fast_status=0
 coverage_invalid=0
+execution_set_invalid=0
+declare -a executed_paths=()
 index=0
 while [ "$index" -lt "$target_count" ]; do
   package_root=${package_paths[index]}
-  package_mode=${package_modes[index]}
   target=${test_paths[index]}
   report_args=(--reporter=junit --reporter-outfile="$report_file")
   target_status=0
-  # Bun treats bare positional paths as substring filters; ./ selects the exact target file.
   selected_path="./$target"
-  if [ "$package_mode" = turbo ]; then
-    GITHUB_ACTIONS=false bun turbo test \
-      --filter="./$package_root" --force -- "${report_args[@]}" "$selected_path" || target_status=$?
-  else
-    (cd "$root/$package_root" && GITHUB_ACTIONS=false bun run test -- \
-      "${report_args[@]}" "$selected_path") || target_status=$?
-  fi
+  (cd "$root/$package_root" && GITHUB_ACTIONS=false bun test \
+    "${report_args[@]}" "$selected_path") || target_status=$?
 
-  if [ "$target_status" -eq 0 ]; then
+  if [ -s "$report_file" ]; then
     report_status=0
-    FAST_SUITE_REPORT="$report_file" FAST_SUITE_TARGET="$target" bun -e '
+    executed_report=
+    executed_report="$(FAST_SUITE_REPORT="$report_file" FAST_SUITE_TARGET="$target" bun -e '
       const report = await Bun.file(process.env.FAST_SUITE_REPORT).text()
       const target = process.env.FAST_SUITE_TARGET
       const suites = Array.from(report.matchAll(/<testsuite\b([^>]*)>/g), ([, text]) => {
@@ -217,19 +201,47 @@ while [ "$index" -lt "$target_count" ]; do
         )
         return { file: attributes.file, tests: Number(attributes.tests), skipped: Number(attributes.skipped ?? 0) }
       })
+      if (suites.some((suite) => typeof suite.file !== "string" || suite.file.length === 0)) {
+        console.error("tests/run.sh: Bun JUnit report omitted file attribution for: " + target)
+        process.exit(2)
+      }
+      const executed = Array.from(new Set(suites.map((suite) => suite.file)))
+      const unexpected = executed.filter((file) => file !== target)
+      if (unexpected.length) {
+        console.error("tests/run.sh: Bun executed files outside manifest entry " + target + ": " + unexpected.join(", "))
+        process.exit(2)
+      }
       const active = suites.some(
         (suite) => suite.file === target && Number.isFinite(suite.tests) && suite.tests > suite.skipped,
       )
       if (!active) {
         console.error("tests/run.sh: Bun reported no active test cases for: " + target)
-        process.exit(1)
+        process.exit(3)
       }
-      ' || report_status=$?
+      if (executed.length !== 1) {
+        console.error("tests/run.sh: Bun report did not resolve exactly one file for: " + target)
+        process.exit(2)
+      }
+      process.stdout.write(executed[0])
+      '
+    )" || report_status=$?
     if [ "$report_status" -ne 0 ]; then
-      coverage_invalid=1
+      if [ "$report_status" -eq 3 ]; then
+        coverage_invalid=1
+      else
+        execution_set_invalid=1
+      fi
       target_status=1
+    else
+      executed_paths+=("$executed_report")
     fi
-  elif [ -s "$report_file" ]; then
+  elif [ "$target_status" -eq 0 ]; then
+    coverage_invalid=1
+    target_status=1
+  else
+    execution_set_invalid=1
+  fi
+  if [ "$target_status" -ne 0 ] && [ -s "$report_file" ]; then
     printf 'tests/run.sh: JUnit report for %s:\n' "$target" >&2
     while IFS= read -r report_line || [ -n "$report_line" ]; do
       printf '%s\n' "$report_line" >&2
@@ -244,5 +256,18 @@ if [ "$coverage_invalid" -ne 0 ]; then
   printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=no-test-cases exit_code=1'
   exit 1
 fi
+if [ "$execution_set_invalid" -ne 0 ] || [ "${#executed_paths[@]}" -ne "$target_count" ]; then
+  printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=execution-set-mismatch exit_code=1'
+  exit 1
+fi
+index=0
+while [ "$index" -lt "$target_count" ]; do
+  if [ "${executed_paths[index]}" != "${test_paths[index]}" ]; then
+    printf 'tests/run.sh: JUnit execution set differs from manifest at: %s\n' "${test_paths[index]}" >&2
+    printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=execution-set-mismatch exit_code=1'
+    exit 1
+  fi
+  index=$((index + 1))
+done
 printf 'tests/run.sh: verdict=completed mode=fast target_count=%d exit_code=%d\n' "$target_count" "$fast_status"
 exit "$fast_status"

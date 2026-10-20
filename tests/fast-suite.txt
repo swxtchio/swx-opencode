@@ -1,6 +1,7 @@
 # Keep this selection deterministic, fast, and behavior-covering.
-# Full-suite/CI Turbo-task gap for TUI, Client, and JS SDK is tracked in #317.
-# Fast mode invokes their package test scripts directly.
+# Full-suite/CI Turbo task gaps include TUI, Client, JS SDK, codemode, effect-drizzle-sqlite,
+# httpapi-codegen, http-recorder, llm, and sdk-next; see #317.
+# Fast mode bypasses package scripts.test and invokes each selected file with bun test.
 # Changes touching an excluded timing class require that class at the final gate via
 # firstmate's repository suite override; release builds require a passing full suite.
 
