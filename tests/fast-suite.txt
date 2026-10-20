@@ -1,4 +1,5 @@
 # Keep this selection deterministic, fast, and behavior-covering.
+# TUI, Client, and JS SDK have package test scripts but no Turbo test task, so the runner invokes their scripts directly.
 # Changes touching an excluded timing class require that class at the final gate via
 # firstmate's repository suite override; release builds require a passing full suite.
 

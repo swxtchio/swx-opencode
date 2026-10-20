@@ -33,6 +33,7 @@ test(
     const packagePath = "packages/example"
     const selectedPath = `${packagePath}/test/selected.test.ts`
     const selectedSecondPath = `${packagePath}/test/selected-second.test.ts`
+    const literalGlobPath = `${packagePath}/test/literal*.test.ts`
     const directPath = "packages/direct/test/direct.test.ts"
     const validManifest = `# only the declared test files run
 
@@ -115,6 +116,29 @@ ${directPath}
       ].join("\n"),
     )
     writeFileSync(
+      join(packageTests, "selected.test.tsx"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        'import { test } from "bun:test"',
+        'test("is an unlisted sibling whose path extends the selected target", () => {',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER!, "selected-sibling\\n")',
+        "})",
+        "",
+      ].join("\n"),
+    )
+    mkdirSync(join(packageTests, "nested", "test"), { recursive: true })
+    writeFileSync(
+      join(packageTests, "nested", "test", "selected.test.ts"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        'import { test } from "bun:test"',
+        'test("is an unlisted nested path containing the selected target", () => {',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER!, "selected-nested\\n")',
+        "})",
+        "",
+      ].join("\n"),
+    )
+    writeFileSync(
       join(packageTests, "selected-second.test.ts"),
       [
         'import { appendFileSync } from "node:fs"',
@@ -136,6 +160,29 @@ ${directPath}
         '  expect(process.env.FAST_SUITE_SCRIPT).toBe("direct-package")',
         '  expect(process.env.FAST_SUITE_PRELOAD).toBe(process.cwd())',
         '  appendFileSync(process.env.FAST_SUITE_MARKER!, "direct\\n")',
+        "})",
+        "",
+      ].join("\n"),
+    )
+    writeFileSync(
+      join(directPackageTests, "direct.test.tsx"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        'import { test } from "bun:test"',
+        'test("is an unlisted direct-package sibling", () => {',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER!, "direct-sibling\\n")',
+        "})",
+        "",
+      ].join("\n"),
+    )
+    mkdirSync(join(directPackageTests, "nested", "test"), { recursive: true })
+    writeFileSync(
+      join(directPackageTests, "nested", "test", "direct.test.ts"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        'import { test } from "bun:test"',
+        'test("is an unlisted direct-package nested path", () => {',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER!, "direct-nested\\n")',
         "})",
         "",
       ].join("\n"),
@@ -163,8 +210,22 @@ ${directPath}
         "",
       ].join("\n"),
     )
-    // This committed target deliberately registers no tests; it must not count as coverage.
-    writeFileSync(join(packageTests, "empty.test.ts"), "export {}\n")
+    // This committed target registers only a skipped case; it must not count as active coverage.
+    writeFileSync(
+      join(packageTests, "empty.test.ts"),
+      ['import { test } from "bun:test"', 'test.skip("does not count as active coverage", () => {})', ""].join("\n"),
+    )
+    writeFileSync(
+      join(packageTests, "literal*.test.ts"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        'import { test } from "bun:test"',
+        'test("is a real tracked target with a reserved glob character", () => {',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER!, "glob\\n")',
+        "})",
+        "",
+      ].join("\n"),
+    )
     const untrackedTarget = join(packageTests, "untracked.test.ts")
     writeFileSync(
       untrackedTarget,
@@ -229,6 +290,7 @@ exit 97
     expect(Bun.spawnSync(["git", "commit", "-qm", "runner fixture"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
 
     const fast = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    if (fast.exitCode !== 0) console.error(fast.stdout.toString(), fast.stderr.toString())
     expect(fast.exitCode).toBe(0)
     expect(fast.stdout.toString().trim().endsWith("verdict=completed mode=fast target_count=3 exit_code=0")).toBe(true)
     expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual(["direct", "second", "selected"])
@@ -253,10 +315,10 @@ exit 97
     ).toBe(true)
     const dirtyFull = Bun.spawnSync(["bash", runner], runOptions)
     expect(dirtyFull.exitCode).toBe(1)
-    expect(
-      dirtyFull.stdout.toString().trim().endsWith("verdict=refused mode=full reason=dirty-checkout exit_code=1"),
-    ).toBe(true)
-    expect(readFileSync(marker, "utf8")).toBe(beforeDirty)
+    expect(dirtyFull.stdout.toString().trim().endsWith("verdict=completed mode=full exit_code=1")).toBe(true)
+    const fullRunsWhileDirty = readFileSync(marker, "utf8").slice(beforeDirty.length).trim().split("\n")
+    expect(fullRunsWhileDirty).toContain("failing")
+    expect(fullRunsWhileDirty).toContain("unlisted")
     writeFileSync(manifest, validManifest)
 
     for (const [selection, reason] of [
@@ -264,7 +326,7 @@ exit 97
       [`${packagePath}/test/missing.test.ts\n`, "invalid-fast-manifest"],
       [`${packagePath}/test/untracked.test.ts\n`, "invalid-fast-manifest"],
       [`${selectedPath}\n${selectedPath}\n`, "invalid-fast-manifest"],
-      [`${packagePath}/test/*.test.ts\n`, "invalid-fast-manifest"],
+      [`${literalGlobPath}\n`, "invalid-fast-manifest"],
       [`${packagePath}/test/../test/selected.test.ts\n`, "invalid-fast-manifest"],
       [`${selectedPath} # inline comment\n`, "invalid-fast-manifest"],
     ] as const) {
@@ -286,18 +348,18 @@ exit 97
 
     writeFileSync(manifest, `${packagePath}/test/empty.test.ts\n`)
     expect(Bun.spawnSync(["git", "add", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
-    const emptySelectionCommit = Bun.spawnSync(["git", "commit", "-qm", "select empty test file"], {
+    const inactiveSelectionCommit = Bun.spawnSync(["git", "commit", "-qm", "select skipped-only target"], {
       cwd: root,
       env: gitEnv,
     })
-    expect(emptySelectionCommit.exitCode).toBe(0)
-    const beforeEmptyFile = readFileSync(marker, "utf8")
-    const emptyFile = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
-    expect(emptyFile.exitCode).toBe(1)
+    expect(inactiveSelectionCommit.exitCode).toBe(0)
+    const beforeInactiveFile = readFileSync(marker, "utf8")
+    const inactiveFile = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(inactiveFile.exitCode).toBe(1)
     expect(
-      emptyFile.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=no-test-cases exit_code=1"),
+      inactiveFile.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=no-test-cases exit_code=1"),
     ).toBe(true)
-    expect(readFileSync(marker, "utf8")).toBe(beforeEmptyFile)
+    expect(readFileSync(marker, "utf8")).toBe(beforeInactiveFile)
     expect(readdirSync(root).filter((name) => name.startsWith(".fast-suite-report."))).toEqual([])
 
     writeFileSync(manifest, `${packagePath}/test/failing.test.ts\n`)
@@ -324,7 +386,15 @@ exit 97
     expect(fullFailure.exitCode).not.toBe(0)
     expect(fullFailure.stdout.toString().trim().endsWith("verdict=completed mode=full exit_code=1")).toBe(true)
     const fullRuns = readFileSync(marker, "utf8").trim().split("\n").sort()
-    expect(fullRuns).toEqual(["failing", "second", "selected", "unlisted"])
+    expect(fullRuns).toEqual([
+      "failing",
+      "glob",
+      "second",
+      "selected",
+      "selected-nested",
+      "selected-sibling",
+      "unlisted",
+    ])
 
     const fullWithArguments = Bun.spawnSync(["bash", runner, "--filter=./packages/example"], runOptions)
     expect(fullWithArguments.exitCode).not.toBe(0)

@@ -30,7 +30,8 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     'when no task is registered.' \
     'Both dispatch paths preserve package scripts and bunfig preloads.' \
     'Fast mode refuses if a selected file reports no active test cases.' \
-    'Test runs refuse a checkout with tracked or untracked changes. A terminal verdict is printed on every exit.'
+    'Fast mode refuses a checkout with tracked or untracked changes; full mode preserves the original Turbo behavior.' \
+    'A terminal verdict is printed on every exit.'
   printf '%s\n' 'tests/run.sh: verdict=completed mode=help exit_code=0'
   exit 0
 fi
@@ -46,16 +47,17 @@ if [ "${1:-}" = "--fast" ]; then
   fi
 fi
 
-git_status=
-if ! git_status="$(git status --porcelain --untracked-files=all 2>/dev/null)"; then
-  printf '%s\n' 'tests/run.sh: could not establish checkout status' >&2
-  printf '%s\n' 'tests/run.sh: verdict=refused mode='"$mode"' reason=git-status-unavailable exit_code=1'
-  exit 1
-fi
-if [ -n "$git_status" ]; then
-  printf '%s\n' 'tests/run.sh: refusing to execute tests from a dirty checkout' >&2
-  printf '%s\n' 'tests/run.sh: verdict=refused mode='"$mode"' reason=dirty-checkout exit_code=1'
-  exit 1
+if [ "$mode" = fast ]; then
+  if ! git_status="$(git status --porcelain --untracked-files=all 2>/dev/null)"; then
+    printf '%s\n' 'tests/run.sh: could not establish checkout status' >&2
+    printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=git-status-unavailable exit_code=1'
+    exit 1
+  fi
+  if [ -n "$git_status" ]; then
+    printf '%s\n' 'tests/run.sh: refusing to execute tests from a dirty checkout' >&2
+    printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=dirty-checkout exit_code=1'
+    exit 1
+  fi
 fi
 
 if ! command -v bun >/dev/null 2>&1; then
@@ -199,12 +201,17 @@ while [ "$index" -lt "$target_count" ]; do
   done
   target_list=$(printf '%s\n' "${selected[@]}")
   package_status=0
+  # Bun treats bare positional paths as substring filters; ./ selects the exact target file.
+  selected_paths=()
+  for test_path in "${selected[@]}"; do
+    selected_paths+=("./$test_path")
+  done
   if [ "$package_mode" = turbo ]; then
     GITHUB_ACTIONS=false bun turbo test \
-      --filter="./$package_root" --force -- "${report_args[@]}" "${selected[@]}" || package_status=$?
+      --filter="./$package_root" --force -- "${report_args[@]}" "${selected_paths[@]}" || package_status=$?
   else
     (cd "$root/$package_root" && GITHUB_ACTIONS=false bun run test -- \
-      "${report_args[@]}" "${selected[@]}") || package_status=$?
+      "${report_args[@]}" "${selected_paths[@]}") || package_status=$?
   fi
 
   if [ "$package_status" -eq 0 ]; then
