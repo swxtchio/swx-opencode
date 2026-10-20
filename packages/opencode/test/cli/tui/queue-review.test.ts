@@ -279,6 +279,7 @@ it.live(
         tui.sdk.session.queue.restore({ sessionID: tui.sessionID, id: doomed.id }),
       )
       expect(restored.response.status).toBe(404)
+      yield* tui.screen("4 pending · 1 steer · 3 queue", "the review list after deleting a prompt")
 
       // Consolidate: the two lint commands as one with steps.
       tui.renderer.mockInput.pressKey("o", { ctrl: true })
