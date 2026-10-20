@@ -25,8 +25,8 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     'committed, regular project-relative path matching packages/<package-path>/test/<path>.test.ts.' \
     'Manifest paths use / separators and cannot contain whitespace, backslashes, glob characters, inline comments,' \
     'absolute paths, or . / .. path components.' \
-    'The target and its owning package must exist in the checkout, and the owning package must define a test script.' \
-    'Fast mode bypasses package scripts.test and Turbo; Bun loads the owning package bunfig.toml preloads.' \
+    'The target and owning package must exist; scripts.test is required for validation only.' \
+    'Fast mode bypasses scripts.test and Turbo, invoking Bun directly with the owning package bunfig.toml.' \
     'Fast mode refuses if a selected file reports no active test cases.' \
     'Fast mode refuses a checkout with tracked or untracked changes; full mode preserves the original Turbo behavior.' \
     'A terminal verdict is printed on every exit.'
@@ -151,7 +151,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     const pkg = await Bun.file(process.env.FAST_SUITE_PACKAGE_JSON).json()
     if (typeof pkg.scripts?.test !== "string") process.exit(1)
   ' >/dev/null; then
-    printf 'tests/run.sh: could not resolve the owning package test command on line %d: %s\n' "$line_number" "$line" >&2
+    printf 'tests/run.sh: could not validate the owning package test script on line %d: %s\n' "$line_number" "$line" >&2
     manifest_invalid=1
     break
   fi
@@ -186,8 +186,9 @@ while [ "$index" -lt "$target_count" ]; do
   report_args=(--reporter=junit --reporter-outfile="$report_file")
   target_status=0
   selected_path="./$target"
-  (cd "$root/$package_root" && GITHUB_ACTIONS=false bun test \
-    "${report_args[@]}" "$selected_path") || target_status=$?
+  # Bun resolves bunfig.toml and relative preload paths from its own working directory.
+  GITHUB_ACTIONS=false bun --cwd="$root/$package_root" test \
+    "${report_args[@]}" "$selected_path" || target_status=$?
 
   if [ -s "$report_file" ]; then
     report_status=0

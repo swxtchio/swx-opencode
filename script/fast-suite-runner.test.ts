@@ -87,6 +87,7 @@ ${directSecondPath}
         workspaces: { packages: ["packages/*"] },
       }),
     )
+    writeFileSync(join(root, "bunfig.toml"), '[test]\nroot = "./do-not-run-tests-from-root"\n')
     writeFileSync(join(root, ".gitignore"), "packages/example/test/untracked.test.ts\n")
     writeFileSync(
       join(root, "turbo.json"),
