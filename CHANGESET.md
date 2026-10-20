@@ -78,6 +78,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#313** Add a persisted per-project context-percentage auto-compaction threshold in Ctrl+P; defer soft compaction until a true idle boundary, retain terminal structured-output capacity maintenance, and automatically resume compacted work or deliver queued prompts. _Fork-only._
 - **#303** Extend the OpenAI-compatible SSE stall deadline to non-empty Responses/Chat generation deltas, including reasoning and tool arguments, so transport-only keepalives cannot hold a stalled attempt open. Preserve the raw-read timeout and classify the bounded failure as `ProviderResponseStreamError` (swxtchio/swx-opencode#302). _Fork-only._
 - **#299** Exclude shell-mode rows from Ctrl+r and keep cleared or discarded drafts out of history, stash and prompt recovery. Preserve submitted-history recovery and picker eligibility for ambiguous legacy rows; rename the draft action and keybind to `prompt.discard` and `prompt_discard` (swxtchio/swx-opencode#298). _Fork-only._
 - **#294** Rehydrate composer history from each session's full transcript so prompts erased from the cache remain available after resume; fingerprint retained rows so cache eviction invalidates completion and triggers later recovery. Treat unmarked direct and queue-produced prompts as human in UP recall and Ctrl+r search; reject undecodable queue provenance and exclude marked automation from both surfaces. Unmarked pre-#272 history follows Firstmate's ruling (swxtchio/swx-opencode#293). _Fork-only._

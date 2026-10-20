@@ -19,6 +19,8 @@ import { ConfigSkillsV1 } from "./skills"
 
 export type Layout = ConfigLayoutV1.Layout
 
+export const AUTO_COMPACTION_THRESHOLD_PERCENT_DEFAULT = 95
+
 export const WellKnown = Schema.Struct({
   config: Schema.optional(Schema.Json),
   remote_config: Schema.optional(Schema.Json),
@@ -175,6 +177,11 @@ export const Info = Schema.Struct({
       auto: Schema.optional(Schema.Boolean).annotate({
         description: "Enable automatic compaction when context is full (default: true)",
       }),
+      threshold_percent: Schema.optional(
+        Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100 })).annotate({
+          description: "Automatic compaction trigger as a percentage of the model context limit.",
+        }),
+      ),
       prune: Schema.optional(Schema.Boolean).annotate({
         description: "Enable pruning of old tool outputs (default: false)",
       }),

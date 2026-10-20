@@ -1148,6 +1148,7 @@ let gateDirectProjection = false
 const directProjectionCompaction = Layer.succeed(
   SessionCompaction.Service,
   SessionCompaction.Service.of({
+    isAutoCompactionDue: () => Effect.succeed(false),
     isOverflow: () => {
       if (!gateDirectProjection) return Effect.succeed(false)
       gateDirectProjection = false
@@ -3745,15 +3746,31 @@ it.instance("loop stops provider overflow instead of auto-compacting when disabl
   }),
 )
 
-it.instance("automatically compacts and continues after an unparseable mid-stream error chunk", () =>
+it.instance("automatically compacts unknown-context sessions after a mid-stream provider overflow", () =>
   Effect.gen(function* () {
-    const { llm } = yield* useServerConfig((url) => ({
-      ...providerCfg(url),
-      compaction: { auto: true },
-    }))
+    const { llm } = yield* useServerConfig((url) => {
+      const base = providerCfg(url)
+      return {
+        ...base,
+        compaction: { auto: true },
+        provider: {
+          ...base.provider,
+          test: {
+            ...base.provider.test,
+            models: {
+              ...base.provider.test.models,
+              "test-model": { ...base.provider.test.models["test-model"], limit: undefined },
+            },
+          },
+        },
+      }
+    })
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
+    const provider = yield* ProviderSvc.Service
     const chat = yield* sessions.create({ title: "Pinned" })
+
+    expect((yield* provider.getModel(ref.providerID, ref.modelID)).limit.context).toBe(0)
 
     yield* llm.push(
       raw({
@@ -3778,9 +3795,12 @@ it.instance("automatically compacts and continues after an unparseable mid-strea
       parts: [{ type: "text", text: "Continue after handling a mocked overflow." }],
     })
     const messages = yield* sessions.messages({ sessionID: chat.id })
+    const compaction = messages
+      .flatMap((message) => message.parts)
+      .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
 
     expect(yield* llm.hits).toHaveLength(3)
-    expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(true)
+    expect(compaction).toMatchObject({ type: "compaction", auto: true, overflow: true })
     expect(
       messages.some((message) =>
         message.parts.some((part) => part.type === "text" && part.text === "partial response"),
@@ -3794,6 +3814,639 @@ it.instance("automatically compacts and continues after an unparseable mid-strea
     )
     if (result.info.role === "assistant") expect(result.info.error).toBeUndefined()
   }),
+)
+
+it.instance(
+  "threshold maintenance waits for idle and then delivers the queued prompt",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const file = path.join(instance.directory, "threshold-tool-result.txt")
+      yield* writeText(file, "threshold tool result")
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        compaction: { auto: true, threshold_percent: 50 },
+      }))
+      const provider = yield* ProviderSvc.Service
+      const configured = yield* provider.getProvider(ref.providerID)
+      const originalFetch = configured.options.fetch ?? fetch
+      const timeline: string[] = []
+      configured.options.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        timeline.push("provider-request")
+        return originalFetch(input, init)
+      }
+      yield* Effect.addFinalizer(() => Effect.sync(() => (configured.options.fetch = originalFetch)))
+
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const chat = yield* sessions.create({
+        title: "Threshold idle boundary",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const idleEvents: string[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Idle.type) return Effect.void
+        return Effect.sync(() => {
+          const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+          idleEvents.push(data.sessionID)
+          if (data.sessionID === chat.id) timeline.push("idle")
+        })
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const toolResponse = yield* Deferred.make<void>()
+      const terminalResponse = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() =>
+        Effect.all([Deferred.succeed(toolResponse, undefined), Deferred.succeed(terminalResponse, undefined)], {
+          discard: true,
+        }),
+      )
+      yield* llm.push(
+        reply()
+          .wait(deferredAsPromise(toolResponse))
+          .tool("read", { filePath: file })
+          .usage({ input: 51_000, output: 100 }),
+        reply()
+          .wait(deferredAsPromise(terminalResponse))
+          .text("root turn answer")
+          .usage({ input: 51_100, output: 100 })
+          .stop(),
+        reply().text("threshold summary").stop(),
+        reply().text("queued prompt answer").stop(),
+      )
+
+      const root = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: said("read the threshold fixture, then finish the task"),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "threshold root request did not start", "10 seconds")
+      const queued = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          delivery: "queue",
+          parts: said("queued next prompt"),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(admitted(chat.id, "queued next prompt"), "next prompt was not queued", "10 seconds")
+
+      yield* Deferred.succeed(toolResponse, undefined)
+      yield* awaitWithTimeout(llm.wait(2), "threshold-crossing tool step did not continue", "10 seconds")
+      const afterTool = yield* llm.inputs
+      expect(JSON.stringify(afterTool[1]?.messages)).toContain("threshold tool result")
+      expect(
+        (yield* sessions.messages({ sessionID: chat.id })).some(
+          (message) => message.info.role === "assistant" && message.info.summary,
+        ),
+      ).toBe(false)
+
+      yield* Deferred.succeed(terminalResponse, undefined)
+      yield* awaitWithTimeout(llm.wait(3), "idle threshold summary request did not start", "10 seconds")
+      const beforeQueuedTurn = yield* sessions.messages({ sessionID: chat.id })
+      const thresholdTask = beforeQueuedTurn
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      const requestOrder = timeline
+        .map((item, index) => (item === "provider-request" ? index : -1))
+        .filter((index) => index >= 0)
+
+      expect(idleEvents).toContain(chat.id)
+      expect(requestOrder).toHaveLength(3)
+      expect(timeline.indexOf("idle")).toBeLessThan(requestOrder[2])
+      expect(thresholdTask).toMatchObject({ type: "compaction", auto: true, trigger: "threshold", resume: false })
+
+      yield* awaitWithTimeout(llm.wait(4), "queued prompt was not delivered after threshold compaction", "10 seconds")
+      const requests = yield* llm.inputs
+      expect(lastUserContent(requests[3])).toContain("queued next prompt")
+      expect(JSON.stringify(requests[3])).not.toContain("Continue if you have next steps")
+
+      const [rootReply, queuedReply] = yield* finish(root, queued)
+      expect(rootReply.info.role).toBe("assistant")
+      expect(rootReply.parts.some((part) => part.type === "text" && part.text === "root turn answer")).toBe(true)
+      expect(queuedReply.info.role).toBe("assistant")
+      expect(queuedReply.parts.some((part) => part.type === "text" && part.text === "queued prompt answer")).toBe(true)
+      expect(yield* queue.list(chat.id)).toEqual([])
+      expect(yield* llm.calls).toBe(4)
+    }),
+  30_000,
+)
+
+it.instance(
+  "soft-threshold maintenance waits for a true idle boundary when a steer joins the running turn",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const file = path.join(instance.directory, "threshold-steer-tool-result.txt")
+      yield* writeText(file, "threshold steer tool result")
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        compaction: { auto: true, threshold_percent: 50 },
+      }))
+      const provider = yield* ProviderSvc.Service
+      const configured = yield* provider.getProvider(ref.providerID)
+      const originalFetch = configured.options.fetch ?? fetch
+      const timeline: string[] = []
+      configured.options.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        timeline.push("provider-request")
+        return originalFetch(input, init)
+      }
+      yield* Effect.addFinalizer(() => Effect.sync(() => (configured.options.fetch = originalFetch)))
+
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const chat = yield* sessions.create({
+        title: "Threshold steer boundary",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const idleEvents: string[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Idle.type) return Effect.void
+        return Effect.sync(() => {
+          const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+          if (data.sessionID === chat.id) {
+            idleEvents.push(data.sessionID)
+            timeline.push("idle")
+          }
+        })
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const toolGate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(toolGate, undefined).pipe(Effect.ignore))
+      yield* llm.push(
+        reply()
+          .wait(deferredAsPromise(toolGate))
+          .tool("read", { filePath: file })
+          .usage({ input: 51_000, output: 100 }),
+        reply().text("steer task completed").usage({ input: 51_100, output: 100 }).stop(),
+        reply().text("threshold summary").stop(),
+        reply().text("automatic continuation after threshold compaction").stop(),
+      )
+
+      const root = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("read the file and finish the task") })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "threshold root request did not start", "10 seconds")
+
+      const steer = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          delivery: "steer",
+          parts: said("steer during the running turn"),
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions.messages({ sessionID: chat.id }).pipe(
+          Effect.map((messages) =>
+            messages.some(
+              (message) =>
+                message.info.role === "user" &&
+                message.parts.some((part) => part.type === "text" && part.text === "steer during the running turn"),
+            ),
+          ),
+        ),
+        "steer was not promoted during the active turn",
+        "10 seconds",
+      )
+
+      yield* Deferred.succeed(toolGate, undefined)
+      yield* awaitWithTimeout(llm.wait(2), "steer continuation was not sent before compaction", "10 seconds")
+      const afterSteer = yield* llm.inputs
+      const steerRequest = afterSteer[1]
+      if (!steerRequest) throw new Error("expected the steer continuation request")
+      expect(JSON.stringify(steerRequest.messages)).toContain("steer during the running turn")
+      expect(JSON.stringify(steerRequest.messages)).toContain("threshold steer tool result")
+      expect(
+        (yield* sessions.messages({ sessionID: chat.id })).some((message) =>
+          message.parts.some((part) => part.type === "compaction"),
+        ),
+      ).toBe(false)
+
+      yield* awaitWithTimeout(llm.wait(3), "threshold compaction did not wait for idle", "10 seconds")
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const task = messages
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      const requestOrder = timeline
+        .map((item, index) => (item === "provider-request" ? index : -1))
+        .filter((index) => index >= 0)
+
+      expect(idleEvents).toContain(chat.id)
+      expect(requestOrder).toHaveLength(3)
+      expect(requestOrder[1]).toBeLessThan(requestOrder[2])
+      expect(timeline.indexOf("idle")).toBeLessThan(requestOrder[2])
+      expect(task).toMatchObject({ type: "compaction", auto: true, trigger: "threshold", resume: true })
+
+      yield* awaitWithTimeout(llm.wait(4), "threshold compaction did not resume its work", "10 seconds")
+      const [rootReply, steerReply] = yield* finish(root, steer)
+      expect(rootReply.info.role).toBe("assistant")
+      expect(steerReply.info.role).toBe("assistant")
+      expect(yield* queue.list(chat.id)).toEqual([])
+      expect(yield* llm.calls).toBe(4)
+    }),
+  30_000,
+)
+
+it.instance(
+  "terminal threshold crossing compacts at idle and resumes automatically",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        compaction: { auto: true, threshold_percent: 50 },
+      }))
+      const provider = yield* ProviderSvc.Service
+      const configured = yield* provider.getProvider(ref.providerID)
+      const originalFetch = configured.options.fetch ?? fetch
+      const timeline: string[] = []
+      configured.options.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        timeline.push("provider-request")
+        return originalFetch(input, init)
+      }
+      yield* Effect.addFinalizer(() => Effect.sync(() => (configured.options.fetch = originalFetch)))
+
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Terminal threshold boundary" })
+      const idleEvents: string[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Idle.type) return Effect.void
+        return Effect.sync(() => {
+          const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+          idleEvents.push(data.sessionID)
+          if (data.sessionID === chat.id) timeline.push("idle")
+        })
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+      yield* llm.push(
+        reply().text("completed threshold answer").usage({ input: 51_000, output: 100 }).stop(),
+        reply().text("maintenance summary").stop(),
+        reply().text("continued automatically after threshold compaction").stop(),
+      )
+
+      const response = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: said("finish the threshold task"),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "terminal threshold request did not start", "10 seconds")
+      yield* awaitWithTimeout(
+        llm.wait(2),
+        "terminal threshold maintenance waited for another user prompt",
+        "10 seconds",
+      )
+      yield* awaitWithTimeout(
+        llm.wait(3),
+        "terminal threshold maintenance did not resume automatically",
+        "10 seconds",
+      )
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const task = messages
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      const requestOrder = timeline
+        .map((item, index) => (item === "provider-request" ? index : -1))
+        .filter((index) => index >= 0)
+
+      expect(idleEvents).toContain(chat.id)
+      expect(requestOrder).toHaveLength(3)
+      expect(timeline.indexOf("idle")).toBeLessThan(requestOrder[1])
+      expect(requestOrder[1]).toBeLessThan(requestOrder[2])
+      expect(task).toMatchObject({ type: "compaction", trigger: "threshold", resume: true })
+
+      const [result] = yield* finish(response)
+      expect(result.info.role).toBe("assistant")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "completed threshold answer")).toBe(true)
+      const finished = yield* sessions.messages({ sessionID: chat.id })
+      expect(
+        finished.some(
+          (message) =>
+            message.info.role === "user" &&
+            message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true),
+        ),
+      ).toBe(true)
+      expect(
+        finished.some((message) =>
+          message.parts.some(
+            (part) => part.type === "text" && part.text === "continued automatically after threshold compaction",
+          ),
+        ),
+      ).toBe(true)
+      expect(yield* llm.calls).toBe(3)
+    }),
+  30_000,
+)
+
+it.instance(
+  "capacity protection compacts before an owed tool continuation and leaves the session usable",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const file = path.join(instance.directory, "capacity-tool-result.txt")
+      yield* writeText(file, "capacity tool result")
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        compaction: { auto: true },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({
+        title: "Capacity recovery",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      yield* llm.push(
+        reply().tool("read", { filePath: file }).usage({ input: 90_000, output: 100 }),
+        reply().text("capacity summary").stop(),
+        reply().text("capacity continuation completed").stop(),
+        reply().text("follow-up succeeded").stop(),
+      )
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: said("continue working after reading the capacity fixture"),
+      })
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const compaction = messages
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      const continuation = messages.find((message) =>
+        message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true),
+      )
+      const tool = messages
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "read")
+
+      expect(compaction).toMatchObject({ type: "compaction", auto: true, trigger: "capacity", resume: true })
+      expect(continuation?.info.role).toBe("user")
+      expect(tool?.state.status).toBe("completed")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "capacity continuation completed")).toBe(
+        true,
+      )
+      expect((yield* status.get(chat.id)).type).toBe("idle")
+
+      const followup = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: said("follow up after recovery"),
+      })
+      expect(followup.parts.some((part) => part.type === "text" && part.text === "follow-up succeeded")).toBe(true)
+      expect(yield* llm.calls).toBe(4)
+    }),
+  30_000,
+)
+
+it.instance(
+  "a threshold-crossing tool turn recovers after provider overflow before idle",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const file = path.join(instance.directory, "threshold-overflow-tool-result.txt")
+      yield* writeText(file, "threshold overflow tool result")
+      const { llm } = yield* useServerConfig((url) => {
+        const base = providerCfg(url)
+        return {
+          ...base,
+          compaction: { auto: true, threshold_percent: 95 },
+          provider: {
+            ...base.provider,
+            test: {
+              ...base.provider.test,
+              models: {
+                ...base.provider.test.models,
+                "test-model": {
+                  ...base.provider.test.models["test-model"],
+                  limit: { context: 100_000, output: 1_000 },
+                },
+              },
+            },
+          },
+        }
+      })
+      const provider = yield* ProviderSvc.Service
+      const model = yield* provider.getModel(ref.providerID, ref.modelID)
+      expect(model.limit.context).toBe(100_000)
+      expect(model.limit.output).toBe(1_000)
+
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const status = yield* SessionStatus.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({
+        title: "Threshold then provider overflow",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const overflowGate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(overflowGate, undefined).pipe(Effect.ignore))
+      const errors: string[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = Schema.decodeUnknownSync(Session.Event.Error.data)(event.data)
+        if (data.sessionID !== chat.id || !data.error) return Effect.void
+        return Effect.sync(() => errors.push(JSON.stringify(data.error)))
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      yield* llm.push(
+        reply().tool("read", { filePath: file }).usage({ input: 90_000, output: 100 }),
+        reply().tool("read", { filePath: file }).usage({ input: 95_000, output: 100 }),
+      )
+      yield* llm.error(
+        413,
+        {
+          error: { message: "Your input exceeds the context window of this model. Please reduce the length and retry." },
+        },
+        deferredAsPromise(overflowGate),
+      )
+      yield* llm.text("Recovered capacity summary")
+      yield* llm.text("Continued after provider overflow")
+      yield* llm.text("Follow-up succeeded")
+
+      const root = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: said("read the threshold overflow fixture twice, then finish the task"),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(3), "provider overflow request did not start", "10 seconds")
+
+      const beforeOverflow = yield* sessions.messages({ sessionID: chat.id })
+      const usage = beforeOverflow.flatMap((message) =>
+        message.info.role === "assistant" && message.info.tokens.total !== undefined
+          ? [message.info.tokens.total]
+          : [],
+      )
+      const tools = beforeOverflow
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "read")
+      expect(usage.some((total) => total < 95_000)).toBe(true)
+      expect(usage.some((total) => total >= 95_000 && total < 99_000)).toBe(true)
+      expect(tools.map((part) => part.state.status)).toEqual(["completed", "completed"])
+      expect(beforeOverflow.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(false)
+      expect((yield* status.get(chat.id)).type).toBe("busy")
+
+      yield* Deferred.succeed(overflowGate, undefined)
+      yield* awaitWithTimeout(llm.wait(4), "overflow compaction summary did not start", "10 seconds")
+      const afterOverflow = yield* sessions.messages({ sessionID: chat.id })
+      const compaction = afterOverflow
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      expect(compaction).toMatchObject({ type: "compaction", auto: true, overflow: true, resume: true })
+      expect(errors.join("\n")).toContain("ContextOverflowError")
+      expect(errors.join("\n")).toContain("Your input exceeds the context window")
+
+      yield* awaitWithTimeout(llm.wait(5), "owed continuation did not resume after overflow compaction", "10 seconds")
+      const requests = yield* llm.inputs
+      expect(JSON.stringify(requests[1]?.messages)).toContain("threshold overflow tool result")
+      expect(JSON.stringify(requests[2]?.messages)).toContain("threshold overflow tool result")
+      expect(lastUserContent(requests[4])).toContain("Continue if you have next steps")
+
+      const [result] = yield* finish(root)
+      expect(result.info.role).toBe("assistant")
+      expect(
+        result.parts.some((part) => part.type === "text" && part.text === "Continued after provider overflow"),
+      ).toBe(true)
+      expect((yield* status.get(chat.id)).type).toBe("idle")
+
+      const followup = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: said("follow up after provider overflow recovery"),
+      })
+      expect(followup.parts.some((part) => part.type === "text" && part.text === "Follow-up succeeded")).toBe(true)
+      expect(yield* queue.list(chat.id)).toEqual([])
+      expect((yield* status.get(chat.id)).type).toBe("idle")
+      expect(yield* llm.calls).toBe(6)
+    }),
+  30_000,
+)
+
+it.instance(
+  "terminal capacity compaction waits for idle and delivers the queued prompt without inventing continuation",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        compaction: { auto: true },
+      }))
+      const provider = yield* ProviderSvc.Service
+      const configured = yield* provider.getProvider(ref.providerID)
+      const originalFetch = configured.options.fetch ?? fetch
+      const timeline: string[] = []
+      configured.options.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        timeline.push("provider-request")
+        return originalFetch(input, init)
+      }
+      yield* Effect.addFinalizer(() => Effect.sync(() => (configured.options.fetch = originalFetch)))
+
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({ title: "Terminal capacity boundary" })
+      const idleEvents: string[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Idle.type) return Effect.void
+        return Effect.sync(() => {
+          const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+          idleEvents.push(data.sessionID)
+          if (data.sessionID === chat.id) timeline.push("idle")
+        })
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const terminalResponse = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(terminalResponse, undefined).pipe(Effect.ignore))
+      yield* llm.push(
+        reply()
+          .wait(deferredAsPromise(terminalResponse))
+          .text("completed capacity answer")
+          .usage({ input: 90_000, output: 100 })
+          .stop(),
+        reply().text("capacity maintenance summary").stop(),
+        reply().text("queued capacity answer").stop(),
+        reply().text("unexpected extra continuation").stop(),
+      )
+
+      const root = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: said("finish the capacity task"),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "terminal capacity request did not start", "10 seconds")
+      const queued = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          delivery: "queue",
+          parts: said("queued after capacity"),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(admitted(chat.id, "queued after capacity"), "capacity follow-up was not queued", "10 seconds")
+
+      yield* Deferred.succeed(terminalResponse, undefined)
+      yield* awaitWithTimeout(llm.wait(2), "terminal capacity summary request did not start", "10 seconds")
+      const afterSummaryStart = yield* sessions.messages({ sessionID: chat.id })
+      const task = afterSummaryStart
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      const requestOrder = timeline
+        .map((item, index) => (item === "provider-request" ? index : -1))
+        .filter((index) => index >= 0)
+
+      expect(idleEvents).toContain(chat.id)
+      expect(requestOrder).toHaveLength(2)
+      expect(timeline.indexOf("idle")).toBeLessThan(requestOrder[1])
+      expect(task).toMatchObject({ type: "compaction", auto: true, trigger: "capacity" })
+
+      yield* awaitWithTimeout(llm.wait(3), "queued capacity prompt was not delivered after compaction", "10 seconds")
+      const requests = yield* llm.inputs
+      expect(requests).toHaveLength(3)
+      expect(lastUserContent(requests[2])).toContain("queued after capacity")
+      expect(lastUserContent(requests[2])).not.toContain("Continue if you have next steps")
+      expect(task).toMatchObject({ resume: false })
+
+      const [rootReply, queuedReply] = yield* finish(root, queued)
+      expect(rootReply.parts.some((part) => part.type === "text" && part.text === "completed capacity answer")).toBe(true)
+      expect(queuedReply.parts.some((part) => part.type === "text" && part.text === "queued capacity answer")).toBe(true)
+      expect(
+        (yield* sessions.messages({ sessionID: chat.id })).some((message) =>
+          message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true),
+        ),
+      ).toBe(false)
+      expect(yield* queue.list(chat.id)).toEqual([])
+      expect((yield* status.get(chat.id)).type).toBe("idle")
+      expect(yield* llm.calls).toBe(3)
+    }),
+  30_000,
 )
 
 noLLMServer.instance.skip(
@@ -7254,6 +7907,85 @@ it.instance(
       expect(lastUser((yield* llm.inputs)[1])).toEqual({ role: "user", content: "queued after it" })
       // One drain carries the queued turn: the session never goes idle between them.
       expect(idleAt).toEqual([2])
+    }),
+  15_000,
+)
+
+it.instance(
+  "terminal structured output preserves capacity compaction before queued delivery",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({ title: "Structured capacity completion" })
+      const structuredGate = yield* Deferred.make<void>()
+      const summaryGate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() =>
+        Effect.all([Deferred.succeed(structuredGate, undefined), Deferred.succeed(summaryGate, undefined)], {
+          discard: true,
+        }),
+      )
+      yield* llm.push(
+        reply()
+          .wait(deferredAsPromise(structuredGate))
+          .tool("StructuredOutput", { answer: "42" })
+          .usage({ input: 90_000, output: 100 }),
+        reply().wait(deferredAsPromise(summaryGate)).text("capacity summary").stop(),
+        reply().text("queued done").stop(),
+      )
+      const idleAt: number[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Idle.type) return Effect.void
+        return Effect.gen(function* () {
+          const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+          if (data.sessionID === chat.id) idleAt.push(yield* llm.calls)
+        })
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const format = Schema.decodeUnknownSync(SessionV1.Format)({
+        type: "json_schema",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+      })
+
+      const structured = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, format, parts: said("answer in structure") })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "structured capacity call never started", "10 seconds")
+      const held = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, delivery: "queue", parts: said("queued after capacity") })
+        .pipe(Effect.forkChild)
+      yield* queued(chat.id, 1)
+
+      yield* Deferred.succeed(structuredGate, undefined)
+      yield* awaitWithTimeout(llm.wait(2), "terminal structured capacity did not start maintenance", "10 seconds")
+      const beforeSummary = yield* sessions.messages({ sessionID: chat.id })
+      const structuredAnswer = beforeSummary.find(
+        (message) => message.info.role === "assistant" && message.info.structured !== undefined,
+      )
+      const task = beforeSummary
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+
+      expect(structuredAnswer?.info.role).toBe("assistant")
+      if (structuredAnswer?.info.role === "assistant") expect(structuredAnswer.info.structured).toEqual({ answer: "42" })
+      expect(task).toMatchObject({ type: "compaction", auto: true, trigger: "capacity", resume: false })
+      expect(idleAt).toContain(1)
+
+      yield* Deferred.succeed(summaryGate, undefined)
+      yield* awaitWithTimeout(llm.wait(3), "queued prompt was not delivered after structured capacity summary", "10 seconds")
+      const queuedRequest = (yield* llm.inputs)[2]
+      if (!queuedRequest) throw new Error("expected queued request after structured capacity summary")
+      expect(lastUserContent(queuedRequest)).toContain("queued after capacity")
+
+      const [result, queuedReply] = yield* finish(structured, held)
+      expect(result?.info.role === "assistant" ? result.info.structured : undefined).toEqual({ answer: "42" })
+      expect(queuedReply?.info.role).toBe("assistant")
+      expect(queuedReply?.parts.some((part) => part.type === "text" && part.text === "queued done")).toBe(true)
+      expect(yield* queue.list(chat.id)).toEqual([])
+      expect(yield* llm.calls).toBe(3)
     }),
   15_000,
 )
