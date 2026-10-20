@@ -1528,6 +1528,8 @@ const layer = Layer.effect(
         let step = 0
         let settled = false
         let seen = 0
+        let deferredCompactionTrigger: SessionV1.CompactionPart["trigger"]
+        let initialProviderBoundary = true
         // The drain already selected its initial input. Each provider completion opens one new queue boundary.
         let queuedInputSelected = true
         let initialRootSelected = false
@@ -1655,13 +1657,28 @@ const layer = Layer.effect(
             // The turn is over. Its reply answers the prompt that began it and every
             // steer that joined it, before the loop goes on to a turn of its own.
             if (lastAssistantMsg) yield* queue.answer(sessionID, lastUser.id, lastAssistantMsg)
-            // Queued prompts wait for this point and run one turn each, so a steer
-            // or another admission arriving meanwhile is weighed before the next.
-            // Each such turn is new user input and gets a fresh step allowance.
             if (yield* promoteInLoop(sessionID, "steer")) {
               step = 0
               continue
             }
+            if (deferredCompactionTrigger && lastAssistant?.error === undefined) {
+              // A runnable queued prompt is the handoff; otherwise continue the compacted work.
+              const resume = !(yield* queue.awaitingDrain(sessionID))
+              yield* compaction.create({
+                sessionID,
+                agent: lastUser.agent,
+                model: lastUser.model,
+                auto: true,
+                trigger: deferredCompactionTrigger,
+                resume,
+              })
+              deferredCompactionTrigger = undefined
+              settled = true
+              break
+            }
+            // Queued prompts wait for this point and run one turn each, so a steer
+            // or another admission arriving meanwhile is weighed before the next.
+            // Each such turn is new user input and gets a fresh step allowance.
             if (yield* promoteInLoop(sessionID, "queue")) {
               queuedInputSelected = true
               step = 0
@@ -1713,18 +1730,44 @@ const layer = Layer.effect(
                 sessionID,
                 auto: task.auto,
                 overflow: task.overflow,
+                resume: task.resume,
               }),
             )
+            deferredCompactionTrigger = undefined
             continue
           }
 
-          if (
-            lastFinished &&
-            lastFinished.summary !== true &&
-            (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
-          ) {
-            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
-            continue
+          if (lastFinished && lastFinished.summary !== true) {
+            const capacity = yield* compaction.isOverflow({ tokens: lastFinished.tokens, model })
+            if (capacity) {
+              yield* compaction.create({
+                sessionID,
+                agent: lastUser.agent,
+                model: lastUser.model,
+                auto: true,
+                trigger: "capacity",
+                resume: true,
+              })
+              deferredCompactionTrigger = undefined
+              continue
+            }
+            if (yield* compaction.isAutoCompactionDue({ tokens: lastFinished.tokens, model })) {
+              // A parent mismatch also occurs when a steer joins the active drain.
+              // Only the first provider boundary of a newly idle runner may compact immediately.
+              if (initialProviderBoundary && lastFinished.parentID !== lastUser.id) {
+                yield* compaction.create({
+                  sessionID,
+                  agent: lastUser.agent,
+                  model: lastUser.model,
+                  auto: true,
+                  trigger: "threshold",
+                  resume: true,
+                })
+                deferredCompactionTrigger = undefined
+                continue
+              }
+              deferredCompactionTrigger ??= "threshold"
+            }
           }
 
           const agent = yield* agents.get(lastUser.agent)
@@ -1844,6 +1887,7 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            initialProviderBoundary = false
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1859,8 +1903,15 @@ const layer = Layer.effect(
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
             })
+            if (result === "continue" && handle.compactionTrigger) {
+              deferredCompactionTrigger =
+                handle.compactionTrigger === "capacity" ? "capacity" : (deferredCompactionTrigger ?? "threshold")
+            }
 
             if (structured !== undefined) {
+              // Structured output returns before the generic compact-result path below.
+              if (result === "compact" && handle.compactionTrigger === "capacity")
+                deferredCompactionTrigger = "capacity"
               handle.message.structured = structured
               handle.message.finish = handle.message.finish ?? "stop"
               yield* sessions.updateMessage(handle.message)
@@ -1896,13 +1947,32 @@ const layer = Layer.effect(
 
             if (result === "stop") return "break" as const
             if (result === "compact") {
+              const overflow = !handle.message.finish
+              if (!overflow && handle.compactionTrigger === "capacity" && finished) {
+                const assistant = yield* MessageV2.get({ sessionID, messageID: handle.message.id }).pipe(
+                  Effect.provideService(Database.Service, database),
+                  Effect.orDie,
+                )
+                const hasToolCalls =
+                  assistant?.parts.some(
+                    (part) =>
+                      part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
+                  ) ?? false
+                if (!hasToolCalls) {
+                  deferredCompactionTrigger = "capacity"
+                  return "continue" as const
+                }
+              }
               yield* compaction.create({
                 sessionID,
                 agent: lastUser.agent,
                 model: lastUser.model,
                 auto: true,
-                overflow: !handle.message.finish,
+                overflow,
+                ...(!overflow && handle.compactionTrigger ? { trigger: handle.compactionTrigger } : {}),
+                resume: overflow || handle.compactionTrigger === "capacity",
               })
+              deferredCompactionTrigger = undefined
             }
             return "continue" as const
           }).pipe(
@@ -2022,11 +2092,25 @@ const layer = Layer.effect(
         (yield* queue.isParked(sessionID))
       )
         return yield* withdrawn.pipe(Effect.andThen(lastAssistant(sessionID)))
-      const result = yield* state.ensureRunning(
+      let result = yield* state.ensureRunning(
         sessionID,
         lastAssistant(sessionID),
         runLoop(sessionID, rootMessageID, retryFailedRoot),
       )
+      const attemptedCompactions = new Set<MessageID>()
+      while (true) {
+        const history = yield* MessageV2.snapshot(sessionID).pipe(Effect.provideService(Database.Service, database))
+        const pending = SessionQueue.openTasks(history.messages, {
+          admissionOrder: history.admissionOrder,
+          excludeNoReply: true,
+        }).findLast(
+          (task): task is SessionV1.CompactionPart =>
+            task.type === "compaction" && task.auto && task.trigger !== undefined,
+        )
+        if (!pending || attemptedCompactions.has(pending.messageID)) break
+        attemptedCompactions.add(pending.messageID)
+        result = yield* state.ensureRunning(sessionID, lastAssistant(sessionID), runLoop(sessionID))
+      }
       // Work admitted after the joined run's last history read would otherwise
       // wait for another prompt. This caller stays with the drains until one has
       // read its own prompt and finished; anyone else's is woken in the background.

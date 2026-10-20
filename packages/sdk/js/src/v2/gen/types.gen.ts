@@ -626,6 +626,8 @@ export type CompactionPart = {
   type: "compaction"
   auto: boolean
   overflow?: boolean
+  trigger?: "threshold" | "capacity"
+  resume?: boolean
   tail_start_id?: string
 }
 
@@ -2150,6 +2152,10 @@ export type Config = {
   }
   compaction?: {
     auto?: boolean
+    /**
+     * Automatic compaction trigger as a percentage of the model context limit.
+     */
+    threshold_percent?: number
     prune?: boolean
     tail_turns?: number
     preserve_recent_tokens?: number
