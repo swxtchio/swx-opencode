@@ -1,7 +1,9 @@
 # Keep this selection deterministic, fast, and behavior-covering.
 # Full-suite/CI Turbo task gaps include TUI, Client, JS SDK, codemode, effect-drizzle-sqlite,
 # httpapi-codegen, http-recorder, llm, and sdk-next; see #317.
-# Fast mode bypasses package scripts.test and invokes each selected file with bun test.
+# Core has a registered @opencode-ai/core#test Turbo task and is also selected for fast coverage.
+# Fast mode reads literal test-script env assignments and --timeout plus direct pretest/posttest hooks;
+# it bypasses each scripts.test command and runs only the exact selected file with bun test.
 # Changes touching an excluded timing class require that class at the final gate via
 # firstmate's repository suite override; release builds require a passing full suite.
 

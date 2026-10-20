@@ -15,16 +15,17 @@ import { dirname, join } from "node:path"
 const scratch = mkdtempSync(join(tmpdir(), "fast-suite-runner-"))
 afterAll(() => rmSync(scratch, { recursive: true, force: true }))
 
-// GOAL: prove the root entrypoint executes only committed manifest targets in their package
-// context, refuses dirty and unusable runs before tests start, and propagates real Bun test failures.
+// GOAL: prove fast mode runs only committed manifest targets in package context with script
+// environment, hooks, and timeout; refuses dirty/unusable selections and unexpected JUnit files.
 test(
-  "tests/run.sh dispatches registered Turbo tasks and direct package tests for the declared targets",
+  "tests/run.sh keeps direct fast targets inside their package test configuration",
   () => {
     const root = join(scratch, "repo")
     const marker = join(scratch, "executed.txt")
     const packageLog = join(scratch, "package-processes.txt")
     const turboLog = join(scratch, "turbo-argv.txt")
     const directLog = join(scratch, "direct-processes.txt")
+    const hookLog = join(scratch, "hooks.txt")
     const runner = join(root, "tests", "run.sh")
     const manifest = join(root, "tests", "fast-suite.txt")
     const packageRoot = join(root, "packages", "example")
@@ -34,9 +35,11 @@ test(
     const scriptlessPackageRoot = join(root, "packages", "no-script")
     const scriptlessPackageTests = join(scriptlessPackageRoot, "test")
     const turbo = join(root, "node_modules", ".bin", "turbo")
+    const bunBin = join(root, "bin", "bun")
     const packagePath = "packages/example"
     const selectedPath = `${packagePath}/test/selected.test.ts`
     const selectedSecondPath = `${packagePath}/test/selected-second.test.ts`
+    const timeoutPath = `${packagePath}/test/timeout.test.ts`
     const literalGlobPath = `${packagePath}/test/literal*.test.ts`
     const whitespacePath = `${packagePath}/test/with space.test.ts`
     const shapeInvalidPath = `${packagePath}/test/selected.test.tsx`
@@ -65,7 +68,10 @@ ${directSecondPath}
         FAST_SUITE_MARKER: marker,
         FAST_SUITE_PACKAGE_LOG: packageLog,
         FAST_SUITE_DIRECT_LOG: directLog,
+        FAST_SUITE_HOOK_LOG: hookLog,
         FAST_TURBO_LOG: turboLog,
+        FAST_SUITE_REAL_BUN: process.execPath,
+        PATH: `${join(root, "bin")}:${process.env.PATH}`,
       },
       stdout: "pipe" as const,
       stderr: "pipe" as const,
@@ -76,8 +82,24 @@ ${directSecondPath}
     mkdirSync(scriptlessPackageTests, { recursive: true })
     mkdirSync(dirname(runner), { recursive: true })
     mkdirSync(dirname(turbo), { recursive: true })
+    mkdirSync(dirname(bunBin), { recursive: true })
     copyFileSync(join(import.meta.dir, "..", "tests", "run.sh"), runner)
     chmodSync(runner, 0o755)
+    writeFileSync(
+      bunBin,
+      `#!/usr/bin/env bash
+set -euo pipefail
+has_test=0
+for argument in "$@"; do
+  if [ "$argument" = test ]; then has_test=1; fi
+done
+if [ "\${FAST_SUITE_FORCE_EXTRA_FILE:-0}" = 1 ] && [ "$has_test" -eq 1 ]; then
+  exec "\${FAST_SUITE_REAL_BUN:?}" "$@" ./test/unlisted.test.ts
+fi
+exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
+`,
+    )
+    chmodSync(bunBin, 0o755)
     writeFileSync(
       join(root, "package.json"),
       JSON.stringify({
@@ -93,61 +115,34 @@ ${directSecondPath}
       join(root, "turbo.json"),
       JSON.stringify({ tasks: { "@fixture/example#test": { outputs: [], dependsOn: ["^build"] } } }),
     )
-    writeFileSync(
-      join(packageRoot, "package.json"),
-      JSON.stringify({
-        name: "@fixture/example",
-        private: true,
-        type: "module",
-        scripts: { test: "FAST_SUITE_SCRIPT=package bun ./test-runner.ts" },
-      }),
-    )
-    writeFileSync(
-      join(packageRoot, "test-runner.ts"),
-      [
-        'import { spawnSync } from "node:child_process"',
-        "const passed = process.argv.slice(2)",
-        'const paths = passed.filter((arg) => arg.startsWith("./test/"))',
-        'const options = passed.filter((arg) => !arg.startsWith("./test/"))',
-        'const preset = paths.length ? ["./test/unlisted.test.ts"] : []',
-        'const result = spawnSync("bun", ["test", "--timeout=5000", "--max-concurrency=1", ...options, ...preset, ...paths], {',
-        "  cwd: process.cwd(),",
-        "  env: process.env,",
-        '  stdio: "inherit",',
-        "})",
-        "process.exit(result.status ?? 1)",
-        "",
-      ].join("\n"),
-    )
+    const exampleTestScript =
+      'FAST_SUITE_SCRIPT=package FAST_SUITE_FROM_SCRIPT="example suite" FAST_SUITE_FORCE_EXTRA_FILE=0 ' +
+      "bun test --timeout=5000 --max-concurrency=1"
+    const examplePackage = {
+      name: "@fixture/example",
+      private: true,
+      type: "module",
+      scripts: {
+        pretest: "bun ./pretest.ts",
+        test: exampleTestScript,
+        posttest: "bun ./posttest.ts",
+      },
+    }
+    writeFileSync(join(packageRoot, "package.json"), JSON.stringify(examplePackage))
     writeFileSync(
       join(directPackageRoot, "package.json"),
       JSON.stringify({
         name: "@fixture/direct",
         private: true,
         type: "module",
-        scripts: { test: "FAST_SUITE_SCRIPT=direct-package bun ./test-runner.ts" },
+        scripts: {
+          test: "FAST_SUITE_SCRIPT=direct-package FAST_SUITE_FROM_SCRIPT=direct bun test --timeout 5000 --max-concurrency=1 ./test/direct.test.ts ./test/direct.test.tsx",
+        },
       }),
     )
     writeFileSync(
       join(scriptlessPackageRoot, "package.json"),
       JSON.stringify({ name: "@fixture/no-script", private: true, type: "module" }),
-    )
-    writeFileSync(
-      join(directPackageRoot, "test-runner.ts"),
-      [
-        'import { spawnSync } from "node:child_process"',
-        "const passed = process.argv.slice(2)",
-        'const paths = passed.filter((arg) => arg.startsWith("./test/"))',
-        'const options = passed.filter((arg) => !arg.startsWith("./test/"))',
-        'const preset = paths.length ? ["./test/direct.test.tsx"] : []',
-        'const result = spawnSync("bun", ["test", "--timeout=5000", "--max-concurrency=1", ...options, ...preset, ...paths], {',
-        "  cwd: process.cwd(),",
-        "  env: process.env,",
-        '  stdio: "inherit",',
-        "})",
-        "process.exit(result.status ?? 1)",
-        "",
-      ].join("\n"),
     )
     writeFileSync(
       join(scriptlessPackageTests, "no-script.test.ts"),
@@ -181,13 +176,32 @@ ${directSecondPath}
       ].join("\n"),
     )
     writeFileSync(
+      join(packageRoot, "pretest.ts"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        'appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "pretest\\n")',
+        "",
+      ].join("\n"),
+    )
+    writeFileSync(
+      join(packageRoot, "posttest.ts"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        'appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "posttest\\n")',
+        "",
+      ].join("\n"),
+    )
+    writeFileSync(
       join(packageTests, "selected.test.ts"),
       [
         'import { appendFileSync } from "node:fs"',
         'import { expect, test } from "bun:test"',
-        'test("uses the package script and preload", () => {',
+        'test("uses the package test environment and preload", () => {',
         '  expect(process.env.FAST_SUITE_PRELOAD).toBe(process.cwd())',
+        '  expect(process.env.FAST_SUITE_SCRIPT).toBe("package")',
+        '  expect(process.env.FAST_SUITE_FROM_SCRIPT).toBe("example suite")',
         '  appendFileSync(process.env.FAST_SUITE_MARKER!, process.env.FAST_SUITE_SCRIPT === "package" ? "selected-script\\n" : "selected-direct\\n")',
+        '  appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "selected\\n")',
         "})",
         "",
       ].join("\n"),
@@ -222,7 +236,10 @@ ${directSecondPath}
         'import { expect, test } from "bun:test"',
         'test("uses the package test task for every selected file", () => {',
         '  expect(process.env.FAST_SUITE_PRELOAD).toBe(process.cwd())',
+        '  expect(process.env.FAST_SUITE_SCRIPT).toBe("package")',
+        '  expect(process.env.FAST_SUITE_FROM_SCRIPT).toBe("example suite")',
         '  appendFileSync(process.env.FAST_SUITE_MARKER!, process.env.FAST_SUITE_SCRIPT === "package" ? "second-script\\n" : "second-direct\\n")',
+        '  appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "selected-second\\n")',
         "})",
         "",
       ].join("\n"),
@@ -234,6 +251,8 @@ ${directSecondPath}
         'import { expect, test } from "bun:test"',
         'test("uses the direct package script and preload", () => {',
         '  expect(process.env.FAST_SUITE_PRELOAD).toBe(process.cwd())',
+        '  expect(process.env.FAST_SUITE_SCRIPT).toBe("direct-package")',
+        '  expect(process.env.FAST_SUITE_FROM_SCRIPT).toBe("direct")',
         '  appendFileSync(process.env.FAST_SUITE_MARKER!, process.env.FAST_SUITE_SCRIPT === "direct-package" ? "direct-script\\n" : "direct-direct\\n")',
         "})",
         "",
@@ -246,6 +265,8 @@ ${directSecondPath}
         'import { expect, test } from "bun:test"',
         'test("uses the direct package script and preload for each target", () => {',
         '  expect(process.env.FAST_SUITE_PRELOAD).toBe(process.cwd())',
+        '  expect(process.env.FAST_SUITE_SCRIPT).toBe("direct-package")',
+        '  expect(process.env.FAST_SUITE_FROM_SCRIPT).toBe("direct")',
         '  appendFileSync(process.env.FAST_SUITE_MARKER!, process.env.FAST_SUITE_SCRIPT === "direct-package" ? "direct-second-script\\n" : "direct-second-direct\\n")',
         "})",
         "",
@@ -293,6 +314,17 @@ ${directSecondPath}
         'test("a real assertion failure reaches the runner", () => {',
         '  appendFileSync(process.env.FAST_SUITE_MARKER!, "failing\\n")',
         '  expect("red").toBe("green")',
+        "})",
+        "",
+      ].join("\n"),
+    )
+    writeFileSync(
+      join(packageTests, "timeout.test.ts"),
+      [
+        'import { expect, test } from "bun:test"',
+        'test("honors the package test timeout", async () => {',
+        "  await Bun.sleep(100)",
+        '  expect(true).toBe(true)',
         "})",
         "",
       ].join("\n"),
@@ -374,6 +406,7 @@ exit 97
     writeFileSync(marker, "")
     writeFileSync(packageLog, "")
     writeFileSync(directLog, "")
+    writeFileSync(hookLog, "")
     writeFileSync(turboLog, "")
 
     const init = Bun.spawnSync(["git", "init", "-q", "-b", "swxtch"], { cwd: root, env: gitEnv })
@@ -394,15 +427,70 @@ exit 97
     expect(fast.exitCode).toBe(0)
     expect(fast.stdout.toString().trim().endsWith("verdict=completed mode=fast target_count=4 exit_code=0")).toBe(true)
     expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual([
-      "direct-direct",
-      "direct-second-direct",
-      "second-direct",
-      "selected-direct",
+      "direct-script",
+      "direct-second-script",
+      "second-script",
+      "selected-script",
     ])
     expect(readdirSync(root).filter((name) => name.startsWith(".fast-suite-report."))).toEqual([])
     expect(readFileSync(turboLog, "utf8")).toBe("")
     expect(readFileSync(packageLog, "utf8").trim().split("\n")).toEqual(["preload", "preload"])
     expect(readFileSync(directLog, "utf8").trim().split("\n")).toEqual(["preload", "preload"])
+    expect(readFileSync(hookLog, "utf8").trim().split("\n")).toEqual([
+      "pretest",
+      "selected",
+      "posttest",
+      "pretest",
+      "selected-second",
+      "posttest",
+    ])
+
+    const unexpectedFileScript = exampleTestScript.replace("FAST_SUITE_FORCE_EXTRA_FILE=0", "FAST_SUITE_FORCE_EXTRA_FILE=1")
+    writeFileSync(
+      join(packageRoot, "package.json"),
+      JSON.stringify({ ...examplePackage, scripts: { ...examplePackage.scripts, test: unexpectedFileScript } }),
+    )
+    writeFileSync(manifest, `${selectedPath}\n`)
+    expect(Bun.spawnSync(["git", "add", "packages/example/package.json", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "trigger an extra Bun test path"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    writeFileSync(marker, "")
+    writeFileSync(hookLog, "")
+    const unexpectedFile = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    if (unexpectedFile.exitCode === 0) console.error(unexpectedFile.stdout.toString(), unexpectedFile.stderr.toString())
+    expect(unexpectedFile.exitCode).toBe(1)
+    expect(
+      unexpectedFile.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=execution-set-mismatch exit_code=1"),
+    ).toBe(true)
+    expect(unexpectedFile.stderr.toString()).toContain("Bun executed files outside manifest entry")
+    expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual(["selected-script", "unlisted"])
+    expect(readdirSync(root).filter((name) => name.startsWith(".fast-suite-report."))).toEqual([])
+
+    writeFileSync(join(packageRoot, "package.json"), JSON.stringify(examplePackage))
+    writeFileSync(manifest, validManifest)
+    expect(Bun.spawnSync(["git", "add", "packages/example/package.json", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "restore package scripts and fast targets"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+
+    const shortTimeoutScript = exampleTestScript.replace("--timeout=5000", "--timeout=20")
+    writeFileSync(
+      join(packageRoot, "package.json"),
+      JSON.stringify({ ...examplePackage, scripts: { ...examplePackage.scripts, test: shortTimeoutScript } }),
+    )
+    writeFileSync(manifest, `${timeoutPath}\n`)
+    expect(Bun.spawnSync(["git", "add", "packages/example/package.json", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "select a target that exceeds the package timeout"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    writeFileSync(marker, "")
+    writeFileSync(hookLog, "")
+    const shortTimeout = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(shortTimeout.exitCode).toBe(1)
+    expect(shortTimeout.stdout.toString().trim().endsWith("verdict=completed mode=fast target_count=1 exit_code=1")).toBe(true)
+    expect(shortTimeout.stderr.toString().toLowerCase()).toContain("timeout")
+    expect(readFileSync(hookLog, "utf8").trim().split("\n")).toEqual(["pretest", "posttest"])
+    expect(readdirSync(root).filter((name) => name.startsWith(".fast-suite-report."))).toEqual([])
+
+    writeFileSync(join(packageRoot, "package.json"), JSON.stringify(examplePackage))
+    writeFileSync(manifest, validManifest)
+    expect(Bun.spawnSync(["git", "add", "packages/example/package.json", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "restore package scripts and fast targets"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
 
     writeFileSync(join(root, ".gitignore"), "packages/example/test/untracked.test.ts\ntests/fast-suite.txt\n")
     expect(Bun.spawnSync(["git", "add", ".gitignore"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
@@ -502,9 +590,9 @@ exit 97
       fastFailure.stdout.toString().trim().endsWith("verdict=completed mode=fast target_count=3 exit_code=1"),
     ).toBe(true)
     expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual([
-      "direct-direct",
+      "direct-script",
       "failing",
-      "selected-direct",
+      "selected-script",
     ])
 
     writeFileSync(manifest, validManifest)
@@ -532,5 +620,5 @@ exit 97
     expect(fullWithArguments.stdout.toString().trim().endsWith("verdict=completed mode=full exit_code=1")).toBe(true)
     expect(readFileSync(turboLog, "utf8").trim().split("\n").at(-1)).toBe("test --filter=./packages/example")
   },
-  20_000,
+  60_000,
 )
