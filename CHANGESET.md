@@ -39,9 +39,9 @@ Newest first. Each entry names the upstream range brought in.
 ### Fork maintenance and CI
 
 - **#311** Add a maintained fast test manifest and `tests/run.sh --fast`; validate committed per-package test paths,
-  run each exact path directly from its owning package with test-script environment, timeout, and pre/post hooks,
-  reject unexpected JUnit files, and require active test cases. Bare full execution remains intact; dirty checkouts
-  and unusable selections refuse with machine-readable verdicts. _Fork-only._
+  run each exact path directly from its owning package with test-script environment/options, Turbo-declared build
+  preparation, and propagate pre/post hook failures; reject unexpected JUnit files and require active test cases.
+  Bare full execution remains intact; only `--fast` refuses dirty checkouts, with machine-readable verdicts. _Fork-only._
 - **#306** Recognize GLM-5.3 ids in the provider variant family match (swxtchio/swx-opencode#305): config-defined
   GLM-5.3 models exposed no effort variants and were refused by effort-proof consumers; the match now covers
   `glm-5.3|glm-5-3|glm-5p3` alongside 5.2. _Fork-only._
