@@ -63,11 +63,15 @@ export function DialogQueue(props: { sessionID: string; enhancement?: PromptEnha
   // accepts after the close never outlives it.
   const request = (renewal: boolean) => {
     const version = ++holdVersion
-    void checked(sdk.client.session.queue.hold({ sessionID: props.sessionID, holder }, { signal: signal() }))
+    void sdk.client.session.queue
+      .hold({ sessionID: props.sessionID, holder }, { signal: signal() })
       .then((result) => {
         if (closed || version !== holdVersion) return
-        setHold("held")
-        if (result.data) sync.queue.listed(props.sessionID, result.data)
+        return checked(Promise.resolve(result)).then((checkedResult) => {
+          if (closed || version !== holdVersion) return
+          setHold("held")
+          if (checkedResult.data) sync.queue.listed(props.sessionID, checkedResult.data)
+        })
       })
       .catch((error) => {
         if (closed || version !== holdVersion) return

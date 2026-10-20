@@ -622,11 +622,11 @@ test("a failed force response refreshes the released hold and current queue", as
 
 test("a late pre-force hold renewal cannot overwrite the reconciled hold state", async () => {
   const renewal = later()
+  const forceReply = later()
   const forced = { ...queued, delivery: "steer" as const }
   const served = { holdPosts: 0, renewalStarted: false, statusReads: 0, statusHeld: undefined as boolean | undefined }
   const view = await setup([steer, queued], (path) => {
-    if (path.endsWith(`/queue/force/${queued.id}`))
-      return Promise.resolve(json({ name: "Unavailable" }, { status: 503 }))
+    if (path.endsWith(`/queue/force/${queued.id}`)) return forceReply.response
     if (path.includes("/queue/hold/")) {
       served.statusReads++
       const response = json({ held: false, items: [steer, forced] })
@@ -665,11 +665,10 @@ test("a late pre-force hold renewal cannot overwrite the reconciled hold state",
   view.app.mockInput.pressArrow("down")
   view.app.mockInput.pressKey("f", { ctrl: true })
   await settle(() => view.requests.some((request) => request.path.endsWith(`/queue/force/${queued.id}`)))
-  await settle(() => view.requests.some((request) => request.method === "GET" && request.path.includes("/queue/hold/")))
-  await settle(() => view.sync.data.session_queue[sessionID]?.find((row) => row.id === queued.id)?.delivery === "steer")
-  expect(served).toMatchObject({ holdPosts: 2, renewalStarted: true, statusReads: 1, statusHeld: false })
+  expect(served).toMatchObject({ holdPosts: 2, renewalStarted: true, statusReads: 0 })
 
-  const stale = json([steer, queued])
+  const staleItem = item("que_stale", "queue", "stale renewal snapshot", 5)
+  const stale = json([steer, staleItem])
   let bodyRead = false
   const readJson = stale.json.bind(stale)
   const readText = stale.text.bind(stale)
@@ -686,7 +685,16 @@ test("a late pre-force hold renewal cannot overwrite the reconciled hold state",
   renewal.answer(stale)
   await settle(() => bodyRead)
   await new Promise<void>((resolve) => queueMicrotask(() => queueMicrotask(resolve)))
+  expect(view.sync.data.session_queue[sessionID]).toEqual([steer, queued])
+  expect(served.statusReads).toBe(0)
 
+  forceReply.answer(json({ name: "Unavailable" }, { status: 503 }))
+  await settle(
+    () =>
+      served.statusReads === 1 &&
+      view.sync.data.session_queue[sessionID]?.find((row) => row.id === queued.id)?.delivery === "steer",
+  )
+  expect(served.statusHeld).toBe(false)
   expect(await view.frame()).toContain("delivery NOT paused")
   expect(view.sync.data.session_queue[sessionID]).toEqual([steer, forced])
 })
