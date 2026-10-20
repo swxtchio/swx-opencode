@@ -4,6 +4,7 @@ import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { Deferred, Effect } from "effect"
 import { Global } from "@opencode-ai/core/global"
 import { Flag } from "@opencode-ai/core/flag/flag"
+import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { ClipboardProvider, useClipboard } from "./context/clipboard"
 import { ExitProvider, useExit } from "./context/exit"
@@ -58,6 +59,7 @@ import { FrecencyProvider } from "./component/prompt/frecency"
 import { PromptStashProvider } from "./component/prompt/stash"
 import { DialogAlert } from "./ui/dialog-alert"
 import { DialogConfirm } from "./ui/dialog-confirm"
+import { DialogPrompt } from "./ui/dialog-prompt"
 import { ToastProvider, useToast } from "./ui/toast"
 import { isDefaultTitle } from "./util/session"
 import { KVProvider, useKV } from "./context/kv"
@@ -559,6 +561,11 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
     if (workspace?.type !== "worktree" || !workspace.directory) return
     return workspace
   })
+  const hasSessionWork = () =>
+    sync.status !== "complete" ||
+    Object.values(sync.data.session_status).some((status) => status.type === "busy" || status.type === "retry") ||
+    Object.values(sync.data.session_queue).some((items) => items.length > 0) ||
+    Object.values(sync.data.session_sending).some((items) => items.length > 0)
   const appCommands = createMemo(() =>
     [
       {
@@ -771,6 +778,49 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
           dialog.replace(() => <DialogStatus />)
         },
         category: "System",
+      },
+      {
+        name: "session.compaction.threshold",
+        title: "Set auto-compaction threshold",
+        desc: "Set the automatic compaction trigger as a percentage of model context for this project.",
+        category: "Session",
+        run: async () => {
+          if (hasSessionWork()) {
+            return toast.show({
+              variant: "warning",
+              message:
+                "Wait for this project's session activity and queued prompts to finish before changing configuration.",
+            })
+          }
+
+          const current =
+            sync.data.config.compaction?.threshold_percent ?? ConfigV1.AUTO_COMPACTION_THRESHOLD_PERCENT_DEFAULT
+          const value = await DialogPrompt.show(dialog, "Auto-compaction threshold (%)", {
+            placeholder: String(current),
+            description: () => (
+              <text fg={theme.textMuted}>Current: {current}%. Enter a whole number from 1 to 100.</text>
+            ),
+          })
+          if (value === null) return
+          dialog.clear()
+
+          const threshold = Number(value.trim() || current)
+          if (!Number.isInteger(threshold) || threshold < 1 || threshold > 100) {
+            return toast.show({ variant: "warning", message: "Enter a whole percentage from 1 to 100." })
+          }
+          if (hasSessionWork()) {
+            return toast.show({
+              variant: "warning",
+              message:
+                "Wait for this project's session activity and queued prompts to finish before changing configuration.",
+            })
+          }
+
+          return sdk.client.config
+            .update({ config: { compaction: { threshold_percent: threshold } } }, { throwOnError: true })
+            .then(() => toast.show({ variant: "info", message: `Auto-compaction threshold set to ${threshold}%.` }))
+            .catch(toast.error)
+        },
       },
       {
         name: "opencode.debug",

@@ -349,6 +349,15 @@ it.instance(
 )
 
 it.instance(
+  "loads the automatic compaction percentage from project config",
+  Effect.gen(function* () {
+    const config = yield* Config.use.get()
+    expect(config.compaction?.threshold_percent).toBe(72)
+  }),
+  { config: { compaction: { threshold_percent: 72 } } },
+)
+
+it.instance(
   "loads shell config field",
   Effect.gen(function* () {
     const config = yield* Config.use.get()
@@ -382,6 +391,18 @@ it.effect("updates global config and omits empty shell key in json", () =>
       expect(writtenConfig).not.toHaveProperty("shell")
     }),
   ),
+)
+
+it.instance("persists the project automatic compaction percentage", () =>
+  Effect.gen(function* () {
+    const instance = yield* TestInstance
+    const file = path.join(instance.directory, "config.json")
+    yield* writeConfigEffect(instance.directory, schemaConfig({ shell: "bash" }), "config.json")
+    yield* Config.use.update({ compaction: { threshold_percent: 72 } })
+    const stored = yield* FSUtil.use.readJson(file)
+
+    expect(stored).toMatchObject({ shell: "bash", compaction: { threshold_percent: 72 } })
+  }),
 )
 
 it.effect("updates global config and omits empty shell key in jsonc", () =>

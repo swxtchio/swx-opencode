@@ -12,7 +12,7 @@ import { Snapshot } from "@/snapshot"
 import { Session } from "./session"
 import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
-import { isOverflow } from "./overflow"
+import { isAutoCompactionDue, isOverflow } from "./overflow"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
@@ -57,6 +57,7 @@ function hasKnownPrice(model: Provider.Model) {
 
 export interface Handle {
   readonly message: SessionV1.Assistant
+  readonly compactionTrigger?: SessionV1.CompactionPart["trigger"]
   readonly updateToolCall: (
     toolCallID: string,
     update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
@@ -140,6 +141,7 @@ interface ProcessorContext extends Input {
   snapshot: string | undefined
   blocked: boolean
   needsCompaction: boolean
+  compactionTrigger: SessionV1.CompactionPart["trigger"]
   currentText: SessionV1.TextPart | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
 }
@@ -308,6 +310,7 @@ const layer = Layer.effect(
         snapshot: initialSnapshot,
         blocked: false,
         needsCompaction: false,
+        compactionTrigger: undefined,
         currentText: undefined,
         reasoningMap: {},
       }
@@ -813,11 +816,14 @@ const layer = Layer.effect(
                 messageID: ctx.assistantMessage.parentID,
               })
               .pipe(Effect.ignore, Effect.forkIn(scope))
-            if (
-              !ctx.assistantMessage.summary &&
-              isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model })
-            ) {
-              ctx.needsCompaction = true
+            if (!ctx.assistantMessage.summary) {
+              const cfg = yield* config.get()
+              if (isOverflow({ cfg, tokens: usage.tokens, model: ctx.model })) {
+                ctx.compactionTrigger = "capacity"
+                if (value.reason === "tool-calls" || value.reason === "unknown") ctx.needsCompaction = true
+              } else if (isAutoCompactionDue({ cfg, tokens: usage.tokens, model: ctx.model })) {
+                ctx.compactionTrigger = "threshold"
+              }
             }
             return
           }
@@ -1019,6 +1025,7 @@ const layer = Layer.effect(
             messageID: input.assistantMessage.id,
           })
           ctx.needsCompaction = false
+          ctx.compactionTrigger = undefined
           ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
           yield* Effect.suspend(() => {
@@ -1096,6 +1103,9 @@ const layer = Layer.effect(
       return {
         get message() {
           return ctx.assistantMessage
+        },
+        get compactionTrigger() {
+          return ctx.compactionTrigger
         },
         updateToolCall,
         admitToolCall,

@@ -1148,6 +1148,7 @@ let gateDirectProjection = false
 const directProjectionCompaction = Layer.succeed(
   SessionCompaction.Service,
   SessionCompaction.Service.of({
+    isAutoCompactionDue: () => Effect.succeed(false),
     isOverflow: () => {
       if (!gateDirectProjection) return Effect.succeed(false)
       gateDirectProjection = false
@@ -3745,15 +3746,31 @@ it.instance("loop stops provider overflow instead of auto-compacting when disabl
   }),
 )
 
-it.instance("automatically compacts and continues after an unparseable mid-stream error chunk", () =>
+it.instance("automatically compacts unknown-context sessions after a mid-stream provider overflow", () =>
   Effect.gen(function* () {
-    const { llm } = yield* useServerConfig((url) => ({
-      ...providerCfg(url),
-      compaction: { auto: true },
-    }))
+    const { llm } = yield* useServerConfig((url) => {
+      const base = providerCfg(url)
+      return {
+        ...base,
+        compaction: { auto: true },
+        provider: {
+          ...base.provider,
+          test: {
+            ...base.provider.test,
+            models: {
+              ...base.provider.test.models,
+              "test-model": { ...base.provider.test.models["test-model"], limit: undefined },
+            },
+          },
+        },
+      }
+    })
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
+    const provider = yield* ProviderSvc.Service
     const chat = yield* sessions.create({ title: "Pinned" })
+
+    expect((yield* provider.getModel(ref.providerID, ref.modelID)).limit.context).toBe(0)
 
     yield* llm.push(
       raw({
@@ -3778,9 +3795,12 @@ it.instance("automatically compacts and continues after an unparseable mid-strea
       parts: [{ type: "text", text: "Continue after handling a mocked overflow." }],
     })
     const messages = yield* sessions.messages({ sessionID: chat.id })
+    const compaction = messages
+      .flatMap((message) => message.parts)
+      .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
 
     expect(yield* llm.hits).toHaveLength(3)
-    expect(messages.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(true)
+    expect(compaction).toMatchObject({ type: "compaction", auto: true, overflow: true })
     expect(
       messages.some((message) =>
         message.parts.some((part) => part.type === "text" && part.text === "partial response"),
@@ -3794,6 +3814,269 @@ it.instance("automatically compacts and continues after an unparseable mid-strea
     )
     if (result.info.role === "assistant") expect(result.info.error).toBeUndefined()
   }),
+)
+
+it.instance(
+  "threshold maintenance waits for idle and then delivers the queued prompt",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const file = path.join(instance.directory, "threshold-tool-result.txt")
+      yield* writeText(file, "threshold tool result")
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        compaction: { auto: true, threshold_percent: 50 },
+      }))
+      const provider = yield* ProviderSvc.Service
+      const configured = yield* provider.getProvider(ref.providerID)
+      const originalFetch = configured.options.fetch ?? fetch
+      const timeline: string[] = []
+      configured.options.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        timeline.push("provider-request")
+        return originalFetch(input, init)
+      }
+      yield* Effect.addFinalizer(() => Effect.sync(() => (configured.options.fetch = originalFetch)))
+
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const chat = yield* sessions.create({
+        title: "Threshold idle boundary",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const idleEvents: string[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Idle.type) return Effect.void
+        return Effect.sync(() => {
+          const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+          idleEvents.push(data.sessionID)
+          if (data.sessionID === chat.id) timeline.push("idle")
+        })
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const toolResponse = yield* Deferred.make<void>()
+      const terminalResponse = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() =>
+        Effect.all([Deferred.succeed(toolResponse, undefined), Deferred.succeed(terminalResponse, undefined)], {
+          discard: true,
+        }),
+      )
+      yield* llm.push(
+        reply()
+          .wait(deferredAsPromise(toolResponse))
+          .tool("read", { filePath: file })
+          .usage({ input: 51_000, output: 100 }),
+        reply()
+          .wait(deferredAsPromise(terminalResponse))
+          .text("root turn answer")
+          .usage({ input: 51_100, output: 100 })
+          .stop(),
+        reply().text("threshold summary").stop(),
+        reply().text("queued prompt answer").stop(),
+      )
+
+      const root = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: said("read the threshold fixture, then finish the task"),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "threshold root request did not start", "10 seconds")
+      const queued = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          delivery: "queue",
+          parts: said("queued next prompt"),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(admitted(chat.id, "queued next prompt"), "next prompt was not queued", "10 seconds")
+
+      yield* Deferred.succeed(toolResponse, undefined)
+      yield* awaitWithTimeout(llm.wait(2), "threshold-crossing tool step did not continue", "10 seconds")
+      const afterTool = yield* llm.inputs
+      expect(JSON.stringify(afterTool[1]?.messages)).toContain("threshold tool result")
+      expect(
+        (yield* sessions.messages({ sessionID: chat.id })).some(
+          (message) => message.info.role === "assistant" && message.info.summary,
+        ),
+      ).toBe(false)
+
+      yield* Deferred.succeed(terminalResponse, undefined)
+      yield* awaitWithTimeout(llm.wait(3), "idle threshold summary request did not start", "10 seconds")
+      const beforeQueuedTurn = yield* sessions.messages({ sessionID: chat.id })
+      const thresholdTask = beforeQueuedTurn
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      const requestOrder = timeline
+        .map((item, index) => (item === "provider-request" ? index : -1))
+        .filter((index) => index >= 0)
+
+      expect(idleEvents).toContain(chat.id)
+      expect(requestOrder).toHaveLength(3)
+      expect(timeline.indexOf("idle")).toBeLessThan(requestOrder[2])
+      expect(thresholdTask).toMatchObject({ type: "compaction", auto: true, trigger: "threshold", resume: false })
+
+      yield* awaitWithTimeout(llm.wait(4), "queued prompt was not delivered after threshold compaction", "10 seconds")
+      const requests = yield* llm.inputs
+      expect(lastUserContent(requests[3])).toContain("queued next prompt")
+      expect(JSON.stringify(requests[3])).not.toContain("Continue if you have next steps")
+
+      const [rootReply, queuedReply] = yield* finish(root, queued)
+      expect(rootReply.info.role).toBe("assistant")
+      expect(rootReply.parts.some((part) => part.type === "text" && part.text === "root turn answer")).toBe(true)
+      expect(queuedReply.info.role).toBe("assistant")
+      expect(queuedReply.parts.some((part) => part.type === "text" && part.text === "queued prompt answer")).toBe(true)
+      expect(yield* queue.list(chat.id)).toEqual([])
+      expect(yield* llm.calls).toBe(4)
+    }),
+  30_000,
+)
+
+it.instance(
+  "terminal threshold crossing compacts at idle without waiting for a later prompt",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        compaction: { auto: true, threshold_percent: 50 },
+      }))
+      const provider = yield* ProviderSvc.Service
+      const configured = yield* provider.getProvider(ref.providerID)
+      const originalFetch = configured.options.fetch ?? fetch
+      const timeline: string[] = []
+      configured.options.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        timeline.push("provider-request")
+        return originalFetch(input, init)
+      }
+      yield* Effect.addFinalizer(() => Effect.sync(() => (configured.options.fetch = originalFetch)))
+
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Terminal threshold boundary" })
+      const idleEvents: string[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Idle.type) return Effect.void
+        return Effect.sync(() => {
+          const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+          idleEvents.push(data.sessionID)
+          if (data.sessionID === chat.id) timeline.push("idle")
+        })
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+      yield* llm.push(
+        reply().text("completed threshold answer").usage({ input: 51_000, output: 100 }).stop(),
+        reply().text("maintenance summary").stop(),
+      )
+
+      const response = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: said("finish the threshold task"),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "terminal threshold request did not start", "10 seconds")
+      yield* awaitWithTimeout(
+        llm.wait(2),
+        "terminal threshold maintenance waited for another user prompt",
+        "10 seconds",
+      )
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const task = messages
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      const requestOrder = timeline
+        .map((item, index) => (item === "provider-request" ? index : -1))
+        .filter((index) => index >= 0)
+
+      expect(idleEvents).toContain(chat.id)
+      expect(requestOrder).toHaveLength(2)
+      expect(timeline.indexOf("idle")).toBeLessThan(requestOrder[1])
+      expect(task).toMatchObject({ type: "compaction", trigger: "threshold", resume: false })
+
+      const [result] = yield* finish(response)
+      expect(result.info.role).toBe("assistant")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "completed threshold answer")).toBe(true)
+      const finished = yield* sessions.messages({ sessionID: chat.id })
+      expect(
+        finished.some((message) =>
+          message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true),
+        ),
+      ).toBe(false)
+      expect(yield* llm.calls).toBe(2)
+    }),
+  30_000,
+)
+
+it.instance(
+  "capacity protection compacts before an owed tool continuation and leaves the session usable",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const file = path.join(instance.directory, "capacity-tool-result.txt")
+      yield* writeText(file, "capacity tool result")
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        compaction: { auto: true },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({
+        title: "Capacity recovery",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      yield* llm.push(
+        reply().tool("read", { filePath: file }).usage({ input: 90_000, output: 100 }),
+        reply().text("capacity summary").stop(),
+        reply().text("capacity continuation completed").stop(),
+        reply().text("follow-up succeeded").stop(),
+      )
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: said("continue working after reading the capacity fixture"),
+      })
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const compaction = messages
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      const continuation = messages.find((message) =>
+        message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true),
+      )
+      const tool = messages
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "read")
+
+      expect(compaction).toMatchObject({ type: "compaction", auto: true, trigger: "capacity", resume: true })
+      expect(continuation?.info.role).toBe("user")
+      expect(tool?.state.status).toBe("completed")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "capacity continuation completed")).toBe(
+        true,
+      )
+      expect((yield* status.get(chat.id)).type).toBe("idle")
+
+      const followup = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: said("follow up after recovery"),
+      })
+      expect(followup.parts.some((part) => part.type === "text" && part.text === "follow-up succeeded")).toBe(true)
+      expect(yield* llm.calls).toBe(4)
+    }),
+  30_000,
 )
 
 noLLMServer.instance.skip(

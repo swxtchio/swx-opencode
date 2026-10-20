@@ -1,9 +1,7 @@
-import type { Config } from "@/config/config"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
-import type { MessageV2 } from "./message-v2"
 
 const COMPACTION_BUFFER = 20_000
 
@@ -19,6 +17,23 @@ export function usable(input: { cfg: ConfigV1.Info; model: Provider.Model; outpu
     : Math.max(0, context - ProviderTransform.maxOutputTokens(input.model, input.outputTokenMax))
 }
 
+function tokenCount(tokens: SessionV1.Assistant["tokens"]) {
+  return tokens.total || tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
+}
+
+export function isAutoCompactionDue(input: {
+  cfg: ConfigV1.Info
+  tokens: SessionV1.Assistant["tokens"]
+  model: Provider.Model
+}) {
+  if (input.cfg.compaction?.auto === false) return false
+  const context = input.model.limit.context
+  if (!Number.isFinite(context) || context <= 0) return false
+
+  const threshold = input.cfg.compaction?.threshold_percent ?? ConfigV1.AUTO_COMPACTION_THRESHOLD_PERCENT_DEFAULT
+  return tokenCount(input.tokens) >= (context * threshold) / 100
+}
+
 export function isOverflow(input: {
   cfg: ConfigV1.Info
   tokens: SessionV1.Assistant["tokens"]
@@ -28,7 +43,5 @@ export function isOverflow(input: {
   if (input.cfg.compaction?.auto === false) return false
   if (input.model.limit.context === 0) return false
 
-  const count =
-    input.tokens.total || input.tokens.input + input.tokens.output + input.tokens.cache.read + input.tokens.cache.write
-  return count >= usable(input)
+  return tokenCount(input.tokens) >= usable(input)
 }
