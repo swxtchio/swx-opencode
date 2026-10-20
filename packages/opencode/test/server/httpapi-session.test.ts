@@ -3529,7 +3529,7 @@ describe("session HttpApi summary records what it sent", () => {
   )
 
   it.live(
-    "an automatic summary runs at the last prompt's variant, as it always has, and records it",
+    "an automatic terminal summary keeps the last prompt's variant and hands off to the next prompt",
     () =>
       Effect.gen(function* () {
         const llm = yield* TestLLMServer
@@ -3542,13 +3542,15 @@ describe("session HttpApi summary records what it sent", () => {
         yield* llm.text("start done", { usage: { input: 95_000, output: 10 } })
         expect((yield* api.prompt("start", "low")).status).toBe(200)
         yield* llm.text("automatic summary")
-        yield* llm.text("continued")
         yield* llm.text("answered")
+        yield* llm.text("unexpected extra continuation")
         expect((yield* api.prompt("after the context filled", "low")).status).toBe(200)
 
         const sent = yield* llm.inputs
-        expect(sent.map((input) => input.reasoning_effort)).toEqual(["low", "low", "low", "low"])
+        expect(sent.map((input) => input.reasoning_effort)).toEqual(["low", "low", "low"])
         expect(JSON.stringify((sent[1]!.messages as unknown[]).at(-1))).toContain("Here is the conversation so far")
+        expect(JSON.stringify(sent[2].messages)).toContain("after the context filled")
+        expect(JSON.stringify(sent[2].messages)).not.toContain("Continue if you have next steps")
         expect(yield* api.summaries()).toEqual([{ modelID: "model-a", variant: "low", effort: "low" }])
       }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
     30_000,
