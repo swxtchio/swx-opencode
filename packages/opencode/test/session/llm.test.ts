@@ -14,7 +14,7 @@ import { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 
-import { testEffect } from "../lib/effect"
+import { testEffect, awaitWithTimeout } from "../lib/effect"
 import type { Agent } from "../../src/agent/agent"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionID, MessageID } from "../../src/session/schema"
@@ -48,6 +48,29 @@ const openAIConfig = (model: ModelsDev.Provider["models"][string], baseURL: stri
           apiKey: "test-openai-key",
           baseURL,
         },
+      },
+    },
+  }
+}
+
+function foundryProviderConfig(baseURL: string, chunkTimeout: number): Partial<ConfigV1.Info> {
+  const model: ConfigModel = {
+    id: "gpt-6.1-sol",
+    name: "GPT-6.1 Sol",
+    reasoning: true,
+    tool_call: true,
+    provider: { npm: "@ai-sdk/openai" },
+    options: { reasoningEffort: "high", reasoningSummary: "auto" },
+  }
+  return {
+    model: "swx-azure/gpt-6.1-sol",
+    enabled_providers: ["swx-azure"],
+    provider: {
+      "swx-azure": {
+        name: "swXtch Foundry",
+        npm: "@ai-sdk/openai",
+        options: { apiKey: "test-key", baseURL, chunkTimeout, headerTimeout: false },
+        models: { "gpt-6.1-sol": model },
       },
     },
   }
@@ -760,6 +783,348 @@ describe("session.llm.stream", () => {
   const opencodeFixture = { providerID: "opencode-test", modelID: vivgridFixture.modelID }
 
   it.instance(
+    "bounds Foundry Responses streams when keepalives continue without generation progress",
+    () =>
+      Effect.gen(function* () {
+        const providerID = ProviderV2.ID.make("swx-azure")
+        const modelID = ModelV2.ID.make("gpt-6.1-sol")
+        const providerRequestAborted = deferred<void>()
+        const responseCancelled = deferred<void>()
+        const release = deferred<void>()
+        const progress = deferred<void>()
+        const keepalives = { count: 0 }
+        const encoder = new TextEncoder()
+        const event = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`
+        let cancelled = false
+        const initial = [
+          {
+            type: "response.created",
+            response: {
+              id: "resp-stalled-generation",
+              created_at: Math.floor(Date.now() / 1000),
+              model: modelID,
+              service_tier: null,
+            },
+          },
+          {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { type: "reasoning", id: "rs-stalled-generation", encrypted_content: null },
+          },
+          {
+            type: "response.reasoning_summary_part.added",
+            item_id: "rs-stalled-generation",
+            summary_index: 0,
+          },
+          {
+            type: "response.reasoning_summary_text.delta",
+            item_id: "rs-stalled-generation",
+            summary_index: 0,
+            delta: "provider reasoning progressed before the stall",
+          },
+        ]
+          .map(event)
+          .join("")
+        const pending = deferred<Capture>()
+        state.queue.push({
+          path: "/responses",
+          resolve: pending.resolve,
+          response: (request) => {
+            request.signal.addEventListener("abort", () => providerRequestAborted.resolve(), { once: true })
+            return new Response(
+              new ReadableStream<Uint8Array>({
+                start(controller) {
+                  controller.enqueue(encoder.encode(initial))
+                },
+                async pull(controller) {
+                  const action = await Promise.race([
+                    release.promise.then(() => "release" as const),
+                    new Promise<"keepalive">((resolve) => setTimeout(() => resolve("keepalive"), 100)),
+                  ])
+                  if (action === "release") {
+                    if (!cancelled) controller.close()
+                    return
+                  }
+                  keepalives.count++
+                  controller.enqueue(encoder.encode(": keep-alive\n\n"))
+                },
+                cancel() {
+                  cancelled = true
+                  responseCancelled.resolve()
+                  release.resolve()
+                },
+              }),
+              { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } },
+            )
+          },
+        })
+        const provider = yield* Provider.Service
+        const configured = yield* provider.getProvider(providerID)
+        configured.options.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+          init?.signal?.addEventListener("abort", () => providerRequestAborted.resolve(), { once: true })
+          return fetch(input, init)
+        }
+        const model = yield* provider.getModel(providerID, modelID)
+        const sessionID = SessionID.make("session-foundry-stalled-generation")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const user = {
+          id: MessageID.ascending(),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID, modelID: model.id, variant: "high" },
+        } satisfies SessionV1.User
+        const fiber = yield* LLM.Service.use((service) =>
+          service
+            .stream({
+              user,
+              sessionID,
+              model,
+              agent,
+              system: [],
+              messages: [{ role: "user", content: "Produce a brief response." }],
+              tools: {},
+              retries: 0,
+            })
+            .pipe(
+              Stream.tap((item) =>
+                item.type === "reasoning-delta" ? Effect.sync(() => progress.resolve()) : Effect.void,
+              ),
+              Stream.runDrain,
+            ),
+        ).pipe(Effect.forkScoped)
+        yield* Effect.addFinalizer(() => Effect.sync(() => release.resolve()))
+
+        const capture = yield* awaitWithTimeout(
+          Effect.promise(() => pending.promise),
+          "Foundry provider request did not start",
+        )
+        expect(capture.url.pathname.endsWith("/responses")).toBe(true)
+        expect(capture.body.model).toBe("gpt-6.1-sol")
+        yield* awaitWithTimeout(
+          Effect.promise(() => progress.promise),
+          "Responses reasoning delta was not decoded",
+        )
+        const exit = yield* awaitWithTimeout(
+          Fiber.await(fiber),
+          "stalled provider attempt did not fail within its bound",
+          "5 seconds",
+        )
+
+        expect(keepalives.count).toBeGreaterThan(0)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          const error = Cause.squash(exit.cause)
+          expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+          if (error instanceof ProviderError.ResponseStreamError)
+            expect(error.message).toBe("SSE generation progress timed out")
+        }
+        yield* awaitWithTimeout(
+          Effect.promise(() => providerRequestAborted.promise),
+          "provider fetch signal was not aborted",
+        )
+        yield* awaitWithTimeout(
+          Effect.promise(() => responseCancelled.promise),
+          "provider response body was not released",
+        )
+      }),
+    { config: () => foundryProviderConfig(`${state.server!.url.origin}/openai/v1`, 2_000) },
+    30_000,
+  )
+
+  it.instance(
+    "preserves slow Foundry reasoning progress with interleaved keepalives",
+    () =>
+      Effect.gen(function* () {
+        const providerID = ProviderV2.ID.make("swx-azure")
+        const modelID = ModelV2.ID.make("gpt-6.1-sol")
+        const encoder = new TextEncoder()
+        const event = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`
+        const reason = (delta: string) =>
+          event({
+            type: "response.reasoning_summary_text.delta",
+            item_id: "rs-slow-progress",
+            summary_index: 0,
+            delta,
+          })
+        const mixedFrame = (frame: string) => {
+          const mixed = frame.replace(/\n\n$/, "\n\r\n")
+          const delimiter = mixed.lastIndexOf("\n\r\n")
+          return [mixed.slice(0, delimiter + 1), mixed.slice(delimiter + 1)]
+        }
+        const mixedReason = (delta: string) => mixedFrame(reason(delta))
+        const mixedKeepAlive = mixedFrame(": keep-alive\n\n")
+        const initial = [
+          {
+            type: "response.created",
+            response: {
+              id: "resp-slow-progress",
+              created_at: Math.floor(Date.now() / 1000),
+              model: modelID,
+              service_tier: null,
+            },
+          },
+          {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { type: "reasoning", id: "rs-slow-progress", encrypted_content: null },
+          },
+          {
+            type: "response.reasoning_summary_part.added",
+            item_id: "rs-slow-progress",
+            summary_index: 0,
+          },
+          {
+            type: "response.reasoning_summary_text.delta",
+            item_id: "rs-slow-progress",
+            summary_index: 0,
+            delta: "reason-1",
+          },
+        ]
+          .map(event)
+          .join("")
+        const tail = [
+          ...mixedKeepAlive,
+          ...mixedReason("reason-2"),
+          ...mixedKeepAlive,
+          ...mixedReason("reason-3"),
+          ...mixedKeepAlive,
+          ...mixedReason("reason-4"),
+          ...mixedKeepAlive,
+          ...mixedReason("reason-5"),
+          ...mixedKeepAlive,
+          ...mixedReason("reason-6"),
+          ...mixedKeepAlive,
+          ...mixedReason("reason-7"),
+          ...mixedKeepAlive,
+          ...mixedReason("reason-8"),
+          ...mixedKeepAlive,
+          [
+            event({
+              type: "response.output_item.added",
+              output_index: 1,
+              item: { type: "message", id: "msg-slow-progress", status: "in_progress", role: "assistant", content: [] },
+            }),
+            event({
+              type: "response.content_part.added",
+              item_id: "msg-slow-progress",
+              output_index: 1,
+              content_index: 0,
+              part: { type: "output_text", text: "", annotations: [] },
+            }),
+            event({
+              type: "response.output_text.delta",
+              item_id: "msg-slow-progress",
+              output_index: 1,
+              content_index: 0,
+              delta: "done",
+              logprobs: null,
+            }),
+            event({
+              type: "response.completed",
+              response: {
+                incomplete_details: null,
+                service_tier: null,
+                usage: {
+                  input_tokens: 1,
+                  input_tokens_details: { cached_tokens: 0 },
+                  output_tokens: 1,
+                  output_tokens_details: { reasoning_tokens: 5 },
+                },
+              },
+            }),
+          ].join(""),
+        ]
+        let index = 0
+        const request = waitRequest(
+          "/responses",
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(encoder.encode(initial))
+              },
+              async pull(controller) {
+                const next = tail[index]
+                if (next === undefined) {
+                  controller.close()
+                  return
+                }
+                await new Promise((resolve) => setTimeout(resolve, 100))
+                index++
+                controller.enqueue(encoder.encode(next))
+              },
+            }),
+            { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } },
+          ),
+        )
+        const provider = yield* Provider.Service
+        const model = yield* provider.getModel(providerID, modelID)
+        const sessionID = SessionID.make("session-foundry-slow-progress")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const user = {
+          id: MessageID.ascending(),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID, modelID: model.id, variant: "high" },
+        } satisfies SessionV1.User
+        const started = performance.now()
+        let reasoningDeltas = 0
+        let firstTextAt: number | undefined
+        yield* awaitWithTimeout(
+          LLM.Service.use((service) =>
+            service
+              .stream({
+                user,
+                sessionID,
+                model,
+                agent,
+                system: [],
+                messages: [{ role: "user", content: "Reason slowly, then answer." }],
+                tools: {},
+                retries: 0,
+              })
+              .pipe(
+                Stream.tap((item) =>
+                  Effect.sync(() => {
+                    if (item.type === "reasoning-delta") reasoningDeltas++
+                    if (item.type === "text-delta") firstTextAt ??= performance.now() - started
+                  }),
+                ),
+                Stream.runDrain,
+              ),
+          ),
+          "slow Foundry reasoning stream did not complete",
+          "10 seconds",
+        )
+        const duration = performance.now() - started
+        const capture = yield* awaitWithTimeout(
+          Effect.promise(() => request),
+          "slow Responses request was not observed",
+        )
+
+        expect(capture.url.pathname.endsWith("/responses")).toBe(true)
+        expect(duration).toBeGreaterThan(2_000)
+        expect(reasoningDeltas).toBeGreaterThanOrEqual(8)
+        expect(firstTextAt).toBeGreaterThan(2_000)
+      }),
+    { config: () => foundryProviderConfig(`${state.server!.url.origin}/openai/v1`, 2_000) },
+    30_000,
+  )
+
+  it.instance(
     "sends the parent session header for opencode providers",
     () =>
       Effect.gen(function* () {
@@ -1043,7 +1408,521 @@ describe("session.llm.stream", () => {
     },
   )
 
+  it.instance(
+    "recognizes Chat Completions progress fields before the inactivity deadline",
+    () =>
+      Effect.gen(function* () {
+        const providerID = ProviderV2.ID.make("progress-chat")
+        const modelID = ModelV2.ID.make("chat-progress-model")
+        const provider = yield* Provider.Service
+        const model = yield* provider.getModel(providerID, modelID)
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const lookup = tool({
+          description: "Look up a fixture value",
+          inputSchema: z.object({ value: z.string() }),
+        })
+        const cases: Array<{
+          name: string
+          delta: Record<string, unknown>
+          finishReason?: string
+          lookup?: boolean
+          multiline?: boolean
+        }> = [
+          { name: "multiline CRLF data", delta: { content: "multiline progress" }, multiline: true },
+          {
+            name: "OpenRouter reasoning_details encrypted",
+            delta: {
+              reasoning_details: [{ type: "reasoning.encrypted", data: "opaque reasoning progress", index: 0 }],
+            },
+          },
+          {
+            name: "OpenRouter reasoning_details text",
+            delta: { reasoning_details: [{ type: "reasoning.text", text: "structured reasoning progress", index: 0 }] },
+          },
+          {
+            name: "OpenRouter reasoning_details summary",
+            delta: {
+              reasoning_details: [{ type: "reasoning.summary", summary: "structured reasoning progress", index: 0 }],
+            },
+          },
+          { name: "content", delta: { content: "text progress" } },
+          { name: "reasoning", delta: { reasoning: "reasoning progress" } },
+          { name: "reasoning_content", delta: { reasoning_content: "reasoning progress" } },
+          { name: "reasoning_text", delta: { reasoning_text: "reasoning progress" } },
+          { name: "refusal", delta: { refusal: "refusal progress" } },
+          {
+            name: "tool arguments",
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call-chat-progress",
+                  type: "function",
+                  function: { name: "lookup", arguments: '{"value":"ok"}' },
+                },
+              ],
+            },
+            finishReason: "tool_calls",
+            lookup: true,
+          },
+          {
+            name: "function-call arguments",
+            delta: { function_call: { name: "lookup", arguments: '{"value":"ok"}' } },
+            finishReason: "function_call",
+          },
+        ]
+        const encoder = new TextEncoder()
+        const event = (delta: Record<string, unknown>, finishReason: string | null = null, multiline = false) => {
+          const data = JSON.stringify({
+            id: "chatcmpl-progress-fields",
+            object: "chat.completion.chunk",
+            created: 0,
+            model: modelID,
+            choices: [{ index: 0, delta, finish_reason: finishReason }],
+          })
+          if (!multiline) return `data: ${data}\n\n`
+          const splitAt = data.indexOf('"choices"')
+          return `data: ${data.slice(0, splitAt)}\r\ndata: ${data.slice(splitAt)}\r\n\r\n`
+        }
+        const runChat = (input: {
+          name: string
+          delta: Record<string, unknown>
+          finishReason?: string
+          lookup?: boolean
+          multiline?: boolean
+        }) =>
+          Effect.gen(function* () {
+            const release = deferred<void>()
+            const initial = event({ role: "assistant" })
+            const chunks = [
+              { data: event(input.delta, null, input.multiline), delay: 1_500 },
+              { data: event({}, input.finishReason ?? "stop"), delay: 1_500 },
+              { data: "data: [DONE]\n\n", delay: 0 },
+            ]
+            let index = 0
+            const request = waitRequest(
+              "/chat/completions",
+              new Response(
+                new ReadableStream<Uint8Array>(
+                  {
+                    start(controller) {
+                      controller.enqueue(encoder.encode(initial))
+                    },
+                    async pull(controller) {
+                      const chunk = chunks[index]
+                      if (chunk === undefined) {
+                        controller.close()
+                        return
+                      }
+                      const shouldContinue = await Promise.race([
+                        release.promise.then(() => false),
+                        new Promise<true>((resolve) => setTimeout(() => resolve(true), chunk.delay)),
+                      ])
+                      if (!shouldContinue) {
+                        controller.close()
+                        return
+                      }
+                      index++
+                      controller.enqueue(encoder.encode(chunk.data))
+                    },
+                    cancel() {
+                      release.resolve()
+                    },
+                  },
+                  { highWaterMark: 0 },
+                ),
+                { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } },
+              ),
+            )
+            const sessionID = SessionID.make(`session-chat-progress-${input.name}`)
+            const user = {
+              id: MessageID.ascending(),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID, modelID: model.id },
+            } satisfies SessionV1.User
+            const started = performance.now()
+            yield* Effect.addFinalizer(() => Effect.sync(() => release.resolve()))
+            const fiber = yield* LLM.Service.use((service) =>
+              service
+                .stream({
+                  user,
+                  sessionID,
+                  model,
+                  agent,
+                  system: [],
+                  messages: [{ role: "user", content: `Exercise ${input.name} progress.` }],
+                  tools: input.lookup ? { lookup } : {},
+                  retries: 0,
+                })
+                .pipe(Stream.runDrain),
+            ).pipe(Effect.forkScoped)
+            const capture = yield* awaitWithTimeout(
+              Effect.promise(() => request),
+              `Chat ${input.name} request was not accepted`,
+            )
+            const exit = yield* awaitWithTimeout(
+              Fiber.await(fiber),
+              `Chat ${input.name} progress did not complete within its bound`,
+              "8 seconds",
+            )
+            return { capture, exit, duration: performance.now() - started }
+          })
+
+        for (const input of cases) {
+          const result = yield* runChat(input)
+          expect(result.capture.url.pathname.endsWith("/chat/completions")).toBe(true)
+          expect(result.capture.body.model).toBe("chat-progress-model")
+          expect(Exit.isSuccess(result.exit)).toBe(true)
+          expect(result.duration).toBeGreaterThan(2_500)
+        }
+
+        for (const input of [
+          { name: "empty content delta", delta: { content: "" } },
+          {
+            name: "empty OpenRouter reasoning_details text",
+            delta: { reasoning_details: [{ type: "reasoning.text", text: "", index: 0 }] },
+          },
+          {
+            name: "empty OpenRouter reasoning_details summary",
+            delta: { reasoning_details: [{ type: "reasoning.summary", summary: "", index: 0 }] },
+          },
+          {
+            name: "empty OpenRouter reasoning_details encrypted",
+            delta: { reasoning_details: [{ type: "reasoning.encrypted", data: "", index: 0 }] },
+          },
+        ]) {
+          const empty = yield* runChat(input)
+          expect(Exit.isFailure(empty.exit)).toBe(true)
+          if (Exit.isFailure(empty.exit)) {
+            const error = Cause.squash(empty.exit.cause)
+            expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+            if (error instanceof ProviderError.ResponseStreamError)
+              expect(error.message).toBe("SSE generation progress timed out")
+          }
+        }
+      }),
+    {
+      config: () => ({
+        enabled_providers: ["progress-chat"],
+        provider: {
+          "progress-chat": {
+            name: "Progress Chat",
+            npm: "@ai-sdk/openai-compatible",
+            options: {
+              apiKey: "test-key",
+              baseURL: `${state.server!.url.origin}/v1`,
+              chunkTimeout: 2_500,
+              headerTimeout: false,
+            },
+            models: {
+              "chat-progress-model": {
+                id: "chat-progress-model",
+                name: "Chat Progress Model",
+                reasoning: true,
+                tool_call: true,
+                provider: { npm: "@ai-sdk/openai-compatible" },
+                options: {},
+              },
+            },
+          },
+        },
+      }),
+    },
+    60_000,
+  )
+
+  it.instance(
+    "keeps OpenRouter structured reasoning_details alive as generation progress",
+    () =>
+      Effect.gen(function* () {
+        const providerID = ProviderV2.ID.make("openrouter")
+        const modelID = ModelV2.ID.make("openrouter-progress-model")
+        const encoder = new TextEncoder()
+        const release = deferred<void>()
+        const event = (delta: Record<string, unknown>, finishReason: string | null = null) =>
+          `data: ${JSON.stringify({
+            id: "chatcmpl-openrouter-progress",
+            object: "chat.completion.chunk",
+            created: 0,
+            model: modelID,
+            choices: [{ index: 0, delta, finish_reason: finishReason }],
+          })}\n\n`
+        const chunks = [
+          {
+            data: event({ reasoning_details: [{ type: "reasoning.text", text: "structured thought", index: 0 }] }),
+            delay: 1_500,
+          },
+          {
+            data: event({ reasoning_details: [{ type: "reasoning.encrypted", data: "opaque thought", index: 0 }] }),
+            delay: 1_500,
+          },
+          {
+            data: event({
+              reasoning_details: [{ type: "reasoning.summary", summary: "structured summary", index: 0 }],
+            }),
+            delay: 1_500,
+          },
+          { data: event({ content: "answer" }, "stop"), delay: 0 },
+          { data: "data: [DONE]\n\n", delay: 0 },
+        ]
+        let index = 0
+        const request = waitRequest(
+          "/chat/completions",
+          new Response(
+            new ReadableStream<Uint8Array>(
+              {
+                start(controller) {
+                  controller.enqueue(encoder.encode(event({ role: "assistant" })))
+                },
+                async pull(controller) {
+                  const chunk = chunks[index]
+                  if (chunk === undefined) {
+                    controller.close()
+                    return
+                  }
+                  const shouldContinue = await Promise.race([
+                    release.promise.then(() => false),
+                    new Promise<true>((resolve) => setTimeout(() => resolve(true), chunk.delay)),
+                  ])
+                  if (!shouldContinue) {
+                    controller.close()
+                    return
+                  }
+                  index++
+                  controller.enqueue(encoder.encode(chunk.data))
+                },
+                cancel() {
+                  release.resolve()
+                },
+              },
+              { highWaterMark: 0 },
+            ),
+            { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } },
+          ),
+        )
+        const provider = yield* Provider.Service
+        const model = yield* provider.getModel(providerID, modelID)
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const sessionID = SessionID.make("session-openrouter-reasoning-progress")
+        const user = {
+          id: MessageID.ascending(),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID, modelID: model.id },
+        } satisfies SessionV1.User
+        yield* Effect.addFinalizer(() => Effect.sync(() => release.resolve()))
+        const started = performance.now()
+        const fiber = yield* LLM.Service.use((service) =>
+          service
+            .stream({
+              user,
+              sessionID,
+              model,
+              agent,
+              system: [],
+              messages: [{ role: "user", content: "Think, then answer." }],
+              tools: {},
+              retries: 0,
+            })
+            .pipe(Stream.runDrain),
+        ).pipe(Effect.forkScoped)
+        const capture = yield* awaitWithTimeout(
+          Effect.promise(() => request),
+          "OpenRouter request was not accepted",
+        )
+        const exit = yield* awaitWithTimeout(
+          Fiber.await(fiber),
+          "OpenRouter structured reasoning progress did not complete",
+          "10 seconds",
+        )
+
+        expect(capture.url.pathname.endsWith("/chat/completions")).toBe(true)
+        expect(capture.body.model).toBe(modelID)
+        expect(Exit.isSuccess(exit)).toBe(true)
+        expect(performance.now() - started).toBeGreaterThan(4_000)
+      }),
+    {
+      config: () => ({
+        enabled_providers: ["openrouter"],
+        provider: {
+          openrouter: {
+            options: {
+              apiKey: "test-key",
+              baseURL: `${state.server!.url.origin}/api/v1`,
+              chunkTimeout: 2_500,
+              headerTimeout: false,
+            },
+            models: {
+              "openrouter-progress-model": {
+                id: "openrouter-progress-model",
+                name: "OpenRouter Progress Model",
+                reasoning: true,
+                tool_call: false,
+                provider: { npm: "@openrouter/ai-sdk-provider" },
+                options: {},
+              },
+            },
+          },
+        },
+      }),
+    },
+    30_000,
+  )
+
   const mistralFixture = { providerID: "mistral", modelID: "mistral-small-latest" }
+  it.instance(
+    "preserves Mistral array-valued thinking and text progress with interleaved keepalives",
+    () =>
+      Effect.gen(function* () {
+        const providerID = ProviderV2.ID.make(mistralFixture.providerID)
+        const modelID = ModelV2.ID.make(mistralFixture.modelID)
+        const encoder = new TextEncoder()
+        const release = deferred<void>()
+        const thinking = (text: string) => [{ type: "thinking", thinking: [{ type: "text", text }] }]
+        const text = (value: string) => [{ type: "text", text: value }]
+        const event = (delta: Record<string, unknown>, finishReason: string | null = null) =>
+          `data: ${JSON.stringify({
+            id: "chatcmpl-mistral-progress",
+            object: "chat.completion.chunk",
+            created: 0,
+            model: mistralFixture.modelID,
+            choices: [{ index: 0, delta, finish_reason: finishReason }],
+          })}\n\n`
+        const initial = event({ role: "assistant", content: thinking("reason-1") })
+        const tail = Array.from({ length: 11 }, (_, index) => [
+          ": keep-alive\n\n",
+          event({ content: thinking(`reason-${index + 2}`) }),
+        ]).flat()
+        tail.push(": keep-alive\n\n", event({ content: text("complete") }), event({}, "stop"), "data: [DONE]\n\n")
+        let index = 0
+        const request = waitRequest(
+          "/chat/completions",
+          new Response(
+            new ReadableStream<Uint8Array>(
+              {
+                start(controller) {
+                  controller.enqueue(encoder.encode(initial))
+                },
+                async pull(controller) {
+                  const next = tail[index]
+                  if (next === undefined) {
+                    controller.close()
+                    return
+                  }
+                  const shouldContinue = await Promise.race([
+                    release.promise.then(() => false),
+                    new Promise<true>((resolve) => setTimeout(() => resolve(true), 100)),
+                  ])
+                  if (!shouldContinue) {
+                    controller.close()
+                    return
+                  }
+                  index++
+                  controller.enqueue(encoder.encode(next))
+                },
+                cancel() {
+                  release.resolve()
+                },
+              },
+              { highWaterMark: 0 },
+            ),
+            { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } },
+          ),
+        )
+        const provider = yield* Provider.Service
+        const model = yield* provider.getModel(providerID, modelID)
+        const sessionID = SessionID.make("session-mistral-array-progress")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const user = {
+          id: MessageID.ascending(),
+          sessionID,
+          role: "user",
+          time: { created: Date.now() },
+          agent: agent.name,
+          model: { providerID, modelID: model.id },
+        } satisfies SessionV1.User
+        const started = performance.now()
+        yield* Effect.addFinalizer(() => Effect.sync(() => release.resolve()))
+        let reasoningDeltas = 0
+        let textDeltas = 0
+        const fiber = yield* LLM.Service.use((service) =>
+          service
+            .stream({
+              user,
+              sessionID,
+              model,
+              agent,
+              system: [],
+              messages: [{ role: "user", content: "Reason, then answer." }],
+              tools: {},
+              retries: 0,
+            })
+            .pipe(
+              Stream.tap((item) =>
+                Effect.sync(() => {
+                  if (item.type === "reasoning-delta") reasoningDeltas++
+                  if (item.type === "text-delta") textDeltas++
+                }),
+              ),
+              Stream.runDrain,
+            ),
+        ).pipe(Effect.forkScoped)
+        const capture = yield* awaitWithTimeout(
+          Effect.promise(() => request),
+          "Mistral request was not accepted",
+        )
+        const exit = yield* awaitWithTimeout(
+          Fiber.await(fiber),
+          "Mistral array progress did not complete",
+          "10 seconds",
+        )
+        const duration = performance.now() - started
+
+        expect(capture.url.pathname.endsWith("/chat/completions")).toBe(true)
+        expect(capture.body.model).toBe(mistralFixture.modelID)
+        expect(Exit.isSuccess(exit)).toBe(true)
+        expect(reasoningDeltas).toBeGreaterThanOrEqual(12)
+        expect(textDeltas).toBe(1)
+        expect(duration).toBeGreaterThan(2_000)
+      }),
+    {
+      config: () => ({
+        enabled_providers: [mistralFixture.providerID],
+        provider: {
+          [mistralFixture.providerID]: {
+            options: {
+              apiKey: "test-key",
+              baseURL: `${state.server!.url.origin}/v1`,
+              chunkTimeout: 2_000,
+              headerTimeout: false,
+            },
+          },
+        },
+      }),
+    },
+    30_000,
+  )
+
   it.instance(
     "replays native Mistral reasoning from chat history",
     () =>
