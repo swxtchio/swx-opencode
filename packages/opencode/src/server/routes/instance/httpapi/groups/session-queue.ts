@@ -24,6 +24,7 @@ export const SessionQueuePaths = {
   consolidate: `${root}/consolidate`,
   consolidateSelected: `${root}/consolidate/:itemID`,
   force: `${root}/force/:itemID`,
+  holdStatus: `${root}/hold/:holder`,
   receipt: `${root}/receipt/:requestID`,
 } as const
 
@@ -37,6 +38,7 @@ export const ForceResult = Schema.Struct({
   outcome: Schema.Literals(["forced", "another-review", "hold-unconfirmed", "preparing", "unavailable"]),
   items: Schema.Array(SessionQueue.Item),
 })
+export const HoldStatusResult = Schema.Struct({ held: Schema.Boolean, items: Schema.Array(SessionQueue.Item) })
 export const RewriteResult = Schema.Struct({
   outcome: Schema.Literals(["rewritten", "stale", "preparing", "unavailable", "no-text", "empty", "missing-reference"]),
   items: Schema.Array(SessionQueue.Item),
@@ -129,6 +131,19 @@ export const SessionQueueApi = HttpApi.make("sessionQueue").add(
           summary: "Force a selected queued prompt",
           description:
             "Give only this prepared pending prompt steer timing. The holder must own a confirmed review hold, which this action releases only when no other live review hold remains. A preparing result leaves the item pending; an unavailable result reports a stale or missing item, and another-review leaves it unchanged. A forced result wakes the session so it reaches the next safe provider step or starts a turn when idle.",
+        }),
+      ),
+      HttpApiEndpoint.get("holdStatus", SessionQueuePaths.holdStatus, {
+        params: { sessionID: SessionID, holder: Schema.String.check(Schema.isNonEmpty()) },
+        query: WorkspaceRoutingQuery,
+        success: described(HoldStatusResult, "Current review-hold state and pending prompts"),
+        error: [HttpApiError.BadRequest, ApiNotFoundError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "session.queue.hold_status",
+          summary: "Inspect a review hold",
+          description:
+            "Read whether this holder currently owns a live review hold and list the current pending prompts. This does not acquire or renew the hold.",
         }),
       ),
       HttpApiEndpoint.post("hold", SessionQueuePaths.hold, {

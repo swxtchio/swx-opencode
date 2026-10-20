@@ -338,6 +338,8 @@ export interface Interface {
     sessionID: SessionID,
     holder: string,
   ) => Effect.Effect<{ readonly started: boolean; readonly items: Item[] }>
+  /** Reads whether this holder owns a live review hold without acquiring or renewing one. */
+  readonly holdStatus: (sessionID: SessionID, holder: string) => Effect.Effect<boolean>
   /** Ends `holder`'s hold; true when that ended the session's hold. */
   readonly release: (sessionID: SessionID, holder: string) => Effect.Effect<boolean>
   /**
@@ -2034,6 +2036,16 @@ const layer = Layer.effect(
       return undefined
     })
 
+    const holdStatus: Interface["holdStatus"] = (sessionID, holder) =>
+      exclusive(
+        sessionID,
+        Effect.gen(function* () {
+          const current = (yield* settle(sessionID, "lapsed")) ? holds.get(sessionID) : undefined
+          const until = current?.leases.get(holder)
+          return until !== undefined && until > (yield* Clock.currentTimeMillis)
+        }),
+      ).pipe(Effect.withSpan("SessionQueue.holdStatus"))
+
     // Drops every pending row's reservation, so a promotion prepared before a
     // hold, reorder or consolidation can no longer commit; its loop reserves
     // again under the new state. A reservation whose message already landed, left
@@ -3214,6 +3226,7 @@ const layer = Layer.effect(
       exclusive,
       whileCompacting,
       hold,
+      holdStatus,
       release,
       released,
       disposition,

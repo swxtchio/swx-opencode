@@ -11162,6 +11162,44 @@ export type SessionQueueForceResponses = {
 
 export type SessionQueueForceResponse = SessionQueueForceResponses[keyof SessionQueueForceResponses]
 
+export type SessionQueueHoldStatusData = {
+  body?: never
+  path: {
+    sessionID: string
+    holder: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/hold/{holder}"
+}
+
+export type SessionQueueHoldStatusErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionQueueHoldStatusError = SessionQueueHoldStatusErrors[keyof SessionQueueHoldStatusErrors]
+
+export type SessionQueueHoldStatusResponses = {
+  /**
+   * Current review-hold state and pending prompts
+   */
+  200: {
+    held: boolean
+    items: Array<SessionPromptQueueItem>
+  }
+}
+
+export type SessionQueueHoldStatusResponse = SessionQueueHoldStatusResponses[keyof SessionQueueHoldStatusResponses]
+
 export type SessionQueueHoldData = {
   body?: {
     holder: string

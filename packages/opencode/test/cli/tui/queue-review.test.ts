@@ -51,6 +51,7 @@ const boot = Effect.fnUntraced(function* (input: { directory: string; sessionID?
   const server = yield* HttpServer.HttpServer
   const base = HttpServer.formatAddress(server.address)
   const queueRequests: { method: string; path: string; body?: string }[] = []
+  const loseForceResponse = { armed: false }
   const fetch = Object.assign(
     async (request: RequestInfo | URL, init?: RequestInit) => {
       const source = request instanceof Request ? request : new Request(request, init)
@@ -59,6 +60,15 @@ const boot = Effect.fnUntraced(function* (input: { directory: string; sessionID?
       if (url.pathname.includes("/queue/")) {
         const body = source.method === "GET" ? "" : await source.clone().text()
         queueRequests.push({ method: source.method, path: url.pathname, ...(body ? { body } : {}) })
+      }
+      if (url.pathname !== "/global/event" && url.pathname.includes("/queue/force/") && loseForceResponse.armed) {
+        loseForceResponse.armed = false
+        const response = await globalThis.fetch(new Request(target, source))
+        if (response.ok) {
+          if (response.body) await response.body.cancel().catch(() => undefined)
+          throw new Error("simulated connection loss after force commit")
+        }
+        return response
       }
       if (url.pathname !== "/global/event") return globalThis.fetch(new Request(target, source))
       // The SDK's event stream leaves a rejected cancel unhandled when the app
@@ -131,6 +141,7 @@ const boot = Effect.fnUntraced(function* (input: { directory: string; sessionID?
     sessionID,
     renderer,
     queueRequests,
+    loseNextForceResponse: () => (loseForceResponse.armed = true),
     dispatch: (command: string) => api?.keymap.dispatchCommand(command),
     frame,
     screen: (text: string, what: string) =>
@@ -440,6 +451,68 @@ it.live(
       Effect.ensuring(Deferred.succeed(continuationGate, undefined)),
       Effect.provide(TestLLMServer.layer),
     )
+  },
+  60_000,
+)
+
+it.live(
+  "Ctrl+f reconciles a lost success response with the server's review hold",
+  () => {
+    const gate = Deferred.makeUnsafe<void>()
+    return Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      yield* llm.hold("initial turn done", Effect.runPromise(Deferred.await(gate)))
+      yield* llm.text("forced prompt answered")
+      const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+      const tui = yield* boot({ directory })
+
+      yield* tui.prompt("start the active turn")
+      yield* pollWithTimeout(
+        lastUsers(llm).pipe(Effect.map((users) => (users.includes("start the active turn") ? true : undefined))),
+        "the initial provider request never started",
+      )
+      yield* tui.compose("selected after response loss")
+      const [selected] = yield* pollWithTimeout(
+        tui.rows.pipe(
+          Effect.map((rows) => {
+            const pending = rows.filter((row) => row.time_promoted === null && row.time_withdrawn === null)
+            return pending.length === 1 && pending[0]?.time_preparing === null ? pending : undefined
+          }),
+        ),
+        "the force-reconciliation prompt never became ready",
+      )
+      if (!selected) throw new Error("the selected prompt was missing")
+
+      yield* tui.open
+      yield* tui.screen("(delivery paused)", "the review view")
+      tui.loseNextForceResponse()
+      tui.renderer.mockInput.pressKey("f", { ctrl: true })
+      yield* tui.screen("Could not force the queued prompts", "the lost force response")
+      const committed = yield* pollWithTimeout(
+        tui.rows.pipe(
+          Effect.map((rows) => {
+            const row = rows.find((item) => item.id === selected.id)
+            return row?.delivery === "steer" && row.time_promoted === null ? row : undefined
+          }),
+        ),
+        "the force operation did not commit before its response was lost",
+      )
+      expect(committed.id).toBe(selected.id)
+      yield* tui.screen("(delivery NOT paused)", "the reconciled review hold state")
+      expect(
+        tui.queueRequests.some(
+          (request) => request.method === "GET" && request.path.includes(`/session/${tui.sessionID}/queue/hold/`),
+        ),
+      ).toBe(true)
+
+      yield* Deferred.succeed(gate, undefined)
+      yield* pollWithTimeout(
+        lastUsers(llm).pipe(Effect.map((users) => (users.includes("selected after response loss") ? true : undefined))),
+        "the server-committed force never reached the provider",
+      )
+      yield* tui.idle
+      expect(texts(yield* tui.rows)).toEqual([])
+    }).pipe(Effect.ensuring(Deferred.succeed(gate, undefined)), Effect.provide(TestLLMServer.layer))
   },
   60_000,
 )

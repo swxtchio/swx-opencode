@@ -132,6 +132,16 @@ export const sessionQueueHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       return { outcome, items: yield* queue.list(ctx.params.sessionID) }
     })
 
+    const holdStatus = Effect.fn("SessionQueueHttpApi.holdStatus")(function* (ctx: {
+      params: { sessionID: SessionID; holder: string }
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      return {
+        held: yield* queue.holdStatus(ctx.params.sessionID, ctx.params.holder),
+        items: yield* queue.list(ctx.params.sessionID),
+      }
+    })
+
     // When a review hold ends, the session is woken to deliver what it kept
     // pending. A session with nothing pending is left alone: a new one has no
     // message for a run to answer.
@@ -211,6 +221,7 @@ export const sessionQueueHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       .handle("update", update)
       .handle("rewrite", rewrite)
       .handle("force", force)
+      .handle("holdStatus", holdStatus)
       .handle("hold", hold)
       .handle("release", release)
       .handle("remove", remove)

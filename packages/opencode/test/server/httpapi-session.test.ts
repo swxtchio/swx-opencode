@@ -126,6 +126,7 @@ function pathFor(path: string, params: Record<string, string>) {
 
 // The opencode-arm-release-x64.yml release-proof job typechecks this file against its pinned source.
 const selectedForcePath = "/session/:sessionID/queue/force/:itemID"
+const selectedHoldStatusPath = "/session/:sessionID/queue/hold/:holder"
 const selectedRewritePath = "/session/:sessionID/queue/rewrite/:itemID"
 
 function createSession(input?: Session.CreateInput) {
@@ -2121,6 +2122,11 @@ it.live(
         const post = (path: string, body: unknown, routeParams: Record<string, string> = params) =>
           request(pathFor(path, routeParams), { method: "POST", headers, body: JSON.stringify(body) })
         const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+        const holdStatus = (holder: string) =>
+          requestJson<{ held: boolean; items: SessionQueue.Item[] }>(
+            pathFor(selectedHoldStatusPath, { ...params, holder }),
+            { headers },
+          )
         const receipt = (requestID: string) =>
           requestJson<SessionQueue.Receipt>(pathFor(SessionQueuePaths.receipt, { ...params, requestID }), { headers })
         const send = (requestID: string, text: string) =>
@@ -2137,6 +2143,8 @@ it.live(
         expect((yield* post(SessionQueuePaths.hold, { holder: "view-two" })).status).toBe(200)
         expect((yield* send("force-earlier", "leave this queued")).status).toBe(204)
         expect((yield* send("force-selected", "force this first")).status).toBe(204)
+        expect((yield* holdStatus("view-one")).held).toBe(true)
+        expect((yield* holdStatus("unheld-view")).held).toBe(false)
         const admitted = yield* pollWithTimeout(
           listed().pipe(Effect.map((items) => (items.length === 2 ? items : undefined))),
           "the selected and unselected prompts were not admitted",
@@ -2168,13 +2176,17 @@ it.live(
             { id: selected.id, delivery: "queue" },
           ],
         })
+        expect((yield* holdStatus("view-one")).held).toBe(true)
         expect((yield* post(SessionQueuePaths.release, { holder: "view-one" })).status).toBe(204)
+        expect((yield* holdStatus("view-one")).held).toBe(false)
+        expect((yield* holdStatus("view-two")).held).toBe(true)
 
         const forced = yield* post(forcePath(selected.id), { holder: "view-two" })
         expect(forced.status).toBe(200)
         expect(yield* json<{ outcome: string; items: SessionQueue.Item[] }>(forced)).toMatchObject({
           outcome: "forced",
         })
+        expect((yield* holdStatus("view-two")).held).toBe(false)
         const requests = yield* pollWithTimeout(
           llm.inputs.pipe(
             Effect.map((inputs) => {

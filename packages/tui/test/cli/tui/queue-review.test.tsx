@@ -583,11 +583,11 @@ test("a stale force result refreshes the list and reports that the item is no lo
 })
 
 test("a failed force request reports failure and preserves the held queue", async () => {
-  const view = await setup([steer, queued], (path) =>
-    path.endsWith(`/queue/force/${queued.id}`)
-      ? Promise.resolve(json({ name: "Unavailable" }, { status: 503 }))
-      : undefined,
-  )
+  const view = await setup([steer, queued], (path) => {
+    if (path.endsWith(`/queue/force/${queued.id}`))
+      return Promise.resolve(json({ name: "Unavailable" }, { status: 503 }))
+    if (path.includes("/queue/hold/")) return Promise.resolve(json({ held: true, items: [steer, queued] }))
+  })
   await view.open()
   view.app.mockInput.pressArrow("down")
   view.app.mockInput.pressKey("f", { ctrl: true })
@@ -597,6 +597,27 @@ test("a failed force request reports failure and preserves the held queue", asyn
   expect(view.dialog.stack.length).toBe(1)
   expect(await view.frame()).toContain("(delivery paused)")
   expect(view.queued("release")).toEqual([])
+})
+
+test("a failed force response refreshes the released hold and current queue", async () => {
+  const forced = { ...queued, delivery: "steer" as const }
+  const view = await setup([steer, queued], (path) => {
+    if (path.endsWith(`/queue/force/${queued.id}`))
+      return Promise.resolve(json({ name: "Unavailable" }, { status: 503 }))
+    if (path.includes("/queue/hold/")) return Promise.resolve(json({ held: false, items: [steer, forced] }))
+  })
+  await view.open()
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("f", { ctrl: true })
+  await wait(() => view.queued("force").length === 1)
+  await wait(() => view.requests.some((request) => request.method === "GET" && request.path.includes("/queue/hold/")))
+  await wait(async () => (await view.frame()).includes("delivery NOT paused"))
+  expect(await view.frame()).toContain("Could not force the queued prompts")
+  expect(view.sync.data.session_queue[sessionID]).toEqual([steer, forced])
+  expect(
+    view.requests.filter((request) => request.method === "POST" && request.path.endsWith("/queue/hold")),
+  ).toHaveLength(1)
+  expect(view.dialog.stack.length).toBe(1)
 })
 
 test("a hold renewal that lands after force closes the view is released", async () => {

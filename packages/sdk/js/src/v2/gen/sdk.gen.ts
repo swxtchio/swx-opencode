@@ -221,6 +221,8 @@ import type {
   SessionQueueForceResponses,
   SessionQueueHoldErrors,
   SessionQueueHoldResponses,
+  SessionQueueHoldStatusErrors,
+  SessionQueueHoldStatusResponses,
   SessionQueueListErrors,
   SessionQueueListResponses,
   SessionQueueReceiptErrors,
@@ -3761,6 +3763,44 @@ export class Queue extends HeyApiClient {
         ...options?.headers,
         ...params.headers,
       },
+    })
+  }
+
+  /**
+   * Inspect a review hold
+   *
+   * Read whether this holder currently owns a live review hold and list the current pending prompts. This does not acquire or renew the hold.
+   */
+  public holdStatus<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      holder: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "holder" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionQueueHoldStatusResponses,
+      SessionQueueHoldStatusErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/queue/hold/{holder}",
+      ...options,
+      ...params,
     })
   }
 

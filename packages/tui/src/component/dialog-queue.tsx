@@ -236,7 +236,31 @@ export function DialogQueue(props: { sessionID: string; enhancement?: PromptEnha
                     message: "The selected prompt is no longer pending; it was not forced.",
                   })
                 })
-                .catch(failed("force"))
+                .catch((error) => {
+                  if (closed) {
+                    failed("force")(error)
+                    return
+                  }
+                  void checked(
+                    sdk.client.session.queue.holdStatus({ sessionID: props.sessionID, holder }, { signal: signal() }),
+                  )
+                    .then((result) => {
+                      if (closed) return
+                      const data = result.data
+                      if (!data) {
+                        setHold("failed")
+                        return
+                      }
+                      sync.queue.listed(props.sessionID, data.items)
+                      setHold(data.held ? "held" : "failed")
+                    })
+                    .catch(() => {
+                      if (!closed) setHold("failed")
+                    })
+                    .finally(() => {
+                      if (!closed) failed("force")(error)
+                    })
+                })
             },
           },
           {

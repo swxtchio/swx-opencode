@@ -1551,6 +1551,30 @@ const scenarios: Scenario[] = [
       check(stable(body) === stable([ctx.state.item]), "hold should return the pending items")
     }),
   http.protected
+    .get("/session/{sessionID}/queue/hold/{holder}", "session.queue.hold_status")
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue hold status session" })
+        const item = yield* ctx.queued(session.id, { text: "held" })
+        yield* ctx.hold(session.id, "exercise")
+        return { session, item }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/hold/{holder}", {
+        sessionID: ctx.state.session.id,
+        holder: "exercise",
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(200, (body, ctx) => {
+      check(isRecord(body) && body.held === true, "holder status should confirm the live review lease")
+      check(
+        isRecord(body) && Array.isArray(body.items) && stable(body.items) === stable([ctx.state.item]),
+        "holder status should return current pending items",
+      )
+    }),
+  http.protected
     .post("/session/{sessionID}/queue/force/{itemID}", "session.queue.force")
     .mutating()
     .seeded((ctx) =>
