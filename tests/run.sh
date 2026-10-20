@@ -34,6 +34,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     'The target and owning package must exist; scripts.test must be a string test command with no static file selectors.' \
     'Fast mode passes only the exact manifest files to one package invocation; the owning runner retains all script' \
     'options, script environment assignments, strict Turbo env, package-local Turbo config, and declared preparation.' \
+    'Only build tasks are admitted as preparation outside JUnit validation; other prerequisite tasks are refused.' \
     'A package-local turbo.json without a resolved owning test task is refused rather than bypassed by direct execution.' \
     'Bun pretest/test/posttest lifecycle runs once per package: pretest failure stops the test, and posttest runs only' \
     'after a successful test command; hook failures propagate through the task result.' \
@@ -183,6 +184,12 @@ while IFS= read -r line || [ -n "$line" ]; do
         process.exit(1)
       }
       if (typeof pkg.scripts?.test !== "string") fail("scripts.test must be a string")
+      if (typeof pkg.name !== "string") fail("package name must be a string")
+      const rootTurbo = await Bun.file(process.env.FAST_SUITE_ROOT + "/turbo.json").json()
+      if (typeof rootTurbo.tasks !== "object" || rootTurbo.tasks === null || Array.isArray(rootTurbo.tasks)) {
+        fail("root turbo.json tasks must be an object")
+      }
+      const hasRootTurboTestTask = rootTurbo.tasks[pkg.name + "#test"] !== undefined || rootTurbo.tasks.test !== undefined
       const script = pkg.scripts.test
       const single = String.fromCharCode(39)
       const words = []
@@ -339,6 +346,9 @@ while IFS= read -r line || [ -n "$line" ]; do
       if (!targetTask && hasLocalTurboConfig) {
         fail("package-local turbo.json exists but Turbo did not resolve its test task; refusing direct fallback")
       }
+      if (!targetTask && plan.tasks.length === 0 && hasRootTurboTestTask) {
+        fail("Turbo returned an empty plan for a root-declared test task; refusing direct fallback")
+      }
       if (!targetTask && plan.tasks.length > 0) {
         fail("Turbo dry-run did not resolve the owning test task for " + process.env.FAST_SUITE_PACKAGE_ROOT)
       }
@@ -348,15 +358,37 @@ while IFS= read -r line || [ -n "$line" ]; do
           fail("Turbo dry-run dependencies must be task ids")
         }
         const taskById = new Map(plan.tasks.map((candidate) => [candidate.taskId, candidate]))
-        for (const dependencyID of targetTask.dependencies) {
+        const pending = [...targetTask.dependencies].reverse().map((taskId) => ({ taskId, collect: true }))
+        const visitedForCollection = new Set()
+        const visitedForAudit = new Set()
+        while (pending.length > 0) {
+          const current = pending.pop()
+          const visited = current.collect ? visitedForCollection : visitedForAudit
+          if (visited.has(current.taskId)) continue
+          visited.add(current.taskId)
+          const dependencyID = current.taskId
           const dependency = taskById.get(dependencyID)
           if (!dependency) fail("Turbo dry-run omitted dependency task " + dependencyID)
-          if (dependency.command === "<NONEXISTENT>") continue
-          if (typeof dependency.command !== "string") fail("Turbo dependency has no resolved command: " + dependencyID)
           if (typeof dependency.taskId !== "string") fail("Turbo dependency has an invalid task id: " + dependencyID)
           const separator = dependency.taskId.lastIndexOf("#")
           if (separator < 1) fail("Turbo dependency has an invalid task id: " + dependencyID)
           const taskName = dependency.taskId.slice(separator + 1)
+          if (typeof dependency.command !== "string") fail("Turbo dependency has no resolved command: " + dependencyID)
+          const commandless = dependency.command === "<NONEXISTENT>"
+          if (
+            /test/i.test(taskName) ||
+            /\b(?:test|vitest|jest|playwright|mocha|ava|pytest|cypress)\b/i.test(dependency.command) ||
+            (!commandless && taskName !== "build")
+          ) {
+            fail("Turbo prerequisite may execute tests outside the JUnit guard or is not an admitted build task: " + dependencyID)
+          }
+          if (!Array.isArray(dependency.dependencies) || dependency.dependencies.some((child) => typeof child !== "string")) {
+            fail("Turbo dependency has no valid child task list: " + dependencyID)
+          }
+          if (commandless) {
+            pending.push(...dependency.dependencies.slice().reverse().map((taskId) => ({ taskId, collect: current.collect })))
+            continue
+          }
           if (
             typeof dependency.directory !== "string" ||
             dependency.directory.startsWith("/") ||
@@ -367,7 +399,8 @@ while IFS= read -r line || [ -n "$line" ]; do
           if (taskName.includes("|") || dependency.directory.includes("|")) {
             fail("Turbo dependency contains a reserved field delimiter: " + dependencyID)
           }
-          preparation.push(taskName + "|" + dependency.directory)
+          if (current.collect) preparation.push(taskName + "|" + dependency.directory)
+          pending.push(...dependency.dependencies.slice().reverse().map((taskId) => ({ taskId, collect: false })))
         }
       }
       const prepared = Array.from(new Set(preparation))

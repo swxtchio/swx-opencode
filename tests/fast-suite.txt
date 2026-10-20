@@ -5,7 +5,8 @@
 # Fast mode groups exact selected files by package and runs one owning Turbo test task with those file arguments;
 # packages without a task use their package test script. Turbo supplies strict env, package-local config, and declared
 # preparation. Bun's package lifecycle is preserved: pretest failure stops test/posttest, and test failure skips
-# posttest; hook failures still propagate. A package-local turbo.json without a resolved test task is refused.
+# posttest; hook failures still propagate. Fast mode traverses commandless Turbo nodes, but refuses test-running or
+# non-build prerequisites outside JUnit validation. A package-local turbo.json without a resolved test task is refused.
 # Changes touching an excluded timing class require that class at the final gate via
 # firstmate's repository suite override; release builds require a passing full suite.
 

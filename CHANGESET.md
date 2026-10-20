@@ -40,7 +40,8 @@ Newest first. Each entry names the upstream range brought in.
 
 - **#311** Add a maintained fast test manifest and `tests/run.sh --fast`; validate committed per-package test paths,
   dispatch each package's exact selected files through one owning Turbo test lifecycle when registered and package
-  scripts otherwise, preserving strict env, package-local config, options, and declared preparation; reject
+  scripts otherwise, preserving strict env, package-local config, options, and declared preparation; traverse
+  commandless prerequisites and refuse test-running/non-build prerequisites outside JUnit validation; reject
   unexpected or missing JUnit files and propagate hook failures. Bare full execution remains intact; only `--fast`
   refuses dirty checkouts. _Fork-only._
 - **#306** Recognize GLM-5.3 ids in the provider variant family match (swxtchio/swx-opencode#305): config-defined

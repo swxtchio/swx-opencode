@@ -17,7 +17,7 @@ const scratch = mkdtempSync(join(tmpdir(), "fast-suite-runner-"))
 afterAll(() => rmSync(scratch, { recursive: true, force: true }))
 
 // GOAL: compare fast-mode package traces with owning Turbo/package-script runs over exact files;
-// refusals preserve attributed failures and reject any JUnit execution-set mismatch.
+// refusal fixtures cover hidden prerequisites, invalid admission metadata, and JUnit scope.
 test(
   "tests/run.sh matches owning package preparation, options, and lifecycle for exact fast targets",
   () => {
@@ -35,6 +35,7 @@ test(
     const packageTurboConfig = join(packageRoot, "turbo.json")
     const packageTests = join(packageRoot, "test")
     const dependencyRoot = join(root, "packages", "dependency")
+    const leafRoot = join(root, "packages", "leaf")
     const directPackageRoot = join(root, "packages", "direct")
     const directPackageTests = join(directPackageRoot, "test")
     const scriptlessPackageRoot = join(root, "packages", "no-script")
@@ -105,6 +106,7 @@ ${directSecondPath}
         FAST_SUITE_FAIL_POSTTEST: "0",
         FAST_SUITE_FAIL_BUILD: "0",
         FAST_SUITE_UNDECLARED: "ambient-only",
+        FAST_SUITE_EMPTY_PLAN: "0",
         FAST_SUITE_REAL_TURBO: realpathSync(join(import.meta.dir, "..", "node_modules", ".bin", "turbo")),
         PATH: `${join(root, "bin")}:${process.env.PATH}`,
       },
@@ -116,6 +118,8 @@ ${directSecondPath}
     mkdirSync(directPackageTests, { recursive: true })
     mkdirSync(scriptlessPackageTests, { recursive: true })
     mkdirSync(dependencyRoot, { recursive: true })
+    mkdirSync(leafRoot, { recursive: true })
+    mkdirSync(join(dependencyRoot, "test"), { recursive: true })
     mkdirSync(dirname(runner), { recursive: true })
     mkdirSync(dirname(turbo), { recursive: true })
     mkdirSync(dirname(bunBin), { recursive: true })
@@ -155,9 +159,18 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
       JSON.stringify({
         tasks: {
           build: {
+            dependsOn: ["^build"],
             outputs: [],
             env: ["FAST_SUITE_FAIL_BUILD"],
             passThroughEnv: ["FAST_SUITE_BUILD_LOG", "FAST_SUITE_REAL_BUN", "PATH"],
+          },
+          "@fixture/dependency#test": {
+            outputs: [],
+            passThroughEnv: ["FAST_SUITE_MARKER", "FAST_SUITE_REAL_BUN", "FAST_SUITE_BUN_LOG", "PATH"],
+          },
+          "@fixture/no-script#test": {
+            outputs: [],
+            passThroughEnv: ["FAST_SUITE_MARKER", "PATH"],
           },
         },
       }),
@@ -184,11 +197,32 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         name: "@fixture/dependency",
         private: true,
         type: "module",
+        dependencies: { "@fixture/leaf": "workspace:*" },
+        scripts: { test: "bun test ./test/unselected.test.ts" },
+      }),
+    )
+    writeFileSync(
+      join(dependencyRoot, "test", "unselected.test.ts"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        'import { test } from "bun:test"',
+        'test("is an unselected test prerequisite that must never escape JUnit", () => {',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER!, "unselected-prep-test\\n")',
+        "})",
+        "",
+      ].join("\n"),
+    )
+    writeFileSync(
+      join(leafRoot, "package.json"),
+      JSON.stringify({
+        name: "@fixture/leaf",
+        private: true,
+        type: "module",
         scripts: { build: "bun ./build.ts" },
       }),
     )
     writeFileSync(
-      join(dependencyRoot, "build.ts"),
+      join(leafRoot, "build.ts"),
       [
         'import { appendFileSync } from "node:fs"',
         'appendFileSync(process.env.FAST_SUITE_BUILD_LOG!, "dependency-build\\n")',
@@ -207,10 +241,8 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         },
       }),
     )
-    writeFileSync(
-      join(scriptlessPackageRoot, "package.json"),
-      JSON.stringify({ name: "@fixture/no-script", private: true, type: "module" }),
-    )
+    const scriptlessPackage = { name: "@fixture/no-script", private: true, type: "module" }
+    writeFileSync(join(scriptlessPackageRoot, "package.json"), JSON.stringify(scriptlessPackage))
     writeFileSync(
       join(scriptlessPackageTests, "no-script.test.ts"),
       [
@@ -447,6 +479,10 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
       `#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "$*" >> "\${FAST_TURBO_LOG:?}"
+if [ "\${FAST_SUITE_EMPTY_PLAN:-0}" = 1 ] && [ "$*" = "run test --filter=./packages/no-script --dry=json" ]; then
+  printf '%s\\n' '{"tasks":[]}'
+  exit 0
+fi
 exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
 `,
     )
@@ -474,6 +510,22 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     expect(Bun.spawnSync(["git", "commit", "-qm", "runner fixture"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
 
     const oracleOptions = { ...runOptions, env: { ...runOptions.env, GITHUB_ACTIONS: "false" } }
+    const planProbe = Bun.spawnSync(
+      ["bun", "turbo", "run", "test", "--filter=./packages/example", "--dry=json"],
+      oracleOptions,
+    )
+    if (planProbe.exitCode !== 0) console.error(planProbe.stdout.toString(), planProbe.stderr.toString())
+    expect(planProbe.exitCode).toBe(0)
+    const planProbeTasks = (
+      JSON.parse(planProbe.stdout.toString()) as {
+        tasks: { taskId: string; command: string; dependencies: string[] }[]
+      }
+    ).tasks
+    const commandlessBuild = planProbeTasks.find((task) => task.taskId === "@fixture/dependency#build")!
+    expect(commandlessBuild.command).toBe("<NONEXISTENT>")
+    expect(commandlessBuild.dependencies).toEqual(["@fixture/leaf#build"])
+    expect(planProbeTasks.find((task) => task.taskId === "@fixture/leaf#build")!.command).toBe("bun ./build.ts")
+
     const turboOracleReport = join(scratch, "turbo-oracle.xml")
     const turboOracle = Bun.spawnSync(
       [
@@ -574,7 +626,7 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     const turboInvocations = readFileSync(turboLog, "utf8").trim().split("\n")
     expect(turboInvocations[0]).toBe("run test --filter=./packages/example --dry=json")
     expect(turboInvocations[1]).toBe("run test --filter=./packages/direct --dry=json")
-    expect(turboInvocations[2]).toBe("run build --filter=./packages/dependency --force")
+    expect(turboInvocations[2]).toBe("run build --filter=./packages/leaf --force")
     expect(turboInvocations[3]).toContain("run test --filter=./packages/example --only --force -- --reporter=junit")
     expect(turboInvocations[3]).toContain("./test/selected.test.ts")
     expect(turboInvocations[3]).toContain("./test/selected-second.test.ts")
@@ -604,6 +656,109 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     writeFileSync(packageTurboConfig, JSON.stringify(exampleTurboConfig))
     expect(Bun.spawnSync(["git", "add", "packages/example/turbo.json"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
     expect(Bun.spawnSync(["git", "commit", "-qm", "restore the package-local test task"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+
+    writeFileSync(
+      packageTurboConfig,
+      JSON.stringify({
+        ...exampleTurboConfig,
+        tasks: {
+          ...exampleTurboConfig.tasks,
+          test: { ...exampleTurboConfig.tasks.test, dependsOn: ["^build", "^test"] },
+        },
+      }),
+    )
+    expect(Bun.spawnSync(["git", "add", "packages/example/turbo.json"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "add an unselected test prerequisite"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    const testPrerequisitePlan = Bun.spawnSync(
+      ["bun", "turbo", "run", "test", "--filter=./packages/example", "--dry=json"],
+      runOptions,
+    )
+    expect(testPrerequisitePlan.exitCode).toBe(0)
+    const testPrerequisiteTasks = (
+      JSON.parse(testPrerequisitePlan.stdout.toString()) as {
+        tasks: { taskId: string; command: string; dependencies: string[] }[]
+      }
+    ).tasks
+    expect(testPrerequisiteTasks.find((task) => task.taskId === "@fixture/example#test")!.dependencies).toContain(
+      "@fixture/dependency#test",
+    )
+    expect(testPrerequisiteTasks.find((task) => task.taskId === "@fixture/dependency#test")!.command).toContain(
+      "test ./test/unselected.test.ts",
+    )
+    writeFileSync(marker, "")
+    const escapedTestPrerequisite = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(escapedTestPrerequisite.exitCode).toBe(1)
+    expect(readFileSync(marker, "utf8")).toBe("")
+    expect(
+      escapedTestPrerequisite.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=invalid-fast-manifest exit_code=1"),
+    ).toBe(true)
+    expect(escapedTestPrerequisite.stderr.toString()).toContain("may execute tests outside the JUnit guard")
+    writeFileSync(packageTurboConfig, JSON.stringify(exampleTurboConfig))
+    expect(Bun.spawnSync(["git", "add", "packages/example/turbo.json"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "remove the unselected test prerequisite"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+
+    writeFileSync(
+      join(scriptlessPackageRoot, "package.json"),
+      JSON.stringify({ ...scriptlessPackage, scripts: { test: "bun test" } }),
+    )
+    writeFileSync(manifest, `${scriptlessPath}\n`)
+    expect(
+      Bun.spawnSync(["git", "add", "packages/no-script/package.json", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode,
+    ).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "select a root Turbo task for the empty-plan proof"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    runOptions.env.FAST_SUITE_EMPTY_PLAN = "1"
+    writeFileSync(marker, "")
+    const emptyRegisteredPlan = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(emptyRegisteredPlan.exitCode).toBe(1)
+    expect(
+      emptyRegisteredPlan.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=invalid-fast-manifest exit_code=1"),
+    ).toBe(true)
+    expect(emptyRegisteredPlan.stderr.toString()).toContain("empty plan for a root-declared test task")
+    expect(readFileSync(marker, "utf8")).toBe("")
+    runOptions.env.FAST_SUITE_EMPTY_PLAN = "0"
+    writeFileSync(join(scriptlessPackageRoot, "package.json"), JSON.stringify(scriptlessPackage))
+    writeFileSync(manifest, validManifest)
+    expect(
+      Bun.spawnSync(["git", "add", "packages/no-script/package.json", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode,
+    ).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "restore direct fallback fixture"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+
+    const unsupportedOptionScript = `${exampleTestScript} --fast-suite-unsupported`
+    writeFileSync(
+      join(packageRoot, "package.json"),
+      JSON.stringify({ ...examplePackage, scripts: { ...examplePackage.scripts, test: unsupportedOptionScript } }),
+    )
+    writeFileSync(manifest, `${selectedPath}\n`)
+    expect(Bun.spawnSync(["git", "add", "packages/example/package.json", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "select an unsupported Bun option"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    writeFileSync(marker, "")
+    const unsupportedOption = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(unsupportedOption.exitCode).toBe(1)
+    expect(
+      unsupportedOption.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=invalid-fast-manifest exit_code=1"),
+    ).toBe(true)
+    expect(unsupportedOption.stderr.toString()).toContain("unsupported scripts.test Bun option")
+    expect(readFileSync(marker, "utf8")).toBe("")
+
+    const staticSelectorScript = `${exampleTestScript} ./test/unlisted.test.ts`
+    writeFileSync(
+      join(packageRoot, "package.json"),
+      JSON.stringify({ ...examplePackage, scripts: { ...examplePackage.scripts, test: staticSelectorScript } }),
+    )
+    expect(Bun.spawnSync(["git", "add", "packages/example/package.json"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "select a static package test path"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    const staticSelector = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(staticSelector.exitCode).toBe(1)
+    expect(
+      staticSelector.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=invalid-fast-manifest exit_code=1"),
+    ).toBe(true)
+    expect(staticSelector.stderr.toString()).toContain("scripts.test contains file selectors")
+    expect(readFileSync(marker, "utf8")).toBe("")
+
+    writeFileSync(join(packageRoot, "package.json"), JSON.stringify(examplePackage))
+    writeFileSync(manifest, validManifest)
+    expect(Bun.spawnSync(["git", "add", "packages/example/package.json", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "restore package admission fixtures"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
 
     writeFileSync(marker, "")
     writeFileSync(buildLog, "")
