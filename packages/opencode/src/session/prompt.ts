@@ -1663,7 +1663,7 @@ const layer = Layer.effect(
                 model: lastUser.model,
                 auto: true,
                 trigger: deferredCompactionTrigger,
-                resume: false,
+                resume: deferredCompactionTrigger === "capacity",
               })
               deferredCompactionTrigger = undefined
               settled = true

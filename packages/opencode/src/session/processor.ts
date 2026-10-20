@@ -820,7 +820,7 @@ const layer = Layer.effect(
               const cfg = yield* config.get()
               if (isOverflow({ cfg, tokens: usage.tokens, model: ctx.model })) {
                 ctx.compactionTrigger = "capacity"
-                if (value.reason === "tool-calls" || value.reason === "unknown") ctx.needsCompaction = true
+                ctx.needsCompaction = true
               } else if (isAutoCompactionDue({ cfg, tokens: usage.tokens, model: ctx.model })) {
                 ctx.compactionTrigger = "threshold"
               }
