@@ -40,23 +40,49 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
   if (!res.headers.get("content-type")?.includes("text/event-stream")) return res
 
   const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let sseBuffer = ""
+  let openAIStream = false
+  let lastProgressAt = performance.now()
   const body = new ReadableStream<Uint8Array>({
     async pull(ctrl) {
       const part = await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
-        const id = setTimeout(() => {
-          const err = new ProviderError.ResponseStreamError("SSE read timed out")
+        let settled = false
+        let readTimeout: ReturnType<typeof setTimeout>
+        let progressTimeout: ReturnType<typeof setTimeout> | undefined
+        const clear = () => {
+          clearTimeout(readTimeout)
+          if (progressTimeout) clearTimeout(progressTimeout)
+        }
+        const fail = (err: ProviderError.ResponseStreamError) => {
+          if (settled) return
+          settled = true
+          clear()
           ctl.abort(err)
           reader.cancel(err).catch(() => {})
           reject(err)
-        }, ms)
+        }
+
+        readTimeout = setTimeout(() => fail(new ProviderError.ResponseStreamError("SSE read timed out")), ms)
+        if (openAIStream) {
+          const remaining = Math.max(0, ms - (performance.now() - lastProgressAt))
+          progressTimeout = setTimeout(
+            () => fail(new ProviderError.ResponseStreamError("SSE generation progress timed out")),
+            remaining,
+          )
+        }
 
         reader.read().then(
           (part) => {
-            clearTimeout(id)
+            if (settled) return
+            settled = true
+            clear()
             resolve(part)
           },
           (err) => {
-            clearTimeout(id)
+            if (settled) return
+            settled = true
+            clear()
             reject(err)
           },
         )
@@ -65,6 +91,19 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
       if (part.done) {
         ctrl.close()
         return
+      }
+
+      sseBuffer += decoder.decode(part.value, { stream: true })
+      const frames = sseBuffer.split(/(?:\r\n|(?<!\r)\n|\r(?!\n)){2}/)
+      sseBuffer = frames.pop() ?? ""
+      for (const frame of frames) {
+        const progress = openAIStreamFrameProgress(frame)
+        if (progress === undefined) continue
+        if (!openAIStream) {
+          openAIStream = true
+          lastProgressAt = performance.now()
+        }
+        if (progress) lastProgressAt = performance.now()
       }
 
       ctrl.enqueue(part.value)
@@ -79,6 +118,78 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
     headers: new Headers(res.headers),
     status: res.status,
     statusText: res.statusText,
+  })
+}
+
+function openAIStreamFrameProgress(frame: string) {
+  // Transport-only SSE frames do not advance the generation-progress deadline.
+  const data = frame
+    .split(/\r\n|\n|\r/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n")
+  if (!data || data === "[DONE]") return
+
+  let value: unknown
+  try {
+    value = JSON.parse(data)
+  } catch {
+    return
+  }
+  if (!isRecord(value)) return
+
+  const openAI =
+    value.object === "chat.completion.chunk" ||
+    Array.isArray(value.choices) ||
+    (typeof value.type === "string" && value.type.startsWith("response."))
+  if (!openAI) return
+  if (typeof value.delta === "string") return value.delta.length > 0
+  if (!Array.isArray(value.choices)) return false
+
+  const hasText = (input: unknown) => {
+    if (typeof input === "string") return input.length > 0
+    if (!Array.isArray(input)) return false
+    return input.some((part) => {
+      if (!isRecord(part)) return false
+      if (part.type === "text" || part.type === "reasoning.text")
+        return typeof part.text === "string" && part.text.length > 0
+      if (part.type === "reasoning.encrypted") return typeof part.data === "string" && part.data.length > 0
+      if (part.type === "reasoning.summary") return typeof part.summary === "string" && part.summary.length > 0
+      return (
+        part.type === "thinking" &&
+        Array.isArray(part.thinking) &&
+        part.thinking.some(
+          (item) => isRecord(item) && item.type === "text" && typeof item.text === "string" && item.text.length > 0,
+        )
+      )
+    })
+  }
+
+  return value.choices.some((choice) => {
+    if (!isRecord(choice) || !isRecord(choice.delta)) return false
+    const delta = choice.delta
+    if (
+      ["content", "reasoning", "reasoning_content", "reasoning_text", "reasoning_details", "refusal"].some((key) =>
+        hasText(delta[key]),
+      )
+    )
+      return true
+    if (
+      Array.isArray(delta.tool_calls) &&
+      delta.tool_calls.some(
+        (call) =>
+          isRecord(call) &&
+          isRecord(call.function) &&
+          typeof call.function.arguments === "string" &&
+          call.function.arguments.length > 0,
+      )
+    )
+      return true
+    return (
+      isRecord(delta.function_call) &&
+      typeof delta.function_call.arguments === "string" &&
+      delta.function_call.arguments.length > 0
+    )
   })
 }
 
