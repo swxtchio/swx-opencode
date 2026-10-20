@@ -1989,7 +1989,15 @@ const layer = Layer.effect(
               const currentInput = decodeInput(row.input)
               const currentText = editableText(currentInput)
               if (currentText !== input.expectedText) return { outcome: "stale" as const, finished: [] }
-              const replacement = rewriteInputText(currentInput, input.text)
+              const replacement = rewriteInputText(
+                currentInput.parts.some(pendingOriginal)
+                  ? currentInput
+                  : {
+                      ...currentInput,
+                      parts: [...currentInput.parts, originalWitness(fromRow(row), PartID.ascending(), true)],
+                    },
+                input.text,
+              )
               if (replacement.outcome !== "rewritten") return { outcome: replacement.outcome, finished: [] }
 
               const finished = yield* invalidate(tx, input.sessionID)

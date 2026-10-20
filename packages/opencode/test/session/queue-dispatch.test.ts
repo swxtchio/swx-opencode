@@ -455,6 +455,82 @@ it.instance("selected human consolidation retains original parts through promoti
   }),
 )
 
+it.instance("enhancing a singleton preserves its admission identity and original constituent", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const original = {
+      sessionID: session.id,
+      requestID: "singleton-custody-a",
+      messageID: MessageID.ascending(),
+      delivery: "queue" as const,
+      origin: "tui-composer" as const,
+      parts: [{ type: "text" as const, text: "ORIGINAL SINGLETON", metadata: { source: "original" } }],
+    }
+    const first = yield* queue.admit(original)
+    const rewrite = yield* queue.rewrite({
+      sessionID: session.id,
+      itemID: first.id,
+      expectedText: "ORIGINAL SINGLETON",
+      text: "ENHANCED SINGLETON",
+    })
+    expect(rewrite.outcome).toBe("rewritten")
+    const retry = yield* queue.request(original)
+    expect(retry.kind).toBe("retry")
+    if (retry.kind !== "retry") throw new Error("the original admission was not recognized as a retry")
+    expect((yield* queue.list(session.id)).map((item) => item.id)).toEqual([first.id])
+
+    const second = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "singleton-custody-b",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: "LATER PROMPT", metadata: { source: "later" } }],
+    })
+    const consolidated = yield* queue.consolidateSelected(session.id, second.id)
+    const carrier = consolidated.items.find((item) => item.id === first.id)
+    if (!carrier) throw new Error("the enhanced singleton was not consolidated")
+    expect(
+      carrier.input.parts
+        .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
+        .join(""),
+    ).toBe("ENHANCED SINGLETON\nLATER PROMPT")
+
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "queue",
+      prepare,
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+    yield* queue.consume(session.id)
+    const message = (yield* MessageV2.stream(session.id))[0]
+    if (!message) throw new Error("the enhanced singleton message was not persisted")
+    expect(text(message)).toContain("ENHANCED SINGLETON\nLATER PROMPT")
+    expect(metadata(message).constituents.map((item) => item.id)).toEqual([first.id, second.id])
+    expect(
+      metadata(message).constituents.map((item) =>
+        item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
+      ),
+    ).toEqual(["ORIGINAL SINGLETON", "LATER PROMPT"])
+    expect(
+      metadata(message).constituents.map((item) =>
+        item.input.parts.flatMap((part) => (part.type === "text" ? [part.metadata?.source] : [])),
+      ),
+    ).toEqual([["original"], ["later"]])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "singleton-custody-a"))).toMatchObject({
+      state: "delivered",
+      messageID: message.info.id,
+    })
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "singleton-custody-b"))).toMatchObject({
+      state: "merged",
+      into: "singleton-custody-a",
+      messageID: message.info.id,
+    })
+  }),
+)
+
 it.instance("enhanced selected human carrier reaches normal delivery with its originals retained", () =>
   Effect.gen(function* () {
     const queue = yield* SessionQueue.Service
