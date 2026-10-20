@@ -82,6 +82,7 @@ async function mount(
   const events = createEventSource()
   const queue = { items: initial }
   const requests: QueueRequest[] = []
+  const enhancements: string[] = []
   const base = createFetch((url) => {
     if (url.pathname === `/session/${sessionID}`) return json(session)
     if (url.pathname === `/session/${sessionID}/message`) return json([userMessage])
@@ -103,6 +104,7 @@ async function mount(
       const text = request.method === "GET" ? "" : await request.clone().text()
       requests.push({ method: request.method, path: url.pathname, body: text ? JSON.parse(text) : undefined })
     }
+    if (url.pathname === "/prompt/enhance" && request.method === "POST") enhancements.push(await request.clone().text())
     return base.fetch(request)
   }) as typeof globalThis.fetch
 
@@ -180,6 +182,7 @@ async function mount(
     sync,
     dialog,
     requests,
+    enhancements,
     frame,
     queued: (method: string) =>
       requests.filter(
@@ -233,6 +236,10 @@ const actionTriggers = [
   {
     title: "force",
     trigger: (view: Awaited<ReturnType<typeof setup>>) => view.app.mockInput.pressKey("f", { ctrl: true }),
+  },
+  {
+    title: "enh",
+    trigger: (view: Awaited<ReturnType<typeof setup>>) => view.app.mockInput.pressKey("e", { ctrl: true }),
   },
   {
     title: "delete",
@@ -381,6 +388,127 @@ test("the consolidate button asks the server to consolidate the pending prompts"
   expect(view.queued("consolidate")[0]?.body).toBeUndefined()
   view.app.mockInput.pressKey("o", { ctrl: true })
   await wait(() => view.queued("consolidate").length === 2)
+})
+
+test("ctrl+e enhances the selected row and rewrites that same queue item", async () => {
+  const selected = {
+    ...queued,
+    input: { origin: "tui-composer" as const, parts: [{ type: "text" as const, text: "rough draft" }] },
+  }
+  const rewritten = {
+    ...selected,
+    input: { ...selected.input, parts: [{ type: "text" as const, text: "polished draft" }] },
+  }
+  const view = await setup([steer, selected], (path) => {
+    if (path === "/prompt/enhance") return Promise.resolve(json("polished draft"))
+    if (path === `/session/${sessionID}/queue/rewrite/${selected.id}`)
+      return Promise.resolve(json({ outcome: "rewritten", items: [steer, rewritten] }))
+  })
+  const enhancement = {
+    model: () => "test/enhance-model",
+    context: () => ({
+      messages: (view.sync.data.message[sessionID] ?? []).map((info) => ({
+        info,
+        parts: view.sync.data.part[info.id] ?? [],
+      })),
+      options: {
+        thinking: false,
+        toolDetails: false,
+        assistantMetadata: false,
+        providers: view.sync.data.provider,
+      },
+      presentation: new Map<string, string>(),
+    }),
+  }
+  DialogQueue.show(view.dialog, sessionID, enhancement)
+  await wait(() => view.queued("hold").length === 1)
+  await wait(async () => (await view.frame()).includes("(delivery paused)"))
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("e", { ctrl: true })
+  await wait(() => view.queued("rewrite").length === 1)
+
+  expect(view.enhancements).toHaveLength(1)
+  expect(JSON.parse(view.enhancements[0]!)).toMatchObject({
+    model: "test/enhance-model",
+    draft: "rough draft",
+    context: expect.stringContaining("already in the transcript"),
+  })
+  expect(view.queued("rewrite")[0]).toMatchObject({
+    method: "POST",
+    path: `/session/${sessionID}/queue/rewrite/${selected.id}`,
+    body: { expectedText: "rough draft", text: "polished draft" },
+  })
+  await wait(async () => (await view.frame()).includes("Queued prompt enhanced."))
+  expect(view.sync.data.session_queue[sessionID]).toEqual([steer, rewritten])
+  expect(view.queued("release")).toEqual([])
+})
+
+for (const result of [
+  {
+    outcome: "stale",
+    message: "The selected prompt changed; no rewrite was applied.",
+    items: [steer, queued],
+  },
+  {
+    outcome: "preparing",
+    message: "The selected prompt is still preparing.",
+    items: [steer, queued],
+  },
+  {
+    outcome: "unavailable",
+    message: "The selected prompt is no longer pending.",
+    items: [steer],
+  },
+] as const) {
+  test(`a ${result.outcome} enhancement rewrite explains why it did not apply`, async () => {
+    const view = await setup([steer, queued], (path) => {
+      if (path === "/prompt/enhance") return Promise.resolve(json("polished draft"))
+      if (path.endsWith(`/queue/rewrite/${queued.id}`))
+        return Promise.resolve(json({ outcome: result.outcome, items: [...result.items] }))
+    })
+    DialogQueue.show(view.dialog, sessionID, { model: () => "test/enhance-model" })
+    await wait(() => view.queued("hold").length === 1)
+    await wait(async () => (await view.frame()).includes("(delivery paused)"))
+    view.app.mockInput.pressArrow("down")
+    view.app.mockInput.pressKey("e", { ctrl: true })
+    await wait(() => view.queued("rewrite").length === 1)
+    await wait(async () => (await view.frame()).includes(result.message))
+
+    expect(view.sync.data.session_queue[sessionID]).toEqual([...result.items])
+    expect(view.dialog.stack.length).toBe(1)
+    expect(view.queued("release")).toEqual([])
+  })
+}
+
+test("an enhancement that drops a file placeholder never rewrites the queued row", async () => {
+  const selected = {
+    ...queued,
+    input: {
+      parts: [
+        { type: "text" as const, text: "rough draft source.txt" },
+        {
+          type: "file" as const,
+          mime: "text/plain",
+          filename: "source.txt",
+          url: "data:text/plain;base64,c291cmNl",
+          source: { type: "file" as const, path: "/source.txt", text: { value: "source.txt", start: 12, end: 22 } },
+        },
+      ],
+    },
+  }
+  const view = await setup([steer, selected], (path) => {
+    if (path === "/prompt/enhance") return Promise.resolve(json("polished draft"))
+  })
+  DialogQueue.show(view.dialog, sessionID, { model: () => "test/enhance-model" })
+  await wait(() => view.queued("hold").length === 1)
+  await wait(async () => (await view.frame()).includes("(delivery paused)"))
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("e", { ctrl: true })
+  await wait(async () => (await view.frame()).includes("attachment or reference placeholder"))
+
+  expect(view.queued("rewrite")).toEqual([])
+  expect(view.sync.data.session_queue[sessionID]).toEqual([steer, selected])
+  expect(view.queued("release")).toEqual([])
 })
 
 for (const trigger of ["keyboard", "row"] as const) {

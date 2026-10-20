@@ -25,6 +25,24 @@ export type MessageWithParts = {
 
 export type TranscriptPresentation = ReadonlyMap<string, string>
 
+export type PromptEnhancementContext = {
+  messages: MessageWithParts[]
+  options: Pick<TranscriptOptions, "thinking" | "toolDetails" | "assistantMetadata" | "providers">
+  presentation: TranscriptPresentation
+}
+
+export type PromptEnhancement = {
+  model: () => string
+  context?: () => PromptEnhancementContext
+}
+
+export function promptEnhancementModel(
+  configured: string | undefined,
+  current: { providerID: string; modelID: string } | undefined,
+) {
+  return configured ?? (current ? `${current.providerID}/${current.modelID}` : "google/gemini-3.8-flash")
+}
+
 export function formatTranscript(
   session: SessionInfo,
   messages: MessageWithParts[],

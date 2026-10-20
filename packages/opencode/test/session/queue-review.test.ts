@@ -2549,6 +2549,141 @@ it.instance(
   30_000,
 )
 
+it.instance("rewriting pending text preserves queue identity, metadata, context and receipts", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "rewrite queued prompt" })
+    const file = {
+      type: "file" as const,
+      mime: "text/plain",
+      filename: "source.txt",
+      url: "data:text/plain;base64,c291cmNl",
+      source: {
+        type: "file" as const,
+        path: "/source.txt",
+        text: { value: "source.txt", start: 12, end: 22 },
+      },
+    }
+    const selected = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "rewrite-selected",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [
+        { type: "text", text: "rough draft source.txt", metadata: { source: "typed-first" } },
+        { type: "text", text: " continued", metadata: { source: "typed-second" } },
+        file,
+      ],
+    })
+    const later = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "rewrite-later",
+      delivery: "queue",
+      parts: [{ type: "text", text: "still later" }],
+    })
+    const before = yield* queue.list(session.id)
+
+    const rewritten = yield* queue.rewrite({
+      sessionID: session.id,
+      itemID: selected.id,
+      expectedText: "rough draft source.txt continued",
+      text: "refined source.txt",
+    })
+    expect(rewritten.outcome).toBe("rewritten")
+    expect(rewritten.items.map((item) => [item.id, item.seq, item.delivery])).toEqual(
+      before.map((item) => [item.id, item.seq, item.delivery]),
+    )
+    const carrier = rewritten.items.find((item) => item.id === selected.id)
+    if (!carrier) throw new Error("rewrite removed its queue item")
+    expect(carrier.requestID).toBe("rewrite-selected")
+    expect(carrier.input.origin).toBe("tui-composer")
+    expect(carrier.origins).toEqual(selected.origins)
+    const texts = carrier.input.parts.flatMap((part) => (part.type === "text" ? [part] : []))
+    expect(texts.map((part) => part.text)).toEqual(["refined source.txt", ""])
+    expect(texts.map((part) => part.metadata?.source)).toEqual(["typed-first", "typed-second"])
+    const attachment = carrier.input.parts.find((part) => part.type === "file")
+    expect(attachment).toMatchObject({
+      filename: "source.txt",
+      source: { type: "file", path: "/source.txt", text: { value: "source.txt", start: 8, end: 18 } },
+    })
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "rewrite-selected"))).toEqual({
+      state: "pending",
+      itemID: selected.id,
+    })
+
+    const stale = yield* queue.rewrite({
+      sessionID: session.id,
+      itemID: selected.id,
+      expectedText: "rough draft source.txt continued",
+      text: "another rewrite source.txt",
+    })
+    expect(stale.outcome).toBe("stale")
+    expect(stale.items).toEqual(rewritten.items)
+
+    expect(
+      (yield* queue.rewrite({
+        sessionID: session.id,
+        itemID: selected.id,
+        expectedText: "refined source.txt",
+        text: "missing the file reference",
+      })).outcome,
+    ).toBe("missing-reference")
+    expect(
+      (yield* queue.rewrite({
+        sessionID: session.id,
+        itemID: selected.id,
+        expectedText: "refined source.txt",
+        text: "   ",
+      })).outcome,
+    ).toBe("empty")
+
+    const fileOnly = yield* queue.admit({ sessionID: session.id, delivery: "queue", parts: [file] })
+    expect(
+      (yield* queue.rewrite({
+        sessionID: session.id,
+        itemID: fileOnly.id,
+        expectedText: "",
+        text: "a description",
+      })).outcome,
+    ).toBe("no-text")
+
+    const preparing = yield* queue.request(
+      {
+        sessionID: session.id,
+        requestID: "rewrite-preparing",
+        delivery: "queue",
+        origin: "tui-composer",
+        parts: [{ type: "text", text: "not ready" }],
+      },
+      undefined,
+      true,
+    )
+    if (preparing.kind !== "admitted") throw new Error("the preparing prompt was not admitted")
+    const preparingItem = (yield* queue.list(session.id)).find((item) => item.id === preparing.own.id)
+    if (!preparingItem) throw new Error("the preparing queue item was missing")
+    expect(
+      (yield* queue.rewrite({
+        sessionID: session.id,
+        itemID: preparingItem.id,
+        expectedText: "not ready",
+        text: "ready text",
+      })).outcome,
+    ).toBe("preparing")
+
+    yield* queue.remove(session.id, selected.id)
+    expect(
+      (yield* queue.rewrite({
+        sessionID: session.id,
+        itemID: selected.id,
+        expectedText: "refined source.txt",
+        text: "late rewrite source.txt",
+      })).outcome,
+    ).toBe("unavailable")
+    expect((yield* queue.list(session.id)).map((item) => item.id)).toContain(later.id)
+  }),
+)
+
 it.instance(
   "selected human consolidation refuses preparing and incompatible members without a partial merge",
   () =>

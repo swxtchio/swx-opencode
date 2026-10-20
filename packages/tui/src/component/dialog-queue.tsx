@@ -7,6 +7,7 @@ import { useDialog, type DialogContext } from "../ui/dialog"
 import { DialogSelect } from "../ui/dialog-select"
 import { useToast } from "../ui/toast"
 import { Locale } from "../util/locale"
+import { promptEnhancementContext, promptEnhancementModel, type PromptEnhancement } from "../util/transcript"
 
 // The review view of a session's pending prompts (swxtchio/swx-opencode#212).
 // While it is open the server holds every promotion for the session, so the
@@ -20,7 +21,7 @@ const RENEW_MS = 30 * 1000
 // No hold or release request waits longer than this for its response.
 const REQUEST_MS = 10 * 1000
 
-export function DialogQueue(props: { sessionID: string }) {
+export function DialogQueue(props: { sessionID: string; enhancement?: PromptEnhancement }) {
   const dialog = useDialog()
   const sdk = useSDK()
   const sync = useSync()
@@ -31,6 +32,7 @@ export function DialogQueue(props: { sessionID: string }) {
   // refuses may let the lease lapse, so the view says so and locks its edits
   // until a later renewal is confirmed.
   const [hold, setHold] = createSignal<"pending" | "held" | "failed">("pending")
+  const [enhancing, setEnhancing] = createSignal(false)
   let closed = false
   let renewed = Date.now()
   let idle: ReturnType<typeof setTimeout> | undefined
@@ -238,6 +240,104 @@ export function DialogQueue(props: { sessionID: string }) {
             },
           },
           {
+            command: "dialog.queue.enhance",
+            title: "enh",
+            side: "right",
+            disabled: () => locked() || enhancing(),
+            onDisabledTrigger: () => {
+              if (locked()) {
+                explainLocked()
+                return
+              }
+              active()
+              toast.show({ variant: "info", message: "A queued prompt enhancement is already running." })
+            },
+            onUnavailableTrigger: explainUnavailable("No queued prompt is selected."),
+            onTrigger: (option) => {
+              active()
+              const selected = items().find((item) => item.id === option.value)
+              if (!selected) {
+                toast.show({ variant: "info", message: "That queued prompt is no longer available." })
+                return
+              }
+              const draft = selected.input.parts
+                .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
+                .join("")
+              if (!draft.trim()) {
+                toast.show({ variant: "info", message: "The selected prompt has no text to enhance." })
+                return
+              }
+              const placeholders = selected.input.parts.flatMap((part) => {
+                if (part.type === "file" && part.source?.text) return [part.source.text.value]
+                if (part.type === "agent" && part.source) return [part.source.value]
+                return []
+              })
+              const transcript = props.enhancement?.context?.()
+              setEnhancing(true)
+              void checked(
+                sdk.client.instance.prompt.enhance({
+                  model: props.enhancement?.model() ?? promptEnhancementModel(undefined, undefined),
+                  draft,
+                  context: transcript
+                    ? promptEnhancementContext(transcript.messages, transcript.options, transcript.presentation)
+                    : "",
+                }),
+              )
+                .then((result) => {
+                  const text = result.data?.trim()
+                  if (!text) throw new Error("The enhancement model returned an empty draft.")
+                  if (placeholders.some((placeholder) => !text.includes(placeholder)))
+                    throw new Error("The enhancement omitted an attachment or reference placeholder.")
+                  return checked(
+                    sdk.client.session.queue.rewrite({
+                      sessionID: props.sessionID,
+                      itemID: selected.id,
+                      expectedText: draft,
+                      text,
+                    }),
+                  )
+                })
+                .then((result) => {
+                  const data = result.data
+                  if (!data) {
+                    toast.show({ variant: "error", message: "The rewrite request returned no queue state." })
+                    return
+                  }
+                  sync.queue.listed(props.sessionID, data.items)
+                  if (data.outcome === "rewritten") {
+                    toast.show({ variant: "success", message: "Queued prompt enhanced." })
+                    return
+                  }
+                  if (data.outcome === "stale") {
+                    toast.show({ variant: "warning", message: "The selected prompt changed; no rewrite was applied." })
+                    return
+                  }
+                  if (data.outcome === "preparing") {
+                    toast.show({ variant: "warning", message: "The selected prompt is still preparing." })
+                    return
+                  }
+                  if (data.outcome === "unavailable") {
+                    toast.show({ variant: "info", message: "The selected prompt is no longer pending." })
+                    return
+                  }
+                  if (data.outcome === "no-text") {
+                    toast.show({ variant: "info", message: "The selected prompt has no text to enhance." })
+                    return
+                  }
+                  if (data.outcome === "empty") {
+                    toast.show({ variant: "warning", message: "The enhancement returned empty text." })
+                    return
+                  }
+                  toast.show({
+                    variant: "warning",
+                    message: "The enhancement omitted an attachment or reference placeholder.",
+                  })
+                })
+                .catch(failed("enhance"))
+                .finally(() => setEnhancing(false))
+            },
+          },
+          {
             command: "dialog.queue.delete",
             title: "delete",
             disabled: locked,
@@ -320,8 +420,8 @@ export function DialogQueue(props: { sessionID: string }) {
   )
 }
 
-DialogQueue.show = (dialog: DialogContext, sessionID: string) =>
-  dialog.replace(() => <DialogQueue sessionID={sessionID} />)
+DialogQueue.show = (dialog: DialogContext, sessionID: string, enhancement?: PromptEnhancement) =>
+  dialog.replace(() => <DialogQueue sessionID={sessionID} enhancement={enhancement} />)
 
 // When the item's oldest instruction was queued and how long ago, how often
 // identical copies were sent, and how many queued instructions it merges.
@@ -346,7 +446,9 @@ function age(ms: number) {
 
 // What a pending item will say: its typed text, or the kinds of its parts.
 export function preview(item: SessionPromptQueueItem) {
-  const text = item.input.parts.flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : []))
+  const text = item.input.parts.flatMap((part) =>
+    part.type === "text" && !part.synthetic && part.text.length > 0 ? [part.text] : [],
+  )
   if (text.length > 0) return text.join("\n")
   return item.input.parts.map((part) => `[${part.type}]`).join(" ")
 }

@@ -15,6 +15,7 @@ export const SessionQueuePaths = {
   list: root,
   withdraw: `${root}/:itemID`,
   update: `${root}/:itemID`,
+  rewrite: `${root}/rewrite/:itemID`,
   restore: `${root}/restore`,
   hold: `${root}/hold`,
   release: `${root}/release`,
@@ -29,10 +30,15 @@ export const SessionQueuePaths = {
 export const RestorePayload = Schema.Struct({ id: SessionQueue.ItemID })
 export const UpdatePayload = Schema.Struct({ delivery: SessionQueue.Delivery })
 export const HoldPayload = Schema.Struct({ holder: Schema.String.check(Schema.isNonEmpty()) })
+export const RewritePayload = Schema.Struct({ expectedText: Schema.String, text: Schema.String })
 export const RemovePayload = Schema.Struct({ id: SessionQueue.ItemID })
 export const ReorderPayload = Schema.Struct({ items: Schema.Array(SessionQueue.ItemID) })
 export const ForceResult = Schema.Struct({
   outcome: Schema.Literals(["forced", "another-review", "hold-unconfirmed", "preparing", "unavailable"]),
+  items: Schema.Array(SessionQueue.Item),
+})
+export const RewriteResult = Schema.Struct({
+  outcome: Schema.Literals(["rewritten", "stale", "preparing", "unavailable", "no-text", "empty", "missing-reference"]),
   items: Schema.Array(SessionQueue.Item),
 })
 export const SelectedConsolidationResult = Schema.Struct({
@@ -95,6 +101,20 @@ export const SessionQueueApi = HttpApi.make("sessionQueue").add(
           summary: "Change queued prompt delivery",
           description:
             "Change how a pending prompt is delivered and wake the session. Setting steer sends a queued prompt at the next step.",
+        }),
+      ),
+      HttpApiEndpoint.post("rewrite", SessionQueuePaths.rewrite, {
+        params: { sessionID: SessionID, itemID: SessionQueue.ItemID },
+        query: WorkspaceRoutingQuery,
+        payload: RewritePayload,
+        success: described(RewriteResult, "Rewrite result and current pending prompts"),
+        error: [HttpApiError.BadRequest, ApiNotFoundError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "session.queue.rewrite",
+          summary: "Rewrite a queued prompt's text",
+          description:
+            "Replace editable text only when the prepared pending item's editable text still matches the expected draft. Preserves the queue item and receipts; returns stale, preparing or unavailable without changing the text when the row cannot be rewritten.",
         }),
       ),
       HttpApiEndpoint.post("force", SessionQueuePaths.force, {

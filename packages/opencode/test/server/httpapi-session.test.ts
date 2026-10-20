@@ -2193,6 +2193,79 @@ it.live(
   )
 
   it.live(
+    "the rewrite route changes only a prepared row's text and rejects a stale input snapshot",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue rewrite route" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const model = { providerID: "test", modelID: "test-model" }
+        const post = (path: string, body: unknown, routeParams: Record<string, string> = params) =>
+          request(pathFor(path, routeParams), { method: "POST", headers, body: JSON.stringify(body) })
+        const list = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+        const receipt = () =>
+          requestJson<SessionQueue.Receipt>(
+            pathFor(SessionQueuePaths.receipt, { ...params, requestID: "rewrite-route-selected" }),
+            { headers },
+          )
+        const send = (requestID: string, text: string) =>
+          post(SessionPaths.promptAsync, {
+            requestID,
+            agent: "build",
+            model,
+            delivery: "queue",
+            origin: "tui-composer",
+            parts: [{ type: "text", text }],
+          })
+
+        expect((yield* post(SessionQueuePaths.hold, { holder: "rewrite-view" })).status).toBe(200)
+        yield* Effect.addFinalizer(() => post(SessionQueuePaths.release, { holder: "rewrite-view" }).pipe(Effect.ignore))
+        expect((yield* send("rewrite-route-selected", "rough draft")).status).toBe(204)
+        expect((yield* send("rewrite-route-later", "leave this prompt alone")).status).toBe(204)
+        const [selected, later] = yield* pollWithTimeout(
+          list().pipe(Effect.map((items) => (items.length === 2 ? items : undefined))),
+          "the rewrite prompts were not admitted",
+        )
+        if (!selected || !later) throw new Error("the rewrite queue rows were missing")
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const { db } = yield* Database.Service
+            const rows = yield* db
+              .select({ id: SessionPromptQueueTable.id, preparing: SessionPromptQueueTable.time_preparing })
+              .from(SessionPromptQueueTable)
+              .where(inArray(SessionPromptQueueTable.id, [selected.id, later.id]))
+              .all()
+              .pipe(Effect.orDie)
+            return rows.length === 2 && rows.every((row) => row.preparing === null) ? true : undefined
+          }).pipe(provideInstanceEffect(directory)),
+          "the rewrite prompts never finished preparing",
+        )
+
+        const rewritePath = pathFor(SessionQueuePaths.rewrite, { ...params, itemID: selected.id })
+        const response = yield* post(rewritePath, { expectedText: "rough draft", text: "clearer draft" })
+        expect(response.status).toBe(200)
+        const rewritten = yield* json<{ outcome: string; items: SessionQueue.Item[] }>(response)
+        expect(rewritten.outcome).toBe("rewritten")
+        expect(rewritten.items.map((item) => item.id)).toEqual([selected.id, later.id])
+        expect(rewritten.items[0]?.input.parts.map((part) => (part.type === "text" ? part.text : undefined))).toEqual([
+          "clearer draft",
+        ])
+        expect(rewritten.items[1]?.input.parts).toEqual(later.input.parts)
+        expect(yield* receipt()).toMatchObject({ state: "pending", itemID: selected.id })
+
+        const stale = yield* post(rewritePath, { expectedText: "rough draft", text: "late enhancement" })
+        expect(stale.status).toBe(200)
+        expect(yield* json<{ outcome: string; items: SessionQueue.Item[] }>(stale)).toMatchObject({
+          outcome: "stale",
+          items: [{ id: selected.id, input: { parts: [{ type: "text", text: "clearer draft" }] } }, { id: later.id }],
+        })
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
     "a queued json_schema prompt is listed and promoted from its stored row into a structured turn, and a text-format steer is promoted from its row",
     () => {
       const gate = Deferred.makeUnsafe<void>()

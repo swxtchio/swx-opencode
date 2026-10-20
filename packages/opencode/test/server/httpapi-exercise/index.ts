@@ -1584,6 +1584,36 @@ const scenarios: Scenario[] = [
       )
     }),
   http.protected
+    .post("/session/{sessionID}/queue/rewrite/{itemID}", "session.queue.rewrite")
+    .mutating()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue rewrite session" })
+        const item = yield* ctx.queued(session.id, { requestID: "rewrite-exercise", text: "rough draft" })
+        return { session, item }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/rewrite/{itemID}", {
+        sessionID: ctx.state.session.id,
+        itemID: ctx.state.item.id,
+      }),
+      headers: ctx.headers(),
+      body: { expectedText: "rough draft", text: "clearer draft" },
+    }))
+    .jsonEffect(200, (body, ctx) =>
+      Effect.gen(function* () {
+        check(isRecord(body) && body.outcome === "rewritten", "rewrite should report an applied update")
+        const items = yield* ctx.queue(ctx.state.session.id)
+        check(items.length === 1 && items[0]?.id === ctx.state.item.id, "rewrite should keep the same queue item")
+        check(
+          items[0]?.input.parts[0]?.type === "text" && items[0].input.parts[0].text === "clearer draft",
+          "rewrite should store the returned text",
+        )
+        check(items[0]?.requestID === "rewrite-exercise", "rewrite should preserve the request identity")
+      }),
+    ),
+  http.protected
     .post("/session/{sessionID}/queue/release", "session.queue.release")
     .preserveDatabase()
     .withLlm()

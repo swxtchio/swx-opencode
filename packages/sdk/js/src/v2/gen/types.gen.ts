@@ -11081,6 +11081,47 @@ export type SessionQueueRestoreResponses = {
 
 export type SessionQueueRestoreResponse = SessionQueueRestoreResponses[keyof SessionQueueRestoreResponses]
 
+export type SessionQueueRewriteData = {
+  body?: {
+    expectedText: string
+    text: string
+  }
+  path: {
+    sessionID: string
+    itemID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/rewrite/{itemID}"
+}
+
+export type SessionQueueRewriteErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionQueueRewriteError = SessionQueueRewriteErrors[keyof SessionQueueRewriteErrors]
+
+export type SessionQueueRewriteResponses = {
+  /**
+   * Rewrite result and current pending prompts
+   */
+  200: {
+    outcome: "rewritten" | "stale" | "preparing" | "unavailable" | "no-text" | "empty" | "missing-reference"
+    items: Array<SessionPromptQueueItem>
+  }
+}
+
+export type SessionQueueRewriteResponse = SessionQueueRewriteResponses[keyof SessionQueueRewriteResponses]
+
 export type SessionQueueForceData = {
   body?: {
     holder: string

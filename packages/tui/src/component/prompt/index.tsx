@@ -48,9 +48,9 @@ import { Locale } from "../../util/locale"
 import { errorMessage } from "../../util/error"
 import {
   promptEnhancementContext,
-  type MessageWithParts,
-  type TranscriptOptions,
-  type TranscriptPresentation,
+  promptEnhancementModel,
+  type PromptEnhancement,
+  type PromptEnhancementContext,
 } from "../../util/transcript"
 import { isRecord } from "../../util/record"
 import { formatDuration } from "../../util/format"
@@ -76,11 +76,8 @@ registerOpencodeSpinner()
 
 export type PromptProps = {
   sessionID?: string
-  enhancementContext?: () => {
-    messages: MessageWithParts[]
-    options: Pick<TranscriptOptions, "thinking" | "toolDetails" | "assistantMetadata" | "providers">
-    presentation: TranscriptPresentation
-  }
+  enhancementContext?: () => PromptEnhancementContext
+  enhancementModel?: () => string
   visible?: boolean
   disabled?: boolean
   onSubmit?: () => void
@@ -181,6 +178,11 @@ export function Prompt(props: PromptProps) {
   const project = useProject()
   const sync = useSync()
   const tuiConfig = useTuiConfig()
+  const enhancement: PromptEnhancement = {
+    model:
+      props.enhancementModel ?? (() => promptEnhancementModel(tuiConfig.prompt_enhance_model, local.model.current())),
+    ...(props.enhancementContext ? { context: props.enhancementContext } : {}),
+  }
   const dialog = useDialog()
   const toast = useToast()
   const status = createMemo(() => sync.data.session_status?.[props.sessionID ?? ""] ?? { type: "idle" })
@@ -1553,16 +1555,13 @@ export function Prompt(props: PromptProps) {
     })
     setEnhancing(true)
     try {
-      const transcript = props.enhancementContext?.()
+      const transcript = enhancement.context?.()
       const context = transcript
         ? promptEnhancementContext(transcript.messages, transcript.options, transcript.presentation)
         : ""
-      const currentModel = local.model.current()
       const response = await sdk.client.instance.prompt.enhance(
         {
-          model:
-            tuiConfig.prompt_enhance_model ??
-            (currentModel ? `${currentModel.providerID}/${currentModel.modelID}` : "google/gemini-3.8-flash"),
+          model: enhancement.model(),
           draft,
           context,
         },
@@ -2027,7 +2026,7 @@ export function Prompt(props: PromptProps) {
             </box>
           </Show>
         </box>
-        <PromptQueueRow sessionID={props.sessionID} />
+        <PromptQueueRow sessionID={props.sessionID} enhancement={enhancement} />
       </box>
       <Autocomplete
         sessionID={props.sessionID}

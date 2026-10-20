@@ -233,6 +233,8 @@ import type {
   SessionQueueReorderResponses,
   SessionQueueRestoreErrors,
   SessionQueueRestoreResponses,
+  SessionQueueRewriteErrors,
+  SessionQueueRewriteResponses,
   SessionQueueUpdateErrors,
   SessionQueueUpdateResponses,
   SessionQueueWithdrawErrors,
@@ -3665,6 +3667,51 @@ export class Queue extends HeyApiClient {
     return (options?.client ?? this.client).post<SessionQueueRestoreResponses, SessionQueueRestoreErrors, ThrowOnError>(
       {
         url: "/session/{sessionID}/queue/restore",
+        ...options,
+        ...params,
+        headers: {
+          "Content-Type": "application/json",
+          ...options?.headers,
+          ...params.headers,
+        },
+      },
+    )
+  }
+
+  /**
+   * Rewrite a queued prompt's text
+   *
+   * Replace editable text only when the prepared pending item's editable text still matches the expected draft. Preserves the queue item and receipts; returns stale, preparing or unavailable without changing the text when the row cannot be rewritten.
+   */
+  public rewrite<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      itemID: string
+      directory?: string
+      workspace?: string
+      expectedText?: string
+      text?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "itemID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "expectedText" },
+            { in: "body", key: "text" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionQueueRewriteResponses, SessionQueueRewriteErrors, ThrowOnError>(
+      {
+        url: "/session/{sessionID}/queue/rewrite/{itemID}",
         ...options,
         ...params,
         headers: {

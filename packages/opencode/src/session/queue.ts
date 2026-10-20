@@ -128,6 +128,14 @@ export const holdLease = Duration.minutes(6)
 export type HoldEnd = "released" | "lapsed"
 export type ForceOutcome = "forced" | "another-review" | "hold-unconfirmed" | "preparing" | "unavailable"
 export type SelectedConsolidationOutcome = "consolidated" | "unchanged" | "preparing" | "incompatible" | "unavailable"
+export type RewriteOutcome =
+  | "rewritten"
+  | "stale"
+  | "preparing"
+  | "unavailable"
+  | "no-text"
+  | "empty"
+  | "missing-reference"
 
 export interface Interface {
   readonly admit: (input: AdmitInput) => Effect.Effect<Item>
@@ -238,6 +246,13 @@ export interface Interface {
     readonly itemID: ItemID
     readonly delivery: Delivery
   }) => Effect.Effect<Option.Option<Item>>
+  /** Rewrites editable text only when the prepared pending input still matches its expected snapshot. */
+  readonly rewrite: (input: {
+    readonly sessionID: SessionID
+    readonly itemID: ItemID
+    readonly expectedText: string
+    readonly text: string
+  }) => Effect.Effect<{ readonly outcome: RewriteOutcome; readonly items: Item[] }>
   /** Gives one prepared pending item steer timing and releases only the requesting review hold. */
   readonly force: (input: {
     readonly sessionID: SessionID
@@ -1950,6 +1965,55 @@ const layer = Layer.effect(
       return Option.some(fromRow(row))
     })
 
+    const rewrite: Interface["rewrite"] = (input) =>
+      exclusive(
+        input.sessionID,
+        Effect.gen(function* () {
+          const result = yield* writable(input.sessionID, (tx) =>
+            Effect.gen(function* () {
+              const row = yield* rowOf(tx, input.itemID)
+              if (
+                !row ||
+                row.session_id !== input.sessionID ||
+                row.time_promoted !== null ||
+                row.time_withdrawn !== null
+              )
+                return { outcome: "unavailable" as const, finished: [] }
+              if (row.time_preparing !== null) return { outcome: "preparing" as const, finished: [] }
+
+              const currentInput = decodeInput(row.input)
+              const currentText = currentInput.parts
+                .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
+                .join("")
+              if (currentText !== input.expectedText) return { outcome: "stale" as const, finished: [] }
+              const replacement = rewriteInputText(currentInput, input.text)
+              if (replacement.outcome !== "rewritten") return { outcome: replacement.outcome, finished: [] }
+
+              const finished = yield* invalidate(tx, input.sessionID)
+              const updated = yield* tx
+                .update(SessionPromptQueueTable)
+                .set({ input: encodeInput(replacement.input) })
+                .where(
+                  and(
+                    eq(SessionPromptQueueTable.id, input.itemID),
+                    pending(input.sessionID),
+                    isNull(SessionPromptQueueTable.time_preparing),
+                  ),
+                )
+                .returning()
+                .get()
+                .pipe(Effect.orDie)
+              return { outcome: updated ? ("rewritten" as const) : ("unavailable" as const), finished }
+            }),
+          ).pipe(Effect.orDie)
+
+          finish(result.finished)
+          if (result.finished.length > 0 || result.outcome === "rewritten") yield* publish(input.sessionID)
+          if (result.outcome === "rewritten") wake(input.sessionID)
+          return { outcome: result.outcome, items: yield* list(input.sessionID) }
+        }),
+      ).pipe(Effect.withSpan("SessionQueue.rewrite"))
+
     const held = (sessionID: SessionID) =>
       Clock.currentTimeMillis.pipe(
         Effect.map((now) => [...(holds.get(sessionID)?.leases.values() ?? [])].some((until) => until > now)),
@@ -3127,6 +3191,7 @@ const layer = Layer.effect(
       withdraw,
       restore,
       update,
+      rewrite,
       force,
       promote,
       consume,
@@ -3471,6 +3536,43 @@ function groupKind(
 
 function humanComposer(input: SessionPromptQueue.QueuedInput, markers?: ConfigV1.Info["machine_message_markers"]) {
   return input.origin === "tui-composer" && !marked(input, markers)
+}
+
+function rewriteInputText(input: SessionPromptQueue.QueuedInput, text: string) {
+  const firstText = input.parts.findIndex((part) => part.type === "text" && !part.synthetic && !part.ignored)
+  if (firstText === -1) return { outcome: "no-text" as const }
+  if (!text.trim()) return { outcome: "empty" as const }
+  const placeholders = input.parts.flatMap((part) => {
+    if (part.type === "file" && part.source?.text) return [part.source.text.value]
+    if (part.type === "agent" && part.source) return [part.source.value]
+    return []
+  })
+  if (placeholders.some((placeholder) => !text.includes(placeholder))) return { outcome: "missing-reference" as const }
+  return {
+    outcome: "rewritten" as const,
+    input: {
+      ...input,
+      parts: input.parts.map((part, index) => {
+        if (part.type === "text" && !part.synthetic && !part.ignored)
+          return { ...part, text: index === firstText ? text : "" }
+        if (part.type === "file" && part.source?.text) {
+          const start = text.indexOf(part.source.text.value)
+          return {
+            ...part,
+            source: {
+              ...part.source,
+              text: { ...part.source.text, start, end: start + part.source.text.value.length },
+            },
+          }
+        }
+        if (part.type === "agent" && part.source) {
+          const start = text.indexOf(part.source.value)
+          return { ...part, source: { ...part.source, start, end: start + part.source.value.length } }
+        }
+        return part
+      }),
+    },
+  }
 }
 
 function toReceipt(row: typeof SessionPromptReceiptTable.$inferSelect): Receipt {

@@ -753,6 +753,92 @@ it.live(
   60_000,
 )
 
+it.live(
+  "Ctrl+e enhances the selected composer prompt in place through prompt enhancement",
+  () => {
+    const gate = Deferred.makeUnsafe<void>()
+    return Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      yield* llm.hold("initial turn done", Effect.runPromise(Deferred.await(gate)))
+      const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+      const tui = yield* boot({ directory })
+
+      yield* tui.prompt("start enhancement context")
+      yield* pollWithTimeout(
+        lastUsers(llm).pipe(Effect.map((users) => (users.includes("start enhancement context") ? true : undefined))),
+        "the enhancement context turn never started",
+      )
+      yield* tui.compose("rough draft")
+      const [selected] = yield* pollWithTimeout(
+        tui.rows.pipe(
+          Effect.map((rows) => {
+            const pending = rows.filter((row) => row.time_promoted === null && row.time_withdrawn === null)
+            return pending.length === 1 && pending[0]?.time_preparing === null ? pending : undefined
+          }),
+        ),
+        "the composer prompt never became ready for enhancement",
+      )
+      const requestID = selected?.request_id
+      if (!selected || !requestID) throw new Error("the selected composer prompt lost its request identity")
+
+      yield* tui.open
+      yield* tui.screen("(delivery paused)", "the enhancement review view")
+      yield* llm.text("polished draft")
+      tui.renderer.mockInput.pressKey("e", { ctrl: true })
+      yield* tui.screen("Queued prompt enhanced.", "the enhancement result")
+      const enhancement = yield* pollWithTimeout(
+        llm.inputs.pipe(Effect.map((inputs) => inputs.find((input) => JSON.stringify(input).includes("rough draft")))),
+        "the selected draft never reached the existing enhancement endpoint",
+      )
+      expect(enhancement.model).toBe("test-model")
+      expect(JSON.stringify(enhancement)).toContain("start enhancement context")
+      const rewrite = tui.queueRequests.find(
+        (request) =>
+          request.method === "POST" && request.path === `/session/${tui.sessionID}/queue/rewrite/${selected.id}`,
+      )
+      if (!rewrite?.body) throw new Error("enhancement did not rewrite the selected queue item")
+      expect(JSON.parse(rewrite.body)).toEqual({ expectedText: "rough draft", text: "polished draft" })
+
+      const rewritten = yield* pollWithTimeout(
+        tui.rows.pipe(
+          Effect.map((rows) => {
+            const item = rows.find((row) => row.id === selected.id)
+            return item && texts([item]).includes("polished draft") ? item : undefined
+          }),
+        ),
+        "the queue row did not retain the enhanced text",
+      )
+      expect(rewritten.seq).toBe(selected.seq)
+      expect(rewritten.delivery).toBe(selected.delivery)
+      expect(rewritten.request_id).toBe(selected.request_id)
+      const pendingReceipt = yield* Effect.promise(() =>
+        tui.sdk.session.queue.receipt({ sessionID: tui.sessionID, requestID }),
+      )
+      expect(pendingReceipt.data?.state).toBe("pending")
+
+      yield* llm.text("polished prompt answered")
+      yield* Deferred.succeed(gate, undefined)
+      yield* tui.idle
+      tui.renderer.mockInput.pressEscape()
+      const delivered = yield* pollWithTimeout(
+        llm.inputs.pipe(
+          Effect.map((inputs) =>
+            inputs.find((input) => JSON.stringify(input).includes("polished draft") && input.model === "test-model"),
+          ),
+        ),
+        "the rewritten prompt was not delivered after the review hold ended",
+      )
+      expect(JSON.stringify(delivered)).not.toContain("rough draft")
+      yield* tui.idle
+      const deliveredReceipt = yield* Effect.promise(() =>
+        tui.sdk.session.queue.receipt({ sessionID: tui.sessionID, requestID }),
+      )
+      expect(deliveredReceipt.data?.state).toBe("delivered")
+    }).pipe(Effect.ensuring(Deferred.succeed(gate, undefined)), Effect.provide(TestLLMServer.layer))
+  },
+  60_000,
+)
+
 // Captures the review's five-minute idle timer, set from dialog-queue, so the
 // test can fire it instead of waiting; every other timer runs as usual.
 // The exact interval is proven with fake timers in packages/tui.

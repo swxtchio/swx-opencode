@@ -9,7 +9,14 @@ import { Cause, Effect, Option, Scope } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import { notFound, QueueItemNotPendingError, QueueItemNotWithdrawnError } from "../errors"
-import { HoldPayload, RemovePayload, ReorderPayload, RestorePayload, UpdatePayload } from "../groups/session-queue"
+import {
+  HoldPayload,
+  RemovePayload,
+  ReorderPayload,
+  RestorePayload,
+  RewritePayload,
+  UpdatePayload,
+} from "../groups/session-queue"
 import * as SessionError from "./session-errors"
 
 export const sessionQueueHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessionQueue", (handlers) =>
@@ -94,6 +101,21 @@ export const sessionQueueHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       if (Option.isNone(item)) return yield* notPending(ctx.params.sessionID, ctx.params.itemID)
       yield* wake(ctx.params.sessionID)
       return item.value
+    })
+
+    const rewrite = Effect.fn("SessionQueueHttpApi.rewrite")(function* (ctx: {
+      params: { sessionID: SessionID; itemID: SessionQueue.ItemID }
+      payload: typeof RewritePayload.Type
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      const result = yield* queue.rewrite({
+        sessionID: ctx.params.sessionID,
+        itemID: ctx.params.itemID,
+        expectedText: ctx.payload.expectedText,
+        text: ctx.payload.text,
+      })
+      if (result.outcome === "rewritten") yield* wake(ctx.params.sessionID)
+      return result
     })
 
     const force = Effect.fn("SessionQueueHttpApi.force")(function* (ctx: {
@@ -187,6 +209,7 @@ export const sessionQueueHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       .handle("withdraw", withdraw)
       .handle("restore", restore)
       .handle("update", update)
+      .handle("rewrite", rewrite)
       .handle("force", force)
       .handle("hold", hold)
       .handle("release", release)

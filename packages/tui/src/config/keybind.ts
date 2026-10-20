@@ -213,6 +213,7 @@ export const Definitions = {
   "dialog.move_session.delete": keybind("ctrl+d", "Delete project copy"),
   "dialog.move_session.refresh": keybind("ctrl+r", "Refresh project copies"),
   "dialog.queue.delete": keybind("ctrl+d", "Delete queued prompt"),
+  "dialog.queue.enhance": keybind("ctrl+e", "Enhance the selected queued prompt"),
   "dialog.queue.force": keybind("ctrl+f", "Force the selected queued prompt"),
   "dialog.queue.move_up": keybind("alt+up", "Deliver queued prompt earlier"),
   "dialog.queue.move_down": keybind("alt+down", "Deliver queued prompt later"),
