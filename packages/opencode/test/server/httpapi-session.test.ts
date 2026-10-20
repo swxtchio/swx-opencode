@@ -2233,7 +2233,7 @@ it.live(
             model,
             delivery: "queue",
             origin: "tui-composer",
-            parts: [{ type: "text", text }],
+            parts: [{ type: "text", text, metadata: { source: requestID } }],
           })
 
         expect((yield* post(SessionQueuePaths.hold, { holder: "rewrite-view" })).status).toBe(200)
@@ -2277,18 +2277,33 @@ it.live(
         const rewritten = yield* json<{ outcome: string; items: SessionQueue.Item[] }>(response)
         expect(rewritten.outcome).toBe("rewritten")
         expect(rewritten.items.map((item) => item.id)).toEqual([selected.id, later.id])
-        expect(rewritten.items[0]?.input.parts.map((part) => (part.type === "text" ? part.text : undefined))).toEqual([
-          "clearer draft",
-        ])
+        const rewrittenItem = rewritten.items[0]
+        if (!rewrittenItem) throw new Error("the rewrite route lost the selected item")
+        expect(
+          rewrittenItem.input.parts.flatMap((part) =>
+            part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [],
+          ),
+        ).toEqual(["clearer draft"])
+        const originals = rewrittenItem.input.parts.flatMap((part) => {
+          if (part.type !== "text" || !part.synthetic || !part.ignored) return []
+          const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueuePendingOriginal)
+          return Option.isSome(group) ? group.value.constituents : []
+        })
+        expect(originals.map((original) => original.id)).toEqual([selected.id])
+        expect(
+          originals.map((original) =>
+            original.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
+          ),
+        ).toEqual(["rough draft"])
+        expect(originals[0]?.input.parts[0]).toMatchObject({ metadata: { source: "rewrite-route-selected" } })
         expect(rewritten.items[1]?.input.parts).toEqual(later.input.parts)
         expect(yield* receipt()).toMatchObject({ state: "pending", itemID: selected.id })
 
         const stale = yield* post(rewritePath, { expectedText: "rough draft", text: "late enhancement" })
         expect(stale.status).toBe(200)
-        expect(yield* json<{ outcome: string; items: SessionQueue.Item[] }>(stale)).toMatchObject({
-          outcome: "stale",
-          items: [{ id: selected.id, input: { parts: [{ type: "text", text: "clearer draft" }] } }, { id: later.id }],
-        })
+        const staleResult = yield* json<{ outcome: string; items: SessionQueue.Item[] }>(stale)
+        expect(staleResult.outcome).toBe("stale")
+        expect(staleResult.items).toEqual(rewritten.items)
       }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
     30_000,
   )

@@ -2599,9 +2599,31 @@ it.instance("rewriting pending text preserves queue identity, metadata, context 
     expect(carrier.requestID).toBe("rewrite-selected")
     expect(carrier.input.origin).toBe("tui-composer")
     expect(carrier.origins).toEqual(selected.origins)
-    const texts = carrier.input.parts.flatMap((part) => (part.type === "text" ? [part] : []))
+    const texts = carrier.input.parts.filter(
+      (part): part is Extract<(typeof carrier.input.parts)[number], { type: "text" }> =>
+        part.type === "text" && !part.synthetic && !part.ignored,
+    )
     expect(texts.map((part) => part.text)).toEqual(["refined source.txt", ""])
     expect(texts.map((part) => part.metadata?.source)).toEqual(["typed-first", "typed-second"])
+    const originals = carrier.input.parts.flatMap((part) => {
+      if (part.type !== "text" || !part.synthetic || !part.ignored) return []
+      const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueuePendingOriginal)
+      return Option.isSome(group) ? group.value.constituents : []
+    })
+    expect(originals.map((original) => original.id)).toEqual([selected.id])
+    expect(
+      originals.map((original) =>
+        original.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
+      ),
+    ).toEqual(["rough draft source.txt continued"])
+    expect(
+      originals.map((original) =>
+        original.input.parts.flatMap((part) => (part.type === "text" ? [part.metadata?.source] : [])),
+      ),
+    ).toEqual([["typed-first", "typed-second"]])
+    expect(originals[0]?.input.parts.find((part) => part.type === "file")).toMatchObject({
+      source: { type: "file", path: "/source.txt", text: { value: "source.txt", start: 12, end: 22 } },
+    })
     const attachment = carrier.input.parts.find((part) => part.type === "file")
     expect(attachment).toMatchObject({
       filename: "source.txt",
