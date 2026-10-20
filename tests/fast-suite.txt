@@ -1,5 +1,6 @@
 # Keep this selection deterministic, fast, and behavior-covering.
-# TUI, Client, and JS SDK have package test scripts but no Turbo test task, so the runner invokes their scripts directly.
+# Full-suite/CI Turbo-task gap for TUI, Client, and JS SDK is tracked in #317.
+# Fast mode invokes their package test scripts directly.
 # Changes touching an excluded timing class require that class at the final gate via
 # firstmate's repository suite override; release builds require a passing full suite.
 

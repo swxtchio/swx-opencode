@@ -20,7 +20,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     '       tests/run.sh --help' \
     '' \
     'With no selector, runs the complete per-package Turbo test suite and forwards all arguments to Turbo.' \
-    '--fast runs exactly the entries in tests/fast-suite.txt through their owning package test tasks.' \
+    '--fast invokes each entry in tests/fast-suite.txt separately through its owning package test task or script.' \
     'The manifest accepts blank lines and whole-line comments beginning with #; every other line must be one' \
     'committed, regular project-relative path matching packages/<package-path>/test/<path>.test.ts.' \
     'Manifest paths use / separators and cannot contain whitespace, backslashes, glob characters, inline comments,' \
@@ -193,60 +193,51 @@ index=0
 while [ "$index" -lt "$target_count" ]; do
   package_root=${package_paths[index]}
   package_mode=${package_modes[index]}
-  selected=()
+  target=${test_paths[index]}
   report_args=(--reporter=junit --reporter-outfile="$report_file")
-  while [ "$index" -lt "$target_count" ] && [ "${package_paths[index]}" = "$package_root" ]; do
-    selected+=("${test_paths[index]}")
-    index=$((index + 1))
-  done
-  target_list=$(printf '%s\n' "${selected[@]}")
-  package_status=0
+  target_status=0
   # Bun treats bare positional paths as substring filters; ./ selects the exact target file.
-  selected_paths=()
-  for test_path in "${selected[@]}"; do
-    selected_paths+=("./$test_path")
-  done
+  selected_path="./$target"
   if [ "$package_mode" = turbo ]; then
     GITHUB_ACTIONS=false bun turbo test \
-      --filter="./$package_root" --force -- "${report_args[@]}" "${selected_paths[@]}" || package_status=$?
+      --filter="./$package_root" --force -- "${report_args[@]}" "$selected_path" || target_status=$?
   else
     (cd "$root/$package_root" && GITHUB_ACTIONS=false bun run test -- \
-      "${report_args[@]}" "${selected_paths[@]}") || package_status=$?
+      "${report_args[@]}" "$selected_path") || target_status=$?
   fi
 
-  if [ "$package_status" -eq 0 ]; then
+  if [ "$target_status" -eq 0 ]; then
     report_status=0
-    FAST_SUITE_REPORT="$report_file" FAST_SUITE_TARGETS="$target_list" bun -e '
+    FAST_SUITE_REPORT="$report_file" FAST_SUITE_TARGET="$target" bun -e '
       const report = await Bun.file(process.env.FAST_SUITE_REPORT).text()
-      const targets = (process.env.FAST_SUITE_TARGETS ?? "").split("\n").filter(Boolean)
+      const target = process.env.FAST_SUITE_TARGET
       const suites = Array.from(report.matchAll(/<testsuite\b([^>]*)>/g), ([, text]) => {
         const attributes = Object.fromEntries(
           Array.from(text.matchAll(/([A-Za-z][A-Za-z0-9_-]*)="([^"]*)"/g), (match) => [match[1], match[2]]),
         )
         return { file: attributes.file, tests: Number(attributes.tests), skipped: Number(attributes.skipped ?? 0) }
       })
-      const missing = targets.filter((target) =>
-        !suites.some((suite) => suite.file === target && Number.isFinite(suite.tests) && suite.tests > suite.skipped),
+      const active = suites.some(
+        (suite) => suite.file === target && Number.isFinite(suite.tests) && suite.tests > suite.skipped,
       )
-      if (missing.length) {
-        console.error("tests/run.sh: Bun reported no active test cases for: " + missing.join(", "))
+      if (!active) {
+        console.error("tests/run.sh: Bun reported no active test cases for: " + target)
         process.exit(1)
       }
       ' || report_status=$?
     if [ "$report_status" -ne 0 ]; then
       coverage_invalid=1
-      package_status=1
+      target_status=1
     fi
   elif [ -s "$report_file" ]; then
-    printf 'tests/run.sh: JUnit report for %s:\n' "$package_root" >&2
+    printf 'tests/run.sh: JUnit report for %s:\n' "$target" >&2
     while IFS= read -r report_line || [ -n "$report_line" ]; do
       printf '%s\n' "$report_line" >&2
     done < "$report_file"
   fi
   rm -f -- "$report_file"
-  if [ "$fast_status" -eq 0 ] && [ "$package_status" -ne 0 ]; then
-    fast_status=$package_status
-  fi
+  if [ "$target_status" -ne 0 ]; then fast_status=1; fi
+  index=$((index + 1))
 done
 
 if [ "$coverage_invalid" -ne 0 ]; then

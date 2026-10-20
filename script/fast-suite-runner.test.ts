@@ -23,6 +23,7 @@ test(
     const root = join(scratch, "repo")
     const marker = join(scratch, "executed.txt")
     const turboLog = join(scratch, "turbo-argv.txt")
+    const directLog = join(scratch, "direct-processes.txt")
     const runner = join(root, "tests", "run.sh")
     const manifest = join(root, "tests", "fast-suite.txt")
     const packageRoot = join(root, "packages", "example")
@@ -34,12 +35,15 @@ test(
     const selectedPath = `${packagePath}/test/selected.test.ts`
     const selectedSecondPath = `${packagePath}/test/selected-second.test.ts`
     const literalGlobPath = `${packagePath}/test/literal*.test.ts`
+    const whitespacePath = `${packagePath}/test/with space.test.ts`
     const directPath = "packages/direct/test/direct.test.ts"
+    const directSecondPath = "packages/direct/test/direct-second.test.ts"
     const validManifest = `# only the declared test files run
 
 ${selectedPath}
 ${selectedSecondPath}
 ${directPath}
+${directSecondPath}
 `
     const gitEnv = {
       ...process.env,
@@ -54,6 +58,7 @@ ${directPath}
         ...process.env,
         FAST_SUITE_FIXTURE_ROOT: root,
         FAST_SUITE_MARKER: marker,
+        FAST_SUITE_DIRECT_LOG: directLog,
         FAST_TURBO_LOG: turboLog,
       },
       stdout: "pipe" as const,
@@ -101,7 +106,15 @@ ${directPath}
     writeFileSync(join(packageRoot, "bunfig.toml"), '[test]\npreload = ["./test/preload.ts"]\n')
     writeFileSync(join(directPackageRoot, "bunfig.toml"), '[test]\npreload = ["./test/preload.ts"]\n')
     writeFileSync(join(packageTests, "preload.ts"), "process.env.FAST_SUITE_PRELOAD = process.cwd()\n")
-    writeFileSync(join(directPackageTests, "preload.ts"), "process.env.FAST_SUITE_PRELOAD = process.cwd()\n")
+    writeFileSync(
+      join(directPackageTests, "preload.ts"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        "process.env.FAST_SUITE_PRELOAD = process.cwd()",
+        'appendFileSync(process.env.FAST_SUITE_DIRECT_LOG!, "preload\\n")',
+        "",
+      ].join("\n"),
+    )
     writeFileSync(
       join(packageTests, "selected.test.ts"),
       [
@@ -160,6 +173,19 @@ ${directPath}
         '  expect(process.env.FAST_SUITE_SCRIPT).toBe("direct-package")',
         '  expect(process.env.FAST_SUITE_PRELOAD).toBe(process.cwd())',
         '  appendFileSync(process.env.FAST_SUITE_MARKER!, "direct\\n")',
+        "})",
+        "",
+      ].join("\n"),
+    )
+    writeFileSync(
+      join(directPackageTests, "direct-second.test.ts"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        'import { expect, test } from "bun:test"',
+        'test("uses the direct package script and preload for each target", () => {',
+        '  expect(process.env.FAST_SUITE_SCRIPT).toBe("direct-package")',
+        '  expect(process.env.FAST_SUITE_PRELOAD).toBe(process.cwd())',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER!, "direct-second\\n")',
         "})",
         "",
       ].join("\n"),
@@ -226,6 +252,17 @@ ${directPath}
         "",
       ].join("\n"),
     )
+    writeFileSync(
+      join(packageTests, "with space.test.ts"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        'import { test } from "bun:test"',
+        'test("is a real tracked target with whitespace in its path", () => {',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER!, "whitespace\\n")',
+        "})",
+        "",
+      ].join("\n"),
+    )
     const untrackedTarget = join(packageTests, "untracked.test.ts")
     writeFileSync(
       untrackedTarget,
@@ -274,6 +311,7 @@ exit 97
     chmodSync(turbo, 0o755)
     writeFileSync(manifest, validManifest)
     writeFileSync(marker, "")
+    writeFileSync(directLog, "")
     writeFileSync(turboLog, "")
 
     const init = Bun.spawnSync(["git", "init", "-q", "-b", "swxtch"], { cwd: root, env: gitEnv })
@@ -292,14 +330,22 @@ exit 97
     const fast = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
     if (fast.exitCode !== 0) console.error(fast.stdout.toString(), fast.stderr.toString())
     expect(fast.exitCode).toBe(0)
-    expect(fast.stdout.toString().trim().endsWith("verdict=completed mode=fast target_count=3 exit_code=0")).toBe(true)
-    expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual(["direct", "second", "selected"])
+    expect(fast.stdout.toString().trim().endsWith("verdict=completed mode=fast target_count=4 exit_code=0")).toBe(true)
+    expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual([
+      "direct",
+      "direct-second",
+      "second",
+      "selected",
+    ])
     expect(readdirSync(root).filter((name) => name.startsWith(".fast-suite-report."))).toEqual([])
     const turboCalls = readFileSync(turboLog, "utf8").trim().split("\n")
-    expect(turboCalls).toHaveLength(1)
+    expect(turboCalls).toHaveLength(2)
     expect(turboCalls[0]).toContain("test --filter=./packages/example --force -- --reporter=junit")
-    expect(turboCalls[0]).toContain("test/selected.test.ts")
-    expect(turboCalls[0]).toContain("test/selected-second.test.ts")
+    expect(turboCalls[0]).toContain("./test/selected.test.ts")
+    expect(turboCalls[0]).not.toContain("./test/selected-second.test.ts")
+    expect(turboCalls[1]).toContain("./test/selected-second.test.ts")
+    expect(turboCalls[1]).not.toContain("./test/selected.test.ts")
+    expect(readFileSync(directLog, "utf8").trim().split("\n")).toEqual(["preload", "preload"])
 
     const beforeDirty = readFileSync(marker, "utf8")
     writeFileSync(manifest, `${validManifest}# pending change\n`)
@@ -327,6 +373,7 @@ exit 97
       [`${packagePath}/test/untracked.test.ts\n`, "invalid-fast-manifest"],
       [`${selectedPath}\n${selectedPath}\n`, "invalid-fast-manifest"],
       [`${literalGlobPath}\n`, "invalid-fast-manifest"],
+      [`${whitespacePath}\n`, "invalid-fast-manifest"],
       [`${packagePath}/test/../test/selected.test.ts\n`, "invalid-fast-manifest"],
       [`${selectedPath} # inline comment\n`, "invalid-fast-manifest"],
     ] as const) {
@@ -339,11 +386,11 @@ exit 97
       expect(invalidCommit.exitCode).toBe(0)
       const priorRuns = readFileSync(marker, "utf8")
       const invalid = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+      expect(readFileSync(marker, "utf8")).toBe(priorRuns)
       expect(invalid.exitCode).toBe(1)
       expect(
         invalid.stdout.toString().trim().endsWith(`verdict=refused mode=fast reason=${reason} exit_code=1`),
       ).toBe(true)
-      expect(readFileSync(marker, "utf8")).toBe(priorRuns)
     }
 
     writeFileSync(manifest, `${packagePath}/test/empty.test.ts\n`)
@@ -362,7 +409,7 @@ exit 97
     expect(readFileSync(marker, "utf8")).toBe(beforeInactiveFile)
     expect(readdirSync(root).filter((name) => name.startsWith(".fast-suite-report."))).toEqual([])
 
-    writeFileSync(manifest, `${packagePath}/test/failing.test.ts\n`)
+    writeFileSync(manifest, `${packagePath}/test/failing.test.ts\n${selectedPath}\n${directPath}\n`)
     expect(Bun.spawnSync(["git", "add", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
     const selectFailureCommit = Bun.spawnSync(["git", "commit", "-qm", "select failing target"], {
       cwd: root,
@@ -373,9 +420,9 @@ exit 97
     const fastFailure = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
     expect(fastFailure.exitCode).not.toBe(0)
     expect(
-      fastFailure.stdout.toString().trim().endsWith("verdict=completed mode=fast target_count=1 exit_code=1"),
+      fastFailure.stdout.toString().trim().endsWith("verdict=completed mode=fast target_count=3 exit_code=1"),
     ).toBe(true)
-    expect(readFileSync(marker, "utf8")).toBe("failing\n")
+    expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual(["direct", "failing", "selected"])
 
     writeFileSync(manifest, validManifest)
     expect(Bun.spawnSync(["git", "add", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
@@ -394,6 +441,7 @@ exit 97
       "selected-nested",
       "selected-sibling",
       "unlisted",
+      "whitespace",
     ])
 
     const fullWithArguments = Bun.spawnSync(["bash", runner, "--filter=./packages/example"], runOptions)
