@@ -2361,7 +2361,7 @@ const layer = Layer.effect(
                   .where(inArray(SessionPromptQueueAliasTable.item_id, itemIDs))
                   .all()
                   .pipe(Effect.orDie)
-                const originals = rows.flatMap(originalsOf)
+                const originals = originalsOfRows(rows)
                 const merged = grouped(rows, aliases, markers)
 
                 // The explicit carrier keeps exact source inputs for later merges,
@@ -2370,7 +2370,13 @@ const layer = Layer.effect(
                 const retained = yield* rowOf(tx, target.id)
                 if (!retained)
                   return { outcome: "unavailable" as const, changed: finished.length > 0, into: [], finished }
-                const pendingWitnesses = decodeInput(retained.input).parts.filter(pendingOriginal)
+                const pendingWitnesses = decodeInput(retained.input)
+                  .parts.flatMap((part) => {
+                    const original = pendingOriginal(part)
+                    return original ? [{ part, original }] : []
+                  })
+                  .toSorted((left, right) => compareAdmissionIdentity(left.original, right.original))
+                  .map(({ part }) => part)
                 const witnesses = originals.map((original) => originalWitness(original, PartID.ascending(), true))
                 yield* settleReceipts(
                   tx,
@@ -2400,7 +2406,7 @@ const layer = Layer.effect(
                         ...witnesses,
                       ],
                     }),
-                    origins: rows.flatMap(origins),
+                    origins: originalOriginsInAdmissionOrder(rows),
                     time_created: Math.max(...rows.map((row) => row.time_created)),
                   })
                   .where(eq(SessionPromptQueueTable.id, target.id))
@@ -3312,7 +3318,40 @@ function pendingOriginal(part: SessionPromptQueue.QueuedInput["parts"][number]) 
 
 function originalsOf(row: typeof SessionPromptQueueTable.$inferSelect) {
   const stored = decodeInput(row.input).parts.flatMap((part) => pendingOriginal(part) ?? [])
-  return stored.length ? [...new Map(stored.map((original) => [original.id, original])).values()] : [fromRow(row)]
+  const originals = stored.length
+    ? [...new Map(stored.map((original) => [original.id, original])).values()]
+    : [fromRow(row)]
+  return originals.toSorted(compareAdmissionIdentity)
+}
+
+function originalsOfRows(rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[]) {
+  return [...new Map(rows.flatMap(originalsOf).map((original) => [original.id, original])).values()].toSorted(
+    compareAdmissionIdentity,
+  )
+}
+
+function originalOriginsInAdmissionOrder(rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[]) {
+  const originals = originalsOfRows(rows)
+  const originByID = new Map(
+    rows.flatMap((row) => {
+      const rowOrigins = origins(row)
+      return originalsOf(row).flatMap((original, index) => {
+        const origin = rowOrigins[index]
+        return origin ? [[original.id, origin] as const] : []
+      })
+    }),
+  )
+  const ordered = originals.flatMap((original) => {
+    const origin = originByID.get(original.id)
+    return origin ? [origin] : []
+  })
+  return ordered.length === originals.length ? ordered : rows.flatMap(origins)
+}
+
+function compareAdmissionIdentity(left: { readonly id: ItemID }, right: { readonly id: ItemID }) {
+  if (left.id < right.id) return -1
+  if (left.id > right.id) return 1
+  return 0
 }
 
 function originalWitness(original: SessionPromptQueue.Group["constituents"][number], id: PartID, pending = false) {
@@ -3414,7 +3453,7 @@ function grouped(
   aliases: readonly (typeof SessionPromptQueueAliasTable.$inferSelect)[] = [],
   markers?: ConfigV1.Info["machine_message_markers"],
 ) {
-  const items = rows.flatMap(originalsOf)
+  const items = originalsOfRows(rows)
   const kind = dispatch(items[0].input, items[0].delivery, markers)
   const first = items[0]
   const humanBatch =

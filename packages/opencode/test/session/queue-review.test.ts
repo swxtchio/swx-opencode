@@ -2685,6 +2685,130 @@ it.instance("rewriting pending text preserves queue identity, metadata, context 
 )
 
 it.instance(
+  "aliased selected-human consolidation preserves admission order through force and promotion",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "aliased human consolidation order" })
+      const composer = (requestID: string, content: string) =>
+        queue.admit({
+          sessionID: session.id,
+          requestID,
+          messageID: MessageID.ascending(),
+          delivery: "queue",
+          origin: "tui-composer",
+          parts: [{ type: "text", text: content, metadata: { source: requestID } }],
+        })
+      const first = yield* composer("alias-human-a", "first aliased instruction")
+      const second = yield* composer("alias-human-b", "second aliased instruction")
+      const consolidated = yield* queue.consolidateSelected(session.id, second.id)
+      expect(consolidated.outcome).toBe("consolidated")
+      const carrier = consolidated.items.find((item) => item.id === first.id)
+      if (!carrier) throw new Error("the aliased human carrier was missing")
+      const visible = carrier.input.parts.flatMap((part) =>
+        part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [],
+      )
+      expect(visible.join("")).toBe("first aliased instruction\nsecond aliased instruction")
+      const queuedOriginals = carrier.input.parts.flatMap((part) => {
+        if (part.type !== "text" || !part.ignored || !part.synthetic) return []
+        const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueuePendingOriginal)
+        return Option.isSome(group) ? group.value.constituents.map((item) => item.id) : []
+      })
+      expect([...new Set(queuedOriginals)]).toEqual([first.id, second.id])
+      expect(carrier.origins.map((origin) => origin.requestID)).toEqual(["alias-human-a", "alias-human-b"])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias-human-b"))).toMatchObject({
+        state: "merged",
+        into: "alias-human-a",
+      })
+
+      yield* queue.hold(session.id, "review")
+      expect(yield* queue.force({ sessionID: session.id, itemID: carrier.id, holder: "review" })).toBe("forced")
+      const delivered: SessionQueue.PromotedInput[] = []
+      yield* queue.promote({
+        sessionID: session.id,
+        delivery: "steer",
+        prepare: (input) => Effect.succeed(input),
+        write: (input) => Effect.sync(() => delivered.push(input)),
+        rejected: () => Effect.void,
+      })
+      const message = delivered[0]
+      if (!message?.group) throw new Error("the forced human carrier lost its group")
+      expect(message.group.constituents.map((item) => item.id)).toEqual([first.id, second.id])
+      expect(
+        message.parts
+          .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
+          .join(""),
+      ).toBe("first aliased instruction\nsecond aliased instruction")
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias-human-a")).state).toBe("delivered")
+    }),
+  30_000,
+)
+
+it.instance(
+  "restoring an intermediate original keeps repeated human consolidation in admission order",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "restored human consolidation order" })
+      const composer = (requestID: string, content: string) =>
+        queue.admit({
+          sessionID: session.id,
+          requestID,
+          delivery: "queue",
+          origin: "tui-composer",
+          parts: [{ type: "text", text: content, metadata: { source: requestID } }],
+        })
+      const first = yield* composer("restore-human-a", "first restored instruction")
+      const middle = yield* composer("restore-human-b", "middle restored instruction")
+      const last = yield* composer("restore-human-c", "last restored instruction")
+      expect(Option.isSome(yield* queue.withdraw(session.id, middle.id))).toBe(true)
+      expect((yield* queue.consolidateSelected(session.id, first.id)).outcome).toBe("consolidated")
+      expect(Option.isSome(yield* queue.restore(session.id, middle.id))).toBe(true)
+
+      const repeated = yield* queue.consolidateSelected(session.id, middle.id)
+      expect(repeated.outcome).toBe("consolidated")
+      const carrier = repeated.items.find((item) => item.id === first.id)
+      if (!carrier) throw new Error("the restored human carrier was missing")
+      const visible = carrier.input.parts.flatMap((part) =>
+        part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [],
+      )
+      expect(visible.join("")).toBe(
+        "first restored instruction\nmiddle restored instruction\nlast restored instruction",
+      )
+      expect(carrier.origins.map((origin) => origin.requestID)).toEqual([
+        "restore-human-a",
+        "restore-human-b",
+        "restore-human-c",
+      ])
+
+      const delivered: SessionQueue.PromotedInput[] = []
+      yield* queue.promote({
+        sessionID: session.id,
+        delivery: "queue",
+        prepare: (input) => Effect.succeed(input),
+        write: (input) => Effect.sync(() => delivered.push(input)),
+        rejected: () => Effect.void,
+      })
+      const message = delivered[0]
+      if (!message?.group) throw new Error("the restored human carrier lost its group")
+      expect(message.group.constituents.map((item) => item.id)).toEqual([first.id, middle.id, last.id])
+      expect(
+        message.parts
+          .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
+          .join(""),
+      ).toBe("first restored instruction\nmiddle restored instruction\nlast restored instruction")
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "restore-human-b"))).toMatchObject({
+        state: "merged",
+        into: "restore-human-a",
+        messageID: message.messageID,
+      })
+    }),
+  30_000,
+)
+
+it.instance(
   "selected human consolidation refuses preparing and incompatible members without a partial merge",
   () =>
     Effect.gen(function* () {
