@@ -455,6 +455,152 @@ it.instance("selected human consolidation retains original parts through promoti
   }),
 )
 
+it.instance("enhanced selected human carrier reaches normal delivery with its originals retained", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const first = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "enhance-human-a",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: "first original", metadata: { source: "typed-a" } }],
+    })
+    const second = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "enhance-human-b",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: "second original", metadata: { source: "typed-b" } }],
+    })
+    const consolidated = yield* queue.consolidateSelected(session.id, second.id)
+    const carrier = consolidated.items.find((item) => item.id === first.id)
+    if (!carrier) throw new Error("human enhancement carrier was missing")
+    const draft = carrier.input.parts
+      .flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : []))
+      .join("")
+    const rewritten = yield* queue.rewrite({
+      sessionID: session.id,
+      itemID: carrier.id,
+      expectedText: draft,
+      text: "ENHANCED HUMAN INSTRUCTIONS",
+    })
+    expect(rewritten.outcome).toBe("rewritten")
+
+    const promoted: SessionQueue.PromotedInput[] = []
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "queue",
+      prepare: (input) => Effect.sync(() => promoted.push(input)).pipe(Effect.andThen(prepare(input))),
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+    const sent = promoted[0]
+    if (!sent?.group) throw new Error("normal delivery lost the enhanced human group")
+    expect(
+      sent.parts
+        .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
+        .join(""),
+    ).toBe("ENHANCED HUMAN INSTRUCTIONS")
+    expect(sent.group.constituents.map((item) => item.id)).toEqual([first.id, second.id])
+    expect(
+      sent.group.constituents.map((item) =>
+        item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
+      ),
+    ).toEqual(["first original", "second original"])
+    const visibleParts = sent.parts.filter(
+      (part): part is Extract<SessionV1.Part, { type: "text" }> =>
+        part.type === "text" && !part.synthetic && !part.ignored,
+    )
+    expect(visibleParts.filter((part) => part.metadata?.source).map((part) => part.metadata?.source)).toEqual([
+      "typed-a",
+      "typed-b",
+    ])
+    yield* queue.consume(session.id)
+    const message = (yield* MessageV2.stream(session.id)).find((item) => metadata(item)?.kind === "human")
+    if (!message) throw new Error("the enhanced human message was not persisted")
+    expect(text(message)).toContain("ENHANCED HUMAN INSTRUCTIONS")
+    expect(metadata(message)?.constituents.map((item) => item.id)).toEqual([first.id, second.id])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "enhance-human-b"))).toMatchObject({
+      state: "merged",
+      into: "enhance-human-a",
+      messageID: sent.messageID,
+    })
+  }),
+)
+
+it.instance("enhanced human carrier survives a later consolidation and forced promotion", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const composer = (requestID: string, value: string) =>
+      queue.admit({
+        sessionID: session.id,
+        requestID,
+        delivery: "queue",
+        origin: "tui-composer",
+        parts: [{ type: "text", text: value }],
+      })
+    const first = yield* composer("enhance-force-a", "first original")
+    const second = yield* composer("enhance-force-b", "second original")
+    const initial = yield* queue.consolidateSelected(session.id, second.id)
+    const initialCarrier = initial.items.find((item) => item.id === first.id)
+    if (!initialCarrier) throw new Error("initial human carrier was missing")
+    const draft = initialCarrier.input.parts
+      .flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : []))
+      .join("")
+    expect(
+      (yield* queue.rewrite({
+        sessionID: session.id,
+        itemID: initialCarrier.id,
+        expectedText: draft,
+        text: "ENHANCED HUMAN INSTRUCTIONS",
+      })).outcome,
+    ).toBe("rewritten")
+    const third = yield* composer("enhance-force-c", "third original")
+    const repeated = yield* queue.consolidateSelected(session.id, third.id)
+    const carrier = repeated.items.find((item) => item.id === first.id)
+    if (!carrier) throw new Error("re-consolidation lost the enhanced carrier")
+    const visible = carrier.input.parts.flatMap((part) =>
+      part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [],
+    )
+    expect(visible.join("")).toBe("ENHANCED HUMAN INSTRUCTIONS\nthird original")
+
+    yield* queue.hold(session.id, "enhance-force-review")
+    expect(yield* queue.force({ sessionID: session.id, itemID: carrier.id, holder: "enhance-force-review" })).toBe(
+      "forced",
+    )
+    const promoted: SessionQueue.PromotedInput[] = []
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "steer",
+      prepare: (input) => Effect.sync(() => promoted.push(input)).pipe(Effect.andThen(prepare(input))),
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+    const sent = promoted[0]
+    if (!sent?.group) throw new Error("forced re-consolidation lost its human group")
+    expect(
+      sent.parts
+        .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
+        .join(""),
+    ).toBe("ENHANCED HUMAN INSTRUCTIONS\nthird original")
+    expect(sent.group.constituents.map((item) => item.id)).toEqual([first.id, second.id, third.id])
+    yield* queue.consume(session.id)
+    const message = (yield* MessageV2.stream(session.id)).find((item) => metadata(item)?.kind === "human")
+    if (!message) throw new Error("the forced enhanced human message was not persisted")
+    expect(text(message)).toContain("ENHANCED HUMAN INSTRUCTIONS\nthird original")
+    expect(metadata(message)?.constituents.map((item) => item.id)).toEqual([first.id, second.id, third.id])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "enhance-force-b"))).toMatchObject({
+      state: "merged",
+      into: "enhance-force-a",
+      messageID: sent.messageID,
+    })
+  }),
+)
+
 it.instance(
   "same automation type delivers once with newest repeated check and every distinct task plus original metadata",
   () =>
@@ -496,6 +642,65 @@ it.instance(
       expect(metadata(message).constituents[0].input.parts[0]).toEqual({ type: "text", text: inputs[0] })
       expect(yield* queue.list(session.id)).toHaveLength(1)
     }),
+)
+
+it.instance("enhanced retained automation carrier reaches grouped delivery", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const envelope = check("enhanced", "pending decision")
+    const first = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "enhanced-check-a",
+      messageID: MessageID.ascending(),
+      delivery: "queue",
+      parts: [{ type: "text", text: envelope }],
+    })
+    const second = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "enhanced-check-b",
+      messageID: MessageID.ascending(),
+      delivery: "queue",
+      parts: [{ type: "text", text: envelope }],
+    })
+    const [carrier] = yield* queue.list(session.id)
+    if (!carrier || (yield* queue.list(session.id)).length !== 1)
+      throw new Error("identical watcher checks did not retain a grouped carrier")
+    const draft = carrier.input.parts
+      .flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : []))
+      .join("")
+    const enhanced = `${draft}\n\nENHANCED AUTOMATION SUFFIX`
+    expect(
+      (yield* queue.rewrite({
+        sessionID: session.id,
+        itemID: carrier.id,
+        expectedText: draft,
+        text: enhanced,
+      })).outcome,
+    ).toBe("rewritten")
+
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "queue",
+      prepare,
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+    const message = (yield* MessageV2.stream(session.id))[0]
+    if (!message) throw new Error("the enhanced automation message was not delivered")
+    expect(text(message)).toContain("ENHANCED AUTOMATION SUFFIX")
+    const group = metadata(message)
+    expect(group.kind).toBe("watcher.check")
+    expect(group.constituents.map((item) => item.id)).toEqual([first.id, second.id].toSorted())
+    expect(
+      group.constituents.map((item) =>
+        item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
+      ),
+    ).toEqual([envelope, envelope])
+    yield* queue.consume(session.id)
+    expect(yield* queue.list(session.id)).toEqual([])
+  }),
 )
 
 it.instance("concurrent peer arrival stays pending and withdrawal invalidates complete prepared group", () =>

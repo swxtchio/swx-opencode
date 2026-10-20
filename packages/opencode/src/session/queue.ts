@@ -41,6 +41,7 @@ import { MessageID, PartID, SessionID } from "./schema"
 type DatabaseService = Database.Interface["db"]
 type DatabaseTransaction = Parameters<Parameters<DatabaseService["transaction"]>[0]>[0]
 type DatabaseAccess = DatabaseService | DatabaseTransaction
+const QueueRewriteMetadataKey = "sessionQueueRewriteText"
 
 // Direct noReply writes need their own original before preparation can ever run again.
 const NoReplyOriginal = Schema.Struct({
@@ -755,6 +756,8 @@ const layer = Layer.effect(
       const now = Date.now()
       if (input.parts.some((part) => part.type === "text" && part.metadata?.sessionQueuePendingOriginal))
         return yield* Effect.die(new Error("Pending peer custody metadata is queue-owned"))
+      if (input.parts.some((part) => part.type === "text" && part.metadata?.[QueueRewriteMetadataKey] === true))
+        return yield* Effect.die(new Error("Queue rewrite metadata is queue-owned"))
       yield* assertNotPreparing(input.sessionID, input.messageID)
       const callerScope = Option.getOrUndefined(yield* Effect.serviceOption(Scope.Scope))
       const result = yield* writable(input.sessionID, (tx) =>
@@ -1982,9 +1985,7 @@ const layer = Layer.effect(
               if (row.time_preparing !== null) return { outcome: "preparing" as const, finished: [] }
 
               const currentInput = decodeInput(row.input)
-              const currentText = currentInput.parts
-                .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
-                .join("")
+              const currentText = editableText(currentInput)
               if (currentText !== input.expectedText) return { outcome: "stale" as const, finished: [] }
               const replacement = rewriteInputText(currentInput, input.text)
               if (replacement.outcome !== "rewritten") return { outcome: replacement.outcome, finished: [] }
@@ -3492,10 +3493,18 @@ function grouped(
       })
   if (!kind) {
     const parts = humanBatch
-      ? items.flatMap((item, index) => [
-          ...(index ? [{ type: "text" as const, text: "\n" }] : []),
-          ...item.input.parts.filter((part) => !pendingOriginal(part)),
-        ])
+      ? rows
+          .flatMap((row) => {
+            const input = decodeInput(row.input)
+            const originals = originalsOf(row)
+            if (queueTextRewritten(input)) return [{ id: originals[0]?.id ?? row.id, input }]
+            return originals.map((original) => ({ id: original.id, input: original.input }))
+          })
+          .toSorted(compareAdmissionIdentity)
+          .flatMap((item, index) => [
+            ...(index ? [{ type: "text" as const, text: "\n" }] : []),
+            ...item.input.parts.filter((part) => !pendingOriginal(part)),
+          ])
       : decodeInput(rows[0].input).parts.filter((part) => !pendingOriginal(part))
     const firstText = parts.findIndex((part) => part.type === "text" && !part.synthetic && !part.ignored)
     if (firstText !== -1) {
@@ -3520,13 +3529,45 @@ function grouped(
     const machine = dispatch(item.input, item.delivery, markers)
     if (machine?.kind === "automation" && machine.episode) latest.set(machine.episode, item.id)
   })
-  const shown =
+  const rewrittenCarriers = rows.flatMap((row) => {
+    const input = decodeInput(row.input)
+    if (!queueTextRewritten(input)) return []
+    const originals = originalsOf(row)
+    const representative = originals.at(-1)
+    return representative ? [{ row, input, originals, representative: representative.id }] : []
+  })
+  const rewrittenOriginals = new Map(
+    rewrittenCarriers.flatMap((carrier) => carrier.originals.map((original) => [original.id, carrier] as const)),
+  )
+  const shown = (
     kind.kind === "peer"
       ? items
       : items.filter((item) => {
           const machine = dispatch(item.input)
           return machine?.kind !== "automation" || !machine.episode || latest.get(machine.episode) === item.id
         })
+  ).flatMap((item) => {
+    const rewritten = rewrittenOriginals.get(item.id)
+    if (rewritten) {
+      if (item.id !== rewritten.representative) return []
+      return [
+        {
+          id: rewritten.row.id,
+          time: rewritten.row.time_created,
+          text: editableText(rewritten.input),
+          files: rewritten.input.parts.filter((part) => part.type === "file"),
+        },
+      ]
+    }
+    return [
+      {
+        id: item.id,
+        time: item.time.created,
+        text: item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
+        files: item.input.parts.filter((part) => part.type === "file"),
+      },
+    ]
+  })
   const heading =
     kind.kind === "peer"
       ? "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation."
@@ -3545,13 +3586,13 @@ function grouped(
           shown
             .map(
               (item, index) =>
-                `${index + 1}. [Admitted ${new Date(item.time.created).toISOString()}; queue ${item.id}]\n${item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")}`,
+                `${index + 1}. [Admitted ${new Date(item.time).toISOString()}; queue ${item.id}]\n${item.text}`,
             )
             .join("\n\n"),
         metadata: { sessionQueue: Schema.encodeSync(SessionPromptQueue.Group)(group) },
       },
       ...shown.flatMap((item, index) => {
-        const files = item.input.parts.filter((part) => part.type === "file")
+        const files = item.files
         return files.length
           ? [
               { type: "text" as const, synthetic: true, text: `Files for numbered peer ${index + 1} (${item.id}):` },
@@ -3593,7 +3634,11 @@ function rewriteInputText(input: SessionPromptQueue.QueuedInput, text: string) {
       ...input,
       parts: input.parts.map((part, index) => {
         if (part.type === "text" && !part.synthetic && !part.ignored)
-          return { ...part, text: index === firstText ? text : "" }
+          return {
+            ...part,
+            text: index === firstText ? text : "",
+            ...(index === firstText ? { metadata: { ...part.metadata, [QueueRewriteMetadataKey]: true } } : {}),
+          }
         if (part.type === "file" && part.source?.text) {
           const start = text.indexOf(part.source.text.value)
           return {
@@ -3612,6 +3657,16 @@ function rewriteInputText(input: SessionPromptQueue.QueuedInput, text: string) {
       }),
     },
   }
+}
+
+function editableText(input: SessionPromptQueue.QueuedInput) {
+  return input.parts
+    .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
+    .join("")
+}
+
+function queueTextRewritten(input: SessionPromptQueue.QueuedInput) {
+  return input.parts.some((part) => part.type === "text" && part.metadata?.[QueueRewriteMetadataKey] === true)
 }
 
 function toReceipt(row: typeof SessionPromptReceiptTable.$inferSelect): Receipt {
