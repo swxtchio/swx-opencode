@@ -4080,6 +4080,135 @@ it.instance(
 )
 
 it.instance(
+  "a threshold-crossing tool turn recovers after provider overflow before idle",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const file = path.join(instance.directory, "threshold-overflow-tool-result.txt")
+      yield* writeText(file, "threshold overflow tool result")
+      const { llm } = yield* useServerConfig((url) => {
+        const base = providerCfg(url)
+        return {
+          ...base,
+          compaction: { auto: true, threshold_percent: 95 },
+          provider: {
+            ...base.provider,
+            test: {
+              ...base.provider.test,
+              models: {
+                ...base.provider.test.models,
+                "test-model": {
+                  ...base.provider.test.models["test-model"],
+                  limit: { context: 100_000, output: 1_000 },
+                },
+              },
+            },
+          },
+        }
+      })
+      const provider = yield* ProviderSvc.Service
+      const model = yield* provider.getModel(ref.providerID, ref.modelID)
+      expect(model.limit.context).toBe(100_000)
+      expect(model.limit.output).toBe(1_000)
+
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const status = yield* SessionStatus.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({
+        title: "Threshold then provider overflow",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const overflowGate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(overflowGate, undefined).pipe(Effect.ignore))
+      const errors: string[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = Schema.decodeUnknownSync(Session.Event.Error.data)(event.data)
+        if (data.sessionID !== chat.id || !data.error) return Effect.void
+        return Effect.sync(() => errors.push(JSON.stringify(data.error)))
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      yield* llm.push(
+        reply().tool("read", { filePath: file }).usage({ input: 90_000, output: 100 }),
+        reply().tool("read", { filePath: file }).usage({ input: 95_000, output: 100 }),
+      )
+      yield* llm.error(
+        413,
+        {
+          error: { message: "Your input exceeds the context window of this model. Please reduce the length and retry." },
+        },
+        deferredAsPromise(overflowGate),
+      )
+      yield* llm.text("Recovered capacity summary")
+      yield* llm.text("Continued after provider overflow")
+      yield* llm.text("Follow-up succeeded")
+
+      const root = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: said("read the threshold overflow fixture twice, then finish the task"),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(3), "provider overflow request did not start", "10 seconds")
+
+      const beforeOverflow = yield* sessions.messages({ sessionID: chat.id })
+      const usage = beforeOverflow.flatMap((message) =>
+        message.info.role === "assistant" && message.info.tokens.total !== undefined
+          ? [message.info.tokens.total]
+          : [],
+      )
+      const tools = beforeOverflow
+        .flatMap((message) => message.parts)
+        .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "read")
+      expect(usage.some((total) => total < 95_000)).toBe(true)
+      expect(usage.some((total) => total >= 95_000 && total < 99_000)).toBe(true)
+      expect(tools.map((part) => part.state.status)).toEqual(["completed", "completed"])
+      expect(beforeOverflow.some((message) => message.parts.some((part) => part.type === "compaction"))).toBe(false)
+      expect((yield* status.get(chat.id)).type).toBe("busy")
+
+      yield* Deferred.succeed(overflowGate, undefined)
+      yield* awaitWithTimeout(llm.wait(4), "overflow compaction summary did not start", "10 seconds")
+      const afterOverflow = yield* sessions.messages({ sessionID: chat.id })
+      const compaction = afterOverflow
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      expect(compaction).toMatchObject({ type: "compaction", auto: true, overflow: true, resume: true })
+      expect(errors.join("\n")).toContain("ContextOverflowError")
+      expect(errors.join("\n")).toContain("Your input exceeds the context window")
+
+      yield* awaitWithTimeout(llm.wait(5), "owed continuation did not resume after overflow compaction", "10 seconds")
+      const requests = yield* llm.inputs
+      expect(JSON.stringify(requests[1]?.messages)).toContain("threshold overflow tool result")
+      expect(JSON.stringify(requests[2]?.messages)).toContain("threshold overflow tool result")
+      expect(lastUserContent(requests[4])).toContain("Continue if you have next steps")
+
+      const [result] = yield* finish(root)
+      expect(result.info.role).toBe("assistant")
+      expect(
+        result.parts.some((part) => part.type === "text" && part.text === "Continued after provider overflow"),
+      ).toBe(true)
+      expect((yield* status.get(chat.id)).type).toBe("idle")
+
+      const followup = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: said("follow up after provider overflow recovery"),
+      })
+      expect(followup.parts.some((part) => part.type === "text" && part.text === "Follow-up succeeded")).toBe(true)
+      expect(yield* queue.list(chat.id)).toEqual([])
+      expect((yield* status.get(chat.id)).type).toBe("idle")
+      expect(yield* llm.calls).toBe(6)
+    }),
+  30_000,
+)
+
+it.instance(
   "terminal capacity compaction waits for idle and delivers the queued prompt without inventing continuation",
   () =>
     Effect.gen(function* () {
