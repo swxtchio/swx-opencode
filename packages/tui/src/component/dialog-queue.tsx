@@ -58,6 +58,24 @@ export function DialogQueue(props: { sessionID: string; enhancement?: PromptEnha
       failed("resume delivery of"),
     )
 
+  // A stale renewal can commit on the server after force releases the lease;
+  // reconcile against the current server state instead of dropping its effect.
+  const reconcile = (version: number) =>
+    checked(sdk.client.session.queue.holdStatus({ sessionID: props.sessionID, holder }, { signal: signal() }))
+      .then((result) => {
+        if (closed || version !== holdVersion) return
+        const data = result.data
+        if (!data) {
+          setHold("failed")
+          return
+        }
+        sync.queue.listed(props.sessionID, data.items)
+        setHold(data.held ? "held" : "failed")
+      })
+      .catch(() => {
+        if (!closed && version === holdVersion) setHold("failed")
+      })
+
   // A close releases at once, and again as each hold request still in flight
   // settles, so no slow response delays the release and a hold the server
   // accepts after the close never outlives it.
@@ -66,15 +84,27 @@ export function DialogQueue(props: { sessionID: string; enhancement?: PromptEnha
     void sdk.client.session.queue
       .hold({ sessionID: props.sessionID, holder }, { signal: signal() })
       .then((result) => {
-        if (closed || version !== holdVersion) return
+        if (closed) return
+        if (version !== holdVersion) {
+          if (renewal) void reconcile(++holdVersion)
+          return
+        }
         return checked(Promise.resolve(result)).then((checkedResult) => {
-          if (closed || version !== holdVersion) return
+          if (closed) return
+          if (version !== holdVersion) {
+            if (renewal) void reconcile(++holdVersion)
+            return
+          }
           setHold("held")
           if (checkedResult.data) sync.queue.listed(props.sessionID, checkedResult.data)
         })
       })
       .catch((error) => {
-        if (closed || version !== holdVersion) return
+        if (closed) return
+        if (version !== holdVersion) {
+          if (renewal) void reconcile(++holdVersion)
+          return
+        }
         setHold("failed")
         failed(renewal ? "keep pausing delivery of" : "pause delivery of")(error)
       })
@@ -251,25 +281,9 @@ export function DialogQueue(props: { sessionID: string; enhancement?: PromptEnha
                     return
                   }
                   const reconciliation = ++holdVersion
-                  void checked(
-                    sdk.client.session.queue.holdStatus({ sessionID: props.sessionID, holder }, { signal: signal() }),
-                  )
-                    .then((result) => {
-                      if (closed || reconciliation !== holdVersion) return
-                      const data = result.data
-                      if (!data) {
-                        setHold("failed")
-                        return
-                      }
-                      sync.queue.listed(props.sessionID, data.items)
-                      setHold(data.held ? "held" : "failed")
-                    })
-                    .catch(() => {
-                      if (!closed && reconciliation === holdVersion) setHold("failed")
-                    })
-                    .finally(() => {
-                      if (!closed) failed("force")(error)
-                    })
+                  void reconcile(reconciliation).finally(() => {
+                    if (!closed) failed("force")(error)
+                  })
                 })
             },
           },

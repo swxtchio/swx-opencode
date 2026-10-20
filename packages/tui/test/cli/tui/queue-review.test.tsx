@@ -327,29 +327,30 @@ test("every route that closes the view releases its hold", async () => {
 
 test("five minutes without activity close the view and release its hold; activity restarts that interval", async () => {
   const view = await setup([steer, queued])
-  // Fake timers stop Bun.sleep, so this waits on the event loop's own turns.
-  const settle = async (done: () => boolean) => {
-    for (let turn = 0; turn < 1000 && !done(); turn++) await new Promise<void>((resolve) => queueMicrotask(resolve))
-    expect(done()).toBe(true)
-  }
   // Opened as the row opens it, since a mouse click waits on timers too.
+  await view.frame()
   jest.useFakeTimers()
   DialogQueue.show(view.dialog, sessionID)
-  await settle(() => view.queued("hold").length === 1)
+  await view.frame()
+  await settle(() => view.queued("hold").length === 1, "initial hold")
+  await settle(async () => (await view.frame()).includes("(delivery paused)"), "initial hold confirmation")
 
   jest.advanceTimersByTime(REVIEW_IDLE_MS - 60_000)
   expect(view.dialog.stack.length).toBe(1)
   // Any key four minutes in, not only one that moves the selection, renews the
   // server's hold and restarts the interval.
   view.app.mockInput.pressKey("x")
-  await settle(() => view.queued("hold").length === 2)
+  await settle(() => view.queued("hold").length === 2, "renewal after activity")
+  await settle(async () => (await view.frame()).includes("(delivery paused)"), "renewal confirmation")
   jest.advanceTimersByTime(REVIEW_IDLE_MS - 1)
   expect(view.dialog.stack.length).toBe(1)
   expect(view.queued("release")).toEqual([])
 
   jest.advanceTimersByTime(1)
-  await settle(() => view.queued("release").length === 1)
-  expect(view.dialog.stack.length).toBe(0)
+  await settle(async () => {
+    await view.frame()
+    return view.dialog.stack.length === 0 && view.queued("release").length === 1
+  }, "view closure and hold release after inactivity")
 })
 
 test("delete removes the selected pending prompt", async () => {
@@ -620,16 +621,20 @@ test("a failed force response refreshes the released hold and current queue", as
   expect(view.dialog.stack.length).toBe(1)
 })
 
-test("a late pre-force hold renewal cannot overwrite the reconciled hold state", async () => {
+test("a late pre-force renewal reconciles to the server hold state after force", async () => {
   const renewal = later()
   const forceReply = later()
   const forced = { ...queued, delivery: "steer" as const }
   const served = { holdPosts: 0, renewalStarted: false, statusReads: 0, statusHeld: undefined as boolean | undefined }
+  let serverHeld = true
   const view = await setup([steer, queued], (path) => {
-    if (path.endsWith(`/queue/force/${queued.id}`)) return forceReply.response
+    if (path.endsWith(`/queue/force/${queued.id}`)) {
+      serverHeld = false
+      return forceReply.response
+    }
     if (path.includes("/queue/hold/")) {
       served.statusReads++
-      const response = json({ held: false, items: [steer, forced] })
+      const response = json({ held: serverHeld, items: [steer, forced] })
       const read = response.json.bind(response)
       response.json = async () => {
         const body = await read()
@@ -682,12 +687,6 @@ test("a late pre-force hold renewal cannot overwrite the reconciled hold state",
     bodyRead = true
     return body
   }
-  renewal.answer(stale)
-  await settle(() => bodyRead)
-  await new Promise<void>((resolve) => queueMicrotask(() => queueMicrotask(resolve)))
-  expect(view.sync.data.session_queue[sessionID]).toEqual([steer, queued])
-  expect(served.statusReads).toBe(0)
-
   forceReply.answer(json({ name: "Unavailable" }, { status: 503 }))
   await settle(
     () =>
@@ -696,6 +695,14 @@ test("a late pre-force hold renewal cannot overwrite the reconciled hold state",
   )
   expect(served.statusHeld).toBe(false)
   expect(await view.frame()).toContain("delivery NOT paused")
+  expect(view.sync.data.session_queue[sessionID]).toEqual([steer, forced])
+
+  // The server accepted the already-dispatched renewal after force released the
+  // lease. Its stale snapshot must prompt a status read, not disappear silently.
+  serverHeld = true
+  renewal.answer(stale)
+  await settle(() => bodyRead && served.statusReads === 2 && served.statusHeld === true)
+  await wait(async () => (await view.frame()).includes("(delivery paused)"))
   expect(view.sync.data.session_queue[sessionID]).toEqual([steer, forced])
 })
 
@@ -874,9 +881,12 @@ function later() {
 }
 
 // Fake timers stop Bun.sleep, so these wait on the event loop's own turns.
-async function settle(done: () => boolean) {
-  for (let turn = 0; turn < 1000 && !done(); turn++) await new Promise<void>((resolve) => queueMicrotask(resolve))
-  expect(done()).toBe(true)
+async function settle(done: () => boolean | Promise<boolean>, what = "condition") {
+  for (let turn = 0; turn < 1000; turn++) {
+    if (await done()) return
+    await new Promise<void>((resolve) => queueMicrotask(resolve))
+  }
+  throw new Error(`timed out waiting for ${what}`)
 }
 
 test("the view says delivery is paused, and allows edits, only once the server confirms the hold", async () => {
@@ -965,17 +975,23 @@ test("a close with a renewal outstanding releases at once, and again when the re
   const view = await setup([steer], (path) =>
     path.endsWith("/queue/hold") && holds++ === 1 ? renewal.response : undefined,
   )
+  await view.frame()
   jest.useFakeTimers()
   DialogQueue.show(view.dialog, sessionID)
-  await settle(() => view.queued("hold").length === 1)
+  await view.frame()
+  await settle(() => view.queued("hold").length === 1, "initial hold")
+  await settle(async () => (await view.frame()).includes("(delivery paused)"), "initial hold confirmation")
   jest.advanceTimersByTime(60_000)
   view.app.mockInput.pressKey("x")
-  await settle(() => view.queued("hold").length === 2)
+  await settle(() => view.queued("hold").length === 2, "renewal after activity")
 
   view.app.mockInput.pressEscape()
-  await settle(() => view.queued("release").length === 1)
+  await settle(async () => {
+    await view.frame()
+    return view.dialog.stack.length === 0 && view.queued("release").length === 1
+  }, "immediate release when closing during renewal")
   renewal.answer(json([steer]))
-  await settle(() => view.queued("release").length === 2)
+  await settle(() => view.queued("release").length === 2, "release again when the renewal arrives")
 })
 
 test("scrolling the review with the mouse wheel restarts the inactivity interval", async () => {
