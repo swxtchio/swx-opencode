@@ -4934,6 +4934,101 @@ it.instance(
 )
 
 it.instance(
+  "SessionPrompt.cancel aborts a progressing provider request and settles the drain",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const provider = yield* ProviderSvc.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const session = yield* sessions.create({ title: "Cancel progressing provider request" })
+      const responseRelease = defer<void>()
+      const fetchAbort = defer<void>()
+      const fetchProgress = defer<void>()
+      yield* llm.push(
+        raw({
+          head: [
+            { id: "chatcmpl-progress", object: "chat.completion.chunk", choices: [{ delta: { role: "assistant" } }] },
+            {
+              id: "chatcmpl-progress",
+              object: "chat.completion.chunk",
+              choices: [{ delta: { content: "provider progress before interrupt" } }],
+            },
+          ],
+          wait: responseRelease.promise,
+        }),
+      )
+      const configured = yield* provider.getProvider(ref.providerID)
+      configured.options.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        init?.signal?.addEventListener("abort", () => fetchAbort.resolve(), { once: true })
+        const response = await fetch(input, init)
+        if (!response.body) return response
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let responseText = ""
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            async pull(controller) {
+              const part = await reader.read()
+              if (part.done) {
+                controller.close()
+                return
+              }
+              responseText += decoder.decode(part.value, { stream: true })
+              if (responseText.includes("provider progress before interrupt")) fetchProgress.resolve()
+              controller.enqueue(part.value)
+            },
+            async cancel(reason) {
+              await reader.cancel(reason)
+            },
+          }),
+          { headers: new Headers(response.headers), status: response.status, statusText: response.statusText },
+        )
+      }
+
+      const run = yield* prompt
+        .prompt({
+          sessionID: session.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "Hold this request after its first delta" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() => Effect.sync(() => responseRelease.resolve()))
+      yield* awaitWithTimeout(llm.wait(1), "provider request was not accepted", "10 seconds")
+      yield* waitForBusy(session.id)
+      yield* awaitWithTimeout(
+        Effect.promise(() => fetchProgress.promise),
+        "provider response did not make progress",
+        "2 seconds",
+      )
+      const cancellation = yield* prompt.cancel(session.id).pipe(Effect.forkChild)
+      const cancelExit = yield* awaitWithTimeout(
+        Fiber.await(cancellation),
+        "prompt cancellation did not finish",
+        "2 seconds",
+      )
+      const runExit = yield* awaitWithTimeout(Fiber.await(run), "cancelled prompt did not settle", "2 seconds")
+      yield* awaitWithTimeout(
+        Effect.promise(() => fetchAbort.promise),
+        "provider fetch signal was not aborted",
+        "2 seconds",
+      )
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const assistant = messages.findLast((message) => message.info.role === "assistant")
+
+      expect(Exit.isSuccess(cancelExit)).toBe(true)
+      expect(Exit.isSuccess(runExit)).toBe(true)
+      expect((yield* status.get(session.id)).type).toBe("idle")
+      expect(assistant?.info.role).toBe("assistant")
+      if (assistant?.info.role === "assistant") expect(assistant.info.error?.name).toBe("MessageAbortedError")
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
   "cancels a held drain during a subtask tool step through runner cancellation",
   () =>
     Effect.gen(function* () {
