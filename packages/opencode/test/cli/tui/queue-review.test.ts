@@ -338,7 +338,7 @@ it.live(
 )
 
 it.live(
-  "Ctrl+f forces only the selected composer prompt into the next tool continuation",
+  "Ctrl+f reconciles a lost response and forces only the selected composer prompt into the next tool continuation",
   () => {
     const toolGate = Deferred.makeUnsafe<void>()
     const continuationGate = Deferred.makeUnsafe<void>()
@@ -406,7 +406,9 @@ it.live(
       yield* tui.open
       yield* tui.screen("(delivery paused)", "the review view")
       tui.renderer.mockInput.pressArrow("down")
+      tui.loseNextForceResponse()
       tui.renderer.mockInput.pressKey("f", { ctrl: true })
+      yield* tui.screen("Could not force the queued prompts", "the lost force response")
       const forced = yield* pollWithTimeout(
         tui.rows.pipe(
           Effect.map((rows) => {
@@ -421,8 +423,14 @@ it.live(
       expect(forced.map((row) => row?.time_promoted)).toEqual([null, null])
       yield* pollWithTimeout(
         tui.frame.pipe(Effect.map((screen) => (screen.includes("(delivery paused)") ? undefined : screen))),
-        "successful force did not close its review hold",
+        "lost force response left the review showing its released hold",
       )
+      yield* tui.screen("(delivery NOT paused)", "the reconciled review hold state")
+      expect(
+        tui.queueRequests.some(
+          (request) => request.method === "GET" && request.path.includes(`/session/${tui.sessionID}/queue/hold/`),
+        ),
+      ).toBe(true)
 
       yield* Deferred.succeed(toolGate, undefined)
       const continuation = yield* pollWithTimeout(
@@ -446,73 +454,17 @@ it.live(
 
       yield* Deferred.succeed(continuationGate, undefined)
       yield* tui.idle
+      const selectedRequest = selected.request_id
+      if (!selectedRequest) throw new Error("the selected composer request lost its receipt identity")
+      const selectedReceipt = yield* Effect.promise(() =>
+        tui.sdk.session.queue.receipt({ sessionID: tui.sessionID, requestID: selectedRequest }),
+      )
+      expect(selectedReceipt.data?.state).toBe("delivered")
     }).pipe(
       Effect.ensuring(Deferred.succeed(toolGate, undefined)),
       Effect.ensuring(Deferred.succeed(continuationGate, undefined)),
       Effect.provide(TestLLMServer.layer),
     )
-  },
-  60_000,
-)
-
-it.live(
-  "Ctrl+f reconciles a lost success response with the server's review hold",
-  () => {
-    const gate = Deferred.makeUnsafe<void>()
-    return Effect.gen(function* () {
-      const llm = yield* TestLLMServer
-      yield* llm.hold("initial turn done", Effect.runPromise(Deferred.await(gate)))
-      yield* llm.text("forced prompt answered")
-      const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
-      const tui = yield* boot({ directory })
-
-      yield* tui.prompt("start the active turn")
-      yield* pollWithTimeout(
-        lastUsers(llm).pipe(Effect.map((users) => (users.includes("start the active turn") ? true : undefined))),
-        "the initial provider request never started",
-      )
-      yield* tui.compose("selected after response loss")
-      const [selected] = yield* pollWithTimeout(
-        tui.rows.pipe(
-          Effect.map((rows) => {
-            const pending = rows.filter((row) => row.time_promoted === null && row.time_withdrawn === null)
-            return pending.length === 1 && pending[0]?.time_preparing === null ? pending : undefined
-          }),
-        ),
-        "the force-reconciliation prompt never became ready",
-      )
-      if (!selected) throw new Error("the selected prompt was missing")
-
-      yield* tui.open
-      yield* tui.screen("(delivery paused)", "the review view")
-      tui.loseNextForceResponse()
-      tui.renderer.mockInput.pressKey("f", { ctrl: true })
-      yield* tui.screen("Could not force the queued prompts", "the lost force response")
-      const committed = yield* pollWithTimeout(
-        tui.rows.pipe(
-          Effect.map((rows) => {
-            const row = rows.find((item) => item.id === selected.id)
-            return row?.delivery === "steer" && row.time_promoted === null ? row : undefined
-          }),
-        ),
-        "the force operation did not commit before its response was lost",
-      )
-      expect(committed.id).toBe(selected.id)
-      yield* tui.screen("(delivery NOT paused)", "the reconciled review hold state")
-      expect(
-        tui.queueRequests.some(
-          (request) => request.method === "GET" && request.path.includes(`/session/${tui.sessionID}/queue/hold/`),
-        ),
-      ).toBe(true)
-
-      yield* Deferred.succeed(gate, undefined)
-      yield* pollWithTimeout(
-        lastUsers(llm).pipe(Effect.map((users) => (users.includes("selected after response loss") ? true : undefined))),
-        "the server-committed force never reached the provider",
-      )
-      yield* tui.idle
-      expect(texts(yield* tui.rows)).toEqual([])
-    }).pipe(Effect.ensuring(Deferred.succeed(gate, undefined)), Effect.provide(TestLLMServer.layer))
   },
   60_000,
 )

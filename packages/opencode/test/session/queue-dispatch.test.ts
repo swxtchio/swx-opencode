@@ -509,6 +509,11 @@ it.instance("enhanced selected human carrier reaches normal delivery with its or
         item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
       ),
     ).toEqual(["first original", "second original"])
+    expect(
+      sent.group.constituents.map((item) =>
+        item.input.parts.flatMap((part) => (part.type === "text" ? [part.metadata?.source] : [])),
+      ),
+    ).toEqual([["typed-a"], ["typed-b"]])
     const visibleParts = sent.parts.filter(
       (part): part is Extract<SessionV1.Part, { type: "text" }> =>
         part.type === "text" && !part.synthetic && !part.ignored,
@@ -527,6 +532,10 @@ it.instance("enhanced selected human carrier reaches normal delivery with its or
       into: "enhance-human-a",
       messageID: sent.messageID,
     })
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "enhance-human-a"))).toMatchObject({
+      state: "delivered",
+      messageID: sent.messageID,
+    })
   }),
 )
 
@@ -541,7 +550,7 @@ it.instance("enhanced human carrier survives a later consolidation and forced pr
         requestID,
         delivery: "queue",
         origin: "tui-composer",
-        parts: [{ type: "text", text: value }],
+        parts: [{ type: "text", text: value, metadata: { source: requestID } }],
       })
     const first = yield* composer("enhance-force-a", "first original")
     const second = yield* composer("enhance-force-b", "second original")
@@ -588,12 +597,26 @@ it.instance("enhanced human carrier survives a later consolidation and forced pr
         .join(""),
     ).toBe("ENHANCED HUMAN INSTRUCTIONS\nthird original")
     expect(sent.group.constituents.map((item) => item.id)).toEqual([first.id, second.id, third.id])
+    expect(
+      sent.group.constituents.map((item) =>
+        item.input.parts.flatMap((part) => (part.type === "text" ? [part.metadata?.source] : [])),
+      ),
+    ).toEqual([["enhance-force-a"], ["enhance-force-b"], ["enhance-force-c"]])
     yield* queue.consume(session.id)
     const message = (yield* MessageV2.stream(session.id)).find((item) => metadata(item)?.kind === "human")
     if (!message) throw new Error("the forced enhanced human message was not persisted")
     expect(text(message)).toContain("ENHANCED HUMAN INSTRUCTIONS\nthird original")
     expect(metadata(message)?.constituents.map((item) => item.id)).toEqual([first.id, second.id, third.id])
     expect(Option.getOrThrow(yield* queue.receipt(session.id, "enhance-force-b"))).toMatchObject({
+      state: "merged",
+      into: "enhance-force-a",
+      messageID: sent.messageID,
+    })
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "enhance-force-a"))).toMatchObject({
+      state: "delivered",
+      messageID: sent.messageID,
+    })
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "enhance-force-c"))).toMatchObject({
       state: "merged",
       into: "enhance-force-a",
       messageID: sent.messageID,
@@ -655,14 +678,14 @@ it.instance("enhanced retained automation carrier reaches grouped delivery", () 
       requestID: "enhanced-check-a",
       messageID: MessageID.ascending(),
       delivery: "queue",
-      parts: [{ type: "text", text: envelope }],
+      parts: [{ type: "text", text: envelope, metadata: { source: "watcher-check" } }],
     })
     const second = yield* queue.admit({
       sessionID: session.id,
       requestID: "enhanced-check-b",
       messageID: MessageID.ascending(),
       delivery: "queue",
-      parts: [{ type: "text", text: envelope }],
+      parts: [{ type: "text", text: envelope, metadata: { source: "watcher-check" } }],
     })
     const [carrier] = yield* queue.list(session.id)
     if (!carrier || (yield* queue.list(session.id)).length !== 1)
@@ -698,8 +721,22 @@ it.instance("enhanced retained automation carrier reaches grouped delivery", () 
         item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
       ),
     ).toEqual([envelope, envelope])
+    expect(
+      group.constituents.map((item) =>
+        item.input.parts.flatMap((part) => (part.type === "text" ? [part.metadata?.source] : [])),
+      ),
+    ).toEqual([["watcher-check"], ["watcher-check"]])
     yield* queue.consume(session.id)
     expect(yield* queue.list(session.id)).toEqual([])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "enhanced-check-a"))).toMatchObject({
+      state: "merged",
+      into: "enhanced-check-b",
+      messageID: message.info.id,
+    })
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "enhanced-check-b"))).toMatchObject({
+      state: "delivered",
+      messageID: message.info.id,
+    })
   }),
 )
 

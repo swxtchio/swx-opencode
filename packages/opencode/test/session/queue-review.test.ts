@@ -2736,11 +2736,21 @@ it.instance(
       if (!message?.group) throw new Error("the forced human carrier lost its group")
       expect(message.group.constituents.map((item) => item.id)).toEqual([first.id, second.id])
       expect(
+        message.group.constituents.map((item) =>
+          item.input.parts.flatMap((part) => (part.type === "text" ? [part.metadata?.source] : [])),
+        ),
+      ).toEqual([["alias-human-a"], ["alias-human-b"]])
+      expect(
         message.parts
           .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
           .join(""),
       ).toBe("first aliased instruction\nsecond aliased instruction")
       expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias-human-a")).state).toBe("delivered")
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias-human-b"))).toMatchObject({
+        state: "merged",
+        into: "alias-human-a",
+        messageID: message.messageID,
+      })
     }),
   30_000,
 )
@@ -2795,6 +2805,11 @@ it.instance(
       if (!message?.group) throw new Error("the restored human carrier lost its group")
       expect(message.group.constituents.map((item) => item.id)).toEqual([first.id, middle.id, last.id])
       expect(
+        message.group.constituents.map((item) =>
+          item.input.parts.flatMap((part) => (part.type === "text" ? [part.metadata?.source] : [])),
+        ),
+      ).toEqual([["restore-human-a"], ["restore-human-b"], ["restore-human-c"]])
+      expect(
         message.parts
           .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
           .join(""),
@@ -2804,6 +2819,12 @@ it.instance(
         into: "restore-human-a",
         messageID: message.messageID,
       })
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "restore-human-c"))).toMatchObject({
+        state: "merged",
+        into: "restore-human-a",
+        messageID: message.messageID,
+      })
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "restore-human-a")).state).toBe("delivered")
     }),
   30_000,
 )
