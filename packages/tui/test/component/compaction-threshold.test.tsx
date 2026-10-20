@@ -1,21 +1,23 @@
 import { TextareaRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
+import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Global } from "@opencode-ai/core/global"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { expect, mock, test } from "bun:test"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import { tmpdir } from "../fixture/fixture"
 import { eventSource } from "../fixture/tui-sdk"
 import { createTuiResolvedConfig } from "../fixture/tui-runtime"
 
-test("command-palette compaction threshold reaches the backend config and processor", async () => {
+test("command-palette threshold overrides an existing .opencode value in the backend", async () => {
   await using tmp = await tmpdir()
   const home = tmp.path
   const state = path.join(home, "state")
+  const overlay = path.join(home, ".opencode")
   const llmReplies = [
     { text: "threshold answer", usage: { input: 75_000, output: 100 } },
     { text: "threshold summary" },
@@ -104,6 +106,12 @@ test("command-palette compaction threshold reaches the backend config and proces
     const url = server.url
     await mkdir(state, { recursive: true })
     await Bun.write(path.join(state, "kv.json"), "{}")
+    await mkdir(overlay, { recursive: true })
+    // This later-loaded project overlay must yield to the explicit palette save.
+    await Bun.write(
+      path.join(overlay, "opencode.json"),
+      JSON.stringify({ compaction: { threshold_percent: 80 } }, null, 2),
+    )
 
     const core = await import("@opentui/core")
     await mock.module("@opentui/core", () => ({
@@ -170,7 +178,7 @@ test("command-palette compaction threshold reaches the backend config and proces
     await until(
       () => {
         app!.api.keymap.dispatchCommand("session.compaction.threshold")
-        return app!.setup.captureCharFrame().includes("Current: 95%")
+        return app!.setup.captureCharFrame().includes("Current: 80%")
       },
       "threshold dialog",
       30_000,
@@ -183,6 +191,14 @@ test("command-palette compaction threshold reaches the backend config and proces
     )
 
     await app.stop()
+    app = undefined
+    const config = await client.config.get({}, { throwOnError: true })
+    expect(config.data.compaction?.threshold_percent).toBe(72)
+    const overlayConfig = Schema.decodeUnknownSync(ConfigV1.Info)(
+      await Bun.file(path.join(overlay, "opencode.json")).json(),
+    )
+    expect(overlayConfig.compaction?.threshold_percent).toBe(72)
+
     app = await mount()
     await until(
       () => {
@@ -194,9 +210,6 @@ test("command-palette compaction threshold reaches the backend config and proces
     )
     await app.stop()
     app = undefined
-
-    const config = await client.config.get({}, { throwOnError: true })
-    expect(config.data.compaction?.threshold_percent).toBe(72)
 
     const session = (
       await client.session.create(
