@@ -35,6 +35,7 @@ export function DialogQueue(props: { sessionID: string; enhancement?: PromptEnha
   const [enhancing, setEnhancing] = createSignal(false)
   let closed = false
   let renewed = Date.now()
+  // Ignore responses from holds issued before a newer force reconciliation.
   let holdVersion = 0
   let idle: ReturnType<typeof setTimeout> | undefined
 
