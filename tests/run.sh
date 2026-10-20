@@ -152,10 +152,7 @@ while [ "$index" -lt "\${#args[@]}" ]; do
   esac
   index=$((index + 1))
 done
-if [ "$report_outfile" = "$main_report" ]; then
-  main_invocation=1
-else
-  main_invocation=0
+if [ "$report_outfile" != "$main_report" ]; then
   report_outfile=$(mktemp "$report_dir/report.XXXXXX")
   printf "%s\\n" "$PWD" > "$report_outfile.cwd"
 fi
@@ -178,11 +175,6 @@ status=0
 if [ ! -s "$report_outfile" ]; then
   printf "%s\\n" "tests/run.sh: Bun test invocation produced no JUnit report: $report_outfile" >&2
   if [ "$status" -eq 0 ]; then status=125; fi
-fi
-if [ "$main_invocation" = 1 ] && [ -s "$main_report" ]; then
-  auxiliary_report=$(mktemp "$report_dir/report.XXXXXX")
-  cp -- "$main_report" "$auxiliary_report"
-  printf "%s\\n" "$PWD" > "$auxiliary_report.cwd"
 fi
 exit "$status"
 `
@@ -689,6 +681,8 @@ while [ "$index" -lt "$target_count" ]; do
   index=$((index + 1))
 done
 
+# Per-package JUnit checks record their actual files; the Bun shim records any other
+# test processes launched by preparation or lifecycle scripts. Enforce their union.
 declare -a manifest_paths=()
 index=0
 while [ "$index" -lt "$target_count" ]; do

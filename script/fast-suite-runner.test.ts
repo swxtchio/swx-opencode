@@ -131,6 +131,7 @@ ${directSecondPath}
     mkdirSync(dirname(bunBin), { recursive: true })
     copyFileSync(join(import.meta.dir, "..", "tests", "run.sh"), runner)
     chmodSync(runner, 0o755)
+    const runnerSource = readFileSync(runner, "utf8")
     writeFileSync(
       bunBin,
       `#!/usr/bin/env bash
@@ -671,6 +672,28 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     expect(fastPackageHooks[0]).toBe("pretest")
     expect(fastPackageHooks.slice(1, -1).sort()).toEqual(["selected", "selected-second"])
     expect(fastPackageHooks.at(-1)).toBe("posttest")
+
+    const observedReceiptCode = [
+      "      await Bun.write(",
+      "        process.env.FAST_SUITE_OBSERVED_FILE,",
+      '        JSON.stringify(Array.from(actual, (file) => process.env.FAST_SUITE_PACKAGE_ROOT + "/" + file)),',
+      "      )",
+    ].join("\n")
+    const runnerWithoutObservedReceipt = runnerSource.replace(observedReceiptCode, "      void actual")
+    expect(runnerWithoutObservedReceipt).not.toBe(runnerSource)
+    writeFileSync(runner, runnerWithoutObservedReceipt)
+    expect(Bun.spawnSync(["git", "add", "tests/run.sh"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "remove the JUnit observed receipt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    writeFileSync(marker, "")
+    const missingObservedReceipt = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(missingObservedReceipt.exitCode).toBe(1)
+    expect(
+      missingObservedReceipt.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=execution-set-mismatch exit_code=1"),
+    ).toBe(true)
+    expect(missingObservedReceipt.stderr.toString()).toContain("manifest files absent from all JUnit reports")
+    writeFileSync(runner, runnerSource)
+    expect(Bun.spawnSync(["git", "add", "tests/run.sh"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "restore the JUnit observed receipt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
 
     runOptions.env.FAST_SUITE_EXTRA_PRETEST_TEST = "1"
     writeFileSync(marker, "")
