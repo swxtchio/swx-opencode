@@ -91,6 +91,9 @@ async function mount(
     if (served) return served
     if (url.pathname === `/session/${sessionID}/queue/release`) return new Response(null, { status: 204 })
     if (url.pathname === `/session/${sessionID}/queue/remove`) return json(queue.items[0])
+    if (url.pathname.includes(`/session/${sessionID}/queue/force/`)) return json({ outcome: "forced", items: [] })
+    if (url.pathname.includes(`/session/${sessionID}/queue/consolidate/`))
+      return json({ outcome: "unchanged", items: queue.items })
     if (url.pathname.startsWith(`/session/${sessionID}/queue`)) return json(queue.items)
   })
   const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -178,7 +181,10 @@ async function mount(
     dialog,
     requests,
     frame,
-    queued: (method: string) => requests.filter((request) => request.path.endsWith(`/queue/${method}`)),
+    queued: (method: string) =>
+      requests.filter(
+        (request) => request.path.endsWith(`/queue/${method}`) || request.path.includes(`/queue/${method}/`),
+      ),
     // The server publishes every change to the pending list.
     publish(items: SessionPromptQueueItem[]) {
       queue.items = items
@@ -224,6 +230,10 @@ const queued = item("que_2", "queue", "queued for later", 3)
 const lockedQueue = item("que_locked", "queue", "queued work", 3)
 
 const actionTriggers = [
+  {
+    title: "force",
+    trigger: (view: Awaited<ReturnType<typeof setup>>) => view.app.mockInput.pressKey("f", { ctrl: true }),
+  },
   {
     title: "delete",
     trigger: (view: Awaited<ReturnType<typeof setup>>) => view.app.mockInput.pressKey("d", { ctrl: true }),
@@ -367,8 +377,120 @@ test("the consolidate button asks the server to consolidate the pending prompts"
   await view.open()
   await view.click("consolidate")
   await wait(() => view.queued("consolidate").length === 1)
+  expect(view.queued("consolidate")[0]?.path).toBe(`/session/${sessionID}/queue/consolidate/${steer.id}`)
+  expect(view.queued("consolidate")[0]?.body).toBeUndefined()
   view.app.mockInput.pressKey("o", { ctrl: true })
   await wait(() => view.queued("consolidate").length === 2)
+})
+
+for (const trigger of ["keyboard", "row"] as const) {
+  test(`forcing the selected prompt through ${trigger} sends its id and closes only after acceptance`, async () => {
+    const view = await setup([steer, queued], (path) =>
+      path.endsWith(`/queue/force/${queued.id}`)
+        ? Promise.resolve(json({ outcome: "forced", items: [steer] }))
+        : undefined,
+    )
+    await view.open()
+    view.app.mockInput.pressArrow("down")
+    if (trigger === "keyboard") view.app.mockInput.pressKey("f", { ctrl: true })
+    else await view.click("force")
+    await wait(() => view.queued("force").length === 1)
+
+    expect(view.queued("force")[0]?.method).toBe("POST")
+    expect(view.queued("force")[0]?.path).toBe(`/session/${sessionID}/queue/force/${queued.id}`)
+    expect(view.queued("force")[0]?.body).toEqual({ holder: view.queued("hold")[0]?.body?.holder })
+    await wait(() => view.dialog.stack.length === 0)
+    await wait(() => view.queued("release").length === 1)
+    expect(view.sync.data.session_queue[sessionID]).toEqual([steer])
+  })
+}
+
+test("a live second review holder blocks force and leaves the view paused", async () => {
+  const view = await setup([steer, queued], (path) =>
+    path.endsWith(`/queue/force/${queued.id}`)
+      ? Promise.resolve(json({ outcome: "another-review", items: [steer, queued] }))
+      : undefined,
+  )
+  await view.open()
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("f", { ctrl: true })
+  await wait(() => view.queued("force").length === 1)
+  expect(await view.frame()).toContain("Another review is holding delivery")
+  expect(await view.frame()).toContain("(delivery paused)")
+  expect(view.dialog.stack.length).toBe(1)
+  expect(view.queued("release")).toEqual([])
+})
+
+test("a force whose hold is no longer confirmed reports that delivery is not paused", async () => {
+  const view = await setup([steer, queued], (path) =>
+    path.endsWith(`/queue/force/${queued.id}`)
+      ? Promise.resolve(json({ outcome: "hold-unconfirmed", items: [steer, queued] }))
+      : undefined,
+  )
+  await view.open()
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("f", { ctrl: true })
+  await wait(() => view.queued("force").length === 1)
+  expect(await view.frame()).toContain("review hold is no longer confirmed")
+  expect(await view.frame()).toContain("delivery NOT paused")
+  expect(view.dialog.stack.length).toBe(1)
+  expect(view.queued("release")).toEqual([])
+})
+
+test("a stale force result refreshes the list and reports that the item is no longer pending", async () => {
+  const view = await setup([steer, queued], (path) =>
+    path.endsWith(`/queue/force/${queued.id}`)
+      ? Promise.resolve(json({ outcome: "unavailable", items: [steer] }))
+      : undefined,
+  )
+  await view.open()
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("f", { ctrl: true })
+  await wait(() => view.queued("force").length === 1)
+  await wait(async () => (await view.frame()).includes("selected prompt is no longer pending"))
+  expect(view.sync.data.session_queue[sessionID]).toEqual([steer])
+  expect(view.dialog.stack.length).toBe(1)
+  expect(await view.frame()).toContain("(delivery paused)")
+  expect(view.queued("release")).toEqual([])
+})
+
+test("a failed force request reports failure and preserves the held queue", async () => {
+  const view = await setup([steer, queued], (path) =>
+    path.endsWith(`/queue/force/${queued.id}`)
+      ? Promise.resolve(json({ name: "Unavailable" }, { status: 503 }))
+      : undefined,
+  )
+  await view.open()
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("f", { ctrl: true })
+  await wait(() => view.queued("force").length === 1)
+  await wait(async () => (await view.frame()).includes("Could not force the queued prompts"))
+  expect(view.sync.data.session_queue[sessionID]).toEqual([steer, queued])
+  expect(view.dialog.stack.length).toBe(1)
+  expect(await view.frame()).toContain("(delivery paused)")
+  expect(view.queued("release")).toEqual([])
+})
+
+test("a hold renewal that lands after force closes the view is released", async () => {
+  const renewal = later()
+  let holds = 0
+  const view = await setup([queued], (path) =>
+    path.endsWith("/queue/hold") && holds++ === 1 ? renewal.response : undefined,
+  )
+  await view.open()
+  await wait(async () => (await view.frame()).includes("(delivery paused)"))
+  jest.useFakeTimers({ now: Date.now() })
+
+  jest.advanceTimersByTime(60_000)
+  view.app.mockInput.pressKey("f", { ctrl: true })
+  await settle(() => view.queued("hold").length === 2)
+  await settle(() => view.queued("force").length === 1)
+  await settle(() => view.queued("release").length === 1)
+  expect(view.dialog.stack.length).toBe(0)
+
+  renewal.answer(json([queued]))
+  await settle(() => view.queued("release").length === 2)
+  expect(view.dialog.stack.length).toBe(0)
 })
 
 for (const action of actionTriggers) {
@@ -408,7 +530,9 @@ test("a consolidation response updates the reviewed list with merged content", a
     origins: [...steer.origins, ...queued.origins],
   }
   const view = await setup([steer, queued], (path) =>
-    path.endsWith("/queue/consolidate") ? Promise.resolve(json([merged])) : undefined,
+    path.includes("/queue/consolidate/")
+      ? Promise.resolve(json({ outcome: "consolidated", items: [merged] }))
+      : undefined,
   )
   await view.open()
   await view.click("consolidate")
@@ -422,7 +546,9 @@ test("a consolidation that only adds provenance is still shown as a merge", asyn
   const repeated = item("que_repeated", "steer", "same", Date.now() + 1)
   const merged = { ...recent, origins: [...recent.origins, ...repeated.origins] }
   const view = await setup([recent, repeated], (path) =>
-    path.endsWith("/queue/consolidate") ? Promise.resolve(json([merged])) : undefined,
+    path.includes("/queue/consolidate/")
+      ? Promise.resolve(json({ outcome: "consolidated", items: [merged] }))
+      : undefined,
   )
   await view.open()
   await view.click("consolidate")
@@ -438,6 +564,27 @@ test("consolidating an unchanged queue explains that there is nothing to merge",
   await wait(() => view.queued("consolidate").length === 1)
   expect(await view.frame()).toContain("Nothing to consolidate")
   expect(await view.frame()).toContain("steer the running turn")
+})
+
+test("selected human consolidation explains why the complete human set cannot be merged yet", async () => {
+  for (const [outcome, message] of [
+    ["preparing", "A human prompt is still preparing"],
+    ["incompatible", "Human prompts with different delivery"],
+  ] as const) {
+    const view = await setup([steer, queued], (path) =>
+      path.includes("/queue/consolidate/") ? Promise.resolve(json({ outcome, items: [steer, queued] })) : undefined,
+    )
+    await view.open()
+    await view.click("consolidate")
+    await wait(() => view.queued("consolidate").length === 1)
+    expect(await view.frame()).toContain(message)
+    expect(await view.frame()).toContain("steer the running turn")
+    expect(await view.frame()).toContain("queued for later")
+    expect(view.dialog.stack.length).toBe(1)
+    expect(view.queued("release")).toEqual([])
+    view.app.renderer.destroy()
+    cleanup = undefined
+  }
 })
 
 test("a move that would cross delivery classes explains why it cannot change the selected prompt", async () => {
@@ -472,6 +619,9 @@ test("an action with no selected prompt explains why it cannot run", async () =>
   await view.click("delete")
   expect(await view.frame()).toContain("No queued prompt is selected")
   expect(view.queued("remove")).toEqual([])
+  await view.click("force")
+  expect(await view.frame()).toContain("No queued prompt is selected")
+  expect(view.queued("force")).toEqual([])
 })
 
 test("consolidating an empty queue explains that there is nothing to consolidate", async () => {

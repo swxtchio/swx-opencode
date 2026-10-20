@@ -182,6 +182,62 @@ export function DialogQueue(props: { sessionID: string }) {
         onMove={active}
         actions={[
           {
+            command: "dialog.queue.force",
+            title: "force",
+            disabled: locked,
+            onDisabledTrigger: explainLocked,
+            onUnavailableTrigger: explainUnavailable("No queued prompt is selected."),
+            onTrigger: (option) => {
+              active()
+              void checked(
+                sdk.client.session.queue.force(
+                  { sessionID: props.sessionID, itemID: option.value, holder },
+                  { signal: signal() },
+                ),
+              )
+                .then((result) => {
+                  const data = result.data
+                  if (!data) {
+                    toast.show({ variant: "error", message: "The force request returned no queue state." })
+                    return
+                  }
+                  sync.queue.listed(props.sessionID, data.items)
+                  if (data.outcome === "forced") {
+                    toast.show({ variant: "info", message: "The selected prompt will reach the next safe step." })
+                    dialog.clear()
+                    return
+                  }
+                  if (data.outcome === "another-review") {
+                    toast.show({
+                      variant: "warning",
+                      message: "Another review is holding delivery; the selected prompt was not forced.",
+                    })
+                    return
+                  }
+                  if (data.outcome === "hold-unconfirmed") {
+                    setHold("failed")
+                    toast.show({
+                      variant: "warning",
+                      message: "The review hold is no longer confirmed; the selected prompt was not forced.",
+                    })
+                    return
+                  }
+                  if (data.outcome === "preparing") {
+                    toast.show({
+                      variant: "warning",
+                      message: "This prompt is still preparing; it was not forced.",
+                    })
+                    return
+                  }
+                  toast.show({
+                    variant: "info",
+                    message: "The selected prompt is no longer pending; it was not forced.",
+                  })
+                })
+                .catch(failed("force"))
+            },
+          },
+          {
             command: "dialog.queue.delete",
             title: "delete",
             disabled: locked,
@@ -222,27 +278,38 @@ export function DialogQueue(props: { sessionID: string }) {
             disabled: locked,
             onDisabledTrigger: explainLocked,
             onUnavailableTrigger: explainUnavailable("Nothing to consolidate."),
-            onTrigger: () => {
+            onTrigger: (option) => {
               active()
-              const before = new Map(
-                items().map(
-                  (item) => [item.id, { text: preview(item), origins: JSON.stringify(item.origins) }] as const,
-                ),
+              void checked(
+                sdk.client.session.queue.consolidateSelected({
+                  sessionID: props.sessionID,
+                  itemID: option.value,
+                }),
               )
-              void checked(sdk.client.session.queue.consolidate({ sessionID: props.sessionID }))
                 .then((result) => {
-                  if (!result.data) {
-                    toast.show({ variant: "info", message: "Nothing to consolidate." })
+                  const data = result.data
+                  if (!data) {
+                    toast.show({ variant: "error", message: "The consolidate request returned no queue state." })
                     return
                   }
-                  const merged = result.data.some((item) => {
-                    const old = before.get(item.id)
-                    return (
-                      old !== undefined && (old.text !== preview(item) || old.origins !== JSON.stringify(item.origins))
-                    )
-                  })
-                  sync.queue.listed(props.sessionID, result.data)
-                  if (!merged) toast.show({ variant: "info", message: "Nothing to consolidate." })
+                  sync.queue.listed(props.sessionID, data.items)
+                  if (data.outcome === "consolidated") return
+                  if (data.outcome === "preparing") {
+                    toast.show({ variant: "warning", message: "A human prompt is still preparing; nothing changed." })
+                    return
+                  }
+                  if (data.outcome === "incompatible") {
+                    toast.show({
+                      variant: "warning",
+                      message: "Human prompts with different delivery or execution context cannot be consolidated.",
+                    })
+                    return
+                  }
+                  if (data.outcome === "unavailable") {
+                    toast.show({ variant: "info", message: "The selected prompt is no longer available." })
+                    return
+                  }
+                  toast.show({ variant: "info", message: "Nothing to consolidate." })
                 })
                 .catch(failed("consolidate"))
             },

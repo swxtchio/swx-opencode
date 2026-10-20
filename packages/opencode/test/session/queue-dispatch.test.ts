@@ -348,6 +348,113 @@ it.instance("human batching preserves synthetic context and typed-part provenanc
   }),
 )
 
+it.instance("selected human consolidation retains original parts through promotion and consume", () =>
+  Effect.gen(function* () {
+    const queue = yield* SessionQueue.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({})
+    const image = {
+      type: "file" as const,
+      mime: "text/plain",
+      filename: "first.txt",
+      url: "data:text/plain;base64,Zmlyc3QgYXR0YWNobWVudA==",
+    }
+    const first = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "consolidate-human-a",
+      delivery: "steer",
+      origin: "tui-composer",
+      parts: [
+        { type: "text", text: "selected editor context", synthetic: true },
+        { type: "text", text: "first instruction", metadata: { source: "typed-a" } },
+        image,
+      ],
+    })
+    const machine = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "consolidate-machine",
+      delivery: "queue",
+      parts: [{ type: "text", text: "[fm-from-firstmate]\x1f[fm-level:nudge:status]\x1f status: machine work" }],
+    })
+    const second = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "consolidate-human-b",
+      delivery: "steer",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: "run lint --fix", metadata: { source: "typed-b" } }],
+    })
+    const duplicate = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "consolidate-human-c",
+      delivery: "steer",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: "run lint --fix", metadata: { source: "typed-c" } }],
+    })
+    yield* queue.reorder(session.id, [duplicate.id, second.id, first.id])
+
+    const consolidated = yield* queue.consolidateSelected(session.id, second.id)
+    expect(consolidated.outcome).toBe("consolidated")
+    expect(consolidated.items).toHaveLength(2)
+    const carrier = consolidated.items.find((item) => item.id === first.id)
+    const untouched = consolidated.items.find((item) => item.id === machine.id)
+    if (!carrier || !untouched) throw new Error("consolidation lost its carrier or machine item")
+    expect(carrier.origins.map((origin) => origin.requestID)).toEqual([
+      "consolidate-human-a",
+      "consolidate-human-b",
+      "consolidate-human-c",
+    ])
+    expect(untouched.input.parts).toEqual(machine.input.parts)
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "consolidate-human-b"))).toMatchObject({
+      state: "merged",
+      into: "consolidate-human-a",
+    })
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "consolidate-human-c"))).toMatchObject({
+      state: "merged",
+      into: "consolidate-human-a",
+    })
+
+    const promoted: SessionQueue.PromotedInput[] = []
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "steer",
+      prepare: (input) => Effect.sync(() => promoted.push(input)).pipe(Effect.andThen(prepare(input))),
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+    const human = promoted.find((input) => input.group?.kind === "human")
+    if (!human?.group) throw new Error("promotion did not emit the human group")
+    expect(human.group.constituents.map((item) => item.id)).toEqual([first.id, second.id, duplicate.id])
+    expect(human.parts.some((part) => part.type === "file" && part.filename === "first.txt")).toBe(true)
+    expect(human.group.constituents[0]?.input.parts).toMatchObject([
+      { type: "text", text: "selected editor context", synthetic: true },
+      { type: "text", text: "first instruction", metadata: { source: "typed-a" } },
+      { type: "file", filename: "first.txt", url: image.url },
+    ])
+    expect((yield* queue.list(session.id)).map((item) => item.id)).toEqual([machine.id])
+    yield* queue.promote({
+      sessionID: session.id,
+      delivery: "queue",
+      prepare,
+      write: writer(sessions),
+      rejected: () => Effect.void,
+    })
+
+    yield* queue.consume(session.id)
+    expect(yield* queue.list(session.id)).toEqual([])
+    const messages = yield* MessageV2.stream(session.id)
+    const delivered = messages.find((message) => metadata(message)?.kind === "human")
+    if (!delivered) throw new Error("the consumed human message lost its group metadata")
+    const deliveredGroup = metadata(delivered)
+    if (!deliveredGroup) throw new Error("the consumed human message lost its constituent group")
+    expect(deliveredGroup.constituents.map((item) => item.id)).toEqual([first.id, second.id, duplicate.id])
+    expect(deliveredGroup.constituents[0]?.input.parts).toMatchObject([
+      { type: "text", text: "selected editor context", synthetic: true },
+      { type: "text", text: "first instruction", metadata: { source: "typed-a" } },
+      { type: "file", filename: "first.txt", url: image.url },
+    ])
+  }),
+)
+
 it.instance(
   "same automation type delivers once with newest repeated check and every distinct task plus original metadata",
   () =>

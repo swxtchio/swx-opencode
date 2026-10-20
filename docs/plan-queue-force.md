@@ -7,7 +7,7 @@
 
 ## Implementation
 
-1. Add the force transition to `packages/opencode/src/session/queue.ts`, using its session lock and immediate transaction so reservation invalidation, selected-row update and hold release have one queue-owned boundary.
+1. Add the force transition to `packages/opencode/src/session/queue.ts`, keeping reservation invalidation, selected-row update, hold release and wake inside one session-locked queue operation; its database writes use the immediate-transaction boundary.
 2. Extend queue consolidation with the selected item identity. Use the queue's human-composer and machine-marker classification; build the carrier from original inputs ordered by admission identity, retain the originals needed by later consolidation and delivery, and settle receipts before retiring source rows.
 3. Wire the review dialog's `Ctrl+f` and selected-item consolidate actions through the declared HttpApi and generated SDK. Keep the `Ctrl+x`, then `q` review opener. Show refusal reasons and close the view only after force succeeds.
 4. Add queue-service, review-dialog, HttpApi and real TUI-to-provider regressions for selection, hold protection, preparation, metadata and receipts. Demonstrate bounded red/green absence proofs for each changed behavior.

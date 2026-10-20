@@ -78,6 +78,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#314** Add `Ctrl+f` in the pending-prompt review to give only the selected prepared item steer timing, releasing its confirmed review hold only when no other live holder remains. Consolidating a selected human-composer item now combines the complete ready, delivery- and execution-compatible human set in admission order, preserving original inputs, parts, receipts and constituents. _Fork-only._
 - **#299** Exclude shell-mode rows from Ctrl+r and keep cleared or discarded drafts out of history, stash and prompt recovery. Preserve submitted-history recovery and picker eligibility for ambiguous legacy rows; rename the draft action and keybind to `prompt.discard` and `prompt_discard` (swxtchio/swx-opencode#298). _Fork-only._
 - **#294** Rehydrate composer history from each session's full transcript so prompts erased from the cache remain available after resume; fingerprint retained rows so cache eviction invalidates completion and triggers later recovery. Treat unmarked direct and queue-produced prompts as human in UP recall and Ctrl+r search; reject undecodable queue provenance and exclude marked automation from both surfaces. Unmarked pre-#272 history follows Firstmate's ruling (swxtchio/swx-opencode#293). _Fork-only._
 - **#276** Add `watcher.fff: false` to disable the FFF background watcher while retaining native file, directory, glob and content search; the index reflects the initial scan when watching is disabled (swxtchio/swx-opencode#274). _Fork-only._

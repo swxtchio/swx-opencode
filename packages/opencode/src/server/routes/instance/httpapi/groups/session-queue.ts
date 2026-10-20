@@ -21,6 +21,8 @@ export const SessionQueuePaths = {
   remove: `${root}/remove`,
   reorder: `${root}/reorder`,
   consolidate: `${root}/consolidate`,
+  consolidateSelected: `${root}/consolidate/:itemID`,
+  force: `${root}/force/:itemID`,
   receipt: `${root}/receipt/:requestID`,
 } as const
 
@@ -29,6 +31,14 @@ export const UpdatePayload = Schema.Struct({ delivery: SessionQueue.Delivery })
 export const HoldPayload = Schema.Struct({ holder: Schema.String.check(Schema.isNonEmpty()) })
 export const RemovePayload = Schema.Struct({ id: SessionQueue.ItemID })
 export const ReorderPayload = Schema.Struct({ items: Schema.Array(SessionQueue.ItemID) })
+export const ForceResult = Schema.Struct({
+  outcome: Schema.Literals(["forced", "another-review", "hold-unconfirmed", "preparing", "unavailable"]),
+  items: Schema.Array(SessionQueue.Item),
+})
+export const SelectedConsolidationResult = Schema.Struct({
+  outcome: Schema.Literals(["consolidated", "unchanged", "preparing", "incompatible", "unavailable"]),
+  items: Schema.Array(SessionQueue.Item),
+})
 
 export const SessionQueueApi = HttpApi.make("sessionQueue").add(
   HttpApiGroup.make("sessionQueue")
@@ -85,6 +95,20 @@ export const SessionQueueApi = HttpApi.make("sessionQueue").add(
           summary: "Change queued prompt delivery",
           description:
             "Change how a pending prompt is delivered and wake the session. Setting steer sends a queued prompt at the next step.",
+        }),
+      ),
+      HttpApiEndpoint.post("force", SessionQueuePaths.force, {
+        params: { sessionID: SessionID, itemID: SessionQueue.ItemID },
+        query: WorkspaceRoutingQuery,
+        payload: HoldPayload,
+        success: described(ForceResult, "Force result and current pending prompts"),
+        error: [HttpApiError.BadRequest, ApiNotFoundError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "session.queue.force",
+          summary: "Force a selected queued prompt",
+          description:
+            "Give only this prepared pending prompt steer timing. The holder must own a confirmed review hold, which this action releases only when no other live review hold remains. A preparing result leaves the item pending; an unavailable result reports a stale or missing item, and another-review leaves it unchanged. A forced result wakes the session so it reaches the next safe provider step or starts a turn when idle.",
         }),
       ),
       HttpApiEndpoint.post("hold", SessionQueuePaths.hold, {
@@ -154,6 +178,19 @@ export const SessionQueueApi = HttpApi.make("sessionQueue").add(
           summary: "Consolidate queued prompts",
           description:
             "Consolidate pending prompts only within one delivery class: merge plain text whose case and whitespace normalized text is equal or one is a prefix of the other, and merge compatible commands with the same leading verb and a containing or distinctive-token-overlapping target into numbered steps in delivery order.",
+        }),
+      ),
+      HttpApiEndpoint.post("consolidateSelected", SessionQueuePaths.consolidateSelected, {
+        params: { sessionID: SessionID, itemID: SessionQueue.ItemID },
+        query: WorkspaceRoutingQuery,
+        success: described(SelectedConsolidationResult, "Selected consolidation result and current pending prompts"),
+        error: [HttpApiError.BadRequest, ApiNotFoundError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "session.queue.consolidate_selected",
+          summary: "Consolidate the selected queued prompt",
+          description:
+            "When the selected item is a human-composer prompt, consolidate every ready pending human-composer prompt with compatible delivery and execution context in admission order, preserving each original input and receipt. Preparing or incompatible human sets remain intact. A non-human selection uses the standard queue consolidation behavior.",
         }),
       ),
       HttpApiEndpoint.get("receipt", SessionQueuePaths.receipt, {

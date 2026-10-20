@@ -11081,6 +11081,46 @@ export type SessionQueueRestoreResponses = {
 
 export type SessionQueueRestoreResponse = SessionQueueRestoreResponses[keyof SessionQueueRestoreResponses]
 
+export type SessionQueueForceData = {
+  body?: {
+    holder: string
+  }
+  path: {
+    sessionID: string
+    itemID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/force/{itemID}"
+}
+
+export type SessionQueueForceErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionQueueForceError = SessionQueueForceErrors[keyof SessionQueueForceErrors]
+
+export type SessionQueueForceResponses = {
+  /**
+   * Force result and current pending prompts
+   */
+  200: {
+    outcome: "forced" | "another-review" | "hold-unconfirmed" | "preparing" | "unavailable"
+    items: Array<SessionPromptQueueItem>
+  }
+}
+
+export type SessionQueueForceResponse = SessionQueueForceResponses[keyof SessionQueueForceResponses]
+
 export type SessionQueueHoldData = {
   body?: {
     holder: string
@@ -11258,6 +11298,46 @@ export type SessionQueueConsolidateResponses = {
 }
 
 export type SessionQueueConsolidateResponse = SessionQueueConsolidateResponses[keyof SessionQueueConsolidateResponses]
+
+export type SessionQueueConsolidateSelectedData = {
+  body?: never
+  path: {
+    sessionID: string
+    itemID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/queue/consolidate/{itemID}"
+}
+
+export type SessionQueueConsolidateSelectedErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionQueueConsolidateSelectedError =
+  SessionQueueConsolidateSelectedErrors[keyof SessionQueueConsolidateSelectedErrors]
+
+export type SessionQueueConsolidateSelectedResponses = {
+  /**
+   * Selected consolidation result and current pending prompts
+   */
+  200: {
+    outcome: "consolidated" | "unchanged" | "preparing" | "incompatible" | "unavailable"
+    items: Array<SessionPromptQueueItem>
+  }
+}
+
+export type SessionQueueConsolidateSelectedResponse =
+  SessionQueueConsolidateSelectedResponses[keyof SessionQueueConsolidateSelectedResponses]
 
 export type SessionQueueReceiptData = {
   body?: never

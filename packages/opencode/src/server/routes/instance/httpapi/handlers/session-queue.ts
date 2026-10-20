@@ -96,6 +96,20 @@ export const sessionQueueHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       return item.value
     })
 
+    const force = Effect.fn("SessionQueueHttpApi.force")(function* (ctx: {
+      params: { sessionID: SessionID; itemID: SessionQueue.ItemID }
+      payload: typeof HoldPayload.Type
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      const outcome = yield* queue.force({
+        sessionID: ctx.params.sessionID,
+        itemID: ctx.params.itemID,
+        holder: ctx.payload.holder,
+      })
+      if (outcome === "forced") yield* wake(ctx.params.sessionID)
+      return { outcome, items: yield* queue.list(ctx.params.sessionID) }
+    })
+
     // When a review hold ends, the session is woken to deliver what it kept
     // pending. A session with nothing pending is left alone: a new one has no
     // message for a run to answer.
@@ -157,16 +171,29 @@ export const sessionQueueHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       return yield* queue.consolidate(ctx.params.sessionID, (yield* config.get()).machine_message_markers)
     })
 
+    const consolidateSelected = Effect.fn("SessionQueueHttpApi.consolidateSelected")(function* (ctx: {
+      params: { sessionID: SessionID; itemID: SessionQueue.ItemID }
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      return yield* queue.consolidateSelected(
+        ctx.params.sessionID,
+        ctx.params.itemID,
+        (yield* config.get()).machine_message_markers,
+      )
+    })
+
     return handlers
       .handle("list", list)
       .handle("withdraw", withdraw)
       .handle("restore", restore)
       .handle("update", update)
+      .handle("force", force)
       .handle("hold", hold)
       .handle("release", release)
       .handle("remove", remove)
       .handle("reorder", reorder)
       .handle("consolidate", consolidate)
+      .handle("consolidateSelected", consolidateSelected)
       .handle("receipt", receipt)
   }),
 )
