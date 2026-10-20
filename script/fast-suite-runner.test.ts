@@ -74,6 +74,8 @@ ${directSecondPath}
             "FAST_SUITE_REAL_BUN",
             "FAST_SUITE_FAIL_PRETEST",
             "FAST_SUITE_FAIL_POSTTEST",
+            "FAST_SUITE_EXTRA_PRETEST_TEST",
+            "FAST_SUITE_EXTRA_POSTTEST_TEST",
             "FAST_SUITE_FORCE_EXTRA_FILE",
             "PATH",
             "HOME",
@@ -104,6 +106,9 @@ ${directSecondPath}
         FAST_SUITE_REAL_BUN: process.execPath,
         FAST_SUITE_FAIL_PRETEST: "0",
         FAST_SUITE_FAIL_POSTTEST: "0",
+        FAST_SUITE_EXTRA_PRETEST_TEST: "0",
+        FAST_SUITE_EXTRA_POSTTEST_TEST: "0",
+        FAST_SUITE_EXTRA_PREP_TEST: "0",
         FAST_SUITE_FAIL_BUILD: "0",
         FAST_SUITE_UNDECLARED: "ambient-only",
         FAST_SUITE_EMPTY_PLAN: "0",
@@ -120,6 +125,7 @@ ${directSecondPath}
     mkdirSync(dependencyRoot, { recursive: true })
     mkdirSync(leafRoot, { recursive: true })
     mkdirSync(join(dependencyRoot, "test"), { recursive: true })
+    mkdirSync(join(leafRoot, "test"), { recursive: true })
     mkdirSync(dirname(runner), { recursive: true })
     mkdirSync(dirname(turbo), { recursive: true })
     mkdirSync(dirname(bunBin), { recursive: true })
@@ -161,8 +167,8 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
           build: {
             dependsOn: ["^build"],
             outputs: [],
-            env: ["FAST_SUITE_FAIL_BUILD"],
-            passThroughEnv: ["FAST_SUITE_BUILD_LOG", "FAST_SUITE_REAL_BUN", "PATH"],
+            env: ["FAST_SUITE_FAIL_BUILD", "FAST_SUITE_EXTRA_PREP_TEST"],
+            passThroughEnv: ["FAST_SUITE_BUILD_LOG", "FAST_SUITE_BUN_LOG", "FAST_SUITE_MARKER", "FAST_SUITE_REAL_BUN", "PATH"],
           },
           "@fixture/dependency#test": {
             outputs: [],
@@ -187,6 +193,7 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         pretest: "bun ./pretest.ts",
         test: exampleTestScript,
         posttest: "bun ./posttest.ts",
+        "verify:unlisted": "bun test ./test/unlisted.test.ts",
       },
     }
     writeFileSync(join(packageRoot, "package.json"), JSON.stringify(examplePackage))
@@ -226,7 +233,22 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
       [
         'import { appendFileSync } from "node:fs"',
         'appendFileSync(process.env.FAST_SUITE_BUILD_LOG!, "dependency-build\\n")',
+        'if (process.env.FAST_SUITE_EXTRA_PREP_TEST === "1") {',
+        '  const result = Bun.spawnSync(["bun", "test", "./test/unselected-build.test.ts"], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
         'if (process.env.FAST_SUITE_FAIL_BUILD === "1") process.exit(1)',
+        "",
+      ].join("\n"),
+    )
+    writeFileSync(
+      join(leafRoot, "test", "unselected-build.test.ts"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        'import { test } from "bun:test"',
+        'test("is an unselected test launched by a build prerequisite", () => {',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER!, "unselected-build-test\\n")',
+        "})",
         "",
       ].join("\n"),
     )
@@ -279,6 +301,10 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
       [
         'import { appendFileSync } from "node:fs"',
         'appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "pretest\\n")',
+        'if (process.env.FAST_SUITE_EXTRA_PRETEST_TEST === "1") {',
+        '  const result = Bun.spawnSync(["bun", "run", "verify:unlisted"], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
         'if (process.env.FAST_SUITE_FAIL_PRETEST === "1") process.exit(1)',
         "",
       ].join("\n"),
@@ -288,6 +314,10 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
       [
         'import { appendFileSync } from "node:fs"',
         'appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "posttest\\n")',
+        'if (process.env.FAST_SUITE_EXTRA_POSTTEST_TEST === "1") {',
+        '  const result = Bun.spawnSync(["bun", "run", "verify:unlisted"], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
         'if (process.env.FAST_SUITE_FAIL_POSTTEST === "1") process.exit(1)',
         "",
       ].join("\n"),
@@ -641,6 +671,34 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     expect(fastPackageHooks[0]).toBe("pretest")
     expect(fastPackageHooks.slice(1, -1).sort()).toEqual(["selected", "selected-second"])
     expect(fastPackageHooks.at(-1)).toBe("posttest")
+
+    runOptions.env.FAST_SUITE_EXTRA_PRETEST_TEST = "1"
+    writeFileSync(marker, "")
+    const pretestEscape = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(pretestEscape.exitCode).toBe(1)
+    expect(pretestEscape.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=execution-set-mismatch exit_code=1")).toBe(true)
+    expect(pretestEscape.stderr.toString()).toContain("JUnit-observed files outside the manifest")
+    expect(readFileSync(marker, "utf8").trim().split("\n")).toContain("unlisted")
+    runOptions.env.FAST_SUITE_EXTRA_PRETEST_TEST = "0"
+
+    runOptions.env.FAST_SUITE_EXTRA_POSTTEST_TEST = "1"
+    writeFileSync(marker, "")
+    const posttestEscape = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(posttestEscape.exitCode).toBe(1)
+    expect(posttestEscape.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=execution-set-mismatch exit_code=1")).toBe(true)
+    expect(posttestEscape.stderr.toString()).toContain("JUnit-observed files outside the manifest")
+    expect(readFileSync(marker, "utf8").trim().split("\n")).toContain("unlisted")
+    runOptions.env.FAST_SUITE_EXTRA_POSTTEST_TEST = "0"
+
+    runOptions.env.FAST_SUITE_EXTRA_PREP_TEST = "1"
+    writeFileSync(marker, "")
+    writeFileSync(buildLog, "")
+    const preparationEscape = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(preparationEscape.exitCode).toBe(1)
+    expect(preparationEscape.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=execution-set-mismatch exit_code=1")).toBe(true)
+    expect(preparationEscape.stderr.toString()).toContain("JUnit-observed files outside the manifest")
+    expect(readFileSync(marker, "utf8").trim().split("\n")).toContain("unselected-build-test")
+    runOptions.env.FAST_SUITE_EXTRA_PREP_TEST = "0"
 
     writeFileSync(packageTurboConfig, JSON.stringify({ extends: ["//"], tasks: {} }))
     expect(Bun.spawnSync(["git", "add", "packages/example/turbo.json"], { cwd: root, env: gitEnv }).exitCode).toBe(0)

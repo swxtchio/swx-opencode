@@ -38,6 +38,8 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     'A package-local turbo.json without a resolved owning test task is refused rather than bypassed by direct execution.' \
     'Bun pretest/test/posttest lifecycle runs once per package: pretest failure stops the test, and posttest runs only' \
     'after a successful test command; hook failures propagate through the task result.' \
+    'All captured Bun JUnit reports, including preparation and lifecycle-hook launches, are collected; their observed' \
+    'file set must equal the manifest exactly.' \
     'A nonzero target with no JUnit report is refused with target attribution, not labeled an execution-set mismatch.' \
     'Fast mode refuses if a selected file reports no active test cases.' \
     'Only --fast refuses a checkout with tracked or untracked changes; full mode preserves the original Turbo behavior.' \
@@ -112,6 +114,86 @@ if ! config_dir="$(mktemp -d "${TMPDIR:-/tmp}/fast-suite-config.XXXXXX")"; then
 fi
 report_file="$root/.fast-suite-report.$$.xml"
 trap 'rm -f -- "$report_file" "$config_dir"/*; rmdir -- "$config_dir" 2>/dev/null || true' EXIT
+real_bun="$(command -v bun)"
+if ! FAST_SUITE_WRAPPER_PATH="$config_dir/bun" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" \
+  FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e '
+  const wrapper = `#!/usr/bin/env bash
+set -euo pipefail
+real_bun=${JSON.stringify(process.env.FAST_SUITE_CAPTURE_REAL_BUN)}
+report_dir=${JSON.stringify(process.env.FAST_SUITE_REPORT_DIR)}
+main_report=${JSON.stringify(process.env.FAST_SUITE_MAIN_REPORT)}
+args=("$@")
+wrapper_name=\${BASH_SOURCE[0]##*/}
+command_index=0
+while [ "$command_index" -lt "\${#args[@]}" ]; do
+  case "\${args[command_index]}" in
+    --cwd=*) command_index=$((command_index + 1)) ;;
+    --cwd|--config|--env-file|--preload|--require|--import|--conditions|--define|--loader|--inspect|--inspect-wait|--inspect-brk|-r|-p|-e|-d|-l) command_index=$((command_index + 2)) ;;
+    --*=*) command_index=$((command_index + 1)) ;;
+    -*) command_index=$((command_index + 1)) ;;
+    *) break ;;
+  esac
+done
+for argument in "\${args[@]}"; do
+  if [ "$argument" = --test-worker ]; then exec "$real_bun" "\${args[@]}"; fi
+done
+command="\${args[command_index]:-}"
+if [ "$wrapper_name" = bunx ]; then
+  case "$command" in vitest|jest|playwright|mocha|ava|pytest|cypress) printf "%s\\n" "tests/run.sh: refusing an unobservable Bunx test runner: $command" >&2; exit 126 ;; esac
+  exec "$real_bun" x "\${args[@]}"
+fi
+if [ "$command" != test ]; then exec "$real_bun" "\${args[@]}"; fi
+report_outfile=
+index=$((command_index + 1))
+while [ "$index" -lt "\${#args[@]}" ]; do
+  case "\${args[index]}" in
+    --reporter-outfile=*) report_outfile=\${args[index]#*=} ;;
+    --reporter-outfile) index=$((index + 1)); report_outfile=\${args[index]:-} ;;
+  esac
+  index=$((index + 1))
+done
+if [ "$report_outfile" = "$main_report" ]; then
+  main_invocation=1
+else
+  main_invocation=0
+  report_outfile=$(mktemp "$report_dir/report.XXXXXX")
+  printf "%s\\n" "$PWD" > "$report_outfile.cwd"
+fi
+forwarded=()
+index=0
+while [ "$index" -lt "\${#args[@]}" ]; do
+  argument=\${args[index]}
+  if [ "$index" -gt "$command_index" ]; then
+    case "$argument" in
+      --reporter-outfile|--reporter) index=$((index + 2)); continue ;;
+      --reporter-outfile=*|--reporter=*|--dots) index=$((index + 1)); continue ;;
+    esac
+  fi
+  forwarded+=("$argument")
+  index=$((index + 1))
+done
+exec_args=("\${forwarded[@]:0:$((command_index + 1))}" --reporter=junit "--reporter-outfile=$report_outfile" "\${forwarded[@]:$((command_index + 1))}")
+status=0
+"$real_bun" "\${exec_args[@]}" || status=$?
+if [ ! -s "$report_outfile" ]; then
+  printf "%s\\n" "tests/run.sh: Bun test invocation produced no JUnit report: $report_outfile" >&2
+  if [ "$status" -eq 0 ]; then status=125; fi
+fi
+if [ "$main_invocation" = 1 ] && [ -s "$main_report" ]; then
+  auxiliary_report=$(mktemp "$report_dir/report.XXXXXX")
+  cp -- "$main_report" "$auxiliary_report"
+  printf "%s\\n" "$PWD" > "$auxiliary_report.cwd"
+fi
+exit "$status"
+`
+  await Bun.write(process.env.FAST_SUITE_WRAPPER_PATH, wrapper)
+'; then
+  printf '%s\n' 'tests/run.sh: could not create the JUnit process observer' >&2
+  printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=junit-observer-unavailable exit_code=1'
+  exit 1
+fi
+chmod 700 "$config_dir/bun"
+ln -s bun "$config_dir/bunx"
 while IFS= read -r line || [ -n "$line" ]; do
   line_number=$((line_number + 1))
   line=${line%$'\r'}
@@ -486,7 +568,7 @@ for prep_task in "${turbo_prep_tasks[@]}"; do
     esac
   done
   preparation_status=0
-  GITHUB_ACTIONS=false bun turbo run "$prep_task" "${prep_filters[@]}" --force || preparation_status=$?
+  GITHUB_ACTIONS=false PATH="$config_dir:$PATH" "$config_dir/bun" turbo run "$prep_task" "${prep_filters[@]}" --force || preparation_status=$?
   if [ "$preparation_status" -ne 0 ]; then
     printf 'tests/run.sh: Turbo-declared preparation task failed: %s\n' "$prep_task" >&2
     printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=turbo-preparation-failed exit_code=1'
@@ -534,10 +616,10 @@ while [ "$index" -lt "$target_count" ]; do
   report_args=(--reporter=junit --reporter-outfile="$report_file")
   test_status=0
   if [ "$has_turbo_task" = 1 ]; then
-    GITHUB_ACTIONS=false bun turbo run test "--filter=./$package_root" --only --force -- \
+    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" "$config_dir/bun" turbo run test "--filter=./$package_root" --only --force -- \
       "${report_args[@]}" "${selected_paths[@]}" || test_status=$?
   else
-    GITHUB_ACTIONS=false bun --cwd="$root/$package_root" run test -- \
+    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" "$config_dir/bun" --cwd="$root/$package_root" run test -- \
       "${report_args[@]}" "${selected_paths[@]}" || test_status=$?
   fi
   if [ "$test_status" -ne 0 ]; then target_status=$test_status; fi
@@ -545,7 +627,8 @@ while [ "$index" -lt "$target_count" ]; do
   if [ -s "$report_file" ]; then
     report_status=0
     printf -v selected_target_lines '%s\n' "${selected_targets[@]}"
-    FAST_SUITE_REPORT="$report_file" FAST_SUITE_TARGETS="$selected_target_lines" bun -e '
+    FAST_SUITE_REPORT="$report_file" FAST_SUITE_TARGETS="$selected_target_lines" \
+      FAST_SUITE_PACKAGE_ROOT="$package_root" FAST_SUITE_OBSERVED_FILE="$config_dir/observed.$index" bun -e '
       const report = await Bun.file(process.env.FAST_SUITE_REPORT).text()
       const targets = process.env.FAST_SUITE_TARGETS.split("\n").filter(Boolean)
       const expected = new Set(targets)
@@ -572,6 +655,10 @@ while [ "$index" -lt "$target_count" ]; do
         console.error("tests/run.sh: Bun reported no active test cases for: " + inactive.join(", "))
         process.exit(3)
       }
+      await Bun.write(
+        process.env.FAST_SUITE_OBSERVED_FILE,
+        JSON.stringify(Array.from(actual, (file) => process.env.FAST_SUITE_PACKAGE_ROOT + "/" + file)),
+      )
       ' || report_status=$?
     if [ "$report_status" -ne 0 ]; then
       if [ "$report_status" -eq 3 ]; then
@@ -601,6 +688,73 @@ while [ "$index" -lt "$target_count" ]; do
   if [ "$target_status" -ne 0 ]; then fast_status=1; fi
   index=$((index + 1))
 done
+
+declare -a manifest_paths=()
+index=0
+while [ "$index" -lt "$target_count" ]; do
+  manifest_paths+=("${package_paths[index]}/${test_paths[index]}")
+  index=$((index + 1))
+done
+printf -v manifest_target_lines '%s\n' "${manifest_paths[@]}"
+observation_status=0
+FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_ROOT="$root" FAST_SUITE_MANIFEST_PATHS="$manifest_target_lines" bun -e '
+  import { readdir } from "node:fs/promises"
+  import { join, relative, resolve, sep } from "node:path"
+
+  const reportDirectory = process.env.FAST_SUITE_REPORT_DIR
+  const root = process.env.FAST_SUITE_ROOT
+  const expected = new Set(process.env.FAST_SUITE_MANIFEST_PATHS.split("\n").filter(Boolean))
+  const observed = new Set()
+  const entries = await readdir(reportDirectory)
+  for (const name of entries.filter((entry) => entry.startsWith("observed."))) {
+    const paths = await Bun.file(join(reportDirectory, name)).json()
+    if (!Array.isArray(paths) || paths.some((file) => typeof file !== "string")) {
+      console.error("tests/run.sh: invalid observed-file receipt: " + name)
+      process.exit(2)
+    }
+    for (const file of paths) observed.add(file)
+  }
+  for (const name of entries.filter((entry) => entry.startsWith("report.") && !entry.endsWith(".cwd"))) {
+    const report = await Bun.file(join(reportDirectory, name)).text()
+    if (!report.trim()) {
+      console.error("tests/run.sh: a captured Bun test launch produced an empty JUnit report: " + name)
+      process.exit(2)
+    }
+    const cwdFile = join(reportDirectory, name + ".cwd")
+    if (!(await Bun.file(cwdFile).exists())) {
+      console.error("tests/run.sh: JUnit report has no execution working directory: " + name)
+      process.exit(2)
+    }
+    const cwd = (await Bun.file(cwdFile).text()).trim()
+    const suites = Array.from(report.matchAll(/<testsuite\b([^>]*)>/g), ([, text]) => {
+      const attributes = Object.fromEntries(
+        Array.from(text.matchAll(/([A-Za-z][A-Za-z0-9_-]*)="([^"]*)"/g), (match) => [match[1], match[2]]),
+      )
+      return attributes.file
+    })
+    if (suites.length === 0) {
+      console.error("tests/run.sh: JUnit report contains no attributed test suites: " + name)
+      process.exit(2)
+    }
+    for (const file of suites) {
+      if (typeof file !== "string" || file.length === 0) {
+        console.error("tests/run.sh: JUnit report contains an unattributed test suite: " + name)
+        process.exit(2)
+      }
+      observed.add(relative(root, resolve(cwd, file)).split(sep).join("/"))
+    }
+  }
+  const unexpected = Array.from(observed).filter((file) => !expected.has(file))
+  const missing = Array.from(expected).filter((file) => !observed.has(file))
+  if (unexpected.length || missing.length) {
+    if (unexpected.length) {
+      console.error("tests/run.sh: JUnit-observed files outside the manifest: " + unexpected.join(", "))
+    }
+    if (missing.length) console.error("tests/run.sh: manifest files absent from all JUnit reports: " + missing.join(", "))
+    process.exit(2)
+  }
+' || observation_status=$?
+if [ "$observation_status" -ne 0 ]; then execution_set_invalid=1; fi
 
 if [ "$coverage_invalid" -ne 0 ]; then
   printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=no-test-cases exit_code=1'
