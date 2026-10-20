@@ -2685,7 +2685,7 @@ it.instance("rewriting pending text preserves queue identity, metadata, context 
 )
 
 it.instance(
-  "aliased selected-human consolidation preserves admission order through force and promotion",
+  "aliased and restored selected-human originals preserve admission order through force and promotion",
   () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
@@ -2701,22 +2701,55 @@ it.instance(
           parts: [{ type: "text", text: content, metadata: { source: requestID } }],
         })
       const first = yield* composer("alias-human-a", "first aliased instruction")
-      const second = yield* composer("alias-human-b", "second aliased instruction")
-      const consolidated = yield* queue.consolidateSelected(session.id, second.id)
+      const middle = yield* composer("alias-human-b", "middle aliased instruction")
+      const last = yield* composer("alias-human-c", "last aliased instruction")
+      expect(Option.isSome(yield* queue.withdraw(session.id, middle.id))).toBe(true)
+      const initial = yield* queue.consolidateSelected(session.id, first.id)
+      expect(initial.outcome).toBe("consolidated")
+      const initialCarrier = initial.items.find((item) => item.id === first.id)
+      if (!initialCarrier) throw new Error("the initial aliased human carrier was missing")
+      const initialVisible = initialCarrier.input.parts.flatMap((part) =>
+        part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [],
+      )
+      expect(initialVisible.join("")).toBe("first aliased instruction\nlast aliased instruction")
+      const initialWitnesses = initialCarrier.input.parts.flatMap((part) => {
+        if (part.type !== "text" || !part.ignored || !part.synthetic) return []
+        const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueuePendingOriginal)
+        return Option.isSome(group) ? group.value.constituents.map((item) => item.id) : []
+      })
+      expect([...new Set(initialWitnesses)]).toEqual([first.id, last.id])
+      expect(initialCarrier.origins.map((origin) => origin.requestID)).toEqual(["alias-human-a", "alias-human-c"])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias-human-c"))).toMatchObject({
+        state: "merged",
+        into: "alias-human-a",
+      })
+      expect(Option.isSome(yield* queue.restore(session.id, middle.id))).toBe(true)
+
+      const consolidated = yield* queue.consolidateSelected(session.id, middle.id)
       expect(consolidated.outcome).toBe("consolidated")
       const carrier = consolidated.items.find((item) => item.id === first.id)
-      if (!carrier) throw new Error("the aliased human carrier was missing")
+      if (!carrier) throw new Error("the restored aliased human carrier was missing")
       const visible = carrier.input.parts.flatMap((part) =>
         part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [],
       )
-      expect(visible.join("")).toBe("first aliased instruction\nsecond aliased instruction")
+      expect(visible.join("")).toBe("first aliased instruction\nmiddle aliased instruction\nlast aliased instruction")
       const queuedOriginals = carrier.input.parts.flatMap((part) => {
         if (part.type !== "text" || !part.ignored || !part.synthetic) return []
         const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueuePendingOriginal)
         return Option.isSome(group) ? group.value.constituents.map((item) => item.id) : []
       })
-      expect([...new Set(queuedOriginals)]).toEqual([first.id, second.id])
-      expect(carrier.origins.map((origin) => origin.requestID)).toEqual(["alias-human-a", "alias-human-b"])
+      expect([...new Set(queuedOriginals)]).toEqual([first.id, middle.id, last.id])
+      expect(carrier.origins.map((origin) => origin.requestID)).toEqual([
+        "alias-human-a",
+        "alias-human-b",
+        "alias-human-c",
+      ])
+      const visiblePart = carrier.input.parts.find(
+        (part) => part.type === "text" && !part.synthetic && !part.ignored && part.text === visible[0],
+      )
+      if (visiblePart?.type !== "text") throw new Error("the consolidated text metadata was missing")
+      const carrierGroup = Schema.decodeUnknownSync(SessionPromptQueue.Group)(visiblePart.metadata?.sessionQueue)
+      expect(carrierGroup.constituents.map((item) => item.id)).toEqual([first.id, middle.id, last.id])
       expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias-human-b"))).toMatchObject({
         state: "merged",
         into: "alias-human-a",
@@ -2734,19 +2767,24 @@ it.instance(
       })
       const message = delivered[0]
       if (!message?.group) throw new Error("the forced human carrier lost its group")
-      expect(message.group.constituents.map((item) => item.id)).toEqual([first.id, second.id])
+      expect(message.group.constituents.map((item) => item.id)).toEqual([first.id, middle.id, last.id])
       expect(
         message.group.constituents.map((item) =>
           item.input.parts.flatMap((part) => (part.type === "text" ? [part.metadata?.source] : [])),
         ),
-      ).toEqual([["alias-human-a"], ["alias-human-b"]])
+      ).toEqual([["alias-human-a"], ["alias-human-b"], ["alias-human-c"]])
       expect(
         message.parts
           .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
           .join(""),
-      ).toBe("first aliased instruction\nsecond aliased instruction")
+      ).toBe("first aliased instruction\nmiddle aliased instruction\nlast aliased instruction")
       expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias-human-a")).state).toBe("delivered")
       expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias-human-b"))).toMatchObject({
+        state: "merged",
+        into: "alias-human-a",
+        messageID: message.messageID,
+      })
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias-human-c"))).toMatchObject({
         state: "merged",
         into: "alias-human-a",
         messageID: message.messageID,
