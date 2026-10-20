@@ -4043,7 +4043,7 @@ it.instance(
         .filter((index) => index >= 0)
 
       expect(idleEvents).toContain(chat.id)
-      expect(requestOrder).toHaveLength(4)
+      expect(requestOrder).toHaveLength(3)
       expect(requestOrder[1]).toBeLessThan(requestOrder[2])
       expect(timeline.indexOf("idle")).toBeLessThan(requestOrder[2])
       expect(task).toMatchObject({ type: "compaction", auto: true, trigger: "threshold", resume: true })
@@ -7937,11 +7937,13 @@ it.instance(
         reply().text("queued done").stop(),
       )
       const idleAt: number[] = []
-      const unsubscribe = yield* events.listen((event) =>
-        event.type === SessionStatus.Event.Idle.type && (event.data as { sessionID: string }).sessionID === chat.id
-          ? llm.calls.pipe(Effect.map((calls) => void idleAt.push(calls)))
-          : Effect.void,
-      )
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Idle.type) return Effect.void
+        return Effect.gen(function* () {
+          const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+          if (data.sessionID === chat.id) idleAt.push(yield* llm.calls)
+        })
+      })
       yield* Effect.addFinalizer(() => unsubscribe)
       const format = Schema.decodeUnknownSync(SessionV1.Format)({
         type: "json_schema",

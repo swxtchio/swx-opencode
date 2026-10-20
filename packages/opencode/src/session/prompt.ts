@@ -1529,6 +1529,7 @@ const layer = Layer.effect(
         let settled = false
         let seen = 0
         let deferredCompactionTrigger: SessionV1.CompactionPart["trigger"]
+        let initialProviderBoundary = true
         // The drain already selected its initial input. Each provider completion opens one new queue boundary.
         let queuedInputSelected = true
         let initialRootSelected = false
@@ -1656,14 +1657,20 @@ const layer = Layer.effect(
             // The turn is over. Its reply answers the prompt that began it and every
             // steer that joined it, before the loop goes on to a turn of its own.
             if (lastAssistantMsg) yield* queue.answer(sessionID, lastUser.id, lastAssistantMsg)
+            if (yield* promoteInLoop(sessionID, "steer")) {
+              step = 0
+              continue
+            }
             if (deferredCompactionTrigger && lastAssistant?.error === undefined) {
+              // A runnable queued prompt is the handoff; otherwise continue the compacted work.
+              const resume = !(yield* queue.awaitingDrain(sessionID))
               yield* compaction.create({
                 sessionID,
                 agent: lastUser.agent,
                 model: lastUser.model,
                 auto: true,
                 trigger: deferredCompactionTrigger,
-                resume: false,
+                resume,
               })
               deferredCompactionTrigger = undefined
               settled = true
@@ -1672,10 +1679,6 @@ const layer = Layer.effect(
             // Queued prompts wait for this point and run one turn each, so a steer
             // or another admission arriving meanwhile is weighed before the next.
             // Each such turn is new user input and gets a fresh step allowance.
-            if (yield* promoteInLoop(sessionID, "steer")) {
-              step = 0
-              continue
-            }
             if (yield* promoteInLoop(sessionID, "queue")) {
               queuedInputSelected = true
               step = 0
@@ -1743,13 +1746,15 @@ const layer = Layer.effect(
                 model: lastUser.model,
                 auto: true,
                 trigger: "capacity",
-                resume: lastFinished.parentID !== lastUser.id,
+                resume: true,
               })
               deferredCompactionTrigger = undefined
               continue
             }
             if (yield* compaction.isAutoCompactionDue({ tokens: lastFinished.tokens, model })) {
-              if (lastFinished.parentID !== lastUser.id) {
+              // A parent mismatch also occurs when a steer joins the active drain.
+              // Only the first provider boundary of a newly idle runner may compact immediately.
+              if (initialProviderBoundary && lastFinished.parentID !== lastUser.id) {
                 yield* compaction.create({
                   sessionID,
                   agent: lastUser.agent,
@@ -1882,6 +1887,7 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            initialProviderBoundary = false
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1903,6 +1909,9 @@ const layer = Layer.effect(
             }
 
             if (structured !== undefined) {
+              // Structured output returns before the generic compact-result path below.
+              if (result === "compact" && handle.compactionTrigger === "capacity")
+                deferredCompactionTrigger = "capacity"
               handle.message.structured = structured
               handle.message.finish = handle.message.finish ?? "stop"
               yield* sessions.updateMessage(handle.message)
