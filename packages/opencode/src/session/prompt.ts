@@ -1663,7 +1663,7 @@ const layer = Layer.effect(
                 model: lastUser.model,
                 auto: true,
                 trigger: deferredCompactionTrigger,
-                resume: deferredCompactionTrigger === "capacity",
+                resume: false,
               })
               deferredCompactionTrigger = undefined
               settled = true
@@ -1939,6 +1939,21 @@ const layer = Layer.effect(
             if (result === "stop") return "break" as const
             if (result === "compact") {
               const overflow = !handle.message.finish
+              if (!overflow && handle.compactionTrigger === "capacity" && finished) {
+                const assistant = yield* MessageV2.get({ sessionID, messageID: handle.message.id }).pipe(
+                  Effect.provideService(Database.Service, database),
+                  Effect.orDie,
+                )
+                const hasToolCalls =
+                  assistant?.parts.some(
+                    (part) =>
+                      part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
+                  ) ?? false
+                if (!hasToolCalls) {
+                  deferredCompactionTrigger = "capacity"
+                  return "continue" as const
+                }
+              }
               yield* compaction.create({
                 sessionID,
                 agent: lastUser.agent,

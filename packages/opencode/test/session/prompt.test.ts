@@ -4079,6 +4079,111 @@ it.instance(
   30_000,
 )
 
+it.instance(
+  "terminal capacity compaction waits for idle and delivers the queued prompt without inventing continuation",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        compaction: { auto: true },
+      }))
+      const provider = yield* ProviderSvc.Service
+      const configured = yield* provider.getProvider(ref.providerID)
+      const originalFetch = configured.options.fetch ?? fetch
+      const timeline: string[] = []
+      configured.options.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        timeline.push("provider-request")
+        return originalFetch(input, init)
+      }
+      yield* Effect.addFinalizer(() => Effect.sync(() => (configured.options.fetch = originalFetch)))
+
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({ title: "Terminal capacity boundary" })
+      const idleEvents: string[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Idle.type) return Effect.void
+        return Effect.sync(() => {
+          const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+          idleEvents.push(data.sessionID)
+          if (data.sessionID === chat.id) timeline.push("idle")
+        })
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const terminalResponse = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(terminalResponse, undefined).pipe(Effect.ignore))
+      yield* llm.push(
+        reply()
+          .wait(deferredAsPromise(terminalResponse))
+          .text("completed capacity answer")
+          .usage({ input: 90_000, output: 100 })
+          .stop(),
+        reply().text("capacity maintenance summary").stop(),
+        reply().text("queued capacity answer").stop(),
+        reply().text("unexpected extra continuation").stop(),
+      )
+
+      const root = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: said("finish the capacity task"),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "terminal capacity request did not start", "10 seconds")
+      const queued = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          delivery: "queue",
+          parts: said("queued after capacity"),
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(admitted(chat.id, "queued after capacity"), "capacity follow-up was not queued", "10 seconds")
+
+      yield* Deferred.succeed(terminalResponse, undefined)
+      yield* awaitWithTimeout(llm.wait(2), "terminal capacity summary request did not start", "10 seconds")
+      const afterSummaryStart = yield* sessions.messages({ sessionID: chat.id })
+      const task = afterSummaryStart
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      const requestOrder = timeline
+        .map((item, index) => (item === "provider-request" ? index : -1))
+        .filter((index) => index >= 0)
+
+      expect(idleEvents).toContain(chat.id)
+      expect(requestOrder).toHaveLength(2)
+      expect(timeline.indexOf("idle")).toBeLessThan(requestOrder[1])
+      expect(task).toMatchObject({ type: "compaction", auto: true, trigger: "capacity" })
+
+      yield* awaitWithTimeout(llm.wait(3), "queued capacity prompt was not delivered after compaction", "10 seconds")
+      const requests = yield* llm.inputs
+      expect(requests).toHaveLength(3)
+      expect(lastUserContent(requests[2])).toContain("queued after capacity")
+      expect(lastUserContent(requests[2])).not.toContain("Continue if you have next steps")
+      expect(task).toMatchObject({ resume: false })
+
+      const [rootReply, queuedReply] = yield* finish(root, queued)
+      expect(rootReply.parts.some((part) => part.type === "text" && part.text === "completed capacity answer")).toBe(true)
+      expect(queuedReply.parts.some((part) => part.type === "text" && part.text === "queued capacity answer")).toBe(true)
+      expect(
+        (yield* sessions.messages({ sessionID: chat.id })).some((message) =>
+          message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true),
+        ),
+      ).toBe(false)
+      expect(yield* queue.list(chat.id)).toEqual([])
+      expect((yield* status.get(chat.id)).type).toBe("idle")
+      expect(yield* llm.calls).toBe(3)
+    }),
+  30_000,
+)
+
 noLLMServer.instance.skip(
   "prompt emits v2 prompted and synthetic events (v2 projector disabled)",
   () =>
