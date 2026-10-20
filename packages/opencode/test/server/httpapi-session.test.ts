@@ -124,6 +124,10 @@ function pathFor(path: string, params: Record<string, string>) {
   return Object.entries(params).reduce((result, [key, value]) => result.replace(`:${key}`, value), path)
 }
 
+// The opencode-arm-release-x64.yml release-proof job typechecks this file against its pinned source.
+const selectedForcePath = "/session/:sessionID/queue/force/:itemID"
+const selectedRewritePath = "/session/:sessionID/queue/rewrite/:itemID"
+
 function createSession(input?: Session.CreateInput) {
   return Session.use.create(input)
 }
@@ -2154,7 +2158,7 @@ it.live(
           "the composer requests never finished preparing",
         )
 
-        const forcePath = (itemID: string) => pathFor(SessionQueuePaths.force, { ...params, itemID })
+        const forcePath = (itemID: string) => pathFor(selectedForcePath, { ...params, itemID })
         const blocked = yield* post(forcePath(selected.id), { holder: "view-one" })
         expect(blocked.status).toBe(200)
         expect(yield* json<{ outcome: string; items: SessionQueue.Item[] }>(blocked)).toMatchObject({
@@ -2221,7 +2225,16 @@ it.live(
           })
 
         expect((yield* post(SessionQueuePaths.hold, { holder: "rewrite-view" })).status).toBe(200)
-        yield* Effect.addFinalizer(() => post(SessionQueuePaths.release, { holder: "rewrite-view" }).pipe(Effect.ignore))
+        yield* Effect.addFinalizer(() =>
+          Effect.gen(function* () {
+            yield* Effect.forEach(
+              yield* list(),
+              (item) => post(SessionQueuePaths.remove, { id: item.id }).pipe(Effect.ignore),
+              { discard: true },
+            )
+            yield* post(SessionQueuePaths.release, { holder: "rewrite-view" }).pipe(Effect.ignore)
+          }).pipe(Effect.ignore),
+        )
         expect((yield* send("rewrite-route-selected", "rough draft")).status).toBe(204)
         expect((yield* send("rewrite-route-later", "leave this prompt alone")).status).toBe(204)
         const [selected, later] = yield* pollWithTimeout(
@@ -2243,7 +2256,10 @@ it.live(
           "the rewrite prompts never finished preparing",
         )
 
-        const rewritePath = pathFor(SessionQueuePaths.rewrite, { ...params, itemID: selected.id })
+        const rewritePath = pathFor(selectedRewritePath, {
+          ...params,
+          itemID: selected.id,
+        })
         const response = yield* post(rewritePath, { expectedText: "rough draft", text: "clearer draft" })
         expect(response.status).toBe(200)
         const rewritten = yield* json<{ outcome: string; items: SessionQueue.Item[] }>(response)
@@ -3433,7 +3449,7 @@ describe("session HttpApi pending prompt selection", () => {
           body: JSON.stringify({ model: { providerID: "test", id: "model-b", variant: "high" } }),
         })
         expect(selected.status).toBe(200)
-        const forced = yield* post(pathFor(SessionQueuePaths.force, { ...params, itemID: pending.id }), {
+        const forced = yield* post(pathFor(selectedForcePath, { ...params, itemID: pending.id }), {
           holder: "force-view",
         })
         expect(forced.status).toBe(200)
