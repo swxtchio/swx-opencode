@@ -3939,7 +3939,127 @@ it.instance(
 )
 
 it.instance(
-  "terminal threshold crossing compacts at idle without waiting for a later prompt",
+  "soft-threshold maintenance waits for a true idle boundary when a steer joins the running turn",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const file = path.join(instance.directory, "threshold-steer-tool-result.txt")
+      yield* writeText(file, "threshold steer tool result")
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        compaction: { auto: true, threshold_percent: 50 },
+      }))
+      const provider = yield* ProviderSvc.Service
+      const configured = yield* provider.getProvider(ref.providerID)
+      const originalFetch = configured.options.fetch ?? fetch
+      const timeline: string[] = []
+      configured.options.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        timeline.push("provider-request")
+        return originalFetch(input, init)
+      }
+      yield* Effect.addFinalizer(() => Effect.sync(() => (configured.options.fetch = originalFetch)))
+
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const chat = yield* sessions.create({
+        title: "Threshold steer boundary",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const idleEvents: string[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Idle.type) return Effect.void
+        return Effect.sync(() => {
+          const data = Schema.decodeUnknownSync(SessionStatus.Event.Idle.data)(event.data)
+          if (data.sessionID === chat.id) {
+            idleEvents.push(data.sessionID)
+            timeline.push("idle")
+          }
+        })
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const toolGate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(toolGate, undefined).pipe(Effect.ignore))
+      yield* llm.push(
+        reply()
+          .wait(deferredAsPromise(toolGate))
+          .tool("read", { filePath: file })
+          .usage({ input: 51_000, output: 100 }),
+        reply().text("steer task completed").usage({ input: 51_100, output: 100 }).stop(),
+        reply().text("threshold summary").stop(),
+        reply().text("automatic continuation after threshold compaction").stop(),
+      )
+
+      const root = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("read the file and finish the task") })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "threshold root request did not start", "10 seconds")
+
+      const steer = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          delivery: "steer",
+          parts: said("steer during the running turn"),
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        sessions.messages({ sessionID: chat.id }).pipe(
+          Effect.map((messages) =>
+            messages.some(
+              (message) =>
+                message.info.role === "user" &&
+                message.parts.some((part) => part.type === "text" && part.text === "steer during the running turn"),
+            ),
+          ),
+        ),
+        "steer was not promoted during the active turn",
+        "10 seconds",
+      )
+
+      yield* Deferred.succeed(toolGate, undefined)
+      yield* awaitWithTimeout(llm.wait(2), "steer continuation was not sent before compaction", "10 seconds")
+      const afterSteer = yield* llm.inputs
+      const steerRequest = afterSteer[1]
+      if (!steerRequest) throw new Error("expected the steer continuation request")
+      expect(JSON.stringify(steerRequest.messages)).toContain("steer during the running turn")
+      expect(JSON.stringify(steerRequest.messages)).toContain("threshold steer tool result")
+      expect(
+        (yield* sessions.messages({ sessionID: chat.id })).some((message) =>
+          message.parts.some((part) => part.type === "compaction"),
+        ),
+      ).toBe(false)
+
+      yield* awaitWithTimeout(llm.wait(3), "threshold compaction did not wait for idle", "10 seconds")
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const task = messages
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      const requestOrder = timeline
+        .map((item, index) => (item === "provider-request" ? index : -1))
+        .filter((index) => index >= 0)
+
+      expect(idleEvents).toContain(chat.id)
+      expect(requestOrder).toHaveLength(4)
+      expect(requestOrder[1]).toBeLessThan(requestOrder[2])
+      expect(timeline.indexOf("idle")).toBeLessThan(requestOrder[2])
+      expect(task).toMatchObject({ type: "compaction", auto: true, trigger: "threshold", resume: true })
+
+      yield* awaitWithTimeout(llm.wait(4), "threshold compaction did not resume its work", "10 seconds")
+      const [rootReply, steerReply] = yield* finish(root, steer)
+      expect(rootReply.info.role).toBe("assistant")
+      expect(steerReply.info.role).toBe("assistant")
+      expect(yield* queue.list(chat.id)).toEqual([])
+      expect(yield* llm.calls).toBe(4)
+    }),
+  30_000,
+)
+
+it.instance(
+  "terminal threshold crossing compacts at idle and resumes automatically",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig((url) => ({
@@ -3973,6 +4093,7 @@ it.instance(
       yield* llm.push(
         reply().text("completed threshold answer").usage({ input: 51_000, output: 100 }).stop(),
         reply().text("maintenance summary").stop(),
+        reply().text("continued automatically after threshold compaction").stop(),
       )
 
       const response = yield* prompt
@@ -3989,6 +4110,11 @@ it.instance(
         "terminal threshold maintenance waited for another user prompt",
         "10 seconds",
       )
+      yield* awaitWithTimeout(
+        llm.wait(3),
+        "terminal threshold maintenance did not resume automatically",
+        "10 seconds",
+      )
 
       const messages = yield* sessions.messages({ sessionID: chat.id })
       const task = messages
@@ -3999,20 +4125,30 @@ it.instance(
         .filter((index) => index >= 0)
 
       expect(idleEvents).toContain(chat.id)
-      expect(requestOrder).toHaveLength(2)
+      expect(requestOrder).toHaveLength(3)
       expect(timeline.indexOf("idle")).toBeLessThan(requestOrder[1])
-      expect(task).toMatchObject({ type: "compaction", trigger: "threshold", resume: false })
+      expect(requestOrder[1]).toBeLessThan(requestOrder[2])
+      expect(task).toMatchObject({ type: "compaction", trigger: "threshold", resume: true })
 
       const [result] = yield* finish(response)
       expect(result.info.role).toBe("assistant")
       expect(result.parts.some((part) => part.type === "text" && part.text === "completed threshold answer")).toBe(true)
       const finished = yield* sessions.messages({ sessionID: chat.id })
       expect(
-        finished.some((message) =>
-          message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true),
+        finished.some(
+          (message) =>
+            message.info.role === "user" &&
+            message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true),
         ),
-      ).toBe(false)
-      expect(yield* llm.calls).toBe(2)
+      ).toBe(true)
+      expect(
+        finished.some((message) =>
+          message.parts.some(
+            (part) => part.type === "text" && part.text === "continued automatically after threshold compaction",
+          ),
+        ),
+      ).toBe(true)
+      expect(yield* llm.calls).toBe(3)
     }),
   30_000,
 )
@@ -7771,6 +7907,83 @@ it.instance(
       expect(lastUser((yield* llm.inputs)[1])).toEqual({ role: "user", content: "queued after it" })
       // One drain carries the queued turn: the session never goes idle between them.
       expect(idleAt).toEqual([2])
+    }),
+  15_000,
+)
+
+it.instance(
+  "terminal structured output preserves capacity compaction before queued delivery",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const events = yield* EventV2Bridge.Service
+      const chat = yield* sessions.create({ title: "Structured capacity completion" })
+      const structuredGate = yield* Deferred.make<void>()
+      const summaryGate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() =>
+        Effect.all([Deferred.succeed(structuredGate, undefined), Deferred.succeed(summaryGate, undefined)], {
+          discard: true,
+        }),
+      )
+      yield* llm.push(
+        reply()
+          .wait(deferredAsPromise(structuredGate))
+          .tool("StructuredOutput", { answer: "42" })
+          .usage({ input: 90_000, output: 100 }),
+        reply().wait(deferredAsPromise(summaryGate)).text("capacity summary").stop(),
+        reply().text("queued done").stop(),
+      )
+      const idleAt: number[] = []
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === SessionStatus.Event.Idle.type && (event.data as { sessionID: string }).sessionID === chat.id
+          ? llm.calls.pipe(Effect.map((calls) => void idleAt.push(calls)))
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const format = Schema.decodeUnknownSync(SessionV1.Format)({
+        type: "json_schema",
+        schema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+      })
+
+      const structured = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, format, parts: said("answer in structure") })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "structured capacity call never started", "10 seconds")
+      const held = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, delivery: "queue", parts: said("queued after capacity") })
+        .pipe(Effect.forkChild)
+      yield* queued(chat.id, 1)
+
+      yield* Deferred.succeed(structuredGate, undefined)
+      yield* awaitWithTimeout(llm.wait(2), "terminal structured capacity did not start maintenance", "10 seconds")
+      const beforeSummary = yield* sessions.messages({ sessionID: chat.id })
+      const structuredAnswer = beforeSummary.find(
+        (message) => message.info.role === "assistant" && message.info.structured !== undefined,
+      )
+      const task = beforeSummary
+        .flatMap((message) => message.parts)
+        .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+
+      expect(structuredAnswer?.info.role).toBe("assistant")
+      if (structuredAnswer?.info.role === "assistant") expect(structuredAnswer.info.structured).toEqual({ answer: "42" })
+      expect(task).toMatchObject({ type: "compaction", auto: true, trigger: "capacity", resume: false })
+      expect(idleAt).toContain(1)
+
+      yield* Deferred.succeed(summaryGate, undefined)
+      yield* awaitWithTimeout(llm.wait(3), "queued prompt was not delivered after structured capacity summary", "10 seconds")
+      const queuedRequest = (yield* llm.inputs)[2]
+      if (!queuedRequest) throw new Error("expected queued request after structured capacity summary")
+      expect(lastUserContent(queuedRequest)).toContain("queued after capacity")
+
+      const [result, queuedReply] = yield* finish(structured, held)
+      expect(result?.info.role === "assistant" ? result.info.structured : undefined).toEqual({ answer: "42" })
+      expect(queuedReply?.info.role).toBe("assistant")
+      expect(queuedReply?.parts.some((part) => part.type === "text" && part.text === "queued done")).toBe(true)
+      expect(yield* queue.list(chat.id)).toEqual([])
+      expect(yield* llm.calls).toBe(3)
     }),
   15_000,
 )

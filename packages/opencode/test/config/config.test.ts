@@ -372,12 +372,12 @@ it.instance("updates config and preserves empty shell sentinel", () =>
     yield* writeConfigEffect(
       test.directory,
       { $schema: "https://opencode.ai/config.json", shell: "bash" },
-      "config.json",
+      "opencode.json",
     )
 
     yield* Config.Service.use((svc) => svc.update(ConfigParse.schema(ConfigV1.Info, { shell: "" }, "test:config")))
 
-    const writtenConfig = yield* FSUtil.use.readJson(path.join(test.directory, "config.json"))
+    const writtenConfig = yield* FSUtil.use.readJson(path.join(test.directory, "opencode.json"))
     expect(writtenConfig).toMatchObject({ shell: "" })
   }),
 )
@@ -396,8 +396,8 @@ it.effect("updates global config and omits empty shell key in json", () =>
 it.instance("persists the project automatic compaction percentage", () =>
   Effect.gen(function* () {
     const instance = yield* TestInstance
-    const file = path.join(instance.directory, "config.json")
-    yield* writeConfigEffect(instance.directory, schemaConfig({ shell: "bash" }), "config.json")
+    const file = path.join(instance.directory, "opencode.json")
+    yield* writeConfigEffect(instance.directory, schemaConfig({ shell: "bash" }), "opencode.json")
     yield* Config.use.update({ compaction: { threshold_percent: 72 } })
     const stored = yield* FSUtil.use.readJson(file)
 
@@ -489,7 +489,7 @@ for (const input of projectInputs) {
     Effect.gen(function* () {
       const instance = yield* TestInstance
       const fs = yield* FSUtil.Service
-      const file = path.join(instance.directory, "config.json")
+      const file = path.join(instance.directory, "opencode.json")
       yield* fs.writeFileString(file, yield* fs.readFileString(path.join(updateFixtures, input)))
       const patch = ConfigParse.schema(ConfigV1.Info, yield* fs.readJson(`${prefix}-patch.json`), input)
       yield* Config.use.update(patch)
@@ -532,7 +532,7 @@ it.instance("rejects a project update with native agent permissions without writ
   Effect.gen(function* () {
     const instance = yield* TestInstance
     const fs = yield* FSUtil.Service
-    const file = path.join(instance.directory, "config.json")
+    const file = path.join(instance.directory, "opencode.json")
     const before = JSON.stringify({ agents: { reviewer: { permissions: [] } } })
     yield* fs.writeFileString(file, before)
     const exit = yield* Effect.exit(Config.use.update({ username: "changed" }))
