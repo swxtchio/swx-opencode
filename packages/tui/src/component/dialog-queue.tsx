@@ -35,6 +35,7 @@ export function DialogQueue(props: { sessionID: string; enhancement?: PromptEnha
   const [enhancing, setEnhancing] = createSignal(false)
   let closed = false
   let renewed = Date.now()
+  let holdVersion = 0
   let idle: ReturnType<typeof setTimeout> | undefined
 
   const checked = async <R extends { error?: unknown; response?: Response }>(call: Promise<R>) => {
@@ -59,21 +60,23 @@ export function DialogQueue(props: { sessionID: string; enhancement?: PromptEnha
   // A close releases at once, and again as each hold request still in flight
   // settles, so no slow response delays the release and a hold the server
   // accepts after the close never outlives it.
-  const request = (renewal: boolean) =>
+  const request = (renewal: boolean) => {
+    const version = ++holdVersion
     void checked(sdk.client.session.queue.hold({ sessionID: props.sessionID, holder }, { signal: signal() }))
       .then((result) => {
-        if (closed) return
+        if (closed || version !== holdVersion) return
         setHold("held")
         if (result.data) sync.queue.listed(props.sessionID, result.data)
       })
       .catch((error) => {
-        if (closed) return
+        if (closed || version !== holdVersion) return
         setHold("failed")
         failed(renewal ? "keep pausing delivery of" : "pause delivery of")(error)
       })
       .finally(() => {
         if (closed) release()
       })
+  }
 
   const active = () => {
     if (closed) return
@@ -191,6 +194,7 @@ export function DialogQueue(props: { sessionID: string; enhancement?: PromptEnha
             onUnavailableTrigger: explainUnavailable("No queued prompt is selected."),
             onTrigger: (option) => {
               active()
+              holdVersion++
               void checked(
                 sdk.client.session.queue.force(
                   { sessionID: props.sessionID, itemID: option.value, holder },
@@ -241,11 +245,12 @@ export function DialogQueue(props: { sessionID: string; enhancement?: PromptEnha
                     failed("force")(error)
                     return
                   }
+                  const reconciliation = ++holdVersion
                   void checked(
                     sdk.client.session.queue.holdStatus({ sessionID: props.sessionID, holder }, { signal: signal() }),
                   )
                     .then((result) => {
-                      if (closed) return
+                      if (closed || reconciliation !== holdVersion) return
                       const data = result.data
                       if (!data) {
                         setHold("failed")
@@ -255,7 +260,7 @@ export function DialogQueue(props: { sessionID: string; enhancement?: PromptEnha
                       setHold(data.held ? "held" : "failed")
                     })
                     .catch(() => {
-                      if (!closed) setHold("failed")
+                      if (!closed && reconciliation === holdVersion) setHold("failed")
                     })
                     .finally(() => {
                       if (!closed) failed("force")(error)

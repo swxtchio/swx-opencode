@@ -620,6 +620,77 @@ test("a failed force response refreshes the released hold and current queue", as
   expect(view.dialog.stack.length).toBe(1)
 })
 
+test("a late pre-force hold renewal cannot overwrite the reconciled hold state", async () => {
+  const renewal = later()
+  const forced = { ...queued, delivery: "steer" as const }
+  const served = { holdPosts: 0, renewalStarted: false, statusReads: 0, statusHeld: undefined as boolean | undefined }
+  const view = await setup([steer, queued], (path) => {
+    if (path.endsWith(`/queue/force/${queued.id}`))
+      return Promise.resolve(json({ name: "Unavailable" }, { status: 503 }))
+    if (path.includes("/queue/hold/")) {
+      served.statusReads++
+      const response = json({ held: false, items: [steer, forced] })
+      const read = response.json.bind(response)
+      response.json = async () => {
+        const body = await read()
+        served.statusHeld = (body as { held: boolean }).held
+        return body
+      }
+      const readText = response.text.bind(response)
+      response.text = async () => {
+        const body = await readText()
+        served.statusHeld = (JSON.parse(body) as { held: boolean }).held
+        return body
+      }
+      return Promise.resolve(response)
+    }
+    if (path.endsWith("/queue/hold")) {
+      served.holdPosts++
+      if (served.holdPosts === 2) {
+        served.renewalStarted = true
+        return renewal.response
+      }
+    }
+  })
+  await view.open()
+  await wait(async () => (await view.frame()).includes("delivery paused"))
+  jest.useFakeTimers({ now: Date.now() })
+
+  jest.advanceTimersByTime(60_000)
+  view.app.mockInput.pressKey("x")
+  await settle(
+    () =>
+      view.requests.filter((request) => request.method === "POST" && request.path.endsWith("/queue/hold")).length === 2,
+  )
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("f", { ctrl: true })
+  await settle(() => view.requests.some((request) => request.path.endsWith(`/queue/force/${queued.id}`)))
+  await settle(() => view.requests.some((request) => request.method === "GET" && request.path.includes("/queue/hold/")))
+  await settle(() => view.sync.data.session_queue[sessionID]?.find((row) => row.id === queued.id)?.delivery === "steer")
+  expect(served).toMatchObject({ holdPosts: 2, renewalStarted: true, statusReads: 1, statusHeld: false })
+
+  const stale = json([steer, queued])
+  let bodyRead = false
+  const readJson = stale.json.bind(stale)
+  const readText = stale.text.bind(stale)
+  stale.json = async () => {
+    const body = await readJson()
+    bodyRead = true
+    return body
+  }
+  stale.text = async () => {
+    const body = await readText()
+    bodyRead = true
+    return body
+  }
+  renewal.answer(stale)
+  await settle(() => bodyRead)
+  await new Promise<void>((resolve) => queueMicrotask(() => queueMicrotask(resolve)))
+
+  expect(await view.frame()).toContain("delivery NOT paused")
+  expect(view.sync.data.session_queue[sessionID]).toEqual([steer, forced])
+})
+
 test("a hold renewal that lands after force closes the view is released", async () => {
   const renewal = later()
   let holds = 0
