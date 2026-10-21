@@ -76,6 +76,7 @@ ${directSecondPath}
             "FAST_SUITE_FAIL_POSTTEST",
             "FAST_SUITE_EXTRA_PRETEST_TEST",
             "FAST_SUITE_EXTRA_POSTTEST_TEST",
+            "FAST_SUITE_LAUNCH_SHAPE",
             "FAST_SUITE_FORCE_EXTRA_FILE",
             "PATH",
             "HOME",
@@ -112,6 +113,8 @@ ${directSecondPath}
         FAST_SUITE_FAIL_BUILD: "0",
         FAST_SUITE_UNDECLARED: "ambient-only",
         FAST_SUITE_EMPTY_PLAN: "0",
+        FAST_SUITE_WRONG_OWNER_PLAN: "0",
+        FAST_SUITE_LAUNCH_SHAPE: "",
         FAST_SUITE_REAL_TURBO: realpathSync(join(import.meta.dir, "..", "node_modules", ".bin", "turbo")),
         PATH: `${join(root, "bin")}:${process.env.PATH}`,
       },
@@ -206,8 +209,18 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         private: true,
         type: "module",
         dependencies: { "@fixture/leaf": "workspace:*" },
-        scripts: { test: "bun test ./test/unselected.test.ts" },
+        scripts: { test: "bun test ./test/unselected.test.ts", prepare: "bun ./probe.ts" },
       }),
+    )
+    writeFileSync(
+      join(dependencyRoot, "probe.ts"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        'appendFileSync(process.env.FAST_SUITE_BUILD_LOG!, "non-build-prerequisite\\n")',
+        'const result = Bun.spawnSync(["bun", "test", "./test/unselected.test.ts"], { stdout: "inherit", stderr: "inherit" })',
+        'if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "",
+      ].join("\n"),
     )
     writeFileSync(
       join(dependencyRoot, "test", "unselected.test.ts"),
@@ -302,6 +315,13 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
       [
         'import { appendFileSync } from "node:fs"',
         'appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "pretest\\n")',
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE === "absolute-bun") {',
+        '  const result = Bun.spawnSync([process.execPath, "test", "./test/unlisted.test.ts"], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE === "bun-delegation") {',
+        '  Bun.spawnSync(["bun", "run", "--bun", "verify:unlisted"], { stdout: "inherit", stderr: "inherit" })',
+        "}",
         'if (process.env.FAST_SUITE_EXTRA_PRETEST_TEST === "1") {',
         '  const result = Bun.spawnSync(["bun", "run", "verify:unlisted"], { stdout: "inherit", stderr: "inherit" })',
         '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
@@ -315,11 +335,26 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
       [
         'import { appendFileSync } from "node:fs"',
         'appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "posttest\\n")',
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE === "node-test") {',
+        '  const result = Bun.spawnSync(["node", "--test", "./x.mjs"], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
         'if (process.env.FAST_SUITE_EXTRA_POSTTEST_TEST === "1") {',
         '  const result = Bun.spawnSync(["bun", "run", "verify:unlisted"], { stdout: "inherit", stderr: "inherit" })',
         '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
         "}",
         'if (process.env.FAST_SUITE_FAIL_POSTTEST === "1") process.exit(1)',
+        "",
+      ].join("\n"),
+    )
+    writeFileSync(
+      join(packageRoot, "x.mjs"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        'import { test } from "node:test"',
+        'test("is an unlisted Node test", () => {',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER, "unlisted-node\\n")',
+        "})",
         "",
       ].join("\n"),
     )
@@ -514,6 +549,9 @@ if [ "\${FAST_SUITE_EMPTY_PLAN:-0}" = 1 ] && [ "$*" = "run test --filter=./packa
   printf '%s\\n' '{"tasks":[]}'
   exit 0
 fi
+if [ "\${FAST_SUITE_WRONG_OWNER_PLAN:-0}" = 1 ] && [ "$*" = "run test --filter=./packages/direct --dry=json" ]; then
+  exec "\${FAST_SUITE_REAL_TURBO:?}" run test --filter=./packages/example --dry=json
+fi
 exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
 `,
     )
@@ -695,6 +733,30 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     expect(Bun.spawnSync(["git", "add", "tests/run.sh"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
     expect(Bun.spawnSync(["git", "commit", "-qm", "restore the JUnit observed receipt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
 
+    for (const shape of ["absolute-bun", "bun-delegation", "node-test"]) {
+      runOptions.env.FAST_SUITE_LAUNCH_SHAPE = shape
+      writeFileSync(marker, "")
+      const launchEscape = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+      if (launchEscape.exitCode === 0) console.error(shape, launchEscape.stdout.toString(), readFileSync(marker, "utf8"))
+      if (shape === "bun-delegation") {
+        expect(readFileSync(marker, "utf8")).not.toContain("unlisted")
+        expect(readFileSync(marker, "utf8")).toContain("selected-configured\n")
+        expect(launchEscape.stdout.toString() + launchEscape.stderr.toString()).toContain("unobservable Bun delegation")
+      }
+      expect(launchEscape.exitCode).toBe(1)
+      expect(launchEscape.stdout.toString()).toContain("verdict=refused mode=fast")
+      if (shape === "absolute-bun") {
+        expect(launchEscape.stderr.toString()).toContain("unobserved Bun test launch")
+        expect(readFileSync(marker, "utf8")).toContain("unlisted\n")
+      }
+      if (shape === "node-test") {
+        expect(launchEscape.stderr.toString()).toContain("unobservable Node test launch")
+        expect(readFileSync(marker, "utf8")).toContain("unlisted-node\n")
+        expect(readFileSync(marker, "utf8")).toContain("selected-configured\n")
+      }
+    }
+    runOptions.env.FAST_SUITE_LAUNCH_SHAPE = ""
+
     runOptions.env.FAST_SUITE_EXTRA_PRETEST_TEST = "1"
     writeFileSync(marker, "")
     const pretestEscape = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
@@ -717,6 +779,9 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     writeFileSync(marker, "")
     writeFileSync(buildLog, "")
     const preparationEscape = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    if (!preparationEscape.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=execution-set-mismatch exit_code=1")) {
+      console.error(preparationEscape.stdout.toString(), preparationEscape.stderr.toString())
+    }
     expect(preparationEscape.exitCode).toBe(1)
     expect(preparationEscape.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=execution-set-mismatch exit_code=1")).toBe(true)
     expect(preparationEscape.stderr.toString()).toContain("JUnit-observed files outside the manifest")
@@ -777,6 +842,78 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     writeFileSync(packageTurboConfig, JSON.stringify(exampleTurboConfig))
     expect(Bun.spawnSync(["git", "add", "packages/example/turbo.json"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
     expect(Bun.spawnSync(["git", "commit", "-qm", "remove the unselected test prerequisite"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+
+    const rootTurboConfig = JSON.parse(readFileSync(join(root, "turbo.json"), "utf8"))
+    writeFileSync(
+      join(root, "turbo.json"),
+      JSON.stringify({
+        ...rootTurboConfig,
+        tasks: {
+          ...rootTurboConfig.tasks,
+          prepare: {
+            outputs: [],
+            passThroughEnv: ["FAST_SUITE_BUILD_LOG", "FAST_SUITE_MARKER", "FAST_SUITE_REAL_BUN", "FAST_SUITE_BUN_LOG", "PATH"],
+          },
+        },
+      }),
+    )
+    writeFileSync(
+      packageTurboConfig,
+      JSON.stringify({
+        ...exampleTurboConfig,
+        tasks: {
+          ...exampleTurboConfig.tasks,
+          test: { ...exampleTurboConfig.tasks.test, dependsOn: ["^prepare"] },
+        },
+      }),
+    )
+    expect(Bun.spawnSync(["git", "add", "turbo.json", "packages/example/turbo.json"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "add a non-build prerequisite without test words"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    const nonBuildPlan = Bun.spawnSync(
+      ["bun", "turbo", "run", "test", "--filter=./packages/example", "--dry=json"],
+      runOptions,
+    )
+    expect(nonBuildPlan.exitCode).toBe(0)
+    const nonBuildTask = JSON.parse(nonBuildPlan.stdout.toString()).tasks.find(
+      (task: { taskId: string }) => task.taskId === "@fixture/dependency#prepare",
+    )
+    expect(nonBuildTask.command).toBe("bun ./probe.ts")
+    writeFileSync(marker, "")
+    writeFileSync(buildLog, "")
+    const nonBuildPrerequisite = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(readFileSync(buildLog, "utf8")).toBe("")
+    expect(readFileSync(marker, "utf8")).toBe("")
+    expect(nonBuildPrerequisite.exitCode).toBe(1)
+    expect(nonBuildPrerequisite.stderr.toString()).toContain("not an admitted build task: @fixture/dependency#prepare")
+    writeFileSync(join(root, "turbo.json"), JSON.stringify(rootTurboConfig))
+    writeFileSync(packageTurboConfig, JSON.stringify(exampleTurboConfig))
+    expect(Bun.spawnSync(["git", "add", "turbo.json", "packages/example/turbo.json"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "restore build preparation"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+
+    writeFileSync(manifest, `${directPath}\n`)
+    expect(Bun.spawnSync(["git", "add", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "select the valid direct package for wrong-owner proof"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    runOptions.env.FAST_SUITE_WRONG_OWNER_PLAN = "1"
+    const wrongOwnerProbe = Bun.spawnSync(
+      ["bun", "turbo", "run", "test", "--filter=./packages/direct", "--dry=json"],
+      runOptions,
+    )
+    expect(wrongOwnerProbe.exitCode).toBe(0)
+    const wrongOwnerTasks = JSON.parse(wrongOwnerProbe.stdout.toString()).tasks as { directory: string; taskId: string }[]
+    expect(wrongOwnerTasks.length).toBeGreaterThan(0)
+    expect(wrongOwnerTasks.some((task) => task.directory === "packages/example" && task.taskId.endsWith("#test"))).toBe(true)
+    expect(wrongOwnerTasks.some((task) => task.directory === "packages/direct")).toBe(false)
+    writeFileSync(marker, "")
+    writeFileSync(buildLog, "")
+    const wrongOwnerPlan = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(readFileSync(marker, "utf8")).toBe("")
+    expect(readFileSync(buildLog, "utf8")).toBe("")
+    expect(wrongOwnerPlan.exitCode).toBe(1)
+    expect(wrongOwnerPlan.stderr.toString()).toContain("did not resolve the owning test task for packages/direct")
+    runOptions.env.FAST_SUITE_WRONG_OWNER_PLAN = "0"
+    writeFileSync(manifest, validManifest)
+    expect(Bun.spawnSync(["git", "add", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "restore selected packages"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
 
     writeFileSync(
       join(scriptlessPackageRoot, "package.json"),
@@ -1069,5 +1206,5 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     expect(fullWithArguments.stdout.toString().trim().endsWith("verdict=completed mode=full exit_code=1")).toBe(true)
     expect(readFileSync(turboLog, "utf8").trim().split("\n").at(-1)).toBe("test --filter=./packages/example")
   },
-  60_000,
+  180_000,
 )

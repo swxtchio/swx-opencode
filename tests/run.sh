@@ -8,10 +8,10 @@
 # together through its scoped test task; packages without a task use `bun run test`.
 # Turbo/Bun own strict env, local config, script options, and one package lifecycle.
 # JUnit-less nonzero exits remain attributed refusals; extra or missing suites are rejected.
-# Residual limitations accepted for this fast gate (follow-up: swxtchio/swx-opencode#324):
-# absolute-Bun argv[0] launches bypass the shim; bun run --bun delegation and node:test
-# launches run unobserved. The non-build prerequisite allowlist and !targetTask
-# plan-empty wrapper refusal boundaries remain unpinned; see swxtchio/swx-opencode#324.
+# Fast mode needs Linux strace to audit child execs outside the PATH-resolved Bun shim.
+# Remaining accepted limits (swxtchio/swx-opencode#324): this is not a security boundary;
+# renamed/other interpreters, in-process test frameworks, and deliberate observer/report
+# tampering are outside its observation scope. The full suite remains the release gate.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,7 +43,9 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     'Bun pretest/test/posttest lifecycle runs once per package: pretest failure stops the test, and posttest runs only' \
     'after a successful test command; hook failures propagate through the task result.' \
     'All captured Bun JUnit reports, including preparation and lifecycle-hook launches, are collected; their observed' \
-    'file set must equal the manifest exactly.' \
+    'file set must equal the manifest exactly for PATH-resolved Bun test launches; see swxtchio/swx-opencode#324.' \
+    'Fast mode requires Linux strace: unobserved absolute Bun test launches and Node --test launches invalidate the run;' \
+    'bun run --bun delegation is refused. This is a merge-gate speedup, not a security boundary; full suite gates releases.' \
     'A nonzero target with no JUnit report is refused with target attribution, not labeled an execution-set mismatch.' \
     'Fast mode refuses if a selected file reports no active test cases.' \
     'Only --fast refuses a checkout with tracked or untracked changes; full mode preserves the original Turbo behavior.' \
@@ -119,6 +121,13 @@ fi
 report_file="$root/.fast-suite-report.$$.xml"
 trap 'rm -f -- "$report_file" "$config_dir"/*; rmdir -- "$config_dir" 2>/dev/null || true' EXIT
 real_bun="$(command -v bun)"
+if ! command -v strace >/dev/null 2>&1 \
+  || ! strace -f --seccomp-bpf -qq -s 65536 -xx -e trace=execve,execveat -o "$config_dir/probe.trace" \
+    "$real_bun" -p 'process.execPath' > "$config_dir/runtime-bun"; then
+  printf '%s\n' 'tests/run.sh: fast mode requires a working Linux strace process-launch observer' >&2
+  printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=process-observer-unavailable exit_code=1'
+  exit 1
+fi
 if ! FAST_SUITE_WRAPPER_PATH="$config_dir/bun" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" \
   FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e '
   const wrapper = `#!/usr/bin/env bash
@@ -139,6 +148,11 @@ while [ "$command_index" -lt "\${#args[@]}" ]; do
   esac
 done
 for argument in "\${args[@]}"; do
+  if [ "$argument" = --bun ] || [ "$argument" = -b ]; then
+    printf "%s\\n" "tests/run.sh: refusing unobservable Bun delegation: $argument" >&2
+    touch "$report_dir/refused-delegation"
+    exit 126
+  fi
   if [ "$argument" = --test-worker ]; then exec "$real_bun" "\${args[@]}"; fi
 done
 command="\${args[command_index]:-}"
@@ -564,7 +578,8 @@ for prep_task in "${turbo_prep_tasks[@]}"; do
     esac
   done
   preparation_status=0
-  GITHUB_ACTIONS=false PATH="$config_dir:$PATH" "$config_dir/bun" turbo run "$prep_task" "${prep_filters[@]}" --force || preparation_status=$?
+  GITHUB_ACTIONS=false PATH="$config_dir:$PATH" strace -f --seccomp-bpf -qq -s 65536 -xx -e trace=execve,execveat \
+    -o "$config_dir/preparation-$prep_task.trace" "$config_dir/bun" turbo run "$prep_task" "${prep_filters[@]}" --force || preparation_status=$?
   if [ "$preparation_status" -ne 0 ]; then
     printf 'tests/run.sh: Turbo-declared preparation task failed: %s\n' "$prep_task" >&2
     printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=turbo-preparation-failed exit_code=1'
@@ -612,10 +627,12 @@ while [ "$index" -lt "$target_count" ]; do
   report_args=(--reporter=junit --reporter-outfile="$report_file")
   test_status=0
   if [ "$has_turbo_task" = 1 ]; then
-    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" "$config_dir/bun" turbo run test "--filter=./$package_root" --only --force -- \
+    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" strace -f --seccomp-bpf -qq -s 65536 -xx -e trace=execve,execveat \
+      -o "$config_dir/package-$index.trace" "$config_dir/bun" turbo run test "--filter=./$package_root" --only --force -- \
       "${report_args[@]}" "${selected_paths[@]}" || test_status=$?
   else
-    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" "$config_dir/bun" --cwd="$root/$package_root" run test -- \
+    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" strace -f --seccomp-bpf -qq -s 65536 -xx -e trace=execve,execveat \
+      -o "$config_dir/package-$index.trace" "$config_dir/bun" --cwd="$root/$package_root" run test -- \
       "${report_args[@]}" "${selected_paths[@]}" || test_status=$?
   fi
   if [ "$test_status" -ne 0 ]; then target_status=$test_status; fi
@@ -685,6 +702,66 @@ while [ "$index" -lt "$target_count" ]; do
   index=$((index + 1))
 done
 
+# A process outside the PATH shim cannot certify a fast run by omitting its report.
+launch_observation_status=0
+FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e '
+  import { existsSync, realpathSync } from "node:fs"
+  import { readdir } from "node:fs/promises"
+  import { basename, join } from "node:path"
+
+  const directory = process.env.FAST_SUITE_REPORT_DIR
+  const runtimeBun = (await Bun.file(join(directory, "runtime-bun")).text()).trim()
+  const entries = await readdir(directory)
+  let invalid = entries.includes("refused-delegation")
+  for (const name of entries.filter((entry) => entry.endsWith(".trace") && entry !== "probe.trace")) {
+    const pending = new Map()
+    for (const line of (await Bun.file(join(directory, name)).text()).split("\n")) {
+      const match = line.match(/^(\d+)\s+(.*)$/)
+      if (!match) continue
+      const pid = match[1]
+      const text = match[2]
+      if (!/^execve(?:at)?\(/.test(text) && !text.startsWith("<... execve")) continue
+      if (text.endsWith("<unfinished ...>")) {
+        pending.set(pid, text.slice(0, -"<unfinished ...>".length))
+        continue
+      }
+      const call = text.startsWith("<... execve") ? (pending.get(pid) ?? "") + text.replace(/^<\.\.\. execve(?:at)? resumed>/, "") : text
+      pending.delete(pid)
+      if (!/^execve(?:at)?\(/.test(call) || !/\)\s+= 0$/.test(call)) continue
+      if (call.includes("...")) {
+        console.error("tests/run.sh: truncated process-launch observation: " + name)
+        invalid = true
+        continue
+      }
+      const strings = Array.from(call.matchAll(/"((?:\\x[0-9a-f]{2})*)"/g), ([, hex]) => Buffer.from(hex.replaceAll("\\x", ""), "hex").toString())
+      const executable = strings[0]
+      const args = strings.slice(2)
+      if (basename(executable ?? "") === "node" && args.some((argument) => argument === "--test" || argument.startsWith("--test="))) {
+        console.error("tests/run.sh: unobservable Node test launch: " + executable)
+        invalid = true
+      }
+      if (!executable || !existsSync(executable) || realpathSync(executable) !== runtimeBun) continue
+      let command = 0
+      while (command < args.length && args[command].startsWith("-")) {
+        const argument = args[command++]
+        if (["--cwd", "--config", "--env-file", "--preload", "--require", "--import", "--conditions", "--define", "--loader", "--inspect", "--inspect-wait", "--inspect-brk", "-r", "-p", "-e", "-d", "-l"].includes(argument)) command++
+      }
+      if (args[command] !== "test" || args.includes("--test-worker")) continue
+      const outfileIndex = args.indexOf("--reporter-outfile")
+      const outfile = args.find((argument) => argument.startsWith("--reporter-outfile="))?.slice("--reporter-outfile=".length) ?? (outfileIndex < 0 ? undefined : args[outfileIndex + 1])
+      const captured = outfile === process.env.FAST_SUITE_MAIN_REPORT || entries.some((entry) => entry.startsWith("report.") && !entry.endsWith(".cwd") && outfile === join(directory, entry))
+      if (!captured || !args.includes("--reporter=junit")) {
+        console.error("tests/run.sh: unobserved Bun test launch: " + executable)
+        invalid = true
+      }
+    }
+    if (pending.size > 0) {
+      console.error("tests/run.sh: incomplete process-launch observation: " + name)
+      invalid = true
+    }
+  }
+  if (invalid) process.exit(2)
+' || launch_observation_status=$?
 # Per-package JUnit checks record their actual files; the Bun shim records any other
 # test processes launched by preparation or lifecycle scripts. Enforce their union.
 declare -a manifest_paths=()
@@ -756,6 +833,10 @@ if [ "$observation_status" -ne 0 ]; then execution_set_invalid=1; fi
 
 if [ "$coverage_invalid" -ne 0 ]; then
   printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=no-test-cases exit_code=1'
+  exit 1
+fi
+if [ "$launch_observation_status" -ne 0 ]; then
+  printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=unobservable-test-launch exit_code=1'
   exit 1
 fi
 if [ "$attributed_refusal" -ne 0 ]; then
