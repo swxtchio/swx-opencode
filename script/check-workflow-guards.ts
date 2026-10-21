@@ -37,7 +37,7 @@ const ALLOWED = new Map([
   ["fff-platform-validation.yml::nix-node-modules", "454365e67a9a2ffe"],
   ["opencode-arm-release-x64.yml::release-proof", "302e93dfb053215d"],
   ["opencode-arm-release-x64.yml::release-candidate", "73e489a389e0a438"],
-  ["test.yml::unit", "86d45bee83bbf1b8"],
+  ["test.yml::unit", "6a6862d7fdea95bc"],
   ["test.yml::e2e", "3c465d9522c227c8"],
   ["typecheck.yml::typecheck", "276be38badce0802"],
 ])
