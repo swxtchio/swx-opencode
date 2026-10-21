@@ -27,7 +27,8 @@ export function resolveReleaseIdentity(input: {
   request: EventValues & { releaseTag: string }
   sourceCommit: string
   packageVersion: string
-  tagCommit: string
+  tagCommit?: string
+  allowUnpublishedTag?: boolean
   bunVersion: string
   expectedBunVersion: string
 }): ReleaseIdentity {
@@ -43,24 +44,25 @@ export function resolveReleaseIdentity(input: {
     throw new Error(`Requested source commit ${input.request.sourceCommit} does not match checked-out source ${sourceCommit}`)
   if (input.request.version && input.request.version !== expectedVersion)
     throw new Error(`Requested version ${input.request.version} does not match checked-out source version ${expectedVersion}`)
-  if (input.tagCommit.toLowerCase() !== sourceCommit)
+  if (input.tagCommit === undefined && !input.allowUnpublishedTag)
+    throw new Error(`Tag ${input.request.releaseTag} has not been verified`)
+  if (input.tagCommit !== undefined && input.tagCommit.toLowerCase() !== sourceCommit)
     throw new Error(`Tag ${input.request.releaseTag} resolves to ${input.tagCommit}, not ${sourceCommit}`)
   if (input.bunVersion !== input.expectedBunVersion)
     throw new Error(`Bun ${input.bunVersion} does not match selected source pin ${input.expectedBunVersion}`)
   return { releaseTag: expectedTag, sourceCommit, version: expectedVersion, bunVersion: input.bunVersion }
 }
 
-async function main() {
-  const sourceDir = Bun.env.RELEASE_SOURCE_DIR
-  const eventPath = Bun.env.GITHUB_EVENT_PATH
-  const githubEnv = Bun.env.GITHUB_ENV
-  const defaultReleaseTag = Bun.env.RELEASE_PROBE_DEFAULT_TAG
-  const eventName = Bun.env.GITHUB_EVENT_NAME
-  if (!sourceDir || !eventPath || !githubEnv || !defaultReleaseTag || !eventName)
-    throw new Error("Release source directory, event context, default tag, and GITHUB_ENV are required")
-
-  const event = await Bun.file(eventPath).json()
-  const request = releaseInput(eventName, event, defaultReleaseTag)
+export async function resolveReleaseTarget(input: {
+  sourceDir: string
+  request: EventValues & { releaseTag: string }
+  candidate?: boolean
+}) {
+  const sourceDir = input.sourceDir
+  const request = input.request
+  const candidate = input.candidate === true
+  if (candidate && !/^[0-9a-f]{40}$/i.test(request.sourceCommit ?? ""))
+    throw new Error("A full explicit source_commit is required for a release candidate")
   if (!/^v\d+\.\d+\.\d+-swxtch\.[0-9a-f]{8}$/.test(request.releaseTag))
     throw new Error(`Invalid release tag input: ${request.releaseTag}`)
   const selectedPackage = (await Bun.file(path.join(sourceDir, "packages/opencode/package.json")).json()) as {
@@ -73,20 +75,46 @@ async function main() {
   const expectedBunVersion = workspacePackage.packageManager?.match(/^bun@([^+]+)/)?.[1]
   if (!expectedBunVersion) throw new Error("Selected source has no pinned Bun packageManager version")
 
-  const tagFetch = Bun.spawnSync(
-    ["git", "-C", sourceDir, "fetch", "origin", `refs/tags/${request.releaseTag}:refs/tags/${request.releaseTag}`],
+  const tagLookup = Bun.spawnSync(
+    ["git", "-C", sourceDir, "ls-remote", "--exit-code", "origin", `refs/tags/${request.releaseTag}`],
     { stdout: "pipe", stderr: "pipe" },
   )
-  if (tagFetch.exitCode !== 0) throw new Error(`Could not fetch release tag ${request.releaseTag}: ${tagFetch.stderr.toString()}`)
+  const unpublished = candidate && tagLookup.exitCode === 2
+  if (!unpublished) {
+    if (tagLookup.exitCode !== 0)
+      throw new Error(`Could not resolve release tag ${request.releaseTag}: ${tagLookup.stderr.toString()}`)
+    const tagFetch = Bun.spawnSync(
+      ["git", "-C", sourceDir, "fetch", "origin", `refs/tags/${request.releaseTag}:refs/tags/${request.releaseTag}`],
+      { stdout: "pipe", stderr: "pipe" },
+    )
+    if (tagFetch.exitCode !== 0) throw new Error(`Could not fetch release tag ${request.releaseTag}: ${tagFetch.stderr.toString()}`)
+  }
   const sourceCommit = git(sourceDir, ["rev-parse", "HEAD"])
-  const tagCommit = git(sourceDir, ["rev-parse", "--verify", `${request.releaseTag}^{commit}`])
-  const identity = resolveReleaseIdentity({
+  const tagCommit = unpublished ? undefined : git(sourceDir, ["rev-parse", "--verify", `${request.releaseTag}^{commit}`])
+  return resolveReleaseIdentity({
     request,
     sourceCommit,
     packageVersion: selectedPackage.version,
     tagCommit,
+    allowUnpublishedTag: candidate,
     bunVersion: Bun.version,
     expectedBunVersion,
+  })
+}
+
+async function main() {
+  const sourceDir = Bun.env.RELEASE_SOURCE_DIR
+  const eventPath = Bun.env.GITHUB_EVENT_PATH
+  const githubEnv = Bun.env.GITHUB_ENV
+  const defaultReleaseTag = Bun.env.RELEASE_PROBE_DEFAULT_TAG
+  const eventName = Bun.env.GITHUB_EVENT_NAME
+  if (!sourceDir || !eventPath || !githubEnv || !defaultReleaseTag || !eventName)
+    throw new Error("Release source directory, event context, default tag, and GITHUB_ENV are required")
+
+  const identity = await resolveReleaseTarget({
+    sourceDir,
+    request: releaseInput(eventName, await Bun.file(eventPath).json(), defaultReleaseTag),
+    candidate: Bun.argv.includes("--candidate"),
   })
   const waitFix = Bun.spawnSync(
     ["git", "-C", sourceDir, "merge-base", "--is-ancestor", "4b87478ddf", identity.sourceCommit],
