@@ -46,6 +46,8 @@ The event stream disconnected at observed tool-success cursor 7. Before the deli
 
 Native message order followed source sequences `2, 3, 9, 14, 15`, with the lexically earlier second user still after the first. The V2 ascending message API matched SQLite order. This proves completed-history restart, not recovery of ambiguous in-flight provider dispatch. The inspected `V2Session.wait` remains join-only and does not start post-crash execution/recovery.
 
+The later [explicit join-only negative control](join-only-verification.md) also executed that boundary: a real promoted admission with its provider request held was crash-reaped, then wait on the same DB returned typed HTTP 503 `Session wait outcome is not observable`, with no new drain/provider request or native history change. A separate admit-only input stayed pending after restart wait. All ten supplemental observations passed; [raw results](join-only-run.json) and [exact driver](join-only-commands.py) are retained. The original fifty-check completed-history battery and this supplemental crash control remain distinct runs with the same release-byte/environment qualification.
+
 ## Consumer cutover conditions
 
 The [actual caller trace](consumer-trace.md) is pinned to clean Abbe `9060ce607b5065f2f5b462e05300334bd983fe8d`, merged main PR #1526. The gateway passes its persisted user ID through adapter → SessionPool → `OpenCodeClient.prompt_session_v2`, top-level. The path validates wait coverage and obtains `native_event_after` from observed V2 history/replay before persisting it in the local durable pointer owner. These are source observations, not live consumer/cohort execution.

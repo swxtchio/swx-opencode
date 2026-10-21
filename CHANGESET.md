@@ -38,7 +38,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Fork maintenance and CI
 
-- **#331** Record the 2026-10-21 published linux-x64 V2 admission/wait/native-history/restart/reconnect verification in an isolated full-system x64 guest, including raw producer evidence, SQLite backup and TCG/JIT qualifications. Hold Abbe cutover for the observed tool-locality mismatch (#1559), V2 replacement proof (#1556) and unestablished cohort inventory. See `docs/verification/native-history-2026-10-21/README.md`. _Fork-only._
+- **#331** Record the 2026-10-21 published linux-x64 V2 admission/wait/native-history/restart/reconnect verification and explicit post-crash join-only/pending controls in an isolated full-system x64 guest, including raw producer evidence, SQLite backup and TCG/JIT qualifications. Hold Abbe cutover for the observed tool-locality mismatch (#1559), V2 replacement proof (#1556) and unestablished cohort inventory. See `docs/verification/native-history-2026-10-21/README.md`. _Fork-only._
 - **#326** Add an explicit prepublication native x64 candidate path to `.github/workflows/opencode-arm-release-x64.yml`; the selected source stays clean and unmodified, and the extracted archive runs the native acceptance probe before its bytes and build inputs are retained. Candidate input resolution permits an absent tag only with an explicit source pin and still refuses an existing conflicting tag. _Fork-only._
 - **#311** Add a maintained fast test manifest and `tests/run.sh --fast`; validate committed per-package test paths,
   dispatch each package's exact selected files through one owning Turbo test lifecycle when registered and package
