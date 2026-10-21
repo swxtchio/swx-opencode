@@ -157,4 +157,15 @@ Direct archive URLs:
 
 The release URL, version, archive digests and successful read-back were posted on the task's existing [draft PR #326 completion thread](https://github.com/swxtchio/swx-opencode/pull/326#issuecomment-6307125194). Its first-comment session stamp and task branch establish the task mapping.
 
-Abbe/SaaS recipient wake-task IDs were not supplied by the task and were not established from the live task/peer records. The current `data/peers.md` in the supervising firstmate home identifies Abbe as a peer firstmate, which is not an assigned task ID, and contains no SaaS route. No peer wake files were fabricated and no unconfirmed delivery is claimed. The externally blocked routing/delivery follow-up is durably filed as [swxtchio/swx-firstmate#2257](https://github.com/swxtchio/swx-firstmate/issues/2257), with the exact version, archive URLs and digests. The later `swx-abbe-1227-native-history` dispatch and downstream deployments remain firstmate-owned and have not been launched by this crew.
+At publication, Abbe/SaaS recipient wake-task IDs were not supplied or established from the live task/peer records. The supervising home's `data/peers.md` identified Abbe as a peer firstmate rather than an assigned task and contained no SaaS registry entry. The routing question was recorded in [swxtchio/swx-firstmate#2257](https://github.com/swxtchio/swx-firstmate/issues/2257).
+
+Under the supervisor's 2026-10-21T03:30 continuation to finish delivery, both notifications used the existing confirmed informational peer-message path. Abbe resolved from the registered peer `abbe`; SaaS used the supported explicit `peer:/home/byates/fm-saas` selector. Their own current `.heartbeat-target` records were read, and `fm-send.sh` revalidated endpoint identity at send time. Each payload carried version `1.18.32-swxtch.d1b232e9`, both complete archive download URLs, both archive SHA-256 values, checksum-companion availability and successful native/read-back verification.
+
+| Recipient | Transport | Delivery receipt | Read-back state |
+| --- | --- | --- | --- |
+| Abbe | `terminal` | `p1792553644-3991099-6753` | `phase=sent`, `disposition=delivered-no-reply` |
+| SaaS | `opencode-http` | `p1792553645-3992254-264e` | `phase=sent`, `disposition=delivered-no-reply` |
+
+The sender-owned records were read back at `/home/byates/fm-llmrouter/state/peer-outbox/<receipt>`. Their complete projected-payload SHA-256 values are `d865d692da4c43defebc82d261098863e74bdc2e12f72bbe20c8bb095604110b` for Abbe and `09b0e68d3192d30436016b30aee161860412fb7f5cce771f30756792b673f4d5` for SaaS. No reply was requested or claimed. This uses confirmed peer delivery and its existing outbox receipts rather than inventing recipient task IDs or synthetic wake files. The receipts and completed delivery were recorded in issue #2257, which was closed as completed and read back closed. The task wake log records the final delivery pointers as well.
+
+The later `swx-abbe-1227-native-history` dispatch and downstream deployments remain firstmate-owned and have not been launched by this crew.
