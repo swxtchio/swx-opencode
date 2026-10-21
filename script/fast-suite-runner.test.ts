@@ -42,6 +42,7 @@ test(
     const scriptlessPackageTests = join(scriptlessPackageRoot, "test")
     const turbo = join(root, "node_modules", ".bin", "turbo")
     const bunBin = join(root, "bin", "bun")
+    const alternateBun = join(scratch, "alternate", "bun")
     const packagePath = "packages/example"
     const selectedPath = `${packagePath}/test/selected.test.ts`
     const selectedSecondPath = `${packagePath}/test/selected-second.test.ts`
@@ -72,6 +73,7 @@ ${directSecondPath}
             "FAST_SUITE_BUILD_LOG",
             "FAST_SUITE_BUN_LOG",
             "FAST_SUITE_REAL_BUN",
+            "FAST_SUITE_ALTERNATE_BUN",
             "FAST_SUITE_FAIL_PRETEST",
             "FAST_SUITE_FAIL_POSTTEST",
             "FAST_SUITE_EXTRA_PRETEST_TEST",
@@ -105,6 +107,7 @@ ${directSecondPath}
         FAST_SUITE_BUN_LOG: bunArgsLog,
         FAST_TURBO_LOG: turboLog,
         FAST_SUITE_REAL_BUN: process.execPath,
+        FAST_SUITE_ALTERNATE_BUN: alternateBun,
         FAST_SUITE_FAIL_PRETEST: "0",
         FAST_SUITE_FAIL_POSTTEST: "0",
         FAST_SUITE_EXTRA_PRETEST_TEST: "0",
@@ -132,6 +135,8 @@ ${directSecondPath}
     mkdirSync(dirname(runner), { recursive: true })
     mkdirSync(dirname(turbo), { recursive: true })
     mkdirSync(dirname(bunBin), { recursive: true })
+    mkdirSync(dirname(alternateBun), { recursive: true })
+    copyFileSync(process.execPath, alternateBun)
     copyFileSync(join(import.meta.dir, "..", "tests", "run.sh"), runner)
     chmodSync(runner, 0o755)
     const runnerSource = readFileSync(runner, "utf8")
@@ -317,6 +322,10 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         'appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "pretest\\n")',
         'if (process.env.FAST_SUITE_LAUNCH_SHAPE === "absolute-bun") {',
         '  const result = Bun.spawnSync([process.execPath, "test", "./test/unlisted.test.ts"], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE === "absolute-bun-copy") {',
+        '  const result = Bun.spawnSync([process.env.FAST_SUITE_ALTERNATE_BUN!, "test", "./test/unlisted.test.ts"], { stdout: "inherit", stderr: "inherit" })',
         '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
         "}",
         'if (process.env.FAST_SUITE_LAUNCH_SHAPE === "bun-delegation") {',
@@ -733,7 +742,7 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     expect(Bun.spawnSync(["git", "add", "tests/run.sh"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
     expect(Bun.spawnSync(["git", "commit", "-qm", "restore the JUnit observed receipt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
 
-    for (const shape of ["absolute-bun", "bun-delegation", "node-test"]) {
+    for (const shape of ["absolute-bun", "absolute-bun-copy", "bun-delegation", "node-test"]) {
       runOptions.env.FAST_SUITE_LAUNCH_SHAPE = shape
       writeFileSync(marker, "")
       const launchEscape = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
@@ -745,7 +754,7 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
       }
       expect(launchEscape.exitCode).toBe(1)
       expect(launchEscape.stdout.toString()).toContain("verdict=refused mode=fast")
-      if (shape === "absolute-bun") {
+      if (shape === "absolute-bun" || shape === "absolute-bun-copy") {
         expect(launchEscape.stderr.toString()).toContain("unobserved Bun test launch")
         expect(readFileSync(marker, "utf8")).toContain("unlisted\n")
       }

@@ -41,13 +41,13 @@ The absolute-Bun fixture launches `[process.execPath, "test", "./test/unlisted.t
 
 ### Observation scope
 
-JUnit equality applies to PATH-resolved Bun test launches. The additional Linux process audit invalidates unobserved absolute launches of the resolved Bun runtime and executable paths named `node` carrying `--test`; Bun `--bun` delegation is refused by the shim and leaves a refusal receipt even when the caller ignores its status. Renamed/other interpreters, in-process frameworks, and deliberate observer/report tampering remain outside the stated scope. See `tests/run.sh --help` and its residual header. This work does not turn fast mode into a security boundary or replace the full release suite.
+JUnit equality applies to PATH-resolved Bun test launches. The additional Linux process audit invalidates unobserved launches from the configured Bun runtime or another absolute executable named `bun`, and executable paths named `node` carrying `--test`; Bun `--bun` delegation is refused by the shim and leaves a refusal receipt even when the caller ignores its status. Unrecognized interpreter identities, in-process frameworks, and deliberate observer/report tampering remain outside the stated scope. See `tests/run.sh --help` and its residual header. This work does not turn fast mode into a security boundary or replace the full release suite.
 
 ### Published CI follow-up (2026-10-21)
 
 At published head `02f7ec5ecad82ba486a11e0e0a2ed7ff80b929c8`, [typecheck run 39543765037](https://github.com/swxtchio/swx-opencode/actions/runs/39543765037) failed during the workspace typecheck: its log reports SIGTERM, task exits 137, and `The operation was canceled`, with no TypeScript diagnostic. The subsequent fork-script typecheck step was not reached. The termination's cause is not established; [swxtchio/swx-opencode#330](https://github.com/swxtchio/swx-opencode/issues/330) records the diagnostic follow-up for the captain's CI decision.
 
-The repository's `bun run typecheck:script` was then run locally on the same fork-script implementation with the installed pinned compiler and types, and exited 0. This supplies a fork-script typecheck result, not a passing workspace CI verdict. The local type-resolution dependencies were linked read-only from the installed project checkout; no runtime implementation or regression changed after the mutation proofs above.
+The repository's `bun run typecheck:script` was then run locally on the same fork-script implementation with the installed pinned compiler and types, and exited 0. This supplied a fork-script typecheck result, not a passing workspace CI verdict. The local type-resolution dependencies were linked read-only from the installed project checkout; the implementation and regression at the subsequent published head `debfb42bdce8aae786b4f488222b41b7297619ae` were still those of the initial mutation-proof pin. That head later passed both [typecheck run 39546180525](https://github.com/swxtchio/swx-opencode/actions/runs/39546180525) and [test run 39546180467](https://github.com/swxtchio/swx-opencode/actions/runs/39546180467).
 
 ## Absolute-path follow-up plan
 

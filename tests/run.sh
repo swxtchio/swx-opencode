@@ -10,7 +10,7 @@
 # JUnit-less nonzero exits remain attributed refusals; extra or missing suites are rejected.
 # Fast mode needs Linux strace to audit child execs outside the PATH-resolved Bun shim.
 # Remaining accepted limits (swxtchio/swx-opencode#324): this is not a security boundary;
-# renamed/other interpreters, in-process test frameworks, and deliberate observer/report
+# unrecognized interpreter identities, in-process test frameworks, and deliberate observer/report
 # tampering are outside its observation scope. The full suite remains the release gate.
 set -euo pipefail
 
@@ -704,7 +704,7 @@ done
 
 # A process outside the PATH shim cannot certify a fast run by omitting its report.
 launch_observation_status=0
-FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e '
+FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e '
   import { existsSync, realpathSync } from "node:fs"
   import { readdir } from "node:fs/promises"
   import { basename, join } from "node:path"
@@ -740,7 +740,10 @@ FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e
         console.error("tests/run.sh: unobservable Node test launch: " + executable)
         invalid = true
       }
-      if (!executable || !existsSync(executable) || realpathSync(executable) !== runtimeBun) continue
+      if (!executable) continue
+      const configuredBun = existsSync(executable) && realpathSync(executable) === runtimeBun
+      const namedBun = executable.startsWith("/") && basename(executable) === "bun" && executable !== join(directory, "bun") && executable !== process.env.FAST_SUITE_CAPTURE_REAL_BUN
+      if (!configuredBun && !namedBun) continue
       let command = 0
       while (command < args.length && args[command].startsWith("-")) {
         const argument = args[command++]
