@@ -32,7 +32,7 @@ bun test test/release-probe-tools.test.ts
 bun typecheck
 ```
 
-The focused file passed: 11 tests, zero failures. Package typecheck exited zero. The new regression runs `release-probe-target.ts` as a child against a real isolated Git remote and checkout; it observes successful candidate resolution and the produced `GITHUB_ENV`, then refuses a missing tag in ordinary proof mode, a conflicting existing tag, a missing explicit source pin, and an unavailable remote.
+At initial harness head `67cfd0c6dd`, the focused file passed: 11 tests, zero failures. Package typecheck exited zero. That initial regression ran `release-probe-target.ts` as a child against an isolated clone of the executing checkout; it observed successful candidate resolution and the produced `GITHUB_ENV`, then refused a missing tag in ordinary proof mode, a conflicting existing tag, a missing explicit source pin, and an unavailable remote. The fixture correction below supersedes its dependence on that executing checkout.
 
 Bounded absence proof: temporarily replace `const unpublished = candidate && tagLookup.exitCode === 2` with `const unpublished = false`, then run:
 
@@ -43,6 +43,14 @@ bun test test/release-probe-tools.test.ts -t 'resolves an unpublished candidate'
 That run exited one with one failed test: the candidate child returned exit one where the regression expected zero. The regression completed without an external timeout. After restoring candidate-mode behavior, the complete focused file again passed and package typecheck again exited zero.
 
 From the repository root, `bun run script/check-workflow-guards.ts` exited zero after reviewing and refreshing the adapted workflow's job and envelope pins. `git diff --check` exited zero. No `bin/fm-lint.sh` is tracked in this project. The project-memory helper reported the existing `AGENTS.md` unchanged.
+
+### Tagged-checkout fixture correction
+
+The live [PR proof run 39529207826](https://github.com/swxtchio/swx-opencode/actions/runs/39529207826) failed at the initial regression's missing-tag assertion. That workflow executes the test from the existing published source checkout, so cloning its Git state retained the very tag the regression expected to be absent. The fixture also depended on full historical ancestry, which the unit workflow's shallow checkout does not supply.
+
+The correction separates the existing filesystem/Git/package identity boundary into `resolveReleaseTarget`, used by both the CLI and regression. The CLI still checks the fixed V2 wait ancestor before emitting `GITHUB_ENV`; that production ancestry check is preserved. The regression now creates its own package files, commits and local Git remote rather than copying the host checkout's tags or history. It drives the real `resolveReleaseTarget` producer for absent-tag admission, ordinary-proof missing-tag refusal, matching-tag acceptance, conflicting-tag refusal, missing-pin refusal and unavailable-remote refusal.
+
+The revised focused file passed 11 tests with zero failures, and package `bun typecheck` exited zero. Replacing the candidate-mode unpublished-tag expression with `false` again made the revised regression fail within its own bound, now with `Could not resolve release tag`; restoring the expression passed. The repository correctness lint command exited zero with no errors, and `git diff --check` passed. The original native x64 archive and its acceptance evidence below remain bound to their unchanged selected release source and original build run.
 
 ## Native candidate and publication evidence
 

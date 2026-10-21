@@ -53,18 +53,14 @@ export function resolveReleaseIdentity(input: {
   return { releaseTag: expectedTag, sourceCommit, version: expectedVersion, bunVersion: input.bunVersion }
 }
 
-async function main() {
-  const sourceDir = Bun.env.RELEASE_SOURCE_DIR
-  const eventPath = Bun.env.GITHUB_EVENT_PATH
-  const githubEnv = Bun.env.GITHUB_ENV
-  const defaultReleaseTag = Bun.env.RELEASE_PROBE_DEFAULT_TAG
-  const eventName = Bun.env.GITHUB_EVENT_NAME
-  if (!sourceDir || !eventPath || !githubEnv || !defaultReleaseTag || !eventName)
-    throw new Error("Release source directory, event context, default tag, and GITHUB_ENV are required")
-
-  const event = await Bun.file(eventPath).json()
-  const request = releaseInput(eventName, event, defaultReleaseTag)
-  const candidate = Bun.argv.includes("--candidate")
+export async function resolveReleaseTarget(input: {
+  sourceDir: string
+  request: EventValues & { releaseTag: string }
+  candidate?: boolean
+}) {
+  const sourceDir = input.sourceDir
+  const request = input.request
+  const candidate = input.candidate === true
   if (candidate && !/^[0-9a-f]{40}$/i.test(request.sourceCommit ?? ""))
     throw new Error("A full explicit source_commit is required for a release candidate")
   if (!/^v\d+\.\d+\.\d+-swxtch\.[0-9a-f]{8}$/.test(request.releaseTag))
@@ -95,7 +91,7 @@ async function main() {
   }
   const sourceCommit = git(sourceDir, ["rev-parse", "HEAD"])
   const tagCommit = unpublished ? undefined : git(sourceDir, ["rev-parse", "--verify", `${request.releaseTag}^{commit}`])
-  const identity = resolveReleaseIdentity({
+  return resolveReleaseIdentity({
     request,
     sourceCommit,
     packageVersion: selectedPackage.version,
@@ -103,6 +99,22 @@ async function main() {
     allowUnpublishedTag: candidate,
     bunVersion: Bun.version,
     expectedBunVersion,
+  })
+}
+
+async function main() {
+  const sourceDir = Bun.env.RELEASE_SOURCE_DIR
+  const eventPath = Bun.env.GITHUB_EVENT_PATH
+  const githubEnv = Bun.env.GITHUB_ENV
+  const defaultReleaseTag = Bun.env.RELEASE_PROBE_DEFAULT_TAG
+  const eventName = Bun.env.GITHUB_EVENT_NAME
+  if (!sourceDir || !eventPath || !githubEnv || !defaultReleaseTag || !eventName)
+    throw new Error("Release source directory, event context, default tag, and GITHUB_ENV are required")
+
+  const identity = await resolveReleaseTarget({
+    sourceDir,
+    request: releaseInput(eventName, await Bun.file(eventPath).json(), defaultReleaseTag),
+    candidate: Bun.argv.includes("--candidate"),
   })
   const waitFix = Bun.spawnSync(
     ["git", "-C", sourceDir, "merge-base", "--is-ancestor", "4b87478ddf", identity.sourceCommit],

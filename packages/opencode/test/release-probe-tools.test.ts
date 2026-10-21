@@ -3,7 +3,7 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import process from "node:process"
-import { releaseInput, resolveReleaseIdentity } from "../script/release-probe-target"
+import { releaseInput, resolveReleaseIdentity, resolveReleaseTarget } from "../script/release-probe-target"
 import { runProcess } from "../script/release-probe-process"
 import { startRequest } from "../script/release-probe-requests"
 
@@ -137,61 +137,56 @@ describe("release proof input resolution", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-release-candidate-"))
     const source = path.join(root, "source")
     const remote = path.join(root, "remote.git")
-    const event = path.join(root, "event.json")
-    const output = path.join(root, "github-env")
-    const script = path.resolve(import.meta.dir, "../script/release-probe-target.ts")
-    const env = {
-      ...process.env,
-      RELEASE_SOURCE_DIR: source,
-      GITHUB_EVENT_PATH: event,
-      GITHUB_ENV: output,
-      GITHUB_EVENT_NAME: "workflow_dispatch",
-      RELEASE_PROBE_DEFAULT_TAG: releaseTag,
-    }
     const git = (...args: string[]) => {
       const result = Bun.spawnSync(["git", ...args], { stdout: "pipe", stderr: "pipe", timeout: 10_000 })
       if (result.exitCode !== 0) throw new Error(result.stderr.toString())
       return result.stdout.toString().trim()
     }
-    const resolve = (candidate = true) =>
-      runProcess([process.execPath, script, ...(candidate ? ["--candidate"] : [])], {
-        cwd: root,
-        env,
-        timeoutMs: 15_000,
-        label: "candidate source identity",
-      })
     try {
-      git("clone", "--bare", "--shared", path.resolve(import.meta.dir, "../../.."), remote)
-      git("clone", "--shared", remote, source)
+      await fs.mkdir(source)
+      await Bun.write(path.join(source, "package.json"), JSON.stringify({ packageManager: `bun@${Bun.version}` }))
+      await Bun.write(path.join(source, "packages/opencode/package.json"), JSON.stringify({ version: "1.0.0" }))
+      git("-C", source, "init", "--quiet")
+      git("-C", source, "add", ".")
+      git(
+        "-C", source,
+        "-c", "user.name=Release fixture",
+        "-c", "user.email=release-fixture@example.invalid",
+        "-c", "commit.gpgsign=false",
+        "commit", "--quiet", "-m", "source packages",
+      )
+      git(
+        "-C", source,
+        "-c", "user.name=Release fixture",
+        "-c", "user.email=release-fixture@example.invalid",
+        "-c", "commit.gpgsign=false",
+        "commit", "--quiet", "--allow-empty", "-m", "candidate source",
+      )
+      git("clone", "--bare", "--shared", source, remote)
+      git("-C", source, "remote", "add", "origin", remote)
       const commit = git("-C", source, "rev-parse", "HEAD")
-      const packageVersion = (await Bun.file(path.join(source, "packages/opencode/package.json")).json()).version
-      const version = `${packageVersion}-swxtch.${commit.slice(0, 8)}`
+      const version = `1.0.0-swxtch.${commit.slice(0, 8)}`
       const tag = `v${version}`
-      await Bun.write(event, JSON.stringify({ inputs: { release_tag: tag, source_commit: commit, version } }))
+      const request = { releaseTag: tag, sourceCommit: commit, version }
+      const resolve = (candidate = true) =>
+        within(resolveReleaseTarget({ sourceDir: source, request, candidate }), 15_000, "candidate source identity")
       const candidate = await resolve()
-      expect(candidate.exit).toBe(0)
-      expect(JSON.parse(candidate.stdout)).toEqual({ releaseTag: tag, sourceCommit: commit, version, bunVersion: Bun.version })
-      expect(await Bun.file(output).text()).toContain(`SOURCE_COMMIT=${commit}\nOPENCODE_VERSION=${version}\n`)
+      expect(candidate).toEqual({ releaseTag: tag, sourceCommit: commit, version, bunVersion: Bun.version })
 
-      const proof = await resolve(false)
-      expect(proof.exit).not.toBe(0)
-      expect(proof.stderr).toContain("Could not resolve release tag")
+      await expect(resolve(false)).rejects.toThrow("Could not resolve release tag")
 
-      git("--git-dir", remote, "tag", tag, git("-C", source, "rev-parse", "HEAD^"))
-      const conflicting = await resolve()
-      expect(conflicting.exit).not.toBe(0)
-      expect(conflicting.stderr).toContain(`Tag ${tag} resolves to`)
+      git("--git-dir", remote, "tag", tag, commit)
+      expect(await resolve(false)).toEqual(candidate)
+      git("-C", source, "tag", "--delete", tag)
+      git("--git-dir", remote, "tag", "--force", tag, git("-C", source, "rev-parse", "HEAD^"))
+      await expect(resolve()).rejects.toThrow(`Tag ${tag} resolves to`)
 
-      await Bun.write(event, JSON.stringify({ inputs: { release_tag: tag, version } }))
-      const implicit = await resolve()
-      expect(implicit.exit).not.toBe(0)
-      expect(implicit.stderr).toContain("A full explicit source_commit is required")
+      await expect(
+        resolveReleaseTarget({ sourceDir: source, request: { releaseTag: tag, version }, candidate: true }),
+      ).rejects.toThrow("A full explicit source_commit is required")
 
-      await Bun.write(event, JSON.stringify({ inputs: { release_tag: tag, source_commit: commit, version } }))
       git("-C", source, "remote", "set-url", "origin", path.join(root, "unavailable.git"))
-      const unavailable = await resolve()
-      expect(unavailable.exit).not.toBe(0)
-      expect(unavailable.stderr).toContain("Could not resolve release tag")
+      await expect(resolve()).rejects.toThrow("Could not resolve release tag")
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
