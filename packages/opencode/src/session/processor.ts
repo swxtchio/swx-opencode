@@ -199,8 +199,7 @@ const layer = Layer.effect(
       const interrupted = input.cause
         ? Cause.hasInterruptsOnly(input.cause)
         : input.error?.name === "MessageAbortedError"
-      const error =
-        input.error ??
+      const error = input.error ??
         (input.cause
           ? interrupted
             ? MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
@@ -723,7 +722,7 @@ const layer = Layer.effect(
           case "tool-error": {
             const match = yield* readToolCall(value.id)
             if (match?.part.state.status === "pending") {
-              match.call.inputError = value.message
+              match.call.inputError = "The tool input could not be parsed as JSON, so the call was not executed. Reissue the call with valid JSON arguments."
               return
             }
             yield* failToolCall(value.id, value.error ?? new Error(value.message))

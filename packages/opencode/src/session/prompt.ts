@@ -650,7 +650,9 @@ const layer = Layer.effect(
                 unwritten = false
                 const preview = userShellOutputPreview(output, outputBytes)
                 part.state.metadata = {
-                  output: preview.truncated ? USER_SHELL_OUTPUT_PREVIEW_MARKER + preview.output : preview.output,
+                  output: preview.truncated
+                    ? USER_SHELL_OUTPUT_PREVIEW_MARKER + preview.output
+                    : preview.output,
                 }
                 return sessions.updatePart(part).pipe(Effect.asVoid)
               }),
@@ -1375,7 +1377,10 @@ const layer = Layer.effect(
         // A prompt's model and variant become the session's selection now, and a
         // pending prompt runs at whichever selection is current when it is
         // delivered (swxtchio/swx-opencode#212).
-        if ((input.model || input.variant) && (classification === "critical" || !dispatch)) {
+        if (
+          (input.model || input.variant) &&
+          (classification === "critical" || !dispatch)
+        ) {
           const model = input.model ?? (yield* currentModel(input.sessionID))
           yield* sessions.setModel({
             sessionID: input.sessionID,
