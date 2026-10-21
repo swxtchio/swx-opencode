@@ -38,6 +38,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Fork maintenance and CI
 
+- **#326** Add an explicit prepublication native x64 candidate path to `.github/workflows/opencode-arm-release-x64.yml`; the selected source stays clean and unmodified, and the extracted archive runs the native acceptance probe before its bytes and build inputs are retained. Candidate input resolution permits an absent tag only with an explicit source pin and still refuses an existing conflicting tag. _Fork-only._
 - **#311** Add a maintained fast test manifest and `tests/run.sh --fast`; validate committed per-package test paths,
   dispatch each package's exact selected files through one owning Turbo test lifecycle when registered and package
   scripts otherwise, preserving strict env, package-local config, options, and declared preparation; traverse

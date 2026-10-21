@@ -34,6 +34,11 @@ on:
         description: Optional OPENCODE_VERSION to verify against the selected source
         required: false
         type: string
+      candidate:
+        description: Build a clean-source candidate before publication (requires full source_commit)
+        required: false
+        type: boolean
+        default: false
   repository_dispatch:
     types:
       - opencode-arm-release-proof
@@ -53,7 +58,7 @@ env:
 
 jobs:
   release-proof:
-    if: github.repository == 'swxtchio/swx-opencode'
+    if: github.repository == 'swxtchio/swx-opencode' && !inputs.candidate
     runs-on: ubuntu-latest
     timeout-minutes: 60
     defaults:
@@ -394,5 +399,148 @@ jobs:
             ${{ runner.temp }}/bun.lock.sha256
             ${{ runner.temp }}/models.dev.sha256
             ${{ runner.temp }}/wait-logging-overlay.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release-candidate:
+    if: github.repository == 'swxtchio/swx-opencode' && github.event_name == 'workflow_dispatch' && inputs.candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout release harness
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node for source-pinned Bun installer
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+
+      - name: Checkout immutable candidate source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.source_commit }}
+          path: source
+          fetch-depth: 0
+
+      - name: Resolve Bun version from selected source
+        id: candidate-bun
+        working-directory: source
+        run: |
+          set -euo pipefail
+          bun_version=$(node -p "require('./package.json').packageManager.match(/^bun@([^+]+)/)?.[1] || ''")
+          test -n "$bun_version"
+          echo "url=https://github.com/oven-sh/bun/releases/download/bun-v${bun_version}/bun-linux-x64-baseline.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Install Bun pinned by selected source
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-download-url: ${{ steps.candidate-bun.outputs.url }}
+
+      - name: Resolve candidate identity and refuse conflicting existing tags
+        env:
+          RELEASE_SOURCE_DIR: ${{ github.workspace }}/source
+        run: bun run packages/opencode/script/release-probe-target.ts --candidate
+
+      - name: Verify native runner and install frozen linux-x64 dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/candidate-evidence"
+          test "$(uname -m)" = x86_64
+          uname -a | tee "$RUNNER_TEMP/candidate-evidence/host.txt"
+          bun -e 'if (process.platform !== "linux" || process.arch !== "x64") throw new Error("not native linux-x64"); console.log(`Bun ${Bun.version} ${process.platform}-${process.arch}`)' | tee "$RUNNER_TEMP/candidate-evidence/bun.txt"
+          test "$(bun --version)" = "$BUN_VERSION"
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
+          git -C source merge-base --is-ancestor 4b87478ddf "$SOURCE_COMMIT"
+          test -z "$(git -C source status --porcelain)"
+          git -C source status --porcelain=v1 | tee "$RUNNER_TEMP/candidate-evidence/source-before.txt"
+          sha256sum source/bun.lock | tee "$RUNNER_TEMP/candidate-evidence/bun.lock.sha256"
+          bun install --cwd source --frozen-lockfile --os=linux --cpu=x64
+          test -z "$(git -C source status --porcelain)"
+
+      - name: Build the clean selected source with pinned catalog and version
+        working-directory: source
+        env:
+          MODELS_DEV_API_JSON: ${{ runner.temp }}/candidate-evidence/models.dev.json
+          OPENCODE_BUILD_DIST: ${{ runner.temp }}/candidate-dist
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          curl --fail --location --retry 3 --silent --show-error --max-time 180 \
+            https://models.dev/api.json --output "$MODELS_DEV_API_JSON"
+          sha256sum "$MODELS_DEV_API_JSON" | tee "$RUNNER_TEMP/candidate-evidence/models.dev.sha256"
+          env -u OPENCODE_RELEASE -u OPENCODE_CHANNEL -u OPENCODE_BUMP -u GH_REPO \
+            OPENCODE_VERSION="$OPENCODE_VERSION" \
+            MODELS_DEV_API_JSON="$MODELS_DEV_API_JSON" \
+            OPENCODE_BUILD_DIST="$OPENCODE_BUILD_DIST" \
+            bun run packages/opencode/script/build.ts --single --skip-install 2>&1 | tee "$RUNNER_TEMP/candidate-evidence/build.log"
+          test -z "$(git status --porcelain)"
+          git status --porcelain=v1 | tee "$RUNNER_TEMP/candidate-evidence/source-after.txt"
+
+      - name: Package and verify the exact native x64 candidate bytes
+        run: |
+          set -euo pipefail
+          assets="$RUNNER_TEMP/candidate-assets"
+          extracted="$RUNNER_TEMP/candidate-extracted"
+          bin="$RUNNER_TEMP/candidate-dist/opencode-linux-x64/bin"
+          mkdir -p "$assets" "$extracted"
+          shopt -s nullglob
+          sidecars=("$bin"/libfff_c-*.so)
+          test "${#sidecars[@]}" -eq 1
+          sidecar_name=$(basename "${sidecars[0]}")
+          file "$bin/opencode" "${sidecars[0]}" | tee "$RUNNER_TEMP/candidate-evidence/files.txt"
+          tar -czf "$assets/opencode-linux-x64.tar.gz" -C "$bin" opencode "$sidecar_name"
+          (cd "$assets" && sha256sum opencode-linux-x64.tar.gz > opencode-linux-x64.tar.gz.sha256 && sha256sum -c opencode-linux-x64.tar.gz.sha256)
+          entries=$(tar -tzf "$assets/opencode-linux-x64.tar.gz" | sort)
+          expected=$(printf '%s\n' opencode "$sidecar_name" | sort)
+          test "$entries" = "$expected"
+          tar -xzf "$assets/opencode-linux-x64.tar.gz" -C "$extracted"
+          version_output=$("$extracted/opencode" --version)
+          test "$version_output" = "$OPENCODE_VERSION"
+          printf '%s\n' "$version_output" | tee "$RUNNER_TEMP/candidate-evidence/version.txt"
+          OPENCODE_VERSION="$OPENCODE_VERSION" bun run packages/opencode/script/release-probe.ts \
+            x64 "$extracted/opencode" "$RUNNER_TEMP/candidate-proof" 2>&1 | tee "$RUNNER_TEMP/candidate-evidence/probe.log"
+          test -z "$(git -C source status --porcelain)"
+          python3 - "$RUNNER_TEMP" "$RELEASE_TAG" "$SOURCE_COMMIT" "$OPENCODE_VERSION" "$BUN_VERSION" "$sidecar_name" "$PROOF_HARNESS_HEAD" <<'PY'
+          import hashlib, json, pathlib, subprocess, sys
+          root = pathlib.Path(sys.argv[1])
+          archive = root / "candidate-assets/opencode-linux-x64.tar.gz"
+          def sha256(file):
+              return hashlib.sha256(file.read_bytes()).hexdigest()
+          metadata = {
+              "release_tag": sys.argv[2],
+              "release_source_commit": sys.argv[3],
+              "version": sys.argv[4],
+              "bun_version": sys.argv[5],
+              "fff_sidecar": sys.argv[6],
+              "proof_harness_head": sys.argv[7],
+              "build_classification": "native linux-x64 candidate from clean selected source; no source overlays",
+              "runner_arch": subprocess.check_output(["uname", "-m"], text=True).strip(),
+              "actions_run_id": "${{ github.run_id }}",
+              "actions_run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "bun_lock_sha256": sha256(pathlib.Path("source/bun.lock")),
+              "models_dev_sha256": sha256(root / "candidate-evidence/models.dev.json"),
+              "archive": archive.name,
+              "archive_bytes": archive.stat().st_size,
+              "archive_sha256": sha256(archive),
+              "binary_sha256": sha256(root / "candidate-extracted/opencode"),
+              "fff_sidecar_sha256": sha256(root / "candidate-extracted" / sys.argv[6]),
+              "proof": json.loads((root / "candidate-proof/evidence.json").read_text()),
+          }
+          (root / "candidate-evidence/provenance.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          print(json.dumps(metadata, indent=2))
+          PY
+
+      - name: Upload verified native candidate and input evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: opencode-linux-x64-candidate-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/candidate-assets/*
+            ${{ runner.temp }}/candidate-evidence/*
+            ${{ runner.temp }}/candidate-proof/evidence.json
+            ${{ runner.temp }}/candidate-proof/opencode-server.log
           if-no-files-found: error
           retention-days: 14
