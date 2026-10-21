@@ -42,3 +42,11 @@ Each row was applied temporarily to production code, run against the focused reg
 ## Delivery ownership
 
 Authenticated pickup account was `brentyates-swx`; issue #304 had no assignees. Open PR #311 claims fast-suite selection, without overlapping runtime scope. The single draft was opened against `swxtch` before implementation with the required first-comment stamp. `CHANGESET.md` carries the qualified #325 entry. Firstmate owns review, final-suite selection, ready transition, merge, and broader issue closure.
+
+## Subsequent CI failure investigation
+
+On 2026-10-21, [test run 39529648422](https://github.com/swxtchio/swx-opencode/actions/runs/39529648422) on port head `5ceca9be644283c344cf0c2a131b2d1e80e8df09` failed only `opencode serve --questions-command (subprocess) > an answer completes the call while the receiver is still holding its delivery`. Bun reported a test timeout rather than a behavioral assertion. Typecheck and e2e CI passed. The plan-only run's earlier changeset failure was corrected before implementation publication and is a different failure.
+
+The failed case passed ten focused runs on `d1b232e940ef155a3e5311794a2baeaa143af1d8` and ten on the port head, using Bun 1.4.2 on the same local host. Base was a detached task-local worktree with the installed dependency tree reused. Command: `bun test test/cli/serve/serve-questions.test.ts -t 'an answer completes the call while the receiver is still holding its delivery'` from each tree's `packages/opencode`. These isolated runs do not reproduce CI load/concurrency, establish a root cause, or authorize treating CI as green. The affected source is the existing held FIFO receiver, answer/continuation path and scoped subprocess cleanup; no length finish occurs in the case.
+
+[swxtchio/swx-opencode#327](https://github.com/swxtchio/swx-opencode/issues/327) retains the unresolved investigation and required producer-driven evidence. No speculative runtime change, skip, retry or enlarged deadline was applied. Firstmate must decide whether to extend this output-limit assignment to the receiver/lifecycle investigation or route it independently; merge remains blocked on the failed unit check.
