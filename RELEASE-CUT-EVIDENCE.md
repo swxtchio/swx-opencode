@@ -56,6 +56,8 @@ At correction head `debb5cc9b13a3300d8950eec9c775bfdb6c0c9ff`, the tagged-releas
 
 This additional harness-validation build used Bun `1.4.2` and lockfile SHA-256 `2c6631f22941c4367a66410ae866c07fa8d4d141798dfba728e46d4c3c400151`. Its independently fetched supplied models.dev snapshot SHA-256 is `5ceb546ecb08f34595f3e07a565735593e7952e92f2e7fbdf25c5766aef6b245`; its archive size is `64703239`, archive SHA-256 `ab7fa520e305aaf9f199a5b24491a433c2fea01ebf8e89f026e6871808e594fe`, executable SHA-256 `bc0ae37f5f060cc580d9dd37973adc4114de44488f9de0a78aa833eefbabe3ff`, and sidecar SHA-256 `977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5`. The originally selected release candidate remains the separately retained archive from run `39528763022`, recorded below.
 
+Live checks read on 2026-10-21 at task-branch head `6c09cdeca6cd85f90629f31b9dda5a2027c42247` reported four passing checks, zero failed checks, and the candidate job skipped for the PR event. The corresponding [test run 39531769952](https://github.com/swxtchio/swx-opencode/actions/runs/39531769952), [typecheck run 39531769885](https://github.com/swxtchio/swx-opencode/actions/runs/39531769885), and [native proof run 39531769886](https://github.com/swxtchio/swx-opencode/actions/runs/39531769886) each completed successfully. This records those executed checks at their pin; firstmate still owns the review and final merge gate.
+
 ## Native candidate and publication evidence
 
 ### Native x64 candidate
