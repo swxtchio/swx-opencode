@@ -55,3 +55,24 @@ The repository's `bun run typecheck:script` was then run locally on the same for
 - If it silently runs an unlisted test, extend the launch audit to refuse that same-name absolute executable without mistaking the generated observer or its configured launcher for an unobserved test process.
 - Pin the alternate-path classification with a behavior-removing mutation that leaves the configured-runtime guard enabled, then restore and run the focused and fork-maintenance checks.
 - Keep the same draft PR, update its proof and observation scope, and hand the new head to firstmate.
+
+## Alternate-path execution evidence (2026-10-21)
+
+Updated implementation pin: `4f8c8dc7ed38f8902792ac086069fe3e21aa0edb`, on the same PR branch and including `origin/swxtch` release-cut commit `ac4e395c8d` through merge `344ee72a87`. The host, real Bun/Turbo execution boundary, focused command, and local scratch environment are the same as in the initial evidence above.
+
+The new fixture copies the running Bun executable into a sibling scratch directory named `alternate/bun`, outside the committed fixture repository, and launches its unlisted test from the real package pretest. Against the prior observer, this executed `unlisted` and printed `verdict=completed mode=fast target_count=4 exit_code=0`; the regression failed at `expect(launchEscape.exitCode).toBe(1)`, expected 1, received 0. This establishes an absolute-Bun escape without changing the executable's name or relying on an uncommitted checkout.
+
+After the fix, only the `namedBun` predicate was replaced with `false`; the `configuredBun` runtime-path predicate remained enabled. The original `process.execPath` cell still passed, then the copied-executable cell failed at that same exit assertion with expected 1, received 0, after unlisted execution and a successful fast verdict. Restoring the predicate and verifying `git diff --exit-code -- ../tests/run.sh` was followed by a green focused run: exit 0, 1 pass, 0 fail, 267 assertions.
+
+All original mutations were also rerun against this updated pin, one at a time, followed by exact restoration and the same focused command. Each restored run exited 0 with 1 pass, 0 fail, and 267 assertions:
+
+| Pin | Behavior-removing mutation | Actual focused failure (exit 1) |
+| --- | --- | --- |
+| Configured absolute Bun | Bun captured-report conditional → `if (false)` | `expect(launchEscape.exitCode).toBe(1)`: expected 1, received 0; unlisted execution and successful fast verdict. |
+| Alternate absolute Bun | `const namedBun = ...` → `const namedBun = false` | `expect(launchEscape.exitCode).toBe(1)`: expected 1, received 0 specifically for `absolute-bun-copy`; the configured-runtime cell remained guarded. |
+| Bun delegation | `--bun` / `-b` wrapper conditional → `if false; then` | Marker assertion expected no `unlisted`; received `unlisted` alongside selected-file markers. |
+| Node test runner | Node basename / `--test` conditional → `if (false)` | `expect(launchEscape.exitCode).toBe(1)`: expected 1, received 0; passing Node TAP and `unlisted-node` execution marker. |
+| Non-build prerequisite | Only `(!commandless && taskName !== "build")` → `false` | Empty build-log assertion received `non-build-prerequisite\n`. |
+| Wrong-owner plan | Only `(!targetTask && plan.tasks.length > 0)` → `false` | Empty execution-marker assertion received `direct-configured\n`. |
+
+The refreshed fork-maintenance command `bun test sync-upstream.test.ts changeset-check.test.ts fast-suite-runner.test.ts`, run from `script`, exited 0 with 96 pass, 0 fail, and 548 assertions. `bun run typecheck:script`, focused correctness lint, `bash -n tests/run.sh`, and `git diff --check` exited 0. Rendered help was read again and retains its PATH-resolved Bun JUnit scope and #324 reference. The alternate-path audit leaves the generated observer and configured launcher on their existing report-capture path; the same runtime test still passes its Turbo/direct, lifecycle, preparation, options, and full-forwarding positive controls.
