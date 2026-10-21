@@ -86,3 +86,25 @@ Scope: the captain's `fix-round-1-order.txt`, addressing the selected round-1 re
 - Correct optional inspector arguments in both the shim and the launch audit, with bare and attached-value runtime coverage.
 - Fold fd-only exec dispatch and child-tool flag forwarding if their producer-driven fixtures support a small change; explicitly disclose bare Node `node:test` execution and any remaining accepted limitations.
 - Demonstrate each changed behavior with an actual guard-removal red run, restore green, run focused/fork-maintenance/type/lint checks, and push only the existing draft for firstmate review.
+
+## Round-1 execution evidence (2026-10-21)
+
+Implementation pin: `f1687c07aaab03cca10dd77ab76705ccf9c68277`, on PR #329. All measurements below drive the committed fixture repository through the real runner on the same Linux ARM64/Bun 1.4.2/Turbo 2.10.2 host. `FAST_SUITE_RUNNER_CASE=<case>` selects a launch cell while retaining the existing runtime positive/refusal controls; the command remains `bun test fast-suite-runner.test.ts` from `script`, with local `TMPDIR` and Turbo telemetry disabled as above.
+
+Before implementation, configured/copied/PATH `--inspect` cells and both Bun/Node shebang cells each executed an unlisted marker and returned `verdict=completed mode=fast target_count=4 exit_code=0`. Every focused regression exited 1 at the launch exit assertion, expected 1, received 0. Separate CLI probes confirmed that bare `--inspect` and `--inspect=127.0.0.1:0` dispatch tests, while a separated `127.0.0.1:0` word is an entrypoint rather than the optional inspector value. Runtime pins use non-waiting `--inspect`; the wait/brk siblings share the corrected bare/attached argument treatment but their debugger-wait behavior is not claimed as tested.
+
+Each counterfactual below modified only the named behavior in the owning production runner. The fixture copied and committed that runner before execution, so no dirty-checkout refusal decided a red. After each mutation group, `git diff --exit-code -- ../tests/run.sh` verified exact restoration and the full focused command passed with 1 pass, 0 fail, and 304 assertions.
+
+| Runtime cell | Behavior removed | Actual focused red (exit 1) |
+| --- | --- | --- |
+| Bun shebang | Interpreter-resolution loop → `while (false)` | Launch exit assertion expected 1, received 0; `shebang-bun` executed and fast mode completed successfully. |
+| Node shebang | Same interpreter-resolution removal | Launch exit assertion expected 1, received 0; native `shebang-node` executed and fast mode completed successfully. |
+| Recursive shebang | Same interpreter-resolution removal | Launch exit assertion expected 1, received 0; the nested interpreter's `shebang-bun` test executed and fast mode completed successfully. |
+| Relative-script working directory | Successful `chdir` state update → `void strings` | Launch exit assertion expected 1, received 0 for Bun shebang execution; process creation still remained traced. |
+| Configured inspector | Restore inspector names to the audit's always-value-taking list | Launch exit assertion expected 1, received 0; `unlisted` executed and fast mode completed successfully. |
+| Copied inspector | Same audit-parser removal | Launch exit assertion expected 1, received 0; copied Bun executed `unlisted` and fast mode completed successfully. |
+| PATH inspector | Restore inspector names to the shim's always-value-taking list | JUnit mismatch assertion failed: expected `reason=execution-set-mismatch`, received `reason=unobservable-test-launch`. Unlisted execution occurred, but the shim failed to capture it; the separate audit still refused success. |
+| fd-only Bun | Replace fd-path reconstruction with early `if (!executable) continue` | Launch exit assertion expected 1, received 0; Python's actual fd exec of Bun ran `unlisted` and fast mode completed successfully. |
+| Child-tool flags | Restore an all-argv delegation scan and remove the bunx/x mode exclusion | Successful-fast assertion expected 0, received 1 at the real tool-forwarding cell; the over-scoped refusal blocked `-b` delivery. |
+
+The full focused matrix includes bare and attached inspector positive controls across configured/copied/PATH launches, both shebang families, recursive dispatch, fd-only execution, and real `bunx tsc -b`, `bun x tsc -b`, and `bun run flag-probe -- -b` forwarding to executable fixture consumers. The refreshed fork-maintenance group exited 0 with 96 pass, 0 fail, and 585 assertions. Fork-script typecheck, focused correctness lint, Bash syntax, rendered help, and diff checks exited 0. Bare Node `node:test` execution without `--test` remains explicitly disclosed and tracked in #337; the two cheap implementation advisories were folded into this hardening batch.
