@@ -621,6 +621,117 @@ describe("session.compaction.isOverflow", () => {
   )
 })
 
+describe("session.compaction.isAutoCompactionDue", () => {
+  it.live(
+    "uses the 95 percent model-context default separately from reserved capacity",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const model = createModel({ context: 100_000, output: 10_000 })
+        const atCapacity = SessionNs.getUsage({
+          model,
+          usage: usage({ inputTokens: 90_000, outputTokens: 0, totalTokens: 90_000 }),
+        }).tokens
+        const belowThreshold = SessionNs.getUsage({
+          model,
+          usage: usage({ inputTokens: 94_999, outputTokens: 0, totalTokens: 94_999 }),
+        }).tokens
+        const atThreshold = SessionNs.getUsage({
+          model,
+          usage: usage({ inputTokens: 95_000, outputTokens: 0, totalTokens: 95_000 }),
+        }).tokens
+
+        expect(yield* compact.isOverflow({ tokens: atCapacity, model })).toBe(true)
+        expect(yield* compact.isAutoCompactionDue({ tokens: atCapacity, model })).toBe(false)
+        expect(yield* compact.isAutoCompactionDue({ tokens: belowThreshold, model })).toBe(false)
+        expect(yield* compact.isAutoCompactionDue({ tokens: atThreshold, model })).toBe(true)
+      }),
+    ),
+  )
+
+  it.live(
+    "honors a saved percentage against model context",
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const compact = yield* SessionCompaction.Service
+          const model = createModel({ context: 100_000, output: 10_000 })
+          const below = SessionNs.getUsage({
+            model,
+            usage: usage({ inputTokens: 74_999, outputTokens: 0, totalTokens: 74_999 }),
+          }).tokens
+          const threshold = SessionNs.getUsage({
+            model,
+            usage: usage({ inputTokens: 75_000, outputTokens: 0, totalTokens: 75_000 }),
+          }).tokens
+
+          expect(yield* compact.isAutoCompactionDue({ tokens: below, model })).toBe(false)
+          expect(yield* compact.isAutoCompactionDue({ tokens: threshold, model })).toBe(true)
+        }),
+      { config: { compaction: { threshold_percent: 75 } } },
+    ),
+  )
+
+  it.live(
+    "uses production reasoning and cache accounting when total usage is absent",
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const compact = yield* SessionCompaction.Service
+          const model = createModel({ context: 100_000, output: 10_000 })
+          const tokens = SessionNs.getUsage({
+            model,
+            usage: usage({
+              inputTokens: 40_000,
+              outputTokens: 8_000,
+              reasoningTokens: 5_000,
+              cacheReadInputTokens: 8_000,
+              cacheWriteInputTokens: 4_000,
+            }),
+          }).tokens
+
+          expect(tokens.total).toBeUndefined()
+          expect(yield* compact.isAutoCompactionDue({ tokens, model })).toBe(true)
+          expect(yield* compact.isAutoCompactionDue({ tokens: { ...tokens, reasoning: 0 }, model })).toBe(false)
+          expect(
+            yield* compact.isAutoCompactionDue({ tokens: { ...tokens, cache: { read: 0, write: 0 } }, model }),
+          ).toBe(false)
+        }),
+      { config: { compaction: { threshold_percent: 48 } } },
+    ),
+  )
+
+  it.live(
+    "does not infer a percentage when model context is unknown",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const tokens = { input: 100_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+
+        expect(yield* compact.isAutoCompactionDue({ tokens, model: createModel({ context: 0, output: 10_000 }) })).toBe(
+          false,
+        )
+      }),
+    ),
+  )
+
+  it.live(
+    "does not auto-compact when disabled",
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const compact = yield* SessionCompaction.Service
+          const tokens = { input: 100_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+
+          expect(
+            yield* compact.isAutoCompactionDue({ tokens, model: createModel({ context: 100_000, output: 10_000 }) }),
+          ).toBe(false)
+        }),
+      { config: { compaction: { auto: false } } },
+    ),
+  )
+})
+
 describe("session.compaction.create", () => {
   it.live(
     "creates a compaction user message and part",
@@ -991,6 +1102,79 @@ describe("session.compaction.process", () => {
         expect(last.parts[0].text).toContain("Continue if you have next steps")
       }
     }),
+  )
+
+  itCompaction.instance(
+    "capacity compaction resumes its turn even when a plugin disables autocontinuation",
+    () => {
+      const stub = llm()
+      stub.push(reply("capacity summary"))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "finish the interrupted task")
+        const taskID = yield* SessionCompaction.use.create({
+          sessionID: session.id,
+          agent: "build",
+          model: ref,
+          auto: true,
+          trigger: "capacity",
+          resume: true,
+        })
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const result = yield* SessionCompaction.use.process({
+          parentID: taskID,
+          messages: msgs,
+          sessionID: session.id,
+          auto: true,
+          resume: true,
+        })
+        const all = yield* ssn.messages({ sessionID: session.id })
+
+        expect(result).toBe("continue")
+        expect(all.at(-1)?.info.role).toBe("user")
+        expect(all.at(-1)?.parts[0]).toMatchObject({
+          type: "text",
+          synthetic: true,
+          metadata: { compaction_continue: true },
+        })
+      }).pipe(withCompaction({ llm: stub.llmLayer, plugin: autocontinue(false) }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "threshold maintenance does not invent a continuation when a plugin enables autocontinuation",
+    () => {
+      const stub = llm()
+      stub.push(reply("threshold summary"))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "the completed turn")
+        const taskID = yield* SessionCompaction.use.create({
+          sessionID: session.id,
+          agent: "build",
+          model: ref,
+          auto: true,
+          trigger: "threshold",
+          resume: false,
+        })
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const result = yield* SessionCompaction.use.process({
+          parentID: taskID,
+          messages: msgs,
+          sessionID: session.id,
+          auto: true,
+          resume: false,
+        })
+        const all = yield* ssn.messages({ sessionID: session.id })
+
+        expect(result).toBe("continue")
+        expect(all.some((message) => message.parts.some((part) => part.type === "text" && part.synthetic))).toBe(false)
+      }).pipe(withCompaction({ llm: stub.llmLayer, plugin: autocontinue(true) }))
+    },
+    { git: true },
   )
 
   itCompaction.instance(

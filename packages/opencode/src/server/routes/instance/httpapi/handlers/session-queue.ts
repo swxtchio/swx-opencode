@@ -9,7 +9,14 @@ import { Cause, Effect, Option, Scope } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import { notFound, QueueItemNotPendingError, QueueItemNotWithdrawnError } from "../errors"
-import { HoldPayload, RemovePayload, ReorderPayload, RestorePayload, UpdatePayload } from "../groups/session-queue"
+import {
+  HoldPayload,
+  RemovePayload,
+  ReorderPayload,
+  RestorePayload,
+  RewritePayload,
+  UpdatePayload,
+} from "../groups/session-queue"
 import * as SessionError from "./session-errors"
 
 export const sessionQueueHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessionQueue", (handlers) =>
@@ -96,6 +103,45 @@ export const sessionQueueHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       return item.value
     })
 
+    const rewrite = Effect.fn("SessionQueueHttpApi.rewrite")(function* (ctx: {
+      params: { sessionID: SessionID; itemID: SessionQueue.ItemID }
+      payload: typeof RewritePayload.Type
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      const result = yield* queue.rewrite({
+        sessionID: ctx.params.sessionID,
+        itemID: ctx.params.itemID,
+        expectedText: ctx.payload.expectedText,
+        text: ctx.payload.text,
+      })
+      if (result.outcome === "rewritten") yield* wake(ctx.params.sessionID)
+      return result
+    })
+
+    const force = Effect.fn("SessionQueueHttpApi.force")(function* (ctx: {
+      params: { sessionID: SessionID; itemID: SessionQueue.ItemID }
+      payload: typeof HoldPayload.Type
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      const outcome = yield* queue.force({
+        sessionID: ctx.params.sessionID,
+        itemID: ctx.params.itemID,
+        holder: ctx.payload.holder,
+      })
+      if (outcome === "forced") yield* wake(ctx.params.sessionID)
+      return { outcome, items: yield* queue.list(ctx.params.sessionID) }
+    })
+
+    const holdStatus = Effect.fn("SessionQueueHttpApi.holdStatus")(function* (ctx: {
+      params: { sessionID: SessionID; holder: string }
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      return {
+        held: yield* queue.holdStatus(ctx.params.sessionID, ctx.params.holder),
+        items: yield* queue.list(ctx.params.sessionID),
+      }
+    })
+
     // When a review hold ends, the session is woken to deliver what it kept
     // pending. A session with nothing pending is left alone: a new one has no
     // message for a run to answer.
@@ -157,16 +203,31 @@ export const sessionQueueHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       return yield* queue.consolidate(ctx.params.sessionID, (yield* config.get()).machine_message_markers)
     })
 
+    const consolidateSelected = Effect.fn("SessionQueueHttpApi.consolidateSelected")(function* (ctx: {
+      params: { sessionID: SessionID; itemID: SessionQueue.ItemID }
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      return yield* queue.consolidateSelected(
+        ctx.params.sessionID,
+        ctx.params.itemID,
+        (yield* config.get()).machine_message_markers,
+      )
+    })
+
     return handlers
       .handle("list", list)
       .handle("withdraw", withdraw)
       .handle("restore", restore)
       .handle("update", update)
+      .handle("rewrite", rewrite)
+      .handle("force", force)
+      .handle("holdStatus", holdStatus)
       .handle("hold", hold)
       .handle("release", release)
       .handle("remove", remove)
       .handle("reorder", reorder)
       .handle("consolidate", consolidate)
+      .handle("consolidateSelected", consolidateSelected)
       .handle("receipt", receipt)
   }),
 )

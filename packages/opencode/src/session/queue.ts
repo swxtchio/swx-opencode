@@ -41,6 +41,7 @@ import { MessageID, PartID, SessionID } from "./schema"
 type DatabaseService = Database.Interface["db"]
 type DatabaseTransaction = Parameters<Parameters<DatabaseService["transaction"]>[0]>[0]
 type DatabaseAccess = DatabaseService | DatabaseTransaction
+const QueueRewriteMetadataKey = "sessionQueueRewriteText"
 
 // Direct noReply writes need their own original before preparation can ever run again.
 const NoReplyOriginal = Schema.Struct({
@@ -126,6 +127,16 @@ const consumeAcquireBackstop = Duration.seconds(20)
 // lease only ends a hold whose client vanished without releasing it.
 export const holdLease = Duration.minutes(6)
 export type HoldEnd = "released" | "lapsed"
+export type ForceOutcome = "forced" | "another-review" | "hold-unconfirmed" | "preparing" | "unavailable"
+export type SelectedConsolidationOutcome = "consolidated" | "unchanged" | "preparing" | "incompatible" | "unavailable"
+export type RewriteOutcome =
+  | "rewritten"
+  | "stale"
+  | "preparing"
+  | "unavailable"
+  | "no-text"
+  | "empty"
+  | "missing-reference"
 
 export interface Interface {
   readonly admit: (input: AdmitInput) => Effect.Effect<Item>
@@ -236,6 +247,19 @@ export interface Interface {
     readonly itemID: ItemID
     readonly delivery: Delivery
   }) => Effect.Effect<Option.Option<Item>>
+  /** Rewrites editable text only when the prepared pending input still matches its expected snapshot. */
+  readonly rewrite: (input: {
+    readonly sessionID: SessionID
+    readonly itemID: ItemID
+    readonly expectedText: string
+    readonly text: string
+  }) => Effect.Effect<{ readonly outcome: RewriteOutcome; readonly items: Item[] }>
+  /** Gives one prepared pending item steer timing and releases only the requesting review hold. */
+  readonly force: (input: {
+    readonly sessionID: SessionID
+    readonly itemID: ItemID
+    readonly holder: string
+  }) => Effect.Effect<ForceOutcome>
   /**
    * Turns pending items into V1 user messages, and reports whether the queue
    * changed. `prepare` resolves a message with no lock held, since it may read
@@ -314,6 +338,8 @@ export interface Interface {
     sessionID: SessionID,
     holder: string,
   ) => Effect.Effect<{ readonly started: boolean; readonly items: Item[] }>
+  /** Reads whether this holder owns a live review hold without acquiring or renewing one. */
+  readonly holdStatus: (sessionID: SessionID, holder: string) => Effect.Effect<boolean>
   /** Ends `holder`'s hold; true when that ended the session's hold. */
   readonly release: (sessionID: SessionID, holder: string) => Effect.Effect<boolean>
   /**
@@ -347,6 +373,12 @@ export interface Interface {
     sessionID: SessionID,
     markers?: ConfigV1.Info["machine_message_markers"],
   ) => Effect.Effect<Item[]>
+  /** Consolidates all pending human-composer prompts when the selected item is human work. */
+  readonly consolidateSelected: (
+    sessionID: SessionID,
+    itemID: ItemID,
+    markers?: ConfigV1.Info["machine_message_markers"],
+  ) => Effect.Effect<{ readonly outcome: SelectedConsolidationOutcome; readonly items: Item[] }>
   /**
    * The messages with a synthetic note, on each one a queued prompt became, of
    * when that prompt was queued and delivered (#212). Only the model request
@@ -726,6 +758,8 @@ const layer = Layer.effect(
       const now = Date.now()
       if (input.parts.some((part) => part.type === "text" && part.metadata?.sessionQueuePendingOriginal))
         return yield* Effect.die(new Error("Pending peer custody metadata is queue-owned"))
+      if (input.parts.some((part) => part.type === "text" && part.metadata?.[QueueRewriteMetadataKey] === true))
+        return yield* Effect.die(new Error("Queue rewrite metadata is queue-owned"))
       yield* assertNotPreparing(input.sessionID, input.messageID)
       const callerScope = Option.getOrUndefined(yield* Effect.serviceOption(Scope.Scope))
       const result = yield* writable(input.sessionID, (tx) =>
@@ -1936,6 +1970,61 @@ const layer = Layer.effect(
       return Option.some(fromRow(row))
     })
 
+    const rewrite: Interface["rewrite"] = (input) =>
+      exclusive(
+        input.sessionID,
+        Effect.gen(function* () {
+          const result = yield* writable(input.sessionID, (tx) =>
+            Effect.gen(function* () {
+              const row = yield* rowOf(tx, input.itemID)
+              if (
+                !row ||
+                row.session_id !== input.sessionID ||
+                row.time_promoted !== null ||
+                row.time_withdrawn !== null
+              )
+                return { outcome: "unavailable" as const, finished: [] }
+              if (row.time_preparing !== null) return { outcome: "preparing" as const, finished: [] }
+
+              const currentInput = decodeInput(row.input)
+              const currentText = editableText(currentInput)
+              if (currentText !== input.expectedText) return { outcome: "stale" as const, finished: [] }
+              const replacement = rewriteInputText(
+                currentInput.parts.some(pendingOriginal)
+                  ? currentInput
+                  : {
+                      ...currentInput,
+                      parts: [...currentInput.parts, originalWitness(fromRow(row), PartID.ascending(), true)],
+                    },
+                input.text,
+              )
+              if (replacement.outcome !== "rewritten") return { outcome: replacement.outcome, finished: [] }
+
+              const finished = yield* invalidate(tx, input.sessionID)
+              const updated = yield* tx
+                .update(SessionPromptQueueTable)
+                .set({ input: encodeInput(replacement.input) })
+                .where(
+                  and(
+                    eq(SessionPromptQueueTable.id, input.itemID),
+                    pending(input.sessionID),
+                    isNull(SessionPromptQueueTable.time_preparing),
+                  ),
+                )
+                .returning()
+                .get()
+                .pipe(Effect.orDie)
+              return { outcome: updated ? ("rewritten" as const) : ("unavailable" as const), finished }
+            }),
+          ).pipe(Effect.orDie)
+
+          finish(result.finished)
+          if (result.finished.length > 0 || result.outcome === "rewritten") yield* publish(input.sessionID)
+          if (result.outcome === "rewritten") wake(input.sessionID)
+          return { outcome: result.outcome, items: yield* list(input.sessionID) }
+        }),
+      ).pipe(Effect.withSpan("SessionQueue.rewrite"))
+
     const held = (sessionID: SessionID) =>
       Clock.currentTimeMillis.pipe(
         Effect.map((now) => [...(holds.get(sessionID)?.leases.values() ?? [])].some((until) => until > now)),
@@ -1954,6 +2043,16 @@ const layer = Layer.effect(
       yield* Deferred.succeed(current.ended, end)
       return undefined
     })
+
+    const holdStatus: Interface["holdStatus"] = (sessionID, holder) =>
+      exclusive(
+        sessionID,
+        Effect.gen(function* () {
+          const current = (yield* settle(sessionID, "lapsed")) ? holds.get(sessionID) : undefined
+          const until = current?.leases.get(holder)
+          return until !== undefined && until > (yield* Clock.currentTimeMillis)
+        }),
+      ).pipe(Effect.withSpan("SessionQueue.holdStatus"))
 
     // Drops every pending row's reservation, so a promotion prepared before a
     // hold, reorder or consolidation can no longer commit; its loop reserves
@@ -2017,6 +2116,68 @@ const layer = Layer.effect(
           return (yield* settle(sessionID, "released")) === undefined
         }),
       ).pipe(Effect.withSpan("SessionQueue.release"))
+
+    const force: Interface["force"] = (input) =>
+      exclusive(
+        input.sessionID,
+        Effect.gen(function* () {
+          const current = (yield* settle(input.sessionID, "lapsed")) ? holds.get(input.sessionID) : undefined
+          if (!current) return "hold-unconfirmed"
+          if (!current.leases.has(input.holder)) return current.leases.size > 0 ? "another-review" : "hold-unconfirmed"
+          if (current.leases.size > 1) return "another-review"
+
+          const forced = yield* writable(input.sessionID, (tx) =>
+            Effect.gen(function* () {
+              const selected = yield* rowOf(tx, input.itemID)
+              if (
+                !selected ||
+                selected.session_id !== input.sessionID ||
+                selected.time_promoted !== null ||
+                selected.time_withdrawn !== null
+              )
+                return { outcome: "unavailable" as const, finished: [] }
+              if (selected.time_preparing !== null) return { outcome: "preparing" as const, finished: [] }
+
+              const now = yield* Clock.currentTimeMillis
+              const until = current.leases.get(input.holder)
+              if (until === undefined || until <= now) return { outcome: "hold-unconfirmed" as const, finished: [] }
+
+              const finished = yield* invalidate(tx, input.sessionID)
+              const currentTime = yield* Clock.currentTimeMillis
+              const stillHeldUntil = current.leases.get(input.holder)
+              if (stillHeldUntil === undefined || stillHeldUntil <= currentTime)
+                return { outcome: "hold-unconfirmed" as const, finished }
+
+              const row = yield* tx
+                .update(SessionPromptQueueTable)
+                .set({ delivery: "steer" })
+                .where(
+                  and(
+                    eq(SessionPromptQueueTable.id, input.itemID),
+                    pending(input.sessionID),
+                    isNull(SessionPromptQueueTable.time_preparing),
+                  ),
+                )
+                .returning()
+                .get()
+                .pipe(Effect.orDie)
+              return { outcome: row ? ("forced" as const) : ("unavailable" as const), finished }
+            }),
+          ).pipe(Effect.orDie)
+
+          finish(forced.finished)
+          if (forced.outcome !== "forced") {
+            if (forced.finished.length > 0) yield* publish(input.sessionID)
+            return forced.outcome
+          }
+
+          current.leases.delete(input.holder)
+          yield* settle(input.sessionID, "released")
+          wake(input.sessionID)
+          yield* publish(input.sessionID)
+          return "forced"
+        }),
+      ).pipe(Effect.withSpan("SessionQueue.force"))
 
     // A renewed lease outlasts the deadline this waits for, so it settles again.
     const released: Interface["released"] = (sessionID) =>
@@ -2125,11 +2286,161 @@ const layer = Layer.effect(
       sessionID: SessionID,
       markers?: ConfigV1.Info["machine_message_markers"],
     ) {
+      return (yield* consolidateAction(sessionID, markers)).items
+    })
+
+    const consolidateSelected = Effect.fn("SessionQueue.consolidateSelected")(function* (
+      sessionID: SessionID,
+      itemID: ItemID,
+      markers?: ConfigV1.Info["machine_message_markers"],
+    ) {
+      return yield* consolidateAction(sessionID, markers, itemID)
+    })
+
+    const consolidateAction = Effect.fnUntraced(function* (
+      sessionID: SessionID,
+      markers?: ConfigV1.Info["machine_message_markers"],
+      selectedID?: ItemID,
+    ) {
+      const humanSelection = (rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[]) => {
+        const selected = rows.find((row) => row.id === selectedID)
+        if (!selected) return { outcome: "unavailable" as const }
+        const selectedInput = fromRow(selected).input
+        if (!humanComposer(selectedInput, markers)) return { outcome: "non-human" as const }
+
+        const human = rows
+          .map((row) => ({ row, input: fromRow(row).input }))
+          .filter(({ input }) => humanComposer(input, markers))
+          .toSorted((left, right) => left.row.id.localeCompare(right.row.id))
+        if (!human.length) return { outcome: "unavailable" as const }
+        if (human.some(({ row }) => row.time_preparing !== null)) return { outcome: "preparing" as const }
+
+        const first = human[0]
+        if (!first) return { outcome: "unavailable" as const }
+        const last = human.at(-1)
+        if (!last) return { outcome: "unavailable" as const }
+        if (rows.some((row) => row.time_preparing !== null && row.id > first.row.id && row.id < last.row.id))
+          return { outcome: "preparing" as const }
+        const context = (input: SessionPromptQueue.QueuedInput) => ({
+          agent: input.agent,
+          format: input.format,
+          system: input.system,
+          tools: input.tools,
+        })
+        if (
+          human.some(
+            ({ row, input }) =>
+              row.delivery !== first.row.delivery || !isDeepStrictEqual(context(input), context(first.input)),
+          )
+        )
+          return { outcome: "incompatible" as const }
+        if (human.length < 2) return { outcome: "unchanged" as const }
+        return { outcome: "ready" as const, rows: human.map(({ row }) => row) }
+      }
+
       return yield* exclusive(
         sessionID,
         Effect.gen(function* () {
-          const changed = yield* writable(sessionID, (tx) =>
+          const result = yield* writable(sessionID, (tx) =>
             Effect.gen(function* () {
+              const pendingRows = selectedID
+                ? yield* tx.select().from(SessionPromptQueueTable).where(pending(sessionID)).all().pipe(Effect.orDie)
+                : []
+              const selectedPlan = selectedID ? humanSelection(pendingRows) : undefined
+              if (selectedPlan?.outcome === "unavailable")
+                return { outcome: "unavailable" as const, changed: false, into: [], finished: [] }
+              if (selectedPlan && selectedPlan.outcome !== "non-human" && selectedPlan.outcome !== "ready")
+                return { outcome: selectedPlan.outcome, changed: false, into: [], finished: [] }
+
+              if (selectedPlan?.outcome === "ready") {
+                const finished = yield* invalidate(tx, sessionID)
+                const currentRows = yield* tx
+                  .select()
+                  .from(SessionPromptQueueTable)
+                  .where(pending(sessionID))
+                  .all()
+                  .pipe(Effect.orDie)
+                const currentPlan = humanSelection(currentRows)
+                if (currentPlan.outcome !== "ready")
+                  return {
+                    outcome: currentPlan.outcome === "non-human" ? ("unavailable" as const) : currentPlan.outcome,
+                    changed: finished.length > 0,
+                    into: [],
+                    finished,
+                  }
+
+                const rows = currentPlan.rows
+                const target = rows[0]
+                if (!target)
+                  return { outcome: "unavailable" as const, changed: finished.length > 0, into: [], finished }
+                const sources = rows.slice(1)
+                const itemIDs = rows.map((row) => row.id)
+                yield* indexAliases(tx, sessionID)
+                const aliases = yield* tx
+                  .select()
+                  .from(SessionPromptQueueAliasTable)
+                  .where(inArray(SessionPromptQueueAliasTable.item_id, itemIDs))
+                  .all()
+                  .pipe(Effect.orDie)
+                const originals = originalsOfRows(rows)
+                const merged = grouped(rows, aliases, markers)
+
+                // The explicit carrier keeps exact source inputs for later merges,
+                // including composer sends that have no stable message alias.
+                yield* retainOriginals(tx, target, sources)
+                const retained = yield* rowOf(tx, target.id)
+                if (!retained)
+                  return { outcome: "unavailable" as const, changed: finished.length > 0, into: [], finished }
+                const pendingWitnesses = decodeInput(retained.input)
+                  .parts.flatMap((part) => {
+                    const original = pendingOriginal(part)
+                    return original ? [{ part, original }] : []
+                  })
+                  .toSorted((left, right) => compareAdmissionIdentity(left.original, right.original))
+                  .map(({ part }) => part)
+                const witnesses = originals.map((original) => originalWitness(original, PartID.ascending(), true))
+                yield* settleReceipts(
+                  tx,
+                  sessionID,
+                  sources.map((row) => row.id),
+                  { kind: "merged", into: target },
+                )
+                yield* tx
+                  .delete(SessionPromptQueueTable)
+                  .where(
+                    inArray(
+                      SessionPromptQueueTable.id,
+                      sources.map((row) => row.id),
+                    ),
+                  )
+                  .run()
+                  .pipe(Effect.orDie)
+                yield* tx
+                  .update(SessionPromptQueueTable)
+                  .set({
+                    seq: Math.min(...rows.map((row) => row.seq)),
+                    input: encodeInput({
+                      ...merged,
+                      parts: [
+                        ...merged.parts.filter((part) => !pendingOriginal(part)),
+                        ...pendingWitnesses,
+                        ...witnesses,
+                      ],
+                    }),
+                    origins: originalOriginsInAdmissionOrder(rows),
+                    time_created: Math.max(...rows.map((row) => row.time_created)),
+                  })
+                  .where(eq(SessionPromptQueueTable.id, target.id))
+                  .run()
+                  .pipe(Effect.orDie)
+                return {
+                  outcome: "consolidated" as const,
+                  changed: true,
+                  into: [{ into: target.id, items: sources.map((row) => row.id) }],
+                  finished,
+                }
+              }
+
               const finished = yield* invalidate(tx, sessionID)
               const rows = yield* tx
                 .select()
@@ -2188,13 +2499,18 @@ const layer = Layer.effect(
                     .pipe(Effect.orDie)
                 }),
               )
-              finish(finished)
-              return { changed: plan.removed.length > 0 || finished.length > 0, into: plan.into }
+              return {
+                outcome: plan.removed.length > 0 ? ("consolidated" as const) : ("unchanged" as const),
+                changed: plan.removed.length > 0 || finished.length > 0,
+                into: plan.into,
+                finished,
+              }
             }),
           ).pipe(Effect.orDie)
-          changed.into.forEach((merge) => retire(merge.items, merge.into))
-          if (changed.changed) yield* publish(sessionID)
-          return yield* list(sessionID)
+          finish(result.finished)
+          result.into.forEach((merge) => retire(merge.items, merge.into))
+          if (result.changed) yield* publish(sessionID)
+          return { outcome: result.outcome, items: yield* list(sessionID) }
         }),
       )
     })
@@ -2902,6 +3218,8 @@ const layer = Layer.effect(
       withdraw,
       restore,
       update,
+      rewrite,
+      force,
       promote,
       consume,
       park,
@@ -2916,12 +3234,14 @@ const layer = Layer.effect(
       exclusive,
       whileCompacting,
       hold,
+      holdStatus,
       release,
       released,
       disposition,
       remove,
       reorder,
       consolidate,
+      consolidateSelected,
       annotate,
     })
   }),
@@ -3020,7 +3340,40 @@ function pendingOriginal(part: SessionPromptQueue.QueuedInput["parts"][number]) 
 
 function originalsOf(row: typeof SessionPromptQueueTable.$inferSelect) {
   const stored = decodeInput(row.input).parts.flatMap((part) => pendingOriginal(part) ?? [])
-  return stored.length ? [...new Map(stored.map((original) => [original.id, original])).values()] : [fromRow(row)]
+  const originals = stored.length
+    ? [...new Map(stored.map((original) => [original.id, original])).values()]
+    : [fromRow(row)]
+  return originals.toSorted(compareAdmissionIdentity)
+}
+
+function originalsOfRows(rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[]) {
+  return [...new Map(rows.flatMap(originalsOf).map((original) => [original.id, original])).values()].toSorted(
+    compareAdmissionIdentity,
+  )
+}
+
+function originalOriginsInAdmissionOrder(rows: readonly (typeof SessionPromptQueueTable.$inferSelect)[]) {
+  const originals = originalsOfRows(rows)
+  const originByID = new Map(
+    rows.flatMap((row) => {
+      const rowOrigins = origins(row)
+      return originalsOf(row).flatMap((original, index) => {
+        const origin = rowOrigins[index]
+        return origin ? [[original.id, origin] as const] : []
+      })
+    }),
+  )
+  const ordered = originals.flatMap((original) => {
+    const origin = originByID.get(original.id)
+    return origin ? [origin] : []
+  })
+  return ordered.length === originals.length ? ordered : rows.flatMap(origins)
+}
+
+function compareAdmissionIdentity(left: { readonly id: ItemID }, right: { readonly id: ItemID }) {
+  if (left.id < right.id) return -1
+  if (left.id > right.id) return 1
+  return 0
 }
 
 function originalWitness(original: SessionPromptQueue.Group["constituents"][number], id: PartID, pending = false) {
@@ -3122,14 +3475,13 @@ function grouped(
   aliases: readonly (typeof SessionPromptQueueAliasTable.$inferSelect)[] = [],
   markers?: ConfigV1.Info["machine_message_markers"],
 ) {
-  const items = rows.flatMap(originalsOf)
+  const items = originalsOfRows(rows)
   const kind = dispatch(items[0].input, items[0].delivery, markers)
+  const first = items[0]
   const humanBatch =
-    rows.length > 1 &&
-    rows.every((row) => {
-      const input = Schema.decodeUnknownOption(SessionPromptQueue.QueuedInput)(row.input)
-      return row.delivery === "queue" && Option.isSome(input) && humanComposer(input.value, markers)
-    })
+    items.length > 1 &&
+    first !== undefined &&
+    items.every((item) => item.delivery === first.delivery && humanComposer(item.input, markers))
   const group: SessionPromptQueue.Group = {
     version: 1,
     sessionID: items[0].sessionID,
@@ -3162,10 +3514,18 @@ function grouped(
       })
   if (!kind) {
     const parts = humanBatch
-      ? items.flatMap((item, index) => [
-          ...(index ? [{ type: "text" as const, text: "\n" }] : []),
-          ...item.input.parts.filter((part) => !pendingOriginal(part)),
-        ])
+      ? rows
+          .flatMap((row) => {
+            const input = decodeInput(row.input)
+            const originals = originalsOf(row)
+            if (queueTextRewritten(input)) return [{ id: originals[0]?.id ?? row.id, input }]
+            return originals.map((original) => ({ id: original.id, input: original.input }))
+          })
+          .toSorted(compareAdmissionIdentity)
+          .flatMap((item, index) => [
+            ...(index ? [{ type: "text" as const, text: "\n" }] : []),
+            ...item.input.parts.filter((part) => !pendingOriginal(part)),
+          ])
       : decodeInput(rows[0].input).parts.filter((part) => !pendingOriginal(part))
     const firstText = parts.findIndex((part) => part.type === "text" && !part.synthetic && !part.ignored)
     if (firstText !== -1) {
@@ -3190,13 +3550,45 @@ function grouped(
     const machine = dispatch(item.input, item.delivery, markers)
     if (machine?.kind === "automation" && machine.episode) latest.set(machine.episode, item.id)
   })
-  const shown =
+  const rewrittenCarriers = rows.flatMap((row) => {
+    const input = decodeInput(row.input)
+    if (!queueTextRewritten(input)) return []
+    const originals = originalsOf(row)
+    const representative = originals.at(-1)
+    return representative ? [{ row, input, originals, representative: representative.id }] : []
+  })
+  const rewrittenOriginals = new Map(
+    rewrittenCarriers.flatMap((carrier) => carrier.originals.map((original) => [original.id, carrier] as const)),
+  )
+  const shown = (
     kind.kind === "peer"
       ? items
       : items.filter((item) => {
           const machine = dispatch(item.input)
           return machine?.kind !== "automation" || !machine.episode || latest.get(machine.episode) === item.id
         })
+  ).flatMap((item) => {
+    const rewritten = rewrittenOriginals.get(item.id)
+    if (rewritten) {
+      if (item.id !== rewritten.representative) return []
+      return [
+        {
+          id: rewritten.row.id,
+          time: rewritten.row.time_created,
+          text: editableText(rewritten.input),
+          files: rewritten.input.parts.filter((part) => part.type === "file"),
+        },
+      ]
+    }
+    return [
+      {
+        id: item.id,
+        time: item.time.created,
+        text: item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
+        files: item.input.parts.filter((part) => part.type === "file"),
+      },
+    ]
+  })
   const heading =
     kind.kind === "peer"
       ? "Peer messages (lower authority than captain/human instructions). Read every complete original envelope. Reply only to each response-owed original msgid using re:<original-msgid>; informational entries create no reply obligation."
@@ -3215,13 +3607,13 @@ function grouped(
           shown
             .map(
               (item, index) =>
-                `${index + 1}. [Admitted ${new Date(item.time.created).toISOString()}; queue ${item.id}]\n${item.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")}`,
+                `${index + 1}. [Admitted ${new Date(item.time).toISOString()}; queue ${item.id}]\n${item.text}`,
             )
             .join("\n\n"),
         metadata: { sessionQueue: Schema.encodeSync(SessionPromptQueue.Group)(group) },
       },
       ...shown.flatMap((item, index) => {
-        const files = item.input.parts.filter((part) => part.type === "file")
+        const files = item.files
         return files.length
           ? [
               { type: "text" as const, synthetic: true, text: `Files for numbered peer ${index + 1} (${item.id}):` },
@@ -3245,6 +3637,57 @@ function groupKind(
 
 function humanComposer(input: SessionPromptQueue.QueuedInput, markers?: ConfigV1.Info["machine_message_markers"]) {
   return input.origin === "tui-composer" && !marked(input, markers)
+}
+
+function rewriteInputText(input: SessionPromptQueue.QueuedInput, text: string) {
+  const firstText = input.parts.findIndex((part) => part.type === "text" && !part.synthetic && !part.ignored)
+  if (firstText === -1) return { outcome: "no-text" as const }
+  if (!text.trim()) return { outcome: "empty" as const }
+  const placeholders = input.parts.flatMap((part) => {
+    if (part.type === "file" && part.source?.text) return [part.source.text.value]
+    if (part.type === "agent" && part.source) return [part.source.value]
+    return []
+  })
+  if (placeholders.some((placeholder) => !text.includes(placeholder))) return { outcome: "missing-reference" as const }
+  return {
+    outcome: "rewritten" as const,
+    input: {
+      ...input,
+      parts: input.parts.map((part, index) => {
+        if (part.type === "text" && !part.synthetic && !part.ignored)
+          return {
+            ...part,
+            text: index === firstText ? text : "",
+            ...(index === firstText ? { metadata: { ...part.metadata, [QueueRewriteMetadataKey]: true } } : {}),
+          }
+        if (part.type === "file" && part.source?.text) {
+          const start = text.indexOf(part.source.text.value)
+          return {
+            ...part,
+            source: {
+              ...part.source,
+              text: { ...part.source.text, start, end: start + part.source.text.value.length },
+            },
+          }
+        }
+        if (part.type === "agent" && part.source) {
+          const start = text.indexOf(part.source.value)
+          return { ...part, source: { ...part.source, start, end: start + part.source.value.length } }
+        }
+        return part
+      }),
+    },
+  }
+}
+
+function editableText(input: SessionPromptQueue.QueuedInput) {
+  return input.parts
+    .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
+    .join("")
+}
+
+function queueTextRewritten(input: SessionPromptQueue.QueuedInput) {
+  return input.parts.some((part) => part.type === "text" && part.metadata?.[QueueRewriteMetadataKey] === true)
 }
 
 function toReceipt(row: typeof SessionPromptReceiptTable.$inferSelect): Receipt {

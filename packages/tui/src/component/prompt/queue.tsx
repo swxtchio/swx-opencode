@@ -6,6 +6,7 @@ import { selectedForeground, useTheme } from "../../context/theme"
 import { useCommandShortcut } from "../../keymap"
 import { useDialog } from "../../ui/dialog"
 import { Locale } from "../../util/locale"
+import type { PromptEnhancement } from "../../util/transcript"
 import { DialogQueue, preview } from "../dialog-queue"
 
 // Only the most recently sent pending prompts are listed under the prompt; the
@@ -47,7 +48,7 @@ export function pendingPrompts(sync: ReturnType<typeof useSync>, sessionID: stri
 // moment it is sent until it becomes a message (swxtchio/swx-opencode#212,
 // #249). They are not messages yet, so the transcript cannot show them;
 // activating the row opens their review view.
-export function PromptQueueRow(props: { sessionID?: string }) {
+export function PromptQueueRow(props: { sessionID?: string; enhancement?: PromptEnhancement }) {
   const sync = useSync()
   const dialog = useDialog()
   const { theme } = useTheme()
@@ -59,7 +60,11 @@ export function PromptQueueRow(props: { sessionID?: string }) {
   return (
     <Show when={props.sessionID && prompts().length > 0 ? props.sessionID : undefined}>
       {(sessionID) => (
-        <box paddingLeft={1} flexDirection="column" onMouseUp={() => DialogQueue.show(dialog, sessionID())}>
+        <box
+          paddingLeft={1}
+          flexDirection="column"
+          onMouseUp={() => DialogQueue.show(dialog, sessionID(), props.enhancement)}
+        >
           <Show when={prompts().length > SHOWN}>
             <text fg={theme.textMuted} wrapMode="none">
               … {prompts().length - SHOWN} sent earlier

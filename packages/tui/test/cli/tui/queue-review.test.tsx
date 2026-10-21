@@ -82,6 +82,7 @@ async function mount(
   const events = createEventSource()
   const queue = { items: initial }
   const requests: QueueRequest[] = []
+  const enhancements: string[] = []
   const base = createFetch((url) => {
     if (url.pathname === `/session/${sessionID}`) return json(session)
     if (url.pathname === `/session/${sessionID}/message`) return json([userMessage])
@@ -91,6 +92,9 @@ async function mount(
     if (served) return served
     if (url.pathname === `/session/${sessionID}/queue/release`) return new Response(null, { status: 204 })
     if (url.pathname === `/session/${sessionID}/queue/remove`) return json(queue.items[0])
+    if (url.pathname.includes(`/session/${sessionID}/queue/force/`)) return json({ outcome: "forced", items: [] })
+    if (url.pathname.includes(`/session/${sessionID}/queue/consolidate/`))
+      return json({ outcome: "unchanged", items: queue.items })
     if (url.pathname.startsWith(`/session/${sessionID}/queue`)) return json(queue.items)
   })
   const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -100,6 +104,7 @@ async function mount(
       const text = request.method === "GET" ? "" : await request.clone().text()
       requests.push({ method: request.method, path: url.pathname, body: text ? JSON.parse(text) : undefined })
     }
+    if (url.pathname === "/prompt/enhance" && request.method === "POST") enhancements.push(await request.clone().text())
     return base.fetch(request)
   }) as typeof globalThis.fetch
 
@@ -177,8 +182,12 @@ async function mount(
     sync,
     dialog,
     requests,
+    enhancements,
     frame,
-    queued: (method: string) => requests.filter((request) => request.path.endsWith(`/queue/${method}`)),
+    queued: (method: string) =>
+      requests.filter(
+        (request) => request.path.endsWith(`/queue/${method}`) || request.path.includes(`/queue/${method}/`),
+      ),
     // The server publishes every change to the pending list.
     publish(items: SessionPromptQueueItem[]) {
       queue.items = items
@@ -224,6 +233,14 @@ const queued = item("que_2", "queue", "queued for later", 3)
 const lockedQueue = item("que_locked", "queue", "queued work", 3)
 
 const actionTriggers = [
+  {
+    title: "force",
+    trigger: (view: Awaited<ReturnType<typeof setup>>) => view.app.mockInput.pressKey("f", { ctrl: true }),
+  },
+  {
+    title: "enh",
+    trigger: (view: Awaited<ReturnType<typeof setup>>) => view.app.mockInput.pressKey("e", { ctrl: true }),
+  },
   {
     title: "delete",
     trigger: (view: Awaited<ReturnType<typeof setup>>) => view.app.mockInput.pressKey("d", { ctrl: true }),
@@ -310,29 +327,30 @@ test("every route that closes the view releases its hold", async () => {
 
 test("five minutes without activity close the view and release its hold; activity restarts that interval", async () => {
   const view = await setup([steer, queued])
-  // Fake timers stop Bun.sleep, so this waits on the event loop's own turns.
-  const settle = async (done: () => boolean) => {
-    for (let turn = 0; turn < 1000 && !done(); turn++) await new Promise<void>((resolve) => queueMicrotask(resolve))
-    expect(done()).toBe(true)
-  }
   // Opened as the row opens it, since a mouse click waits on timers too.
+  await view.frame()
   jest.useFakeTimers()
   DialogQueue.show(view.dialog, sessionID)
-  await settle(() => view.queued("hold").length === 1)
+  await view.frame()
+  await settle(() => view.queued("hold").length === 1, "initial hold")
+  await settle(async () => (await view.frame()).includes("(delivery paused)"), "initial hold confirmation")
 
   jest.advanceTimersByTime(REVIEW_IDLE_MS - 60_000)
   expect(view.dialog.stack.length).toBe(1)
   // Any key four minutes in, not only one that moves the selection, renews the
   // server's hold and restarts the interval.
   view.app.mockInput.pressKey("x")
-  await settle(() => view.queued("hold").length === 2)
+  await settle(() => view.queued("hold").length === 2, "renewal after activity")
+  await settle(async () => (await view.frame()).includes("(delivery paused)"), "renewal confirmation")
   jest.advanceTimersByTime(REVIEW_IDLE_MS - 1)
   expect(view.dialog.stack.length).toBe(1)
   expect(view.queued("release")).toEqual([])
 
   jest.advanceTimersByTime(1)
-  await settle(() => view.queued("release").length === 1)
-  expect(view.dialog.stack.length).toBe(0)
+  await settle(async () => {
+    await view.frame()
+    return view.dialog.stack.length === 0 && view.queued("release").length === 1
+  }, "view closure and hold release after inactivity")
 })
 
 test("delete removes the selected pending prompt", async () => {
@@ -367,8 +385,347 @@ test("the consolidate button asks the server to consolidate the pending prompts"
   await view.open()
   await view.click("consolidate")
   await wait(() => view.queued("consolidate").length === 1)
+  expect(view.queued("consolidate")[0]?.path).toBe(`/session/${sessionID}/queue/consolidate/${steer.id}`)
+  expect(view.queued("consolidate")[0]?.body).toBeUndefined()
   view.app.mockInput.pressKey("o", { ctrl: true })
   await wait(() => view.queued("consolidate").length === 2)
+})
+
+test("ctrl+e enhances the selected row and rewrites that same queue item", async () => {
+  const selected = {
+    ...queued,
+    input: { origin: "tui-composer" as const, parts: [{ type: "text" as const, text: "rough draft" }] },
+  }
+  const rewritten = {
+    ...selected,
+    input: { ...selected.input, parts: [{ type: "text" as const, text: "polished draft" }] },
+  }
+  const view = await setup([steer, selected], (path) => {
+    if (path === "/prompt/enhance") return Promise.resolve(json("polished draft"))
+    if (path === `/session/${sessionID}/queue/rewrite/${selected.id}`)
+      return Promise.resolve(json({ outcome: "rewritten", items: [steer, rewritten] }))
+  })
+  const enhancement = {
+    model: () => "test/enhance-model",
+    context: () => ({
+      messages: (view.sync.data.message[sessionID] ?? []).map((info) => ({
+        info,
+        parts: view.sync.data.part[info.id] ?? [],
+      })),
+      options: {
+        thinking: false,
+        toolDetails: false,
+        assistantMetadata: false,
+        providers: view.sync.data.provider,
+      },
+      presentation: new Map<string, string>(),
+    }),
+  }
+  DialogQueue.show(view.dialog, sessionID, enhancement)
+  await wait(() => view.queued("hold").length === 1)
+  await wait(async () => (await view.frame()).includes("(delivery paused)"))
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("e", { ctrl: true })
+  await wait(() => view.queued("rewrite").length === 1)
+
+  expect(view.enhancements).toHaveLength(1)
+  expect(JSON.parse(view.enhancements[0]!)).toMatchObject({
+    model: "test/enhance-model",
+    draft: "rough draft",
+    context: expect.stringContaining("already in the transcript"),
+  })
+  expect(view.queued("rewrite")[0]).toMatchObject({
+    method: "POST",
+    path: `/session/${sessionID}/queue/rewrite/${selected.id}`,
+    body: { expectedText: "rough draft", text: "polished draft" },
+  })
+  await wait(async () => (await view.frame()).includes("Queued prompt enhanced."))
+  expect(view.sync.data.session_queue[sessionID]).toEqual([steer, rewritten])
+  expect(view.queued("release")).toEqual([])
+})
+
+for (const result of [
+  {
+    outcome: "stale",
+    message: "The selected prompt changed; no rewrite was applied.",
+    items: [steer, queued],
+  },
+  {
+    outcome: "preparing",
+    message: "The selected prompt is still preparing.",
+    items: [steer, queued],
+  },
+  {
+    outcome: "unavailable",
+    message: "The selected prompt is no longer pending.",
+    items: [steer],
+  },
+] as const) {
+  test(`a ${result.outcome} enhancement rewrite explains why it did not apply`, async () => {
+    const view = await setup([steer, queued], (path) => {
+      if (path === "/prompt/enhance") return Promise.resolve(json("polished draft"))
+      if (path.endsWith(`/queue/rewrite/${queued.id}`))
+        return Promise.resolve(json({ outcome: result.outcome, items: [...result.items] }))
+    })
+    DialogQueue.show(view.dialog, sessionID, { model: () => "test/enhance-model" })
+    await wait(() => view.queued("hold").length === 1)
+    await wait(async () => (await view.frame()).includes("(delivery paused)"))
+    view.app.mockInput.pressArrow("down")
+    view.app.mockInput.pressKey("e", { ctrl: true })
+    await wait(() => view.queued("rewrite").length === 1)
+    await wait(async () => (await view.frame()).includes(result.message))
+
+    expect(view.sync.data.session_queue[sessionID]).toEqual([...result.items])
+    expect(view.dialog.stack.length).toBe(1)
+    expect(view.queued("release")).toEqual([])
+  })
+}
+
+test("an enhancement that drops a file placeholder never rewrites the queued row", async () => {
+  const selected = {
+    ...queued,
+    input: {
+      parts: [
+        { type: "text" as const, text: "rough draft source.txt" },
+        {
+          type: "file" as const,
+          mime: "text/plain",
+          filename: "source.txt",
+          url: "data:text/plain;base64,c291cmNl",
+          source: { type: "file" as const, path: "/source.txt", text: { value: "source.txt", start: 12, end: 22 } },
+        },
+      ],
+    },
+  }
+  const view = await setup([steer, selected], (path) => {
+    if (path === "/prompt/enhance") return Promise.resolve(json("polished draft"))
+  })
+  DialogQueue.show(view.dialog, sessionID, { model: () => "test/enhance-model" })
+  await wait(() => view.queued("hold").length === 1)
+  await wait(async () => (await view.frame()).includes("(delivery paused)"))
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("e", { ctrl: true })
+  await wait(async () => (await view.frame()).includes("attachment or reference placeholder"))
+
+  expect(view.queued("rewrite")).toEqual([])
+  expect(view.sync.data.session_queue[sessionID]).toEqual([steer, selected])
+  expect(view.queued("release")).toEqual([])
+})
+
+for (const trigger of ["keyboard", "row"] as const) {
+  test(`forcing the selected prompt through ${trigger} sends its id and closes only after acceptance`, async () => {
+    const view = await setup([steer, queued], (path) =>
+      path.endsWith(`/queue/force/${queued.id}`)
+        ? Promise.resolve(json({ outcome: "forced", items: [steer] }))
+        : undefined,
+    )
+    await view.open()
+    view.app.mockInput.pressArrow("down")
+    if (trigger === "keyboard") view.app.mockInput.pressKey("f", { ctrl: true })
+    else await view.click("force")
+    await wait(() => view.queued("force").length === 1)
+
+    expect(view.queued("force")[0]?.method).toBe("POST")
+    expect(view.queued("force")[0]?.path).toBe(`/session/${sessionID}/queue/force/${queued.id}`)
+    expect(view.queued("force")[0]?.body).toEqual({ holder: view.queued("hold")[0]?.body?.holder })
+    await wait(() => view.dialog.stack.length === 0)
+    await wait(() => view.queued("release").length === 1)
+    expect(view.sync.data.session_queue[sessionID]).toEqual([steer])
+  })
+}
+
+test("a live second review holder blocks force and leaves the view paused", async () => {
+  const view = await setup([steer, queued], (path) =>
+    path.endsWith(`/queue/force/${queued.id}`)
+      ? Promise.resolve(json({ outcome: "another-review", items: [steer, queued] }))
+      : undefined,
+  )
+  await view.open()
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("f", { ctrl: true })
+  await wait(() => view.queued("force").length === 1)
+  expect(await view.frame()).toContain("Another review is holding delivery")
+  expect(await view.frame()).toContain("(delivery paused)")
+  expect(view.dialog.stack.length).toBe(1)
+  expect(view.queued("release")).toEqual([])
+})
+
+test("a force whose hold is no longer confirmed reports that delivery is not paused", async () => {
+  const view = await setup([steer, queued], (path) =>
+    path.endsWith(`/queue/force/${queued.id}`)
+      ? Promise.resolve(json({ outcome: "hold-unconfirmed", items: [steer, queued] }))
+      : undefined,
+  )
+  await view.open()
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("f", { ctrl: true })
+  await wait(() => view.queued("force").length === 1)
+  expect(await view.frame()).toContain("review hold is no longer confirmed")
+  expect(await view.frame()).toContain("delivery NOT paused")
+  expect(view.dialog.stack.length).toBe(1)
+  expect(view.queued("release")).toEqual([])
+})
+
+test("a stale force result refreshes the list and reports that the item is no longer pending", async () => {
+  const view = await setup([steer, queued], (path) =>
+    path.endsWith(`/queue/force/${queued.id}`)
+      ? Promise.resolve(json({ outcome: "unavailable", items: [steer] }))
+      : undefined,
+  )
+  await view.open()
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("f", { ctrl: true })
+  await wait(() => view.queued("force").length === 1)
+  await wait(async () => (await view.frame()).includes("selected prompt is no longer pending"))
+  expect(view.sync.data.session_queue[sessionID]).toEqual([steer])
+  expect(view.dialog.stack.length).toBe(1)
+  expect(await view.frame()).toContain("(delivery paused)")
+  expect(view.queued("release")).toEqual([])
+})
+
+test("a failed force request reports failure and preserves the held queue", async () => {
+  const view = await setup([steer, queued], (path) => {
+    if (path.endsWith(`/queue/force/${queued.id}`))
+      return Promise.resolve(json({ name: "Unavailable" }, { status: 503 }))
+    if (path.includes("/queue/hold/")) return Promise.resolve(json({ held: true, items: [steer, queued] }))
+  })
+  await view.open()
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("f", { ctrl: true })
+  await wait(() => view.queued("force").length === 1)
+  await wait(async () => (await view.frame()).includes("Could not force the queued prompts"))
+  expect(view.sync.data.session_queue[sessionID]).toEqual([steer, queued])
+  expect(view.dialog.stack.length).toBe(1)
+  expect(await view.frame()).toContain("(delivery paused)")
+  expect(view.queued("release")).toEqual([])
+})
+
+test("a failed force response refreshes the released hold and current queue", async () => {
+  const forced = { ...queued, delivery: "steer" as const }
+  const view = await setup([steer, queued], (path) => {
+    if (path.endsWith(`/queue/force/${queued.id}`))
+      return Promise.resolve(json({ name: "Unavailable" }, { status: 503 }))
+    if (path.includes("/queue/hold/")) return Promise.resolve(json({ held: false, items: [steer, forced] }))
+  })
+  await view.open()
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("f", { ctrl: true })
+  await wait(() => view.queued("force").length === 1)
+  await wait(() => view.requests.some((request) => request.method === "GET" && request.path.includes("/queue/hold/")))
+  await wait(async () => (await view.frame()).includes("delivery NOT paused"))
+  expect(await view.frame()).toContain("Could not force the queued prompts")
+  expect(view.sync.data.session_queue[sessionID]).toEqual([steer, forced])
+  expect(
+    view.requests.filter((request) => request.method === "POST" && request.path.endsWith("/queue/hold")),
+  ).toHaveLength(1)
+  expect(view.dialog.stack.length).toBe(1)
+})
+
+test("a late pre-force renewal reconciles to the server hold state after force", async () => {
+  const renewal = later()
+  const forceReply = later()
+  const forced = { ...queued, delivery: "steer" as const }
+  const served = { holdPosts: 0, renewalStarted: false, statusReads: 0, statusHeld: undefined as boolean | undefined }
+  let serverHeld = true
+  const view = await setup([steer, queued], (path) => {
+    if (path.endsWith(`/queue/force/${queued.id}`)) {
+      serverHeld = false
+      return forceReply.response
+    }
+    if (path.includes("/queue/hold/")) {
+      served.statusReads++
+      const response = json({ held: serverHeld, items: [steer, forced] })
+      const read = response.json.bind(response)
+      response.json = async () => {
+        const body = await read()
+        served.statusHeld = (body as { held: boolean }).held
+        return body
+      }
+      const readText = response.text.bind(response)
+      response.text = async () => {
+        const body = await readText()
+        served.statusHeld = (JSON.parse(body) as { held: boolean }).held
+        return body
+      }
+      return Promise.resolve(response)
+    }
+    if (path.endsWith("/queue/hold")) {
+      served.holdPosts++
+      if (served.holdPosts === 2) {
+        served.renewalStarted = true
+        return renewal.response
+      }
+    }
+  })
+  await view.open()
+  await wait(async () => (await view.frame()).includes("delivery paused"))
+  jest.useFakeTimers({ now: Date.now() })
+
+  jest.advanceTimersByTime(60_000)
+  view.app.mockInput.pressKey("x")
+  await settle(
+    () =>
+      view.requests.filter((request) => request.method === "POST" && request.path.endsWith("/queue/hold")).length === 2,
+  )
+  view.app.mockInput.pressArrow("down")
+  view.app.mockInput.pressKey("f", { ctrl: true })
+  await settle(() => view.requests.some((request) => request.path.endsWith(`/queue/force/${queued.id}`)))
+  expect(served).toMatchObject({ holdPosts: 2, renewalStarted: true, statusReads: 0 })
+
+  const staleItem = item("que_stale", "queue", "stale renewal snapshot", 5)
+  const stale = json([steer, staleItem])
+  let bodyRead = false
+  const readJson = stale.json.bind(stale)
+  const readText = stale.text.bind(stale)
+  stale.json = async () => {
+    const body = await readJson()
+    bodyRead = true
+    return body
+  }
+  stale.text = async () => {
+    const body = await readText()
+    bodyRead = true
+    return body
+  }
+  forceReply.answer(json({ name: "Unavailable" }, { status: 503 }))
+  await settle(
+    () =>
+      served.statusReads === 1 &&
+      view.sync.data.session_queue[sessionID]?.find((row) => row.id === queued.id)?.delivery === "steer",
+  )
+  expect(served.statusHeld).toBe(false)
+  expect(await view.frame()).toContain("delivery NOT paused")
+  expect(view.sync.data.session_queue[sessionID]).toEqual([steer, forced])
+
+  // The server accepted the already-dispatched renewal after force released the
+  // lease. Its stale snapshot must prompt a status read, not disappear silently.
+  serverHeld = true
+  renewal.answer(stale)
+  await settle(() => bodyRead && served.statusReads === 2 && served.statusHeld === true)
+  await wait(async () => (await view.frame()).includes("(delivery paused)"))
+  expect(view.sync.data.session_queue[sessionID]).toEqual([steer, forced])
+})
+
+test("a hold renewal that lands after force closes the view is released", async () => {
+  const renewal = later()
+  let holds = 0
+  const view = await setup([queued], (path) =>
+    path.endsWith("/queue/hold") && holds++ === 1 ? renewal.response : undefined,
+  )
+  await view.open()
+  await wait(async () => (await view.frame()).includes("(delivery paused)"))
+  jest.useFakeTimers({ now: Date.now() })
+
+  jest.advanceTimersByTime(60_000)
+  view.app.mockInput.pressKey("f", { ctrl: true })
+  await settle(() => view.queued("hold").length === 2)
+  await settle(() => view.queued("force").length === 1)
+  await settle(() => view.queued("release").length === 1)
+  expect(view.dialog.stack.length).toBe(0)
+
+  renewal.answer(json([queued]))
+  await settle(() => view.queued("release").length === 2)
+  expect(view.dialog.stack.length).toBe(0)
 })
 
 for (const action of actionTriggers) {
@@ -408,7 +765,9 @@ test("a consolidation response updates the reviewed list with merged content", a
     origins: [...steer.origins, ...queued.origins],
   }
   const view = await setup([steer, queued], (path) =>
-    path.endsWith("/queue/consolidate") ? Promise.resolve(json([merged])) : undefined,
+    path.includes("/queue/consolidate/")
+      ? Promise.resolve(json({ outcome: "consolidated", items: [merged] }))
+      : undefined,
   )
   await view.open()
   await view.click("consolidate")
@@ -422,7 +781,9 @@ test("a consolidation that only adds provenance is still shown as a merge", asyn
   const repeated = item("que_repeated", "steer", "same", Date.now() + 1)
   const merged = { ...recent, origins: [...recent.origins, ...repeated.origins] }
   const view = await setup([recent, repeated], (path) =>
-    path.endsWith("/queue/consolidate") ? Promise.resolve(json([merged])) : undefined,
+    path.includes("/queue/consolidate/")
+      ? Promise.resolve(json({ outcome: "consolidated", items: [merged] }))
+      : undefined,
   )
   await view.open()
   await view.click("consolidate")
@@ -438,6 +799,27 @@ test("consolidating an unchanged queue explains that there is nothing to merge",
   await wait(() => view.queued("consolidate").length === 1)
   expect(await view.frame()).toContain("Nothing to consolidate")
   expect(await view.frame()).toContain("steer the running turn")
+})
+
+test("selected human consolidation explains why the complete human set cannot be merged yet", async () => {
+  for (const [outcome, message] of [
+    ["preparing", "A human prompt is still preparing"],
+    ["incompatible", "Human prompts with different delivery"],
+  ] as const) {
+    const view = await setup([steer, queued], (path) =>
+      path.includes("/queue/consolidate/") ? Promise.resolve(json({ outcome, items: [steer, queued] })) : undefined,
+    )
+    await view.open()
+    await view.click("consolidate")
+    await wait(() => view.queued("consolidate").length === 1)
+    expect(await view.frame()).toContain(message)
+    expect(await view.frame()).toContain("steer the running turn")
+    expect(await view.frame()).toContain("queued for later")
+    expect(view.dialog.stack.length).toBe(1)
+    expect(view.queued("release")).toEqual([])
+    view.app.renderer.destroy()
+    cleanup = undefined
+  }
 })
 
 test("a move that would cross delivery classes explains why it cannot change the selected prompt", async () => {
@@ -472,6 +854,9 @@ test("an action with no selected prompt explains why it cannot run", async () =>
   await view.click("delete")
   expect(await view.frame()).toContain("No queued prompt is selected")
   expect(view.queued("remove")).toEqual([])
+  await view.click("force")
+  expect(await view.frame()).toContain("No queued prompt is selected")
+  expect(view.queued("force")).toEqual([])
 })
 
 test("consolidating an empty queue explains that there is nothing to consolidate", async () => {
@@ -496,9 +881,12 @@ function later() {
 }
 
 // Fake timers stop Bun.sleep, so these wait on the event loop's own turns.
-async function settle(done: () => boolean) {
-  for (let turn = 0; turn < 1000 && !done(); turn++) await new Promise<void>((resolve) => queueMicrotask(resolve))
-  expect(done()).toBe(true)
+async function settle(done: () => boolean | Promise<boolean>, what = "condition") {
+  for (let turn = 0; turn < 1000; turn++) {
+    if (await done()) return
+    await new Promise<void>((resolve) => queueMicrotask(resolve))
+  }
+  throw new Error(`timed out waiting for ${what}`)
 }
 
 test("the view says delivery is paused, and allows edits, only once the server confirms the hold", async () => {
@@ -587,17 +975,23 @@ test("a close with a renewal outstanding releases at once, and again when the re
   const view = await setup([steer], (path) =>
     path.endsWith("/queue/hold") && holds++ === 1 ? renewal.response : undefined,
   )
+  await view.frame()
   jest.useFakeTimers()
   DialogQueue.show(view.dialog, sessionID)
-  await settle(() => view.queued("hold").length === 1)
+  await view.frame()
+  await settle(() => view.queued("hold").length === 1, "initial hold")
+  await settle(async () => (await view.frame()).includes("(delivery paused)"), "initial hold confirmation")
   jest.advanceTimersByTime(60_000)
   view.app.mockInput.pressKey("x")
-  await settle(() => view.queued("hold").length === 2)
+  await settle(() => view.queued("hold").length === 2, "renewal after activity")
 
   view.app.mockInput.pressEscape()
-  await settle(() => view.queued("release").length === 1)
+  await settle(async () => {
+    await view.frame()
+    return view.dialog.stack.length === 0 && view.queued("release").length === 1
+  }, "immediate release when closing during renewal")
   renewal.answer(json([steer]))
-  await settle(() => view.queued("release").length === 2)
+  await settle(() => view.queued("release").length === 2, "release again when the renewal arrives")
 })
 
 test("scrolling the review with the mouse wheel restarts the inactivity interval", async () => {

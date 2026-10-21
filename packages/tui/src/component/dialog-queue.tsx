@@ -7,6 +7,7 @@ import { useDialog, type DialogContext } from "../ui/dialog"
 import { DialogSelect } from "../ui/dialog-select"
 import { useToast } from "../ui/toast"
 import { Locale } from "../util/locale"
+import { promptEnhancementContext, promptEnhancementModel, type PromptEnhancement } from "../util/transcript"
 
 // The review view of a session's pending prompts (swxtchio/swx-opencode#212).
 // While it is open the server holds every promotion for the session, so the
@@ -20,7 +21,7 @@ const RENEW_MS = 30 * 1000
 // No hold or release request waits longer than this for its response.
 const REQUEST_MS = 10 * 1000
 
-export function DialogQueue(props: { sessionID: string }) {
+export function DialogQueue(props: { sessionID: string; enhancement?: PromptEnhancement }) {
   const dialog = useDialog()
   const sdk = useSDK()
   const sync = useSync()
@@ -31,8 +32,11 @@ export function DialogQueue(props: { sessionID: string }) {
   // refuses may let the lease lapse, so the view says so and locks its edits
   // until a later renewal is confirmed.
   const [hold, setHold] = createSignal<"pending" | "held" | "failed">("pending")
+  const [enhancing, setEnhancing] = createSignal(false)
   let closed = false
   let renewed = Date.now()
+  // Ignore responses from holds issued before a newer force reconciliation.
+  let holdVersion = 0
   let idle: ReturnType<typeof setTimeout> | undefined
 
   const checked = async <R extends { error?: unknown; response?: Response }>(call: Promise<R>) => {
@@ -54,24 +58,60 @@ export function DialogQueue(props: { sessionID: string }) {
       failed("resume delivery of"),
     )
 
+  // A stale renewal can commit on the server after force releases the lease;
+  // reconcile against the current server state instead of dropping its effect.
+  const reconcile = (version: number) =>
+    checked(sdk.client.session.queue.holdStatus({ sessionID: props.sessionID, holder }, { signal: signal() }))
+      .then((result) => {
+        if (closed || version !== holdVersion) return
+        const data = result.data
+        if (!data) {
+          setHold("failed")
+          return
+        }
+        sync.queue.listed(props.sessionID, data.items)
+        setHold(data.held ? "held" : "failed")
+      })
+      .catch(() => {
+        if (!closed && version === holdVersion) setHold("failed")
+      })
+
   // A close releases at once, and again as each hold request still in flight
   // settles, so no slow response delays the release and a hold the server
   // accepts after the close never outlives it.
-  const request = (renewal: boolean) =>
-    void checked(sdk.client.session.queue.hold({ sessionID: props.sessionID, holder }, { signal: signal() }))
+  const request = (renewal: boolean) => {
+    const version = ++holdVersion
+    void sdk.client.session.queue
+      .hold({ sessionID: props.sessionID, holder }, { signal: signal() })
       .then((result) => {
         if (closed) return
-        setHold("held")
-        if (result.data) sync.queue.listed(props.sessionID, result.data)
+        if (version !== holdVersion) {
+          if (renewal) void reconcile(++holdVersion)
+          return
+        }
+        return checked(Promise.resolve(result)).then((checkedResult) => {
+          if (closed) return
+          if (version !== holdVersion) {
+            if (renewal) void reconcile(++holdVersion)
+            return
+          }
+          setHold("held")
+          if (checkedResult.data) sync.queue.listed(props.sessionID, checkedResult.data)
+        })
       })
       .catch((error) => {
         if (closed) return
+        if (version !== holdVersion) {
+          if (renewal) void reconcile(++holdVersion)
+          return
+        }
         setHold("failed")
         failed(renewal ? "keep pausing delivery of" : "pause delivery of")(error)
       })
       .finally(() => {
         if (closed) release()
       })
+  }
 
   const active = () => {
     if (closed) return
@@ -182,6 +222,170 @@ export function DialogQueue(props: { sessionID: string }) {
         onMove={active}
         actions={[
           {
+            command: "dialog.queue.force",
+            title: "force",
+            disabled: locked,
+            onDisabledTrigger: explainLocked,
+            onUnavailableTrigger: explainUnavailable("No queued prompt is selected."),
+            onTrigger: (option) => {
+              active()
+              holdVersion++
+              void checked(
+                sdk.client.session.queue.force(
+                  { sessionID: props.sessionID, itemID: option.value, holder },
+                  { signal: signal() },
+                ),
+              )
+                .then((result) => {
+                  const data = result.data
+                  if (!data) {
+                    toast.show({ variant: "error", message: "The force request returned no queue state." })
+                    return
+                  }
+                  sync.queue.listed(props.sessionID, data.items)
+                  if (data.outcome === "forced") {
+                    toast.show({ variant: "info", message: "The selected prompt will reach the next safe step." })
+                    dialog.clear()
+                    return
+                  }
+                  if (data.outcome === "another-review") {
+                    toast.show({
+                      variant: "warning",
+                      message: "Another review is holding delivery; the selected prompt was not forced.",
+                    })
+                    return
+                  }
+                  if (data.outcome === "hold-unconfirmed") {
+                    setHold("failed")
+                    toast.show({
+                      variant: "warning",
+                      message: "The review hold is no longer confirmed; the selected prompt was not forced.",
+                    })
+                    return
+                  }
+                  if (data.outcome === "preparing") {
+                    toast.show({
+                      variant: "warning",
+                      message: "This prompt is still preparing; it was not forced.",
+                    })
+                    return
+                  }
+                  toast.show({
+                    variant: "info",
+                    message: "The selected prompt is no longer pending; it was not forced.",
+                  })
+                })
+                .catch((error) => {
+                  if (closed) {
+                    failed("force")(error)
+                    return
+                  }
+                  const reconciliation = ++holdVersion
+                  void reconcile(reconciliation).finally(() => {
+                    if (!closed) failed("force")(error)
+                  })
+                })
+            },
+          },
+          {
+            command: "dialog.queue.enhance",
+            title: "enh",
+            side: "right",
+            disabled: () => locked() || enhancing(),
+            onDisabledTrigger: () => {
+              if (locked()) {
+                explainLocked()
+                return
+              }
+              active()
+              toast.show({ variant: "info", message: "A queued prompt enhancement is already running." })
+            },
+            onUnavailableTrigger: explainUnavailable("No queued prompt is selected."),
+            onTrigger: (option) => {
+              active()
+              const selected = items().find((item) => item.id === option.value)
+              if (!selected) {
+                toast.show({ variant: "info", message: "That queued prompt is no longer available." })
+                return
+              }
+              const draft = selected.input.parts
+                .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
+                .join("")
+              if (!draft.trim()) {
+                toast.show({ variant: "info", message: "The selected prompt has no text to enhance." })
+                return
+              }
+              const placeholders = selected.input.parts.flatMap((part) => {
+                if (part.type === "file" && part.source?.text) return [part.source.text.value]
+                if (part.type === "agent" && part.source) return [part.source.value]
+                return []
+              })
+              const transcript = props.enhancement?.context?.()
+              setEnhancing(true)
+              void checked(
+                sdk.client.instance.prompt.enhance({
+                  model: props.enhancement?.model() ?? promptEnhancementModel(undefined, undefined),
+                  draft,
+                  context: transcript
+                    ? promptEnhancementContext(transcript.messages, transcript.options, transcript.presentation)
+                    : "",
+                }),
+              )
+                .then((result) => {
+                  const text = result.data?.trim()
+                  if (!text) throw new Error("The enhancement model returned an empty draft.")
+                  if (placeholders.some((placeholder) => !text.includes(placeholder)))
+                    throw new Error("The enhancement omitted an attachment or reference placeholder.")
+                  return checked(
+                    sdk.client.session.queue.rewrite({
+                      sessionID: props.sessionID,
+                      itemID: selected.id,
+                      expectedText: draft,
+                      text,
+                    }),
+                  )
+                })
+                .then((result) => {
+                  const data = result.data
+                  if (!data) {
+                    toast.show({ variant: "error", message: "The rewrite request returned no queue state." })
+                    return
+                  }
+                  sync.queue.listed(props.sessionID, data.items)
+                  if (data.outcome === "rewritten") {
+                    toast.show({ variant: "success", message: "Queued prompt enhanced." })
+                    return
+                  }
+                  if (data.outcome === "stale") {
+                    toast.show({ variant: "warning", message: "The selected prompt changed; no rewrite was applied." })
+                    return
+                  }
+                  if (data.outcome === "preparing") {
+                    toast.show({ variant: "warning", message: "The selected prompt is still preparing." })
+                    return
+                  }
+                  if (data.outcome === "unavailable") {
+                    toast.show({ variant: "info", message: "The selected prompt is no longer pending." })
+                    return
+                  }
+                  if (data.outcome === "no-text") {
+                    toast.show({ variant: "info", message: "The selected prompt has no text to enhance." })
+                    return
+                  }
+                  if (data.outcome === "empty") {
+                    toast.show({ variant: "warning", message: "The enhancement returned empty text." })
+                    return
+                  }
+                  toast.show({
+                    variant: "warning",
+                    message: "The enhancement omitted an attachment or reference placeholder.",
+                  })
+                })
+                .catch(failed("enhance"))
+                .finally(() => setEnhancing(false))
+            },
+          },
+          {
             command: "dialog.queue.delete",
             title: "delete",
             disabled: locked,
@@ -222,27 +426,38 @@ export function DialogQueue(props: { sessionID: string }) {
             disabled: locked,
             onDisabledTrigger: explainLocked,
             onUnavailableTrigger: explainUnavailable("Nothing to consolidate."),
-            onTrigger: () => {
+            onTrigger: (option) => {
               active()
-              const before = new Map(
-                items().map(
-                  (item) => [item.id, { text: preview(item), origins: JSON.stringify(item.origins) }] as const,
-                ),
+              void checked(
+                sdk.client.session.queue.consolidateSelected({
+                  sessionID: props.sessionID,
+                  itemID: option.value,
+                }),
               )
-              void checked(sdk.client.session.queue.consolidate({ sessionID: props.sessionID }))
                 .then((result) => {
-                  if (!result.data) {
-                    toast.show({ variant: "info", message: "Nothing to consolidate." })
+                  const data = result.data
+                  if (!data) {
+                    toast.show({ variant: "error", message: "The consolidate request returned no queue state." })
                     return
                   }
-                  const merged = result.data.some((item) => {
-                    const old = before.get(item.id)
-                    return (
-                      old !== undefined && (old.text !== preview(item) || old.origins !== JSON.stringify(item.origins))
-                    )
-                  })
-                  sync.queue.listed(props.sessionID, result.data)
-                  if (!merged) toast.show({ variant: "info", message: "Nothing to consolidate." })
+                  sync.queue.listed(props.sessionID, data.items)
+                  if (data.outcome === "consolidated") return
+                  if (data.outcome === "preparing") {
+                    toast.show({ variant: "warning", message: "A human prompt is still preparing; nothing changed." })
+                    return
+                  }
+                  if (data.outcome === "incompatible") {
+                    toast.show({
+                      variant: "warning",
+                      message: "Human prompts with different delivery or execution context cannot be consolidated.",
+                    })
+                    return
+                  }
+                  if (data.outcome === "unavailable") {
+                    toast.show({ variant: "info", message: "The selected prompt is no longer available." })
+                    return
+                  }
+                  toast.show({ variant: "info", message: "Nothing to consolidate." })
                 })
                 .catch(failed("consolidate"))
             },
@@ -253,8 +468,8 @@ export function DialogQueue(props: { sessionID: string }) {
   )
 }
 
-DialogQueue.show = (dialog: DialogContext, sessionID: string) =>
-  dialog.replace(() => <DialogQueue sessionID={sessionID} />)
+DialogQueue.show = (dialog: DialogContext, sessionID: string, enhancement?: PromptEnhancement) =>
+  dialog.replace(() => <DialogQueue sessionID={sessionID} enhancement={enhancement} />)
 
 // When the item's oldest instruction was queued and how long ago, how often
 // identical copies were sent, and how many queued instructions it merges.
@@ -279,7 +494,9 @@ function age(ms: number) {
 
 // What a pending item will say: its typed text, or the kinds of its parts.
 export function preview(item: SessionPromptQueueItem) {
-  const text = item.input.parts.flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : []))
+  const text = item.input.parts.flatMap((part) =>
+    part.type === "text" && !part.synthetic && part.text.length > 0 ? [part.text] : [],
+  )
   if (text.length > 0) return text.join("\n")
   return item.input.parts.map((part) => `[${part.type}]`).join(" ")
 }

@@ -14,7 +14,7 @@ import { NotFoundError } from "@/storage/storage"
 
 import { Effect, Exit, Layer, Context } from "effect"
 import { InstanceState } from "@/effect/instance-state"
-import { isOverflow as overflow, usable } from "./overflow"
+import { isAutoCompactionDue, isOverflow, usable } from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -168,6 +168,10 @@ export interface Interface {
     tokens: SessionV1.Assistant["tokens"]
     model: Provider.Model
   }) => Effect.Effect<boolean>
+  readonly isAutoCompactionDue: (input: {
+    tokens: SessionV1.Assistant["tokens"]
+    model: Provider.Model
+  }) => Effect.Effect<boolean>
   readonly prune: (input: { sessionID: SessionID }) => Effect.Effect<void>
   readonly process: (input: {
     parentID: MessageID
@@ -175,6 +179,7 @@ export interface Interface {
     sessionID: SessionID
     auto: boolean
     overflow?: boolean
+    resume?: boolean
   }) => Effect.Effect<"continue" | "stop">
   readonly create: (input: {
     sessionID: SessionID
@@ -182,6 +187,8 @@ export interface Interface {
     model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
     auto: boolean
     overflow?: boolean
+    trigger?: SessionV1.CompactionPart["trigger"]
+    resume?: boolean
   }) => Effect.Effect<MessageID>
 }
 
@@ -202,16 +209,23 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const queue = yield* SessionQueue.Service
 
-    const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
+    const checkOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
       tokens: SessionV1.Assistant["tokens"]
       model: Provider.Model
     }) {
-      return overflow({
+      return isOverflow({
         cfg: yield* config.get(),
         tokens: input.tokens,
         model: input.model,
         outputTokenMax: flags.outputTokenMax,
       })
+    })
+
+    const checkAutoCompactionDue = Effect.fn("SessionCompaction.isAutoCompactionDue")(function* (input: {
+      tokens: SessionV1.Assistant["tokens"]
+      model: Provider.Model
+    }) {
+      return isAutoCompactionDue({ cfg: yield* config.get(), tokens: input.tokens, model: input.model })
     })
 
     const estimate = Effect.fn("SessionCompaction.estimate")(function* (input: {
@@ -324,6 +338,7 @@ const layer = Layer.effect(
       sessionID: SessionID
       auto: boolean
       overflow?: boolean
+      resume?: boolean
     }) {
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
       if (!parent || parent.info.role !== "user") {
@@ -514,25 +529,32 @@ const layer = Layer.effect(
 
         if (!replay) {
           const info = yield* provider.getProvider(userMessage.model.providerID)
+          const mustResume =
+            input.overflow === true ||
+            input.resume === true ||
+            (compactionPart?.trigger === "capacity" && input.resume !== false)
+          const usePluginContinuation = compactionPart?.trigger === undefined && input.resume === undefined
           if (
-            (yield* plugin.trigger(
-              "experimental.compaction.autocontinue",
-              {
-                sessionID: input.sessionID,
-                agent: userMessage.agent,
-                model: yield* provider
-                  .getModel(userMessage.model.providerID, userMessage.model.modelID)
-                  .pipe(Effect.orDie),
-                provider: {
-                  source: info.source,
-                  info,
-                  options: info.options,
+            mustResume ||
+            (usePluginContinuation &&
+              (yield* plugin.trigger(
+                "experimental.compaction.autocontinue",
+                {
+                  sessionID: input.sessionID,
+                  agent: userMessage.agent,
+                  model: yield* provider
+                    .getModel(userMessage.model.providerID, userMessage.model.modelID)
+                    .pipe(Effect.orDie),
+                  provider: {
+                    source: info.source,
+                    info,
+                    options: info.options,
+                  },
+                  message: userMessage,
+                  overflow: input.overflow === true,
                 },
-                message: userMessage,
-                overflow: input.overflow === true,
-              },
-              { enabled: true },
-            )).enabled
+                { enabled: true },
+              )).enabled)
           ) {
             const continueMsg = yield* session.updateMessage({
               id: MessageID.ascending(),
@@ -581,6 +603,8 @@ const layer = Layer.effect(
         model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
         auto: boolean
         overflow?: boolean
+        trigger?: SessionV1.CompactionPart["trigger"]
+        resume?: boolean
       }) {
         const msg = yield* session.updateMessage({
           id: MessageID.ascending(),
@@ -597,6 +621,8 @@ const layer = Layer.effect(
           type: "compaction",
           auto: input.auto,
           overflow: input.overflow,
+          ...(input.trigger ? { trigger: input.trigger } : {}),
+          ...(input.resume !== undefined ? { resume: input.resume } : {}),
         })
         return msg.id
       },
@@ -606,7 +632,8 @@ const layer = Layer.effect(
     )
 
     return Service.of({
-      isOverflow,
+      isOverflow: checkOverflow,
+      isAutoCompactionDue: checkAutoCompactionDue,
       prune,
       process: processCompaction,
       create,

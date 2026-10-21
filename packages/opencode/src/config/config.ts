@@ -623,17 +623,53 @@ const layer = Layer.effect(
     })
 
     const update = Effect.fn("Config.update")(function* (config: Info) {
-      const dir = yield* InstanceState.directory
-      const file = path.join(dir, "config.json")
+      const ctx = yield* InstanceState.context
+      // Patch the last-loaded project source that currently owns the threshold, including `.opencode` overlays.
+      const thresholdOwner =
+        config.compaction?.threshold_percent === undefined
+          ? undefined
+          : yield* Effect.gen(function* () {
+              const directories = yield* ConfigPaths.directories(ctx.directory, ctx.worktree).pipe(
+                Effect.provideService(FSUtil.Service, fs),
+                Effect.orDie,
+              )
+              const files = directories
+                .filter(
+                  (directory) =>
+                    directory.endsWith(".opencode") &&
+                    directory !== Flag.OPENCODE_CONFIG_DIR &&
+                    containsPath(directory, ctx),
+                )
+                .flatMap((directory) => ["opencode.json", "opencode.jsonc"].map((name) => path.join(directory, name)))
+              const owners = yield* Effect.forEach(files, (file) =>
+                readConfigFile(file).pipe(
+                  Effect.map((text) => {
+                    if (!text) return undefined
+                    const config = ConfigParse.jsonc(text, file)
+                    if (!isRecord(config) || !isRecord(config.compaction)) return undefined
+                    if (config.compaction.threshold_percent === undefined) return undefined
+                    return file
+                  }),
+                ),
+              ).pipe(Effect.orDie)
+              return owners.findLast((owner) => owner !== undefined)
+            })
+      const file =
+        thresholdOwner ??
+        (yield* ConfigPaths.files("opencode", ctx.directory, ctx.worktree).pipe(
+          Effect.provideService(FSUtil.Service, fs),
+          Effect.orDie,
+        )).findLast((candidate) => path.dirname(candidate) === ctx.directory) ??
+        path.join(ctx.directory, "opencode.json")
       const existing = yield* loadFile(file)
       const text = yield* readConfigFile(file)
       const original = text ? ConfigParse.jsonc(text, file) : writable(existing)
-      yield* fs
-        .writeFileString(
-          file,
-          JSON.stringify(mergeDeep(isRecord(original) ? original : writable(existing), writable(config)), null, 2),
-        )
-        .pipe(Effect.orDie)
+      const patch = writable(config)
+      const updated =
+        text && file.endsWith(".jsonc")
+          ? patchJsonc(text, patch)
+          : JSON.stringify(mergeDeep(isRecord(original) ? original : writable(existing), patch), null, 2)
+      yield* fs.writeFileString(file, updated).pipe(Effect.orDie)
     })
 
     const invalidate = Effect.fn("Config.invalidate")(function* () {
