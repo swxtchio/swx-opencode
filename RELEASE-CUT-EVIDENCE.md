@@ -1,15 +1,15 @@
 # Release-cut evidence
 
-Evidence collected 2026-10-21 for the release-cut task. This is a dated execution record, not a claim that publication has happened. The harness changes and this record are durably available through [PR #326](https://github.com/swxtchio/swx-opencode/pull/326); the release source remains separate from its task-branch head.
+Evidence collected 2026-10-21 for the release-cut task. [v1.18.32-swxtch.d1b232e9](https://github.com/swxtchio/swx-opencode/releases/tag/v1.18.32-swxtch.d1b232e9) was published at 2026-10-21T03:12:35Z and confirmed as Latest by GitHub read-back. This dated execution record retains the published release's build, acceptance and delivery evidence. The harness changes and this record are durably available through [PR #326](https://github.com/swxtchio/swx-opencode/pull/326); the release source remains separate from its task-branch head.
 
 ## Selected source
 
 - Source: `d1b232e940ef155a3e5311794a2baeaa143af1d8`.
-- Derived version: `1.18.32-swxtch.d1b232e9`; intended tag: `v1.18.32-swxtch.d1b232e9`. Read `packages/opencode/package.json` at the selected commit and apply `local-release.sh`'s source-SHA convention to reproduce the derivation. `packages/script/src/index.ts` and `packages/opencode/script/build.ts` consume the explicit `OPENCODE_VERSION` build pin.
+- Derived version: `1.18.32-swxtch.d1b232e9`; published tag: `v1.18.32-swxtch.d1b232e9`. Read `packages/opencode/package.json` at the selected commit and apply `local-release.sh`'s source-SHA convention to reproduce the derivation. `packages/script/src/index.ts` and `packages/opencode/script/build.ts` consume the explicit `OPENCODE_VERSION` build pin.
 - The selected root `package.json` pins Bun `1.4.2`. The local harness checks used Bun `1.4.2` (`744846f84`).
 - Selected `bun.lock` SHA-256: `2c6631f22941c4367a66410ae866c07fa8d4d141798dfba728e46d4c3c400151`, measured with `git show d1b232e940:bun.lock | sha256sum`.
 - `git merge-base --is-ancestor 4b87478ddf d1b232e940ef155a3e5311794a2baeaa143af1d8` exited zero.
-- GitHub's default-branch read returned `swxtch`. The selected release tag was absent from `git ls-remote origin refs/tags/v1.18.32-swxtch.d1b232e9` at pickup; the release list contained the two prior releases. Publication must re-check the live state.
+- GitHub's default-branch read returned `swxtch`. The selected release tag was absent from `git ls-remote origin refs/tags/v1.18.32-swxtch.d1b232e9` at pickup; the release list contained the two prior releases. The subsequent publication and read-back below establish the published tag and Latest designation.
 
 The following GitHub API reads returned `merged: true` and the listed merge commits. Each commit passed `git merge-base --is-ancestor <commit> <selected-source>`:
 
@@ -102,7 +102,9 @@ timestamp=2026-10-21T01:42:44.927Z level=INFO run=5026de4c message="Session wait
 
 ### Native ARM64 candidate
 
-Following the supervisor's 2026-10-21T03:02 continuation of the preceding handoff naming the VM14 root and build/test purposes, the ARM64 work proceeded within `/home/byates/vm14-builds/opencode-release-d1b232e9` on `vm14-001`. A fresh source clone checked out immutable commit `d1b232e940ef155a3e5311794a2baeaa143af1d8`; its V2 wait ancestry check passed, and the source was checked clean before installation, after installation, after building, and after the native probe. HOME, temporary directories, dependency/cache writes, catalog snapshots, build outputs, archives, extraction and runtime proof all used that task root. The host record identifies Linux `aarch64`; the Bun record is `Bun 1.4.2 linux-arm64`.
+The release-cut task brief at `/home/byates/fm-llmrouter/data/opencode-release-cut/brief.md`, "Native builds and reproducible provenance," designates `vm14-001` as the native linux/arm64 builder. The captain's 2026-10-16 sequencing ruling, recorded under `swx-abbe-1227-native-history` in `/home/byates/fm-llmrouter/data/backlog.md`, requires the release to carry the V2 producer and the converged watcher/containment fixes before the subsequent native-history verification.
+
+The ARM64 work used `/home/byates/vm14-builds/opencode-release-d1b232e9` on `vm14-001`. A fresh source clone checked out immutable commit `d1b232e940ef155a3e5311794a2baeaa143af1d8`; its V2 wait ancestry check passed, and the source was checked clean before installation, after installation, after building, and after the native probe. HOME, temporary directories, dependency/cache writes, catalog snapshots, build outputs, archives, extraction and runtime proof all used that task root. The host record identifies Linux `aarch64`; the Bun record is `Bun 1.4.2 linux-arm64`.
 
 The frozen all-platform dependency install used `--frozen-lockfile --os="*" --cpu="*"` and a cache within the task root. The unmodified selected source ran `bun run packages/opencode/script/build.ts --skip-install` with `OPENCODE_VERSION=1.18.32-swxtch.d1b232e9`, the absolute `MODELS_DEV_API_JSON` snapshot path, and an absolute `OPENCODE_BUILD_DIST` beneath the task root. The selected ARM64 output was packaged, extracted and tested natively through the selected source's unchanged `release-probe.ts`.
 
@@ -155,17 +157,30 @@ Direct archive URLs:
 
 ### Delivery
 
-The release URL, version, archive digests and successful read-back were posted on the task's existing [draft PR #326 completion thread](https://github.com/swxtchio/swx-opencode/pull/326#issuecomment-6307125194). Its first-comment session stamp and task branch establish the task mapping.
+The release URL, version, archive digests and successful read-back were posted as a [supplemental publication comment on draft PR #326](https://github.com/swxtchio/swx-opencode/pull/326#issuecomment-6307125194). This does not establish the PR as the task completion thread. Completion is reported to firstmate through `/home/byates/fm-llmrouter/state/opencode-release-cut.wake-events`; firstmate owns the task completion thread and its delivery path. The PR's session stamp identifies the code/evidence claim only.
 
-At publication, Abbe/SaaS recipient wake-task IDs were not supplied or established from the live task/peer records. The supervising home's `data/peers.md` identified Abbe as a peer firstmate rather than an assigned task and contained no SaaS registry entry. The routing question was recorded in [swxtchio/swx-firstmate#2257](https://github.com/swxtchio/swx-firstmate/issues/2257).
+At publication, the crew had not verified Abbe/SaaS recipient task IDs. The supervising home's `data/peers.md` identified Abbe as a peer firstmate rather than an assigned task and contained no SaaS registry entry. The routing question was recorded in [swxtchio/swx-firstmate#2257](https://github.com/swxtchio/swx-firstmate/issues/2257); the task records subsequently verified for round 1 are listed below.
 
-Under the supervisor's 2026-10-21T03:30 continuation to finish delivery, both notifications used the existing confirmed informational peer-message path. Abbe resolved from the registered peer `abbe`; SaaS used the supported explicit `peer:/home/byates/fm-saas` selector. Their own current `.heartbeat-target` records were read, and `fm-send.sh` revalidated endpoint identity at send time. Each payload carried version `1.18.32-swxtch.d1b232e9`, both complete archive download URLs, both archive SHA-256 values, checksum-companion availability and successful native/read-back verification.
+The initial supplemental notifications used the existing confirmed informational peer-message path. Abbe resolved from the registered peer `abbe`; SaaS used the supported explicit `peer:/home/byates/fm-saas` selector. Their `.heartbeat-target` records were read, and `fm-send.sh` revalidated endpoint identity at send time. Each payload carried version `1.18.32-swxtch.d1b232e9`, both complete archive download URLs, both archive SHA-256 values, checksum-companion availability and successful native/read-back verification.
 
 | Recipient | Transport | Delivery receipt | Read-back state |
 | --- | --- | --- | --- |
 | Abbe | `terminal` | `p1792553644-3991099-6753` | `phase=sent`, `disposition=delivered-no-reply` |
 | SaaS | `opencode-http` | `p1792553645-3992254-264e` | `phase=sent`, `disposition=delivered-no-reply` |
 
-The sender-owned records were read back at `/home/byates/fm-llmrouter/state/peer-outbox/<receipt>`. Their complete projected-payload SHA-256 values are `d865d692da4c43defebc82d261098863e74bdc2e12f72bbe20c8bb095604110b` for Abbe and `09b0e68d3192d30436016b30aee161860412fb7f5cce771f30756792b673f4d5` for SaaS. No reply was requested or claimed. This uses confirmed peer delivery and its existing outbox receipts rather than inventing recipient task IDs or synthetic wake files. The receipts and completed delivery were recorded in issue #2257, which was closed as completed and read back closed. The task wake log records the final delivery pointers as well.
+The sender-owned records were read back at `/home/byates/fm-llmrouter/state/peer-outbox/<receipt>`. Their complete projected-payload SHA-256 values are `d865d692da4c43defebc82d261098863e74bdc2e12f72bbe20c8bb095604110b` for Abbe and `09b0e68d3192d30436016b30aee161860412fb7f5cce771f30756792b673f4d5` for SaaS. No reply was requested or claimed. Issue #2257 was closed on those peer-message receipts, but those receipts did not satisfy the task's required append to the peers' verified task wake logs. Round 1 corrects that delivery contract through the actual wake-log appends recorded below.
+
+#### Round-1 task wake-log append receipts
+
+Before writing, Abbe task `abbe-jail-swx-opencode-441` was verified in `/home/byates/fm-abbe/data/backlog.md`, where it is queued waiting for the fork release tag and digest. SaaS task `opencode-arm-release` was verified in `/home/byates/fm-saas/data/backlog.md` and its retained `/home/byates/fm-saas/data/opencode-arm-release/brief.md`, "Assigned outcome and authority"; that task is recorded as completed and owns the preceding release/image handoff. Verification establishes the task identities, not a new dispatch or activation.
+
+At 2026-10-21T05:23:17Z, the round-1 release notice was appended with `>>` to each verified task's actual wake-log path:
+
+| Peer | Verified task ID | Wake-log append destination | Read-back receipt |
+| --- | --- | --- | --- |
+| Abbe | `abbe-jail-swx-opencode-441` | `/home/byates/fm-abbe/state/abbe-jail-swx-opencode-441.wake-events` | Appended release notice present at line 1, timestamp `2026-10-21T05:23:17Z` |
+| SaaS | `opencode-arm-release` | `/home/byates/fm-saas/state/opencode-arm-release.wake-events` | Appended release notice present at line 1, timestamp `2026-10-21T05:23:17Z` |
+
+Both complete notices were read back after the appends. Each contains the published release URL, version `1.18.32-swxtch.d1b232e9`, fixed source commit, both full archive download URLs, ARM64 archive SHA-256 `816046ddda7f3e3127c0396cff220aef8bf1ed4b1a7f3f7ad624d560941a8466`, x64 archive SHA-256 `dde0e4f1bd56664ca1d442951b15983f3c5338d1fa84c1bbee1f9b25587dd6ad`, checksum-companion availability and native/published-byte verification results. At this read-back snapshot each log contained the single 771-byte appended line, with file SHA-256 `9210c7468d68185cb71af74ac3c8628a9b38bcab38a41db42dd6e83f160f779c`. These file appends satisfy the required wake-log delivery; the earlier peer-message receipts remain supplemental evidence only.
 
 The later `swx-abbe-1227-native-history` dispatch and downstream deployments remain firstmate-owned and have not been launched by this crew.
