@@ -1,6 +1,6 @@
 # Abbe consumer trace — 2026-10-21 source snapshot
 
-Inspected clean Abbe checkout `/home/byates/fm-llmrouter/projects/swx-abbe` at `9060ce607b5065f2f5b462e05300334bd983fe8d` (reachable through Abbe's `swxtch` history). `git rev-parse HEAD` and `git status --short` were read before and after inspection; the revision stayed unchanged and the checkout was clean. These are source observations, not deployed-cohort or executed integration results. Each source link below is pinned to that consumer revision.
+Inspected clean Abbe checkout `/home/byates/fm-llmrouter/projects/swx-abbe` at `9060ce607b5065f2f5b462e05300334bd983fe8d`, the merged [Abbe PR #1526](https://github.com/swxtchio/swx-abbe/pull/1526) snapshot. Abbe's default branch was read through `gh-axi repo view -R swxtchio/swx-abbe` as `main`; the sampled checkout's local `origin/main` resolved to this same commit. `git rev-parse HEAD` and `git status --short` were read before and after inspection; the revision stayed unchanged and the checkout was clean. These are source observations, not deployed-cohort or executed integration results. Each source link below is pinned to that consumer revision.
 
 ## Actual caller chain
 
