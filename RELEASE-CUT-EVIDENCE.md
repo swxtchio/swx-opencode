@@ -100,6 +100,39 @@ timestamp=2026-10-21T01:42:44.051Z level=INFO run=5026de4c message="Session wait
 timestamp=2026-10-21T01:42:44.927Z level=INFO run=5026de4c message="Session wait resolved" event=session.wait.resolved wait_id=1c925326-fbad-4618-8bdf-8295798c38dc session_id=ses_ea3dffe5effes37ZYpq8EYC0Cb admitted_seq=1 message_id=msg_15c2001ac001v0cIzNzdCSD202 outcome=interrupted
 ```
 
+### Native ARM64 candidate
+
+Following the supervisor's 2026-10-21T03:02 continuation of the preceding handoff naming the VM14 root and build/test purposes, the ARM64 work proceeded within `/home/byates/vm14-builds/opencode-release-d1b232e9` on `vm14-001`. A fresh source clone checked out immutable commit `d1b232e940ef155a3e5311794a2baeaa143af1d8`; its V2 wait ancestry check passed, and the source was checked clean before installation, after installation, after building, and after the native probe. HOME, temporary directories, dependency/cache writes, catalog snapshots, build outputs, archives, extraction and runtime proof all used that task root. The host record identifies Linux `aarch64`; the Bun record is `Bun 1.4.2 linux-arm64`.
+
+The frozen all-platform dependency install used `--frozen-lockfile --os="*" --cpu="*"` and a cache within the task root. The unmodified selected source ran `bun run packages/opencode/script/build.ts --skip-install` with `OPENCODE_VERSION=1.18.32-swxtch.d1b232e9`, the absolute `MODELS_DEV_API_JSON` snapshot path, and an absolute `OPENCODE_BUILD_DIST` beneath the task root. The selected ARM64 output was packaged, extracted and tested natively through the selected source's unchanged `release-probe.ts`.
+
+| Observation | Value |
+| --- | --- |
+| Archive | `opencode-linux-arm64.tar.gz` |
+| Archive bytes | `64223558` |
+| Archive SHA-256 | `816046ddda7f3e3127c0396cff220aef8bf1ed4b1a7f3f7ad624d560941a8466` |
+| Extracted executable SHA-256 | `e14e69ea24931b7cdca7d1a5ddbed9fa7419d788d7f97642f287cd3a658f5884` |
+| FFF sidecar | `libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so` |
+| Actual FFF sidecar SHA-256 | `0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42` |
+| Actual supplied models.dev snapshot SHA-256 | `5c24a412697daea8a05a642ef87185ca1392e7073d41e20cb37ba7a16f6c1a14` |
+| Selected lockfile SHA-256 | `2c6631f22941c4367a66410ae866c07fa8d4d141798dfba728e46d4c3c400151` |
+| Extracted native version | `1.18.32-swxtch.d1b232e9` |
+
+The full native probe passed. FFF search found `src/nested/needle-target.ts`; the HTTP outcomes were `idle`, `pending`, `completed`, `failed` and `interrupted`. Completed wait remained unresolved across both the held Bash tool and the held final provider continuation, using one producer wait registration. User `msg_15c6ccc8e001M1kNeqs3nlnS5L` and terminal assistant `msg_15c6cce75001zn359DFxVHR4rF` survived restart on the isolated `/home/byates/vm14-builds/opencode-release-d1b232e9/runtime/session.sqlite`. Exclusive replay after admission sequence `1` matched the original durable event IDs for sequences `2` through `12`. The two explicit database stores opened successfully and had distinct inodes `333123` and `333130` on device `64770`; no conflicting XDG database appeared, and the unset selector matched its channel-default path.
+
+Both the archive and companion validated on VM14. The selected archive, companion, build/install logs, supplied snapshot, host/Bun/cleanliness records and native evidence JSON were transported into the task worktree's `.release-cut/arm-candidate/`; its companion also passed local validation after transport.
+
+Producer-emitted ARM64 wait records retained verbatim:
+
+```text
+timestamp=2026-10-21T03:06:36.730Z level=INFO run=0ab76658 message="Session wait registered" event=session.wait.registered wait_id=ae029570-ab84-4ae5-a4c7-e785a55e2ae4 session_id=ses_ea393337bffem10KkxBmP1Sxy4 admitted_seq=1 message_id=msg_15c6ccc8e001M1kNeqs3nlnS5L waiter_count=1
+timestamp=2026-10-21T03:06:37.068Z level=INFO run=0ab76658 message="Session wait resolved" event=session.wait.resolved wait_id=ae029570-ab84-4ae5-a4c7-e785a55e2ae4 session_id=ses_ea393337bffem10KkxBmP1Sxy4 admitted_seq=1 message_id=msg_15c6ccc8e001M1kNeqs3nlnS5L outcome=completed
+timestamp=2026-10-21T03:06:39.448Z level=INFO run=64af5bcc message="Session wait registered" event=session.wait.registered wait_id=e91e6e4e-3abb-406c-8316-dba17b5deda9 session_id=ses_ea3932945ffesv0nJxJzx0ueMD admitted_seq=1 message_id=msg_15c6cd6cb0013S6BSvrirRf1wP waiter_count=1
+timestamp=2026-10-21T03:06:39.590Z level=INFO run=64af5bcc message="Session wait resolved" event=session.wait.resolved wait_id=e91e6e4e-3abb-406c-8316-dba17b5deda9 session_id=ses_ea3932945ffesv0nJxJzx0ueMD admitted_seq=1 message_id=msg_15c6cd6cb0013S6BSvrirRf1wP outcome=failed
+timestamp=2026-10-21T03:06:40.664Z level=INFO run=64af5bcc message="Session wait registered" event=session.wait.registered wait_id=acaab8b1-f894-4461-a4c0-2500c61c5d55 session_id=ses_ea39323e0ffelKEZD2Ennzagvz admitted_seq=1 message_id=msg_15c6cdc2a001kzm2ihNTWL30Xn waiter_count=1
+timestamp=2026-10-21T03:06:41.542Z level=INFO run=64af5bcc message="Session wait resolved" event=session.wait.resolved wait_id=acaab8b1-f894-4461-a4c0-2500c61c5d55 session_id=ses_ea39323e0ffelKEZD2Ennzagvz admitted_seq=1 message_id=msg_15c6cdc2a001kzm2ihNTWL30Xn outcome=interrupted
+```
+
 ### Remaining release steps
 
-A read-only VM14 check returned `aarch64` and Bun `1.4.2`. No ARM64 candidate build has run: the generated task requires current host/root/purpose authorization before VM14 writes. Completion-thread and peer-task routing must also be established before delivery. ARM64 build evidence, publication read-back, and delivery pointers will be added only after their corresponding executions. No historical archive values are reused as candidate evidence.
+Both selected candidates have passed native acceptance. Publication read-back and delivery pointers will be recorded after execution. The task's draft PR establishes its release-evidence discussion; peer wake-task routing still requires verified recipient records. No historical archive values are reused as candidate evidence.
