@@ -11,7 +11,8 @@
 # test launches (swxtchio/swx-opencode#324). Linux strace audits child execs: unobserved absolute Bun tests and Node
 # --test launches invalidate the run; bun run --bun is refused. A package-local turbo.json without a resolved test task
 # is refused. This speedup is not a security boundary; see tests/run.sh for residual observation limits.
-# The launch audit also resolves kernel shebang interpreters and fd-only execveat targets from process context.
+# The launch audit reconstructs paths from process context, then verifies physical targets and interpreter headers in
+# the audit-time filesystem; vanished targets are refused. Interpreter bytes are not captured at the instant of exec.
 # Changes touching an excluded timing class require that class at the final gate via
 # firstmate's repository suite override; release builds require a passing full suite.
 

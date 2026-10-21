@@ -13,6 +13,8 @@
 # unrecognized interpreter identities, in-process test frameworks, and deliberate observer/report
 # tampering are outside its observation scope. The full suite remains the release gate.
 # In particular, bare Node scripts using node:test without --test remain unobserved.
+# Executable paths and interpreter headers are re-verified in the audit-time filesystem;
+# they are not captured interpreter-byte snapshots from the instant of exec.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,7 +48,8 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     'All captured Bun JUnit reports, including preparation and lifecycle-hook launches, are collected; their observed' \
     'file set must equal the manifest exactly for PATH-resolved Bun test launches; see swxtchio/swx-opencode#324.' \
     'Fast mode requires Linux strace: unobserved absolute Bun test launches and Node --test launches invalidate the run;' \
-    'kernel shebang interpreters and fd-only execveat launches are resolved from captured process context.' \
+    'Captured process context reconstructs paths; real targets and shebang headers are verified in the audit-time filesystem.' \
+    'Vanished or unverifiable execution targets are refused; this is not an exec-time interpreter-byte snapshot.' \
     'bun run --bun delegation is refused. This is a merge-gate speedup, not a security boundary; full suite gates releases.' \
     'A nonzero target with no JUnit report is refused with target attribution, not labeled an execution-set mismatch.' \
     'Fast mode refuses if a selected file reports no active test cases.' \
@@ -724,11 +727,26 @@ launch_observation_status=0
 FAST_SUITE_ROOT="$root" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e '
   import { existsSync, realpathSync } from "node:fs"
   import { readdir } from "node:fs/promises"
-  import { basename, join, resolve } from "node:path"
+  import { basename, dirname, join } from "node:path"
 
   const directory = process.env.FAST_SUITE_REPORT_DIR
   const runtimeBun = (await Bun.file(join(directory, "runtime-bun")).text()).trim()
   const entries = await readdir(directory)
+  const resolveTarget = (raw, base) => {
+    if (!raw || (!raw.startsWith("/") && !base)) return undefined
+    let path = raw.startsWith("/") ? "/" : base
+    for (const part of raw.split("/")) {
+      if (!part || part === ".") continue
+      if (part === "..") {
+        path = dirname(path)
+        continue
+      }
+      const target = path + "/" + part
+      if (!existsSync(target)) return undefined
+      path = realpathSync(target)
+    }
+    return path
+  }
   let invalid = entries.includes("refused-delegation")
   for (const name of entries.filter((entry) => entry.endsWith(".trace") && entry !== "probe.trace")) {
     const calls = []
@@ -757,7 +775,7 @@ FAST_SUITE_ROOT="$root" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPOR
     }
     const ordered = calls.sort((a, b) => a.index - b.index)
     const working = new Map()
-    if (ordered.length) working.set(ordered[0].pid, { path: process.env.FAST_SUITE_ROOT })
+    if (ordered.length) working.set(ordered[0].pid, { path: resolveTarget(process.env.FAST_SUITE_ROOT) })
     for (const entry of ordered) {
       const call = entry.call
       const cwd = working.get(entry.pid)
@@ -772,13 +790,21 @@ FAST_SUITE_ROOT="$root" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPOR
       }
       const strings = Array.from(call.matchAll(/"((?:\\x[0-9a-f]{2})*)"/g), ([, hex]) => Buffer.from(hex.replaceAll("\\x", ""), "hex").toString())
       if (/^chdir\(/.test(call)) {
-        cwd.path = strings[0].startsWith("/") ? strings[0] : cwd.path ? resolve(cwd.path, strings[0]) : undefined
+        cwd.path = resolveTarget(strings[0], cwd.path)
+        if (!cwd.path) {
+          console.error("tests/run.sh: unavailable executed chdir target: " + strings[0])
+          invalid = true
+        }
         continue
       }
       const descriptor = call.match(/^(?:execveat|fchdir)\([^<]*<([^>]+)>/)?.[1]
       const descriptorPath = descriptor?.startsWith("\\x") ? Buffer.from(descriptor.replaceAll("\\x", ""), "hex").toString() : descriptor
       if (/^fchdir\(/.test(call)) {
-        cwd.path = descriptorPath?.startsWith("/") ? descriptorPath : undefined
+        cwd.path = resolveTarget(descriptorPath)
+        if (!cwd.path) {
+          console.error("tests/run.sh: unavailable executed fchdir target")
+          invalid = true
+        }
         continue
       }
       if (!/^execve(?:at)?\(/.test(call) || entry.result !== 0) continue
@@ -786,17 +812,20 @@ FAST_SUITE_ROOT="$root" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPOR
       let executable = strings[0]
       let args = strings.slice(2)
       if (!executable && descriptorPath?.startsWith("/")) executable = descriptorPath
-      if (executable && !executable.startsWith("/")) {
-        const base = descriptorPath ?? cwd.path
-        executable = base ? resolve(base, executable) : undefined
-      }
       if (!executable) {
         console.error("tests/run.sh: unobservable executable pathname: " + name)
         invalid = true
         continue
       }
+      const requested = executable
+      executable = resolveTarget(executable, descriptorPath ?? cwd.path)
+      if (!executable) {
+        console.error("tests/run.sh: unavailable executed target: " + requested)
+        invalid = true
+        continue
+      }
       const interpreters = new Set()
-      while (existsSync(executable)) {
+      while (executable) {
         const header = await Bun.file(executable).slice(0, 256).text()
         if (!header.startsWith("#!")) break
         if (interpreters.has(executable)) {
@@ -812,7 +841,11 @@ FAST_SUITE_ROOT="$root" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPOR
           break
         }
         args = [...(bang[2] ? [bang[2]] : []), executable, ...args]
-        executable = bang[1].startsWith("/") ? bang[1] : resolve(cwd.path, bang[1])
+        executable = resolveTarget(bang[1], cwd.path)
+        if (!executable) {
+          console.error("tests/run.sh: unavailable executed interpreter target: " + bang[1])
+          invalid = true
+        }
       }
       if (basename(executable ?? "") === "node" && args.some((argument) => argument === "--test" || argument.startsWith("--test="))) {
         console.error("tests/run.sh: unobservable Node test launch: " + executable)
