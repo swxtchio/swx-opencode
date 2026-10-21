@@ -6,6 +6,7 @@
   "guest_image_initial_sha256": "04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94",
   "qemu_system_version": "QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)",
   "qemu_system_executable_sha256": "cfac2d1293e7cc362fd9a5b0ee7b8a8ce6b4d3abc9711cdcbbd2efb435c9a923",
+  "guest_shutdown": {"qemu_pid": 2565048, "driver_pid": 2564873, "reaped_exit": 0, "condition": "Task-owned guest stop marker; stopped receipt matches the current launch PID"},
   "guest_readiness_response": "x86_64\n/usr/bin/git\n/usr/bin/python3\nguest-ready",
   "guest_readiness_condition": "Successful key-authenticated SSH response after /var/lib/cloud/instance/boot-finished exists; image and seed files are task-owned",
   "guest_kernel": "Linux 6.8.0-147-generic x86_64",

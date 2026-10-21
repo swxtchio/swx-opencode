@@ -1,6 +1,6 @@
-# Remaining published-binary execution procedure
+# Native x64 hardware reproduction procedure
 
-This is an **unexecuted handoff procedure** for the blocked native x64 step, not a passing result. Run only in a firstmate-authorized native x64 disposable worktree/root. Keep every database, config, provider fixture, scratch directory and evidence output there. Preserve the selected release bytes and packaged sidecar; a source-built executable cannot replace them.
+This checklist was prepared while native x64 execution was blocked. The later [manual driver](probe-commands.py) completed the qualified full-system guest run recorded in [the final recommendation](README.md); this original source-owned battery was not executed by this task. Retain this procedure for a stock native-x64-hardware reproduction in an authorized disposable worktree/root. Keep every database, config, provider fixture, scratch directory and evidence output there. Preserve the selected release bytes and packaged sidecar; a source-built executable cannot replace them.
 
 ## Existing release battery
 
@@ -24,9 +24,9 @@ OPENCODE_VERSION=1.18.32-swxtch.d1b232e9 bun packages/opencode/script/release-pr
 
 The battery's `native-run/evidence.json`, `opencode-server.log`, native DB and generated provider/permission config are reproduction leads and evidence outputs. Copy raw observations into the committed evidence directory after reviewing them for unrelated/environment-secret content. Retain process stop/reap confirmation; use readiness and returned state rather than elapsed time as success signals.
 
-## Required additional observations
+## Observation checklist beyond the original release battery
 
-The existing battery alone does not fulfill this task. Continue the same release execution with real producer-owned fixtures at `packages/opencode/test/server/httpapi-session.test.ts` (held wait and durable cursor cases), `packages/core/test/session-history.test.ts`, and `packages/core/test/message-history-order.test.ts` as design leads. Retain the actual request/response data for each item below; source-test passes cannot replace the release execution.
+The existing battery alone does not cover the complete task. For reproduction, include the observations below, using the producer-owned fixtures at `packages/opencode/test/server/httpapi-session.test.ts` (held wait and durable cursor cases), `packages/core/test/session-history.test.ts`, and `packages/core/test/message-history-order.test.ts` as design leads. The qualified guest run's raw observations are now retained in `release-run.json`; source-test passes cannot replace execution of the published bytes.
 
 | Observation | Request/record boundary | Required comparison |
 | --- | --- | --- |

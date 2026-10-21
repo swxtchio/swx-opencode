@@ -1,0 +1,9 @@
+timestamp=2026-10-21T06:55:45.046Z level=INFO run=c3cf9fcf message=loading path=/home/byates/fm-worktrees/fm-llmrouter/swx-abbe-1227-native-history/swx-opencode/.native-history/native-guest-run-5/home/.config/opencode/config.json
+timestamp=2026-10-21T06:55:45.460Z level=INFO run=c3cf9fcf message=loading path=/home/byates/fm-worktrees/fm-llmrouter/swx-abbe-1227-native-history/swx-opencode/.native-history/native-guest-run-5/home/.config/opencode/opencode.json
+timestamp=2026-10-21T06:55:45.903Z level=INFO run=c3cf9fcf message=loading path=/home/byates/fm-worktrees/fm-llmrouter/swx-abbe-1227-native-history/swx-opencode/.native-history/native-guest-run-5/home/.config/opencode/opencode.jsonc
+timestamp=2026-10-21T06:55:46.026Z level=WARN run=c3cf9fcf message="configuration compatibility diagnostic" source=/home/byates/fm-worktrees/fm-llmrouter/swx-abbe-1227-native-history/swx-opencode/.native-history/native-guest-run-5/home/.config/opencode/opencode.jsonc path="[\"providers\"]" kind=unsupported action="Omitted native setting that cannot be represented in V1"
+opencode server listening on http://127.0.0.1:60955
+timestamp=2026-10-21T06:56:09.350Z level=INFO run=c3cf9fcf message="project copy refresh started" projectID=56e84395abba73bff90a1041f6e0ef6fe604c849
+timestamp=2026-10-21T06:56:09.495Z level=INFO run=c3cf9fcf message="project copy refresh done" projectID=56e84395abba73bff90a1041f6e0ef6fe604c849 updated=[] removed=[]
+timestamp=2026-10-21T06:57:09.665Z level=INFO run=c3cf9fcf message="watcher active" watch=git directory=/home/byates/fm-worktrees/fm-llmrouter/swx-abbe-1227-native-history/swx-opencode/.native-history/native-guest-run-5/workspace/.git
+timestamp=2026-10-21T06:57:11.262Z level=INFO run=c3cf9fcf message="booting location services" directory=/home/byates/fm-worktrees/fm-llmrouter/swx-abbe-1227-native-history/swx-opencode/.native-history/native-guest-run-5/workspace workspaceID=undefined

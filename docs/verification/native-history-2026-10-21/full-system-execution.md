@@ -2,7 +2,7 @@
 
 The initial ARM64 direct-execution blocker was advanced through a worktree-local full-system x64 guest. **This is emulated x64 Linux, not native x64 hardware.** The same published executable and packaged sidecar were transported into the guest, and their digests matched the release before execution. All guest disk/seed/key/log files are inside the task worktree; the guest disk is a disposable task-owned image, not a tenant store or a live runtime.
 
-[Startup observations](full-system-startup.json) record the guest image's downloaded digest, emulator identity, positive guest readiness, executable/sidecar identity, successful `--version`, absolute `db path`, and packaged FFF search. The initial native-guest runtime attempt did not reach a configured V2 API response within its bounded readiness probe. Version/selector/sidecar observations establish those specific prerequisites; they do not establish V2 admission, wait, native projections, history or restart correctness.
+[Startup observations](full-system-startup.json) record the guest image's downloaded digest, emulator identity, positive guest readiness, executable/sidecar identity, successful `--version`, absolute `db path`, and packaged FFF search. The initial native-guest runtime attempt did not reach a configured V2 API response within its bounded readiness probe. The later run 5 completed the actual V2 admission/wait/native-row/history/restart/reconnect battery: [raw results](release-run.json), [exact driver](probe-commands.py) and [final recommendation](README.md) retain the passing observations with the qualifications below.
 
 ## Execution settings and earlier failures
 
@@ -10,7 +10,7 @@ QEMU user-mode 11.1.2 failed on the unchanged binary with Bun/JavaScriptCore `Me
 
 The native-guest startup battery uses a fresh absolute `OPENCODE_DB`, config/data/cache/state/tmp roots and a fixture Git workspace under the guest's replica of this task-worktree path. It launches only the published binary as `serve --pure --print-logs --hostname 127.0.0.1 --port <selected-port>`. A configured `/api/model` response is the positive readiness condition; timers only bound failure. The isolated local provider uses fake credentials and controlled initial-provider, local-Bash and final-continuation holds. Neither the default provider nor any live customer store is used.
 
-The currently executing continuation extends the fixture's cold-start request budget while retaining the same positive readiness condition; it does not treat the listening socket or an elapsed delay as configured readiness. The sidecar observation already executed in this task is retained independently, so another FFF warm-up is not counted as a V2 admission or made a prerequisite to collecting the remaining V2 observations.
+The successful continuation extended the fixture's cold-start request budget while retaining the same positive readiness condition; it did not treat the listening socket or an elapsed delay as configured readiness. The sidecar observation already executed in this task is retained independently; another FFF warm-up was not counted as a V2 admission or made a prerequisite to collecting V2 observations.
 
 ## Reproduction paths
 
@@ -18,4 +18,4 @@ The host's ignored `.native-history/` tree retains `guest-start.py`, the cloud-i
 
 The full-system launch uses the extracted Ubuntu arm64 QEMU system package and its modules, explicit SeaBIOS path, `pc,accel=tcg`, `-cpu max`, two guest CPUs, task-owned image, loopback-only SSH forwarding and a loopback cloud-init seed server. The guest becomes usable only after an authenticated command confirms the cloud-init completion marker and returns `x86_64`, Git and Python paths. The image's initial hash refers to its downloaded state; subsequent fixture writes intentionally mutate that disposable image and do not alter the downloaded release archive.
 
-The producer verdict remains **not established** until the remaining release-binary observations actually complete. A passing emulated execution would still need its emulator/JIT qualification; it would not certify stock native-hardware deployment, the consumer replacement tests, or persistent-cohort migration.
+Run 5 established the functional producer invariants with the recorded emulator/JIT qualification. It does not certify stock native-hardware deployment, consumer replacement tests or persistent-cohort migration. The final recommendation holds consumer cutover, including the observed tool-locality mismatch filed as Abbe #1559.

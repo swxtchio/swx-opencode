@@ -1,0 +1,13 @@
+{
+  "observation_date": "2026-10-21",
+  "method": "Read-only SQLite backup integrity_check; compare event ID/seq after excluding the observed nonpublic session.created.1 type with every restart finite-history page; compare session_message ID/type/seq with native ascending API readback",
+  "integrity": "ok",
+  "original_store_after_restart": {"device": 64769, "inode": 85745, "size": 413696},
+  "cases": {
+    "ses_ea2c5436fffeMEwu2H5erHsb76": {"native_event_rows": 19, "public_event_rows": 18, "public_history_exactly_matches_native_rows": true, "native_message_order_matches_readback": true},
+    "ses_ea2c3acd4ffecTvsUW6YQLxAXT": {"native_event_rows": 13, "public_event_rows": 12, "public_history_exactly_matches_native_rows": true, "native_message_order_matches_readback": true},
+    "ses_ea2c2d8feffeNewiyCUHOgB1Ic": {"native_event_rows": 9, "public_event_rows": 8, "public_history_exactly_matches_native_rows": true, "native_message_order_matches_readback": true},
+    "ses_ea2c564feffeoyfD8VV5iPjxnM": {"native_event_rows": 1, "public_event_rows": 0, "public_history_exactly_matches_native_rows": true, "native_message_order_matches_readback": true},
+    "ses_ea2c54dc4ffeugrrLC0EwZX7vH": {"native_event_rows": 2, "public_event_rows": 1, "public_history_exactly_matches_native_rows": true, "native_message_order_matches_readback": true}
+  }
+}

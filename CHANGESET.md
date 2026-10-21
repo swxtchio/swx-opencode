@@ -38,7 +38,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Fork maintenance and CI
 
-- **#331** Record the 2026-10-21 published linux-x64 artifact identity verification, pinned Abbe V2 caller trace, local emulation failure and remaining release-execution procedure. Runtime acceptance remains blocked by execution placement; Abbe #1556 tracks the inspected V2 consumer replacement-proof gap. See `docs/verification/native-history-2026-10-21/README.md`. _Fork-only._
+- **#331** Record the 2026-10-21 published linux-x64 V2 admission/wait/native-history/restart/reconnect verification in an isolated full-system x64 guest, including raw producer evidence, SQLite backup and TCG/JIT qualifications. Hold Abbe cutover for the observed tool-locality mismatch (#1559), V2 replacement proof (#1556) and unestablished cohort inventory. See `docs/verification/native-history-2026-10-21/README.md`. _Fork-only._
 - **#311** Add a maintained fast test manifest and `tests/run.sh --fast`; validate committed per-package test paths,
   dispatch each package's exact selected files through one owning Turbo test lifecycle when registered and package
   scripts otherwise, preserving strict env, package-local config, options, and declared preparation; traverse
