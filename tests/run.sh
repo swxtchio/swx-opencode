@@ -8,6 +8,10 @@
 # together through its scoped test task; packages without a task use `bun run test`.
 # Turbo/Bun own strict env, local config, script options, and one package lifecycle.
 # JUnit-less nonzero exits remain attributed refusals; extra or missing suites are rejected.
+# Residual limitations accepted for this fast gate (follow-up: swxtchio/swx-opencode#324):
+# absolute-Bun argv[0] launches bypass the shim; bun run --bun delegation and node:test
+# launches run unobserved. The non-build prerequisite allowlist and !targetTask
+# plan-empty wrapper refusal boundaries remain unpinned; see swxtchio/swx-opencode#324.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
