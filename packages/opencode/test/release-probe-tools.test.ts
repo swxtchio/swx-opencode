@@ -132,6 +132,70 @@ describe("release proof input resolution", () => {
       }),
     ).toThrow()
   })
+
+  test("resolves an unpublished candidate from a real Git source and refuses conflicting tags", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-release-candidate-"))
+    const source = path.join(root, "source")
+    const remote = path.join(root, "remote.git")
+    const event = path.join(root, "event.json")
+    const output = path.join(root, "github-env")
+    const script = path.resolve(import.meta.dir, "../script/release-probe-target.ts")
+    const env = {
+      ...process.env,
+      RELEASE_SOURCE_DIR: source,
+      GITHUB_EVENT_PATH: event,
+      GITHUB_ENV: output,
+      GITHUB_EVENT_NAME: "workflow_dispatch",
+      RELEASE_PROBE_DEFAULT_TAG: releaseTag,
+    }
+    const git = (...args: string[]) => {
+      const result = Bun.spawnSync(["git", ...args], { stdout: "pipe", stderr: "pipe", timeout: 10_000 })
+      if (result.exitCode !== 0) throw new Error(result.stderr.toString())
+      return result.stdout.toString().trim()
+    }
+    const resolve = (candidate = true) =>
+      runProcess([process.execPath, script, ...(candidate ? ["--candidate"] : [])], {
+        cwd: root,
+        env,
+        timeoutMs: 15_000,
+        label: "candidate source identity",
+      })
+    try {
+      git("clone", "--bare", "--shared", path.resolve(import.meta.dir, "../../.."), remote)
+      git("clone", "--shared", remote, source)
+      const commit = git("-C", source, "rev-parse", "HEAD")
+      const packageVersion = (await Bun.file(path.join(source, "packages/opencode/package.json")).json()).version
+      const version = `${packageVersion}-swxtch.${commit.slice(0, 8)}`
+      const tag = `v${version}`
+      await Bun.write(event, JSON.stringify({ inputs: { release_tag: tag, source_commit: commit, version } }))
+      const candidate = await resolve()
+      expect(candidate.exit).toBe(0)
+      expect(JSON.parse(candidate.stdout)).toEqual({ releaseTag: tag, sourceCommit: commit, version, bunVersion: Bun.version })
+      expect(await Bun.file(output).text()).toContain(`SOURCE_COMMIT=${commit}\nOPENCODE_VERSION=${version}\n`)
+
+      const proof = await resolve(false)
+      expect(proof.exit).not.toBe(0)
+      expect(proof.stderr).toContain("Could not resolve release tag")
+
+      git("--git-dir", remote, "tag", tag, git("-C", source, "rev-parse", "HEAD^"))
+      const conflicting = await resolve()
+      expect(conflicting.exit).not.toBe(0)
+      expect(conflicting.stderr).toContain(`Tag ${tag} resolves to`)
+
+      await Bun.write(event, JSON.stringify({ inputs: { release_tag: tag, version } }))
+      const implicit = await resolve()
+      expect(implicit.exit).not.toBe(0)
+      expect(implicit.stderr).toContain("A full explicit source_commit is required")
+
+      await Bun.write(event, JSON.stringify({ inputs: { release_tag: tag, source_commit: commit, version } }))
+      git("-C", source, "remote", "set-url", "origin", path.join(root, "unavailable.git"))
+      const unavailable = await resolve()
+      expect(unavailable.exit).not.toBe(0)
+      expect(unavailable.stderr).toContain("Could not resolve release tag")
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  }, 60_000)
 })
 
 describe("release probe request ownership", () => {
