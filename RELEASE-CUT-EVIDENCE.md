@@ -133,6 +133,28 @@ timestamp=2026-10-21T03:06:40.664Z level=INFO run=64af5bcc message="Session wait
 timestamp=2026-10-21T03:06:41.542Z level=INFO run=64af5bcc message="Session wait resolved" event=session.wait.resolved wait_id=acaab8b1-f894-4461-a4c0-2500c61c5d55 session_id=ses_ea39323e0ffelKEZD2Ennzagvz admitted_seq=1 message_id=msg_15c6cdc2a001kzm2ihNTWL30Xn outcome=interrupted
 ```
 
-### Remaining release steps
+### Publication and read-back
 
-Both selected candidates have passed native acceptance. Publication read-back and delivery pointers will be recorded after execution. The task's draft PR establishes its release-evidence discussion; peer wake-task routing still requires verified recipient records. No historical archive values are reused as candidate evidence.
+Published [v1.18.32-swxtch.d1b232e9](https://github.com/swxtchio/swx-opencode/releases/tag/v1.18.32-swxtch.d1b232e9) at 2026-10-21T03:12:35Z with `gh-axi release create`, explicit repository `swxtchio/swx-opencode`, target `d1b232e940ef155a3e5311794a2baeaa143af1d8`, title `v1.18.32-swxtch.d1b232e9`, the committed `RELEASE-CUT-NOTES.md` body, `--latest`, and both archive/companion pairs. The local exact repository allowlist was read before the write.
+
+`gh-axi release view v1.18.32-swxtch.d1b232e9 -R swxtchio/swx-opencode --full` returned the complete provenance body, including Release identity, Build provenance, Release assets, Runtime verification and the carried-fix references. The tag-specific API and `/releases/latest` both returned release ID `419105624`, the intended name and tag, the fixed `target_commitish`, `draft: false`, `prerelease: false`, and all four uploaded assets. `git ls-remote origin refs/tags/v1.18.32-swxtch.d1b232e9` returned the exact fixed source commit.
+
+| Uploaded asset | GitHub asset ID | Uploaded bytes |
+| --- | --- | ---: |
+| `opencode-linux-arm64.tar.gz` | `661203944` | 64223558 |
+| `opencode-linux-arm64.tar.gz.sha256` | `661203943` | 94 |
+| `opencode-linux-x64.tar.gz` | `661203939` | 64703288 |
+| `opencode-linux-x64.tar.gz.sha256` | `661203947` | 92 |
+
+All four assets were downloaded through `gh-axi release download` into the task worktree's `.release-cut/published/`. Both companion validations passed. The archives matched the selected native-tested archives byte-for-byte with `cmp`. Extracting both published archives reproduced their recorded executable and actual FFF sidecar SHA-256 values, so the published bytes remain linked to the completed native acceptance batteries.
+
+Direct archive URLs:
+
+- ARM64: <https://github.com/swxtchio/swx-opencode/releases/download/v1.18.32-swxtch.d1b232e9/opencode-linux-arm64.tar.gz>.
+- x64: <https://github.com/swxtchio/swx-opencode/releases/download/v1.18.32-swxtch.d1b232e9/opencode-linux-x64.tar.gz>.
+
+### Delivery
+
+The release URL, version, archive digests and successful read-back were posted on the task's existing [draft PR #326 completion thread](https://github.com/swxtchio/swx-opencode/pull/326#issuecomment-6307125194). Its first-comment session stamp and task branch establish the task mapping.
+
+Abbe/SaaS recipient wake-task IDs were not supplied by the task and were not established from the live task/peer records. The current `data/peers.md` in the supervising firstmate home identifies Abbe as a peer firstmate, which is not an assigned task ID, and contains no SaaS route. No peer wake files were fabricated and no unconfirmed delivery is claimed. The externally blocked routing/delivery follow-up is durably filed as [swxtchio/swx-firstmate#2257](https://github.com/swxtchio/swx-firstmate/issues/2257), with the exact version, archive URLs and digests. The later `swx-abbe-1227-native-history` dispatch and downstream deployments remain firstmate-owned and have not been launched by this crew.
