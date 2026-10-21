@@ -25,3 +25,9 @@ The exact cause remains **unestablished**. This verification-only task has no in
 - Any new/rewritten regression must obtain listener behavior through the production producer, terminate on absence of the guarded behavior, and pass after restoring the complete correction.
 
 This source/test investigation is outside the assigned published-release verification work at https://github.com/swxtchio/swx-opencode/pull/331. The published-byte fifty-check battery and ten post-crash join-only observations still passed with their explicit emulation/JIT qualifications; the PR's fresh CI is currently red and needs this owning-boundary decision before a clean handoff.
+
+## Different failure on the automatic follow-up run
+
+On 2026-10-21, automatic run [39582803608](https://github.com/swxtchio/swx-opencode/actions/runs/39582803608) at `7fc5540233bcd384cdb720bc01024b74fc7306b6` also failed its unit job, but it did not establish recurrence of this listener assertion. `@opencode-ai/core#test` reported the V1-to-V2 config property test exceeding its five-second test bound and the crashed-lock-owner fixture timing out before its worker `ready` file appeared. The owning test blobs still match default: `b9615877539b818cb51896694cb7612eaab2b5ab` and `a0f737a998d584828e4010deef77ed294587d28e`. Additional ACP timeout diagnostics and opencode exit 130 were logged while the Turbo run failed; their causal relation is unestablished. Typecheck/e2e passed.
+
+[Owning core timeout investigation #336](https://github.com/swxtchio/swx-opencode/issues/336) records the distinct cases, source trace and needed matched-condition reproduction. The lock readiness timeout happened before crashed-owner recovery was exercised; it is not an observed failure of that recovery algorithm. No infrastructure/load cause is inferred from timeout text alone. Both #335 and #336 remain unresolved; no retries, wider thresholds, skips or source fixes were used to produce a green label.
