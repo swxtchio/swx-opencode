@@ -48,3 +48,10 @@ JUnit equality applies to PATH-resolved Bun test launches. The additional Linux 
 At published head `02f7ec5ecad82ba486a11e0e0a2ed7ff80b929c8`, [typecheck run 39543765037](https://github.com/swxtchio/swx-opencode/actions/runs/39543765037) failed during the workspace typecheck: its log reports SIGTERM, task exits 137, and `The operation was canceled`, with no TypeScript diagnostic. The subsequent fork-script typecheck step was not reached. The termination's cause is not established; [swxtchio/swx-opencode#330](https://github.com/swxtchio/swx-opencode/issues/330) records the diagnostic follow-up for the captain's CI decision.
 
 The repository's `bun run typecheck:script` was then run locally on the same fork-script implementation with the installed pinned compiler and types, and exited 0. This supplies a fork-script typecheck result, not a passing workspace CI verdict. The local type-resolution dependencies were linked read-only from the installed project checkout; no runtime implementation or regression changed after the mutation proofs above.
+
+## Absolute-path follow-up plan
+
+- Exercise a real Bun executable copied outside the fixture repository to a different absolute path named `bun`, while keeping the fixture checkout committed and otherwise valid.
+- If it silently runs an unlisted test, extend the launch audit to refuse that same-name absolute executable without mistaking the generated observer or its configured launcher for an unobserved test process.
+- Pin the alternate-path classification with a behavior-removing mutation that leaves the configured-runtime guard enabled, then restore and run the focused and fork-maintenance checks.
+- Keep the same draft PR, update its proof and observation scope, and hand the new head to firstmate.
