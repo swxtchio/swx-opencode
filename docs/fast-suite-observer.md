@@ -108,3 +108,12 @@ Each counterfactual below modified only the named behavior in the owning product
 | Child-tool flags | Restore an all-argv delegation scan and remove the bunx/x mode exclusion | Successful-fast assertion expected 0, received 1 at the real tool-forwarding cell; the over-scoped refusal blocked `-b` delivery. |
 
 The full focused matrix includes bare and attached inspector positive controls across configured/copied/PATH launches, both shebang families, recursive dispatch, fd-only execution, and real `bunx tsc -b`, `bun x tsc -b`, and `bun run flag-probe -- -b` forwarding to executable fixture consumers. The refreshed fork-maintenance group exited 0 with 96 pass, 0 fail, and 585 assertions. Fork-script typecheck, focused correctness lint, Bash syntax, rendered help, and diff checks exited 0. Bare Node `node:test` execution without `--test` remains explicitly disclosed and tracked in #337; the two cheap implementation advisories were folded into this hardening batch.
+
+## Round-2 target-resolution plan
+
+Scope: the captain's `fix-round-2-order.txt`, at reviewed pin `60706b49f5`.
+
+- Exercise real Bun/Node shebangs through symlinked working directories and `..` paths, including ordinary decoys at the incorrect lexical targets, plus executed scripts removed before the audit.
+- Preserve kernel pathname semantics by concatenating raw paths before filesystem canonicalization; canonicalize successful cwd changes and the actual execution/interpreter targets.
+- Refuse execution targets that cannot be re-read, and make public claims explicit about audit-time filesystem verification rather than an exec-time interpreter-byte snapshot.
+- Pin each corrected path and vanished-target behavior with targeted mutations, strengthen the specific audit-reason assertions, restore full focused green, then publish the same draft head for firstmate.
