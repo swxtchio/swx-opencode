@@ -3081,6 +3081,30 @@ function pendingItem(id: string, text: string, extra: Partial<SessionPromptQueue
   }
 }
 
+test("a machine-appended composer prompt keeps its transport origin and records its machine provenance", async () => {
+  const app = await startSession({ queue: [] })
+  const text = "OBSERVER: generated queue instruction"
+  try {
+    await until(async () => (await screen(app)).some((line) => line.includes("already in the transcript")), "session")
+    app.appendPrompt(text)
+    await until(async () => composerLines(await screen(app), text).length === 1, "the appended prompt")
+    app.renderer.mockInput.pressEnter()
+    await until(() => app.prompts.length === 1, "the appended send")
+    const prompt = app.prompts[0]
+    if (!prompt) throw new Error("the appended send was not captured")
+
+    expect(prompt.origin).toBe("tui-composer")
+    expect(prompt.parts.at(-1)).toMatchObject({
+      type: "text",
+      text,
+      metadata: { [SessionPromptQueue.TuiPromptAppendMetadataKey]: true },
+    })
+    prompt.answer(json(transcript))
+  } finally {
+    await app.stop()
+  }
+})
+
 test("a prompt sent while its session is busy shows QUEUED from the moment the composer clears", async () => {
   const app = await startSession({ queue: [] })
   try {

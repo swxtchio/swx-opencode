@@ -74,7 +74,7 @@ import * as Model from "../../util/model"
 import { AssistantModelLabel } from "./message-model"
 import { groupOpaqueReasoning, reasoningText } from "./opaque-reasoning"
 import type { SessionStepMessage } from "../../util/model"
-import { formatTranscript } from "../../util/transcript"
+import { formatTranscript, promptEnhancementModel } from "../../util/transcript"
 import { sessionEpilogue } from "../../util/presentation"
 import { setPreLayoutSiblingMargin } from "../../util/layout"
 import { useTuiConfig } from "../../config"
@@ -583,6 +583,10 @@ export function Session() {
   }
 
   const local = useLocal()
+  const enhancement = {
+    model: () => promptEnhancementModel(tuiConfig.prompt_enhance_model, local.model.current()),
+    context: enhancementContext,
+  }
 
   function enterChild(sessionID: string) {
     navigate({
@@ -666,7 +670,7 @@ export function Session() {
         name: "queue",
       },
       run: () => {
-        DialogQueue.show(dialog, route.sessionID)
+        DialogQueue.show(dialog, route.sessionID, enhancement)
       },
     },
     {
@@ -1499,7 +1503,8 @@ export function Session() {
                         toBottom()
                       }}
                       sessionID={route.sessionID}
-                      enhancementContext={enhancementContext}
+                      enhancementContext={enhancement.context}
+                      enhancementModel={enhancement.model}
                       right={<pluginRuntime.Slot name="session_prompt_right" session_id={route.sessionID} />}
                     />
                   </pluginRuntime.Slot>

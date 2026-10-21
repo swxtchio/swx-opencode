@@ -49,7 +49,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import * as DateTime from "effect/DateTime"
 import * as TestClock from "effect/testing/TestClock"
-import { eq } from "drizzle-orm"
+import { eq, inArray } from "drizzle-orm"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideInstanceEffect, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { reply, TestLLMServer } from "../lib/llm-server"
@@ -123,6 +123,11 @@ const itClocked = testEffect(
 function pathFor(path: string, params: Record<string, string>) {
   return Object.entries(params).reduce((result, [key, value]) => result.replace(`:${key}`, value), path)
 }
+
+// The opencode-arm-release-x64.yml release-proof job typechecks this file against its pinned source.
+const selectedForcePath = "/session/:sessionID/queue/force/:itemID"
+const selectedHoldStatusPath = "/session/:sessionID/queue/hold/:holder"
+const selectedRewritePath = "/session/:sessionID/queue/rewrite/:itemID"
 
 function createSession(input?: Session.CreateInput) {
   return Session.use.create(input)
@@ -2103,6 +2108,207 @@ it.live(
   )
 
   it.live(
+    "the force route refuses another live holder, then starts the selected idle prompt before the queue",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.text("selected prompt answer")
+        yield* llm.text("remaining queued answer")
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue force route" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const model = { providerID: "test", modelID: "test-model" }
+        const post = (path: string, body: unknown, routeParams: Record<string, string> = params) =>
+          request(pathFor(path, routeParams), { method: "POST", headers, body: JSON.stringify(body) })
+        const listed = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+        const holdStatus = (holder: string) =>
+          requestJson<{ held: boolean; items: SessionQueue.Item[] }>(
+            pathFor(selectedHoldStatusPath, { ...params, holder }),
+            { headers },
+          )
+        const receipt = (requestID: string) =>
+          requestJson<SessionQueue.Receipt>(pathFor(SessionQueuePaths.receipt, { ...params, requestID }), { headers })
+        const send = (requestID: string, text: string) =>
+          post(SessionPaths.promptAsync, {
+            requestID,
+            agent: "build",
+            model,
+            delivery: "queue",
+            origin: "tui-composer",
+            parts: [{ type: "text", text }],
+          })
+
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view-one" })).status).toBe(200)
+        expect((yield* post(SessionQueuePaths.hold, { holder: "view-two" })).status).toBe(200)
+        expect((yield* send("force-earlier", "leave this queued")).status).toBe(204)
+        expect((yield* send("force-selected", "force this first")).status).toBe(204)
+        expect((yield* holdStatus("view-one")).held).toBe(true)
+        expect((yield* holdStatus("unheld-view")).held).toBe(false)
+        const admitted = yield* pollWithTimeout(
+          listed().pipe(Effect.map((items) => (items.length === 2 ? items : undefined))),
+          "the selected and unselected prompts were not admitted",
+        )
+        const earlier = admitted.find((item) => item.requestID === "force-earlier")
+        const selected = admitted.find((item) => item.requestID === "force-selected")
+        if (!earlier || !selected) throw new Error("the force requests were not listed")
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const { db } = yield* Database.Service
+            const rows = yield* db
+              .select({ id: SessionPromptQueueTable.id, preparing: SessionPromptQueueTable.time_preparing })
+              .from(SessionPromptQueueTable)
+              .where(inArray(SessionPromptQueueTable.id, [earlier.id, selected.id]))
+              .all()
+              .pipe(Effect.orDie)
+            return rows.length === 2 && rows.every((row) => row.preparing === null) ? true : undefined
+          }).pipe(provideInstanceEffect(directory)),
+          "the composer requests never finished preparing",
+        )
+
+        const forcePath = (itemID: string) => pathFor(selectedForcePath, { ...params, itemID })
+        const blocked = yield* post(forcePath(selected.id), { holder: "view-one" })
+        expect(blocked.status).toBe(200)
+        expect(yield* json<{ outcome: string; items: SessionQueue.Item[] }>(blocked)).toMatchObject({
+          outcome: "another-review",
+          items: [
+            { id: earlier.id, delivery: "queue" },
+            { id: selected.id, delivery: "queue" },
+          ],
+        })
+        expect((yield* holdStatus("view-one")).held).toBe(true)
+        expect((yield* post(SessionQueuePaths.release, { holder: "view-one" })).status).toBe(204)
+        expect((yield* holdStatus("view-one")).held).toBe(false)
+        expect((yield* holdStatus("view-two")).held).toBe(true)
+
+        const forced = yield* post(forcePath(selected.id), { holder: "view-two" })
+        expect(forced.status).toBe(200)
+        expect(yield* json<{ outcome: string; items: SessionQueue.Item[] }>(forced)).toMatchObject({
+          outcome: "forced",
+        })
+        expect((yield* holdStatus("view-two")).held).toBe(false)
+        const requests = yield* pollWithTimeout(
+          llm.inputs.pipe(
+            Effect.map((inputs) => {
+              const turns = inputs.filter(
+                (input) => !JSON.stringify(input).includes("Generate a title for this conversation"),
+              )
+              return turns.length >= 2 ? turns : undefined
+            }),
+          ),
+          "the forced and queued prompts never reached the provider",
+        )
+        expect(JSON.stringify(requests[0])).toContain("force this first")
+        expect(JSON.stringify(requests[0])).not.toContain("leave this queued")
+        expect(JSON.stringify(requests[1])).toContain("leave this queued")
+        expect((yield* listed()).length).toBe(0)
+        expect((yield* receipt("force-selected")).state).toBe("delivered")
+        expect((yield* receipt("force-earlier")).state).toBe("delivered")
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
+    "the rewrite route changes only a prepared row's text and rejects a stale input snapshot",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "queue rewrite route" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const model = { providerID: "test", modelID: "test-model" }
+        const post = (path: string, body: unknown, routeParams: Record<string, string> = params) =>
+          request(pathFor(path, routeParams), { method: "POST", headers, body: JSON.stringify(body) })
+        const list = () => requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers })
+        const receipt = () =>
+          requestJson<SessionQueue.Receipt>(
+            pathFor(SessionQueuePaths.receipt, { ...params, requestID: "rewrite-route-selected" }),
+            { headers },
+          )
+        const send = (requestID: string, text: string) =>
+          post(SessionPaths.promptAsync, {
+            requestID,
+            agent: "build",
+            model,
+            delivery: "queue",
+            origin: "tui-composer",
+            parts: [{ type: "text", text, metadata: { source: requestID } }],
+          })
+
+        expect((yield* post(SessionQueuePaths.hold, { holder: "rewrite-view" })).status).toBe(200)
+        yield* Effect.addFinalizer(() =>
+          Effect.gen(function* () {
+            yield* Effect.forEach(
+              yield* list(),
+              (item) => post(SessionQueuePaths.remove, { id: item.id }).pipe(Effect.ignore),
+              { discard: true },
+            )
+            yield* post(SessionQueuePaths.release, { holder: "rewrite-view" }).pipe(Effect.ignore)
+          }).pipe(Effect.ignore),
+        )
+        expect((yield* send("rewrite-route-selected", "rough draft")).status).toBe(204)
+        expect((yield* send("rewrite-route-later", "leave this prompt alone")).status).toBe(204)
+        const [selected, later] = yield* pollWithTimeout(
+          list().pipe(Effect.map((items) => (items.length === 2 ? items : undefined))),
+          "the rewrite prompts were not admitted",
+        )
+        if (!selected || !later) throw new Error("the rewrite queue rows were missing")
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const { db } = yield* Database.Service
+            const rows = yield* db
+              .select({ id: SessionPromptQueueTable.id, preparing: SessionPromptQueueTable.time_preparing })
+              .from(SessionPromptQueueTable)
+              .where(inArray(SessionPromptQueueTable.id, [selected.id, later.id]))
+              .all()
+              .pipe(Effect.orDie)
+            return rows.length === 2 && rows.every((row) => row.preparing === null) ? true : undefined
+          }).pipe(provideInstanceEffect(directory)),
+          "the rewrite prompts never finished preparing",
+        )
+
+        const rewritePath = pathFor(selectedRewritePath, {
+          ...params,
+          itemID: selected.id,
+        })
+        const response = yield* post(rewritePath, { expectedText: "rough draft", text: "clearer draft" })
+        expect(response.status).toBe(200)
+        const rewritten = yield* json<{ outcome: string; items: SessionQueue.Item[] }>(response)
+        expect(rewritten.outcome).toBe("rewritten")
+        expect(rewritten.items.map((item) => item.id)).toEqual([selected.id, later.id])
+        const rewrittenItem = rewritten.items[0]
+        if (!rewrittenItem) throw new Error("the rewrite route lost the selected item")
+        expect(
+          rewrittenItem.input.parts.flatMap((part) =>
+            part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [],
+          ),
+        ).toEqual(["clearer draft"])
+        const originals = rewrittenItem.input.parts.flatMap((part) => {
+          if (part.type !== "text" || !part.synthetic || !part.ignored) return []
+          const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueuePendingOriginal)
+          return Option.isSome(group) ? group.value.constituents : []
+        })
+        expect(originals.map((original) => original.id)).toEqual([selected.id])
+        expect(
+          originals.map((original) =>
+            original.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
+          ),
+        ).toEqual(["rough draft"])
+        expect(originals[0]?.input.parts[0]).toMatchObject({ metadata: { source: "rewrite-route-selected" } })
+        expect(rewritten.items[1]?.input.parts).toEqual(later.input.parts)
+        expect(yield* receipt()).toMatchObject({ state: "pending", itemID: selected.id })
+
+        const stale = yield* post(rewritePath, { expectedText: "rough draft", text: "late enhancement" })
+        expect(stale.status).toBe(200)
+        const staleResult = yield* json<{ outcome: string; items: SessionQueue.Item[] }>(stale)
+        expect(staleResult.outcome).toBe("stale")
+        expect(staleResult.items).toEqual(rewritten.items)
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
     "a queued json_schema prompt is listed and promoted from its stored row into a structured turn, and a text-format steer is promoted from its row",
     () => {
       const gate = Deferred.makeUnsafe<void>()
@@ -3212,6 +3418,98 @@ describe("session HttpApi pending prompt selection", () => {
         Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
       )
     },
+    30_000,
+  )
+
+  it.live(
+    "a forced pending singleton uses the session model and variant current at promotion",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.text("forced current selection answer")
+        const directory = yield* tmpdirScoped({ git: true, config: selectableConfig(llm.url) })
+        const session = yield* createSession({ title: "forced current selection" }).pipe(
+          provideInstanceEffect(directory),
+        )
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const params = { sessionID: session.id }
+        const model = { providerID: "test", modelID: "model-a" }
+        const post = (path: string, body: unknown) =>
+          request(pathFor(path, params), { method: "POST", headers, body: JSON.stringify(body) })
+        const sent = yield* post(SessionQueuePaths.hold, { holder: "force-view" })
+        expect(sent.status).toBe(200)
+        expect(
+          (yield* post(SessionPaths.promptAsync, {
+            requestID: "force-current-selection",
+            agent: "build",
+            model,
+            variant: "low",
+            delivery: "queue",
+            origin: "tui-composer",
+            parts: [{ type: "text", text: "run at the current selection" }],
+          })).status,
+        ).toBe(204)
+        const [pending] = yield* pollWithTimeout(
+          requestJson<SessionQueue.Item[]>(pathFor(SessionQueuePaths.list, params), { headers }).pipe(
+            Effect.map((items) => (items.length === 1 ? items : undefined)),
+          ),
+          "the model-selected prompt never queued",
+        )
+        if (!pending) throw new Error("the selected queue item was missing")
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const { db } = yield* Database.Service
+            const row = yield* db
+              .select({ preparing: SessionPromptQueueTable.time_preparing })
+              .from(SessionPromptQueueTable)
+              .where(eq(SessionPromptQueueTable.id, pending.id))
+              .get()
+              .pipe(Effect.orDie)
+            return row?.preparing === null ? true : undefined
+          }).pipe(provideInstanceEffect(directory)),
+          "the selected prompt never finished preparing",
+        )
+
+        const selected = yield* request(pathFor(SessionPaths.update, params), {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ model: { providerID: "test", id: "model-b", variant: "high" } }),
+        })
+        expect(selected.status).toBe(200)
+        const forced = yield* post(pathFor(selectedForcePath, { ...params, itemID: pending.id }), {
+          holder: "force-view",
+        })
+        expect(forced.status).toBe(200)
+        expect(yield* json<{ outcome: string }>(forced)).toMatchObject({ outcome: "forced" })
+
+        const providerRequest = yield* pollWithTimeout(
+          llm.inputs.pipe(
+            Effect.map((inputs) =>
+              inputs.find((input) => input.model === "model-b" && input.reasoning_effort === "high"),
+            ),
+          ),
+          "the forced prompt did not use the current model and variant",
+        )
+        expect(providerRequest.model).toBe("model-b")
+        expect(providerRequest.reasoning_effort).toBe("high")
+        const messages = yield* Session.use
+          .messages({ sessionID: session.id })
+          .pipe(provideInstanceEffect(directory), Effect.orDie)
+        const delivered = messages.find(
+          (message) =>
+            message.info.role === "user" &&
+            message.parts.some((part) => part.type === "text" && part.text === "run at the current selection"),
+        )
+        if (!delivered || delivered.info.role !== "user") throw new Error("the forced user message was not stored")
+        expect(delivered.info.model).toMatchObject({ modelID: "model-b", variant: "high" })
+        const part = delivered.parts.find(
+          (part) => part.type === "text" && !part.synthetic && !part.ignored && part.metadata?.sessionQueue,
+        )
+        if (!part || part.type !== "text") throw new Error("the forced prompt lost its queue group")
+        const group = Schema.decodeUnknownSync(SessionPromptQueue.Group)(part.metadata?.sessionQueue)
+        expect(group.constituents[0]?.input.model?.modelID.toString()).toBe("model-a")
+        expect(group.constituents[0]?.input.variant).toBe("low")
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
     30_000,
   )
 

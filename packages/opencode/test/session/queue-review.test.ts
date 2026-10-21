@@ -4,7 +4,7 @@ import { rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { eq } from "drizzle-orm"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
@@ -12,6 +12,7 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionPromptQueueTable } from "@opencode-ai/core/session/prompt-queue.sql"
+import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { Session } from "@/session/session"
 import { SessionQueue } from "@/session/queue"
 import { MessageID, PartID, SessionID } from "@/session/schema"
@@ -2328,6 +2329,755 @@ it.instance(
       expect(yield* queue.list(session.id)).toEqual([])
     }),
   30_000,
+)
+
+it.instance("forcing a selected prompt preserves other holds and leaves unselected prompts queued", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "force selected prompt" })
+    const first = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "force-first",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: "leave this queued" }],
+    })
+    const selected = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "force-selected",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: "force only this prompt" }],
+    })
+    expect((yield* queue.hold(session.id, "view-1")).started).toBe(true)
+    expect((yield* queue.hold(session.id, "view-2")).started).toBe(false)
+
+    expect(yield* queue.force({ sessionID: session.id, itemID: selected.id, holder: "view-1" })).toBe("another-review")
+    expect((yield* queue.list(session.id)).map((item) => [item.id, item.delivery])).toEqual([
+      [first.id, "queue"],
+      [selected.id, "queue"],
+    ])
+
+    expect(yield* queue.release(session.id, "view-1")).toBe(false)
+    expect(yield* queue.force({ sessionID: session.id, itemID: selected.id, holder: "view-2" })).toBe("forced")
+    expect((yield* queue.list(session.id)).map((item) => [item.id, item.delivery])).toEqual([
+      [selected.id, "steer"],
+      [first.id, "queue"],
+    ])
+    expect((yield* queue.hold(session.id, "probe")).started).toBe(true)
+    expect(yield* queue.release(session.id, "probe")).toBe(true)
+
+    const written: string[] = []
+    yield* promoter(session.id, written)("steer")
+    expect(written).toEqual(["force only this prompt"])
+    expect((yield* queue.list(session.id)).map((item) => item.id)).toEqual([first.id])
+    yield* promoter(session.id, written)("queue")
+    expect(written).toEqual(["force only this prompt", "leave this queued"])
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "force-selected")).state).toBe("delivered")
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "force-first")).state).toBe("delivered")
+  }),
+)
+
+it.instance("forcing refuses a preparing or retired selection without changing its receipt", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "force preparation and stale selection" })
+    const admitted = yield* queue.request(
+      {
+        sessionID: session.id,
+        requestID: "force-preparing",
+        delivery: "queue",
+        origin: "tui-composer",
+        parts: [{ type: "text", text: "still preparing" }],
+      },
+      undefined,
+      true,
+    )
+    if (admitted.kind !== "admitted") throw new Error("the preparing prompt was not admitted")
+    yield* queue.hold(session.id, "view")
+
+    expect(yield* queue.force({ sessionID: session.id, itemID: admitted.own.id, holder: "view" })).toBe("preparing")
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "force-preparing"))).toEqual({
+      state: "pending",
+      itemID: admitted.own.id,
+    })
+
+    yield* queue.unprepared(session.id, admitted.own.id)
+    expect(yield* queue.force({ sessionID: session.id, itemID: admitted.own.id, holder: "view" })).toBe("unavailable")
+    expect(yield* queue.list(session.id)).toEqual([])
+    expect(Option.isNone(yield* queue.receipt(session.id, "force-preparing"))).toBe(true)
+    expect(yield* queue.release(session.id, "view")).toBe(true)
+  }),
+)
+
+it.instance(
+  "a prepared queue reservation cannot commit stale delivery after the selected item is forced",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "force invalidates stale reservation" })
+      const selected = yield* queue.admit({
+        sessionID: session.id,
+        requestID: "force-reservation",
+        delivery: "queue",
+        origin: "tui-composer",
+        parts: [{ type: "text", text: "stale queue preparation" }],
+      })
+      const written: string[] = []
+      const racing = yield* gated(session.id, "queue", written)
+      yield* queue.hold(session.id, "view")
+
+      expect(yield* queue.force({ sessionID: session.id, itemID: selected.id, holder: "view" })).toBe("forced")
+      yield* racing.finish
+      expect(written).toEqual([])
+      expect((yield* queue.list(session.id)).map((item) => [item.id, item.delivery])).toEqual([[selected.id, "steer"]])
+
+      yield* promoter(session.id, written)("steer")
+      expect(written).toEqual(["stale queue preparation"])
+      expect(yield* queue.list(session.id)).toEqual([])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "force-reservation")).state).toBe("delivered")
+    }),
+  30_000,
+)
+
+it.instance(
+  "selected human consolidation preserves admission order across reorder and repeat consolidation",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "human prompt consolidation" })
+      const composer = (requestID: string, parts: SessionQueue.AdmitInput["parts"]) =>
+        queue.admit({ sessionID: session.id, requestID, delivery: "queue", origin: "tui-composer", parts })
+      const first = yield* composer("human-a", [
+        { type: "text", text: "selected editor context", synthetic: true },
+        { type: "text", text: "first human\ncontinued first", metadata: { source: "typed-a" } },
+      ])
+      const automation = yield* queue.admit({
+        sessionID: session.id,
+        requestID: "automation",
+        delivery: "queue",
+        parts: [{ type: "text", text: "[fm-from-firstmate]\x1f[fm-level:nudge:status]\x1f status: build is green" }],
+      })
+      const second = yield* composer("human-b", [{ type: "text", text: "build API", metadata: { source: "typed-b" } }])
+      const duplicate = yield* composer("human-c", [
+        { type: "text", text: "build API", metadata: { source: "typed-c" } },
+      ])
+      yield* queue.reorder(session.id, [duplicate.id, automation.id, second.id, first.id])
+
+      const merged = yield* queue.consolidateSelected(session.id, second.id)
+      expect(merged.outcome).toBe("consolidated")
+      expect(merged.items).toHaveLength(2)
+      const carrier = merged.items.find((item) => item.id === first.id)
+      const untouched = merged.items.find((item) => item.id === automation.id)
+      if (!carrier || !untouched) throw new Error("the carrier or automation row was lost")
+      expect(carrier.origins.map((origin) => origin.requestID)).toEqual(["human-a", "human-b", "human-c"])
+      expect(untouched.input.parts).toEqual(automation.input.parts)
+      const visible = carrier.input.parts.filter(
+        (part): part is Extract<(typeof carrier.input.parts)[number], { type: "text" }> =>
+          part.type === "text" && !part.synthetic && !part.ignored,
+      )
+      expect(visible.map((part) => part.text).join("")).toBe("first human\ncontinued first\nbuild API\nbuild API")
+      expect(visible.filter((part) => part.metadata?.source).map((part) => part.metadata?.source)).toEqual([
+        "typed-a",
+        "typed-b",
+        "typed-c",
+      ])
+      const firstVisible = visible[0]
+      if (!firstVisible) throw new Error("the first human text part was not retained")
+      const group = Schema.decodeUnknownSync(SessionPromptQueue.Group)(firstVisible.metadata?.sessionQueue)
+      expect(group.constituents.map((item) => item.id)).toEqual([first.id, second.id, duplicate.id])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "human-b"))).toMatchObject({
+        state: "merged",
+        into: "human-a",
+      })
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "human-c"))).toMatchObject({
+        state: "merged",
+        into: "human-a",
+      })
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "automation")).state).toBe("pending")
+
+      const fourth = yield* composer("human-d", [{ type: "text", text: "later admitted" }])
+      yield* queue.reorder(session.id, [fourth.id, automation.id, carrier.id])
+      const repeated = yield* queue.consolidateSelected(session.id, fourth.id)
+      expect(repeated.outcome).toBe("consolidated")
+      expect(repeated.items).toHaveLength(2)
+      const repeatedCarrier = repeated.items.find((item) => item.id === first.id)
+      if (!repeatedCarrier) throw new Error("the original human carrier was replaced")
+      expect(repeatedCarrier.origins.map((origin) => origin.requestID)).toEqual([
+        "human-a",
+        "human-b",
+        "human-c",
+        "human-d",
+      ])
+      const repeatedVisible = repeatedCarrier.input.parts.filter(
+        (part): part is Extract<(typeof repeatedCarrier.input.parts)[number], { type: "text" }> =>
+          part.type === "text" && !part.synthetic && !part.ignored,
+      )
+      expect(repeatedVisible.map((part) => part.text).join("")).toBe(
+        "first human\ncontinued first\nbuild API\nbuild API\nlater admitted",
+      )
+      const repeatedFirst = repeatedVisible[0]
+      if (!repeatedFirst) throw new Error("the first repeated human text part was not retained")
+      const repeatedGroup = Schema.decodeUnknownSync(SessionPromptQueue.Group)(repeatedFirst.metadata?.sessionQueue)
+      expect(repeatedGroup.constituents.map((item) => item.id)).toEqual([first.id, second.id, duplicate.id, fourth.id])
+
+      const delivered: SessionQueue.PromotedInput[] = []
+      yield* queue.promote({
+        sessionID: session.id,
+        delivery: "queue",
+        prepare: (input) => Effect.succeed(input),
+        write: (input) => Effect.sync(() => delivered.push(input)),
+        rejected: () => Effect.void,
+      })
+      expect(delivered[0]?.group?.kind).toBe("human")
+      expect(delivered[0]?.group?.constituents.map((item) => item.id)).toEqual([
+        first.id,
+        second.id,
+        duplicate.id,
+        fourth.id,
+      ])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "human-d"))).toMatchObject({
+        state: "merged",
+        into: "human-a",
+        messageID: delivered[0]?.messageID,
+      })
+    }),
+  30_000,
+)
+
+it.instance("rewriting pending text preserves queue identity, metadata, context and receipts", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+    const session = yield* sessions.create({ title: "rewrite queued prompt" })
+    const file = {
+      type: "file" as const,
+      mime: "text/plain",
+      filename: "source.txt",
+      url: "data:text/plain;base64,c291cmNl",
+      source: {
+        type: "file" as const,
+        path: "/source.txt",
+        text: { value: "source.txt", start: 12, end: 22 },
+      },
+    }
+    const selected = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "rewrite-selected",
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [
+        { type: "text", text: "rough draft source.txt", metadata: { source: "typed-first" } },
+        { type: "text", text: " continued", metadata: { source: "typed-second" } },
+        file,
+      ],
+    })
+    const later = yield* queue.admit({
+      sessionID: session.id,
+      requestID: "rewrite-later",
+      delivery: "queue",
+      parts: [{ type: "text", text: "still later" }],
+    })
+    const before = yield* queue.list(session.id)
+
+    const rewritten = yield* queue.rewrite({
+      sessionID: session.id,
+      itemID: selected.id,
+      expectedText: "rough draft source.txt continued",
+      text: "refined source.txt",
+    })
+    expect(rewritten.outcome).toBe("rewritten")
+    expect(rewritten.items.map((item) => [item.id, item.seq, item.delivery])).toEqual(
+      before.map((item) => [item.id, item.seq, item.delivery]),
+    )
+    const carrier = rewritten.items.find((item) => item.id === selected.id)
+    if (!carrier) throw new Error("rewrite removed its queue item")
+    expect(carrier.requestID).toBe("rewrite-selected")
+    expect(carrier.input.origin).toBe("tui-composer")
+    expect(carrier.origins).toEqual(selected.origins)
+    const texts = carrier.input.parts.filter(
+      (part): part is Extract<(typeof carrier.input.parts)[number], { type: "text" }> =>
+        part.type === "text" && !part.synthetic && !part.ignored,
+    )
+    expect(texts.map((part) => part.text)).toEqual(["refined source.txt", ""])
+    expect(texts.map((part) => part.metadata?.source)).toEqual(["typed-first", "typed-second"])
+    const originals = carrier.input.parts.flatMap((part) => {
+      if (part.type !== "text" || !part.synthetic || !part.ignored) return []
+      const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueuePendingOriginal)
+      return Option.isSome(group) ? group.value.constituents : []
+    })
+    expect(originals.map((original) => original.id)).toEqual([selected.id])
+    expect(
+      originals.map((original) =>
+        original.input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
+      ),
+    ).toEqual(["rough draft source.txt continued"])
+    expect(
+      originals.map((original) =>
+        original.input.parts.flatMap((part) => (part.type === "text" ? [part.metadata?.source] : [])),
+      ),
+    ).toEqual([["typed-first", "typed-second"]])
+    expect(originals[0]?.input.parts.find((part) => part.type === "file")).toMatchObject({
+      source: { type: "file", path: "/source.txt", text: { value: "source.txt", start: 12, end: 22 } },
+    })
+    const attachment = carrier.input.parts.find((part) => part.type === "file")
+    expect(attachment).toMatchObject({
+      filename: "source.txt",
+      source: { type: "file", path: "/source.txt", text: { value: "source.txt", start: 8, end: 18 } },
+    })
+    expect(Option.getOrThrow(yield* queue.receipt(session.id, "rewrite-selected"))).toEqual({
+      state: "pending",
+      itemID: selected.id,
+    })
+
+    const stale = yield* queue.rewrite({
+      sessionID: session.id,
+      itemID: selected.id,
+      expectedText: "rough draft source.txt continued",
+      text: "another rewrite source.txt",
+    })
+    expect(stale.outcome).toBe("stale")
+    expect(stale.items).toEqual(rewritten.items)
+
+    expect(
+      (yield* queue.rewrite({
+        sessionID: session.id,
+        itemID: selected.id,
+        expectedText: "refined source.txt",
+        text: "missing the file reference",
+      })).outcome,
+    ).toBe("missing-reference")
+    expect(
+      (yield* queue.rewrite({
+        sessionID: session.id,
+        itemID: selected.id,
+        expectedText: "refined source.txt",
+        text: "   ",
+      })).outcome,
+    ).toBe("empty")
+
+    const fileOnly = yield* queue.admit({ sessionID: session.id, delivery: "queue", parts: [file] })
+    expect(
+      (yield* queue.rewrite({
+        sessionID: session.id,
+        itemID: fileOnly.id,
+        expectedText: "",
+        text: "a description",
+      })).outcome,
+    ).toBe("no-text")
+
+    const preparing = yield* queue.request(
+      {
+        sessionID: session.id,
+        requestID: "rewrite-preparing",
+        delivery: "queue",
+        origin: "tui-composer",
+        parts: [{ type: "text", text: "not ready" }],
+      },
+      undefined,
+      true,
+    )
+    if (preparing.kind !== "admitted") throw new Error("the preparing prompt was not admitted")
+    const preparingItem = (yield* queue.list(session.id)).find((item) => item.id === preparing.own.id)
+    if (!preparingItem) throw new Error("the preparing queue item was missing")
+    expect(
+      (yield* queue.rewrite({
+        sessionID: session.id,
+        itemID: preparingItem.id,
+        expectedText: "not ready",
+        text: "ready text",
+      })).outcome,
+    ).toBe("preparing")
+
+    yield* queue.remove(session.id, selected.id)
+    expect(
+      (yield* queue.rewrite({
+        sessionID: session.id,
+        itemID: selected.id,
+        expectedText: "refined source.txt",
+        text: "late rewrite source.txt",
+      })).outcome,
+    ).toBe("unavailable")
+    expect((yield* queue.list(session.id)).map((item) => item.id)).toContain(later.id)
+  }),
+)
+
+it.instance(
+  "aliased and restored selected-human originals preserve admission order through force and promotion",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "aliased human consolidation order" })
+      const composer = (requestID: string, content: string) =>
+        queue.admit({
+          sessionID: session.id,
+          requestID,
+          messageID: MessageID.ascending(),
+          delivery: "queue",
+          origin: "tui-composer",
+          parts: [{ type: "text", text: content, metadata: { source: requestID } }],
+        })
+      const first = yield* composer("alias-human-a", "first aliased instruction")
+      const middle = yield* composer("alias-human-b", "middle aliased instruction")
+      const last = yield* composer("alias-human-c", "last aliased instruction")
+      expect(Option.isSome(yield* queue.withdraw(session.id, middle.id))).toBe(true)
+      const initial = yield* queue.consolidateSelected(session.id, first.id)
+      expect(initial.outcome).toBe("consolidated")
+      const initialCarrier = initial.items.find((item) => item.id === first.id)
+      if (!initialCarrier) throw new Error("the initial aliased human carrier was missing")
+      const initialVisible = initialCarrier.input.parts.flatMap((part) =>
+        part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [],
+      )
+      expect(initialVisible.join("")).toBe("first aliased instruction\nlast aliased instruction")
+      const initialWitnesses = initialCarrier.input.parts.flatMap((part) => {
+        if (part.type !== "text" || !part.ignored || !part.synthetic) return []
+        const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueuePendingOriginal)
+        return Option.isSome(group) ? group.value.constituents.map((item) => item.id) : []
+      })
+      expect([...new Set(initialWitnesses)]).toEqual([first.id, last.id])
+      expect(initialCarrier.origins.map((origin) => origin.requestID)).toEqual(["alias-human-a", "alias-human-c"])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias-human-c"))).toMatchObject({
+        state: "merged",
+        into: "alias-human-a",
+      })
+      expect(Option.isSome(yield* queue.restore(session.id, middle.id))).toBe(true)
+
+      const consolidated = yield* queue.consolidateSelected(session.id, middle.id)
+      expect(consolidated.outcome).toBe("consolidated")
+      const carrier = consolidated.items.find((item) => item.id === first.id)
+      if (!carrier) throw new Error("the restored aliased human carrier was missing")
+      const visible = carrier.input.parts.flatMap((part) =>
+        part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [],
+      )
+      expect(visible.join("")).toBe("first aliased instruction\nmiddle aliased instruction\nlast aliased instruction")
+      const queuedOriginals = carrier.input.parts.flatMap((part) => {
+        if (part.type !== "text" || !part.ignored || !part.synthetic) return []
+        const group = Schema.decodeUnknownOption(SessionPromptQueue.Group)(part.metadata?.sessionQueuePendingOriginal)
+        return Option.isSome(group) ? group.value.constituents.map((item) => item.id) : []
+      })
+      expect([...new Set(queuedOriginals)]).toEqual([first.id, middle.id, last.id])
+      expect(carrier.origins.map((origin) => origin.requestID)).toEqual([
+        "alias-human-a",
+        "alias-human-b",
+        "alias-human-c",
+      ])
+      const visiblePart = carrier.input.parts.find(
+        (part) => part.type === "text" && !part.synthetic && !part.ignored && part.text === visible[0],
+      )
+      if (visiblePart?.type !== "text") throw new Error("the consolidated text metadata was missing")
+      const carrierGroup = Schema.decodeUnknownSync(SessionPromptQueue.Group)(visiblePart.metadata?.sessionQueue)
+      expect(carrierGroup.constituents.map((item) => item.id)).toEqual([first.id, middle.id, last.id])
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias-human-b"))).toMatchObject({
+        state: "merged",
+        into: "alias-human-a",
+      })
+
+      yield* queue.hold(session.id, "review")
+      expect(yield* queue.force({ sessionID: session.id, itemID: carrier.id, holder: "review" })).toBe("forced")
+      const delivered: SessionQueue.PromotedInput[] = []
+      yield* queue.promote({
+        sessionID: session.id,
+        delivery: "steer",
+        prepare: (input) => Effect.succeed(input),
+        write: (input) => Effect.sync(() => delivered.push(input)),
+        rejected: () => Effect.void,
+      })
+      const message = delivered[0]
+      if (!message?.group) throw new Error("the forced human carrier lost its group")
+      expect(message.group.constituents.map((item) => item.id)).toEqual([first.id, middle.id, last.id])
+      expect(
+        message.group.constituents.map((item) =>
+          item.input.parts.flatMap((part) => (part.type === "text" ? [part.metadata?.source] : [])),
+        ),
+      ).toEqual([["alias-human-a"], ["alias-human-b"], ["alias-human-c"]])
+      expect(
+        message.parts
+          .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
+          .join(""),
+      ).toBe("first aliased instruction\nmiddle aliased instruction\nlast aliased instruction")
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias-human-a")).state).toBe("delivered")
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias-human-b"))).toMatchObject({
+        state: "merged",
+        into: "alias-human-a",
+        messageID: message.messageID,
+      })
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "alias-human-c"))).toMatchObject({
+        state: "merged",
+        into: "alias-human-a",
+        messageID: message.messageID,
+      })
+    }),
+  30_000,
+)
+
+it.instance(
+  "restoring an intermediate original keeps repeated human consolidation in admission order",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const session = yield* sessions.create({ title: "restored human consolidation order" })
+      const composer = (requestID: string, content: string) =>
+        queue.admit({
+          sessionID: session.id,
+          requestID,
+          delivery: "queue",
+          origin: "tui-composer",
+          parts: [{ type: "text", text: content, metadata: { source: requestID } }],
+        })
+      const first = yield* composer("restore-human-a", "first restored instruction")
+      const middle = yield* composer("restore-human-b", "middle restored instruction")
+      const last = yield* composer("restore-human-c", "last restored instruction")
+      expect(Option.isSome(yield* queue.withdraw(session.id, middle.id))).toBe(true)
+      expect((yield* queue.consolidateSelected(session.id, first.id)).outcome).toBe("consolidated")
+      expect(Option.isSome(yield* queue.restore(session.id, middle.id))).toBe(true)
+
+      const repeated = yield* queue.consolidateSelected(session.id, middle.id)
+      expect(repeated.outcome).toBe("consolidated")
+      const carrier = repeated.items.find((item) => item.id === first.id)
+      if (!carrier) throw new Error("the restored human carrier was missing")
+      const visible = carrier.input.parts.flatMap((part) =>
+        part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : [],
+      )
+      expect(visible.join("")).toBe(
+        "first restored instruction\nmiddle restored instruction\nlast restored instruction",
+      )
+      expect(carrier.origins.map((origin) => origin.requestID)).toEqual([
+        "restore-human-a",
+        "restore-human-b",
+        "restore-human-c",
+      ])
+
+      const delivered: SessionQueue.PromotedInput[] = []
+      yield* queue.promote({
+        sessionID: session.id,
+        delivery: "queue",
+        prepare: (input) => Effect.succeed(input),
+        write: (input) => Effect.sync(() => delivered.push(input)),
+        rejected: () => Effect.void,
+      })
+      const message = delivered[0]
+      if (!message?.group) throw new Error("the restored human carrier lost its group")
+      expect(message.group.constituents.map((item) => item.id)).toEqual([first.id, middle.id, last.id])
+      expect(
+        message.group.constituents.map((item) =>
+          item.input.parts.flatMap((part) => (part.type === "text" ? [part.metadata?.source] : [])),
+        ),
+      ).toEqual([["restore-human-a"], ["restore-human-b"], ["restore-human-c"]])
+      expect(
+        message.parts
+          .flatMap((part) => (part.type === "text" && !part.synthetic && !part.ignored ? [part.text] : []))
+          .join(""),
+      ).toBe("first restored instruction\nmiddle restored instruction\nlast restored instruction")
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "restore-human-b"))).toMatchObject({
+        state: "merged",
+        into: "restore-human-a",
+        messageID: message.messageID,
+      })
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "restore-human-c"))).toMatchObject({
+        state: "merged",
+        into: "restore-human-a",
+        messageID: message.messageID,
+      })
+      expect(Option.getOrThrow(yield* queue.receipt(session.id, "restore-human-a")).state).toBe("delivered")
+    }),
+  30_000,
+)
+
+it.instance(
+  "selected human consolidation refuses preparing and incompatible members without a partial merge",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const preparingSession = yield* sessions.create({ title: "human consolidation preparation barrier" })
+      const ready = yield* queue.admit({
+        sessionID: preparingSession.id,
+        requestID: "ready-human",
+        delivery: "queue",
+        origin: "tui-composer",
+        parts: [{ type: "text", text: "ready" }],
+      })
+      const preparing = yield* queue.request(
+        {
+          sessionID: preparingSession.id,
+          requestID: "preparing-human",
+          delivery: "queue",
+          origin: "tui-composer",
+          parts: [{ type: "text", text: "not classified yet" }],
+        },
+        undefined,
+        true,
+      )
+      if (preparing.kind !== "admitted") throw new Error("the preparing human prompt was not admitted")
+      const beforePreparing = yield* queue.list(preparingSession.id)
+      const blockedPreparing = yield* queue.consolidateSelected(preparingSession.id, ready.id)
+      expect(blockedPreparing.outcome).toBe("preparing")
+      expect(blockedPreparing.items.map((item) => [item.id, text(item)])).toEqual(
+        beforePreparing.map((item) => [item.id, text(item)]),
+      )
+      expect(Option.getOrThrow(yield* queue.receipt(preparingSession.id, "ready-human")).state).toBe("pending")
+      expect(Option.getOrThrow(yield* queue.receipt(preparingSession.id, "preparing-human")).state).toBe("pending")
+      yield* queue.unprepared(preparingSession.id, preparing.own.id)
+
+      const barrierSession = yield* sessions.create({ title: "preparing item between human admissions" })
+      const barrierFirst = yield* queue.admit({
+        sessionID: barrierSession.id,
+        delivery: "queue",
+        origin: "tui-composer",
+        parts: [{ type: "text", text: "human before preparation" }],
+      })
+      const barrier = yield* queue.request(
+        {
+          sessionID: barrierSession.id,
+          requestID: "preparing-native-barrier",
+          delivery: "queue",
+          parts: [{ type: "text", text: "native preparation barrier" }],
+        },
+        undefined,
+        true,
+      )
+      if (barrier.kind !== "admitted") throw new Error("the native barrier was not admitted")
+      const barrierLast = yield* queue.admit({
+        sessionID: barrierSession.id,
+        delivery: "queue",
+        origin: "tui-composer",
+        parts: [{ type: "text", text: "human after preparation" }],
+      })
+      expect(barrierFirst.id < barrier.own.id && barrier.own.id < barrierLast.id).toBe(true)
+      const beforeBarrier = yield* queue.list(barrierSession.id)
+      const blockedByBarrier = yield* queue.consolidateSelected(barrierSession.id, barrierLast.id)
+      expect(blockedByBarrier.outcome).toBe("preparing")
+      expect(blockedByBarrier.items.map((item) => [item.id, text(item)])).toEqual(
+        beforeBarrier.map((item) => [item.id, text(item)]),
+      )
+      yield* queue.unprepared(barrierSession.id, barrier.own.id)
+
+      const scenarios = [
+        {
+          title: "mixed delivery",
+          first: { delivery: "queue" as const, agent: "build" },
+          second: { delivery: "steer" as const, agent: "build" },
+        },
+        {
+          title: "mixed execution context",
+          first: { delivery: "queue" as const, agent: "build" },
+          second: { delivery: "queue" as const, agent: "plan" },
+        },
+      ]
+      for (const [index, scenario] of scenarios.entries()) {
+        const session = yield* sessions.create({ title: scenario.title })
+        const first = yield* queue.admit({
+          sessionID: session.id,
+          requestID: `human-incompatible-a-${index}`,
+          delivery: scenario.first.delivery,
+          origin: "tui-composer",
+          agent: scenario.first.agent,
+          parts: [{ type: "text", text: "first instruction" }],
+        })
+        const second = yield* queue.admit({
+          sessionID: session.id,
+          requestID: `human-incompatible-b-${index}`,
+          delivery: scenario.second.delivery,
+          origin: "tui-composer",
+          agent: scenario.second.agent,
+          parts: [{ type: "text", text: "second instruction" }],
+        })
+        const before = yield* queue.list(session.id)
+        const blocked = yield* queue.consolidateSelected(session.id, second.id)
+        expect(blocked.outcome).toBe("incompatible")
+        expect(blocked.items.map((item) => [item.id, item.delivery, text(item)])).toEqual(
+          before.map((item) => [item.id, item.delivery, text(item)]),
+        )
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, `human-incompatible-a-${index}`)).state).toBe(
+          "pending",
+        )
+        expect(Option.getOrThrow(yield* queue.receipt(session.id, `human-incompatible-b-${index}`)).state).toBe(
+          "pending",
+        )
+        expect((yield* queue.list(session.id)).map((item) => [item.id, item.delivery])).toContainEqual([
+          first.id,
+          scenario.first.delivery,
+        ])
+      }
+    }),
+  30_000,
+)
+
+it.instance("selected non-human consolidation keeps native, configured-marker, and appended work semantics", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const queue = yield* SessionQueue.Service
+
+    const native = yield* sessions.create({ title: "native selected consolidation" })
+    const nativeFirst = yield* queue.admit({
+      sessionID: native.id,
+      delivery: "queue",
+      parts: [{ type: "text", text: "run lint" }],
+    })
+    yield* queue.admit({
+      sessionID: native.id,
+      delivery: "queue",
+      parts: [{ type: "text", text: "run lint --fix" }],
+    })
+    const nativeResult = yield* queue.consolidateSelected(native.id, nativeFirst.id)
+    expect(nativeResult.outcome).toBe("consolidated")
+    expect(nativeResult.items.map(text)).toEqual(["run lint:\n1. run lint\n2. --fix"])
+
+    const markers = { critical: [{ type: "prefix" as const, value: "GENERATED:" }] }
+    const configured = yield* sessions.create({ title: "configured-marker selected consolidation" })
+    const configuredFirst = yield* queue.admit({
+      sessionID: configured.id,
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: "GENERATED: run lint" }],
+    })
+    const configuredSecond = yield* queue.admit({
+      sessionID: configured.id,
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [{ type: "text", text: "GENERATED: run lint --fix" }],
+    })
+    const configuredResult = yield* queue.consolidateSelected(configured.id, configuredFirst.id, markers)
+    expect(configuredResult.outcome).toBe("unchanged")
+    expect(configuredResult.items.map(text)).toEqual(["GENERATED: run lint", "GENERATED: run lint --fix"])
+    expect(configuredResult.items.map((item) => item.id)).toEqual([configuredFirst.id, configuredSecond.id])
+
+    const appended = yield* sessions.create({ title: "appended marker selected consolidation" })
+    const appendedFirst = yield* queue.admit({
+      sessionID: appended.id,
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [
+        {
+          type: "text",
+          text: "run lint",
+          metadata: { [SessionPromptQueue.TuiPromptAppendMetadataKey]: true },
+        },
+      ],
+    })
+    const appendedSecond = yield* queue.admit({
+      sessionID: appended.id,
+      delivery: "queue",
+      origin: "tui-composer",
+      parts: [
+        {
+          type: "text",
+          text: "run lint --fix",
+          metadata: { [SessionPromptQueue.TuiPromptAppendMetadataKey]: true },
+        },
+      ],
+    })
+    const appendedResult = yield* queue.consolidateSelected(appended.id, appendedFirst.id)
+    expect(appendedResult.outcome).toBe("unchanged")
+    expect(appendedResult.items.map(text)).toEqual(["run lint", "run lint --fix"])
+    expect(appendedResult.items.map((item) => item.id)).toEqual([appendedFirst.id, appendedSecond.id])
+  }),
 )
 
 it.instance(

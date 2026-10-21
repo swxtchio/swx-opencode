@@ -215,8 +215,14 @@ import type {
   SessionPromptResponses,
   SessionQueueConsolidateErrors,
   SessionQueueConsolidateResponses,
+  SessionQueueConsolidateSelectedErrors,
+  SessionQueueConsolidateSelectedResponses,
+  SessionQueueForceErrors,
+  SessionQueueForceResponses,
   SessionQueueHoldErrors,
   SessionQueueHoldResponses,
+  SessionQueueHoldStatusErrors,
+  SessionQueueHoldStatusResponses,
   SessionQueueListErrors,
   SessionQueueListResponses,
   SessionQueueReceiptErrors,
@@ -229,6 +235,8 @@ import type {
   SessionQueueReorderResponses,
   SessionQueueRestoreErrors,
   SessionQueueRestoreResponses,
+  SessionQueueRewriteErrors,
+  SessionQueueRewriteResponses,
   SessionQueueUpdateErrors,
   SessionQueueUpdateResponses,
   SessionQueueWithdrawErrors,
@@ -3673,6 +3681,130 @@ export class Queue extends HeyApiClient {
   }
 
   /**
+   * Rewrite a queued prompt's text
+   *
+   * Replace editable text only when the prepared pending item's editable text still matches the expected draft. Preserves the queue item and receipts; returns stale, preparing or unavailable without changing the text when the row cannot be rewritten.
+   */
+  public rewrite<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      itemID: string
+      directory?: string
+      workspace?: string
+      expectedText?: string
+      text?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "itemID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "expectedText" },
+            { in: "body", key: "text" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionQueueRewriteResponses, SessionQueueRewriteErrors, ThrowOnError>(
+      {
+        url: "/session/{sessionID}/queue/rewrite/{itemID}",
+        ...options,
+        ...params,
+        headers: {
+          "Content-Type": "application/json",
+          ...options?.headers,
+          ...params.headers,
+        },
+      },
+    )
+  }
+
+  /**
+   * Force a selected queued prompt
+   *
+   * Give only this prepared pending prompt steer timing. The holder must own a confirmed review hold, which this action releases only when no other live review hold remains. A preparing result leaves the item pending; an unavailable result reports a stale or missing item, and another-review leaves it unchanged. A forced result wakes the session so it reaches the next safe provider step or starts a turn when idle.
+   */
+  public force<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      itemID: string
+      directory?: string
+      workspace?: string
+      holder?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "itemID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "holder" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionQueueForceResponses, SessionQueueForceErrors, ThrowOnError>({
+      url: "/session/{sessionID}/queue/force/{itemID}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Inspect a review hold
+   *
+   * Read whether this holder currently owns a live review hold and list the current pending prompts. This does not acquire or renew the hold.
+   */
+  public holdStatus<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      holder: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "holder" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionQueueHoldStatusResponses,
+      SessionQueueHoldStatusErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/queue/hold/{holder}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
    * Hold queued prompts for review
    *
    * Start or renew a review hold for this holder. While a session has a hold, none of its queued prompts reaches the model, so the returned list stays as it is until the hold ends. A hold the holder does not renew lapses after six minutes.
@@ -3863,6 +3995,44 @@ export class Queue extends HeyApiClient {
       ThrowOnError
     >({
       url: "/session/{sessionID}/queue/consolidate",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Consolidate the selected queued prompt
+   *
+   * When the selected item is a human-composer prompt, consolidate every ready pending human-composer prompt with compatible delivery and execution context in admission order, preserving each original input and receipt. Preparing or incompatible human sets remain intact. A non-human selection uses the standard queue consolidation behavior.
+   */
+  public consolidateSelected<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      itemID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "itemID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      SessionQueueConsolidateSelectedResponses,
+      SessionQueueConsolidateSelectedErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/queue/consolidate/{itemID}",
       ...options,
       ...params,
     })

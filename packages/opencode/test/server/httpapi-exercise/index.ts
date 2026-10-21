@@ -1551,6 +1551,93 @@ const scenarios: Scenario[] = [
       check(stable(body) === stable([ctx.state.item]), "hold should return the pending items")
     }),
   http.protected
+    .get("/session/{sessionID}/queue/hold/{holder}", "session.queue.hold_status")
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue hold status session" })
+        const item = yield* ctx.queued(session.id, { text: "held" })
+        yield* ctx.hold(session.id, "exercise")
+        return { session, item }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/hold/{holder}", {
+        sessionID: ctx.state.session.id,
+        holder: "exercise",
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(200, (body, ctx) => {
+      check(isRecord(body) && body.held === true, "holder status should confirm the live review lease")
+      check(
+        isRecord(body) && Array.isArray(body.items) && stable(body.items) === stable([ctx.state.item]),
+        "holder status should return current pending items",
+      )
+    }),
+  http.protected
+    .post("/session/{sessionID}/queue/force/{itemID}", "session.queue.force")
+    .mutating()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue force session" })
+        const earlier = yield* ctx.queued(session.id, { text: "leave queued" })
+        const selected = yield* ctx.queued(session.id, { text: "force selected" })
+        yield* ctx.hold(session.id, "review-one")
+        yield* ctx.hold(session.id, "review-two")
+        return { session, earlier, selected }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/force/{itemID}", {
+        sessionID: ctx.state.session.id,
+        itemID: ctx.state.selected.id,
+      }),
+      headers: ctx.headers(),
+      body: { holder: "review-one" },
+    }))
+    .json(200, (body, ctx) => {
+      check(isRecord(body) && body.outcome === "another-review", "force should report the other live review holder")
+      check(
+        isRecord(body) &&
+          Array.isArray(body.items) &&
+          body.items.length === 2 &&
+          body.items.every((item) => isRecord(item) && item.delivery === "queue") &&
+          stable(body.items.map((item) => (isRecord(item) ? item.id : undefined))) ===
+            stable([ctx.state.earlier.id, ctx.state.selected.id]),
+        "a blocked force should leave both rows pending without changing delivery",
+      )
+    }),
+  http.protected
+    .post("/session/{sessionID}/queue/rewrite/{itemID}", "session.queue.rewrite")
+    .mutating()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue rewrite session" })
+        const item = yield* ctx.queued(session.id, { requestID: "rewrite-exercise", text: "rough draft" })
+        return { session, item }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/rewrite/{itemID}", {
+        sessionID: ctx.state.session.id,
+        itemID: ctx.state.item.id,
+      }),
+      headers: ctx.headers(),
+      body: { expectedText: "rough draft", text: "clearer draft" },
+    }))
+    .jsonEffect(200, (body, ctx) =>
+      Effect.gen(function* () {
+        check(isRecord(body) && body.outcome === "rewritten", "rewrite should report an applied update")
+        const items = yield* ctx.queue(ctx.state.session.id)
+        check(items.length === 1 && items[0]?.id === ctx.state.item.id, "rewrite should keep the same queue item")
+        check(
+          items[0]?.input.parts[0]?.type === "text" && items[0].input.parts[0].text === "clearer draft",
+          "rewrite should store the returned text",
+        )
+        check(items[0]?.requestID === "rewrite-exercise", "rewrite should preserve the request identity")
+      }),
+    ),
+  http.protected
     .post("/session/{sessionID}/queue/release", "session.queue.release")
     .preserveDatabase()
     .withLlm()
@@ -1644,6 +1731,46 @@ const scenarios: Scenario[] = [
               parts: [{ ...ctx.state.item.input.parts[0], text: "fix parser:\n1. first\n2. second" }],
             }),
         "consolidate should merge commands sharing a verb and target into the first",
+      )
+    }),
+  http.protected
+    .post("/session/{sessionID}/queue/consolidate/{itemID}", "session.queue.consolidate_selected")
+    .mutating()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Queue selected consolidation session" })
+        const first = yield* ctx.queued(session.id, { text: "fix parser: first step" })
+        const selected = yield* ctx.queued(session.id, { text: "fix parser: second step" })
+        return { session, first, selected }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/queue/consolidate/{itemID}", {
+        sessionID: ctx.state.session.id,
+        itemID: ctx.state.selected.id,
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(200, (body, ctx) => {
+      const items = isRecord(body) ? body.items : undefined
+      const merged = Array.isArray(items) ? items[0] : undefined
+      const parts =
+        isRecord(merged) && isRecord(merged.input) && Array.isArray(merged.input.parts) ? merged.input.parts : undefined
+      check(
+        isRecord(body) && body.outcome === "consolidated",
+        "selected non-human consolidation should use standard merge",
+      )
+      check(
+        Array.isArray(items) &&
+          items.length === 1 &&
+          isRecord(items[0]) &&
+          items[0].id === ctx.state.first.id &&
+          Array.isArray(parts) &&
+          parts.some(
+            (part) =>
+              isRecord(part) && part.type === "text" && part.text === "fix parser:\n1. first step\n2. second step",
+          ),
+        "selected non-human consolidation should preserve standard command steps",
       )
     }),
   http.protected
