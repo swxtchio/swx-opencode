@@ -2,7 +2,7 @@
 
 Task: [swxtchio/swx-abbe#1227](https://github.com/swxtchio/swx-abbe/issues/1227). Task draft: [swxtchio/swx-opencode#331](https://github.com/swxtchio/swx-opencode/pull/331).
 
-**Producer verdict: not established. Recommendation: hold the release-verification decision and consumer rollout.** The named linux-x64 executable cannot run directly on this task's ARM64 host. This is an execution-placement blocker, not an observed V2 producer failure. This record is provisional; the required completed/failed/interrupted, idempotent admission, restart, pagination and reconnect observations have not run, and no native admission/message/event identities or database writes are claimed.
+**Producer verdict: not established. Recommendation: hold the release-verification decision and consumer rollout.** The named linux-x64 executable cannot run directly on this task's ARM64 host. A worktree-local full-system x64 guest has now executed the unchanged artifact's version, database selector and packaged sidecar search with the execution qualifications below; the V2 runtime battery is continuing. This record is provisional: no passing completed/failed/interrupted, idempotent admission, native projection/history, restart, pagination or reconnect result is claimed yet.
 
 ## Executed artifact observations
 
@@ -15,6 +15,8 @@ The extracted executable is `/home/byates/fm-worktrees/fm-llmrouter/swx-abbe-122
 ## Required placement decision
 
 Firstmate must name an approved native x64 host and an explicit disposable filesystem root for this task's artifact download, source/fixture staging, config/data/cache, isolated absolute `OPENCODE_DB`, and evidence collection, or redispatch the task to an x64 worktree. The current brief authorizes filesystem writes inside this launched worktree, so a different host/root cannot be selected by the crew. Substituting the ARM64 release would not fulfill the named x64 verification.
+
+The [full-system continuation](full-system-execution.md) has advanced execution without a remote-host write: a disposable x64 guest image stored in the task worktree printed `1.18.32-swxtch.d1b232e9`, selected its task-owned absolute database path and successfully used the packaged FFF sidecar. [Raw startup observations](full-system-startup.json) retain those results and the material TCG/JIT qualifications. They are specific prerequisite observations, not a passing V2 producer verdict. Approved native x64 hardware placement remains required for a stock native-hardware result.
 
 The selected source's `packages/core/src/database/database.ts::path` calls `resolvePath` with `Flag.OPENCODE_DB`; `packages/core/src/database/resolve-path.ts::resolvePath` chooses an explicit absolute selector unchanged. This source inspection informs the pending runtime probe; no observed resolved path or physical native store is claimed yet. The existing `packages/opencode/script/release-probe.ts` provides held-tool/continuation and terminal-outcome reproduction leads. Additional exact-retry, complete pagination and event-stream reconnect observations remain required by the committed plan.
 

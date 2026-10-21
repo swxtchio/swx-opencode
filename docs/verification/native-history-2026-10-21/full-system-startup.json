@@ -1,0 +1,58 @@
+{
+  "observation_date": "2026-10-21",
+  "classification": "x86_64 Linux guest under full-system QEMU TCG on the aarch64 task host; not native x64 hardware",
+  "host_image_path": "/home/byates/fm-worktrees/fm-llmrouter/swx-abbe-1227-native-history/swx-opencode/.native-history/guest/noble-server-cloudimg-amd64.img",
+  "guest_image_download_url": "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
+  "guest_image_initial_sha256": "04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94",
+  "qemu_system_version": "QEMU emulator version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)",
+  "qemu_system_executable_sha256": "cfac2d1293e7cc362fd9a5b0ee7b8a8ce6b4d3abc9711cdcbbd2efb435c9a923",
+  "guest_readiness_response": "x86_64\n/usr/bin/git\n/usr/bin/python3\nguest-ready",
+  "guest_readiness_condition": "Successful key-authenticated SSH response after /var/lib/cloud/instance/boot-finished exists; image and seed files are task-owned",
+  "guest_kernel": "Linux 6.8.0-147-generic x86_64",
+  "executable": "/home/byates/fm-worktrees/fm-llmrouter/swx-abbe-1227-native-history/swx-opencode/.native-history/extracted/opencode",
+  "executable_sha256": "6891cf61987bd8566660b681217cdfc2605fd684bbf64faaf2cd5072ea0e8e80",
+  "sidecar_sha256": "977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5",
+  "run_3": {
+    "date": "2026-10-21T06:30:41.506284+00:00",
+    "runtime_environment": {
+      "BUN_JSC_useDFGJIT": "false",
+      "BUN_JSC_useFTLJIT": "false"
+    },
+    "version": {
+      "args": ["--version"],
+      "exit": 0,
+      "stdout": "1.18.32-swxtch.d1b232e9\n",
+      "stderr": ""
+    },
+    "db_path": {
+      "args": ["db", "path"],
+      "exit": 0,
+      "stdout": "/home/byates/fm-worktrees/fm-llmrouter/swx-abbe-1227-native-history/swx-opencode/.native-history/native-guest-run-3/session.sqlite\n",
+      "stderr": ""
+    },
+    "fff_search": {
+      "args": ["debug", "file", "search", "needle-target"],
+      "exit": 0,
+      "stdout": "needle-target.txt\n",
+      "stderr": ""
+    },
+    "server_command": [
+      "/home/byates/fm-worktrees/fm-llmrouter/swx-abbe-1227-native-history/swx-opencode/.native-history/extracted/opencode",
+      "serve", "--pure", "--print-logs", "--hostname", "127.0.0.1", "--port", "38171"
+    ],
+    "server_reaped_exit": -15,
+    "v2_readiness_result": "TimeoutError: configured release server readiness",
+    "v2_readiness_budget_seconds": 300,
+    "successful_http_responses_captured": [],
+    "admission_message_event_identities": []
+  },
+  "user_mode_qemu_11": {
+    "package_url": "https://deb.debian.org/debian/pool/main/q/qemu/qemu-user_11.1.2+ds-3_arm64.deb",
+    "package_sha256": "e278d393447a97b548728918af8e395a33086f5b7100138e38cf06a41766612e",
+    "executable_sha256": "9048e4ba852e35f00a2c15269f2768df01a69cfa34c6348c63fb359cae7e8ec9",
+    "version": "qemu-x86_64 version 11.1.2 (Debian 1:11.1.2+ds-3)",
+    "release_version_command_exit": -6,
+    "release_version_command_stdout": "",
+    "release_version_command_error": "ASSERTION FAILED: MemoryExhaustion: Crash intentionally because memory is exhausted. vendor/WebKit/Source/JavaScriptCore/heap/LocalAllocator.cpp; Bun v1.4.2 (744846f84) Linux x64"
+  }
+}
