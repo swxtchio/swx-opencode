@@ -1,0 +1,20 @@
+{
+  "observation_date": "2026-10-21",
+  "runtime": "1.4.2",
+  "architecture": "arm64",
+  "evidence_kind": "forced node:http dependency probe, not reproduction of Server.listen or proof of the actual CI responder",
+  "command": "bun .native-history/ci-investigation/oracle-control.mjs",
+  "retained_driver": "ci-port-reuse-probe.mjs",
+  "observations": [
+    {"attempt": 0, "port": 42747, "original_listener_closed": true, "retired_url_fetch_resolved": true, "status": 200, "response_body": "replacement"},
+    {"attempt": 1, "port": 36561, "original_listener_closed": true, "retired_url_fetch_resolved": true, "status": 200, "response_body": "replacement"},
+    {"attempt": 2, "port": 33143, "original_listener_closed": true, "retired_url_fetch_resolved": true, "status": 200, "response_body": "replacement"},
+    {"attempt": 3, "port": 32867, "original_listener_closed": true, "retired_url_fetch_resolved": true, "status": 200, "response_body": "replacement"},
+    {"attempt": 4, "port": 34203, "original_listener_closed": true, "retired_url_fetch_resolved": true, "status": 200, "response_body": "replacement"},
+    {"attempt": 5, "port": 34195, "original_listener_closed": true, "retired_url_fetch_resolved": true, "status": 200, "response_body": "replacement"},
+    {"attempt": 6, "port": 33939, "original_listener_closed": true, "retired_url_fetch_resolved": true, "status": 200, "response_body": "replacement"},
+    {"attempt": 7, "port": 44031, "original_listener_closed": true, "retired_url_fetch_resolved": true, "status": 200, "response_body": "replacement"},
+    {"attempt": 8, "port": 39339, "original_listener_closed": true, "retired_url_fetch_resolved": true, "status": 200, "response_body": "replacement"},
+    {"attempt": 9, "port": 36799, "original_listener_closed": true, "retired_url_fetch_resolved": true, "status": 200, "response_body": "replacement"}
+  ]
+}
