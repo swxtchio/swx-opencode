@@ -137,6 +137,42 @@ ${directSecondPath}
     mkdirSync(dirname(bunBin), { recursive: true })
     mkdirSync(dirname(alternateBun), { recursive: true })
     copyFileSync(process.execPath, alternateBun)
+    writeFileSync(
+      join(packageRoot, "shebang-bun.ts"),
+      [
+        `#!${process.execPath} test`,
+        'import { appendFileSync } from "node:fs"',
+        'import { test } from "bun:test"',
+        'test("kernel-dispatched Bun test", () => appendFileSync(process.env.FAST_SUITE_MARKER!, "shebang-bun\\n"))',
+        "",
+      ].join("\n"),
+    )
+    writeFileSync(
+      join(packageRoot, "shebang-node.cjs"),
+      [
+        `#!${realpathSync(Bun.which("node")!)} --test`,
+        'const { appendFileSync } = require("node:fs")',
+        'const { test } = require("node:test")',
+        'test("kernel-dispatched Node test", () => appendFileSync(process.env.FAST_SUITE_MARKER, "shebang-node\\n"))',
+        "",
+      ].join("\n"),
+    )
+    chmodSync(join(packageRoot, "shebang-bun.ts"), 0o755)
+    chmodSync(join(packageRoot, "shebang-node.cjs"), 0o755)
+    writeFileSync(
+      join(packageRoot, "shebang-chain"),
+      `#!${join(packageRoot, "shebang-bun.ts")}\n`,
+    )
+    chmodSync(join(packageRoot, "shebang-chain"), 0o755)
+    writeFileSync(
+      join(root, "node_modules", ".bin", "tsc"),
+      '#!/usr/bin/env bash\nprintf "tool-flag:%s\\n" "$*" >> "${FAST_SUITE_MARKER:?}"\n',
+    )
+    chmodSync(join(root, "node_modules", ".bin", "tsc"), 0o755)
+    writeFileSync(
+      join(packageRoot, "flag-probe.ts"),
+      'import { appendFileSync } from "node:fs"\nappendFileSync(process.env.FAST_SUITE_MARKER!, "script-flag:" + process.argv.at(-1) + "\\n")\n',
+    )
     copyFileSync(join(import.meta.dir, "..", "tests", "run.sh"), runner)
     chmodSync(runner, 0o755)
     const runnerSource = readFileSync(runner, "utf8")
@@ -203,6 +239,7 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         test: exampleTestScript,
         posttest: "bun ./posttest.ts",
         "verify:unlisted": "bun test ./test/unlisted.test.ts",
+        "flag-probe": "bun ./flag-probe.ts",
       },
     }
     writeFileSync(join(packageRoot, "package.json"), JSON.stringify(examplePackage))
@@ -320,6 +357,28 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
       [
         'import { appendFileSync } from "node:fs"',
         'appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "pretest\\n")',
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE === "tool-flags") {',
+        '  for (const command of [["bunx", "tsc", "-b"], ["bun", "x", "tsc", "-b"], ["bun", "run", "flag-probe", "--", "-b"]]) {',
+        '    const result = Bun.spawnSync(command, { stdout: "inherit", stderr: "inherit" })',
+        '    if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "  }",
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE === "fd-bun") {',
+        `  const source = ${JSON.stringify('import os; path=os.environ["FAST_SUITE_REAL_BUN"]; fd=os.open(path, os.O_RDONLY); os.execve(fd, [path, "test", "./test/unlisted.test.ts"], dict(os.environ))')}`,
+        '  const result = Bun.spawnSync(["python3", "-c", source], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("inspect-")) {',
+        '  const executable = process.env.FAST_SUITE_LAUNCH_SHAPE.includes("path") ? "bun" : process.env.FAST_SUITE_LAUNCH_SHAPE.includes("copy") ? process.env.FAST_SUITE_ALTERNATE_BUN! : process.execPath',
+        '  const flag = process.env.FAST_SUITE_LAUNCH_SHAPE.endsWith("inline") ? "--inspect=127.0.0.1:0" : "--inspect"',
+        '  const result = Bun.spawnSync([executable, flag, "test", "./test/unlisted.test.ts"], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("shebang-")) {',
+        '  const script = process.env.FAST_SUITE_LAUNCH_SHAPE === "shebang-bun" ? "./shebang-bun.ts" : process.env.FAST_SUITE_LAUNCH_SHAPE === "shebang-chain" ? "./shebang-chain" : "./shebang-node.cjs"',
+        '  const result = Bun.spawnSync([script], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
         'if (process.env.FAST_SUITE_LAUNCH_SHAPE === "absolute-bun") {',
         '  const result = Bun.spawnSync([process.execPath, "test", "./test/unlisted.test.ts"], { stdout: "inherit", stderr: "inherit" })',
         '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
@@ -742,7 +801,10 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     expect(Bun.spawnSync(["git", "add", "tests/run.sh"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
     expect(Bun.spawnSync(["git", "commit", "-qm", "restore the JUnit observed receipt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
 
-    for (const shape of ["absolute-bun", "absolute-bun-copy", "bun-delegation", "node-test"]) {
+    const launchShapes = process.env.FAST_SUITE_RUNNER_CASE
+      ? [process.env.FAST_SUITE_RUNNER_CASE]
+      : ["absolute-bun", "absolute-bun-copy", "bun-delegation", "node-test", "inspect-base", "inspect-copy", "inspect-path", "inspect-base-inline", "inspect-copy-inline", "inspect-path-inline", "shebang-bun", "shebang-node", "shebang-chain", "fd-bun"]
+    for (const shape of launchShapes) {
       runOptions.env.FAST_SUITE_LAUNCH_SHAPE = shape
       writeFileSync(marker, "")
       const launchEscape = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
@@ -754,6 +816,15 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
       }
       expect(launchEscape.exitCode).toBe(1)
       expect(launchEscape.stdout.toString()).toContain("verdict=refused mode=fast")
+      if (shape.startsWith("inspect-")) expect(readFileSync(marker, "utf8")).toContain("unlisted\n")
+      if (shape.startsWith("inspect-path")) {
+        expect(launchEscape.stdout.toString()).toContain("reason=execution-set-mismatch")
+        expect(launchEscape.stderr.toString()).toContain("JUnit-observed files outside the manifest")
+      }
+      if (shape.startsWith("shebang-")) {
+        expect(readFileSync(marker, "utf8")).toContain(shape === "shebang-chain" ? "shebang-bun\n" : `${shape}\n`)
+      }
+      if (shape === "fd-bun") expect(readFileSync(marker, "utf8")).toContain("unlisted\n")
       if (shape === "absolute-bun" || shape === "absolute-bun-copy") {
         expect(launchEscape.stderr.toString()).toContain("unobserved Bun test launch")
         expect(readFileSync(marker, "utf8")).toContain("unlisted\n")
@@ -764,6 +835,15 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
         expect(readFileSync(marker, "utf8")).toContain("selected-configured\n")
       }
     }
+    runOptions.env.FAST_SUITE_LAUNCH_SHAPE = ""
+
+    runOptions.env.FAST_SUITE_LAUNCH_SHAPE = "tool-flags"
+    writeFileSync(marker, "")
+    const forwardedFlags = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    if (forwardedFlags.exitCode !== 0) console.error(forwardedFlags.stdout.toString(), forwardedFlags.stderr.toString())
+    expect(forwardedFlags.exitCode).toBe(0)
+    expect(readFileSync(marker, "utf8").split("\n").filter((line) => line === "tool-flag:-b")).toHaveLength(2)
+    expect(readFileSync(marker, "utf8")).toContain("script-flag:-b\n")
     runOptions.env.FAST_SUITE_LAUNCH_SHAPE = ""
 
     runOptions.env.FAST_SUITE_EXTRA_PRETEST_TEST = "1"

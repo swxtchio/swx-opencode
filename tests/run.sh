@@ -12,6 +12,7 @@
 # Remaining accepted limits (swxtchio/swx-opencode#324): this is not a security boundary;
 # unrecognized interpreter identities, in-process test frameworks, and deliberate observer/report
 # tampering are outside its observation scope. The full suite remains the release gate.
+# In particular, bare Node scripts using node:test without --test remain unobserved.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -45,6 +46,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     'All captured Bun JUnit reports, including preparation and lifecycle-hook launches, are collected; their observed' \
     'file set must equal the manifest exactly for PATH-resolved Bun test launches; see swxtchio/swx-opencode#324.' \
     'Fast mode requires Linux strace: unobserved absolute Bun test launches and Node --test launches invalidate the run;' \
+    'kernel shebang interpreters and fd-only execveat launches are resolved from captured process context.' \
     'bun run --bun delegation is refused. This is a merge-gate speedup, not a security boundary; full suite gates releases.' \
     'A nonzero target with no JUnit report is refused with target attribution, not labeled an execution-set mismatch.' \
     'Fast mode refuses if a selected file reports no active test cases.' \
@@ -122,7 +124,7 @@ report_file="$root/.fast-suite-report.$$.xml"
 trap 'rm -f -- "$report_file" "$config_dir"/*; rmdir -- "$config_dir" 2>/dev/null || true' EXIT
 real_bun="$(command -v bun)"
 if ! command -v strace >/dev/null 2>&1 \
-  || ! strace -f --seccomp-bpf -qq -s 65536 -xx -e trace=execve,execveat -o "$config_dir/probe.trace" \
+  || ! strace -f --seccomp-bpf -qq -yy -s 65536 -xx -e trace=execve,execveat,clone,clone3,fork,vfork,chdir,fchdir -o "$config_dir/probe.trace" \
     "$real_bun" -p 'process.execPath' > "$config_dir/runtime-bun"; then
   printf '%s\n' 'tests/run.sh: fast mode requires a working Linux strace process-launch observer' >&2
   printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=process-observer-unavailable exit_code=1'
@@ -138,21 +140,36 @@ main_report=${JSON.stringify(process.env.FAST_SUITE_MAIN_REPORT)}
 args=("$@")
 wrapper_name=\${BASH_SOURCE[0]##*/}
 command_index=0
+delegated=0
 while [ "$command_index" -lt "\${#args[@]}" ]; do
+  case "\${args[command_index]}" in --bun|-b) delegated=1 ;; esac
   case "\${args[command_index]}" in
     --cwd=*) command_index=$((command_index + 1)) ;;
-    --cwd|--config|--env-file|--preload|--require|--import|--conditions|--define|--loader|--inspect|--inspect-wait|--inspect-brk|-r|-p|-e|-d|-l) command_index=$((command_index + 2)) ;;
+    --cwd|--config|--env-file|--preload|--require|--import|--conditions|--define|--loader|-r|-p|-e|-d|-l) command_index=$((command_index + 2)) ;;
     --*=*) command_index=$((command_index + 1)) ;;
     -*) command_index=$((command_index + 1)) ;;
     *) break ;;
   esac
 done
+if [ "\${args[command_index]:-}" = run ]; then
+  option_index=$((command_index + 1))
+  while [ "$option_index" -lt "\${#args[@]}" ]; do
+    case "\${args[option_index]}" in --bun|-b) delegated=1 ;; esac
+    case "\${args[option_index]}" in
+      --) break ;;
+      --cwd|--config|--env-file|--preload|--require|--import|--conditions|--define|--loader|-r|-p|-e|-d|-l) option_index=$((option_index + 2)) ;;
+      -*) option_index=$((option_index + 1)) ;;
+      *) break ;;
+    esac
+  done
+fi
+if [ "$wrapper_name" != bunx ] && [ "\${args[command_index]:-}" != x ] && [ "$delegated" -eq 1 ]; then
+  printf "%s\\n" "tests/run.sh: refusing unobservable Bun delegation" >&2
+  touch "$report_dir/refused-delegation"
+  exit 126
+fi
 for argument in "\${args[@]}"; do
-  if [ "$argument" = --bun ] || [ "$argument" = -b ]; then
-    printf "%s\\n" "tests/run.sh: refusing unobservable Bun delegation: $argument" >&2
-    touch "$report_dir/refused-delegation"
-    exit 126
-  fi
+  if [ "$argument" = -- ]; then break; fi
   if [ "$argument" = --test-worker ]; then exec "$real_bun" "\${args[@]}"; fi
 done
 command="\${args[command_index]:-}"
@@ -578,7 +595,7 @@ for prep_task in "${turbo_prep_tasks[@]}"; do
     esac
   done
   preparation_status=0
-  GITHUB_ACTIONS=false PATH="$config_dir:$PATH" strace -f --seccomp-bpf -qq -s 65536 -xx -e trace=execve,execveat \
+  GITHUB_ACTIONS=false PATH="$config_dir:$PATH" strace -f --seccomp-bpf -qq -yy -s 65536 -xx -e trace=execve,execveat,clone,clone3,fork,vfork,chdir,fchdir \
     -o "$config_dir/preparation-$prep_task.trace" "$config_dir/bun" turbo run "$prep_task" "${prep_filters[@]}" --force || preparation_status=$?
   if [ "$preparation_status" -ne 0 ]; then
     printf 'tests/run.sh: Turbo-declared preparation task failed: %s\n' "$prep_task" >&2
@@ -627,11 +644,11 @@ while [ "$index" -lt "$target_count" ]; do
   report_args=(--reporter=junit --reporter-outfile="$report_file")
   test_status=0
   if [ "$has_turbo_task" = 1 ]; then
-    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" strace -f --seccomp-bpf -qq -s 65536 -xx -e trace=execve,execveat \
+    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" strace -f --seccomp-bpf -qq -yy -s 65536 -xx -e trace=execve,execveat,clone,clone3,fork,vfork,chdir,fchdir \
       -o "$config_dir/package-$index.trace" "$config_dir/bun" turbo run test "--filter=./$package_root" --only --force -- \
       "${report_args[@]}" "${selected_paths[@]}" || test_status=$?
   else
-    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" strace -f --seccomp-bpf -qq -s 65536 -xx -e trace=execve,execveat \
+    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" strace -f --seccomp-bpf -qq -yy -s 65536 -xx -e trace=execve,execveat,clone,clone3,fork,vfork,chdir,fchdir \
       -o "$config_dir/package-$index.trace" "$config_dir/bun" --cwd="$root/$package_root" run test -- \
       "${report_args[@]}" "${selected_paths[@]}" || test_status=$?
   fi
@@ -704,38 +721,99 @@ done
 
 # A process outside the PATH shim cannot certify a fast run by omitting its report.
 launch_observation_status=0
-FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e '
+FAST_SUITE_ROOT="$root" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e '
   import { existsSync, realpathSync } from "node:fs"
   import { readdir } from "node:fs/promises"
-  import { basename, join } from "node:path"
+  import { basename, join, resolve } from "node:path"
 
   const directory = process.env.FAST_SUITE_REPORT_DIR
   const runtimeBun = (await Bun.file(join(directory, "runtime-bun")).text()).trim()
   const entries = await readdir(directory)
   let invalid = entries.includes("refused-delegation")
   for (const name of entries.filter((entry) => entry.endsWith(".trace") && entry !== "probe.trace")) {
+    const calls = []
     const pending = new Map()
-    for (const line of (await Bun.file(join(directory, name)).text()).split("\n")) {
+    for (const [index, line] of (await Bun.file(join(directory, name)).text()).split("\n").entries()) {
       const match = line.match(/^(\d+)\s+(.*)$/)
       if (!match) continue
       const pid = match[1]
       const text = match[2]
-      if (!/^execve(?:at)?\(/.test(text) && !text.startsWith("<... execve")) continue
+      if (!/^(?:execve(?:at)?|clone3?|fork|vfork|chdir|fchdir)\(/.test(text) && !text.startsWith("<... ")) continue
       if (text.endsWith("<unfinished ...>")) {
-        pending.set(pid, text.slice(0, -"<unfinished ...>".length))
+        pending.set(pid, { text: text.slice(0, -"<unfinished ...>".length), index })
         continue
       }
-      const call = text.startsWith("<... execve") ? (pending.get(pid) ?? "") + text.replace(/^<\.\.\. execve(?:at)? resumed>/, "") : text
+      const start = pending.get(pid)
+      const call = text.startsWith("<... ") ? (start?.text ?? "") + text.replace(/^<\.\.\. \w+ resumed>/, "") : text
       pending.delete(pid)
-      if (!/^execve(?:at)?\(/.test(call) || !/\)\s+= 0$/.test(call)) continue
+      const result = call.match(/\)\s+= (\d+)$/)
+      if (!result) continue
       if (call.includes("...")) {
         console.error("tests/run.sh: truncated process-launch observation: " + name)
         invalid = true
         continue
       }
+      calls.push({ pid, call, index: start?.index ?? index, result: Number(result[1]) })
+    }
+    const ordered = calls.sort((a, b) => a.index - b.index)
+    const working = new Map()
+    if (ordered.length) working.set(ordered[0].pid, { path: process.env.FAST_SUITE_ROOT })
+    for (const entry of ordered) {
+      const call = entry.call
+      const cwd = working.get(entry.pid)
+      if (!cwd) {
+        console.error("tests/run.sh: process has no observed working directory: " + entry.pid)
+        invalid = true
+        continue
+      }
+      if (/^(?:clone3?|fork|vfork)\(/.test(call)) {
+        if (entry.result > 0) working.set(String(entry.result), call.includes("CLONE_FS") ? cwd : { path: cwd.path })
+        continue
+      }
       const strings = Array.from(call.matchAll(/"((?:\\x[0-9a-f]{2})*)"/g), ([, hex]) => Buffer.from(hex.replaceAll("\\x", ""), "hex").toString())
-      const executable = strings[0]
-      const args = strings.slice(2)
+      if (/^chdir\(/.test(call)) {
+        cwd.path = strings[0].startsWith("/") ? strings[0] : cwd.path ? resolve(cwd.path, strings[0]) : undefined
+        continue
+      }
+      const descriptor = call.match(/^(?:execveat|fchdir)\([^<]*<([^>]+)>/)?.[1]
+      const descriptorPath = descriptor?.startsWith("\\x") ? Buffer.from(descriptor.replaceAll("\\x", ""), "hex").toString() : descriptor
+      if (/^fchdir\(/.test(call)) {
+        cwd.path = descriptorPath?.startsWith("/") ? descriptorPath : undefined
+        continue
+      }
+      if (!/^execve(?:at)?\(/.test(call) || entry.result !== 0) continue
+      working.set(entry.pid, { path: cwd.path })
+      let executable = strings[0]
+      let args = strings.slice(2)
+      if (!executable && descriptorPath?.startsWith("/")) executable = descriptorPath
+      if (executable && !executable.startsWith("/")) {
+        const base = descriptorPath ?? cwd.path
+        executable = base ? resolve(base, executable) : undefined
+      }
+      if (!executable) {
+        console.error("tests/run.sh: unobservable executable pathname: " + name)
+        invalid = true
+        continue
+      }
+      const interpreters = new Set()
+      while (existsSync(executable)) {
+        const header = await Bun.file(executable).slice(0, 256).text()
+        if (!header.startsWith("#!")) break
+        if (interpreters.has(executable)) {
+          console.error("tests/run.sh: cyclic script interpreter dispatch: " + executable)
+          invalid = true
+          break
+        }
+        interpreters.add(executable)
+        const bang = header.slice(2).split(/[\n\0]/, 1)[0].replace(/[ \t]+$/, "").match(/^[ \t]*([^ \t]+)(?:[ \t]+(.*))?$/)
+        if (!bang || (!bang[1].startsWith("/") && !cwd.path)) {
+          console.error("tests/run.sh: unobservable script interpreter dispatch: " + executable)
+          invalid = true
+          break
+        }
+        args = [...(bang[2] ? [bang[2]] : []), executable, ...args]
+        executable = bang[1].startsWith("/") ? bang[1] : resolve(cwd.path, bang[1])
+      }
       if (basename(executable ?? "") === "node" && args.some((argument) => argument === "--test" || argument.startsWith("--test="))) {
         console.error("tests/run.sh: unobservable Node test launch: " + executable)
         invalid = true
@@ -747,7 +825,7 @@ FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPORT_DIR="$config_dir" FAST
       let command = 0
       while (command < args.length && args[command].startsWith("-")) {
         const argument = args[command++]
-        if (["--cwd", "--config", "--env-file", "--preload", "--require", "--import", "--conditions", "--define", "--loader", "--inspect", "--inspect-wait", "--inspect-brk", "-r", "-p", "-e", "-d", "-l"].includes(argument)) command++
+        if (["--cwd", "--config", "--env-file", "--preload", "--require", "--import", "--conditions", "--define", "--loader", "-r", "-p", "-e", "-d", "-l"].includes(argument)) command++
       }
       if (args[command] !== "test" || args.includes("--test-worker")) continue
       const outfileIndex = args.indexOf("--reporter-outfile")

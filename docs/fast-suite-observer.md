@@ -41,7 +41,7 @@ The absolute-Bun fixture launches `[process.execPath, "test", "./test/unlisted.t
 
 ### Observation scope
 
-JUnit equality applies to PATH-resolved Bun test launches. The additional Linux process audit invalidates unobserved launches from the configured Bun runtime or another absolute executable named `bun`, and executable paths named `node` carrying `--test`; Bun `--bun` delegation is refused by the shim and leaves a refusal receipt even when the caller ignores its status. Unrecognized interpreter identities, in-process frameworks, and deliberate observer/report tampering remain outside the stated scope. See `tests/run.sh --help` and its residual header. This work does not turn fast mode into a security boundary or replace the full release suite.
+JUnit equality applies to PATH-resolved Bun test launches. The additional Linux process audit resolves execution paths from process creation and working-directory events, follows kernel shebang interpreter dispatch, and decodes fd-only execveat targets before classifying Bun tests and Node `--test` launches. Bun `--bun` delegation is refused by the shim and leaves a refusal receipt even when the caller ignores its status; child-tool flags remain recipient-owned. Unrecognized interpreter identities, in-process frameworks, bare Node scripts using `node:test` without `--test` ([#337](https://github.com/swxtchio/swx-opencode/issues/337)), and deliberate observer/report tampering remain outside the stated scope. See `tests/run.sh --help` and its residual header. This work does not turn fast mode into a security boundary or replace the full release suite.
 
 ### Published CI follow-up (2026-10-21)
 
