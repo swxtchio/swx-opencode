@@ -76,3 +76,13 @@ All original mutations were also rerun against this updated pin, one at a time, 
 | Wrong-owner plan | Only `(!targetTask && plan.tasks.length > 0)` → `false` | Empty execution-marker assertion received `direct-configured\n`. |
 
 The refreshed fork-maintenance command `bun test sync-upstream.test.ts changeset-check.test.ts fast-suite-runner.test.ts`, run from `script`, exited 0 with 96 pass, 0 fail, and 548 assertions. `bun run typecheck:script`, focused correctness lint, `bash -n tests/run.sh`, and `git diff --check` exited 0. Rendered help was read again and retains its PATH-resolved Bun JUnit scope and #324 reference. The alternate-path audit leaves the generated observer and configured launcher on their existing report-capture path; the same runtime test still passes its Turbo/direct, lifecycle, preparation, options, and full-forwarding positive controls.
+
+## Round-1 hardening plan
+
+Scope: the captain's `fix-round-1-order.txt`, addressing the selected round-1 reviews at `6cb3b40b03`.
+
+- Reproduce Bun/Node kernel-shebang launches and bare inspector-option launches through the existing committed real-runner fixtures.
+- Record process creation and working-directory transitions alongside execs so script interpreter dispatch can be resolved from the actual execution context. Follow Linux's single optional shebang argument and recursive interpreter loading before classifying Bun/Node launches.
+- Correct optional inspector arguments in both the shim and the launch audit, with bare and attached-value runtime coverage.
+- Fold fd-only exec dispatch and child-tool flag forwarding if their producer-driven fixtures support a small change; explicitly disclose bare Node `node:test` execution and any remaining accepted limitations.
+- Demonstrate each changed behavior with an actual guard-removal red run, restore green, run focused/fork-maintenance/type/lint checks, and push only the existing draft for firstmate review.
