@@ -111,6 +111,7 @@ type ToolCall = {
   attempt: Attempt
   // The execution the call's owning attempt, or an earlier one, last admitted.
   execution?: Execution
+  inputError?: string
 }
 
 type Execution = { call: ToolCall; attempt: Attempt }
@@ -198,7 +199,8 @@ const layer = Layer.effect(
       const interrupted = input.cause
         ? Cause.hasInterruptsOnly(input.cause)
         : input.error?.name === "MessageAbortedError"
-      const error = input.error ??
+      const error =
+        input.error ??
         (input.cause
           ? interrupted
             ? MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
@@ -620,6 +622,11 @@ const layer = Layer.effect(
 
           case "tool-input-delta":
             yield* ensureToolCall(value)
+            yield* updateToolCall(value.id, (match) =>
+              match.state.status === "pending"
+                ? { ...match, state: { ...match.state, raw: match.state.raw + value.text } }
+                : match,
+            )
             return
 
           case "tool-input-end": {
@@ -714,6 +721,11 @@ const layer = Layer.effect(
           }
 
           case "tool-error": {
+            const match = yield* readToolCall(value.id)
+            if (match?.part.state.status === "pending") {
+              match.call.inputError = value.message
+              return
+            }
             yield* failToolCall(value.id, value.error ?? new Error(value.message))
             return
           }
@@ -956,14 +968,28 @@ const layer = Layer.effect(
                 }
                 const end = Date.now()
                 const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
+                const inputFailure =
+                  part.state.status === "pending" &&
+                  !ctx.assistantMessage.error &&
+                  (ctx.assistantMessage.finish === "length" || match.call.inputError !== undefined)
+                const inputError =
+                  ctx.assistantMessage.finish === "length"
+                    ? "The tool call was not executed because the output token limit (stop reason: length) was reached before you could complete the arguments. Break large payloads into smaller tool calls and reissue the call with complete arguments."
+                    : match.call.inputError
                 const exit = yield* attempt(
                   session.updatePart({
                     ...part,
                     state: {
                       ...part.state,
                       status: "error",
-                      error: "Tool execution aborted",
-                      metadata: { ...metadata, interrupted: true },
+                      error:
+                        inputFailure && part.state.status === "pending"
+                          ? inputError +
+                            (part.state.raw.length
+                              ? `\n\nInput excerpt (first ${Math.min(part.state.raw.length, 2048)} of ${part.state.raw.length} characters):\n${part.state.raw.slice(0, 2048)}${part.state.raw.length > 2048 ? "\n[truncated]" : ""}`
+                              : "")
+                          : "Tool execution aborted",
+                      metadata: inputFailure ? metadata : { ...metadata, interrupted: true },
                       time: { start: "time" in part.state ? part.state.time.start : end, end },
                     },
                   }),
