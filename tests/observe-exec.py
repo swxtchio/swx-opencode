@@ -12,16 +12,18 @@ import sys
 libc = ctypes.CDLL(None, use_errno=True)
 libc.ptrace.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 libc.ptrace.restype = ctypes.c_long
-TRACEME = 0
 CONT = 7
-SETOPTIONS = 0x4200
 GETEVENTMSG = 0x4201
+SEIZE = 0x4206
+LISTEN = 0x4208
 TRACEFORK = 1 << 1
 TRACEVFORK = 1 << 2
 TRACECLONE = 1 << 3
 TRACEEXEC = 1 << 4
 EXITKILL = 1 << 20
 EXEC = 4
+EVENT_STOP = 128
+STOP_SIGNALS = (signal.SIGSTOP, signal.SIGTSTP, signal.SIGTTIN, signal.SIGTTOU)
 WALL = 0x40000000
 
 
@@ -35,26 +37,30 @@ def ptrace(request, pid, data=0):
 
 def observe(output, command):
     with open(output, "w", encoding="utf-8") as report:
+        reader, writer = os.pipe()
         root = os.fork()
         if root == 0:
             try:
-                ptrace(TRACEME, 0)
-                os.kill(os.getpid(), signal.SIGSTOP)
+                os.close(writer)
+                if os.read(reader, 1) != b"r":
+                    os._exit(125)
+                os.close(reader)
                 os.execvpe(command[0], command, os.environ)
             except OSError as error:
                 print("tests/run.sh: observed dispatch failed: " + str(error), file=sys.stderr)
                 os._exit(125)
-
+        os.close(reader)
         children = {root}
-        started = {root}
         count = 0
         root_status = None
         try:
-            pid, status = os.waitpid(root, 0)
-            if not os.WIFSTOPPED(status) or os.WSTOPSIG(status) != signal.SIGSTOP:
-                raise RuntimeError("observer child did not acknowledge tracing")
-            ptrace(SETOPTIONS, pid, TRACEFORK | TRACEVFORK | TRACECLONE | TRACEEXEC | EXITKILL)
-            ptrace(CONT, pid)
+            # SEIZE enables transparent group-stop handling without an attach SIGSTOP.
+            # The pipe gates dispatch until tracing options are acknowledged by the kernel.
+            try:
+                ptrace(SEIZE, root, TRACEFORK | TRACEVFORK | TRACECLONE | TRACEEXEC | EXITKILL)
+                os.write(writer, b"r")
+            finally:
+                os.close(writer)
             while True:
                 try:
                     pid, status = os.waitpid(-1, WALL)
@@ -65,7 +71,6 @@ def observe(output, command):
                     break
                 if os.WIFEXITED(status) or os.WIFSIGNALED(status):
                     children.discard(pid)
-                    started.discard(pid)
                     if pid == root:
                         root_status = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status)
                     continue
@@ -73,7 +78,15 @@ def observe(output, command):
                     raise RuntimeError("unrecognized traced process state")
                 event = status >> 16
                 stop = os.WSTOPSIG(status)
-                if event:
+                restart = CONT
+                if event == EVENT_STOP:
+                    children.add(pid)
+                    # Only real group-stops carry a stopping signal here; auto-attached
+                    # children and SIGCONT wakeups carry SIGTRAP (ptrace(2), PTRACE_SEIZE).
+                    if stop in STOP_SIGNALS:
+                        restart = LISTEN
+                    stop = 0
+                elif event:
                     message = ctypes.c_ulong()
                     try:
                         ptrace(GETEVENTMSG, pid, ctypes.addressof(message))
@@ -89,7 +102,6 @@ def observe(output, command):
                         # A non-leader thread adopts its thread group's PID on exec.
                         if message.value != pid:
                             children.discard(message.value)
-                            started.discard(message.value)
                         children.add(pid)
                         executable = os.readlink(f"/proc/{pid}/exe")
                         identity = os.stat(f"/proc/{pid}/exe")
@@ -109,12 +121,8 @@ def observe(output, command):
                         report.flush()
                         count += 1
                     stop = 0
-                elif pid not in started and stop == signal.SIGSTOP:
-                    children.add(pid)
-                    started.add(pid)
-                    stop = 0
                 try:
-                    ptrace(CONT, pid, stop)
+                    ptrace(restart, pid, stop)
                 except OSError as error:
                     # A thread can disappear when another thread execs or exits the group.
                     # Keep waiting for its terminal wait status, rather than assuming completion.

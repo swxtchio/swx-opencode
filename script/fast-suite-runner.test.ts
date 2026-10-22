@@ -55,6 +55,24 @@ test("exec observer preserves signal exits and execution from a non-leader threa
   expect(threadRecords.at(-1)).toMatchObject({ event: "complete", exitCode: 0, execCount: 2 })
 })
 
+test.each(["SIGSTOP", "SIGTSTP", "SIGTTIN", "SIGTTOU"])("exec observer preserves %s until SIGCONT", (stop) => {
+  const fixture = join(import.meta.dir, "fixtures", "job-control.py")
+  const plain = Bun.spawnSync(["python3", fixture, stop])
+  if (plain.exitCode !== 0) console.error(plain.stderr.toString())
+  expect(plain.exitCode).toBe(0)
+  const observed = Bun.spawnSync([
+    "python3",
+    join(import.meta.dir, "..", "tests", "observe-exec.py"),
+    join(scratch, stop + ".execs"),
+    "python3",
+    fixture,
+    stop,
+  ])
+  if (observed.exitCode !== 0) console.error(observed.stderr.toString())
+  expect(observed.exitCode).toBe(0)
+  expect(observed.stdout.toString()).toBe(plain.stdout.toString())
+})
+
 // GOAL: compare fast-mode package traces with owning Turbo/package-script runs over exact files;
 // refusal fixtures cover hidden prerequisites, invalid admission metadata, and JUnit scope.
 test(
@@ -226,6 +244,7 @@ ${directSecondPath}
     )
     copyFileSync(join(import.meta.dir, "..", "tests", "run.sh"), runner)
     copyFileSync(join(import.meta.dir, "..", "tests", "observe-exec.py"), join(root, "tests", "observe-exec.py"))
+    copyFileSync(join(import.meta.dir, "fixtures", "job-control.py"), join(packageRoot, "job-control.py"))
     const observerSource = readFileSync(join(root, "tests", "observe-exec.py"), "utf8")
     chmodSync(runner, 0o755)
     const runnerSource = readFileSync(runner, "utf8")
@@ -410,6 +429,12 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
       [
         'import { appendFileSync, chmodSync, copyFileSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"',
         'appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "pretest\\n")',
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("job-control-")) {',
+        '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
+        '  const result = Bun.spawnSync(["python3", "./job-control.py", shape.slice("job-control-".length)], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER!, shape + "\\n")',
+        "}",
         'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("deleted-")) {',
         '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
         '  const temporary = mkdtempSync(process.env.FAST_SUITE_ALTERNATE_BUN! + "-cwd-")',
@@ -895,22 +920,18 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
 
     const launchShapes = process.env.FAST_SUITE_RUNNER_CASE
       ? [process.env.FAST_SUITE_RUNNER_CASE]
-      : ["deleted-cwd", "deleted-fchdir", "overwrite-bun", "overwrite-node", "repoint-bun", "repoint-node", "absolute-bun", "absolute-bun-copy", "bun-delegation", "node-test", "inspect-base", "inspect-copy", "inspect-path", "inspect-base-inline", "inspect-copy-inline", "inspect-path-inline", "shebang-bun", "shebang-node", "shebang-chain", "fd-bun", "symlink-bun-missing", "symlink-node-missing", "symlink-bun-decoy", "symlink-node-decoy", "relative-bun-decoy", "relative-node-decoy", "chdir-bun-decoy", "chdir-node-decoy", "transient-bun", "transient-node"]
+      : ["job-control-SIGSTOP", "job-control-SIGTSTP", "job-control-SIGTTIN", "job-control-SIGTTOU", "deleted-cwd", "deleted-fchdir", "overwrite-bun", "overwrite-node", "repoint-bun", "repoint-node", "absolute-bun", "absolute-bun-copy", "bun-delegation", "node-test", "inspect-base", "inspect-copy", "inspect-path", "inspect-base-inline", "inspect-copy-inline", "inspect-path-inline", "shebang-bun", "shebang-node", "shebang-chain", "fd-bun", "symlink-bun-missing", "symlink-node-missing", "symlink-bun-decoy", "symlink-node-decoy", "relative-bun-decoy", "relative-node-decoy", "chdir-bun-decoy", "chdir-node-decoy", "transient-bun", "transient-node"]
     for (const shape of launchShapes) {
       runOptions.env.FAST_SUITE_LAUNCH_SHAPE = shape
       writeFileSync(marker, "")
       const launchEscape = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
-      if (shape.startsWith("deleted-")) {
+      if (shape.startsWith("deleted-") || shape.startsWith("job-control-")) {
         if (launchEscape.exitCode !== 0) console.error(shape, launchEscape.stdout.toString(), launchEscape.stderr.toString())
         expect(launchEscape.exitCode).toBe(0)
         expect(launchEscape.stdout.toString()).toContain("verdict=completed mode=fast target_count=4 exit_code=0")
-        expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual([
-          shape,
-          "direct-configured",
-          "direct-second-configured",
-          "second-configured",
-          "selected-configured",
-        ])
+        expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual(
+          [shape, "direct-configured", "direct-second-configured", "second-configured", "selected-configured"].sort(),
+        )
         continue
       }
       if (launchEscape.exitCode === 0) console.error(shape, launchEscape.stdout.toString(), readFileSync(marker, "utf8"))
@@ -942,6 +963,9 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
         expect(launchEscape.stderr.toString()).toContain("unobserved Bun test launch")
       }
       if (/^(?:symlink|relative|chdir|transient|overwrite|repoint)-/.test(shape)) {
+        if (!readFileSync(marker, "utf8").includes(shape.includes("node") ? "shebang-node\n" : "shebang-bun\n")) {
+          console.error(shape, launchEscape.stdout.toString(), launchEscape.stderr.toString())
+        }
         expect(readFileSync(marker, "utf8")).toContain(shape.includes("node") ? "shebang-node\n" : "shebang-bun\n")
         expect(launchEscape.stderr.toString()).toContain(shape.includes("node") ? "unobservable Node test launch" : "unobserved Bun test launch")
       }
