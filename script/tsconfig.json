@@ -14,6 +14,7 @@
     "audit-*.test.ts",
     "check-workflow-guards.ts",
     "fast-suite-runner.test.ts",
+    "test-argv.ts",
     "guard-expression.test.ts",
     "sync-upstream*.ts",
     "changeset-check*.ts",

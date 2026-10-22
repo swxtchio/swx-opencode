@@ -49,6 +49,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     'Fast mode requires Python 3 and working Linux procfs/ptrace; unobserved Bun tests and Node --test invalidate the run.' \
     'The loaded interpreter identity and kernel-expanded argv are captured while each process is stopped at exec,' \
     'before user code runs. Failed or incomplete observation is refused; later script/cwd cleanup cannot change these records.' \
+    'Runtime/test option prefixes use explicit Bun/Node arities; unclassified options are refused instead of assumed boolean.' \
     'bun run --bun delegation is refused. This is a merge-gate speedup, not a security boundary; full suite gates releases.' \
     'A nonzero target with no JUnit report is refused with target attribution, not labeled an execution-set mismatch.' \
     'Fast mode refuses if a selected file reports no active test cases.' \
@@ -145,6 +146,7 @@ args=("$@")
 wrapper_name=\${BASH_SOURCE[0]##*/}
 if ! parsed=$("$parser_bun" "$parser" -- "\${args[@]}" 3>&1 >/dev/null); then
   printf "%s\\n" "tests/run.sh: could not parse Bun launch options" >&2
+  touch "$report_dir/refused-options"
   exit 126
 fi
 fields=()
@@ -720,7 +722,7 @@ FAST_SUITE_ROOT="$root" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPOR
     process.exit(2)
   }
   const entries = await readdir(directory)
-  let invalid = entries.includes("refused-delegation")
+  let invalid = entries.includes("refused-delegation") || entries.includes("refused-options")
   for (const name of entries.filter((entry) => entry.endsWith(".execs") && entry !== "probe.execs")) {
     const records = (await Bun.file(join(directory, name)).text()).trim().split("\n").map((line) => JSON.parse(line))
     const launches = records.filter((entry) => entry.event === "exec")
@@ -733,14 +735,23 @@ FAST_SUITE_ROOT="$root" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPOR
     for (const entry of launches) {
       const executable = entry.executable
       const args = entry.argv.slice(1)
-      if (basename(executable ?? "") === "node" && parseLaunch("node", args).test) {
-        console.error("tests/run.sh: unobservable Node test launch: " + executable)
-        invalid = true
-      }
       const configuredBun = entry.device === runtime.device && entry.inode === runtime.inode
       const namedBun = executable.startsWith("/") && basename(executable) === "bun"
-      if (!configuredBun && !namedBun) continue
-      const parsed = parseLaunch("bun", args)
+      const node = basename(executable ?? "") === "node"
+      if (!configuredBun && !namedBun && !node) continue
+      const parsed = parseLaunch(node ? "node" : "bun", args)
+      if (parsed.error) {
+        console.error("tests/run.sh: " + parsed.error)
+        invalid = true
+        continue
+      }
+      if (node) {
+        if (parsed.test) {
+          console.error("tests/run.sh: unobservable Node test launch: " + executable)
+          invalid = true
+        }
+        continue
+      }
       if (!parsed.test || parsed.worker) continue
       const outfileIndex = parsed.options.find((index) => args[index] === "--reporter-outfile" || args[index].startsWith("--reporter-outfile="))
       const outfile = outfileIndex === undefined ? undefined : args[outfileIndex].includes("=") ? args[outfileIndex].slice("--reporter-outfile=".length) : args[outfileIndex + 1]
