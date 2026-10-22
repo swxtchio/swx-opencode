@@ -24,6 +24,8 @@ import { InstanceStore } from "@/project/instance-store"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { Npm } from "@opencode-ai/core/npm"
+import { NpmTest } from "../fake/npm"
 
 const originalEnv = new Map<string, string | undefined>()
 
@@ -90,6 +92,15 @@ const paid = (providers: Record<string, { models: Record<string, { cost: { input
 const languageBaseURL = (language: unknown) => (language as { config: { baseURL: string } }).config.baseURL
 
 const it = testEffect(LayerNode.compile(LayerNode.group([Provider.node, Env.node, Plugin.node])))
+const smallModelProvider = testEffect(
+  LayerNode.compile(LayerNode.group([Provider.node, Env.node, Plugin.node]), [
+    [Npm.node, NpmTest.noop],
+    [Plugin.node, Layer.mock(Plugin.Service)({
+      list: () => Effect.succeed([]),
+      trigger: (_name, _input, output) => Effect.succeed(output),
+    })],
+  ]),
+)
 const experimentalModels = testEffect(providerLayer({ enableExperimentalModels: true }))
 
 const alphaProviderConfig = {
@@ -810,7 +821,7 @@ it.instance(
   },
 )
 
-it.instance("getSmallModel returns appropriate small model", () =>
+smallModelProvider.instance("getSmallModel returns appropriate small model", () =>
   Effect.gen(function* () {
     yield* set("ANTHROPIC_API_KEY", "test-api-key")
     const model = yield* Provider.use.getSmallModel(ProviderV2.ID.anthropic)
@@ -819,7 +830,7 @@ it.instance("getSmallModel returns appropriate small model", () =>
   }),
 )
 
-it.instance("getSmallModel prefers Gemini for Google Vertex", () =>
+smallModelProvider.instance("getSmallModel prefers Gemini for Google Vertex", () =>
   Effect.gen(function* () {
     yield* set("GOOGLE_VERTEX_PROJECT", "test-project")
     const model = yield* Provider.use.getSmallModel(ProviderV2.ID.googleVertex)
@@ -828,7 +839,7 @@ it.instance("getSmallModel prefers Gemini for Google Vertex", () =>
   }),
 )
 
-it.instance(
+smallModelProvider.instance(
   "getSmallModel selects the latest model in the preferred family",
   Effect.gen(function* () {
     const model = yield* Provider.use.getSmallModel(ProviderV2.ID.make("test-provider"))
@@ -852,7 +863,7 @@ it.instance(
   },
 )
 
-it.instance(
+smallModelProvider.instance(
   "getSmallModel matches exact model families",
   Effect.gen(function* () {
     const model = yield* Provider.use.getSmallModel(ProviderV2.ID.make("test-provider"))
@@ -875,7 +886,7 @@ it.instance(
   },
 )
 
-it.instance(
+smallModelProvider.instance(
   "getSmallModel ignores model IDs without family metadata",
   Effect.gen(function* () {
     const model = yield* Provider.use.getSmallModel(ProviderV2.ID.make("test-provider"))
@@ -897,7 +908,7 @@ it.instance(
   },
 )
 
-it.instance("getSmallModel skips inferred models for Azure", () =>
+smallModelProvider.instance("getSmallModel skips inferred models for Azure", () =>
   Effect.gen(function* () {
     yield* set("AZURE_RESOURCE_NAME", "test-resource")
     yield* set("AZURE_API_KEY", "test-key")
@@ -906,7 +917,7 @@ it.instance("getSmallModel skips inferred models for Azure", () =>
   }),
 )
 
-it.instance("getSmallModel skips inferred models for Azure Cognitive Services", () =>
+smallModelProvider.instance("getSmallModel skips inferred models for Azure Cognitive Services", () =>
   Effect.gen(function* () {
     yield* set("AZURE_COGNITIVE_SERVICES_RESOURCE_NAME", "test-resource")
     yield* set("AZURE_COGNITIVE_SERVICES_API_KEY", "test-key")
@@ -915,7 +926,7 @@ it.instance("getSmallModel skips inferred models for Azure Cognitive Services", 
   }),
 )
 
-it.instance(
+smallModelProvider.instance(
   "getSmallModel respects config small_model override",
   Effect.gen(function* () {
     yield* set("ANTHROPIC_API_KEY", "test-api-key")
@@ -927,7 +938,7 @@ it.instance(
   { config: { small_model: "anthropic/claude-sonnet-4-6" } },
 )
 
-it.instance(
+smallModelProvider.instance(
   "getSmallModel reports invalid config small_model",
   Effect.gen(function* () {
     yield* set("ANTHROPIC_API_KEY", "test-api-key")
