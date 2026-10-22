@@ -1,0 +1,97 @@
+{
+  "observedAt": "2026-10-22T07:12:57.554Z",
+  "sourceCommit": "2ba9a2123cb70ebb08b5a0619dbc3e45cfb97fec",
+  "platform": "linux-arm64",
+  "bun": "1.4.2",
+  "autoVacuum": "NONE",
+  "privateDatabaseOnly": true,
+  "before": [
+    {
+      "path": "opencode.db",
+      "allocatedBytes": 25575424,
+      "sizeBytes": 25571328
+    },
+    {
+      "path": "opencode.db-wal",
+      "allocatedBytes": 0,
+      "sizeBytes": 0
+    },
+    {
+      "path": "opencode.db-shm",
+      "allocatedBytes": 0,
+      "sizeBytes": 0
+    },
+    {
+      "path": "opencode.db-journal",
+      "allocatedBytes": 0,
+      "sizeBytes": 0
+    }
+  ],
+  "after": [
+    {
+      "path": "opencode.db",
+      "allocatedBytes": 372736,
+      "sizeBytes": 368640
+    },
+    {
+      "path": "opencode.db-wal",
+      "allocatedBytes": 0,
+      "sizeBytes": 0
+    },
+    {
+      "path": "opencode.db-shm",
+      "allocatedBytes": 32768,
+      "sizeBytes": 32768
+    },
+    {
+      "path": "opencode.db-journal",
+      "allocatedBytes": 0,
+      "sizeBytes": 0
+    }
+  ],
+  "deletedCounts": {
+    "sessions": 1,
+    "ownedRows": 34,
+    "byTable": {
+      "session_prompt_queue_alias": 2,
+      "session_prompt_queue": 2,
+      "session_prompt_queue_sequence": 1,
+      "session_prompt_receipt": 2,
+      "session_prompt_provenance": 1,
+      "session_ask": 1,
+      "session_input": 1,
+      "session_context_epoch": 1,
+      "todo": 1,
+      "session_share": 0,
+      "part": 2,
+      "message": 3,
+      "session_message": 3,
+      "event": 11,
+      "event_aggregate_writer": 1,
+      "event_retention": 0,
+      "event_sequence": 1,
+      "session": 1
+    }
+  },
+  "liveSessionRetained": true,
+  "livePartsRetained": true,
+  "integrity": [
+    {
+      "integrity_check": "ok"
+    }
+  ],
+  "foreignKeys": [],
+  "checkpoint": {
+    "busy": 0,
+    "log": 0,
+    "checkpointed": 0
+  },
+  "vacuum": {
+    "state": "complete"
+  },
+  "vacuumCheckpoint": {
+    "busy": 0,
+    "log": 0,
+    "checkpointed": 0
+  }
+}

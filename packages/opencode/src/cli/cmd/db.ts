@@ -6,7 +6,7 @@ import { sql } from "drizzle-orm"
 import { cmd } from "./cmd"
 import { effectCmd } from "../effect-cmd"
 import { ExportUsageCommand } from "./db-export-usage"
-import { PruneCommand } from "./db-prune"
+import { PruneCommand, RetireCommand } from "./db-prune"
 import { RetentionCommand } from "./db-retention"
 
 const QueryCommand = effectCmd({
@@ -63,6 +63,7 @@ export const DbCommand = cmd({
       .command(PathCommand)
       .command(ExportUsageCommand)
       .command(PruneCommand)
+      .command(RetireCommand)
       .command(RetentionCommand)
       .demandCommand()
   },

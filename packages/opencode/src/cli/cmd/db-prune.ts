@@ -14,6 +14,8 @@ type LedgerStatus = "available" | "unavailable" | "failed"
 
 type PruneArgs = {
   before?: string
+  database?: string
+  directory?: string
   session?: string[]
   apply?: boolean
   firstmateRanIt?: boolean
@@ -21,9 +23,19 @@ type PruneArgs = {
   usageLedgerStatus?: LedgerStatus
 }
 
-type SessionRow = { id: string; parent_id: string | null; time_created: number; time_updated: number }
+type SessionRow = {
+  id: string
+  directory: string
+  parent_id: string | null
+  time_created: number
+  time_updated: number
+}
 type SessionReport = {
   sessionID: string
+  directory: string | null
+  directoryIdentity: string | null
+  directoryState: string
+  ownedRows: Record<string, number>
   parentSessionID: string | null
   createdAt: string | null
   lastActivity: string | null
@@ -57,7 +69,7 @@ const ownedSessionTables = new Set([
 const aggregateTables = ["event_sequence", "event", "event_retention", "event_aggregate_writer"]
 
 const requiredColumns: Record<string, string[]> = {
-  session: ["id", "parent_id", "time_created", "time_updated", "time_compacting"],
+  session: ["id", "directory", "parent_id", "time_created", "time_updated", "time_compacting"],
   message: ["id", "session_id", "time_created", "time_updated", "data"],
   part: ["id", "message_id", "session_id", "time_created", "time_updated", "data"],
   todo: ["session_id", "time_created", "time_updated"],
@@ -91,7 +103,14 @@ const activitySources: {
   scope: string
   columns: { name: string; optional: boolean }[]
 }[] = [
-  { table: "session", scope: "id", columns: [{ name: "time_created", optional: false }, { name: "time_updated", optional: false }] },
+  {
+    table: "session",
+    scope: "id",
+    columns: [
+      { name: "time_created", optional: false },
+      { name: "time_updated", optional: false },
+    ],
+  },
   {
     table: "message",
     scope: "session_id",
@@ -159,55 +178,97 @@ const activitySources: {
       { name: "time_updated", optional: false },
     ],
   },
-  { table: "event_retention", scope: "aggregate_id", columns: [{ name: "time_started", optional: false }, { name: "time_updated", optional: false }] },
+  {
+    table: "event_retention",
+    scope: "aggregate_id",
+    columns: [
+      { name: "time_started", optional: false },
+      { name: "time_updated", optional: false },
+    ],
+  },
   { table: "event_aggregate_writer", scope: "aggregate_id", columns: [{ name: "time_last_append", optional: false }] },
 ]
 
 const sidecars = ["-wal", "-shm", "-journal"]
 
+const storageScopes: readonly (readonly [string, string])[] = [
+  ["session_prompt_queue_alias", "item_id IN (SELECT id FROM session_prompt_queue WHERE session_id = ?)"],
+  ...[
+    "session_prompt_queue",
+    "session_prompt_queue_sequence",
+    "session_prompt_receipt",
+    "session_prompt_provenance",
+    "session_ask",
+    "session_input",
+    "session_context_epoch",
+    "todo",
+    "session_share",
+    "part",
+    "message",
+    "session_message",
+  ].map((table) => [table, "session_id = ?"] as const),
+  ...["event", "event_aggregate_writer", "event_retention", "event_sequence"].map(
+    (table) => [table, "aggregate_id = ?"] as const,
+  ),
+  ["session", "id = ?"],
+]
+
+const pruneOptions = (yargs: Argv) =>
+  yargs
+    .option("before", {
+      type: "string",
+      describe: "optional UTC or offset cutoff narrowing missing-directory Sessions by activity",
+    })
+    .option("database", {
+      type: "string",
+      describe: "target local database file (defaults to opencode db path); never creates a database",
+    })
+    .option("directory", {
+      type: "string",
+      describe: "limit retirement to this absolute recorded directory, after it has been removed",
+    })
+    .option("session", {
+      type: "array",
+      string: true,
+      describe: "limit inventory and apply to these Session IDs; may be repeated",
+    })
+    .option("apply", {
+      type: "boolean",
+      default: false,
+      describe: "delete the selected whole Sessions and reclaim allocated database bytes",
+    })
+    .option("firstmate-ran-it", {
+      type: "boolean",
+      default: false,
+      describe: "report Firstmate's actual-run confirmation; this does not gate pruning",
+    })
+    .option("measurement-status", {
+      type: "string",
+      choices: ["measured", "partial", "unavailable", "failed"],
+      default: "unavailable",
+      describe: "report the best-effort Firstmate measurement state without requiring completeness",
+    })
+    .option("usage-ledger-status", {
+      type: "string",
+      choices: ["available", "unavailable", "failed"],
+      default: "unavailable",
+      describe: "report Firstmate's durable usage-ledger state without using it as a deletion gate",
+    })
+
 export const PruneCommand = cmd<{}, PruneArgs>({
   command: "prune",
-  describe: "inventory old local Sessions; --apply deletes whole Sessions and reclaims allocated database bytes",
-  builder: (yargs: Argv) =>
-    yargs
-      .option("before", {
-        type: "string",
-        demandOption: true,
-        describe: "explicit UTC or offset timestamp cutoff; only older, inactive Sessions are considered",
-      })
-      .option("session", {
-        type: "array",
-        string: true,
-        describe: "limit inventory and apply to these Session IDs; may be repeated",
-      })
-      .option("apply", {
-        type: "boolean",
-        default: false,
-        describe: "delete the selected whole Sessions and reclaim allocated database bytes",
-      })
-      .option("firstmate-ran-it", {
-        type: "boolean",
-        default: false,
-        describe: "report Firstmate's actual-run confirmation; this does not gate pruning",
-      })
-      .option("measurement-status", {
-        type: "string",
-        choices: ["measured", "partial", "unavailable", "failed"],
-        default: "unavailable",
-        describe: "report the best-effort Firstmate measurement state without requiring completeness",
-      })
-      .option("usage-ledger-status", {
-        type: "string",
-        choices: ["available", "unavailable", "failed"],
-        default: "unavailable",
-        describe: "report Firstmate's durable usage-ledger state without using it as a deletion gate",
-      }),
+  describe: "inventory missing-directory local Sessions; --apply deletes them offline and vacuums the database",
+  builder: pruneOptions,
   async handler(args) {
-    const filename = Database.path()
+    const filename = args.database ?? Database.path()
     const cutoff = parseCutoff(args.before)
     const requested = normalizeSessionIDs(args.session)
     const usage = measurementReport(args)
-    if (!cutoff || requested === null) {
+    if (
+      (args.before !== undefined && !cutoff) ||
+      requested === null ||
+      (args.directory !== undefined && !validDirectory(args.directory))
+    ) {
       console.log(
         JSON.stringify(
           {
@@ -217,9 +278,18 @@ export const PruneCommand = cmd<{}, PruneArgs>({
             selectedSessions: [],
             excludedSessions: [],
             deletionScope: { sessionIDs: [], wholeSessions: true },
-            reclamation: { ready: false, reasons: [!cutoff ? "invalid-or-missing-cutoff" : "invalid-session-selection"] },
+            reclamation: {
+              ready: false,
+              reasons: [
+                args.before !== undefined && !cutoff
+                  ? "invalid-or-missing-cutoff"
+                  : requested === null
+                    ? "invalid-session-selection"
+                    : "invalid-directory-selection",
+              ],
+            },
             usageMeasurement: usage,
-            rawTranscriptWarning: "Applying this command permanently deletes the old raw transcripts in selected Sessions.",
+            rawTranscriptWarning: "Applying this command permanently deletes the raw transcripts in selected Sessions.",
             changedRows: 0,
           },
           null,
@@ -232,53 +302,87 @@ export const PruneCommand = cmd<{}, PruneArgs>({
 
     const resolved = await resolveDatabaseFile(filename)
     if ("reason" in resolved) {
-      console.log(JSON.stringify(refusedReport(filename, cutoff, requested, usage, [resolved.reason ?? "database-file-unreadable"]), null, 2))
+      console.log(
+        JSON.stringify(
+          refusedReport(filename, cutoff, requested, usage, [resolved.reason ?? "database-file-unreadable"]),
+          null,
+          2,
+        ),
+      )
       process.exitCode = 1
       return
     }
+    if (args.apply) {
+      const holders = scanDatabaseHolders(resolved.filename)
+      const reasons =
+        holders.state === "unreadable"
+          ? [`database-liveness-unreadable:${holders.reason}`]
+          : holders.pids.length > 0
+            ? [`database-in-use-by-process:${holders.pids.join(",")}`]
+            : []
+      if (reasons.length > 0) {
+        console.log(JSON.stringify(refusedReport(filename, cutoff, requested, usage, reasons), null, 2))
+        process.exitCode = 1
+        return
+      }
+    }
 
     const sqlite = await import("bun:sqlite")
-    const db = new sqlite.Database(
-      resolved.filename,
-      args.apply ? { readwrite: true, create: false } : { readonly: true },
-    ) as SqliteAccess
+    let db: SqliteAccess | undefined
     try {
+      db = new sqlite.Database(resolved.filename, args.apply ? { readwrite: true, create: false } : { readonly: true })
       db.exec("PRAGMA busy_timeout = 5; PRAGMA foreign_keys = ON")
-      const inventory = await inventorySnapshot(db, resolved.filename, cutoff, requested)
+      // Retain SQLite exclusion across the committed delete and the out-of-transaction vacuum.
+      if (args.apply) db.exec("PRAGMA locking_mode = EXCLUSIVE")
+      const inventory = await inventorySnapshot(db, resolved.filename, cutoff, requested, args.directory)
       if (!args.apply) {
         console.log(JSON.stringify({ ...inventory, action: "inventory", usageMeasurement: usage }, null, 2))
         return
       }
 
-      const result = await applyPrune(db, resolved.filename, cutoff, requested, inventory)
+      const result = await applyPrune(db, resolved.filename, cutoff, requested, inventory, args.directory)
       console.log(JSON.stringify({ ...result, usageMeasurement: usage }, null, 2))
-      if (result.action !== "applied") process.exitCode = 1
+      if (result.action !== "applied" && result.action !== "noop") process.exitCode = 1
     } catch (error) {
       console.log(
         JSON.stringify(
-          refusedReport(filename, cutoff, requested, usage, [error instanceof Error ? error.message : "database-operation-failed"]),
+          refusedReport(filename, cutoff, requested, usage, [
+            error instanceof Error ? error.message : "database-operation-failed",
+          ]),
           null,
           2,
         ),
       )
       process.exitCode = 1
     } finally {
-      db.close()
+      db?.close()
     }
   },
+})
+
+export const RetireCommand = cmd<{}, PruneArgs>({
+  command: "retire",
+  describe: "retire a removed worktree's local Sessions; inventory unless --apply is specified",
+  builder: (yargs: Argv) => pruneOptions(yargs).demandOption("directory"),
+  handler: PruneCommand.handler,
 })
 
 async function inventorySnapshot(
   db: SqliteAccess,
   filename: string,
-  cutoff: number,
+  cutoff: number | undefined,
   requested: readonly string[] | undefined,
+  directory?: string,
 ) {
   const schema = inspectSchema(db)
   const sessions = schema.tables.has("session")
-    ? db.query<SessionRow, []>("SELECT id, parent_id, time_created, time_updated FROM session ORDER BY id").all()
+    ? db
+        .query<SessionRow, []>("SELECT id, directory, parent_id, time_created, time_updated FROM session ORDER BY id")
+        .all()
     : []
   const parents = sessions.map((row) => [row.id, row.parent_id] as const)
+  const targetDirectory = directory === undefined ? undefined : await directoryIdentity(directory)
+  const targetState = directory === undefined ? undefined : await inspectDirectory(directory)
   const ids = new Set(sessions.map((row) => row.id))
   const activities = activityBySession(db, schema.tables, schema.columnMap)
   const ownership = aggregateOwnershipFailures(db, ids, schema.tables)
@@ -295,6 +399,8 @@ async function inventorySnapshot(
   const autoVacuum = db.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()?.auto_vacuum
   const allocated = await allocatedBytes(filename)
   const globalReasons = [...schema.failures, ...unknownStorage, ...ownership]
+  if (directory !== undefined && targetDirectory === undefined) globalReasons.push("directory-identity-unreadable")
+  if (targetState !== undefined && targetState !== "missing") globalReasons.push(`retirement-target-${targetState}`)
   if (integrity.state !== "ok") globalReasons.push(`integrity-check-${integrity.state}`)
   if (foreignKeys.state !== "ok") globalReasons.push(`foreign-key-check-${foreignKeys.state}`)
   const candidates = new Map<string, SessionReport>()
@@ -302,6 +408,12 @@ async function inventorySnapshot(
 
   for (const row of sessions) {
     const reasons = [...globalReasons, ...holderReasons]
+    const identity = await directoryIdentity(row.directory)
+    const directoryState = identity === undefined ? "unknown" : await inspectDirectory(identity)
+    if (directoryState !== "missing") reasons.push(`session-directory-${directoryState}`)
+    if (directory !== undefined && !retirementScope(row.directory, identity, directory, targetDirectory)) {
+      reasons.push("outside-explicit-directory-selection")
+    }
     if (requested && !requested.includes(row.id)) reasons.push("outside-explicit-session-selection")
     if (row.parent_id !== null && !ids.has(row.parent_id)) reasons.push("parent-session-missing")
     if (hasParentCycle(row.id, new Map(sessions.map((item) => [item.id, item.parent_id])))) {
@@ -309,13 +421,17 @@ async function inventorySnapshot(
     }
     const activity = activities.get(row.id)
     if (!activity || activity.unreadable) reasons.push("activity-evidence-unreadable")
-    else if (activity.lastActivity >= cutoff) reasons.push("activity-at-or-after-cutoff")
+    else if (cutoff !== undefined && activity.lastActivity >= cutoff) reasons.push("activity-at-or-after-cutoff")
     if (schema.failures.length === 0) {
       reasons.push(...writerFailures(db, row.id))
       reasons.push(...sessionWorkFailures(db, row.id))
     }
     const report: SessionReport = {
       sessionID: row.id,
+      directory: row.directory,
+      directoryIdentity: identity ?? null,
+      directoryState,
+      ownedRows: schema.failures.length === 0 ? ownedRows(db, row.id) : {},
       parentSessionID: row.parent_id,
       createdAt: Number.isFinite(row.time_created) ? new Date(row.time_created).toISOString() : null,
       lastActivity: activity ? new Date(activity.lastActivity).toISOString() : null,
@@ -343,6 +459,10 @@ async function inventorySnapshot(
     if (ids.has(id)) continue
     excluded.set(id, {
       sessionID: id,
+      directory: null,
+      directoryIdentity: null,
+      directoryState: "unknown",
+      ownedRows: {},
       parentSessionID: null,
       createdAt: null,
       lastActivity: null,
@@ -358,27 +478,54 @@ async function inventorySnapshot(
     ...crossSessionOwnership,
     ...holderReasons,
   ]
+  if (directory !== undefined && targetDirectory === undefined) readinessReasons.push("directory-identity-unreadable")
   if (integrity.state !== "ok") readinessReasons.push(`integrity-check-${integrity.state}`)
   if (foreignKeys.state !== "ok") readinessReasons.push(`foreign-key-check-${foreignKeys.state}`)
-  if (autoVacuum !== 2) readinessReasons.push(`incremental-auto-vacuum-unsupported:${autoVacuum ?? "unreadable"}`)
   if (allocated.status !== "measured") readinessReasons.push(`allocated-byte-measurement-${allocated.status}`)
+  const retainedSessions = [...excluded.values()].filter(
+    (item) =>
+      (!requested || requested.includes(item.sessionID)) &&
+      (directory !== undefined
+        ? retirementScope(item.directory, item.directoryIdentity ?? undefined, directory, targetDirectory)
+        : requested !== undefined || item.directoryState === "missing") &&
+      !item.reasons.includes("activity-at-or-after-cutoff"),
+  )
   return {
     database: filename,
-    cutoff: new Date(cutoff).toISOString(),
+    cutoff: cutoff === undefined ? null : new Date(cutoff).toISOString(),
+    explicitDirectory: directory ?? null,
+    directoryIdentity: targetDirectory ?? null,
+    retirementTarget:
+      directory === undefined ? null : { directory, identity: targetDirectory ?? null, state: targetState },
     explicitSessionIDs: requested ?? null,
     selectedSessions: [...candidates.values()].toSorted((left, right) => left.sessionID.localeCompare(right.sessionID)),
     excludedSessions: [...excluded.values()].toSorted((left, right) => left.sessionID.localeCompare(right.sessionID)),
+    retainedSessions,
+    retainedCounts: {
+      sessions: retainedSessions.length,
+      ownedRows: retainedSessions.reduce(
+        (sum, item) => sum + Object.values(item.ownedRows).reduce((sum, n) => sum + n, 0),
+        0,
+      ),
+    },
     deletionScope: { sessionIDs: [...candidates.keys()].toSorted(), wholeSessions: true },
+    selectedCounts: {
+      sessions: candidates.size,
+      ownedRows: [...candidates.values()].reduce(
+        (sum, item) => sum + Object.values(item.ownedRows).reduce((sum, n) => sum + n, 0),
+        0,
+      ),
+    },
     reclamation: {
       ready: readinessReasons.length === 0,
-      method: "PRAGMA incremental_vacuum followed by PRAGMA wal_checkpoint(TRUNCATE)",
-      autoVacuum: autoVacuum === 2 ? "incremental" : autoVacuum ?? "unreadable",
+      method: "PRAGMA wal_checkpoint(TRUNCATE) followed by VACUUM",
+      autoVacuum: autoVacuum === 2 ? "incremental" : (autoVacuum ?? "unreadable"),
       allocatedBytes: allocated,
       integrity,
       foreignKeys,
       reasons: [...new Set(readinessReasons)].toSorted(),
     },
-    rawTranscriptWarning: "Applying this command permanently deletes the old raw transcripts in selected Sessions.",
+    rawTranscriptWarning: "Applying this command permanently deletes the raw transcripts in selected Sessions.",
     changedRows: 0,
     [parentSnapshot]: parents,
   }
@@ -387,21 +534,53 @@ async function inventorySnapshot(
 async function applyPrune(
   db: SqliteAccess,
   filename: string,
-  cutoff: number,
+  cutoff: number | undefined,
   requested: readonly string[] | undefined,
   inventory: Awaited<ReturnType<typeof inventorySnapshot>>,
+  directory?: string,
 ) {
+  if (directory !== undefined) {
+    const state = await inspectDirectory(directory)
+    if (state === "exists") return retirementNoop(inventory, "target-exists")
+    if (state !== "missing")
+      return { ...inventory, action: "refused", refusalReasons: [`retirement-target-${state}`], changedRows: 0 }
+  }
   const refusalReasons = [...inventory.reclamation.reasons]
-  if (inventory.selectedSessions.length === 0) refusalReasons.push("no-eligible-sessions")
+  if (inventory.selectedSessions.length === 0 && directory === undefined) refusalReasons.push("no-eligible-sessions")
   if (refusalReasons.length > 0) return { ...inventory, action: "refused", refusalReasons, changedRows: 0 }
+  if (inventory.selectedSessions.length === 0) {
+    const targetDirectory = await directoryIdentity(directory!)
+    const state = targetDirectory === undefined ? "unknown" : await inspectDirectory(targetDirectory)
+    if (
+      state !== "missing" ||
+      inventory.excludedSessions.some((item) =>
+        retirementScope(item.directory, item.directoryIdentity ?? undefined, directory!, targetDirectory),
+      )
+    ) {
+      return {
+        ...inventory,
+        action: "refused",
+        refusalReasons: [`directory-retirement-not-eligible:${state}`],
+        changedRows: 0,
+      }
+    }
+    return retirementNoop(inventory, "no-matching-sessions")
+  }
   if (inventory.reclamation.allocatedBytes.status !== "measured") {
-    return { ...inventory, action: "refused", refusalReasons: ["allocated-byte-measurement-unavailable"], changedRows: 0 }
+    return {
+      ...inventory,
+      action: "refused",
+      refusalReasons: ["allocated-byte-measurement-unavailable"],
+      changedRows: 0,
+    }
   }
 
   let changedRows = 0
+  const deletedByTable: Record<string, number> = {}
   db.exec("BEGIN IMMEDIATE")
   try {
-    const current = await inventorySnapshot(db, filename, cutoff, requested)
+    await requireMissingTarget(directory)
+    const current = await inventorySnapshot(db, filename, cutoff, requested, directory)
     if (!current.reclamation.ready) throw new Error(`revalidation-failed:${current.reclamation.reasons.join(",")}`)
     if (!sameIDs(inventory.deletionScope.sessionIDs, current.deletionScope.sessionIDs)) {
       throw new Error("selection-changed-after-inventory")
@@ -409,7 +588,12 @@ async function applyPrune(
     if (!sameParents(inventory[parentSnapshot], current[parentSnapshot])) {
       throw new Error("session-relationships-changed-after-inventory")
     }
-    if (!sameIDs(current.deletionScope.sessionIDs, inventory.selectedSessions.map((item) => item.sessionID))) {
+    if (
+      !sameIDs(
+        current.deletionScope.sessionIDs,
+        inventory.selectedSessions.map((item) => item.sessionID),
+      )
+    ) {
       throw new Error("inventory-scope-inconsistent")
     }
 
@@ -418,8 +602,13 @@ async function applyPrune(
     if (beforeIntegrity.state !== "ok") throw new Error(`integrity-check-${beforeIntegrity.state}`)
     if (beforeForeignKeys.state !== "ok") throw new Error(`foreign-key-check-${beforeForeignKeys.state}`)
 
-    changedRows += deleteSessions(db, current.deletionScope.sessionIDs)
-    db.exec("PRAGMA incremental_vacuum")
+    for (const session of current.selectedSessions) {
+      if ((await inspectDirectory(session.directory!)) !== "missing")
+        throw new Error("session-directory-restored-before-delete")
+    }
+    await requireMissingTarget(directory)
+    Object.assign(deletedByTable, deleteSessions(db, current.deletionScope.sessionIDs))
+    changedRows = Object.values(deletedByTable).reduce((sum, count) => sum + count, 0)
     const afterIntegrity = integrityResult(db)
     const afterForeignKeys = foreignKeyResult(db)
     if (afterIntegrity.state !== "ok") throw new Error(`integrity-check-after-delete-${afterIntegrity.state}`)
@@ -435,6 +624,8 @@ async function applyPrune(
     db.exec("COMMIT")
   } catch (error) {
     if (db.inTransaction) db.exec("ROLLBACK")
+    if (error instanceof Error && error.message === "retirement-target-exists")
+      return retirementNoop(inventory, "target-exists")
     return {
       ...inventory,
       action: "refused",
@@ -443,17 +634,22 @@ async function applyPrune(
     }
   }
 
-  const checkpoint = (() => {
+  const checkpoint = checkpointDatabase(db)
+  const vacuum = (() => {
+    if (changedRows === 0) return { state: "skipped", reason: "no-deletions" }
+    if ("error" in checkpoint || checkpoint.busy !== 0) return { state: "skipped", reason: "checkpoint-incomplete" }
     try {
-      return (
-        db.query<{ busy: number }, []>("PRAGMA wal_checkpoint(TRUNCATE)").get() ?? {
-          error: "wal-checkpoint-returned-no-result",
-        }
-      )
+      const holders = scanDatabaseHolders(filename)
+      if (holders.state === "unreadable") throw new Error(`database-liveness-unreadable:${holders.reason}`)
+      if (holders.pids.length > 0) throw new Error(`database-in-use-by-process:${holders.pids.join(",")}`)
+      db.exec("VACUUM")
+      return { state: "complete" }
     } catch (error) {
-      return { error: error instanceof Error ? error.message : "unknown" }
+      return { state: "failed", reason: error instanceof Error ? error.message : "unknown" }
     }
   })()
+  // VACUUM can populate a WAL even after shrinking the main file.
+  const vacuumCheckpoint = vacuum.state === "complete" ? checkpointDatabase(db) : undefined
   const afterAllocated = await allocatedBytes(filename)
   const beforeAllocated = inventory.reclamation.allocatedBytes
   const reclaimedBytes =
@@ -479,17 +675,26 @@ async function applyPrune(
   const reclamationReasons = []
   if ("error" in checkpoint) reclamationReasons.push(`wal-checkpoint-failed:${checkpoint.error}`)
   else if (checkpoint.busy !== 0) reclamationReasons.push("wal-checkpoint-did-not-complete")
-  if (afterAllocated.status !== "measured") reclamationReasons.push("allocated-byte-measurement-after-apply-unavailable")
-  if (reclaimedBytes === undefined || reclaimedBytes <= 0) reclamationReasons.push("allocated-bytes-not-reclaimed")
+  if (vacuum.state !== "complete" && vacuum.reason !== "no-deletions")
+    reclamationReasons.push(`vacuum-${vacuum.state}:${vacuum.reason}`)
+  if (vacuumCheckpoint && "error" in vacuumCheckpoint)
+    reclamationReasons.push(`vacuum-checkpoint-failed:${vacuumCheckpoint.error}`)
+  else if (vacuumCheckpoint && vacuumCheckpoint.busy !== 0)
+    reclamationReasons.push("vacuum-checkpoint-did-not-complete")
+  if (afterAllocated.status !== "measured")
+    reclamationReasons.push("allocated-byte-measurement-after-apply-unavailable")
   if (postIntegrity.state !== "ok") reclamationReasons.push(`integrity-check-after-checkpoint-${postIntegrity.state}`)
-  if (postForeignKeys.state !== "ok") reclamationReasons.push(`foreign-key-check-after-checkpoint-${postForeignKeys.state}`)
-  const action = reclamationReasons.length === 0 ? "applied" : "failed"
+  if (postForeignKeys.state !== "ok")
+    reclamationReasons.push(`foreign-key-check-after-checkpoint-${postForeignKeys.state}`)
+  const action = reclamationReasons.length === 0 ? (changedRows > 0 ? "applied" : "noop") : "failed"
   return {
     ...inventory,
     action,
     committed: true,
+    partial: inventory.retainedSessions.length > 0,
     changedRows,
     deletedSessionIDs: inventory.deletionScope.sessionIDs,
+    deletedCounts: { sessions: deletedByTable.session ?? 0, ownedRows: changedRows, byTable: deletedByTable },
     reclamation: {
       ...inventory.reclamation,
       allocatedBytesBefore: beforeAllocated,
@@ -497,6 +702,8 @@ async function applyPrune(
       reclaimedBytes,
       allocatedBytesByPath,
       checkpoint,
+      vacuum,
+      vacuumCheckpoint,
       integrityAfter: postIntegrity,
       foreignKeysAfter: postForeignKeys,
       reasons: reclamationReasons,
@@ -505,30 +712,160 @@ async function applyPrune(
   }
 }
 
+async function requireMissingTarget(directory: string | undefined) {
+  if (directory === undefined) return
+  const state = await inspectDirectory(directory)
+  if (state !== "missing") throw new Error(`retirement-target-${state}`)
+}
+
+function retirementNoop(inventory: Awaited<ReturnType<typeof inventorySnapshot>>, reason: string) {
+  const retainedSessions =
+    reason === "target-exists"
+      ? [...inventory.selectedSessions, ...inventory.retainedSessions].map((item) => ({
+          ...item,
+          reasons: [...new Set([...item.reasons, "retirement-target-exists"])],
+        }))
+      : inventory.retainedSessions
+  return {
+    ...inventory,
+    action: "noop",
+    noopReason: reason,
+    retirementTarget:
+      reason === "target-exists" && inventory.retirementTarget
+        ? { ...inventory.retirementTarget, state: "exists" }
+        : inventory.retirementTarget,
+    committed: false,
+    selectedSessions: [],
+    selectedCounts: { sessions: 0, ownedRows: 0 },
+    deletionScope: { ...inventory.deletionScope, sessionIDs: [] },
+    retainedSessions,
+    retainedCounts: {
+      sessions: retainedSessions.length,
+      ownedRows: retainedSessions.reduce(
+        (sum, item) => sum + Object.values(item.ownedRows).reduce((sum, n) => sum + n, 0),
+        0,
+      ),
+    },
+    changedRows: 0,
+    deletedSessionIDs: [],
+    deletedCounts: { sessions: 0, ownedRows: 0, byTable: {} },
+    reclamation: { ...inventory.reclamation, vacuum: { state: "skipped", reason: "no-deletions" } },
+  }
+}
+
+function retirementScope(
+  recorded: string | null,
+  identity: string | undefined,
+  target: string,
+  targetIdentity: string | undefined,
+) {
+  if (identity !== undefined && targetIdentity !== undefined) return withinDirectory(identity, targetIdentity)
+  if (recorded === null || !validDirectory(recorded)) return false
+  return (
+    withinDirectory(path.resolve(recorded), path.resolve(target)) ||
+    withinDirectory(path.resolve(recorded), targetIdentity)
+  )
+}
+
+function checkpointDatabase(db: SqliteAccess) {
+  try {
+    return (
+      db.query<{ busy: number }, []>("PRAGMA wal_checkpoint(TRUNCATE)").get() ?? {
+        error: "wal-checkpoint-returned-no-result",
+      }
+    )
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : "unknown" }
+  }
+}
+
 function deleteSessions(db: SqliteAccess, sessionIDs: readonly string[]) {
-  const placeholders = sessionIDs.map(() => "?").join(",")
-  const params = sessionIDs as string[]
-  const operations = [
-    `DELETE FROM session_prompt_queue_alias WHERE item_id IN (SELECT id FROM session_prompt_queue WHERE session_id IN (${placeholders}))`,
-    `DELETE FROM session_prompt_queue WHERE session_id IN (${placeholders})`,
-    `DELETE FROM session_prompt_queue_sequence WHERE session_id IN (${placeholders})`,
-    `DELETE FROM session_prompt_receipt WHERE session_id IN (${placeholders})`,
-    `DELETE FROM session_prompt_provenance WHERE session_id IN (${placeholders})`,
-    `DELETE FROM session_ask WHERE session_id IN (${placeholders})`,
-    `DELETE FROM session_input WHERE session_id IN (${placeholders})`,
-    `DELETE FROM session_context_epoch WHERE session_id IN (${placeholders})`,
-    `DELETE FROM todo WHERE session_id IN (${placeholders})`,
-    `DELETE FROM session_share WHERE session_id IN (${placeholders})`,
-    `DELETE FROM part WHERE session_id IN (${placeholders})`,
-    `DELETE FROM message WHERE session_id IN (${placeholders})`,
-    `DELETE FROM session_message WHERE session_id IN (${placeholders})`,
-    `DELETE FROM event WHERE aggregate_id IN (${placeholders})`,
-    `DELETE FROM event_aggregate_writer WHERE aggregate_id IN (${placeholders})`,
-    `DELETE FROM event_retention WHERE aggregate_id IN (${placeholders})`,
-    `DELETE FROM event_sequence WHERE aggregate_id IN (${placeholders})`,
-    `DELETE FROM session WHERE id IN (${placeholders})`,
-  ]
-  return operations.reduce((changed, query) => changed + db.query(query).run(...params).changes, 0)
+  return Object.fromEntries(
+    storageScopes.map(([table, scope]) => [
+      table,
+      sessionIDs.reduce((sum, id) => sum + db.query(`DELETE FROM ${quote(table)} WHERE ${scope}`).run(id).changes, 0),
+    ]),
+  )
+}
+
+function ownedRows(db: SqliteAccess, sessionID: string) {
+  return Object.fromEntries(
+    storageScopes.map(([table, scope]) => [
+      table,
+      db
+        .query<{ rows: number }, [string]>(`SELECT count(*) AS rows FROM ${quote(table)} WHERE ${scope}`)
+        .get(sessionID)!.rows,
+    ]),
+  )
+}
+
+function validDirectory(directory: string) {
+  return (
+    typeof directory === "string" && directory.length > 0 && !directory.includes("\0") && path.isAbsolute(directory)
+  )
+}
+
+async function directoryIdentity(directory: string) {
+  if (!validDirectory(directory)) return undefined
+  const root = path.parse(directory).root
+  const segments = directory
+    .slice(root.length)
+    .split(path.sep)
+    .filter((segment) => segment && segment !== ".")
+  let current = path.resolve(root)
+  for (const [index, segment] of segments.entries()) {
+    if (segment === "..") {
+      current = path.dirname(current)
+      continue
+    }
+    const candidate = path.join(current, segment)
+    try {
+      const entry = await lstat(candidate)
+      // Resolve each existing link before parent segments can hide a dangling one.
+      current = entry.isSymbolicLink() ? await realpath(candidate) : candidate
+      if (index < segments.length - 1 && !(entry.isSymbolicLink() ? await stat(current) : entry).isDirectory()) {
+        return undefined
+      }
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) return undefined
+      // ENOENT from lstat is absence; ENOENT resolving a present symlink is uncertainty.
+      try {
+        await lstat(candidate)
+        return undefined
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) return undefined
+      }
+      current = candidate
+    }
+  }
+  return current
+}
+
+function withinDirectory(candidate: string | undefined, directory: string | undefined) {
+  if (candidate === undefined || directory === undefined) return false
+  return (
+    candidate === directory || candidate.startsWith(directory.endsWith(path.sep) ? directory : directory + path.sep)
+  )
+}
+
+async function inspectDirectory(directory: string) {
+  const identity = await directoryIdentity(directory)
+  if (identity === undefined) return "unknown"
+  const root = path.parse(identity).root
+  let current = root
+  for (const segment of identity.slice(root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment)
+    try {
+      const entry = await lstat(current)
+      // Do not infer disappearance through an inaccessible or dangling symlink ancestor.
+      if (entry.isSymbolicLink()) return "unknown"
+      if (!entry.isDirectory()) return "exists"
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return "missing"
+      return "unknown"
+    }
+  }
+  return "exists"
 }
 
 function inspectSchema(db: SqliteAccess) {
@@ -546,7 +883,10 @@ function inspectSchema(db: SqliteAccess) {
       continue
     }
     const present = new Set(
-      db.query<{ name: string }, []>(`PRAGMA table_info(${quote(table)})`).all().map((row) => row.name),
+      db
+        .query<{ name: string }, []>(`PRAGMA table_info(${quote(table)})`)
+        .all()
+        .map((row) => row.name),
     )
     columnMap.set(table, present)
     for (const column of columns) {
@@ -556,7 +896,10 @@ function inspectSchema(db: SqliteAccess) {
 
   const unclassifiedTables = [...tables].filter((table) => {
     if (ownedSessionTables.has(table) || table === "event_writer_process") return false
-    const columns = db.query<{ name: string }, []>(`PRAGMA table_info(${quote(table)})`).all().map((row) => row.name)
+    const columns = db
+      .query<{ name: string }, []>(`PRAGMA table_info(${quote(table)})`)
+      .all()
+      .map((row) => row.name)
     if (columns.includes("session_id") || columns.includes("aggregate_id")) return true
     return db
       .query<{ table: string }, []>(`PRAGMA foreign_key_list(${quote(table)})`)
@@ -612,7 +955,9 @@ function crossSessionCascadeFailures(db: SqliteAccess, sessionIDs: readonly stri
     )
     .all()
     .filter((row) => selected.has(row.parentSessionID) !== selected.has(row.childSessionID))
-    .map((row) => `cross-session-cascade:part.message_id:${row.messageID}:${row.parentSessionID}->${row.childSessionID}`)
+    .map(
+      (row) => `cross-session-cascade:part.message_id:${row.messageID}:${row.parentSessionID}->${row.childSessionID}`,
+    )
     .toSorted()
 }
 
@@ -627,21 +972,29 @@ function activityBySession(
       continue
     }
     const values = source.columns
-      .map((column) => `SELECT ${quote(source.scope)} AS session_id, ${quote(column.name)} AS activity, ${column.optional ? 1 : 0} AS optional FROM ${quote(source.table)}`)
+      .map(
+        (column) =>
+          `SELECT ${quote(source.scope)} AS session_id, ${quote(column.name)} AS activity, ${column.optional ? 1 : 0} AS optional FROM ${quote(source.table)}`,
+      )
       .join(" UNION ALL ")
     const rows = db
-      .query<{ session_id: string; newest: number | null; unreadable: number }, []>(`
+      .query<{ session_id: string; newest: number | null; unreadable: number }, []>(
+        `
         SELECT session_id,
           max(CASE WHEN typeof(activity) = 'integer' THEN activity END) AS newest,
           sum(CASE WHEN typeof(activity) = 'integer' OR (activity IS NULL AND optional = 1) THEN 0 ELSE 1 END) AS unreadable
         FROM (${values})
         GROUP BY session_id
-      `)
+      `,
+      )
       .all()
     for (const row of rows) {
       const current = result.get(row.session_id)
       result.set(row.session_id, {
-        lastActivity: Math.max(current?.lastActivity ?? Number.NEGATIVE_INFINITY, row.newest ?? Number.NEGATIVE_INFINITY),
+        lastActivity: Math.max(
+          current?.lastActivity ?? Number.NEGATIVE_INFINITY,
+          row.newest ?? Number.NEGATIVE_INFINITY,
+        ),
         unreadable: Boolean(current?.unreadable || row.unreadable),
       })
     }
@@ -651,10 +1004,7 @@ function activityBySession(
 
 function writerFailures(db: SqliteAccess, sessionID: string) {
   const rows = db
-    .query<
-      { pid: number | null; boot_id: string | null; start_ticks: string | null },
-      [string]
-    >(
+    .query<{ pid: number | null; boot_id: string | null; start_ticks: string | null }, [string]>(
       `SELECT process.pid, process.boot_id, process.start_ticks
        FROM event_aggregate_writer writer
        LEFT JOIN event_writer_process process ON process.writer_id = writer.writer_id
@@ -725,7 +1075,8 @@ function sessionWorkFailures(db: SqliteAccess, sessionID: string) {
   if (!row) return ["session-work-state-unreadable"]
   const failures = new Set<string>()
   if (row.compacting) failures.add("session-compaction-in-flight")
-  if (row.unreadableV1Message || row.unreadableV2Message || row.unreadablePart) failures.add("session-work-state-unreadable")
+  if (row.unreadableV1Message || row.unreadableV2Message || row.unreadablePart)
+    failures.add("session-work-state-unreadable")
   if (row.unfinishedV1 || row.unfinishedV2 || row.runningPart) failures.add("assistant-or-tool-work-in-flight")
   if (row.pendingV1 || row.preparingV1 || row.pendingReceipt) failures.add("v1-prompt-pending-or-in-custody")
   if (row.malformedV1Queue) failures.add("v1-queue-state-unreadable")
@@ -779,7 +1130,9 @@ function integrityResult(db: SqliteAccess) {
 
 function foreignKeyResult(db: SqliteAccess) {
   try {
-    const rows = db.query<{ table: string; rowid: number | null; parent: string; fkid: number }, []>("PRAGMA foreign_key_check").all()
+    const rows = db
+      .query<{ table: string; rowid: number | null; parent: string; fkid: number }, []>("PRAGMA foreign_key_check")
+      .all()
     return rows.length === 0 ? { state: "ok" as const, violations: [] } : { state: "failed" as const, violations: rows }
   } catch {
     return { state: "unreadable" as const, violations: [] }
@@ -878,20 +1231,25 @@ function sameIDs(left: readonly string[], right: readonly string[]) {
   return left.length === sorted.length && left.toSorted().every((id, index) => id === sorted[index])
 }
 
-function sameParents(left: readonly (readonly [string, string | null])[], right: readonly (readonly [string, string | null])[]) {
+function sameParents(
+  left: readonly (readonly [string, string | null])[],
+  right: readonly (readonly [string, string | null])[],
+) {
   const sorted = right.toSorted(([leftID], [rightID]) => leftID.localeCompare(rightID))
   return (
     left.length === sorted.length &&
-    left.toSorted(([leftID], [rightID]) => leftID.localeCompare(rightID)).every(([id, parent], index) => {
-      const other = sorted[index]
-      return id === other?.[0] && parent === other[1]
-    })
+    left
+      .toSorted(([leftID], [rightID]) => leftID.localeCompare(rightID))
+      .every(([id, parent], index) => {
+        const other = sorted[index]
+        return id === other?.[0] && parent === other[1]
+      })
   )
 }
 
 function refusedReport(
   filename: string,
-  cutoff: number,
+  cutoff: number | undefined,
   requested: readonly string[] | undefined,
   usage: ReturnType<typeof measurementReport>,
   reasons: string[],
@@ -899,14 +1257,14 @@ function refusedReport(
   return {
     action: "refused",
     database: filename,
-    cutoff: new Date(cutoff).toISOString(),
+    cutoff: cutoff === undefined ? null : new Date(cutoff).toISOString(),
     explicitSessionIDs: requested ?? null,
     selectedSessions: [],
     excludedSessions: [],
     deletionScope: { sessionIDs: [], wholeSessions: true },
     reclamation: { ready: false, reasons },
     usageMeasurement: usage,
-    rawTranscriptWarning: "Applying this command permanently deletes the old raw transcripts in selected Sessions.",
+    rawTranscriptWarning: "Applying this command permanently deletes the raw transcripts in selected Sessions.",
     changedRows: 0,
   }
 }

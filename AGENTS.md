@@ -223,6 +223,7 @@ const table = sqliteTable("session", {
 
 ## Session Retention (fork)
 
+- `opencode db prune` and directory-targeted `db retire` are offline local reclamation commands; see `docs/dead-session-retirement.md` for the teardown handoff. Their owner is `packages/opencode/src/cli/cmd/db-prune.ts`, with producer-driven behavior tests in `test/cli/db/prune.test.ts`.
 - `opencode db retention` (`packages/opencode/src/cli/cmd/db-retention.ts`) redacts inactive Session trees only when every gate in `candidateFailures` passes, re-checked inside each batch's write lock.
 - Its cross-process liveness relies on `packages/core/src/event/writer.ts`: the Database layer registers each process, and `EventV2` records the writing process in the same transaction as every durable append. Keep Session writes on that path, and classify any new Session-owned table in the retention tool, or it refuses every tree.
 
