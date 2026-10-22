@@ -1,0 +1,64 @@
+*** Begin Patch
+*** Update File: packages/core/src/v1/config/agent.ts
+@@
+   "model",
+-  "small_model",
+   "variant",
+*** Update File: packages/opencode/src/config/v2-compat.ts
+@@
+-  for (const key of ["description", "mode", "hidden", "color", "steps", "small_model"] as const) {
++  for (const key of ["description", "mode", "hidden", "color", "steps"] as const) {
+*** Update File: packages/opencode/src/agent/agent.ts
+@@
+-          if (value.small_model !== undefined) item.smallModel = Provider.parseModel(value.small_model)
+*** Update File: packages/opencode/src/session/session.ts
+@@
+-    smallModel: row.small_model
+-      ? { id: ModelV2.ID.make(row.small_model.id), providerID: ProviderV2.ID.make(row.small_model.providerID) }
+-      : undefined,
+@@
+-        smallModel: input.smallModel,
+*** Update File: packages/opencode/src/provider/provider.ts
+@@
+-      const selected = input?.model ?? (cfg.small_model !== undefined ? parseModel(cfg.small_model) : undefined)
++      const selected = cfg.small_model !== undefined ? parseModel(cfg.small_model) : undefined
+       if (selected) {
+-        return yield* getModel(selected.providerID, selected.modelID)
++        return yield* getModel(selected.providerID, selected.modelID).pipe(
++          Effect.catchTag("ProviderModelNotFoundError", () => Effect.succeed(undefined)),
++        )
+       }
+*** Update File: packages/opencode/src/session/prompt.ts
+@@
+-      const current = yield* sessions.get(input.session.id).pipe(Effect.orDie)
+-      const originAgent = yield* agents.get(firstInfo.agent)
+-      const smallModel =
+-        ag.smallModel ??
+-        originAgent?.smallModel ??
+-        (current.smallModel ? { providerID: current.smallModel.providerID, modelID: current.smallModel.id } : undefined)
+@@
+-              .getSmallModel(input.providerID, { model: smallModel })
++              .getSmallModel(input.providerID)
+@@
+-        Effect.tapError((error) =>
+-          events.publish(Session.Event.Error, {
+-            sessionID: input.session.id,
+-            error: new NamedError.Unknown({ message: error.message }).toObject(),
+-          }),
+-        ),
+*** Update File: packages/opencode/src/session/compaction.ts
+@@
+-      const current = yield* session.get(input.sessionID).pipe(Effect.orDie)
+-      const originAgent = yield* agents.get(userMessage.agent)
+-      const smallModel =
+-        agent.smallModel ??
+-        originAgent?.smallModel ??
+-        (current.smallModel ? { providerID: current.smallModel.providerID, modelID: current.smallModel.id } : undefined)
+       const model = agent.model
+         ? yield* provider.getModel(agent.model.providerID, agent.model.modelID).pipe(Effect.orDie)
+-        : ((yield* provider
+-            .getSmallModel(userMessage.model.providerID, { model: smallModel, infer: false })
+-            .pipe(Effect.orDie)) ??
+-          (yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)))
++        : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
+*** End Patch
