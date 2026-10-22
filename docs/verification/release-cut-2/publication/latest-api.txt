@@ -1,0 +1,72 @@
+id: 420448399
+author:
+  login: brentyates-swx
+  id: 71790259
+  type: User
+tag_name: v1.18.32-swxtch.bce37c27
+target_commitish: bce37c276f4070e3c9d343baa61ce5f35ca38dc9
+name: v1.18.32-swxtch.bce37c27
+draft: false
+immutable: false
+prerelease: false
+created_at: "2026-10-22T07:28:20Z"
+updated_at: "2026-10-22T08:03:44Z"
+published_at: "2026-10-22T08:03:44Z"
+assets[4]:
+  - id: 665124333
+    name: opencode-linux-arm64.tar.gz
+    label: ""
+    uploader:
+      login: brentyates-swx
+      id: 71790259
+      type: User
+    content_type: application/x-gtar
+    state: uploaded
+    size: 64257813
+    digest: "sha256:000821fca1887f4c1ce0ff5bf35fa29c2b4b84f52664d37d6ae0f6d92cdc1907"
+    download_count: 0
+    created_at: "2026-10-22T08:03:13Z"
+    updated_at: "2026-10-22T08:03:38Z"
+  - id: 665124330
+    name: opencode-linux-arm64.tar.gz.sha256
+    label: ""
+    uploader:
+      login: brentyates-swx
+      id: 71790259
+      type: User
+    content_type: application/octet-stream
+    state: uploaded
+    size: 94
+    digest: "sha256:7e93867b7ac492200a9b42aac76cb660e37f4de203065d94ec2f517198e2b115"
+    download_count: 0
+    created_at: "2026-10-22T08:03:13Z"
+    updated_at: "2026-10-22T08:03:13Z"
+  - id: 665124326
+    name: opencode-linux-x64.tar.gz
+    label: ""
+    uploader:
+      login: brentyates-swx
+      id: 71790259
+      type: User
+    content_type: application/x-gtar
+    state: uploaded
+    size: 64746454
+    digest: "sha256:45f8587523b67bd76ae9005c4d023722781976f95ed1ccedf37e44bc3fa47675"
+    download_count: 0
+    created_at: "2026-10-22T08:03:13Z"
+    updated_at: "2026-10-22T08:03:43Z"
+  - id: 665124327
+    name: opencode-linux-x64.tar.gz.sha256
+    label: ""
+    uploader:
+      login: brentyates-swx
+      id: 71790259
+      type: User
+    content_type: application/octet-stream
+    state: uploaded
+    size: 92
+    digest: "sha256:8b97adeec2dc0212dcc0a81c5bf25f745a2aacb52bcba0ec2f6f06c475f3ef54"
+    download_count: 0
+    created_at: "2026-10-22T08:03:13Z"
+    updated_at: "2026-10-22T08:03:13Z"
+body: "# OpenCode fork binary release\n\nEvidence collected 2026-10-22. This release carries [small-model independence #338](Issue#338), resolved by [#342](PR#342), [output-limit continuation #325](PR#325), [fast-suite observer hardening #329](PR#329), and [published-native V2-history verification #331](PR#331). Their merge commits passed the required ancestry checks against this release's captured source. Closes swxtchio/swx-opencode#338.\n\nThe earlier release's functionality is inherited through source ancestry. The build, focused tests and native acceptance observations below are new executions for this release. This producer release supplies the artifact for Abbe B-16.10; consumer image adoption, deployment and live-store migration remain downstream duties. The #331 distinction between completed-history restart durability and ambiguous in-flight recovery is preserved.\n\n## Release identity\n\n- Tag: `v1.18.32-swxtch.bce37c27`.\n- Immutable source: `bce37c276f4070e3c9d343baa61ce5f35ca38dc9`, captured by `git fetch origin swxtch` at task pickup on 2026-10-22. Later evidence-branch commits are not binary inputs.\n- Version: `1.18.32-swxtch.bce37c27`, printed by both extracted native candidates. This follows `local-release.sh`'s `<packages/opencode/package.json version>-swxtch.<source sha8>` convention, with `OPENCODE_VERSION` pinned for both builds.\n- Required landed commits: #342 `bce37c276f4070e3c9d343baa61ce5f35ca38dc9`; #329 `9340c4d4a88b3c9f1f5274e69e72bd8c631a5053`; #325 `05a4d4194ca4306ae9f11758f66e56d8fb1cf295`; #331 `cbfcad62a6fe04475dae23545c6296976f53fa5d`. Each passed `git merge-base --is-ancestor <commit> <source>`; live PR API records returned the same merged commits.\n- Existing V2-wait ancestry requirement: `git merge-base --is-ancestor 4b87478ddf4a14ffb42cdffde4af48712a9b03b6 bce37c276f4070e3c9d343baa61ce5f35ca38dc9` passed.\n- Both candidate source trees were unmodified and clean before installation/build and after build/native probe.\n- Actual Bun: `1.4.2` on both... (truncated)"
