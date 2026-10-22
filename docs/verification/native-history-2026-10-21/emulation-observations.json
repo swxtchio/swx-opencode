@@ -1,0 +1,25 @@
+{
+  "date": "2026-10-21",
+  "host_architecture": "aarch64",
+  "classification": "worktree-local user-mode emulation feasibility probe; no V2 runtime acceptance established",
+  "qemu_package": "qemu-user-static_1%3a8.2.2+ds-0ubuntu1.18_arm64.deb",
+  "qemu_package_sha256": "0565144632acc09b92da93e5ef9a2f44fa092797c5b0949744351b184ad948a8",
+  "qemu_executable_sha256": "de72ec1143909f0f495a53c36d9215cb86e2952517aad87044c741a1088dc60f",
+  "qemu_version": "qemu-x86_64 version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)",
+  "libc_package_url": "https://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6_2.39-0ubuntu8.9_amd64.deb",
+  "libc_package_sha256": "ff5557d99b51f761c4b7c92368b9cc45565eda17df9bf9eb4b134d09825008be",
+  "command": [
+    "/home/byates/fm-worktrees/fm-llmrouter/swx-abbe-1227-native-history/swx-opencode/.native-history/emulator/usr/bin/qemu-x86_64-static",
+    "-L",
+    "/home/byates/fm-worktrees/fm-llmrouter/swx-abbe-1227-native-history/swx-opencode/.native-history/sysroot",
+    "/home/byates/fm-worktrees/fm-llmrouter/swx-abbe-1227-native-history/swx-opencode/.native-history/extracted/opencode",
+    "--version"
+  ],
+  "exit": -11,
+  "deadline_expired": false,
+  "stdout": "",
+  "stderr": "qemu-x86_64-static: QEMU internal SIGSEGV {code=MAPERR, addr=0x20}\n",
+  "capture_method": "Python subprocess.Popen with start_new_session, communicate(timeout=20), process-group SIGKILL on expiry and bounded reap; configured HOME/XDG/TMPDIR/BUN_TMPDIR/OPENCODE_DB inside the task worktree",
+  "native_server_started": false,
+  "admission_message_event_identities": []
+}
