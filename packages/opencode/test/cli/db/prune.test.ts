@@ -302,6 +302,36 @@ test("dead-directory parents preserve their live-directory descendants", async (
   )
 })
 
+test("a directory restored after locked inventory is checked at the destructive decision", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const id = store.metadata[0]!.created[0]!.id
+  const read = new Database(store.filename, { readonly: true })
+  const directory = read
+    .query<{ directory: string }, [string]>("SELECT directory FROM session WHERE id = ?")
+    .get(id)!.directory
+  read.close()
+  const before = ownedCounts(store.filename, id)
+  const original = Database.prototype.query
+  let checks = 0
+  const query = spyOn(Database.prototype, "query").mockImplementation(function <
+    ReturnType,
+    ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+  >(this: Database, statement: string) {
+    if (statement === "PRAGMA integrity_check" && ++checks === 3) mkdirSync(directory)
+    return (original<ReturnType, ParamsType>).call(this, statement)
+  })
+  try {
+    const result = await invokeHandler(store, { apply: true })
+    expect(existsSync(directory)).toBe(true)
+    expect(result.report.action).toBe("refused")
+    expect(result.report.refusalReasons).toContain("session-directory-restored-before-delete")
+    expect(ownedCounts(store.filename, id)).toEqual(before)
+  } finally {
+    query.mockRestore()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test("teardown CLI retires only the removed directory and repeated retirement is harmless", async () => {
   await using store = await createStore()
   const dead = await produceLive(store, { create: { payloadBytes: 512 * 1024, withdrawnV1: true, ask: true } })
@@ -320,6 +350,12 @@ test("teardown CLI retires only the removed directory and repeated retirement is
   const live = await produceLive({ ...store, project: liveDirectory }, { create: {} })
   const liveID = live.created[0]!.id
   const liveBefore = ownedCounts(store.filename, liveID)
+  const unrelatedDirectory = path.join(store.directory, "other-dead-worktree")
+  await mkdir(unrelatedDirectory)
+  const unrelated = await produceLive({ ...store, project: unrelatedDirectory }, { create: {} })
+  const unrelatedID = unrelated.created[0]!.id
+  const unrelatedBefore = ownedCounts(store.filename, unrelatedID)
+  await rm(unrelatedDirectory, { recursive: true })
   await rm(target, { recursive: true })
   const inventory = parseReport(
     await runCLI(store, ["--database", store.filename, "--directory", target], 0, retirement),
@@ -339,6 +375,7 @@ test("teardown CLI retires only the removed directory and repeated retirement is
   expect(repeated.action).toBe("noop")
   expect(repeated.changedRows).toBe(0)
   expect(ownedCounts(store.filename, liveID)).toEqual(liveBefore)
+  expect(ownedCounts(store.filename, unrelatedID)).toEqual(unrelatedBefore)
 }, 60000)
 
 test(
@@ -1147,6 +1184,7 @@ test("SQLite exclusion blocks late readers and writers through post-commit vacuu
   })
   try {
     const result = await invokeHandler(store, { session: [sessionID], apply: true })
+    if (result.report.action !== "applied") throw new Error(JSON.stringify(result.report, null, 2))
     expect(result.report.action).toBe("applied")
     expect(probes).toEqual([{ read: false, write: false }])
     expect(ownedCounts(store.filename, sessionID).session).toBe(0)

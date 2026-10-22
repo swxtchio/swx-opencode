@@ -288,8 +288,7 @@ export const PruneCommand = cmd<{}, PruneArgs>({
               ],
             },
             usageMeasurement: usage,
-            rawTranscriptWarning:
-              "Applying this command permanently deletes the old raw transcripts in selected Sessions.",
+            rawTranscriptWarning: "Applying this command permanently deletes the raw transcripts in selected Sessions.",
             changedRows: 0,
           },
           null,
@@ -498,7 +497,7 @@ async function inventorySnapshot(
       foreignKeys,
       reasons: [...new Set(readinessReasons)].toSorted(),
     },
-    rawTranscriptWarning: "Applying this command permanently deletes the old raw transcripts in selected Sessions.",
+    rawTranscriptWarning: "Applying this command permanently deletes the raw transcripts in selected Sessions.",
     changedRows: 0,
     [parentSnapshot]: parents,
   }
@@ -1129,7 +1128,7 @@ function refusedReport(
     deletionScope: { sessionIDs: [], wholeSessions: true },
     reclamation: { ready: false, reasons },
     usageMeasurement: usage,
-    rawTranscriptWarning: "Applying this command permanently deletes the old raw transcripts in selected Sessions.",
+    rawTranscriptWarning: "Applying this command permanently deletes the raw transcripts in selected Sessions.",
     changedRows: 0,
   }
 }
