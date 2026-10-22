@@ -133,47 +133,32 @@ if ! command -v python3 >/dev/null 2>&1 \
   exit 1
 fi
 if ! FAST_SUITE_WRAPPER_PATH="$config_dir/bun" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" \
-  FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e '
+  FAST_SUITE_ARGV_PARSER="$root/script/test-argv.ts" FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e '
   const wrapper = `#!/usr/bin/env bash
 set -euo pipefail
 real_bun=${JSON.stringify(process.env.FAST_SUITE_CAPTURE_REAL_BUN)}
+parser_bun=${JSON.stringify(process.execPath)}
+parser=${JSON.stringify(process.env.FAST_SUITE_ARGV_PARSER)}
 report_dir=${JSON.stringify(process.env.FAST_SUITE_REPORT_DIR)}
 main_report=${JSON.stringify(process.env.FAST_SUITE_MAIN_REPORT)}
 args=("$@")
 wrapper_name=\${BASH_SOURCE[0]##*/}
-command_index=0
-delegated=0
-while [ "$command_index" -lt "\${#args[@]}" ]; do
-  case "\${args[command_index]}" in --bun|-b) delegated=1 ;; esac
-  case "\${args[command_index]}" in
-    --cwd=*) command_index=$((command_index + 1)) ;;
-    --cwd|--config|--env-file|--preload|--require|--import|--conditions|--define|--loader|-r|-p|-e|-d|-l) command_index=$((command_index + 2)) ;;
-    --*=*) command_index=$((command_index + 1)) ;;
-    -*) command_index=$((command_index + 1)) ;;
-    *) break ;;
-  esac
-done
-if [ "\${args[command_index]:-}" = run ]; then
-  option_index=$((command_index + 1))
-  while [ "$option_index" -lt "\${#args[@]}" ]; do
-    case "\${args[option_index]}" in --bun|-b) delegated=1 ;; esac
-    case "\${args[option_index]}" in
-      --) break ;;
-      --cwd|--config|--env-file|--preload|--require|--import|--conditions|--define|--loader|-r|-p|-e|-d|-l) option_index=$((option_index + 2)) ;;
-      -*) option_index=$((option_index + 1)) ;;
-      *) break ;;
-    esac
-  done
+if ! parsed=$("$parser_bun" "$parser" -- "\${args[@]}" 3>&1 >/dev/null); then
+  printf "%s\\n" "tests/run.sh: could not parse Bun launch options" >&2
+  exit 126
 fi
+fields=()
+while IFS= read -r field; do fields+=("$field"); done <<< "$parsed"
+command_index=\${fields[0]}
+worker=\${fields[1]}
+delegated=\${fields[2]}
+read -r -a option_indices <<< "\${fields[3]:-}"
 if [ "$wrapper_name" != bunx ] && [ "\${args[command_index]:-}" != x ] && [ "$delegated" -eq 1 ]; then
   printf "%s\\n" "tests/run.sh: refusing unobservable Bun delegation" >&2
   touch "$report_dir/refused-delegation"
   exit 126
 fi
-for argument in "\${args[@]}"; do
-  if [ "$argument" = -- ]; then break; fi
-  if [ "$argument" = --test-worker ]; then exec "$real_bun" "\${args[@]}"; fi
-done
+if [ "$worker" = 1 ]; then exec "$real_bun" "\${args[@]}"; fi
 command="\${args[command_index]:-}"
 if [ "$wrapper_name" = bunx ]; then
   case "$command" in vitest|jest|playwright|mocha|ava|pytest|cypress) printf "%s\\n" "tests/run.sh: refusing an unobservable Bunx test runner: $command" >&2; exit 126 ;; esac
@@ -181,13 +166,11 @@ if [ "$wrapper_name" = bunx ]; then
 fi
 if [ "$command" != test ]; then exec "$real_bun" "\${args[@]}"; fi
 report_outfile=
-index=$((command_index + 1))
-while [ "$index" -lt "\${#args[@]}" ]; do
+for index in "\${option_indices[@]}"; do
   case "\${args[index]}" in
     --reporter-outfile=*) report_outfile=\${args[index]#*=} ;;
     --reporter-outfile) index=$((index + 1)); report_outfile=\${args[index]:-} ;;
   esac
-  index=$((index + 1))
 done
 if [ "$report_outfile" != "$main_report" ]; then
   report_outfile=$(mktemp "$report_dir/report.XXXXXX")
@@ -197,7 +180,7 @@ forwarded=()
 index=0
 while [ "$index" -lt "\${#args[@]}" ]; do
   argument=\${args[index]}
-  if [ "$index" -gt "$command_index" ]; then
+  if [[ " \${option_indices[*]} " = *" $index "* ]]; then
     case "$argument" in
       --reporter-outfile|--reporter) index=$((index + 2)); continue ;;
       --reporter-outfile=*|--reporter=*|--dots) index=$((index + 1)); continue ;;
@@ -726,6 +709,7 @@ launch_observation_status=0
 FAST_SUITE_ROOT="$root" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e '
   import { readdir } from "node:fs/promises"
   import { basename, join } from "node:path"
+  import { parseLaunch } from "./script/test-argv.ts"
 
   const directory = process.env.FAST_SUITE_REPORT_DIR
   const runtimeBun = (await Bun.file(join(directory, "runtime-bun")).text()).trim()
@@ -749,23 +733,20 @@ FAST_SUITE_ROOT="$root" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPOR
     for (const entry of launches) {
       const executable = entry.executable
       const args = entry.argv.slice(1)
-      if (basename(executable ?? "") === "node" && args.some((argument) => argument === "--test" || argument.startsWith("--test="))) {
+      if (basename(executable ?? "") === "node" && parseLaunch("node", args).test) {
         console.error("tests/run.sh: unobservable Node test launch: " + executable)
         invalid = true
       }
       const configuredBun = entry.device === runtime.device && entry.inode === runtime.inode
       const namedBun = executable.startsWith("/") && basename(executable) === "bun"
       if (!configuredBun && !namedBun) continue
-      let command = 0
-      while (command < args.length && args[command].startsWith("-")) {
-        const argument = args[command++]
-        if (["--cwd", "--config", "--env-file", "--preload", "--require", "--import", "--conditions", "--define", "--loader", "-r", "-p", "-e", "-d", "-l"].includes(argument)) command++
-      }
-      if (args[command] !== "test" || args.includes("--test-worker")) continue
-      const outfileIndex = args.indexOf("--reporter-outfile")
-      const outfile = args.find((argument) => argument.startsWith("--reporter-outfile="))?.slice("--reporter-outfile=".length) ?? (outfileIndex < 0 ? undefined : args[outfileIndex + 1])
+      const parsed = parseLaunch("bun", args)
+      if (!parsed.test || parsed.worker) continue
+      const outfileIndex = parsed.options.find((index) => args[index] === "--reporter-outfile" || args[index].startsWith("--reporter-outfile="))
+      const outfile = outfileIndex === undefined ? undefined : args[outfileIndex].includes("=") ? args[outfileIndex].slice("--reporter-outfile=".length) : args[outfileIndex + 1]
       const captured = outfile === process.env.FAST_SUITE_MAIN_REPORT || entries.some((entry) => entry.startsWith("report.") && !entry.endsWith(".cwd") && outfile === join(directory, entry))
-      if (!captured || !args.includes("--reporter=junit")) {
+      const junit = parsed.options.some((index) => args[index] === "--reporter=junit" || (args[index] === "--reporter" && args[index + 1] === "junit"))
+      if (!captured || !junit) {
         console.error("tests/run.sh: unobserved Bun test launch: " + executable)
         invalid = true
       }

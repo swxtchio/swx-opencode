@@ -242,8 +242,14 @@ ${directSecondPath}
       join(packageRoot, "flag-probe.ts"),
       'import { appendFileSync } from "node:fs"\nappendFileSync(process.env.FAST_SUITE_MARKER!, "script-flag:" + process.argv.at(-1) + "\\n")\n',
     )
+    writeFileSync(
+      join(packageRoot, "arg-probe.cjs"),
+      'const { appendFileSync } = require("node:fs"); appendFileSync(process.env.FAST_SUITE_MARKER, process.env.FAST_SUITE_LAUNCH_SHAPE + "\\n"); console.log(process.argv.slice(2).join(" "))\n',
+    )
     copyFileSync(join(import.meta.dir, "..", "tests", "run.sh"), runner)
     copyFileSync(join(import.meta.dir, "..", "tests", "observe-exec.py"), join(root, "tests", "observe-exec.py"))
+    mkdirSync(join(root, "script"), { recursive: true })
+    copyFileSync(join(import.meta.dir, "test-argv.ts"), join(root, "script", "test-argv.ts"))
     copyFileSync(join(import.meta.dir, "fixtures", "job-control.py"), join(packageRoot, "job-control.py"))
     const observerSource = readFileSync(join(root, "tests", "observe-exec.py"), "utf8")
     chmodSync(runner, 0o755)
@@ -429,6 +435,21 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
       [
         'import { appendFileSync, chmodSync, copyFileSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"',
         'appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "pretest\\n")',
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("worker-")) {',
+        '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
+        '  const executable = shape.includes("path") ? "bun" : process.execPath',
+        '  const options = shape.endsWith("outfile") ? ["--reporter=junit", "--reporter-outfile", "--test-worker"] : ["--env-file", "--test-worker"]',
+        '  const result = Bun.spawnSync([executable, "test", ...options, "./test/unlisted.test.ts"], { stdout: "inherit", stderr: "inherit" })',
+        '  rmSync("./--test-worker", { force: true })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("user-")) {',
+        '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
+        `  const source = ${JSON.stringify('require("node:fs").appendFileSync(process.env.FAST_SUITE_MARKER, process.env.FAST_SUITE_LAUNCH_SHAPE + "\\n"); console.log(process.argv.slice(1).join(" "))')}`,
+        '  const command = shape === "user-node-script" ? ["node", "./arg-probe.cjs", "--test"] : shape === "user-node-delimiter" ? ["node", "--", "./arg-probe.cjs", "--test"] : shape === "user-node-script-inline" ? ["node", "./arg-probe.cjs", "--test=ordinary"] : shape === "user-bun-eval" ? ["bun", "-e", source, "--", "--test-worker"] : ["node", "-e", source, "--", "--test"]',
+        '  const result = Bun.spawnSync(command, { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
         'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("job-control-")) {',
         '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
         '  const result = Bun.spawnSync(["python3", "./job-control.py", shape.slice("job-control-".length)], { stdout: "inherit", stderr: "inherit" })',
@@ -920,12 +941,12 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
 
     const launchShapes = process.env.FAST_SUITE_RUNNER_CASE
       ? [process.env.FAST_SUITE_RUNNER_CASE]
-      : ["job-control-SIGSTOP", "job-control-SIGTSTP", "job-control-SIGTTIN", "job-control-SIGTTOU", "deleted-cwd", "deleted-fchdir", "overwrite-bun", "overwrite-node", "repoint-bun", "repoint-node", "absolute-bun", "absolute-bun-copy", "bun-delegation", "node-test", "inspect-base", "inspect-copy", "inspect-path", "inspect-base-inline", "inspect-copy-inline", "inspect-path-inline", "shebang-bun", "shebang-node", "shebang-chain", "fd-bun", "symlink-bun-missing", "symlink-node-missing", "symlink-bun-decoy", "symlink-node-decoy", "relative-bun-decoy", "relative-node-decoy", "chdir-bun-decoy", "chdir-node-decoy", "transient-bun", "transient-node"]
+      : ["worker-path-env", "worker-absolute-env", "worker-path-outfile", "worker-absolute-outfile", "user-node-eval", "user-node-script", "user-node-delimiter", "user-node-script-inline", "user-bun-eval", "job-control-SIGSTOP", "job-control-SIGTSTP", "job-control-SIGTTIN", "job-control-SIGTTOU", "deleted-cwd", "deleted-fchdir", "overwrite-bun", "overwrite-node", "repoint-bun", "repoint-node", "absolute-bun", "absolute-bun-copy", "bun-delegation", "node-test", "inspect-base", "inspect-copy", "inspect-path", "inspect-base-inline", "inspect-copy-inline", "inspect-path-inline", "shebang-bun", "shebang-node", "shebang-chain", "fd-bun", "symlink-bun-missing", "symlink-node-missing", "symlink-bun-decoy", "symlink-node-decoy", "relative-bun-decoy", "relative-node-decoy", "chdir-bun-decoy", "chdir-node-decoy", "transient-bun", "transient-node"]
     for (const shape of launchShapes) {
       runOptions.env.FAST_SUITE_LAUNCH_SHAPE = shape
       writeFileSync(marker, "")
       const launchEscape = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
-      if (shape.startsWith("deleted-") || shape.startsWith("job-control-")) {
+      if (shape.startsWith("deleted-") || shape.startsWith("job-control-") || shape.startsWith("user-")) {
         if (launchEscape.exitCode !== 0) console.error(shape, launchEscape.stdout.toString(), launchEscape.stderr.toString())
         expect(launchEscape.exitCode).toBe(0)
         expect(launchEscape.stdout.toString()).toContain("verdict=completed mode=fast target_count=4 exit_code=0")
@@ -942,6 +963,12 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
       }
       expect(launchEscape.exitCode).toBe(1)
       expect(launchEscape.stdout.toString()).toContain("verdict=refused mode=fast")
+      if (shape.startsWith("worker-")) {
+        expect(readFileSync(marker, "utf8")).toContain("unlisted\n")
+        expect(readFileSync(marker, "utf8")).toContain("selected-configured\n")
+        expect(launchEscape.stdout.toString()).toContain(shape.includes("path") ? "reason=execution-set-mismatch" : "reason=unobservable-test-launch")
+        expect(launchEscape.stderr.toString()).toContain(shape.includes("path") ? "JUnit-observed files outside the manifest" : "unobserved Bun test launch")
+      }
       if (shape.startsWith("inspect-")) {
         if (!readFileSync(marker, "utf8").includes("unlisted\n")) console.error(shape, launchEscape.stdout.toString(), launchEscape.stderr.toString())
         expect(readFileSync(marker, "utf8")).toContain("unlisted\n")
