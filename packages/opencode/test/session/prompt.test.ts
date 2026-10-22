@@ -534,11 +534,11 @@ function makePrompt(input?: PromptTestOptions) {
   return LayerNode.compile(promptRoot, replacements)
 }
 
-function makeHttp(input?: PromptTestOptions) {
+function makeHttp(input?: PromptTestOptions & { liveSummary?: boolean }) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
     [Npm.node, promptSdk],
-    [SessionSummary.node, summary],
+    ...(input?.liveSummary ? [] : [[SessionSummary.node, summary] as const]),
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
     [RuntimeFlags.node, runtimeFlags],
@@ -843,6 +843,7 @@ const gatedPlugin = LayerNode.make({
 })
 
 const it = promptTests(makeHttp())
+const liveSummaryPrompt = promptTests(makeHttp({ liveSummary: true }))
 const abruptPrompt = promptTests(makeHttp({ llm: abruptAssistantLLM }))
 const gated = promptTests(
   LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
@@ -3591,6 +3592,55 @@ for (const tools of ["none", "completed", "incomplete"] as const) {
     30_000,
   )
 }
+
+liveSummaryPrompt.instance("output-limit resets after the real producer summarizes new user input", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    yield* llm.push(
+      reply().text("Old first partial").finish("length"),
+      reply().text("Old second partial").finish("length"),
+      reply().text("Old exhausted partial").finish("length"),
+      reply().text("Unexpected request beyond the old cap").stop(),
+    )
+    const exhausted = yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("Old work") })
+    expect(yield* llm.calls).toBe(3)
+    expect(exhausted.info).toMatchObject({ error: { name: "MessageOutputLengthError" } })
+
+    yield* llm.reset
+    const gate = yield* Deferred.make<void>()
+    yield* Effect.addFinalizer(() => Deferred.succeed(gate, undefined).pipe(Effect.asVoid))
+    yield* llm.push(
+      reply().wait(deferredAsPromise(gate)).text("Fresh first partial").finish("length"),
+      reply().text("Fresh second partial").finish("length"),
+      reply().text("Fresh work completed").stop(),
+    )
+    const fiber = yield* prompt
+      .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("Fresh summarized work") })
+      .pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "fresh request did not arrive", "10 seconds")
+    // Gate the length response on the real producer's durable user summary, not a fabricated marker.
+    yield* pollWithTimeout(
+      sessions.messages({ sessionID: chat.id }).pipe(
+        Effect.map((messages) => {
+          const user = messages.findLast((message) =>
+            message.parts.some((part) => part.type === "text" && part.text === "Fresh summarized work"),
+          )
+          return user?.info.role === "user" && user.info.summary?.diffs !== undefined ? true : undefined
+        }),
+      ),
+      "the real summary producer did not persist the fresh user summary",
+      "10 seconds",
+    )
+    yield* Deferred.succeed(gate, undefined)
+    const result = yield* awaitWithTimeout(Fiber.join(fiber), "summarized-input recovery did not settle", "10 seconds")
+    expect(yield* llm.calls).toBe(3)
+    expect(result.info).toMatchObject({ finish: "stop" })
+    expect(result.info.role === "assistant" ? result.info.error : undefined).toBeUndefined()
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "Fresh work completed" }))
+  }),
+  30_000,
+)
 
 it.instance("output-limit preserves exhaustion across repeated capacity compaction", () =>
   Effect.gen(function* () {

@@ -729,7 +729,10 @@ export const outputLimitExhausted = Effect.fn("MessageV2.outputLimitExhausted")(
           .where(
             and(
               eq(MessageTable.session_id, sessionID),
-              sql`coalesce(json_extract(${MessageTable.data}, '$.summary'), 0) = 0`,
+              sql`not (
+                json_extract(${MessageTable.data}, '$.role') = 'assistant'
+                and coalesce(json_type(${MessageTable.data}, '$.summary'), '') = 'true'
+              )`,
               sql`not exists (
                 select 1 from ${PartTable}
                 where ${PartTable.message_id} = ${MessageTable.id}
