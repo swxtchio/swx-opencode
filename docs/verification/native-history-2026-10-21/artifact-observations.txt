@@ -1,0 +1,44 @@
+Observation date: 2026-10-21 UTC
+Launch worktree: /home/byates/fm-worktrees/fm-llmrouter/swx-abbe-1227-native-history/swx-opencode
+Branch: fm/swx-abbe-1227-native-history
+
+$ gh-axi release download v1.18.32-swxtch.d1b232e9 -R swxtchio/swx-opencode --pattern 'opencode-linux-x64.tar.gz*' --dir .native-history/downloads
+download: ok
+tag: v1.18.32-swxtch.d1b232e9
+
+From .native-history/downloads:
+$ sha256sum opencode-linux-x64.tar.gz
+dde0e4f1bd56664ca1d442951b15983f3c5338d1fa84c1bbee1f9b25587dd6ad  opencode-linux-x64.tar.gz
+$ sha256sum -c opencode-linux-x64.tar.gz.sha256
+opencode-linux-x64.tar.gz: OK
+$ tar -tzf opencode-linux-x64.tar.gz
+opencode
+libfff_c-977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5.so
+$ tar -xzf opencode-linux-x64.tar.gz -C ../extracted
+$ sha256sum ../extracted/*
+977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5  ../extracted/libfff_c-977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5.so
+6891cf61987bd8566660b681217cdfc2605fd684bbf64faaf2cd5072ea0e8e80  ../extracted/opencode
+$ ../extracted/opencode --version
+/bin/bash: line 1: ../extracted/opencode: cannot execute binary file: Exec format error
+Exit: 126
+
+From launch worktree:
+$ uname -m
+aarch64
+$ file .native-history/extracted/opencode
+.native-history/extracted/opencode: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=5afca2666bfab8605a934f1b6231dacae0518a5f, not stripped
+$ command -v qemu-x86_64
+No output; exit 1
+$ command -v qemu-x86_64-static
+No output; exit 1
+$ stat -c '%n %s bytes' .native-history/downloads/opencode-linux-x64.tar.gz .native-history/extracted/opencode .native-history/extracted/*.so
+.native-history/downloads/opencode-linux-x64.tar.gz 64703288 bytes
+.native-history/extracted/opencode 179406304 bytes
+.native-history/extracted/libfff_c-977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5.so 5576816 bytes
+
+$ git rev-parse v1.18.32-swxtch.d1b232e9^{commit}
+d1b232e940ef155a3e5311794a2baeaa143af1d8
+$ git merge-base --is-ancestor 4b87478ddf d1b232e940ef155a3e5311794a2baeaa143af1d8
+No output; exit 0
+$ git diff d1b232e940ef155a3e5311794a2baeaa143af1d8 -- packages/core/src/database/database.ts packages/core/src/session.ts packages/core/src/session/sql.ts packages/protocol/src/groups/session.ts packages/opencode/script/release-probe.ts packages/schema/src/session.ts
+No output; exit 0 (before task evidence edits)
