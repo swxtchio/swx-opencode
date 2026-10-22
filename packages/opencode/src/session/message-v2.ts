@@ -28,6 +28,7 @@ import { eq } from "drizzle-orm"
 import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
+import { sql } from "drizzle-orm"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
@@ -707,6 +708,50 @@ export const snapshot = Effect.fnUntraced(function* (sessionID: SessionID, after
           messages: filtered,
           admissionOrder: new Map(rows.map((row) => [row.id, row.admission_seq])),
         }
+      }),
+    )
+    .pipe(Effect.orDie)
+})
+
+export const outputLimitExhausted = Effect.fn("MessageV2.outputLimitExhausted")(function* (sessionID: SessionID) {
+  const { db } = yield* Database.Service
+  return yield* db
+    .transaction((tx) =>
+      Effect.gen(function* () {
+        yield* EventV2.assertReplayableIn(tx, sessionID)
+        // Compaction is context maintenance, not new work. Read turn history outside the compacted model view.
+        const recent = yield* tx
+          .select({
+            role: sql<string>`json_extract(${MessageTable.data}, '$.role')`,
+            finish: sql<string | null>`json_extract(${MessageTable.data}, '$.finish')`,
+          })
+          .from(MessageTable)
+          .where(
+            and(
+              eq(MessageTable.session_id, sessionID),
+              sql`not (
+                json_extract(${MessageTable.data}, '$.role') = 'assistant'
+                and coalesce(json_type(${MessageTable.data}, '$.summary'), '') = 'true'
+              )`,
+              sql`not exists (
+                select 1 from ${PartTable}
+                where ${PartTable.message_id} = ${MessageTable.id}
+                  and (
+                    json_extract(${PartTable.data}, '$.type') = 'compaction'
+                    or (
+                      json_extract(${PartTable.data}, '$.type') = 'text'
+                      and json_extract(${PartTable.data}, '$.synthetic') = 1
+                      and json_extract(${PartTable.data}, '$.metadata.compaction_continue') = 1
+                    )
+                  )
+              )`,
+            ),
+          )
+          .orderBy(desc(MessageTable.admission_seq))
+          .limit(3)
+          .all()
+          .pipe(Effect.orDie)
+        return recent.length === 3 && recent.every((row) => row.role === "assistant" && row.finish === "length")
       }),
     )
     .pipe(Effect.orDie)

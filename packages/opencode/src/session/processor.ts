@@ -111,6 +111,8 @@ type ToolCall = {
   attempt: Attempt
   // The execution the call's owning attempt, or an earlier one, last admitted.
   execution?: Execution
+  raw: string
+  inputError?: string
 }
 
 type Execution = { call: ToolCall; attempt: Attempt }
@@ -511,7 +513,11 @@ const layer = Layer.effect(
                 readToolCall(input.id).pipe(
                   Effect.tap((match) =>
                     Effect.sync(() => {
-                      if (match) match.call.attempt = attempt
+                      if (match) {
+                        match.call.attempt = attempt
+                        match.call.raw = ""
+                        match.call.inputError = undefined
+                      }
                     }),
                   ),
                 ),
@@ -535,6 +541,7 @@ const layer = Layer.effect(
           sessionID: ctx.assistantMessage.sessionID,
           done: Deferred.makeUnsafe<void>(),
           attempt,
+          raw: "",
         }
         ctx.toolcalls[input.id] = call
         const part = yield* session.updatePart({
@@ -618,9 +625,13 @@ const layer = Layer.effect(
             yield* ensureToolCall(value)
             return
 
-          case "tool-input-delta":
-            yield* ensureToolCall(value)
+          case "tool-input-delta": {
+            const existing = ctx.toolcalls[value.id]
+            const call = existing?.attempt === ctx.attempt ? existing : (yield* ensureToolCall(value))?.call
+            // Keep fragments with their stream attempt; settlement persists repair context without write amplification.
+            if (call) call.raw += value.text
             return
+          }
 
           case "tool-input-end": {
             yield* ensureToolCall(value)
@@ -714,6 +725,11 @@ const layer = Layer.effect(
           }
 
           case "tool-error": {
+            const match = yield* readToolCall(value.id)
+            if (match?.part.state.status === "pending") {
+              match.call.inputError = "The tool input could not be parsed as JSON, so the call was not executed. Reissue the call with valid JSON arguments."
+              return
+            }
             yield* failToolCall(value.id, value.error ?? new Error(value.message))
             return
           }
@@ -956,14 +972,28 @@ const layer = Layer.effect(
                 }
                 const end = Date.now()
                 const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
+                const inputFailure =
+                  part.state.status === "pending" &&
+                  !ctx.assistantMessage.error &&
+                  (ctx.assistantMessage.finish === "length" || match.call.inputError !== undefined)
+                const inputError =
+                  ctx.assistantMessage.finish === "length"
+                    ? "The tool call was not executed because the output token limit (stop reason: length) was reached before you could complete the arguments. Break large payloads into smaller tool calls and reissue the call with complete arguments."
+                    : match.call.inputError
                 const exit = yield* attempt(
                   session.updatePart({
                     ...part,
                     state: {
                       ...part.state,
                       status: "error",
-                      error: "Tool execution aborted",
-                      metadata: { ...metadata, interrupted: true },
+                      error:
+                        inputFailure && part.state.status === "pending"
+                          ? inputError +
+                            (match.call.raw.length
+                              ? `\n\nInput excerpt (first ${Math.min(match.call.raw.length, 2048)} of ${match.call.raw.length} characters):\n${match.call.raw.slice(0, 2048)}${match.call.raw.length > 2048 ? "\n[truncated]" : ""}`
+                              : "")
+                          : "Tool execution aborted",
+                      metadata: inputFailure ? metadata : { ...metadata, interrupted: true },
                       time: { start: "time" in part.state ? part.state.time.start : end, end },
                     },
                   }),
