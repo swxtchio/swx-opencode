@@ -1,6 +1,6 @@
 import { afterAll, expect, spyOn, test } from "bun:test"
 import { Database, type SQLQueryBindings } from "bun:sqlite"
-import { existsSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import {
   chmod,
   copyFile,
@@ -13,6 +13,7 @@ import {
   rename,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises"
 import path from "node:path"
@@ -55,6 +56,7 @@ type Create = {
   unfinished?: boolean
   runningTool?: boolean
   ask?: boolean
+  completeStorage?: boolean
 }
 
 type ChildResult = {
@@ -94,8 +96,10 @@ type Report = {
   action: string
   database: string
   cutoff: string
-  selectedSessions: { sessionID: string; reasons: string[] }[]
-  excludedSessions: { sessionID: string; reasons: string[] }[]
+  selectedSessions: { sessionID: string; directory: string; ownedRows: Record<string, number>; reasons: string[] }[]
+  excludedSessions: { sessionID: string; directory: string | null; reasons: string[] }[]
+  selectedCounts: { sessions: number; ownedRows: number }
+  deletedCounts?: { sessions: number; ownedRows: number; byTable: Record<string, number> }
   deletionScope: { sessionIDs: string[]; wholeSessions: boolean }
   reclamation: {
     ready: boolean
@@ -113,6 +117,7 @@ type Report = {
     integrity?: { state: string; details: string[] }
     integrityAfter?: { state: string }
     checkpoint?: { busy: number } | { error: string }
+    vacuum?: { state: string; reason?: string }
   }
   rawTranscriptWarning?: string
   usageMeasurement?: {
@@ -175,6 +180,167 @@ afterAll(async () => {
   await rm(scratchRoot, { recursive: true, force: true })
 })
 
+test("dead-directory inventory counts and apply preserve live and uncertain directories", async () => {
+  await using store = await producedStore([
+    { payloadBytes: 1024 * 1024, withdrawnV1: true, ask: true, completeStorage: true },
+  ])
+  const deadID = store.metadata[0]!.created[0]!.id
+  const live = await produceLive(store, { create: [{}, {}, {}] })
+  const [liveID, emptyID, invalidID] = live.created.map((item) => item.id)
+  backdateSession(store.filename, liveID!, Date.parse("2020-01-01T00:00:00Z"))
+  const db = new Database(store.filename)
+  db.query("UPDATE session SET directory = '' WHERE id = ?").run(emptyID!)
+  db.query("UPDATE session SET directory = 'relative-missing' WHERE id = ?").run(invalidID!)
+  const projects = db.query("SELECT * FROM project ORDER BY id").all()
+  const writers = db.query("SELECT * FROM event_writer_process ORDER BY writer_id").all()
+  db.close()
+  const beforeDead = ownedCounts(store.filename, deadID)
+  const beforeLive = live.created.map((item) => ownedCounts(store.filename, item.id))
+  expect(beforeDead).toMatchObject({ session: 1, receipt: 2, ask: 1, sessionInput: 1 })
+  expect(beforeDead.queueAlias).toBeGreaterThan(0)
+  expect(beforeDead.provenance).toBeGreaterThan(0)
+  const inventory = parseReport(await runCLI(store, []))
+  expect(inventory.action).toBe("inventory")
+  expect(inventory.selectedSessions.map((item) => item.sessionID)).toEqual([deadID])
+  expect(inventory.selectedSessions[0]!.directory).not.toBe(store.project)
+  const rows = Object.values(beforeDead).reduce((sum, n) => sum + n, 0)
+  expect(inventory.selectedCounts).toEqual({ sessions: 1, ownedRows: rows })
+  expect(Object.values(inventory.selectedSessions[0]!.ownedRows).reduce((sum, n) => sum + n, 0)).toBe(rows)
+  expect(ownedCounts(store.filename, deadID)).toEqual(beforeDead)
+  const protectedExplicit = parseReport(
+    await runCLI(store, ["--before", "2026-01-01T00:00:00Z", "--session", liveID!, "--apply"], 1),
+  )
+  expect(protectedExplicit.changedRows).toBe(0)
+  expect(protectedExplicit.excludedSessions.find((item) => item.sessionID === liveID)?.reasons).toContain(
+    "session-directory-exists",
+  )
+  const result = parseReport(await runCLI(store, ["--apply"]))
+  expect(result.action).toBe("applied")
+  expect(result.deletedCounts).toMatchObject({ sessions: 1, ownedRows: rows })
+  expect(result.changedRows).toBe(rows)
+  expect(result.deletedCounts?.byTable.session_ask).toBe(beforeDead.ask)
+  expect(result.deletedCounts?.byTable.session_prompt_queue_alias).toBe(beforeDead.queueAlias)
+  expect(result.deletedCounts?.byTable.session_input).toBe(beforeDead.sessionInput)
+  expect(Object.values(ownedCounts(store.filename, deadID)).every((n) => n === 0)).toBe(true)
+  expect(live.created.map((item) => ownedCounts(store.filename, item.id))).toEqual(beforeLive)
+  const retained = new Database(store.filename, { readonly: true })
+  expect(retained.query("SELECT * FROM project ORDER BY id").all()).toEqual(projects)
+  expect(retained.query("SELECT * FROM event_writer_process ORDER BY writer_id").all()).toEqual(writers)
+  expect(retained.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" })
+  expect(retained.query("PRAGMA foreign_key_check").all()).toEqual([])
+  retained.close()
+}, 60000)
+
+test("directory uncertainty from inaccessible paths and dangling symlinks never authorizes deletion", async () => {
+  await using store = await producedStore([{}, { payloadBytes: 512 * 1024 }, {}])
+  const [blockedID, deadID, symlinkID] = store.metadata.map((item) => item.created[0]!.id)
+  const blocked = path.join(store.directory, "inaccessible")
+  const dangling = path.join(store.directory, "dangling")
+  await mkdir(blocked)
+  await symlink(path.join(store.directory, "absent-target"), dangling)
+  const db = new Database(store.filename)
+  db.query("UPDATE session SET directory = ? WHERE id = ?").run(path.join(blocked, "missing"), blockedID!)
+  db.query("UPDATE session SET directory = ? WHERE id = ?").run(path.join(dangling, "missing"), symlinkID!)
+  db.close()
+  const beforeBlocked = ownedCounts(store.filename, blockedID!)
+  const beforeSymlink = ownedCounts(store.filename, symlinkID!)
+  await chmod(blocked, 0)
+  try {
+    const result = parseReport(await runCLI(store, ["--apply"]))
+    expect(result.deletedSessionIDs).toEqual([deadID!])
+    expect(ownedCounts(store.filename, blockedID!)).toEqual(beforeBlocked)
+    expect(ownedCounts(store.filename, symlinkID!)).toEqual(beforeSymlink)
+  } finally {
+    await chmod(blocked, 0o700)
+  }
+})
+
+test("a directory restored after inventory protects its producer-created session", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const id = store.metadata[0]!.created[0]!.id
+  const read = new Database(store.filename, { readonly: true })
+  const directory = read
+    .query<{ directory: string }, [string]>("SELECT directory FROM session WHERE id = ?")
+    .get(id)!.directory
+  read.close()
+  const before = ownedCounts(store.filename, id)
+  const original = Database.prototype.exec
+  let restored = false
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, sql: string) {
+    if (sql === "BEGIN IMMEDIATE" && !restored) {
+      restored = true
+      mkdirSync(directory)
+    }
+    return original.call(this, sql)
+  })
+  try {
+    const result = await invokeHandler(store, { apply: true })
+    expect(restored).toBe(true)
+    expect(result.report.action).toBe("refused")
+    expect(result.report.refusalReasons).toContain("selection-changed-after-inventory")
+    expect(ownedCounts(store.filename, id)).toEqual(before)
+  } finally {
+    exec.mockRestore()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test("dead-directory parents preserve their live-directory descendants", async () => {
+  await using store = await producedStore([{}, { payloadBytes: 512 * 1024 }])
+  const parentID = store.metadata[0]!.created[0]!.id
+  const deadID = store.metadata[1]!.created[0]!.id
+  const child = await produceLive(store, { create: { parentID } })
+  const childID = child.created[0]!.id
+  const beforeParent = ownedCounts(store.filename, parentID)
+  const beforeChild = ownedCounts(store.filename, childID)
+  const result = parseReport(await runCLI(store, ["--apply"]))
+  expect(result.deletedSessionIDs).toEqual([deadID])
+  expect(ownedCounts(store.filename, parentID)).toEqual(beforeParent)
+  expect(ownedCounts(store.filename, childID)).toEqual(beforeChild)
+  expect(result.excludedSessions.find((item) => item.sessionID === parentID)?.reasons).toContain(
+    `protected-descendant:${childID}`,
+  )
+})
+
+test("teardown CLI retires only the removed directory and repeated retirement is harmless", async () => {
+  await using store = await createStore()
+  const dead = await produceLive(store, { create: { payloadBytes: 512 * 1024, withdrawnV1: true, ask: true } })
+  const id = dead.created[0]!.id
+  const before = ownedCounts(store.filename, id)
+  const target = store.project
+  const retirement = { command: "retire", databaseDefault: path.join(store.directory, "not-the-target.db") }
+  const refused = parseReport(
+    await runCLI(store, ["--database", store.filename, "--directory", target, "--apply"], 1, retirement),
+  )
+  expect(refused.action).toBe("refused")
+  expect(refused.database).toBe(store.filename)
+  expect(ownedCounts(store.filename, id)).toEqual(before)
+  const liveDirectory = path.join(store.directory, "live-worktree")
+  await mkdir(liveDirectory)
+  const live = await produceLive({ ...store, project: liveDirectory }, { create: {} })
+  const liveID = live.created[0]!.id
+  const liveBefore = ownedCounts(store.filename, liveID)
+  await rm(target, { recursive: true })
+  const inventory = parseReport(
+    await runCLI(store, ["--database", store.filename, "--directory", target], 0, retirement),
+  )
+  expect(inventory.action).toBe("inventory")
+  expect(inventory.deletionScope.sessionIDs).toEqual([id])
+  expect(ownedCounts(store.filename, id)).toEqual(before)
+  const result = parseReport(
+    await runCLI(store, ["--database", store.filename, "--directory", target, "--apply"], 0, retirement),
+  )
+  expect(result.action).toBe("applied")
+  expect(result.deletedCounts?.sessions).toBe(1)
+  expect(Object.values(ownedCounts(store.filename, id)).every((n) => n === 0)).toBe(true)
+  const repeated = parseReport(
+    await runCLI(store, ["--database", store.filename, "--directory", target, "--apply"], 0, retirement),
+  )
+  expect(repeated.action).toBe("noop")
+  expect(repeated.changedRows).toBe(0)
+  expect(ownedCounts(store.filename, liveID)).toEqual(liveBefore)
+}, 60000)
+
 test(
   "CLI inventory is read-only, validates the explicit cutoff, and narrows by Session ID",
   async () => {
@@ -221,7 +387,7 @@ test(
     const future = await runCLI(store, ["--before", new Date(Date.now() + 60_000).toISOString(), "--apply"], 1)
     expect(future.status).toBe(1)
     expect(storedSessionIDs(store.filename)).toEqual(sessionIDsBefore)
-    const absent = await runCLI(store, ["--apply"], "nonzero")
+    const absent = await runCLI(store, ["--directory", "", "--apply"], "nonzero")
     expect(absent.status).not.toBe(0)
     expect(storedSessionIDs(store.filename)).toEqual(sessionIDsBefore)
     expect(await readFile(store.filename)).toEqual(before)
@@ -655,9 +821,10 @@ test("an outstanding supervised ask refuses deletion, and once settled it is del
   // The producer's ask, reopened as one a server still waits on.
   const db = new Database(store.filename)
   const settled = db
-    .query<{ decision: string; time_settled: number }, [string]>(
-      "SELECT decision, time_settled FROM session_ask WHERE session_id = ?",
-    )
+    .query<
+      { decision: string; time_settled: number },
+      [string]
+    >("SELECT decision, time_settled FROM session_ask WHERE session_id = ?")
     .get(askedID)!
   db.query("UPDATE session_ask SET decision = NULL, time_settled = NULL, time_created = ? WHERE session_id = ?").run(
     cutoffAt - 1_000,
@@ -765,7 +932,7 @@ test(
   { timeout: 60_000 },
 )
 
-test("a pending prompt added after inventory is revalidated before the first deletion", async () => {
+test("a pending prompt admitted as offline cleanup acquires ownership remains protected", async () => {
   await using store = await producedStore([{}])
   await using controlStore = await producedStore([{ payloadBytes: 512 * 1024 }])
   const old = produce(store, { create: {} })
@@ -794,7 +961,7 @@ test("a pending prompt added after inventory is revalidated before the first del
   let injected = false
   let readinessDuringWrite: string | undefined
   const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, sql: string) {
-    if (sql === "BEGIN IMMEDIATE" && !injected) {
+    if (sql === "PRAGMA locking_mode = EXCLUSIVE" && !injected) {
       injected = true
       writeFileSync(startFile, "admit\n")
       const deadline = Date.now() + 10_000
@@ -812,6 +979,7 @@ test("a pending prompt added after inventory is revalidated before the first del
       }
       const result = JSON.parse(readFileSync(readyFile, "utf8")) as { ready: boolean; error?: string }
       if (!result.ready) throw new Error(`queue producer failed before revalidation: ${result.error}`)
+      backdateSession(store.filename, oldID, cutoffAt - 1_000)
     }
     return originalExec.call(this, sql)
   })
@@ -821,7 +989,9 @@ test("a pending prompt added after inventory is revalidated before the first del
     expect(readinessDuringWrite).toBeUndefined()
     expect(result.report.action).toBe("refused")
     expect(result.report.changedRows).toBe(0)
-    expect(result.report.refusalReasons).toContain("selection-changed-after-inventory")
+    expect(result.report.excludedSessions.find((item) => item.sessionID === oldID)?.reasons).toContain(
+      "v1-prompt-pending-or-in-custody",
+    )
     expect(ownedCounts(store.filename, oldID).session).toBe(before.session)
     expect(ownedCounts(store.filename, oldID).queue).toBeGreaterThan(0)
   } finally {
@@ -878,8 +1048,8 @@ test("a failed queue producer publishes its complete readiness error atomically"
 })
 
 test("a live review hold is a liveness blocker, with a clean private control", async () => {
-  await using heldStore = await producedStore([{}])
-  const heldSession = produce(heldStore, { create: {} })
+  await using heldStore = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const heldSession = produce(heldStore, { create: { payloadBytes: 512 * 1024 } })
   const heldID = heldSession.created[0]!.id
   const cutoffAt = Date.now() - 5
   backdateSession(heldStore.filename, heldID, cutoffAt - 1_000)
@@ -905,76 +1075,84 @@ test("a live review hold is a liveness blocker, with a clean private control", a
     assertChildOutcome(await holder.finish(), 0)
   }
 
-  await using controlStore = await producedStore([{ payloadBytes: 512 * 1024 }])
-  const control = produce(controlStore, { create: { payloadBytes: 512 * 1024 } })
-  backdateSession(controlStore.filename, control.created[0]!.id, cutoffAt - 1_000)
-  const controlResult = await invokeHandler(controlStore, {
-    before: new Date(Date.now() - 5).toISOString(),
-    session: [control.created[0]!.id],
+  const controlResult = await invokeHandler(heldStore, {
+    before: cutoff,
+    session: [heldID],
     apply: true,
   })
   expect(controlResult.report.action).toBe("applied")
+  expect(ownedCounts(heldStore.filename, heldID).session).toBe(0)
 })
 
-test("a reader that opens after deletion starts is rechecked before commit", async () => {
-  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
-  const old = produce(store, { create: { payloadBytes: 512 * 1024 } })
-  const cutoffAt = Date.now() - 5
-  backdateSession(store.filename, old.created[0]!.id, cutoffAt - 1_000)
-  const cutoff = new Date(cutoffAt).toISOString()
-  const sessionID = old.created[0]!.id
-  const startFile = path.join(store.directory, "late-reader-start")
-  const readyFile = path.join(store.directory, "late-reader-ready")
-  await using holder = startProducer(store, { holdAfterSignal: { startFile, readyFile } })
+test("a post-commit vacuum failure reports deletion and directory retirement retries compaction", async () => {
+  await using store = await producedStore([{ payloadBytes: 1024 * 1024 }])
+  const id = store.metadata[0]!.created[0]!.id
+  const read = new Database(store.filename, { readonly: true })
+  const directory = read
+    .query<{ directory: string }, [string]>("SELECT directory FROM session WHERE id = ?")
+    .get(id)!.directory
+  read.close()
+  const original = Database.prototype.exec
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, sql: string) {
+    if (sql === "VACUUM") throw new Error("private-vacuum-failure")
+    return original.call(this, sql)
+  })
   try {
-    await readMatchingLine(holder, "PRUNE_HOLDER_WAITING")
-    const before = ownedCounts(store.filename, sessionID)
-    const originalExec = Database.prototype.exec
-    let readerOpened = false
-    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
-      if (statement === "PRAGMA incremental_vacuum" && !readerOpened) {
-        readerOpened = true
-        writeFileSync(startFile, "open\n")
-        const deadline = Date.now() + 10_000
-        const wait = new Int32Array(new SharedArrayBuffer(4))
-        while (!existsSync(readyFile)) {
-          if (Date.now() >= deadline) throw new Error("late database reader did not acknowledge its open connection")
-          Atomics.wait(wait, 0, 0, 5)
-        }
-      }
-      return originalExec.call(this, statement)
-    })
-    try {
-      const result = await invokeHandler(store, { before: cutoff, session: [sessionID], apply: true })
-      expect(ownedCounts(store.filename, sessionID)).toEqual(before)
-      expect(readerOpened).toBe(true)
-      expect(result.report.action).toBe("refused")
-      expect(result.report.changedRows).toBe(0)
-      expect(result.report.refusalReasons).toEqual(
-        expect.arrayContaining([expect.stringMatching(/database-(?:in-use-by-process|liveness-unreadable):/)]),
-      )
-    } finally {
-      exec.mockRestore()
-    }
+    const failed = await invokeHandler(store, { directory, apply: true })
+    expect(failed.report.action).toBe("failed")
+    expect(failed.report.committed).toBe(true)
+    expect(failed.report.changedRows).toBeGreaterThan(0)
+    expect(failed.report.deletedSessionIDs).toEqual([id])
+    expect(failed.report.reclamation.vacuum).toEqual({ state: "failed", reason: "private-vacuum-failure" })
+    expect(Object.values(ownedCounts(store.filename, id)).every((n) => n === 0)).toBe(true)
   } finally {
-    if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
-    holder.child.stdin.write("release\n")
-    holder.child.stdin.end()
-    assertChildOutcome(await holder.finish(), 0)
+    exec.mockRestore()
   }
+  const beforeRetry = await allocatedBytes(store.filename)
+  const retry = await invokeHandler(store, { directory, apply: true })
+  expect(retry.report.action).toBe("noop")
+  expect(retry.report.changedRows).toBe(0)
+  expect(retry.report.reclamation.vacuum?.state).toBe("complete")
+  expect(await allocatedBytes(store.filename)).toBeLessThan(beforeRetry)
+})
 
-  await using controlStore = await producedStore([{ payloadBytes: 512 * 1024 }])
-  const control = produce(controlStore, { create: { payloadBytes: 512 * 1024 } })
-  backdateSession(controlStore.filename, control.created[0]!.id, cutoffAt - 1_000)
-  const cleanControl = await runCLI(controlStore, [
-    "--before",
-    new Date(Date.now() - 5).toISOString(),
-    "--session",
-    control.created[0]!.id,
-    "--apply",
-  ])
-  expect(cleanControl.status).toBe(0)
-  expect(parseReport(cleanControl).action).toBe("applied")
+test("SQLite exclusion blocks late readers and writers through post-commit vacuum", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  const original = Database.prototype.exec
+  const probes: { read: boolean; write: boolean }[] = []
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+    if (statement === "VACUUM") {
+      const child = Bun.spawnSync(
+        [
+          process.execPath,
+          "-e",
+          `
+        const { Database } = require('bun:sqlite');
+        const db = new Database(process.argv[1]);
+        db.exec('PRAGMA busy_timeout=5');
+        const result = {read:false, write:false};
+        try { db.query('SELECT id FROM session').all(); result.read=true } catch {}
+        try { db.exec('BEGIN IMMEDIATE; ROLLBACK'); result.write=true } catch {}
+        db.close(); console.log(JSON.stringify(result));
+      `,
+          store.filename,
+        ],
+        { timeout: 5000 },
+      )
+      expect(child.exitCode).toBe(0)
+      probes.push(JSON.parse(child.stdout.toString()))
+    }
+    return original.call(this, statement)
+  })
+  try {
+    const result = await invokeHandler(store, { session: [sessionID], apply: true })
+    expect(result.report.action).toBe("applied")
+    expect(probes).toEqual([{ read: false, write: false }])
+    expect(ownedCounts(store.filename, sessionID).session).toBe(0)
+  } finally {
+    exec.mockRestore()
+  }
 })
 
 test("unreadable liveness refuses without row changes, then deletion works when evidence is readable", async () => {
@@ -1218,7 +1396,7 @@ test("a failed integrity check refuses with zero rows changed and the clean cont
   expect(ownedCounts(source.filename, sessionID).session).toBe(0)
 })
 
-test("stores without incremental auto-vacuum refuse before deleting rows", async () => {
+test("full vacuum reclaims a migrated NONE store while its live session remains readable", async () => {
   await using source = await producedStore([{ payloadBytes: 512 * 1024 }])
   const created = produce(source, { create: { payloadBytes: 512 * 1024 } })
   const cutoffAt = Date.now() - 5
@@ -1230,16 +1408,23 @@ test("stores without incremental auto-vacuum refuse before deleting rows", async
   db.exec("PRAGMA auto_vacuum=NONE; VACUUM")
   expect(db.query("PRAGMA auto_vacuum").get()).toEqual({ auto_vacuum: 0 })
   db.close()
-  const before = ownedCounts(unsupported.filename, sessionID)
-  const refused = await invokeHandler(unsupported, { before: cutoff, session: [sessionID], apply: true })
-  expect(refused.report.action).toBe("refused")
-  expect(refused.report.changedRows).toBe(0)
-  expect(refused.report.reclamation.reasons).toContain("incremental-auto-vacuum-unsupported:0")
-  expect(ownedCounts(unsupported.filename, sessionID)).toEqual(before)
-
-  const control = await invokeHandler(source, { before: cutoff, session: [sessionID], apply: true })
-  expect(control.report.action).toBe("applied")
-  expect(ownedCounts(source.filename, sessionID).session).toBe(0)
+  const live = await produceLive(unsupported, { create: { payloadBytes: 128 } })
+  const liveID = live.created[0]!.id
+  const text = textParts(unsupported.filename, liveID)
+  const liveBefore = ownedCounts(unsupported.filename, liveID)
+  const before = await allocatedBytes(unsupported.filename)
+  const applied = parseReport(await runCLI(unsupported, ["--before", cutoff, "--session", sessionID, "--apply"]))
+  expect(applied.action).toBe("applied")
+  expect(applied.reclamation.vacuum?.state).toBe("complete")
+  expect(applied.reclamation.reclaimedBytes).toBeGreaterThan(0)
+  expect(await allocatedBytes(unsupported.filename)).toBeLessThan(before)
+  expect(Object.values(ownedCounts(unsupported.filename, sessionID)).every((n) => n === 0)).toBe(true)
+  expect(ownedCounts(unsupported.filename, liveID)).toEqual(liveBefore)
+  expect(textParts(unsupported.filename, liveID)).toEqual(text)
+  const verify = new Database(unsupported.filename, { readonly: true })
+  expect(verify.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" })
+  expect(verify.query("PRAGMA foreign_key_check").all()).toEqual([])
+  verify.close()
 })
 
 test("same-shape prune fixtures acquired together or later own their stores and metadata", async () => {
@@ -1698,6 +1883,7 @@ async function produceTemplate(creates: Create[], scratch: string, timeout: numb
     if (await Bun.file(`${filename}-wal`).exists()) {
       throw new ChildOutputFailure(result, "prune producer", "the exited producer left an uncheckpointed WAL")
     }
+    await rm(project, { recursive: true })
     return {
       directory,
       filename,
@@ -1778,15 +1964,20 @@ async function runCLI(
   store: Store,
   args: string[],
   expectedStatus: number | "nonzero" = 0,
-  options: { entrypoint?: string; timeout?: number } = {},
+  options: { entrypoint?: string; timeout?: number; command?: string; databaseDefault?: string } = {},
 ) {
   const result = await runChild(
     "opencode db prune",
     process.execPath,
-    [options.entrypoint ?? entrypoint, "db", "prune", ...args],
+    [options.entrypoint ?? entrypoint, "db", options.command ?? "prune", ...args],
     {
       cwd: packageRoot,
-      env: { ...process.env, OPENCODE_DB: store.filename, OPENCODE_DISABLE_CHANNEL_DB: "1", OPENCODE_PURE: "1" },
+      env: {
+        ...process.env,
+        OPENCODE_DB: options.databaseDefault ?? store.filename,
+        OPENCODE_DISABLE_CHANNEL_DB: "1",
+        OPENCODE_PURE: "1",
+      },
       timeout: options.timeout ?? 30_000,
     },
   )
@@ -2059,7 +2250,8 @@ async function readMatchingLine(producer: RunningChild, prefix: string) {
 async function invokeHandler(
   store: Store,
   args: {
-    before: string
+    before?: string
+    directory?: string
     session?: string[]
     apply?: boolean
     firstmateRanIt?: boolean

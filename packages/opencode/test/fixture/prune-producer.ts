@@ -14,6 +14,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionContextEpoch } from "@opencode-ai/core/session/context-epoch"
+import { SessionInput } from "@opencode-ai/core/session/input"
 import { SystemContext } from "@opencode-ai/core/system-context/index"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -41,6 +42,7 @@ type Create = {
   runningTool?: boolean
   // A question answered under `--questions-command`, leaving its settled ledger row.
   ask?: boolean
+  completeStorage?: boolean
 }
 
 const input = JSON.parse(serialized) as {
@@ -238,11 +240,43 @@ const produce = Effect.gen(function* () {
       if (create.withdrawnV1) {
         const requested = yield* queue.request({
           sessionID,
+          messageID: MessageID.ascending(),
           requestID: Schema.decodeSync(SessionQueue.RequestID)("prune-withdrawn"),
           delivery: "queue",
           parts: [{ type: "text", text: "withdrawn work retained for history" }],
         })
         if (requested.kind === "admitted") yield* queue.withdraw(sessionID, requested.own.id)
+      }
+      if (create.completeStorage) {
+        yield* queue.request({
+          sessionID,
+          messageID: MessageID.ascending(),
+          requestID: Schema.decodeSync(SessionQueue.RequestID)("prune-promoted"),
+          delivery: "queue",
+          parts: [{ type: "text", text: "delivered history" }],
+        })
+        yield* queue.promote({
+          sessionID,
+          delivery: "queue",
+          prepare: (input) => Effect.succeed(input.messageID),
+          write: (id) =>
+            sessions.updateMessage({
+              id,
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: "build",
+              model: { providerID: "provider-a", modelID: "requested-model" },
+            } as SessionV1.User),
+          rejected: (cause) => Effect.failCause(cause),
+        })
+        yield* v2.prompt({
+          sessionID: SessionV2.ID.make(sessionID),
+          prompt: { text: "promoted durable history" },
+          delivery: "queue",
+          resume: false,
+        })
+        yield* SessionInput.promoteNextQueued(db, events, SessionV2.ID.make(sessionID))
       }
       if (create.pendingV2) {
         yield* v2.prompt({
