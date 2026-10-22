@@ -98,6 +98,9 @@ type Report = {
   cutoff: string
   selectedSessions: { sessionID: string; directory: string; ownedRows: Record<string, number>; reasons: string[] }[]
   excludedSessions: { sessionID: string; directory: string | null; reasons: string[] }[]
+  retainedSessions: { sessionID: string; directory: string; ownedRows: Record<string, number>; reasons: string[] }[]
+  retainedCounts: { sessions: number; ownedRows: number }
+  partial?: boolean
   selectedCounts: { sessions: number; ownedRows: number }
   deletedCounts?: { sessions: number; ownedRows: number; byTable: Record<string, number> }
   deletionScope: { sessionIDs: string[]; wholeSessions: boolean }
@@ -232,8 +235,8 @@ test("dead-directory inventory counts and apply preserve live and uncertain dire
 }, 60000)
 
 test("directory uncertainty from inaccessible paths and dangling symlinks never authorizes deletion", async () => {
-  await using store = await producedStore([{}, { payloadBytes: 512 * 1024 }, {}])
-  const [blockedID, deadID, symlinkID] = store.metadata.map((item) => item.created[0]!.id)
+  await using store = await producedStore([{}, { payloadBytes: 512 * 1024 }, {}, {}])
+  const [blockedID, deadID, symlinkID, ambiguousID] = store.metadata.map((item) => item.created[0]!.id)
   const blocked = path.join(store.directory, "inaccessible")
   const dangling = path.join(store.directory, "dangling")
   await mkdir(blocked)
@@ -241,15 +244,21 @@ test("directory uncertainty from inaccessible paths and dangling symlinks never 
   const db = new Database(store.filename)
   db.query("UPDATE session SET directory = ? WHERE id = ?").run(path.join(blocked, "missing"), blockedID!)
   db.query("UPDATE session SET directory = ? WHERE id = ?").run(path.join(dangling, "missing"), symlinkID!)
+  db.query("UPDATE session SET directory = ? WHERE id = ?").run(
+    `${dangling}${path.sep}..${path.sep}missing`,
+    ambiguousID!,
+  )
   db.close()
   const beforeBlocked = ownedCounts(store.filename, blockedID!)
   const beforeSymlink = ownedCounts(store.filename, symlinkID!)
+  const beforeAmbiguous = ownedCounts(store.filename, ambiguousID!)
   await chmod(blocked, 0)
   try {
     const result = parseReport(await runCLI(store, ["--apply"]))
     expect(result.deletedSessionIDs).toEqual([deadID!])
     expect(ownedCounts(store.filename, blockedID!)).toEqual(beforeBlocked)
     expect(ownedCounts(store.filename, symlinkID!)).toEqual(beforeSymlink)
+    expect(ownedCounts(store.filename, ambiguousID!)).toEqual(beforeAmbiguous)
   } finally {
     await chmod(blocked, 0o700)
   }
@@ -350,7 +359,7 @@ test("teardown CLI retires only the removed directory and repeated retirement is
   const live = await produceLive({ ...store, project: liveDirectory }, { create: {} })
   const liveID = live.created[0]!.id
   const liveBefore = ownedCounts(store.filename, liveID)
-  const unrelatedDirectory = path.join(store.directory, "other-dead-worktree")
+  const unrelatedDirectory = store.project + "-sibling"
   await mkdir(unrelatedDirectory)
   const unrelated = await produceLive({ ...store, project: unrelatedDirectory }, { create: {} })
   const unrelatedID = unrelated.created[0]!.id
@@ -374,8 +383,90 @@ test("teardown CLI retires only the removed directory and repeated retirement is
   )
   expect(repeated.action).toBe("noop")
   expect(repeated.changedRows).toBe(0)
+  expect(repeated.reclamation.vacuum).toEqual({ state: "skipped", reason: "no-deletions" })
   expect(ownedCounts(store.filename, liveID)).toEqual(liveBefore)
   expect(ownedCounts(store.filename, unrelatedID)).toEqual(unrelatedBefore)
+}, 60000)
+
+test("small retirement completes even without positive allocated-byte recovery", async () => {
+  await using store = await createStore()
+  const setup = new Database(store.filename)
+  setup.exec("PRAGMA page_size=65536; VACUUM")
+  setup.close()
+  const created = await produceLive(store, { create: {} })
+  const id = created.created[0]!.id
+  const before = ownedCounts(store.filename, id)
+  await rm(store.project, { recursive: true })
+  const result = parseReport(await runCLI(store, ["--directory", store.project, "--apply"], 0, { command: "retire" }))
+  expect(result.action).toBe("applied")
+  expect(result.reclamation.vacuum?.state).toBe("complete")
+  expect(result.reclamation.reclaimedBytes).toBeLessThanOrEqual(0)
+  expect(result.deletedCounts?.ownedRows).toBe(Object.values(before).reduce((sum, n) => sum + n, 0))
+  expect(Object.values(ownedCounts(store.filename, id)).every((n) => n === 0)).toBe(true)
+  expect(result.retainedCounts).toEqual({ sessions: 0, ownedRows: 0 })
+}, 60000)
+
+test.each(["trailing separator", "parent segment", "resolved symlink"])(
+  "retirement normalizes %s for selection and retained-target detection",
+  async (spelling) => {
+    await using store = await createStore()
+    const nested = path.join(store.project, "repo")
+    await mkdir(nested)
+    const alias = path.join(store.directory, "alias")
+    await symlink(store.directory, alias)
+    const recorded = spelling === "trailing separator" ? store.project : nested
+    const created = await produceLive({ ...store, project: recorded }, { create: [{}, { pendingV1: true }] })
+    const eligibleID = created.created[0]!.id
+    const protectedID = created.created[1]!.id
+    const protectedBefore = ownedCounts(store.filename, protectedID)
+    const target =
+      spelling === "trailing separator"
+        ? store.project + path.sep
+        : spelling === "parent segment"
+          ? `${store.project}${path.sep}..${path.sep}project`
+          : path.join(alias, "project")
+    await rm(store.project, { recursive: true })
+    const inventory = parseReport(await runCLI(store, ["--directory", target], 0, { command: "retire" }))
+    expect(inventory.deletionScope.sessionIDs).toEqual([eligibleID])
+    expect(inventory.retainedSessions.map((item) => item.sessionID)).toEqual([protectedID])
+    const applied = parseReport(await runCLI(store, ["--directory", target, "--apply"], 0, { command: "retire" }))
+    expect(applied.action).toBe("applied")
+    expect(applied.partial).toBe(true)
+    expect(applied.deletedSessionIDs).toEqual([eligibleID])
+    expect(Object.values(ownedCounts(store.filename, eligibleID)).every((n) => n === 0)).toBe(true)
+    expect(ownedCounts(store.filename, protectedID)).toEqual(protectedBefore)
+    expect(applied.retainedCounts.ownedRows).toBe(Object.values(protectedBefore).reduce((sum, n) => sum + n, 0))
+    const retry = parseReport(await runCLI(store, ["--directory", target, "--apply"], 1, { command: "retire" }))
+    expect(retry.action).toBe("refused")
+    expect(retry.changedRows).toBe(0)
+    expect(retry.retainedSessions.map((item) => item.sessionID)).toEqual([protectedID])
+    expect(ownedCounts(store.filename, protectedID)).toEqual(protectedBefore)
+  },
+  60000,
+)
+
+test("mixed live and dead directory targets retire independently and report retained rows", async () => {
+  await using store = await createStore()
+  const live = await produceLive(store, { create: {} })
+  const liveID = live.created[0]!.id
+  const liveBefore = ownedCounts(store.filename, liveID)
+  const nested = path.join(store.project, "removed-task")
+  await mkdir(nested)
+  const dead = await produceLive({ ...store, project: nested }, { create: {} })
+  const deadID = dead.created[0]!.id
+  await rm(nested, { recursive: true })
+  const applied = parseReport(await runCLI(store, ["--directory", store.project, "--apply"], 0, { command: "retire" }))
+  expect(applied.action).toBe("applied")
+  expect(applied.partial).toBe(true)
+  expect(applied.deletedSessionIDs).toEqual([deadID])
+  expect(Object.values(ownedCounts(store.filename, deadID)).every((n) => n === 0)).toBe(true)
+  expect(ownedCounts(store.filename, liveID)).toEqual(liveBefore)
+  expect(applied.retainedSessions.map((item) => item.sessionID)).toEqual([liveID])
+  expect(applied.retainedSessions[0]!.reasons).toContain("session-directory-exists")
+  expect(applied.retainedCounts).toEqual({
+    sessions: 1,
+    ownedRows: Object.values(liveBefore).reduce((sum, n) => sum + n, 0),
+  })
 }, 60000)
 
 test(
@@ -1122,7 +1213,7 @@ test("a live review hold is a liveness blocker, with a clean private control", a
   expect(ownedCounts(heldStore.filename, heldID).session).toBe(0)
 })
 
-test("a post-commit vacuum failure reports deletion and directory retirement retries compaction", async () => {
+test("a post-commit vacuum failure reports deletion and a no-op retry skips compaction", async () => {
   await using store = await producedStore([{ payloadBytes: 1024 * 1024 }])
   const id = store.metadata[0]!.created[0]!.id
   const read = new Database(store.filename, { readonly: true })
@@ -1137,6 +1228,7 @@ test("a post-commit vacuum failure reports deletion and directory retirement ret
   })
   try {
     const failed = await invokeHandler(store, { directory, apply: true })
+    if (failed.report.action !== "failed") throw new Error(JSON.stringify(failed.report, null, 2))
     expect(failed.report.action).toBe("failed")
     expect(failed.report.committed).toBe(true)
     expect(failed.report.changedRows).toBeGreaterThan(0)
@@ -1146,13 +1238,19 @@ test("a post-commit vacuum failure reports deletion and directory retirement ret
   } finally {
     exec.mockRestore()
   }
-  const beforeRetry = await allocatedBytes(store.filename)
-  const retry = await invokeHandler(store, { directory, apply: true })
-  if (retry.report.action !== "noop") throw new Error(JSON.stringify(retry.report, null, 2))
-  expect(retry.report.action).toBe("noop")
-  expect(retry.report.changedRows).toBe(0)
-  expect(retry.report.reclamation.vacuum?.state).toBe("complete")
-  expect(await allocatedBytes(store.filename)).toBeLessThan(beforeRetry)
+  const retryExec = spyOn(Database.prototype, "exec")
+  try {
+    const retry = await invokeHandler(store, { directory, apply: true })
+    if (retry.report.action !== "noop") throw new Error(JSON.stringify(retry.report, null, 2))
+    expect(retry.report.action).toBe("noop")
+    expect(retry.report.changedRows).toBe(0)
+    expect(retryExec.mock.calls.some(([sql]) => sql === "VACUUM")).toBe(false)
+    expect(retry.report.committed).toBe(false)
+    expect(retry.report.reclamation.vacuum).toEqual({ state: "skipped", reason: "no-deletions" })
+    expect(retry.report.reclamation).not.toHaveProperty("reclaimedBytes")
+  } finally {
+    retryExec.mockRestore()
+  }
 })
 
 test("SQLite exclusion blocks late readers and writers through post-commit vacuum", async () => {

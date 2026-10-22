@@ -33,6 +33,7 @@ type SessionRow = {
 type SessionReport = {
   sessionID: string
   directory: string | null
+  directoryIdentity: string | null
   directoryState: string
   ownedRows: Record<string, number>
   parentSessionID: string | null
@@ -380,6 +381,7 @@ async function inventorySnapshot(
         .all()
     : []
   const parents = sessions.map((row) => [row.id, row.parent_id] as const)
+  const targetDirectory = directory === undefined ? undefined : await directoryIdentity(directory)
   const ids = new Set(sessions.map((row) => row.id))
   const activities = activityBySession(db, schema.tables, schema.columnMap)
   const ownership = aggregateOwnershipFailures(db, ids, schema.tables)
@@ -396,6 +398,7 @@ async function inventorySnapshot(
   const autoVacuum = db.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()?.auto_vacuum
   const allocated = await allocatedBytes(filename)
   const globalReasons = [...schema.failures, ...unknownStorage, ...ownership]
+  if (directory !== undefined && targetDirectory === undefined) globalReasons.push("directory-identity-unreadable")
   if (integrity.state !== "ok") globalReasons.push(`integrity-check-${integrity.state}`)
   if (foreignKeys.state !== "ok") globalReasons.push(`foreign-key-check-${foreignKeys.state}`)
   const candidates = new Map<string, SessionReport>()
@@ -403,9 +406,10 @@ async function inventorySnapshot(
 
   for (const row of sessions) {
     const reasons = [...globalReasons, ...holderReasons]
-    const directoryState = await inspectDirectory(row.directory)
+    const identity = await directoryIdentity(row.directory)
+    const directoryState = identity === undefined ? "unknown" : await inspectDirectory(identity)
     if (directoryState !== "missing") reasons.push(`session-directory-${directoryState}`)
-    if (directory !== undefined && path.normalize(row.directory) !== path.normalize(directory)) {
+    if (directory !== undefined && !withinDirectory(identity, targetDirectory)) {
       reasons.push("outside-explicit-directory-selection")
     }
     if (requested && !requested.includes(row.id)) reasons.push("outside-explicit-session-selection")
@@ -423,6 +427,7 @@ async function inventorySnapshot(
     const report: SessionReport = {
       sessionID: row.id,
       directory: row.directory,
+      directoryIdentity: identity ?? null,
       directoryState,
       ownedRows: schema.failures.length === 0 ? ownedRows(db, row.id) : {},
       parentSessionID: row.parent_id,
@@ -453,6 +458,7 @@ async function inventorySnapshot(
     excluded.set(id, {
       sessionID: id,
       directory: null,
+      directoryIdentity: null,
       directoryState: "unknown",
       ownedRows: {},
       parentSessionID: null,
@@ -470,16 +476,34 @@ async function inventorySnapshot(
     ...crossSessionOwnership,
     ...holderReasons,
   ]
+  if (directory !== undefined && targetDirectory === undefined) readinessReasons.push("directory-identity-unreadable")
   if (integrity.state !== "ok") readinessReasons.push(`integrity-check-${integrity.state}`)
   if (foreignKeys.state !== "ok") readinessReasons.push(`foreign-key-check-${foreignKeys.state}`)
   if (allocated.status !== "measured") readinessReasons.push(`allocated-byte-measurement-${allocated.status}`)
+  const retainedSessions = [...excluded.values()].filter(
+    (item) =>
+      (!requested || requested.includes(item.sessionID)) &&
+      (directory !== undefined
+        ? withinDirectory(item.directoryIdentity ?? undefined, targetDirectory)
+        : requested !== undefined || item.directoryState === "missing") &&
+      !item.reasons.includes("activity-at-or-after-cutoff"),
+  )
   return {
     database: filename,
     cutoff: cutoff === undefined ? null : new Date(cutoff).toISOString(),
     explicitDirectory: directory ?? null,
+    directoryIdentity: targetDirectory ?? null,
     explicitSessionIDs: requested ?? null,
     selectedSessions: [...candidates.values()].toSorted((left, right) => left.sessionID.localeCompare(right.sessionID)),
     excludedSessions: [...excluded.values()].toSorted((left, right) => left.sessionID.localeCompare(right.sessionID)),
+    retainedSessions,
+    retainedCounts: {
+      sessions: retainedSessions.length,
+      ownedRows: retainedSessions.reduce(
+        (sum, item) => sum + Object.values(item.ownedRows).reduce((sum, n) => sum + n, 0),
+        0,
+      ),
+    },
     deletionScope: { sessionIDs: [...candidates.keys()].toSorted(), wholeSessions: true },
     selectedCounts: {
       sessions: candidates.size,
@@ -515,12 +539,11 @@ async function applyPrune(
   if (inventory.selectedSessions.length === 0 && directory === undefined) refusalReasons.push("no-eligible-sessions")
   if (refusalReasons.length > 0) return { ...inventory, action: "refused", refusalReasons, changedRows: 0 }
   if (inventory.selectedSessions.length === 0) {
-    const state = await inspectDirectory(directory!)
+    const targetDirectory = await directoryIdentity(directory!)
+    const state = targetDirectory === undefined ? "unknown" : await inspectDirectory(targetDirectory)
     if (
       state !== "missing" ||
-      inventory.excludedSessions.some(
-        (item) => item.directory !== null && path.normalize(item.directory) === path.normalize(directory!),
-      )
+      inventory.excludedSessions.some((item) => withinDirectory(item.directoryIdentity ?? undefined, targetDirectory))
     ) {
       return {
         ...inventory,
@@ -528,6 +551,15 @@ async function applyPrune(
         refusalReasons: [`directory-retirement-not-eligible:${state}`],
         changedRows: 0,
       }
+    }
+    return {
+      ...inventory,
+      action: "noop",
+      committed: false,
+      changedRows: 0,
+      deletedSessionIDs: [],
+      deletedCounts: { sessions: 0, ownedRows: 0, byTable: {} },
+      reclamation: { ...inventory.reclamation, vacuum: { state: "skipped", reason: "no-deletions" } },
     }
   }
   if (inventory.reclamation.allocatedBytes.status !== "measured") {
@@ -596,6 +628,7 @@ async function applyPrune(
 
   const checkpoint = checkpointDatabase(db)
   const vacuum = (() => {
+    if (changedRows === 0) return { state: "skipped", reason: "no-deletions" }
     if ("error" in checkpoint || checkpoint.busy !== 0) return { state: "skipped", reason: "checkpoint-incomplete" }
     try {
       const holders = scanDatabaseHolders(filename)
@@ -634,15 +667,14 @@ async function applyPrune(
   const reclamationReasons = []
   if ("error" in checkpoint) reclamationReasons.push(`wal-checkpoint-failed:${checkpoint.error}`)
   else if (checkpoint.busy !== 0) reclamationReasons.push("wal-checkpoint-did-not-complete")
-  if (vacuum.state !== "complete") reclamationReasons.push(`vacuum-${vacuum.state}:${vacuum.reason}`)
+  if (vacuum.state !== "complete" && vacuum.reason !== "no-deletions")
+    reclamationReasons.push(`vacuum-${vacuum.state}:${vacuum.reason}`)
   if (vacuumCheckpoint && "error" in vacuumCheckpoint)
     reclamationReasons.push(`vacuum-checkpoint-failed:${vacuumCheckpoint.error}`)
   else if (vacuumCheckpoint && vacuumCheckpoint.busy !== 0)
     reclamationReasons.push("vacuum-checkpoint-did-not-complete")
   if (afterAllocated.status !== "measured")
     reclamationReasons.push("allocated-byte-measurement-after-apply-unavailable")
-  if (reclaimedBytes === undefined || (changedRows > 0 && reclaimedBytes <= 0))
-    reclamationReasons.push("allocated-bytes-not-reclaimed")
   if (postIntegrity.state !== "ok") reclamationReasons.push(`integrity-check-after-checkpoint-${postIntegrity.state}`)
   if (postForeignKeys.state !== "ok")
     reclamationReasons.push(`foreign-key-check-after-checkpoint-${postForeignKeys.state}`)
@@ -651,6 +683,7 @@ async function applyPrune(
     ...inventory,
     action,
     committed: true,
+    partial: inventory.retainedSessions.length > 0,
     changedRows,
     deletedSessionIDs: inventory.deletionScope.sessionIDs,
     deletedCounts: { sessions: deletedByTable.session ?? 0, ownedRows: changedRows, byTable: deletedByTable },
@@ -705,19 +738,59 @@ function ownedRows(db: SqliteAccess, sessionID: string) {
 
 function validDirectory(directory: string) {
   return (
-    typeof directory === "string" &&
-    directory.length > 0 &&
-    !directory.includes("\0") &&
-    path.isAbsolute(directory) &&
-    !directory.split(path.sep).includes("..")
+    typeof directory === "string" && directory.length > 0 && !directory.includes("\0") && path.isAbsolute(directory)
+  )
+}
+
+async function directoryIdentity(directory: string) {
+  if (!validDirectory(directory)) return undefined
+  const root = path.parse(directory).root
+  const segments = directory
+    .slice(root.length)
+    .split(path.sep)
+    .filter((segment) => segment && segment !== ".")
+  let current = path.resolve(root)
+  for (const [index, segment] of segments.entries()) {
+    if (segment === "..") {
+      current = path.dirname(current)
+      continue
+    }
+    const candidate = path.join(current, segment)
+    try {
+      const entry = await lstat(candidate)
+      // Resolve each existing link before parent segments can hide a dangling one.
+      current = entry.isSymbolicLink() ? await realpath(candidate) : candidate
+      if (index < segments.length - 1 && !(entry.isSymbolicLink() ? await stat(current) : entry).isDirectory()) {
+        return undefined
+      }
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) return undefined
+      // ENOENT from lstat is absence; ENOENT resolving a present symlink is uncertainty.
+      try {
+        await lstat(candidate)
+        return undefined
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) return undefined
+      }
+      current = candidate
+    }
+  }
+  return current
+}
+
+function withinDirectory(candidate: string | undefined, directory: string | undefined) {
+  if (candidate === undefined || directory === undefined) return false
+  return (
+    candidate === directory || candidate.startsWith(directory.endsWith(path.sep) ? directory : directory + path.sep)
   )
 }
 
 async function inspectDirectory(directory: string) {
-  if (!validDirectory(directory)) return "unknown"
-  const root = path.parse(directory).root
+  const identity = await directoryIdentity(directory)
+  if (identity === undefined) return "unknown"
+  const root = path.parse(identity).root
   let current = root
-  for (const segment of directory.slice(root.length).split(path.sep).filter(Boolean)) {
+  for (const segment of identity.slice(root.length).split(path.sep).filter(Boolean)) {
     current = path.join(current, segment)
     try {
       const entry = await lstat(current)
