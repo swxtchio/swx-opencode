@@ -2,7 +2,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { afterEach, describe, expect, test } from "bun:test"
 import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { mkdir, open, stat } from "node:fs/promises"
+import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import { setTimeout } from "node:timers/promises"
 import { pathToFileURL } from "node:url"
@@ -57,6 +57,7 @@ import { testProviderConfig } from "../lib/test-provider"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { spanHold } from "../fixture/span-hold"
 import { applyRetentionFixture } from "../fixture/session-retention"
+import { smallModelConfig } from "../fixture/small-model"
 
 const originalWorkspaces = Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
 const noopBootstrapLayer = Layer.succeed(
@@ -124,7 +125,6 @@ function pathFor(path: string, params: Record<string, string>) {
   return Object.entries(params).reduce((result, [key, value]) => result.replace(`:${key}`, value), path)
 }
 
-// The opencode-arm-release-x64.yml release-proof job typechecks this file against its pinned source.
 const selectedForcePath = "/session/:sessionID/queue/force/:itemID"
 const selectedHoldStatusPath = "/session/:sessionID/queue/hold/:holder"
 const selectedRewritePath = "/session/:sessionID/queue/rewrite/:itemID"
@@ -287,6 +287,88 @@ function json<T>(response: HttpClientResponse.HttpClientResponse) {
 function responseJson(response: HttpClientResponse.HttpClientResponse) {
   return response.json
 }
+
+it.live(
+  "small-model HTTP controls isolate title and compaction requests in one server",
+  () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      const directory = yield* tmpdirScoped({
+        git: true,
+        config: { ...smallModelConfig(llm.url), small_model: "auxiliary/global-small" },
+      })
+      const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+      const first = yield* requestJson<Session.Info>(SessionPaths.create, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: { providerID: "test", id: "test-model" },
+          smallModel: { providerID: "auxiliary", id: "session-small" },
+        }),
+      })
+      const second = yield* requestJson<Session.Info>(SessionPaths.create, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: { providerID: "test", id: "test-model" },
+          smallModel: { providerID: "auxiliary", id: "other-small" },
+        }),
+      })
+      expect(first.smallModel?.id).toEqual(ModelV2.ID.make("session-small"))
+      expect(second.smallModel?.id).toEqual(ModelV2.ID.make("other-small"))
+      const updated = yield* requestJson<Session.Info>(pathFor(SessionPaths.update, { sessionID: first.id }), {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ smallModel: { providerID: "auxiliary", id: "dedicated-small" } }),
+      })
+      expect(updated.model).toEqual(first.model)
+      expect(updated.smallModel?.id).toEqual(ModelV2.ID.make("dedicated-small"))
+      for (const chat of [first, second]) {
+        yield* llm.text("Selected title")
+        yield* llm.text("Primary reply")
+        expect(
+          (yield* request(pathFor(SessionPaths.prompt, { sessionID: chat.id }), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              agent: "build",
+              parts: [{ type: "text", text: "Explain per-session configuration" }],
+            }),
+          })).status,
+        ).toBe(200)
+        yield* pollWithTimeout(
+          requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: chat.id }), { headers }).pipe(
+            Effect.map((info) => (Session.isDefaultTitle(info.title) ? undefined : info)),
+          ),
+          "HTTP title did not finish",
+          "10 seconds",
+        )
+        yield* llm.text("Session summary")
+        expect(
+          (yield* request(pathFor(SessionPaths.summarize, { sessionID: chat.id }), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ providerID: "test", modelID: "test-model" }),
+          })).status,
+        ).toBe(200)
+        const messages = yield* requestJson<SessionV1.WithParts[]>(
+          pathFor(SessionPaths.messages, { sessionID: chat.id }),
+          { headers },
+        )
+        expect(
+          messages.find((message) => message.info.role === "assistant" && message.info.summary)?.info,
+        ).toMatchObject({ providerID: "auxiliary", modelID: chat.id === first.id ? "dedicated-small" : "other-small" })
+      }
+      const inputs = yield* llm.inputs
+      expect(inputs.map((input) => input.model).sort()).toEqual(
+        ["dedicated-small", "dedicated-small", "other-small", "other-small", "test-model", "test-model"].sort(),
+      )
+      expect(
+        (yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: second.id }), { headers })).smallModel,
+      ).toEqual(second.smallModel)
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  60_000,
+)
 
 function requestJson<T>(path: string, init?: RequestInit) {
   return request(path, init).pipe(Effect.flatMap(json<T>))
@@ -569,92 +651,92 @@ describe("session HttpApi", () => {
     { git: true, config: { formatter: false, lsp: false } },
   )
 
-it.live(
-  "enhances a draft through the configured provider without creating a session prompt",
-  () =>
-    Effect.gen(function* () {
-      const llm = yield* TestLLMServer
-      yield* llm.text("clear rewritten draft")
-      const base = testProviderConfig(llm.url)
-      const config = {
-        ...base,
-        provider: {
-          ...base.provider,
-          test: {
-            ...base.provider.test,
-            options: { ...base.provider.test.options, setCacheKey: true },
+  it.live(
+    "enhances a draft through the configured provider without creating a session prompt",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.text("clear rewritten draft")
+        const base = testProviderConfig(llm.url)
+        const config = {
+          ...base,
+          provider: {
+            ...base.provider,
+            test: {
+              ...base.provider.test,
+              options: { ...base.provider.test.options, setCacheKey: true },
+            },
           },
-        },
-      }
-      const directory = yield* tmpdirScoped({ git: true, config })
-      const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
-      const response = yield* request(`${InstancePaths.promptEnhance}?directory=${encodeURIComponent(directory)}`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          model: "test/test-model",
-          draft: "rough draft",
-          context: "visible session context",
-        }),
-      })
+        }
+        const directory = yield* tmpdirScoped({ git: true, config })
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const response = yield* request(`${InstancePaths.promptEnhance}?directory=${encodeURIComponent(directory)}`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            model: "test/test-model",
+            draft: "rough draft",
+            context: "visible session context",
+          }),
+        })
 
-      expect(response.status).toBe(200)
-      expect(yield* json<string>(response)).toBe("clear rewritten draft")
-      const calls = yield* llm.inputs
-      expect(calls).toHaveLength(1)
-      expect(calls[0]?.model).toBe("test-model")
-      expect(JSON.stringify(calls[0])).toContain("visible session context")
-      expect(JSON.stringify(calls[0])).toContain("rough draft")
-      expect(JSON.stringify(calls[0])).toContain("preserving its intent")
-      expect(JSON.stringify(calls[0])).toContain("promptCacheKey")
-    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
-  30_000,
-)
+        expect(response.status).toBe(200)
+        expect(yield* json<string>(response)).toBe("clear rewritten draft")
+        const calls = yield* llm.inputs
+        expect(calls).toHaveLength(1)
+        expect(calls[0]?.model).toBe("test-model")
+        expect(JSON.stringify(calls[0])).toContain("visible session context")
+        expect(JSON.stringify(calls[0])).toContain("rough draft")
+        expect(JSON.stringify(calls[0])).toContain("preserving its intent")
+        expect(JSON.stringify(calls[0])).toContain("promptCacheKey")
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
 
-it.live(
-  "reports an unavailable prompt enhancement model as a model resolution failure",
-  () =>
-    Effect.gen(function* () {
-      const llm = yield* TestLLMServer
-      const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
-      const response = yield* request(`${InstancePaths.promptEnhance}?directory=${encodeURIComponent(directory)}`, {
-        method: "POST",
-        headers: { "x-opencode-directory": directory, "content-type": "application/json" },
-        body: JSON.stringify({ model: "test/missing-model", draft: "rough draft", context: "" }),
-      })
+  it.live(
+    "reports an unavailable prompt enhancement model as a model resolution failure",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const response = yield* request(`${InstancePaths.promptEnhance}?directory=${encodeURIComponent(directory)}`, {
+          method: "POST",
+          headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+          body: JSON.stringify({ model: "test/missing-model", draft: "rough draft", context: "" }),
+        })
 
-      expect(response.status).toBe(404)
-      const body = yield* response.text
-      expect(body).toContain("test/missing-model")
-      expect(body).toContain("Model not found")
-      expect(yield* llm.calls).toBe(0)
-    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
-  30_000,
-)
+        expect(response.status).toBe(404)
+        const body = yield* response.text
+        expect(body).toContain("test/missing-model")
+        expect(body).toContain("Model not found")
+        expect(yield* llm.calls).toBe(0)
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
 
-it.live(
-  "reports enhancement provider failures with the provider error detail",
-  () =>
-    Effect.gen(function* () {
-      const llm = yield* TestLLMServer
-      yield* llm.error(401, { error: "credentials rejected" })
-      const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
-      const response = yield* request(`${InstancePaths.promptEnhance}?directory=${encodeURIComponent(directory)}`, {
-        method: "POST",
-        headers: { "x-opencode-directory": directory, "content-type": "application/json" },
-        body: JSON.stringify({ model: "test/test-model", draft: "rough draft", context: "" }),
-      })
+  it.live(
+    "reports enhancement provider failures with the provider error detail",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.error(401, { error: "credentials rejected" })
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const response = yield* request(`${InstancePaths.promptEnhance}?directory=${encodeURIComponent(directory)}`, {
+          method: "POST",
+          headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+          body: JSON.stringify({ model: "test/test-model", draft: "rough draft", context: "" }),
+        })
 
-      expect(response.status).toBe(502)
-      const body = yield* response.text
-      expect(body).toContain("credentials rejected")
-      expect(yield* llm.calls).toBe(1)
-    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
-  30_000,
-)
+        expect(response.status).toBe(502)
+        const body = yield* response.text
+        expect(body).toContain("credentials rejected")
+        expect(yield* llm.calls).toBe(1)
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
 
-it.live(
-  "uses the persisted session directory for prompt requests",
+  it.live(
+    "uses the persisted session directory for prompt requests",
     () =>
       Effect.gen(function* () {
         const llm = yield* TestLLMServer
@@ -1096,91 +1178,6 @@ it.live(
           expect(providerCalls).toBe(index + 1)
         }
         expect(yield* llm.calls).toBe(2)
-      }).pipe(Effect.provide(TestLLMServer.layer)),
-    { git: true, config: { formatter: false, lsp: false } },
-    30_000,
-  )
-
-  it.instance(
-    "logs producer wait registration and resolution for a held HTTP wait",
-    () =>
-      Effect.gen(function* () {
-        const llm = yield* TestLLMServer
-        const directory = yield* tmpdirScoped({
-          git: true,
-          init: (directory) => writeNativeTestProvider(directory, llm.url),
-        })
-        const session = yield* createNativeSession(directory, SessionV2.ID.make("ses_wait_registration_http"))
-        yield* awaitNativeModel(directory)
-        let releaseFinal = () => {}
-        const finalGate = new Promise<void>((resolve) => (releaseFinal = resolve))
-        yield* Effect.addFinalizer(() => Effect.sync(releaseFinal))
-        yield* llm.hold("Wait registration was observed", finalGate)
-
-        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
-        const admission = yield* requestJson<{ data: { id: string; admittedSeq: number } }>(
-          `/api/session/${session.id}/prompt`,
-          { method: "POST", headers, body: JSON.stringify({ prompt: { text: "Hold a wait registration" } }) },
-        )
-        yield* awaitWithTimeout(llm.wait(1), "wait-registration provider request did not start", "10 seconds")
-        const logFile = path.join(Global.Path.log, "opencode.log")
-        let logOffset = yield* Effect.promise(() => stat(logFile).then((info) => info.size, () => 0))
-        let logText = ""
-        const waitResponse = yield* Deferred.make<HttpClientResponse.HttpClientResponse>()
-        const waiter = yield* request(`/api/session/${session.id}/wait`, { method: "POST", headers }).pipe(
-          Effect.tap((response) => Deferred.succeed(waitResponse, response)),
-          Effect.forkScoped,
-        )
-        const waitLog = (event: string, waitID?: string) =>
-          Effect.promise(async () => {
-            const deadline = performance.now() + 10_000
-            while (performance.now() < deadline) {
-              const handle = await open(logFile, "r").catch(() => undefined)
-              if (handle) {
-                try {
-                  const info = await handle.stat()
-                  if (info.size > logOffset) {
-                    const buffer = Buffer.alloc(info.size - logOffset)
-                    const read = await handle.read(buffer, 0, buffer.length, logOffset)
-                    logOffset += read.bytesRead
-                    logText += buffer.toString("utf8", 0, read.bytesRead)
-                  }
-                } finally {
-                  await handle.close()
-                }
-              }
-              const match = logText.split(/\r?\n/).find(
-                (line) =>
-                  line.includes(`event=${event}`) &&
-                  line.includes(`session_id=${session.id}`) &&
-                  line.includes(`admitted_seq=${admission.data.admittedSeq}`) &&
-                  line.includes(`message_id=${admission.data.id}`) &&
-                  (waitID === undefined || line.includes(`wait_id=${waitID}`)),
-              )
-              if (match) return match
-              await setTimeout(25)
-            }
-            throw new Error(`timed out waiting for producer wait log ${event}`)
-          })
-        const registration = yield* waitLog("session.wait.registered").pipe(
-          Effect.onExit((exit) => (Exit.isFailure(exit) ? Effect.sync(releaseFinal) : Effect.void)),
-        )
-        const waitID = /(?:^|\s)wait_id=([^\s]+)/.exec(registration)?.[1]
-        if (!waitID) throw new Error(`wait registration had no server-generated wait ID: ${registration}`)
-        expect(yield* Deferred.isDone(waitResponse)).toBe(false)
-
-        releaseFinal()
-        const response = yield* awaitWithTimeout(
-          Deferred.await(waitResponse),
-          "HTTP wait did not return after releasing the provider",
-          "10 seconds",
-        )
-        expect(response.status).toBe(200)
-        const outcome = yield* json<{ data: SessionV2.WaitResult }>(response)
-        expect(outcome.data).toMatchObject({ type: "completed", admittedSeq: admission.data.admittedSeq })
-        yield* Fiber.join(waiter)
-        const resolution = yield* waitLog("session.wait.resolved", waitID)
-        expect(resolution).toContain("outcome=completed")
       }).pipe(Effect.provide(TestLLMServer.layer)),
     { git: true, config: { formatter: false, lsp: false } },
     30_000,

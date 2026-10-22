@@ -308,6 +308,7 @@ export default {
           \`permission\` text,
           \`agent\` text,
           \`model\` text,
+          \`small_model\` text,
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL,
           \`time_compacting\` integer,

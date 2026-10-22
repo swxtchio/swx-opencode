@@ -61,6 +61,7 @@ export const UpdatePayload = Schema.Struct({
   model: Session.Info.fields.model.annotate({
     description: "The model and variant the session's pending and later prompts run at",
   }),
+  smallModel: Session.Info.fields.smallModel,
   time: Schema.optional(
     Schema.Struct({
       archived: Schema.optional(Session.ArchivedTimestamp),
@@ -408,7 +409,13 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: PermissionResponsePayload,
           success: described(Schema.Boolean, "Permission processed successfully"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError, PermissionNotFoundError, AskUnavailableError, AskNotAppliedError],
+          error: [
+            HttpApiError.BadRequest,
+            ApiNotFoundError,
+            PermissionNotFoundError,
+            AskUnavailableError,
+            AskNotAppliedError,
+          ],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "permission.respond",

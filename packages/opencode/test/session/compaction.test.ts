@@ -26,7 +26,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Provider } from "@/provider/provider"
 import * as SessionProcessorModule from "../../src/session/processor"
 import { ProviderTest } from "../fake/provider"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { TestConfig } from "../fixture/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -35,6 +35,9 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { recordSmallModelRequests, smallModelCases, smallModelConfig, smallSelection } from "../fixture/small-model"
+import { Npm } from "@opencode-ai/core/npm"
+import { NpmTest } from "../fake/npm"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -301,6 +304,206 @@ const compactionEnv = AppNodeBuilder.build(
   LayerNode.group([SessionNs.node, SessionProjector.node, Database.node, EventV2Bridge.node, CrossSpawnSpawner.node]),
 )
 const itCompaction = testEffect(compactionEnv)
+
+function smallModelCompaction(recorded: ReturnType<typeof recordSmallModelRequests>) {
+  return testEffect(
+    AppNodeBuilder.build(compactionTestNode, [
+      [LLM.node, recorded.layer],
+      [SessionSummary.node, summary],
+      [Npm.node, NpmTest.noop],
+      [RuntimeFlags.node, RuntimeFlags.layer({ disableDefaultPlugins: true })],
+    ]),
+  )
+}
+
+for (const entry of smallModelCases) {
+  const recorded = recordSmallModelRequests()
+  smallModelCompaction(recorded).instance(
+    `small-model compaction and summary honor ${entry.name}`,
+    () =>
+      Effect.gen(function* () {
+        recorded.requests.length = 0
+        const sessions = yield* SessionNs.Service
+        const compact = yield* SessionCompaction.Service
+        const chat = yield* sessions.create({ smallModel: entry.session ? smallSelection(entry.session) : undefined })
+        yield* createUserMessage(chat.id, "Summarize this conversation")
+        const parentID = yield* compact.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+        expect(
+          yield* compact.process({
+            sessionID: chat.id,
+            parentID,
+            messages: yield* sessions.messages({ sessionID: chat.id }),
+            auto: false,
+          }),
+        ).toBe("continue")
+        expect(
+          recorded.requests.map((request) => [String(request.model.providerID), String(request.model.id)]),
+        ).toEqual([["auxiliary", entry.expected]])
+        const result = (yield* sessions.messages({ sessionID: chat.id })).find(
+          (message) => message.info.role === "assistant" && message.info.summary,
+        )
+        expect(result?.info).toMatchObject({ providerID: "auxiliary", modelID: entry.expected, summary: true })
+        expect(result?.parts).toEqual(
+          expect.arrayContaining([expect.objectContaining({ type: "text", text: "Auxiliary response" })]),
+        )
+      }),
+    { config: { ...smallModelConfig(), ...entry.config } },
+  )
+}
+
+for (const providerID of ["azure", "azure-cognitive-services"]) {
+  const recorded = recordSmallModelRequests()
+  smallModelCompaction(recorded).instance(
+    `small-model compaction honors configured cross-provider selection for ${providerID}`,
+    () =>
+      Effect.gen(function* () {
+        recorded.requests.length = 0
+        const sessions = yield* SessionNs.Service
+        const compact = yield* SessionCompaction.Service
+        const chat = yield* sessions.create()
+        const model = { providerID: ProviderV2.ID.make(providerID), modelID: ref.modelID }
+        const parentID = yield* compact.create({ sessionID: chat.id, agent: "build", model, auto: false })
+        yield* compact.process({
+          sessionID: chat.id,
+          parentID,
+          messages: yield* sessions.messages({ sessionID: chat.id }),
+          auto: false,
+        })
+        expect(
+          recorded.requests.map((request) => [String(request.model.providerID), String(request.model.id)]),
+        ).toEqual([["auxiliary", "global-small"]])
+      }),
+    { config: { ...smallModelConfig(), small_model: "auxiliary/global-small" } },
+  )
+}
+
+for (const scope of ["global", "agent", "session"] as const) {
+  const recorded = recordSmallModelRequests()
+  smallModelCompaction(recorded).instance(
+    `small-model compaction reports invalid ${scope} selection without substitute request`,
+    () =>
+      Effect.gen(function* () {
+        recorded.requests.length = 0
+        const sessions = yield* SessionNs.Service
+        const compact = yield* SessionCompaction.Service
+        const chat = yield* sessions.create({
+          smallModel: scope === "session" ? smallSelection("missing-small") : undefined,
+        })
+        const events = yield* EventV2Bridge.Service
+        const failure = yield* Deferred.make<string>()
+        const unsubscribe = yield* events.listen((event) => {
+          if (event.type !== SessionNs.Event.Error.type) return Effect.void
+          const data = Schema.decodeUnknownSync(SessionNs.Event.Error.data)(event.data)
+          return data.sessionID === chat.id ? Deferred.succeed(failure, JSON.stringify(data.error)).pipe(Effect.asVoid) : Effect.void
+        })
+        yield* Effect.addFinalizer(() => unsubscribe)
+        const parentID = yield* compact.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+        const exit = yield* compact
+          .process({
+            sessionID: chat.id,
+            parentID,
+            messages: yield* sessions.messages({ sessionID: chat.id }),
+            auto: false,
+          })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("missing-small")
+        expect(yield* awaitWithTimeout(Deferred.await(failure), "compaction lookup failure was not reported")).toContain("missing-small")
+        expect(recorded.requests).toEqual([])
+        expect(
+          (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "assistant"),
+        ).toEqual([])
+      }),
+    {
+      config: {
+        ...smallModelConfig(),
+        ...(scope === "global" ? { small_model: "auxiliary/missing-small" } : {}),
+        ...(scope === "agent" ? { agent: { build: { small_model: "auxiliary/missing-small" } } } : {}),
+      },
+    },
+  )
+}
+
+for (const setting of ["model", "small_model"] as const) {
+  const recorded = recordSmallModelRequests()
+  smallModelCompaction(recorded).instance(
+    `small-model compaction honors dedicated agent ${setting}`,
+    () =>
+      Effect.gen(function* () {
+        recorded.requests.length = 0
+        const sessions = yield* SessionNs.Service
+        const compact = yield* SessionCompaction.Service
+        const chat = yield* sessions.create({ smallModel: smallSelection("session-small") })
+        const parentID = yield* compact.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+        yield* compact.process({
+          sessionID: chat.id,
+          parentID,
+          messages: yield* sessions.messages({ sessionID: chat.id }),
+          auto: false,
+        })
+        expect(recorded.requests.map((request) => String(request.model.id))).toEqual(["dedicated-small"])
+      }),
+    {
+      config: {
+        ...smallModelConfig(),
+        small_model: "auxiliary/global-small",
+        agent: {
+          build: { small_model: "auxiliary/agent-small" },
+          compaction: { [setting]: "auxiliary/dedicated-small" },
+        },
+      },
+    },
+  )
+}
+
+for (const providerID of ["test", "azure", "azure-cognitive-services"]) {
+  const recorded = recordSmallModelRequests()
+  smallModelCompaction(recorded).instance(
+    `small-model unconfigured compaction preserves primary fallback for ${providerID}`,
+    () =>
+      Effect.gen(function* () {
+        recorded.requests.length = 0
+        const sessions = yield* SessionNs.Service
+        const compact = yield* SessionCompaction.Service
+        const chat = yield* sessions.create()
+        const model = { providerID: ProviderV2.ID.make(providerID), modelID: ref.modelID }
+        const parentID = yield* compact.create({ sessionID: chat.id, agent: "build", model, auto: false })
+        yield* compact.process({
+          sessionID: chat.id,
+          parentID,
+          messages: yield* sessions.messages({ sessionID: chat.id }),
+          auto: false,
+        })
+        expect(
+          recorded.requests.map((request) => [String(request.model.providerID), String(request.model.id)]),
+        ).toEqual([[providerID, "test-model"]])
+      }),
+    { config: smallModelConfig() },
+  )
+}
+
+{
+  const recorded = recordSmallModelRequests()
+  smallModelCompaction(recorded).instance(
+    "small-model unconfigured compaction ignores provider family inference",
+    () =>
+      Effect.gen(function* () {
+        recorded.requests.length = 0
+        const sessions = yield* SessionNs.Service
+        const compact = yield* SessionCompaction.Service
+        const chat = yield* sessions.create()
+        const parentID = yield* compact.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+        yield* compact.process({
+          sessionID: chat.id,
+          parentID,
+          messages: yield* sessions.messages({ sessionID: chat.id }),
+          auto: false,
+        })
+        expect(recorded.requests.map((request) => String(request.model.id))).toEqual(["test-model"])
+      }),
+    { config: smallModelConfig(undefined, true) },
+  )
+}
 
 type CompactionProcessOptions = {
   result?: "continue" | "compact"

@@ -202,6 +202,10 @@ export type Session = {
     providerID: string
     variant?: string
   }
+  smallModel?: {
+    id: string
+    providerID: string
+  }
   version: string
   metadata?: {
     [key: string]: unknown
@@ -1812,6 +1816,7 @@ export type PermissionConfig =
 
 export type AgentConfig = {
   model?: string
+  small_model?: string
   variant?: string
   temperature?: number
   top_p?: number
@@ -2369,6 +2374,10 @@ export type GlobalSession = {
     providerID: string
     variant?: string
   }
+  smallModel?: {
+    id: string
+    providerID: string
+  }
   version: string
   metadata?: {
     [key: string]: unknown
@@ -2515,6 +2524,10 @@ export type Agent = {
     providerID: string
   }
   variant?: string
+  smallModel?: {
+    modelID: string
+    providerID: string
+  }
   prompt?: string
   options: {
     [key: string]: unknown
@@ -9917,6 +9930,10 @@ export type SessionCreateData = {
       providerID: string
       variant?: string
     }
+    smallModel?: {
+      id: string
+      providerID: string
+    }
     metadata?: {
       [key: string]: unknown
     }
@@ -10058,6 +10075,10 @@ export type SessionUpdateData = {
       id: string
       providerID: string
       variant?: string
+    }
+    smallModel?: {
+      id: string
+      providerID: string
     }
     time?: {
       archived?: number

@@ -55,6 +55,7 @@ export const SessionTable = sqliteTable(
       providerID: string
       variant?: string
     }>(),
+    small_model: text({ mode: "json" }).$type<{ id: string; providerID: string }>(),
     ...Timestamps,
     time_compacting: integer(),
     time_archived: integer(),

@@ -23,6 +23,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
+import { NamedError } from "@opencode-ai/core/util/error"
 
 export const Event = SessionCompactionEvent
 
@@ -373,9 +374,23 @@ const layer = Layer.effect(
       }
 
       const agent = yield* agents.get("compaction")
-      const model = agent.model
-        ? yield* provider.getModel(agent.model.providerID, agent.model.modelID).pipe(Effect.orDie)
-        : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
+      const current = yield* session.get(input.sessionID).pipe(Effect.orDie)
+      const originAgent = yield* agents.get(userMessage.agent)
+      const smallModel =
+        agent.smallModel ??
+        originAgent?.smallModel ??
+        (current.smallModel ? { providerID: current.smallModel.providerID, modelID: current.smallModel.id } : undefined)
+      const model = yield* (agent.model
+        ? provider.getModel(agent.model.providerID, agent.model.modelID)
+        : provider.getSmallModel(userMessage.model.providerID, { model: smallModel, infer: false }).pipe(
+            Effect.flatMap((small) => small ? Effect.succeed(small) : provider.getModel(userMessage.model.providerID, userMessage.model.modelID)),
+          )).pipe(
+        Effect.tapError((error) => events.publish(Session.Event.Error, {
+          sessionID: input.sessionID,
+          error: new NamedError.Unknown({ message: error.message }).toObject(),
+        })),
+        Effect.orDie,
+      )
       const cfg = yield* config.get()
       const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
       const prior = completedCompactions(history)
