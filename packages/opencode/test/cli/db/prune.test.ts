@@ -597,6 +597,7 @@ test("a post-commit checkpoint failure reports committed deletions", async () =>
   })
   try {
     const result = await invokeHandler(store, { before: cutoff, session: [sessionID], apply: true })
+    if (!result.report.committed) throw new Error(JSON.stringify(result.report, null, 2))
     expect(ownedCounts(store.filename, sessionID)).toEqual({
       ...before,
       session: 0,
@@ -1147,6 +1148,7 @@ test("a post-commit vacuum failure reports deletion and directory retirement ret
   }
   const beforeRetry = await allocatedBytes(store.filename)
   const retry = await invokeHandler(store, { directory, apply: true })
+  if (retry.report.action !== "noop") throw new Error(JSON.stringify(retry.report, null, 2))
   expect(retry.report.action).toBe("noop")
   expect(retry.report.changedRows).toBe(0)
   expect(retry.report.reclamation.vacuum?.state).toBe("complete")
