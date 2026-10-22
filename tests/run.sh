@@ -50,6 +50,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     'The loaded interpreter identity and kernel-expanded argv are captured while each process is stopped at exec,' \
     'before user code runs. Failed or incomplete observation is refused; later script/cwd cleanup cannot change these records.' \
     'Runtime/test option prefixes use explicit Bun/Node arities; unclassified options are refused instead of assumed boolean.' \
+    'The version-dependent bare Node --experimental-config-file form is refused; use --experimental-config-file=path.' \
     'bun run --bun delegation is refused. This is a merge-gate speedup, not a security boundary; full suite gates releases.' \
     'A nonzero target with no JUnit report is refused with target attribution, not labeled an execution-set mismatch.' \
     'Fast mode refuses if a selected file reports no active test cases.' \

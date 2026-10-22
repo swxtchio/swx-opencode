@@ -18,7 +18,7 @@ const nodeValues = [
   "--test-reporter", "--test-reporter-destination", "--test-concurrency", "--test-timeout", "--test-shard", "--input-type",
   "--experimental-default-type", "--watch-path", "--max-old-space-size", "--stack-trace-limit", "-C",
   "--allow-fs-read", "--allow-fs-write", "--build-snapshot-config", "--disable-proto", "--disable-warning",
-  "--dns-result-order", "--experimental-config-file", "--experimental-sea-config", "--experimental-test-isolation",
+  "--dns-result-order", "--experimental-sea-config", "--experimental-test-isolation",
   "--heapsnapshot-near-heap-limit", "--heapsnapshot-signal", "--icu-data-dir", "--inspect-publish-uid",
   "--localstorage-file", "--max-http-header-size", "--network-family-autoselection-attempt-timeout", "--openssl-config",
   "--report-dir", "--report-signal", "--run", "--secure-heap", "--secure-heap-min", "--snapshot-blob",
@@ -71,7 +71,7 @@ const nodeBooleans = [
   "--experimental-storage-inspection", "--experimental-stream-iter", "--no-async-context-frame", "--no-require-module",
   "--experimental-strip-types", "--no-strip-types", "--permission-audit", "--test-randomize", "--use-env-proxy",
 ]
-type Arity = "value" | "boolean" | "optional" | "number" | "eval" | "evalOptional"
+type Arity = "value" | "boolean" | "optional" | "number" | "eval" | "evalOptional" | "attached"
 const tables = {
   bun: new Map<string, Arity>([
     ...[...commonValues, ...bunValues].map((name): [string, Arity] => [name, "value"]),
@@ -86,6 +86,7 @@ const tables = {
     ...["--inspect", "--inspect-wait", "--inspect-brk", "--force-fips"].map((name): [string, Arity] => [name, "optional"]),
     ...["-e", "--eval"].map((name): [string, Arity] => [name, "eval"]),
     ...["-p", "--print"].map((name): [string, Arity] => [name, "evalOptional"]),
+    ["--experimental-config-file", "attached"],
   ]),
 }
 
@@ -117,6 +118,12 @@ export function parseLaunch(runtime: "bun" | "node", args: readonly string[]) {
       break
     }
     const attached = argument.includes("=")
+    // This bare alias changed arity within Node 24; only the attached spelling
+    // has stable operand semantics without identifying the executed Node minor.
+    if (arity === "attached" && (!attached || argument.endsWith("="))) {
+      error = "unattached Node config-file option is version-dependent; use --experimental-config-file=path"
+      break
+    }
     if (arity === "boolean" && attached) {
       error = "unexpected value for " + runtime + " boolean option: " + name
       break

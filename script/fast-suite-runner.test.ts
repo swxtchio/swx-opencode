@@ -18,7 +18,7 @@ import { parseLaunch } from "./test-argv"
 const scratch = mkdtempSync(join(tmpdir(), "fast-suite-runner-"))
 afterAll(() => rmSync(scratch, { recursive: true, force: true }))
 
-test("launch option arities follow the installed runtime help surfaces", () => {
+test("launch option arities check declared help syntax and explicit refusal", () => {
   for (const runtime of ["bun", "node"] as const) {
     const commands = runtime === "bun" ? [["bun", "--help"], ["bun", "test", "--help"]] : [["node", "--help"]]
     for (const command of commands) {
@@ -45,7 +45,9 @@ test("launch option arities follow the installed runtime help surfaces", () => {
             : spellings.find((part) => part.match(/^--?[A-Za-z0-9][A-Za-z0-9._-]*/)?.[0] === aliases[name]) ?? spelling
           const optional = syntax.includes("[=") || ["--inspect", "--inspect-wait", "--inspect-brk", "--parallel", "--bail", "--changed"].includes(name)
           const value = !optional && (syntax.includes("=") || ["-e", "--eval", "-p", "--print"].includes(name))
-          const parsed = parseLaunch(runtime, runtime === "bun" ? ["test", name, "--test-worker", "./probe.test.ts"] : [name, "--test", "./probe.cjs"])
+          const configFile = runtime === "node" && name === "--experimental-config-file"
+          const parsed = parseLaunch(runtime, runtime === "bun" ? ["test", name, "--test-worker", "./probe.test.ts"] : [configFile ? name + "=./probe.json" : name, "--test", "./probe.cjs"])
+          if (configFile) expect(parseLaunch("node", [name, "--test", "./probe.cjs"]).error).toBeDefined()
           if (runtime === "node" && parsed.error) {
             // Node floats in CI; newly added options must reject explicitly until
             // supported, rather than fail this test merely by existing in help.
@@ -54,7 +56,7 @@ test("launch option arities follow the installed runtime help surfaces", () => {
           }
           if (parsed.error) console.error(runtime, declaration, parsed.error)
           expect(parsed.error).toBeUndefined()
-          expect(runtime === "bun" ? parsed.worker : parsed.test).toBe(!value)
+          expect(runtime === "bun" ? parsed.worker : parsed.test).toBe(configFile || !value)
           if (syntax.includes("[=")) {
             const attached = parseLaunch(runtime, runtime === "bun" ? ["test", name + "=1", "--test-worker"] : [name + "=1", "--test"])
             expect(attached.error).toBeUndefined()
@@ -296,6 +298,7 @@ ${directSecondPath}
       join(packageRoot, "arg-probe.cjs"),
       'const { appendFileSync } = require("node:fs"); appendFileSync(process.env.FAST_SUITE_MARKER, process.env.FAST_SUITE_LAUNCH_SHAPE + "\\n"); console.log(process.argv.slice(2).join(" "))\n',
     )
+    writeFileSync(join(packageRoot, "node.config.json"), JSON.stringify({ nodeOptions: {} }))
     copyFileSync(join(import.meta.dir, "..", "tests", "run.sh"), runner)
     copyFileSync(join(import.meta.dir, "..", "tests", "observe-exec.py"), join(root, "tests", "observe-exec.py"))
     mkdirSync(join(root, "script"), { recursive: true })
@@ -512,7 +515,7 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("user-")) {',
         '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
         `  const source = ${JSON.stringify('require("node:fs").appendFileSync(process.env.FAST_SUITE_MARKER, process.env.FAST_SUITE_LAUNCH_SHAPE + "\\n"); console.log(process.argv.slice(1).join(" "))')}`,
-        '  const command = shape === "user-node-script" ? ["node", "./arg-probe.cjs", "--test"] : shape === "user-node-delimiter" ? ["node", "--", "./arg-probe.cjs", "--test"] : shape === "user-node-script-inline" ? ["node", "./arg-probe.cjs", "--test=ordinary"] : shape === "user-bun-eval" ? ["bun", "-e", source, "--", "--test-worker"] : shape === "user-node24-options" ? ["node", Number(Bun.spawnSync(["node", "--version"]).stdout.toString().slice(1).split(".")[0]) >= 24 ? "--allow-inspector" : "--no-warnings", "-e", source] : ["node", "-e", source, "--", "--test"]',
+        '  const command = shape === "user-node-config-attached" ? ["node", "--experimental-config-file=./node.config.json", "-e", source] : shape === "user-node-script" ? ["node", "./arg-probe.cjs", "--test"] : shape === "user-node-delimiter" ? ["node", "--", "./arg-probe.cjs", "--test"] : shape === "user-node-script-inline" ? ["node", "./arg-probe.cjs", "--test=ordinary"] : shape === "user-bun-eval" ? ["bun", "-e", source, "--", "--test-worker"] : shape === "user-node24-options" ? ["node", Number(Bun.spawnSync(["node", "--version"]).stdout.toString().slice(1).split(".")[0]) >= 24 ? "--allow-inspector" : "--no-warnings", "-e", source] : ["node", "-e", source, "--", "--test"]',
         '  const result = Bun.spawnSync(command, { stdout: "inherit", stderr: "inherit" })',
         '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
         "}",
@@ -609,7 +612,9 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         'appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "posttest\\n")',
         'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("node-test")) {',
         '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
-        '  const options = shape === "node-test-localstorage" ? ["--localstorage-file", "./ls"] : shape === "node-test-report-dir" ? ["--report-dir", "."] : shape === "node-test" ? [] : ["--test-coverage-" + shape.slice("node-test-coverage-".length), shape.endsWith("include") || shape.endsWith("exclude") ? "never-match" : "0"]',
+        '  const version = Bun.spawnSync(["node", "--version"]).stdout.toString().slice(1).split(".").map(Number)',
+        '  const bare = version[0] === 24 && version[1] >= 21',
+        '  const options = shape === "node-test-config-bare" ? bare ? ["--test-isolation=none", "--experimental-config-file"] : ["--experimental-config-file=./node.config.json"] : shape === "node-test-localstorage" ? ["--localstorage-file", "./ls"] : shape === "node-test-report-dir" ? ["--report-dir", "."] : shape === "node-test" ? [] : ["--test-coverage-" + shape.slice("node-test-coverage-".length), shape.endsWith("include") || shape.endsWith("exclude") ? "never-match" : "0"]',
         '  const result = Bun.spawnSync(["node", ...options, "--test", "./x.mjs"], { stdout: "inherit", stderr: "inherit" })',
         '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
         "}",
@@ -1009,7 +1014,7 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
 
     const launchShapes = process.env.FAST_SUITE_RUNNER_CASE
       ? [process.env.FAST_SUITE_RUNNER_CASE]
-      : ["user-node24-options", "worker-path-ignore", "worker-absolute-ignore", "worker-path-timings", "worker-absolute-timings", "value-bun-ignore", "value-bun-timings", "value-node-localstorage", "unknown-bun-path", "unknown-bun-absolute", "unknown-node-v8", "node-test-localstorage", "node-test-coverage-include", "node-test-coverage-exclude", "node-test-report-dir", "node-test-coverage-lines", "node-test-coverage-branches", "node-test-coverage-functions", "worker-path-env", "worker-absolute-env", "worker-path-outfile", "worker-absolute-outfile", "user-node-eval", "user-node-script", "user-node-delimiter", "user-node-script-inline", "user-bun-eval", "job-control-SIGSTOP", "job-control-SIGTSTP", "job-control-SIGTTIN", "job-control-SIGTTOU", "deleted-cwd", "deleted-fchdir", "overwrite-bun", "overwrite-node", "repoint-bun", "repoint-node", "absolute-bun", "absolute-bun-copy", "bun-delegation", "node-test", "inspect-base", "inspect-copy", "inspect-path", "inspect-base-inline", "inspect-copy-inline", "inspect-path-inline", "shebang-bun", "shebang-node", "shebang-chain", "fd-bun", "symlink-bun-missing", "symlink-node-missing", "symlink-bun-decoy", "symlink-node-decoy", "relative-bun-decoy", "relative-node-decoy", "chdir-bun-decoy", "chdir-node-decoy", "transient-bun", "transient-node"]
+      : ["node-test-config-bare", "user-node-config-attached", "user-node24-options", "worker-path-ignore", "worker-absolute-ignore", "worker-path-timings", "worker-absolute-timings", "value-bun-ignore", "value-bun-timings", "value-node-localstorage", "unknown-bun-path", "unknown-bun-absolute", "unknown-node-v8", "node-test-localstorage", "node-test-coverage-include", "node-test-coverage-exclude", "node-test-report-dir", "node-test-coverage-lines", "node-test-coverage-branches", "node-test-coverage-functions", "worker-path-env", "worker-absolute-env", "worker-path-outfile", "worker-absolute-outfile", "user-node-eval", "user-node-script", "user-node-delimiter", "user-node-script-inline", "user-bun-eval", "job-control-SIGSTOP", "job-control-SIGTSTP", "job-control-SIGTTIN", "job-control-SIGTTOU", "deleted-cwd", "deleted-fchdir", "overwrite-bun", "overwrite-node", "repoint-bun", "repoint-node", "absolute-bun", "absolute-bun-copy", "bun-delegation", "node-test", "inspect-base", "inspect-copy", "inspect-path", "inspect-base-inline", "inspect-copy-inline", "inspect-path-inline", "shebang-bun", "shebang-node", "shebang-chain", "fd-bun", "symlink-bun-missing", "symlink-node-missing", "symlink-bun-decoy", "symlink-node-decoy", "relative-bun-decoy", "relative-node-decoy", "chdir-bun-decoy", "chdir-node-decoy", "transient-bun", "transient-node"]
     for (const shape of launchShapes) {
       runOptions.env.FAST_SUITE_LAUNCH_SHAPE = shape
       writeFileSync(marker, "")
@@ -1076,7 +1081,10 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
         expect(readFileSync(marker, "utf8")).toContain("unlisted\n")
       }
       if (shape.startsWith("node-test")) {
-        expect(launchEscape.stderr.toString()).toContain("unobservable Node test launch")
+        if (shape === "node-test-config-bare") {
+          expect(launchEscape.stderr.toString()).toMatch(/unobservable Node test launch|unattached Node config-file option/)
+        }
+        if (shape !== "node-test-config-bare") expect(launchEscape.stderr.toString()).toContain("unobservable Node test launch")
         expect(readFileSync(marker, "utf8")).toContain("unlisted-node\n")
         expect(readFileSync(marker, "utf8")).toContain("selected-configured\n")
       }
