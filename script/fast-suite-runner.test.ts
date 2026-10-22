@@ -8,13 +8,121 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
+import { parseLaunch } from "./test-argv"
 
 const scratch = mkdtempSync(join(tmpdir(), "fast-suite-runner-"))
 afterAll(() => rmSync(scratch, { recursive: true, force: true }))
+
+test("launch option arities check declared help syntax and explicit refusal", () => {
+  for (const runtime of ["bun", "node"] as const) {
+    const commands = runtime === "bun" ? [["bun", "--help"], ["bun", "test", "--help"]] : [["node", "--help"]]
+    for (const command of commands) {
+      const help = Bun.spawnSync(command)
+      expect(help.exitCode).toBe(0)
+      const declarations = help.stdout.toString().split("\n").filter((line) => (runtime === "node" ? /^ {2}--?[A-Za-z0-9]/ : /^ {2,6}--?[A-Za-z0-9]/).test(line))
+      expect(declarations.length).toBeGreaterThan(0)
+      for (const line of declarations) {
+        const declaration = line.trimStart().match(/^--?[A-Za-z0-9][^\s,]*(?:,\s*--?[A-Za-z0-9][^\s,]*)*/)?.[0] ?? ""
+        const spellings = declaration.split(/,\s*/)
+        for (const spelling of spellings) {
+          const name = spelling.match(/^--?[A-Za-z0-9][A-Za-z0-9._-]*/)?.[0]
+          if (!name) continue
+          // These long aliases share a value operand; other grouped long names can
+          // have different arities (for example Node's two config-file switches).
+          const aliases: Record<string, string> = {
+            "--loader": "--experimental-loader",
+            "--debug-port": "--inspect-port",
+            "--report-directory": "--report-dir",
+            "--experimental-test-isolation": "--test-isolation",
+          }
+          const syntax = name.length === 2
+            ? spellings.find((part) => part.startsWith("--")) ?? spelling
+            : spellings.find((part) => part.match(/^--?[A-Za-z0-9][A-Za-z0-9._-]*/)?.[0] === aliases[name]) ?? spelling
+          const optional = syntax.includes("[=") || ["--inspect", "--inspect-wait", "--inspect-brk", "--parallel", "--bail", "--changed"].includes(name)
+          const value = !optional && (syntax.includes("=") || ["-e", "--eval", "-p", "--print"].includes(name))
+          const configFile = runtime === "node" && name === "--experimental-config-file"
+          const parsed = parseLaunch(runtime, runtime === "bun" ? ["test", name, "--test-worker", "./probe.test.ts"] : [configFile ? name + "=./probe.json" : name, "--test", "./probe.cjs"])
+          if (configFile) expect(parseLaunch("node", [name, "--test", "./probe.cjs"]).error).toBeDefined()
+          if (runtime === "node" && parsed.error) {
+            // Node floats in CI; newly added options must reject explicitly until
+            // supported, rather than fail this test merely by existing in help.
+            expect(parsed.error).toBe("unclassified node launch option: " + name)
+            continue
+          }
+          if (parsed.error) console.error(runtime, declaration, parsed.error)
+          expect(parsed.error).toBeUndefined()
+          expect(runtime === "bun" ? parsed.worker : parsed.test).toBe(configFile || !value)
+          if (syntax.includes("[=")) {
+            const attached = parseLaunch(runtime, runtime === "bun" ? ["test", name + "=1", "--test-worker"] : [name + "=1", "--test"])
+            expect(attached.error).toBeUndefined()
+            expect(runtime === "bun" ? attached.worker : attached.test).toBe(true)
+          }
+        }
+      }
+    }
+  }
+})
+
+test("exec observer preserves signal exits and execution from a non-leader thread", () => {
+  const observer = join(import.meta.dir, "..", "tests", "observe-exec.py")
+  const signaled = Bun.spawnSync([
+    "python3",
+    observer,
+    join(scratch, "signal.execs"),
+    "python3",
+    "-c",
+    "import os,signal; os.kill(os.getpid(), signal.SIGUSR1)",
+  ])
+  expect(signaled.exitCode).toBe(138)
+  const signalRecords = readFileSync(join(scratch, "signal.execs"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+  expect(signalRecords.at(-1)).toMatchObject({ event: "complete", exitCode: 138, execCount: 1 })
+  const threaded = Bun.spawnSync([
+    "python3",
+    observer,
+    join(scratch, "thread.execs"),
+    "python3",
+    "-c",
+    'import os,threading; t=threading.Thread(target=lambda: os.execv("/usr/bin/printf", ["printf", "thread-exec-ok"])); t.start(); t.join()',
+  ])
+  if (threaded.exitCode !== 0) console.error(threaded.stderr.toString())
+  expect(threaded.exitCode).toBe(0)
+  expect(threaded.stdout.toString()).toBe("thread-exec-ok")
+  const threadRecords = readFileSync(join(scratch, "thread.execs"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+  expect(threadRecords.filter((entry) => entry.event === "exec").at(-1)).toMatchObject({
+    executable: realpathSync("/usr/bin/printf"),
+    argv: ["printf", "thread-exec-ok"],
+  })
+  expect(threadRecords.at(-1)).toMatchObject({ event: "complete", exitCode: 0, execCount: 2 })
+})
+
+test.each(["SIGSTOP", "SIGTSTP", "SIGTTIN", "SIGTTOU"])("exec observer preserves %s until SIGCONT", (stop) => {
+  const fixture = join(import.meta.dir, "fixtures", "job-control.py")
+  const plain = Bun.spawnSync(["python3", fixture, stop])
+  if (plain.exitCode !== 0) console.error(plain.stderr.toString())
+  expect(plain.exitCode).toBe(0)
+  const observed = Bun.spawnSync([
+    "python3",
+    join(import.meta.dir, "..", "tests", "observe-exec.py"),
+    join(scratch, stop + ".execs"),
+    "python3",
+    fixture,
+    stop,
+  ])
+  if (observed.exitCode !== 0) console.error(observed.stderr.toString())
+  expect(observed.exitCode).toBe(0)
+  expect(observed.stdout.toString()).toBe(plain.stdout.toString())
+})
 
 // GOAL: compare fast-mode package traces with owning Turbo/package-script runs over exact files;
 // refusal fixtures cover hidden prerequisites, invalid admission metadata, and JUnit scope.
@@ -42,6 +150,7 @@ test(
     const scriptlessPackageTests = join(scriptlessPackageRoot, "test")
     const turbo = join(root, "node_modules", ".bin", "turbo")
     const bunBin = join(root, "bin", "bun")
+    const alternateBun = join(scratch, "alternate", "bun")
     const packagePath = "packages/example"
     const selectedPath = `${packagePath}/test/selected.test.ts`
     const selectedSecondPath = `${packagePath}/test/selected-second.test.ts`
@@ -68,14 +177,17 @@ ${directSecondPath}
           passThroughEnv: [
             "FAST_SUITE_MARKER",
             "FAST_SUITE_PACKAGE_PRELOAD_LOG",
+            "FAST_SUITE_DIRECT_PRELOAD_LOG",
             "FAST_SUITE_HOOK_LOG",
             "FAST_SUITE_BUILD_LOG",
             "FAST_SUITE_BUN_LOG",
             "FAST_SUITE_REAL_BUN",
+            "FAST_SUITE_ALTERNATE_BUN",
             "FAST_SUITE_FAIL_PRETEST",
             "FAST_SUITE_FAIL_POSTTEST",
             "FAST_SUITE_EXTRA_PRETEST_TEST",
             "FAST_SUITE_EXTRA_POSTTEST_TEST",
+            "FAST_SUITE_LAUNCH_SHAPE",
             "FAST_SUITE_FORCE_EXTRA_FILE",
             "PATH",
             "HOME",
@@ -104,6 +216,7 @@ ${directSecondPath}
         FAST_SUITE_BUN_LOG: bunArgsLog,
         FAST_TURBO_LOG: turboLog,
         FAST_SUITE_REAL_BUN: process.execPath,
+        FAST_SUITE_ALTERNATE_BUN: alternateBun,
         FAST_SUITE_FAIL_PRETEST: "0",
         FAST_SUITE_FAIL_POSTTEST: "0",
         FAST_SUITE_EXTRA_PRETEST_TEST: "0",
@@ -112,6 +225,8 @@ ${directSecondPath}
         FAST_SUITE_FAIL_BUILD: "0",
         FAST_SUITE_UNDECLARED: "ambient-only",
         FAST_SUITE_EMPTY_PLAN: "0",
+        FAST_SUITE_WRONG_OWNER_PLAN: "0",
+        FAST_SUITE_LAUNCH_SHAPE: "",
         FAST_SUITE_REAL_TURBO: realpathSync(join(import.meta.dir, "..", "node_modules", ".bin", "turbo")),
         PATH: `${join(root, "bin")}:${process.env.PATH}`,
       },
@@ -129,7 +244,67 @@ ${directSecondPath}
     mkdirSync(dirname(runner), { recursive: true })
     mkdirSync(dirname(turbo), { recursive: true })
     mkdirSync(dirname(bunBin), { recursive: true })
+    mkdirSync(dirname(alternateBun), { recursive: true })
+    copyFileSync(process.execPath, alternateBun)
+    writeFileSync(
+      join(packageRoot, "shebang-bun.ts"),
+      [
+        `#!${process.execPath} test`,
+        'import { appendFileSync } from "node:fs"',
+        'import { test } from "bun:test"',
+        'test("kernel-dispatched Bun test", () => appendFileSync(process.env.FAST_SUITE_MARKER!, "shebang-bun\\n"))',
+        "",
+      ].join("\n"),
+    )
+    writeFileSync(
+      join(packageRoot, "shebang-node.cjs"),
+      [
+        `#!${realpathSync(Bun.which("node")!)} --test`,
+        'const { appendFileSync } = require("node:fs")',
+        'const { test } = require("node:test")',
+        'test("kernel-dispatched Node test", () => appendFileSync(process.env.FAST_SUITE_MARKER, "shebang-node\\n"))',
+        "",
+      ].join("\n"),
+    )
+    chmodSync(join(packageRoot, "shebang-bun.ts"), 0o755)
+    chmodSync(join(packageRoot, "shebang-node.cjs"), 0o755)
+    mkdirSync(join(packageRoot, "physical", "child"), { recursive: true })
+    symlinkSync("physical/child", join(packageRoot, "linked"))
+    for (const family of ["bun", "node"]) {
+      const extension = family === "bun" ? "ts" : "cjs"
+      for (const kind of ["missing", "decoy"]) {
+        copyFileSync(
+          join(packageRoot, `shebang-${family}.${extension}`),
+          join(packageRoot, "physical", `probe-${kind}.${extension}`),
+        )
+      }
+      writeFileSync(join(packageRoot, `probe-decoy.${extension}`), "// ordinary lexical-path decoy\n")
+    }
+    writeFileSync(
+      join(packageRoot, "shebang-chain"),
+      `#!${join(packageRoot, "shebang-bun.ts")}\n`,
+    )
+    chmodSync(join(packageRoot, "shebang-chain"), 0o755)
+    writeFileSync(
+      join(root, "node_modules", ".bin", "tsc"),
+      '#!/usr/bin/env bash\nprintf "tool-flag:%s\\n" "$*" >> "${FAST_SUITE_MARKER:?}"\n',
+    )
+    chmodSync(join(root, "node_modules", ".bin", "tsc"), 0o755)
+    writeFileSync(
+      join(packageRoot, "flag-probe.ts"),
+      'import { appendFileSync } from "node:fs"\nappendFileSync(process.env.FAST_SUITE_MARKER!, "script-flag:" + process.argv.at(-1) + "\\n")\n',
+    )
+    writeFileSync(
+      join(packageRoot, "arg-probe.cjs"),
+      'const { appendFileSync } = require("node:fs"); appendFileSync(process.env.FAST_SUITE_MARKER, process.env.FAST_SUITE_LAUNCH_SHAPE + "\\n"); console.log(process.argv.slice(2).join(" "))\n',
+    )
+    writeFileSync(join(packageRoot, "node.config.json"), JSON.stringify({ nodeOptions: {} }))
     copyFileSync(join(import.meta.dir, "..", "tests", "run.sh"), runner)
+    copyFileSync(join(import.meta.dir, "..", "tests", "observe-exec.py"), join(root, "tests", "observe-exec.py"))
+    mkdirSync(join(root, "script"), { recursive: true })
+    copyFileSync(join(import.meta.dir, "test-argv.ts"), join(root, "script", "test-argv.ts"))
+    copyFileSync(join(import.meta.dir, "fixtures", "job-control.py"), join(packageRoot, "job-control.py"))
+    const observerSource = readFileSync(join(root, "tests", "observe-exec.py"), "utf8")
     chmodSync(runner, 0o755)
     const runnerSource = readFileSync(runner, "utf8")
     writeFileSync(
@@ -195,6 +370,7 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         test: exampleTestScript,
         posttest: "bun ./posttest.ts",
         "verify:unlisted": "bun test ./test/unlisted.test.ts",
+        "flag-probe": "bun ./flag-probe.ts",
       },
     }
     writeFileSync(join(packageRoot, "package.json"), JSON.stringify(examplePackage))
@@ -206,8 +382,18 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         private: true,
         type: "module",
         dependencies: { "@fixture/leaf": "workspace:*" },
-        scripts: { test: "bun test ./test/unselected.test.ts" },
+        scripts: { test: "bun test ./test/unselected.test.ts", prepare: "bun ./probe.ts" },
       }),
+    )
+    writeFileSync(
+      join(dependencyRoot, "probe.ts"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        'appendFileSync(process.env.FAST_SUITE_BUILD_LOG!, "non-build-prerequisite\\n")',
+        'const result = Bun.spawnSync(["bun", "test", "./test/unselected.test.ts"], { stdout: "inherit", stderr: "inherit" })',
+        'if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "",
+      ].join("\n"),
     )
     writeFileSync(
       join(dependencyRoot, "test", "unselected.test.ts"),
@@ -279,6 +465,7 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
     )
     writeFileSync(join(packageRoot, "bunfig.toml"), '[test]\npreload = ["./test/preload.ts"]\n')
     writeFileSync(join(directPackageRoot, "bunfig.toml"), '[test]\npreload = ["./test/preload.ts"]\n')
+    writeFileSync(join(directPackageRoot, "timings.json"), JSON.stringify({ version: 1, files: {} }))
     writeFileSync(
       join(packageTests, "preload.ts"),
       [
@@ -300,8 +487,116 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
     writeFileSync(
       join(packageRoot, "pretest.ts"),
       [
-        'import { appendFileSync } from "node:fs"',
+        'import { appendFileSync, chmodSync, copyFileSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"',
         'appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "pretest\\n")',
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("worker-")) {',
+        '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
+        '  const executable = shape.includes("path") ? "bun" : process.execPath',
+        '  const options = shape.endsWith("outfile") ? ["--reporter=junit", "--reporter-outfile", "--test-worker"] : [shape.endsWith("ignore") ? "--path-ignore-patterns" : shape.endsWith("timings") ? "--timings" : "--env-file", "--test-worker"]',
+        '  const result = Bun.spawnSync([executable, "test", ...options, "./test/unlisted.test.ts"], { stdout: "inherit", stderr: "inherit" })',
+        '  rmSync("./--test-worker", { force: true })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("value-bun-")) {',
+        '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
+        '  const options = shape.endsWith("timings") ? ["--timings", "./timings.json"] : ["--path-ignore-patterns", "never-match"]',
+        '  const result = Bun.spawnSync(["bun", "test", ...options, "./test/direct.test.ts"], { cwd: "../direct", env: { ...process.env, FAST_SUITE_CONFIG_KIND: "direct-package", FAST_SUITE_CONFIG_VALUE: "direct\\\\path", FAST_SUITE_UNDECLARED: "ambient-only" }, stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER!, shape + "\\n")',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE === "value-node-localstorage" || process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("unknown-")) {',
+        '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
+        `  const source = ${JSON.stringify('require("node:fs").appendFileSync(process.env.FAST_SUITE_MARKER, process.env.FAST_SUITE_LAUNCH_SHAPE + "\\n")')}`,
+        '  const executable = shape.includes("node") ? "node" : shape.endsWith("path") ? "bun" : process.execPath',
+        '  const options = shape === "value-node-localstorage" ? ["--localstorage-file", "./ls"] : shape.includes("node") ? ["--stack-size=1024"] : ["--minify"]',
+        '  const result = Bun.spawnSync([executable, ...options, "-e", source], { stdout: "inherit", stderr: "inherit" })',
+        '  if (shape === "value-node-localstorage" && result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("user-")) {',
+        '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
+        `  const source = ${JSON.stringify('require("node:fs").appendFileSync(process.env.FAST_SUITE_MARKER, process.env.FAST_SUITE_LAUNCH_SHAPE + "\\n"); console.log(process.argv.slice(1).join(" "))')}`,
+        '  const command = shape === "user-node-config-attached" ? ["node", "--experimental-config-file=./node.config.json", "-e", source] : shape === "user-node-script" ? ["node", "./arg-probe.cjs", "--test"] : shape === "user-node-delimiter" ? ["node", "--", "./arg-probe.cjs", "--test"] : shape === "user-node-script-inline" ? ["node", "./arg-probe.cjs", "--test=ordinary"] : shape === "user-bun-eval" ? ["bun", "-e", source, "--", "--test-worker"] : shape === "user-node24-options" ? ["node", Number(Bun.spawnSync(["node", "--version"]).stdout.toString().slice(1).split(".")[0]) >= 24 ? "--allow-inspector" : "--no-warnings", "-e", source] : ["node", "-e", source, "--", "--test"]',
+        '  const result = Bun.spawnSync(command, { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("job-control-")) {',
+        '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
+        '  const result = Bun.spawnSync(["python3", "./job-control.py", shape.slice("job-control-".length)], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER!, shape + "\\n")',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("deleted-")) {',
+        '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
+        '  const temporary = mkdtempSync(process.env.FAST_SUITE_ALTERNATE_BUN! + "-cwd-")',
+        `  const source = ${JSON.stringify('import os,sys; fd=os.open(sys.argv[1], os.O_RDONLY); os.fchdir(fd); os.close(fd); os.execve("/usr/bin/true", ["true"], dict(os.environ))')}`,
+        '  const result = shape === "deleted-fchdir" ? Bun.spawnSync(["python3", "-c", source, temporary], { stdout: "inherit", stderr: "inherit" }) : Bun.spawnSync(["/usr/bin/true"], { cwd: temporary, stdout: "inherit", stderr: "inherit" })',
+        '  rmSync(temporary, { recursive: true })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER!, shape + "\\n")',
+        "}",
+        'if (/^(overwrite|repoint)-/.test(process.env.FAST_SUITE_LAUNCH_SHAPE ?? "")) {',
+        '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE!',
+        '  const node = shape.endsWith("node")',
+        '  const source = process.cwd() + (node ? "/shebang-node.cjs" : "/shebang-bun.ts")',
+        '  const temporary = process.env.FAST_SUITE_ALTERNATE_BUN! + "-" + shape + (node ? ".cjs" : ".ts")',
+        '  rmSync(temporary, { force: true })',
+        '  if (shape.startsWith("repoint-")) symlinkSync(source, temporary)',
+        '  if (shape.startsWith("overwrite-")) { copyFileSync(source, temporary); chmodSync(temporary, 0o755) }',
+        '  const result = Bun.spawnSync([temporary], { stdout: "inherit", stderr: "inherit" })',
+        '  if (shape.startsWith("repoint-")) { rmSync(temporary); symlinkSync(process.cwd() + (node ? "/probe-decoy.cjs" : "/probe-decoy.ts"), temporary) }',
+        '  if (shape.startsWith("overwrite-")) writeFileSync(temporary, "// ordinary replacement bytes\\n")',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("symlink-") || process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("relative-") || process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("chdir-")) {',
+        '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
+        '  const extension = shape.includes("node") ? "cjs" : "ts"',
+        '  const name = "probe-" + (shape.endsWith("decoy") ? "decoy" : "missing") + "." + extension',
+        '  const result = shape.startsWith("relative-") ? Bun.spawnSync(["./linked/../" + name, process.cwd() + "/shebang-" + (shape.includes("node") ? "node.cjs" : "bun.ts")], { stdout: "inherit", stderr: "inherit" }) : Bun.spawnSync([shape.startsWith("chdir-") ? "./" + name : "../" + name], { cwd: shape.startsWith("chdir-") ? "./linked/.." : "./linked", stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("transient-")) {',
+        '  const node = process.env.FAST_SUITE_LAUNCH_SHAPE.endsWith("node")',
+        '  const source = node ? "./shebang-node.cjs" : "./shebang-bun.ts"',
+        '  const temporary = node ? "./vanishing-node.cjs" : "./vanishing-bun.ts"',
+        '  copyFileSync(source, temporary)',
+        '  chmodSync(temporary, 0o755)',
+        '  const result = Bun.spawnSync([temporary], { stdout: "inherit", stderr: "inherit" })',
+        '  rmSync(temporary)',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE === "tool-flags") {',
+        '  for (const command of [["bunx", "tsc", "-b"], ["bun", "x", "tsc", "-b"], ["bun", "run", "flag-probe", "--", "-b"]]) {',
+        '    const result = Bun.spawnSync(command, { stdout: "inherit", stderr: "inherit" })',
+        '    if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "  }",
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE === "fd-bun") {',
+        `  const source = ${JSON.stringify('import os; path=os.environ["FAST_SUITE_REAL_BUN"]; fd=os.open(path, os.O_RDONLY); os.execve(fd, [path, "test", "./test/unlisted.test.ts"], dict(os.environ))')}`,
+        '  const result = Bun.spawnSync(["python3", "-c", source], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("inspect-")) {',
+        '  const executable = process.env.FAST_SUITE_LAUNCH_SHAPE.includes("path") ? "bun" : process.env.FAST_SUITE_LAUNCH_SHAPE.includes("copy") ? process.env.FAST_SUITE_ALTERNATE_BUN! : process.execPath',
+        '  const flag = process.env.FAST_SUITE_LAUNCH_SHAPE.endsWith("inline") ? "--inspect=127.0.0.1:0" : "--inspect"',
+        '  const result = Bun.spawnSync([executable, flag, "test", "./test/unlisted.test.ts"], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("shebang-")) {',
+        '  const script = process.env.FAST_SUITE_LAUNCH_SHAPE === "shebang-bun" ? "./shebang-bun.ts" : process.env.FAST_SUITE_LAUNCH_SHAPE === "shebang-chain" ? "./shebang-chain" : "./shebang-node.cjs"',
+        '  const result = Bun.spawnSync([script], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE === "absolute-bun") {',
+        '  const result = Bun.spawnSync([process.execPath, "test", "./test/unlisted.test.ts"], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE === "absolute-bun-copy") {',
+        '  const result = Bun.spawnSync([process.env.FAST_SUITE_ALTERNATE_BUN!, "test", "./test/unlisted.test.ts"], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE === "bun-delegation") {',
+        '  Bun.spawnSync(["bun", "run", "--bun", "verify:unlisted"], { stdout: "inherit", stderr: "inherit" })',
+        "}",
         'if (process.env.FAST_SUITE_EXTRA_PRETEST_TEST === "1") {',
         '  const result = Bun.spawnSync(["bun", "run", "verify:unlisted"], { stdout: "inherit", stderr: "inherit" })',
         '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
@@ -315,11 +610,30 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
       [
         'import { appendFileSync } from "node:fs"',
         'appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "posttest\\n")',
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("node-test")) {',
+        '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
+        '  const version = Bun.spawnSync(["node", "--version"]).stdout.toString().slice(1).split(".").map(Number)',
+        '  const bare = version[0] === 24 && version[1] >= 21',
+        '  const options = shape === "node-test-config-bare" ? bare ? ["--test-isolation=none", "--experimental-config-file"] : ["--experimental-config-file=./node.config.json"] : shape === "node-test-localstorage" ? ["--localstorage-file", "./ls"] : shape === "node-test-report-dir" ? ["--report-dir", "."] : shape === "node-test" ? [] : ["--test-coverage-" + shape.slice("node-test-coverage-".length), shape.endsWith("include") || shape.endsWith("exclude") ? "never-match" : "0"]',
+        '  const result = Bun.spawnSync(["node", ...options, "--test", "./x.mjs"], { stdout: "inherit", stderr: "inherit" })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
         'if (process.env.FAST_SUITE_EXTRA_POSTTEST_TEST === "1") {',
         '  const result = Bun.spawnSync(["bun", "run", "verify:unlisted"], { stdout: "inherit", stderr: "inherit" })',
         '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
         "}",
         'if (process.env.FAST_SUITE_FAIL_POSTTEST === "1") process.exit(1)',
+        "",
+      ].join("\n"),
+    )
+    writeFileSync(
+      join(packageRoot, "x.mjs"),
+      [
+        'import { appendFileSync } from "node:fs"',
+        'import { test } from "node:test"',
+        'test("is an unlisted Node test", () => {',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER, "unlisted-node\\n")',
+        "})",
         "",
       ].join("\n"),
     )
@@ -514,6 +828,9 @@ if [ "\${FAST_SUITE_EMPTY_PLAN:-0}" = 1 ] && [ "$*" = "run test --filter=./packa
   printf '%s\\n' '{"tasks":[]}'
   exit 0
 fi
+if [ "\${FAST_SUITE_WRONG_OWNER_PLAN:-0}" = 1 ] && [ "$*" = "run test --filter=./packages/direct --dry=json" ]; then
+  exec "\${FAST_SUITE_REAL_TURBO:?}" run test --filter=./packages/example --dry=json
+fi
 exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
 `,
     )
@@ -695,6 +1012,117 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     expect(Bun.spawnSync(["git", "add", "tests/run.sh"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
     expect(Bun.spawnSync(["git", "commit", "-qm", "restore the JUnit observed receipt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
 
+    const launchShapes = process.env.FAST_SUITE_RUNNER_CASE
+      ? [process.env.FAST_SUITE_RUNNER_CASE]
+      : ["node-test-config-bare", "user-node-config-attached", "user-node24-options", "worker-path-ignore", "worker-absolute-ignore", "worker-path-timings", "worker-absolute-timings", "value-bun-ignore", "value-bun-timings", "value-node-localstorage", "unknown-bun-path", "unknown-bun-absolute", "unknown-node-v8", "node-test-localstorage", "node-test-coverage-include", "node-test-coverage-exclude", "node-test-report-dir", "node-test-coverage-lines", "node-test-coverage-branches", "node-test-coverage-functions", "worker-path-env", "worker-absolute-env", "worker-path-outfile", "worker-absolute-outfile", "user-node-eval", "user-node-script", "user-node-delimiter", "user-node-script-inline", "user-bun-eval", "job-control-SIGSTOP", "job-control-SIGTSTP", "job-control-SIGTTIN", "job-control-SIGTTOU", "deleted-cwd", "deleted-fchdir", "overwrite-bun", "overwrite-node", "repoint-bun", "repoint-node", "absolute-bun", "absolute-bun-copy", "bun-delegation", "node-test", "inspect-base", "inspect-copy", "inspect-path", "inspect-base-inline", "inspect-copy-inline", "inspect-path-inline", "shebang-bun", "shebang-node", "shebang-chain", "fd-bun", "symlink-bun-missing", "symlink-node-missing", "symlink-bun-decoy", "symlink-node-decoy", "relative-bun-decoy", "relative-node-decoy", "chdir-bun-decoy", "chdir-node-decoy", "transient-bun", "transient-node"]
+    for (const shape of launchShapes) {
+      runOptions.env.FAST_SUITE_LAUNCH_SHAPE = shape
+      writeFileSync(marker, "")
+      const launchEscape = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+      if (shape.startsWith("deleted-") || shape.startsWith("job-control-") || shape.startsWith("user-") || shape.startsWith("value-")) {
+        if (launchEscape.exitCode !== 0) console.error(shape, launchEscape.stdout.toString(), launchEscape.stderr.toString())
+        expect(launchEscape.exitCode).toBe(0)
+        expect(launchEscape.stdout.toString()).toContain("verdict=completed mode=fast target_count=4 exit_code=0")
+        expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual(
+          [shape, "direct-configured", "direct-second-configured", "second-configured", "selected-configured"].concat(shape.startsWith("value-bun-") ? ["direct-configured"] : []).sort(),
+        )
+        continue
+      }
+      if (launchEscape.exitCode === 0) console.error(shape, launchEscape.stdout.toString(), readFileSync(marker, "utf8"))
+      if (shape === "bun-delegation") {
+        expect(readFileSync(marker, "utf8")).not.toContain("unlisted")
+        expect(readFileSync(marker, "utf8")).toContain("selected-configured\n")
+        expect(launchEscape.stdout.toString() + launchEscape.stderr.toString()).toContain("unobservable Bun delegation")
+      }
+      expect(launchEscape.exitCode).toBe(1)
+      expect(launchEscape.stdout.toString()).toContain("verdict=refused mode=fast")
+      if (shape.startsWith("unknown-")) {
+        expect(launchEscape.stdout.toString()).toContain("reason=unobservable-test-launch")
+        expect(launchEscape.stdout.toString() + launchEscape.stderr.toString()).toContain("unclassified " + (shape.includes("node") ? "node" : "bun") + " launch option")
+        expect(readFileSync(marker, "utf8")).toContain("selected-configured\n")
+        if (shape.endsWith("path")) expect(readFileSync(marker, "utf8")).not.toContain(shape + "\n")
+        if (!shape.endsWith("path")) expect(readFileSync(marker, "utf8")).toContain(shape + "\n")
+      }
+      if (shape.startsWith("worker-")) {
+        expect(readFileSync(marker, "utf8")).toContain("unlisted\n")
+        expect(readFileSync(marker, "utf8")).toContain("selected-configured\n")
+        expect(launchEscape.stdout.toString()).toContain(shape.includes("path") ? "reason=execution-set-mismatch" : "reason=unobservable-test-launch")
+        expect(launchEscape.stderr.toString()).toContain(shape.includes("path") ? "JUnit-observed files outside the manifest" : "unobserved Bun test launch")
+      }
+      if (shape.startsWith("inspect-")) {
+        if (!readFileSync(marker, "utf8").includes("unlisted\n")) console.error(shape, launchEscape.stdout.toString(), launchEscape.stderr.toString())
+        expect(readFileSync(marker, "utf8")).toContain("unlisted\n")
+      }
+      if (shape.startsWith("inspect-") && !shape.startsWith("inspect-path")) {
+        expect(launchEscape.stderr.toString()).toContain("unobserved Bun test launch")
+      }
+      if (shape.startsWith("inspect-path")) {
+        if (!launchEscape.stdout.toString().includes("reason=execution-set-mismatch")) console.error(launchEscape.stderr.toString())
+        expect(launchEscape.stdout.toString()).toContain("reason=execution-set-mismatch")
+        expect(launchEscape.stderr.toString()).toContain("JUnit-observed files outside the manifest")
+      }
+      if (shape.startsWith("shebang-")) {
+        expect(readFileSync(marker, "utf8")).toContain(shape === "shebang-chain" ? "shebang-bun\n" : `${shape}\n`)
+        expect(launchEscape.stderr.toString()).toContain(shape === "shebang-node" ? "unobservable Node test launch" : "unobserved Bun test launch")
+      }
+      if (shape === "fd-bun") {
+        expect(readFileSync(marker, "utf8")).toContain("unlisted\n")
+        expect(launchEscape.stderr.toString()).toContain("unobserved Bun test launch")
+      }
+      if (/^(?:symlink|relative|chdir|transient|overwrite|repoint)-/.test(shape)) {
+        if (!readFileSync(marker, "utf8").includes(shape.includes("node") ? "shebang-node\n" : "shebang-bun\n")) {
+          console.error(shape, launchEscape.stdout.toString(), launchEscape.stderr.toString())
+        }
+        expect(readFileSync(marker, "utf8")).toContain(shape.includes("node") ? "shebang-node\n" : "shebang-bun\n")
+        expect(launchEscape.stderr.toString()).toContain(shape.includes("node") ? "unobservable Node test launch" : "unobserved Bun test launch")
+      }
+      if (shape === "absolute-bun" || shape === "absolute-bun-copy") {
+        expect(launchEscape.stderr.toString()).toContain("unobserved Bun test launch")
+        expect(readFileSync(marker, "utf8")).toContain("unlisted\n")
+      }
+      if (shape.startsWith("node-test")) {
+        if (shape === "node-test-config-bare") {
+          expect(launchEscape.stderr.toString()).toMatch(/unobservable Node test launch|unattached Node config-file option/)
+        }
+        if (shape !== "node-test-config-bare") expect(launchEscape.stderr.toString()).toContain("unobservable Node test launch")
+        expect(readFileSync(marker, "utf8")).toContain("unlisted-node\n")
+        expect(readFileSync(marker, "utf8")).toContain("selected-configured\n")
+      }
+    }
+    runOptions.env.FAST_SUITE_LAUNCH_SHAPE = ""
+
+    const incompleteObserver = observerSource.replace(
+      '            report.write(json.dumps({"event": "complete", "exitCode": root_status, "execCount": count}) + "\\n")',
+      '            if output.endswith("/probe.execs"):\n                report.write(json.dumps({"event": "complete", "exitCode": root_status, "execCount": count}) + "\\n")',
+    )
+    expect(incompleteObserver).not.toBe(observerSource)
+    writeFileSync(join(root, "tests", "observe-exec.py"), incompleteObserver)
+    expect(Bun.spawnSync(["git", "add", "tests/observe-exec.py"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "exercise incomplete observer output"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    writeFileSync(marker, "")
+    const incompleteObservation = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(incompleteObservation.exitCode).toBe(1)
+    expect(incompleteObservation.stdout.toString()).toContain("reason=unobservable-test-launch")
+    expect(incompleteObservation.stderr.toString()).toContain("incomplete process-launch observation")
+    expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual([
+      "direct-configured",
+      "direct-second-configured",
+      "second-configured",
+      "selected-configured",
+    ])
+    writeFileSync(join(root, "tests", "observe-exec.py"), observerSource)
+    expect(Bun.spawnSync(["git", "add", "tests/observe-exec.py"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "restore complete observer output"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+
+    runOptions.env.FAST_SUITE_LAUNCH_SHAPE = "tool-flags"
+    writeFileSync(marker, "")
+    const forwardedFlags = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    if (forwardedFlags.exitCode !== 0) console.error(forwardedFlags.stdout.toString(), forwardedFlags.stderr.toString())
+    expect(forwardedFlags.exitCode).toBe(0)
+    expect(readFileSync(marker, "utf8").split("\n").filter((line) => line === "tool-flag:-b")).toHaveLength(2)
+    expect(readFileSync(marker, "utf8")).toContain("script-flag:-b\n")
+    runOptions.env.FAST_SUITE_LAUNCH_SHAPE = ""
+
     runOptions.env.FAST_SUITE_EXTRA_PRETEST_TEST = "1"
     writeFileSync(marker, "")
     const pretestEscape = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
@@ -717,6 +1145,9 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     writeFileSync(marker, "")
     writeFileSync(buildLog, "")
     const preparationEscape = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    if (!preparationEscape.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=execution-set-mismatch exit_code=1")) {
+      console.error(preparationEscape.stdout.toString(), preparationEscape.stderr.toString())
+    }
     expect(preparationEscape.exitCode).toBe(1)
     expect(preparationEscape.stdout.toString().trim().endsWith("verdict=refused mode=fast reason=execution-set-mismatch exit_code=1")).toBe(true)
     expect(preparationEscape.stderr.toString()).toContain("JUnit-observed files outside the manifest")
@@ -777,6 +1208,78 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     writeFileSync(packageTurboConfig, JSON.stringify(exampleTurboConfig))
     expect(Bun.spawnSync(["git", "add", "packages/example/turbo.json"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
     expect(Bun.spawnSync(["git", "commit", "-qm", "remove the unselected test prerequisite"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+
+    const rootTurboConfig = JSON.parse(readFileSync(join(root, "turbo.json"), "utf8"))
+    writeFileSync(
+      join(root, "turbo.json"),
+      JSON.stringify({
+        ...rootTurboConfig,
+        tasks: {
+          ...rootTurboConfig.tasks,
+          prepare: {
+            outputs: [],
+            passThroughEnv: ["FAST_SUITE_BUILD_LOG", "FAST_SUITE_MARKER", "FAST_SUITE_REAL_BUN", "FAST_SUITE_BUN_LOG", "PATH"],
+          },
+        },
+      }),
+    )
+    writeFileSync(
+      packageTurboConfig,
+      JSON.stringify({
+        ...exampleTurboConfig,
+        tasks: {
+          ...exampleTurboConfig.tasks,
+          test: { ...exampleTurboConfig.tasks.test, dependsOn: ["^prepare"] },
+        },
+      }),
+    )
+    expect(Bun.spawnSync(["git", "add", "turbo.json", "packages/example/turbo.json"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "add a non-build prerequisite without test words"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    const nonBuildPlan = Bun.spawnSync(
+      ["bun", "turbo", "run", "test", "--filter=./packages/example", "--dry=json"],
+      runOptions,
+    )
+    expect(nonBuildPlan.exitCode).toBe(0)
+    const nonBuildTask = JSON.parse(nonBuildPlan.stdout.toString()).tasks.find(
+      (task: { taskId: string }) => task.taskId === "@fixture/dependency#prepare",
+    )
+    expect(nonBuildTask.command).toBe("bun ./probe.ts")
+    writeFileSync(marker, "")
+    writeFileSync(buildLog, "")
+    const nonBuildPrerequisite = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(readFileSync(buildLog, "utf8")).toBe("")
+    expect(readFileSync(marker, "utf8")).toBe("")
+    expect(nonBuildPrerequisite.exitCode).toBe(1)
+    expect(nonBuildPrerequisite.stderr.toString()).toContain("not an admitted build task: @fixture/dependency#prepare")
+    writeFileSync(join(root, "turbo.json"), JSON.stringify(rootTurboConfig))
+    writeFileSync(packageTurboConfig, JSON.stringify(exampleTurboConfig))
+    expect(Bun.spawnSync(["git", "add", "turbo.json", "packages/example/turbo.json"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "restore build preparation"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+
+    writeFileSync(manifest, `${directPath}\n`)
+    expect(Bun.spawnSync(["git", "add", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "select the valid direct package for wrong-owner proof"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    runOptions.env.FAST_SUITE_WRONG_OWNER_PLAN = "1"
+    const wrongOwnerProbe = Bun.spawnSync(
+      ["bun", "turbo", "run", "test", "--filter=./packages/direct", "--dry=json"],
+      runOptions,
+    )
+    expect(wrongOwnerProbe.exitCode).toBe(0)
+    const wrongOwnerTasks = JSON.parse(wrongOwnerProbe.stdout.toString()).tasks as { directory: string; taskId: string }[]
+    expect(wrongOwnerTasks.length).toBeGreaterThan(0)
+    expect(wrongOwnerTasks.some((task) => task.directory === "packages/example" && task.taskId.endsWith("#test"))).toBe(true)
+    expect(wrongOwnerTasks.some((task) => task.directory === "packages/direct")).toBe(false)
+    writeFileSync(marker, "")
+    writeFileSync(buildLog, "")
+    const wrongOwnerPlan = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(readFileSync(marker, "utf8")).toBe("")
+    expect(readFileSync(buildLog, "utf8")).toBe("")
+    expect(wrongOwnerPlan.exitCode).toBe(1)
+    expect(wrongOwnerPlan.stderr.toString()).toContain("did not resolve the owning test task for packages/direct")
+    runOptions.env.FAST_SUITE_WRONG_OWNER_PLAN = "0"
+    writeFileSync(manifest, validManifest)
+    expect(Bun.spawnSync(["git", "add", "tests/fast-suite.txt"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "restore selected packages"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
 
     writeFileSync(
       join(scriptlessPackageRoot, "package.json"),
@@ -1069,5 +1572,5 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     expect(fullWithArguments.stdout.toString().trim().endsWith("verdict=completed mode=full exit_code=1")).toBe(true)
     expect(readFileSync(turboLog, "utf8").trim().split("\n").at(-1)).toBe("test --filter=./packages/example")
   },
-  60_000,
+  300_000,
 )

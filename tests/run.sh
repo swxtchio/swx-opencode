@@ -8,10 +8,12 @@
 # together through its scoped test task; packages without a task use `bun run test`.
 # Turbo/Bun own strict env, local config, script options, and one package lifecycle.
 # JUnit-less nonzero exits remain attributed refusals; extra or missing suites are rejected.
-# Residual limitations accepted for this fast gate (follow-up: swxtchio/swx-opencode#324):
-# absolute-Bun argv[0] launches bypass the shim; bun run --bun delegation and node:test
-# launches run unobserved. The non-build prerequisite allowlist and !targetTask
-# plan-empty wrapper refusal boundaries remain unpinned; see swxtchio/swx-opencode#324.
+# Fast mode needs Linux procfs/ptrace and Python 3 to observe child execs outside the Bun shim.
+# Remaining accepted limits (swxtchio/swx-opencode#324): this is not a security boundary;
+# unrecognized interpreter identities, in-process test frameworks, and deliberate observer/report
+# tampering are outside its observation scope. The full suite remains the release gate.
+# In particular, bare Node scripts using node:test without --test remain unobserved.
+# The observer records the loaded interpreter and kernel-expanded argv at exec stops.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,7 +45,13 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     'Bun pretest/test/posttest lifecycle runs once per package: pretest failure stops the test, and posttest runs only' \
     'after a successful test command; hook failures propagate through the task result.' \
     'All captured Bun JUnit reports, including preparation and lifecycle-hook launches, are collected; their observed' \
-    'file set must equal the manifest exactly.' \
+    'file set must equal the manifest exactly for PATH-resolved Bun test launches; see swxtchio/swx-opencode#324.' \
+    'Fast mode requires Python 3 and working Linux procfs/ptrace; unobserved Bun tests and Node --test invalidate the run.' \
+    'The loaded interpreter identity and kernel-expanded argv are captured while each process is stopped at exec,' \
+    'before user code runs. Failed or incomplete observation is refused; later script/cwd cleanup cannot change these records.' \
+    'Runtime/test option prefixes use explicit Bun/Node arities; unclassified options are refused instead of assumed boolean.' \
+    'The version-dependent bare Node --experimental-config-file form is refused; use --experimental-config-file=path.' \
+    'bun run --bun delegation is refused. This is a merge-gate speedup, not a security boundary; full suite gates releases.' \
     'A nonzero target with no JUnit report is refused with target attribution, not labeled an execution-set mismatch.' \
     'Fast mode refuses if a selected file reports no active test cases.' \
     'Only --fast refuses a checkout with tracked or untracked changes; full mode preserves the original Turbo behavior.' \
@@ -119,28 +127,41 @@ fi
 report_file="$root/.fast-suite-report.$$.xml"
 trap 'rm -f -- "$report_file" "$config_dir"/*; rmdir -- "$config_dir" 2>/dev/null || true' EXIT
 real_bun="$(command -v bun)"
+if ! command -v python3 >/dev/null 2>&1 \
+  || ! python3 "$root/tests/observe-exec.py" "$config_dir/probe.execs" \
+    "$real_bun" -p 'process.execPath' > "$config_dir/runtime-bun"; then
+  printf '%s\n' 'tests/run.sh: fast mode requires Python 3 and a working Linux procfs/ptrace process-launch observer' >&2
+  printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=process-observer-unavailable exit_code=1'
+  exit 1
+fi
 if ! FAST_SUITE_WRAPPER_PATH="$config_dir/bun" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" \
-  FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e '
+  FAST_SUITE_ARGV_PARSER="$root/script/test-argv.ts" FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e '
   const wrapper = `#!/usr/bin/env bash
 set -euo pipefail
 real_bun=${JSON.stringify(process.env.FAST_SUITE_CAPTURE_REAL_BUN)}
+parser_bun=${JSON.stringify(process.execPath)}
+parser=${JSON.stringify(process.env.FAST_SUITE_ARGV_PARSER)}
 report_dir=${JSON.stringify(process.env.FAST_SUITE_REPORT_DIR)}
 main_report=${JSON.stringify(process.env.FAST_SUITE_MAIN_REPORT)}
 args=("$@")
 wrapper_name=\${BASH_SOURCE[0]##*/}
-command_index=0
-while [ "$command_index" -lt "\${#args[@]}" ]; do
-  case "\${args[command_index]}" in
-    --cwd=*) command_index=$((command_index + 1)) ;;
-    --cwd|--config|--env-file|--preload|--require|--import|--conditions|--define|--loader|--inspect|--inspect-wait|--inspect-brk|-r|-p|-e|-d|-l) command_index=$((command_index + 2)) ;;
-    --*=*) command_index=$((command_index + 1)) ;;
-    -*) command_index=$((command_index + 1)) ;;
-    *) break ;;
-  esac
-done
-for argument in "\${args[@]}"; do
-  if [ "$argument" = --test-worker ]; then exec "$real_bun" "\${args[@]}"; fi
-done
+if ! parsed=$("$parser_bun" "$parser" -- "\${args[@]}" 3>&1 >/dev/null); then
+  printf "%s\\n" "tests/run.sh: could not parse Bun launch options" >&2
+  touch "$report_dir/refused-options"
+  exit 126
+fi
+fields=()
+while IFS= read -r field; do fields+=("$field"); done <<< "$parsed"
+command_index=\${fields[0]}
+worker=\${fields[1]}
+delegated=\${fields[2]}
+read -r -a option_indices <<< "\${fields[3]:-}"
+if [ "$wrapper_name" != bunx ] && [ "\${args[command_index]:-}" != x ] && [ "$delegated" -eq 1 ]; then
+  printf "%s\\n" "tests/run.sh: refusing unobservable Bun delegation" >&2
+  touch "$report_dir/refused-delegation"
+  exit 126
+fi
+if [ "$worker" = 1 ]; then exec "$real_bun" "\${args[@]}"; fi
 command="\${args[command_index]:-}"
 if [ "$wrapper_name" = bunx ]; then
   case "$command" in vitest|jest|playwright|mocha|ava|pytest|cypress) printf "%s\\n" "tests/run.sh: refusing an unobservable Bunx test runner: $command" >&2; exit 126 ;; esac
@@ -148,13 +169,11 @@ if [ "$wrapper_name" = bunx ]; then
 fi
 if [ "$command" != test ]; then exec "$real_bun" "\${args[@]}"; fi
 report_outfile=
-index=$((command_index + 1))
-while [ "$index" -lt "\${#args[@]}" ]; do
+for index in "\${option_indices[@]}"; do
   case "\${args[index]}" in
     --reporter-outfile=*) report_outfile=\${args[index]#*=} ;;
     --reporter-outfile) index=$((index + 1)); report_outfile=\${args[index]:-} ;;
   esac
-  index=$((index + 1))
 done
 if [ "$report_outfile" != "$main_report" ]; then
   report_outfile=$(mktemp "$report_dir/report.XXXXXX")
@@ -164,7 +183,7 @@ forwarded=()
 index=0
 while [ "$index" -lt "\${#args[@]}" ]; do
   argument=\${args[index]}
-  if [ "$index" -gt "$command_index" ]; then
+  if [[ " \${option_indices[*]} " = *" $index "* ]]; then
     case "$argument" in
       --reporter-outfile|--reporter) index=$((index + 2)); continue ;;
       --reporter-outfile=*|--reporter=*|--dots) index=$((index + 1)); continue ;;
@@ -564,7 +583,8 @@ for prep_task in "${turbo_prep_tasks[@]}"; do
     esac
   done
   preparation_status=0
-  GITHUB_ACTIONS=false PATH="$config_dir:$PATH" "$config_dir/bun" turbo run "$prep_task" "${prep_filters[@]}" --force || preparation_status=$?
+  GITHUB_ACTIONS=false PATH="$config_dir:$PATH" python3 "$root/tests/observe-exec.py" \
+    "$config_dir/preparation-$prep_task.execs" "$config_dir/bun" turbo run "$prep_task" "${prep_filters[@]}" --force || preparation_status=$?
   if [ "$preparation_status" -ne 0 ]; then
     printf 'tests/run.sh: Turbo-declared preparation task failed: %s\n' "$prep_task" >&2
     printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=turbo-preparation-failed exit_code=1'
@@ -612,10 +632,12 @@ while [ "$index" -lt "$target_count" ]; do
   report_args=(--reporter=junit --reporter-outfile="$report_file")
   test_status=0
   if [ "$has_turbo_task" = 1 ]; then
-    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" "$config_dir/bun" turbo run test "--filter=./$package_root" --only --force -- \
+    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" python3 "$root/tests/observe-exec.py" \
+      "$config_dir/package-$index.execs" "$config_dir/bun" turbo run test "--filter=./$package_root" --only --force -- \
       "${report_args[@]}" "${selected_paths[@]}" || test_status=$?
   else
-    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" "$config_dir/bun" --cwd="$root/$package_root" run test -- \
+    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" python3 "$root/tests/observe-exec.py" \
+      "$config_dir/package-$index.execs" "$config_dir/bun" --cwd="$root/$package_root" run test -- \
       "${report_args[@]}" "${selected_paths[@]}" || test_status=$?
   fi
   if [ "$test_status" -ne 0 ]; then target_status=$test_status; fi
@@ -685,6 +707,65 @@ while [ "$index" -lt "$target_count" ]; do
   index=$((index + 1))
 done
 
+# A process outside the PATH shim cannot certify a fast run by omitting its report.
+launch_observation_status=0
+FAST_SUITE_ROOT="$root" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e '
+  import { readdir } from "node:fs/promises"
+  import { basename, join } from "node:path"
+  import { parseLaunch } from "./script/test-argv.ts"
+
+  const directory = process.env.FAST_SUITE_REPORT_DIR
+  const runtimeBun = (await Bun.file(join(directory, "runtime-bun")).text()).trim()
+  const probe = (await Bun.file(join(directory, "probe.execs")).text()).trim().split("\n").map((line) => JSON.parse(line))
+  const runtime = probe.find((entry) => entry.event === "exec" && entry.executable === runtimeBun)
+  if (!runtime || probe.at(-1)?.event !== "complete") {
+    console.error("tests/run.sh: unavailable runtime executable identity")
+    process.exit(2)
+  }
+  const entries = await readdir(directory)
+  let invalid = entries.includes("refused-delegation") || entries.includes("refused-options")
+  for (const name of entries.filter((entry) => entry.endsWith(".execs") && entry !== "probe.execs")) {
+    const records = (await Bun.file(join(directory, name)).text()).trim().split("\n").map((line) => JSON.parse(line))
+    const launches = records.filter((entry) => entry.event === "exec")
+    const completion = records.at(-1)
+    if (completion?.event !== "complete" || completion.execCount !== launches.length || !launches.length || records.length !== launches.length + 1) {
+      console.error("tests/run.sh: incomplete process-launch observation: " + name)
+      invalid = true
+      continue
+    }
+    for (const entry of launches) {
+      const executable = entry.executable
+      const args = entry.argv.slice(1)
+      const configuredBun = entry.device === runtime.device && entry.inode === runtime.inode
+      const namedBun = executable.startsWith("/") && basename(executable) === "bun"
+      const node = basename(executable ?? "") === "node"
+      if (!configuredBun && !namedBun && !node) continue
+      const parsed = parseLaunch(node ? "node" : "bun", args)
+      if (parsed.error) {
+        console.error("tests/run.sh: " + parsed.error)
+        invalid = true
+        continue
+      }
+      if (node) {
+        if (parsed.test) {
+          console.error("tests/run.sh: unobservable Node test launch: " + executable)
+          invalid = true
+        }
+        continue
+      }
+      if (!parsed.test || parsed.worker) continue
+      const outfileIndex = parsed.options.find((index) => args[index] === "--reporter-outfile" || args[index].startsWith("--reporter-outfile="))
+      const outfile = outfileIndex === undefined ? undefined : args[outfileIndex].includes("=") ? args[outfileIndex].slice("--reporter-outfile=".length) : args[outfileIndex + 1]
+      const captured = outfile === process.env.FAST_SUITE_MAIN_REPORT || entries.some((entry) => entry.startsWith("report.") && !entry.endsWith(".cwd") && outfile === join(directory, entry))
+      const junit = parsed.options.some((index) => args[index] === "--reporter=junit" || (args[index] === "--reporter" && args[index + 1] === "junit"))
+      if (!captured || !junit) {
+        console.error("tests/run.sh: unobserved Bun test launch: " + executable)
+        invalid = true
+      }
+    }
+  }
+  if (invalid) process.exit(2)
+' || launch_observation_status=$?
 # Per-package JUnit checks record their actual files; the Bun shim records any other
 # test processes launched by preparation or lifecycle scripts. Enforce their union.
 declare -a manifest_paths=()
@@ -756,6 +837,10 @@ if [ "$observation_status" -ne 0 ]; then execution_set_invalid=1; fi
 
 if [ "$coverage_invalid" -ne 0 ]; then
   printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=no-test-cases exit_code=1'
+  exit 1
+fi
+if [ "$launch_observation_status" -ne 0 ]; then
+  printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=unobservable-test-launch exit_code=1'
   exit 1
 fi
 if [ "$attributed_refusal" -ne 0 ]; then
