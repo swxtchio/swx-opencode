@@ -1,5 +1,7 @@
 # Retirement review corrections — 2026-10-22
 
+This is a historical round-1 record. [Round 2](dead-retirement-round-2.md) corrects the existing-target/missing-child behavior and requires the target's own absence before any per-session retirement; the current operator contract is `../dead-session-retirement.md`.
+
 Source sampled: `839bdac6a0c0ac5a9475d90d633f028f992c70ef` on [PR #343](https://github.com/swxtchio/swx-opencode/pull/343). Authority: the round-1 fix order against `1cd9a4a616`. This record supersedes the earlier no-op compaction-retry behavior and positive-byte-recovery success gate; the initial allocation rehearsal remains a valid dated observation of its recorded source.
 
 ## Delivered behavior
