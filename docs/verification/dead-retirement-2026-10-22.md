@@ -1,6 +1,6 @@
 # Dead-worktree reclamation verification — 2026-10-22
 
-Final production/test source sampled: `da7be8f5f0b30a662d3cedb4956b116b385b1798`, reachable through [draft PR #343](https://github.com/swxtchio/swx-opencode/pull/343). The earlier independent rehearsal's production source is retained separately in its raw snapshot. The rehearsal driver is committed beside this evidence in that PR. Environment: Linux ARM64, Bun 1.4.2. All database mutation used fresh private stores under the task checkout's `.scratch`.
+Final production/test source sampled: `1d386c7e934458342badfdf6b24a7277d5f01a06`, reachable through [draft PR #343](https://github.com/swxtchio/swx-opencode/pull/343), including the merge of `swxtch`'s small-model schema/producer change (#342). The earlier independent rehearsal's production source is retained separately in its raw snapshot. The rehearsal driver is committed beside this evidence in that PR. Environment: Linux ARM64, Bun 1.4.2. All database mutation used fresh private stores under the task checkout's `.scratch`.
 
 ## Passing boundary run
 
@@ -8,7 +8,7 @@ From `packages/opencode`, `bun test --timeout 60000 test/cli/db/prune.test.ts` c
 
 The initial whole-file run exposed an obsolete race fixture: it tried to admit a prompt after the cleanup connection already held exclusive SQLite ownership. The fixture now admits through the real queue producer immediately before ownership acquisition, then removes age as a competing blocker. Its guarded behavior is pending-work preservation. The final passing run includes that correction.
 
-One later whole-file run returned an early `refused` result in the late-reader/vacuum test before that assertion retained its full production report. The refusal's cause is unestablished. Full refusal diagnostics were added; its focused rerun and the subsequent whole-file run passed. [Issue #344](https://github.com/swxtchio/swx-opencode/issues/344) preserves that intermittent observation for broader process-scan investigation without weakening the unchanged fail-closed liveness policy.
+One later whole-file run returned an early `refused` result in the late-reader/vacuum test before that assertion retained its full production report. After merging the newer base, another run refused in the existing checkpoint-failure test and the directory-compaction retry; the checkpoint test's rows remained intact. The refusals' causes are unestablished. Full refusal diagnostics were added at these assertions, and the subsequent whole-file run passed. [Issue #344](https://github.com/swxtchio/swx-opencode/issues/344) preserves the intermittent observations for broader process-scan investigation without weakening the unchanged fail-closed liveness policy.
 
 ## Behavior-removal evidence
 
