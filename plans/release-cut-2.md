@@ -27,4 +27,4 @@ On 2026-10-22, `git fetch origin swxtch` selected immutable source `bce37c276f40
 
 ## Current execution boundary
 
-The new task-specific VM14 grant was read before staging and workload admission. Both native candidates passed the unchanged packaged acceptance battery, and the carried small-model focused run passed 59 tests with zero failures. `RELEASE-CUT-2-EVIDENCE.md` records this execution checkpoint; publication and verified recipient handoff are the remaining phases.
+The new task-specific VM14 grant was read before staging and workload admission. Both native candidates passed the unchanged packaged acceptance battery, and the carried small-model focused run passed 59 tests with zero failures. The release is published and its Latest/tag/body/assets/downloaded bytes are verified. SaaS's required wake-log append and supplemental delivery are confirmed; Abbe's B-16.10 task wake-log routing and pending composer require firstmate's disposition. `RELEASE-CUT-2-EVIDENCE.md` records the complete execution checkpoint.
