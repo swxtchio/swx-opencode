@@ -57,6 +57,7 @@ import { testProviderConfig } from "../lib/test-provider"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { spanHold } from "../fixture/span-hold"
 import { applyRetentionFixture } from "../fixture/session-retention"
+import { smallModelConfig } from "../fixture/small-model"
 
 const originalWorkspaces = Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
 const noopBootstrapLayer = Layer.succeed(
@@ -287,6 +288,35 @@ function json<T>(response: HttpClientResponse.HttpClientResponse) {
 function responseJson(response: HttpClientResponse.HttpClientResponse) {
   return response.json
 }
+
+it.live("small-model HTTP controls isolate title and compaction requests in one server", () =>
+  Effect.gen(function* () {
+    const llm = yield* TestLLMServer
+    const directory = yield* tmpdirScoped({ git: true, config: { ...smallModelConfig(llm.url), small_model: "auxiliary/global-small" } })
+    const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+    const first = yield* requestJson<Session.Info>(SessionPaths.create, { method: "POST", headers, body: JSON.stringify({ model: { providerID: "test", id: "test-model" }, smallModel: { providerID: "auxiliary", id: "session-small" } }) })
+    const second = yield* requestJson<Session.Info>(SessionPaths.create, { method: "POST", headers, body: JSON.stringify({ model: { providerID: "test", id: "test-model" }, smallModel: { providerID: "auxiliary", id: "other-small" } }) })
+    expect(first.smallModel?.id).toEqual(ModelV2.ID.make("session-small"))
+    expect(second.smallModel?.id).toEqual(ModelV2.ID.make("other-small"))
+    const updated = yield* requestJson<Session.Info>(pathFor(SessionPaths.update, { sessionID: first.id }), { method: "PATCH", headers, body: JSON.stringify({ smallModel: { providerID: "auxiliary", id: "dedicated-small" } }) })
+    expect(updated.model).toEqual(first.model)
+    expect(updated.smallModel?.id).toEqual(ModelV2.ID.make("dedicated-small"))
+    for (const chat of [first, second]) {
+      yield* llm.text("Selected title")
+      yield* llm.text("Primary reply")
+      expect((yield* request(pathFor(SessionPaths.prompt, { sessionID: chat.id }), { method: "POST", headers, body: JSON.stringify({ agent: "build", parts: [{ type: "text", text: "Explain per-session configuration" }] }) })).status).toBe(200)
+      yield* pollWithTimeout(requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: chat.id }), { headers }).pipe(Effect.map((info) => Session.isDefaultTitle(info.title) ? undefined : info)), "HTTP title did not finish", "10 seconds")
+      yield* llm.text("Session summary")
+      expect((yield* request(pathFor(SessionPaths.summarize, { sessionID: chat.id }), { method: "POST", headers, body: JSON.stringify({ providerID: "test", modelID: "test-model" }) })).status).toBe(200)
+      const messages = yield* requestJson<SessionV1.WithParts[]>(pathFor(SessionPaths.messages, { sessionID: chat.id }), { headers })
+      expect(messages.find((message) => message.info.role === "assistant" && message.info.summary)?.info).toMatchObject({ providerID: "auxiliary", modelID: chat.id === first.id ? "dedicated-small" : "other-small" })
+    }
+    const inputs = yield* llm.inputs
+    expect(inputs.map((input) => input.model).sort()).toEqual(["dedicated-small", "dedicated-small", "other-small", "other-small", "test-model", "test-model"].sort())
+    expect((yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: second.id }), { headers })).smallModel).toEqual(second.smallModel)
+  }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  60_000,
+)
 
 function requestJson<T>(path: string, init?: RequestInit) {
   return request(path, init).pipe(Effect.flatMap(json<T>))

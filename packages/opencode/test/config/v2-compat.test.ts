@@ -60,6 +60,12 @@ describe("V2 compatibility read fixtures", () => {
 })
 
 describe("ConfigV2Compat.lower", () => {
+  test("small-model survives compatible plural agent loading", () => {
+    const config = lower({ agents: { build: { model: "test/test-model", small_model: "auxiliary/agent-small" } } })
+    expect(config.agent?.build?.small_model).toBe("auxiliary/agent-small")
+    expect(config.agent?.build?.options).not.toHaveProperty("small_model")
+  })
+
   test("returns structured invalid diagnostics while retaining supported siblings", () => {
     const result = ConfigV2Compat.lower({
       mcp: {

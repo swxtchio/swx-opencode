@@ -207,6 +207,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           if (ctx.payload.model !== undefined) {
             yield* session.setModel({ sessionID: ctx.params.sessionID, model: ctx.payload.model })
           }
+          if (ctx.payload.smallModel !== undefined) {
+            yield* session.setSmallModel({ sessionID: ctx.params.sessionID, model: ctx.payload.smallModel })
+          }
           if (ctx.payload.time?.archived !== undefined) {
             yield* session.setArchived({ sessionID: ctx.params.sessionID, time: ctx.payload.time.archived })
           }

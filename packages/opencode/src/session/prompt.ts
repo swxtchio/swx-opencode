@@ -323,10 +323,21 @@ const layer = Layer.effect(
 
       const ag = yield* agents.get("title")
       if (!ag) return
-      const mdl = ag.model
-        ? yield* provider.getModel(ag.model.providerID, ag.model.modelID)
-        : ((yield* provider.getSmallModel(input.providerID)) ??
-          (yield* provider.getModel(input.providerID, input.modelID)))
+      const current = yield* sessions.get(input.session.id).pipe(Effect.orDie)
+      const originAgent = yield* agents.get(firstInfo.agent)
+      const smallModel = ag.smallModel ?? originAgent?.smallModel ??
+        (current.smallModel ? { providerID: current.smallModel.providerID, modelID: current.smallModel.id } : undefined)
+      const mdl = yield* (ag.model
+        ? provider.getModel(ag.model.providerID, ag.model.modelID)
+        : provider.getSmallModel(input.providerID, { model: smallModel }).pipe(
+            Effect.flatMap((small) => small ? Effect.succeed(small) : provider.getModel(input.providerID, input.modelID)),
+          )).pipe(
+        Effect.tapError((error) => events.publish(Session.Event.Error, {
+          sessionID: input.session.id,
+          error: new NamedError.Unknown({ message: error.message }).toObject(),
+        })),
+        Effect.orDie,
+      )
       const msgs = onlySubtasks
         ? [{ role: "user" as const, content: subtasks.map((p) => p.prompt).join("\n") }]
         : yield* MessageV2.toModelMessagesEffect(context, mdl)

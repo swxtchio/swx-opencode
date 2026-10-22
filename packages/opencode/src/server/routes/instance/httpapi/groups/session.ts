@@ -61,6 +61,7 @@ export const UpdatePayload = Schema.Struct({
   model: Session.Info.fields.model.annotate({
     description: "The model and variant the session's pending and later prompts run at",
   }),
+  smallModel: Session.Info.fields.smallModel,
   time: Schema.optional(
     Schema.Struct({
       archived: Schema.optional(Session.ArchivedTimestamp),

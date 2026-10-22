@@ -4133,6 +4133,10 @@ export class Session2 extends HeyApiClient {
         providerID: string
         variant?: string
       }
+      smallModel?: {
+        id: string
+        providerID: string
+      }
       metadata?: {
         [key: string]: unknown
       }
@@ -4152,6 +4156,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "title" },
             { in: "body", key: "agent" },
             { in: "body", key: "model" },
+            { in: "body", key: "smallModel" },
             { in: "body", key: "metadata" },
             { in: "body", key: "permission" },
             { in: "body", key: "workspaceID" },
@@ -4285,6 +4290,10 @@ export class Session2 extends HeyApiClient {
         providerID: string
         variant?: string
       }
+      smallModel?: {
+        id: string
+        providerID: string
+      }
       time?: {
         archived?: number
       }
@@ -4303,6 +4312,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "metadata" },
             { in: "body", key: "permission" },
             { in: "body", key: "model" },
+            { in: "body", key: "smallModel" },
             { in: "body", key: "time" },
           ],
         },

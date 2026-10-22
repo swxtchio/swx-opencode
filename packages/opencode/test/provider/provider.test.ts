@@ -928,11 +928,12 @@ it.instance(
 )
 
 it.instance(
-  "getSmallModel ignores invalid config small_model",
+  "getSmallModel reports invalid config small_model",
   Effect.gen(function* () {
     yield* set("ANTHROPIC_API_KEY", "test-api-key")
-    const model = yield* Provider.use.getSmallModel(ProviderV2.ID.anthropic)
-    expect(model).toBeUndefined()
+    const result = yield* Provider.use.getSmallModel(ProviderV2.ID.anthropic).pipe(Effect.flip)
+    expect(result).toBeInstanceOf(Provider.ModelNotFoundError)
+    expect(String(result.modelID)).toBe("not-a-real-model")
   }),
   { config: { small_model: "anthropic/not-a-real-model" } },
 )

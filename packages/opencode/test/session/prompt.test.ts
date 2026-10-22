@@ -98,6 +98,7 @@ import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/l
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { runImport } from "../../src/cli/cmd/import"
 import { ShareNext } from "../../src/share/share-next"
+import { recordSmallModelRequests, smallModelCases, smallModelConfig, smallSelection } from "../fixture/small-model"
 
 const promptTests = <R, E>(layer: Layer.Layer<R, E>) => testEffect(layer, { git: true })
 
@@ -1250,6 +1251,121 @@ const seedUser = Effect.fn("test.seedUser")(function* (input: Omit<SessionPrompt
   yield* sessions.updateMessage(info)
   return { info, parts: message.parts }
 })
+
+for (const entry of smallModelCases) {
+  const recorded = recordSmallModelRequests()
+  promptTests(makePrompt({ llm: recorded.layer })).instance(
+    `small-model title honors ${entry.name}`,
+    () => Effect.gen(function* () {
+      recorded.requests.length = 0
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* sessions.create({ smallModel: entry.session ? smallSelection(entry.session) : undefined })
+      yield* prompt.prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "Explain scope selection" }] })
+      yield* pollWithTimeout(sessions.get(chat.id).pipe(Effect.map((info) => Session.isDefaultTitle(info.title) ? undefined : info.title)), "title did not finish")
+      expect(recorded.requests.filter((request) => request.agent.name === "title").map((request) => [String(request.model.providerID), String(request.model.id)])).toEqual([["auxiliary", entry.expected]])
+      expect(String((yield* sessions.get(chat.id)).model?.providerID)).toBe("test")
+    }),
+    { config: { ...smallModelConfig(), ...entry.config } },
+  )
+}
+
+for (const providerID of ["azure", "azure-cognitive-services"]) {
+  const recorded = recordSmallModelRequests()
+  promptTests(makePrompt({ llm: recorded.layer })).instance(
+    `small-model title honors configured cross-provider selection for ${providerID}`,
+    () => Effect.gen(function* () {
+      recorded.requests.length = 0
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* sessions.create()
+      yield* prompt.prompt({ sessionID: chat.id, parts: [{ type: "text", text: "Explain Azure" }] })
+      yield* pollWithTimeout(sessions.get(chat.id).pipe(Effect.map((info) => Session.isDefaultTitle(info.title) ? undefined : info.title)), "title did not finish")
+      expect(recorded.requests.filter((request) => request.agent.name === "title").map((request) => [String(request.model.providerID), String(request.model.id)])).toEqual([["auxiliary", "global-small"]])
+      expect(String((yield* sessions.get(chat.id)).model?.providerID)).toBe(providerID)
+    }),
+    { config: { ...smallModelConfig(), model: `${providerID}/test-model`, small_model: "auxiliary/global-small" } },
+  )
+}
+
+for (const scope of ["global", "agent", "session"] as const) {
+  const recorded = recordSmallModelRequests()
+  promptTests(makePrompt({ llm: recorded.layer })).instance(
+    `small-model title reports invalid ${scope} selection without substitute request`,
+    () => Effect.gen(function* () {
+      recorded.requests.length = 0
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const events = yield* EventV2Bridge.Service
+      const failure = yield* Deferred.make<string>()
+      const unsubscribe = yield* events.listen((event) => event.type === Session.Event.Error.type ? Deferred.succeed(failure, JSON.stringify(event.data)).pipe(Effect.asVoid) : Effect.void)
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const chat = yield* sessions.create({ smallModel: scope === "session" ? smallSelection("missing-small") : undefined })
+      yield* prompt.prompt({ sessionID: chat.id, parts: [{ type: "text", text: "Explain failure" }] })
+      expect(yield* awaitWithTimeout(Deferred.await(failure), "configured title failure was not reported")).toContain("missing-small")
+      expect(recorded.requests.filter((request) => request.agent.name === "title")).toEqual([])
+      expect(Session.isDefaultTitle((yield* sessions.get(chat.id)).title)).toBe(true)
+    }),
+    { config: { ...smallModelConfig(), ...(scope === "global" ? { small_model: "auxiliary/missing-small" } : {}), ...(scope === "agent" ? { agent: { build: { small_model: "auxiliary/missing-small" } } } : {}) } },
+  )
+}
+
+for (const setting of ["model", "small_model"] as const) {
+  const recorded = recordSmallModelRequests()
+  promptTests(makePrompt({ llm: recorded.layer })).instance(
+    `small-model title honors dedicated agent ${setting}`,
+    () => Effect.gen(function* () {
+      recorded.requests.length = 0
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* sessions.create({ smallModel: smallSelection("session-small") })
+      yield* prompt.prompt({ sessionID: chat.id, parts: [{ type: "text", text: "Explain dedicated title" }] })
+      yield* pollWithTimeout(sessions.get(chat.id).pipe(Effect.map((info) => Session.isDefaultTitle(info.title) ? undefined : info.title)), "title did not finish")
+      expect(recorded.requests.filter((request) => request.agent.name === "title").map((request) => String(request.model.id))).toEqual(["dedicated-small"])
+    }),
+    { config: { ...smallModelConfig(), small_model: "auxiliary/global-small", agent: { build: { small_model: "auxiliary/agent-small" }, title: { [setting]: "auxiliary/dedicated-small" } } } },
+  )
+}
+
+for (const providerID of ["test", "azure", "azure-cognitive-services"]) {
+  const recorded = recordSmallModelRequests()
+  promptTests(makePrompt({ llm: recorded.layer })).instance(
+    `small-model unconfigured title uses primary fallback for ${providerID}`,
+    () => Effect.gen(function* () {
+      recorded.requests.length = 0
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* sessions.create()
+      yield* prompt.prompt({ sessionID: chat.id, parts: [{ type: "text", text: "Explain fallback" }] })
+      yield* pollWithTimeout(sessions.get(chat.id).pipe(Effect.map((info) => Session.isDefaultTitle(info.title) ? undefined : info.title)), "title did not finish")
+      expect(recorded.requests.filter((request) => request.agent.name === "title").map((request) => [String(request.model.providerID), String(request.model.id)])).toEqual([[providerID, "test-model"]])
+    }),
+    { config: { ...smallModelConfig(), model: `${providerID}/test-model` } },
+  )
+}
+
+for (const source of ["markdown", "plural agents"] as const) {
+  const recorded = recordSmallModelRequests()
+  promptTests(makePrompt({ llm: recorded.layer })).instance(
+    `small-model title receives ${source} agent configuration`,
+    () => Effect.gen(function* () {
+      recorded.requests.length = 0
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* sessions.create()
+      yield* prompt.prompt({ sessionID: chat.id, parts: [{ type: "text", text: "Explain loaded agent" }] })
+      yield* pollWithTimeout(sessions.get(chat.id).pipe(Effect.map((info) => Session.isDefaultTitle(info.title) ? undefined : info.title)), "title did not finish")
+      expect(recorded.requests.filter((request) => request.agent.name === "title").map((request) => String(request.model.id))).toEqual(["agent-small"])
+    }),
+    { init: (directory) => Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      yield* fs.writeFileString(path.join(directory, "opencode.json"), JSON.stringify({ ...smallModelConfig(), small_model: "auxiliary/global-small", ...(source === "plural agents" ? { agents: { build: { small_model: "auxiliary/agent-small" } } } : {}) }))
+      if (source !== "markdown") return
+      yield* fs.makeDirectory(path.join(directory, ".opencode/agents"), { recursive: true })
+      yield* fs.writeFileString(path.join(directory, ".opencode/agents/build.md"), "---\nsmall_model: auxiliary/agent-small\n---\nUse the configured auxiliary model.")
+    }).pipe(Effect.provide(LayerNode.compile(filesystem))) },
+  )
+}
 
 // These prefix-only defaults are separate from the tokenized current-producer captures below.
 test("holds each filed default marker only with its required framing", () => {

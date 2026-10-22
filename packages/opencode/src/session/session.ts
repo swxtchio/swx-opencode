@@ -94,6 +94,9 @@ export function fromRow(row: SessionRow): Info {
         }
       : undefined,
     version: row.version,
+    smallModel: row.small_model
+      ? { id: ModelV2.ID.make(row.small_model.id), providerID: ProviderV2.ID.make(row.small_model.providerID) }
+      : undefined,
     summary,
     cost: row.cost,
     tokens: {
@@ -130,6 +133,7 @@ export function toRow(info: Info) {
     title: info.title,
     agent: info.agent,
     model: info.model,
+    small_model: info.smallModel,
     version: info.version,
     share_url: info.share?.url,
     summary_additions: info.summary?.additions,
@@ -220,6 +224,11 @@ const Model = Schema.Struct({
   variant: optional(Schema.String),
 })
 
+const SmallModel = Schema.Struct({
+  id: ModelV2.ID,
+  providerID: ProviderV2.ID,
+})
+
 export const Metadata = Schema.Record(Schema.String, Schema.Any)
 
 export const Info = Schema.Struct({
@@ -237,6 +246,7 @@ export const Info = Schema.Struct({
   title: Schema.String,
   agent: optional(Schema.String),
   model: optional(Model),
+  smallModel: optional(SmallModel),
   version: Schema.String,
   metadata: optional(Metadata),
   time: Time,
@@ -264,6 +274,7 @@ export const CreateInput = Schema.optional(
     title: Schema.optional(Schema.String),
     agent: Schema.optional(Schema.String),
     model: Schema.optional(Model),
+    smallModel: Schema.optional(SmallModel),
     metadata: Schema.optional(Metadata),
     permission: Schema.optional(PermissionV1.Ruleset),
     workspaceID: Schema.optional(WorkspaceV2.ID),
@@ -419,6 +430,7 @@ export interface Interface {
     title?: string
     agent?: string
     model?: Schema.Schema.Type<typeof Model>
+    smallModel?: Schema.Schema.Type<typeof SmallModel>
     metadata?: typeof Metadata.Type
     permission?: PermissionV1.Ruleset
     workspaceID?: WorkspaceV2.ID
@@ -437,6 +449,7 @@ export interface Interface {
   }) => Effect.Effect<void>
   /** Selects the model a pending prompt runs at when it is delivered (swxtchio/swx-opencode#212). */
   readonly setModel: (input: { sessionID: SessionID; model: NonNullable<Info["model"]> }) => Effect.Effect<void>
+  readonly setSmallModel: (input: { sessionID: SessionID; model: NonNullable<Info["smallModel"]> }) => Effect.Effect<void>
   readonly setPermission: (input: { sessionID: SessionID; permission: PermissionV1.Ruleset }) => Effect.Effect<void>
   readonly setRevert: (input: {
     sessionID: SessionID
@@ -506,6 +519,7 @@ const layer: Layer.Layer<
       title?: string
       agent?: string
       model?: Schema.Schema.Type<typeof Model>
+      smallModel?: Schema.Schema.Type<typeof SmallModel>
       parentID?: SessionID
       workspaceID?: WorkspaceV2.ID
       directory: string
@@ -526,6 +540,7 @@ const layer: Layer.Layer<
         title: input.title ?? (input.parentID ? childTitlePrefix : parentTitlePrefix) + new Date().toISOString(),
         agent: input.agent,
         model: input.model,
+        smallModel: input.smallModel,
         metadata: input.metadata,
         permission: input.permission ? [...input.permission] : undefined,
         cost: 0,
@@ -706,6 +721,7 @@ const layer: Layer.Layer<
       title?: string
       agent?: string
       model?: Schema.Schema.Type<typeof Model>
+      smallModel?: Schema.Schema.Type<typeof SmallModel>
       metadata?: typeof Metadata.Type
       permission?: PermissionV1.Ruleset
       workspaceID?: WorkspaceV2.ID
@@ -719,6 +735,7 @@ const layer: Layer.Layer<
         title: input?.title,
         agent: input?.agent,
         model: input?.model,
+        smallModel: input?.smallModel,
         metadata: input?.metadata,
         permission: input?.permission,
         workspaceID: input?.workspaceID ?? workspace,
@@ -817,6 +834,13 @@ const layer: Layer.Layer<
       model: NonNullable<Info["model"]>
     }) {
       yield* patch(input.sessionID, { model: input.model, time: { updated: Date.now() } }).pipe(Effect.orDie)
+    })
+
+    const setSmallModel = Effect.fn("Session.setSmallModel")(function* (input: {
+      sessionID: SessionID
+      model: NonNullable<Info["smallModel"]>
+    }) {
+      yield* patch(input.sessionID, { smallModel: input.model, time: { updated: Date.now() } }).pipe(Effect.orDie)
     })
 
     const setPermission = Effect.fn("Session.setPermission")(function* (input: {
@@ -962,6 +986,7 @@ const layer: Layer.Layer<
       setMetadata,
       setAgentModel,
       setModel,
+      setSmallModel,
       setPermission,
       setRevert,
       clearRevert,

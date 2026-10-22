@@ -49,6 +49,12 @@ export const Info = Schema.Struct({
     }),
   ),
   variant: Schema.optional(Schema.String),
+  smallModel: Schema.optional(
+    Schema.Struct({
+      modelID: ModelV2.ID,
+      providerID: ProviderV2.ID,
+    }),
+  ),
   prompt: Schema.optional(Schema.String),
   options: Schema.Record(Schema.String, Schema.Unknown),
   steps: Schema.optional(Schema.Finite),
@@ -279,6 +285,7 @@ const layer = Layer.effect(
               native: false,
             }
           if (value.model) item.model = Provider.parseModel(value.model)
+          if (value.small_model !== undefined) item.smallModel = Provider.parseModel(value.small_model)
           item.variant = value.variant ?? item.variant
           item.prompt = value.prompt ?? item.prompt
           item.description = value.description ?? item.description

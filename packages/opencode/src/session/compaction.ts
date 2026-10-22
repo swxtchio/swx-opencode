@@ -373,9 +373,14 @@ const layer = Layer.effect(
       }
 
       const agent = yield* agents.get("compaction")
+      const current = yield* session.get(input.sessionID).pipe(Effect.orDie)
+      const originAgent = yield* agents.get(userMessage.agent)
+      const smallModel = agent.smallModel ?? originAgent?.smallModel ??
+        (current.smallModel ? { providerID: current.smallModel.providerID, modelID: current.smallModel.id } : undefined)
       const model = agent.model
         ? yield* provider.getModel(agent.model.providerID, agent.model.modelID).pipe(Effect.orDie)
-        : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
+        : ((yield* provider.getSmallModel(userMessage.model.providerID, { model: smallModel, infer: false }).pipe(Effect.orDie)) ??
+          (yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)))
       const cfg = yield* config.get()
       const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
       const prior = completedCompactions(history)
