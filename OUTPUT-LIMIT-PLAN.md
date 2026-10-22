@@ -14,3 +14,9 @@ Refs swxtchio/swx-opencode#304, output-limit sub-scope only.
 - Buffer tool-argument fragments in their stream-attempt-owned call and settle incomplete input with its existing terminal write. Preserve execution admission and takeover custody without publishing cumulative raw input for each fragment.
 - Drive automatic capacity compaction and fragmented argument streams through the production prompt loop. Prove exhaustion survives compaction, real input resets it, and fragment count does not amplify durable tool writes; retain bounded behavior-removal red evidence.
 - File the adjudicated bare malformed-call edge as a follow-up, update handoff evidence, run focused tests/typecheck and mechanical gates, and push the same draft PR for firstmate review.
+
+## Review fix round 2
+
+- Restrict summary exclusion to assistant compaction-summary markers. Keep real user input in the streak even after `SessionSummary.summarize` has attached its diff summary.
+- Enable the real summary producer in a focused prompt-loop fixture. Gate fresh input's first length response on its persisted user summary, then verify it receives the renewed continuation allowance; demonstrate the old predicate's bounded failure.
+- Preserve round-1 compaction and fragment coverage, update evidence, and push the existing draft PR after the focused and mechanical gates pass.
