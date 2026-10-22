@@ -94,6 +94,8 @@ type RunningChild = {
 
 type Report = {
   action: string
+  noopReason?: string
+  retirementTarget?: { directory: string; identity: string | null; state: string } | null
   database: string
   cutoff: string
   selectedSessions: { sessionID: string; directory: string; ownedRows: Record<string, number>; reasons: string[] }[]
@@ -262,7 +264,7 @@ test("directory uncertainty from inaccessible paths and dangling symlinks never 
   } finally {
     await chmod(blocked, 0o700)
   }
-})
+}, 60000)
 
 test("a directory restored after inventory protects its producer-created session", async () => {
   await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
@@ -349,9 +351,10 @@ test("teardown CLI retires only the removed directory and repeated retirement is
   const target = store.project
   const retirement = { command: "retire", databaseDefault: path.join(store.directory, "not-the-target.db") }
   const refused = parseReport(
-    await runCLI(store, ["--database", store.filename, "--directory", target, "--apply"], 1, retirement),
+    await runCLI(store, ["--database", store.filename, "--directory", target, "--apply"], 0, retirement),
   )
-  expect(refused.action).toBe("refused")
+  expect(refused.action).toBe("noop")
+  expect(refused.noopReason).toBe("target-exists")
   expect(refused.database).toBe(store.filename)
   expect(ownedCounts(store.filename, id)).toEqual(before)
   const liveDirectory = path.join(store.directory, "live-worktree")
@@ -382,6 +385,7 @@ test("teardown CLI retires only the removed directory and repeated retirement is
     await runCLI(store, ["--database", store.filename, "--directory", target, "--apply"], 0, retirement),
   )
   expect(repeated.action).toBe("noop")
+  expect(repeated.noopReason).toBe("no-matching-sessions")
   expect(repeated.changedRows).toBe(0)
   expect(repeated.reclamation.vacuum).toEqual({ state: "skipped", reason: "no-deletions" })
   expect(ownedCounts(store.filename, liveID)).toEqual(liveBefore)
@@ -445,7 +449,7 @@ test.each(["trailing separator", "parent segment", "resolved symlink"])(
   60000,
 )
 
-test("mixed live and dead directory targets retire independently and report retained rows", async () => {
+test("existing retirement target preserves sessions in missing subdirectories", async () => {
   await using store = await createStore()
   const live = await produceLive(store, { create: {} })
   const liveID = live.created[0]!.id
@@ -454,20 +458,120 @@ test("mixed live and dead directory targets retire independently and report reta
   await mkdir(nested)
   const dead = await produceLive({ ...store, project: nested }, { create: {} })
   const deadID = dead.created[0]!.id
+  const deadBefore = ownedCounts(store.filename, deadID)
   await rm(nested, { recursive: true })
   const applied = parseReport(await runCLI(store, ["--directory", store.project, "--apply"], 0, { command: "retire" }))
-  expect(applied.action).toBe("applied")
-  expect(applied.partial).toBe(true)
-  expect(applied.deletedSessionIDs).toEqual([deadID])
-  expect(Object.values(ownedCounts(store.filename, deadID)).every((n) => n === 0)).toBe(true)
+  expect(ownedCounts(store.filename, deadID)).toEqual(deadBefore)
+  expect(applied.action).toBe("noop")
+  expect(applied.noopReason).toBe("target-exists")
+  expect(applied.changedRows).toBe(0)
+  expect(applied.deletedSessionIDs).toEqual([])
   expect(ownedCounts(store.filename, liveID)).toEqual(liveBefore)
-  expect(applied.retainedSessions.map((item) => item.sessionID)).toEqual([liveID])
-  expect(applied.retainedSessions[0]!.reasons).toContain("session-directory-exists")
+  expect(applied.retainedSessions.map((item) => item.sessionID).toSorted()).toEqual([liveID, deadID].toSorted())
   expect(applied.retainedCounts).toEqual({
-    sessions: 1,
-    ownedRows: Object.values(liveBefore).reduce((sum, n) => sum + n, 0),
+    sessions: 2,
+    ownedRows: [...Object.values(liveBefore), ...Object.values(deadBefore)].reduce((sum, n) => sum + n, 0),
   })
 }, 60000)
+
+test.each(["before lock", "after locked inventory"])(
+  "restored retirement target preserves missing descendants %s",
+  async (window) => {
+    await using store = await createStore()
+    const nested = path.join(store.project, "removed-task")
+    await mkdir(nested)
+    const created = await produceLive({ ...store, project: nested }, { create: {} })
+    const id = created.created[0]!.id
+    const before = ownedCounts(store.filename, id)
+    await rm(store.project, { recursive: true })
+    const originalExec = Database.prototype.exec
+    const originalQuery = Database.prototype.query
+    let restored = false
+    let checks = 0
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, sql: string) {
+      if (window === "before lock" && sql === "BEGIN IMMEDIATE") {
+        mkdirSync(store.project)
+        restored = true
+      }
+      return originalExec.call(this, sql)
+    })
+    const query = spyOn(Database.prototype, "query").mockImplementation(function <
+      ReturnType,
+      ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+    >(this: Database, sql: string) {
+      if (window === "after locked inventory" && sql === "PRAGMA integrity_check" && ++checks === 3) {
+        mkdirSync(store.project)
+        restored = true
+      }
+      return (originalQuery<ReturnType, ParamsType>).call(this, sql)
+    })
+    try {
+      const result = await invokeHandler(store, { directory: store.project, apply: true })
+      expect(restored).toBe(true)
+      expect(ownedCounts(store.filename, id)).toEqual(before)
+      expect(result.report.action).toBe("noop")
+      expect(result.report.noopReason).toBe("target-exists")
+      expect(result.report.retirementTarget?.state).toBe("exists")
+      expect(result.report.changedRows).toBe(0)
+      expect(result.exitCode).toBe(0)
+      expect(result.report.retainedSessions.map((item) => item.sessionID)).toEqual([id])
+      expect(result.report.deletionScope.sessionIDs).toEqual([])
+    } finally {
+      exec.mockRestore()
+      query.mockRestore()
+    }
+  },
+  60000,
+)
+
+test.each(["inaccessible", "dangling symlink"])(
+  "retirement retains in-scope %s uncertainty with a missing sibling",
+  async (kind) => {
+    await using store = await createStore()
+    const uncertain = path.join(store.project, "uncertain")
+    const child = path.join(uncertain, "child")
+    const dead = path.join(store.project, "dead")
+    await mkdir(child, { recursive: true })
+    await mkdir(dead)
+    const held = await produceLive({ ...store, project: child }, { create: {} })
+    const eligible = await produceLive({ ...store, project: dead }, { create: {} })
+    const heldID = held.created[0]!.id
+    const deadID = eligible.created[0]!.id
+    const heldBefore = ownedCounts(store.filename, heldID)
+    const deadBefore = ownedCounts(store.filename, deadID)
+    await rm(dead, { recursive: true })
+    if (kind === "inaccessible") await chmod(uncertain, 0)
+    if (kind === "dangling symlink") {
+      await rm(uncertain, { recursive: true })
+      await symlink(path.join(store.directory, "absent"), uncertain)
+    }
+    try {
+      const inventory = parseReport(await runCLI(store, ["--directory", store.project], 0, { command: "retire" }))
+      expect(inventory.retainedSessions.map((item) => item.sessionID).toSorted()).toEqual([heldID, deadID].toSorted())
+      const heldReport = inventory.retainedSessions.find((item) => item.sessionID === heldID)!
+      expect(heldReport.reasons).toContain("session-directory-unknown")
+      expect(heldReport.reasons).not.toContain("outside-explicit-directory-selection")
+      const applied = parseReport(
+        await runCLI(store, ["--directory", store.project, "--apply"], 0, { command: "retire" }),
+      )
+      expect(applied.action).toBe("noop")
+      expect(applied.noopReason).toBe("target-exists")
+      expect(applied.retainedCounts.sessions).toBe(2)
+      expect(ownedCounts(store.filename, heldID)).toEqual(heldBefore)
+      expect(ownedCounts(store.filename, deadID)).toEqual(deadBefore)
+      const unknownTarget = kind === "inaccessible" ? child : uncertain
+      const refused = parseReport(
+        await runCLI(store, ["--directory", unknownTarget, "--apply"], 1, { command: "retire" }),
+      )
+      expect(refused.action).toBe("refused")
+      expect(refused.changedRows).toBe(0)
+      expect(refused.retainedSessions.map((item) => item.sessionID)).toEqual([heldID])
+    } finally {
+      if (kind === "inaccessible") await chmod(uncertain, 0o700)
+    }
+  },
+  60000,
+)
 
 test(
   "CLI inventory is read-only, validates the explicit cutoff, and narrows by Session ID",

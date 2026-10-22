@@ -382,6 +382,7 @@ async function inventorySnapshot(
     : []
   const parents = sessions.map((row) => [row.id, row.parent_id] as const)
   const targetDirectory = directory === undefined ? undefined : await directoryIdentity(directory)
+  const targetState = directory === undefined ? undefined : await inspectDirectory(directory)
   const ids = new Set(sessions.map((row) => row.id))
   const activities = activityBySession(db, schema.tables, schema.columnMap)
   const ownership = aggregateOwnershipFailures(db, ids, schema.tables)
@@ -399,6 +400,7 @@ async function inventorySnapshot(
   const allocated = await allocatedBytes(filename)
   const globalReasons = [...schema.failures, ...unknownStorage, ...ownership]
   if (directory !== undefined && targetDirectory === undefined) globalReasons.push("directory-identity-unreadable")
+  if (targetState !== undefined && targetState !== "missing") globalReasons.push(`retirement-target-${targetState}`)
   if (integrity.state !== "ok") globalReasons.push(`integrity-check-${integrity.state}`)
   if (foreignKeys.state !== "ok") globalReasons.push(`foreign-key-check-${foreignKeys.state}`)
   const candidates = new Map<string, SessionReport>()
@@ -409,7 +411,7 @@ async function inventorySnapshot(
     const identity = await directoryIdentity(row.directory)
     const directoryState = identity === undefined ? "unknown" : await inspectDirectory(identity)
     if (directoryState !== "missing") reasons.push(`session-directory-${directoryState}`)
-    if (directory !== undefined && !withinDirectory(identity, targetDirectory)) {
+    if (directory !== undefined && !retirementScope(row.directory, identity, directory, targetDirectory)) {
       reasons.push("outside-explicit-directory-selection")
     }
     if (requested && !requested.includes(row.id)) reasons.push("outside-explicit-session-selection")
@@ -484,7 +486,7 @@ async function inventorySnapshot(
     (item) =>
       (!requested || requested.includes(item.sessionID)) &&
       (directory !== undefined
-        ? withinDirectory(item.directoryIdentity ?? undefined, targetDirectory)
+        ? retirementScope(item.directory, item.directoryIdentity ?? undefined, directory, targetDirectory)
         : requested !== undefined || item.directoryState === "missing") &&
       !item.reasons.includes("activity-at-or-after-cutoff"),
   )
@@ -493,6 +495,8 @@ async function inventorySnapshot(
     cutoff: cutoff === undefined ? null : new Date(cutoff).toISOString(),
     explicitDirectory: directory ?? null,
     directoryIdentity: targetDirectory ?? null,
+    retirementTarget:
+      directory === undefined ? null : { directory, identity: targetDirectory ?? null, state: targetState },
     explicitSessionIDs: requested ?? null,
     selectedSessions: [...candidates.values()].toSorted((left, right) => left.sessionID.localeCompare(right.sessionID)),
     excludedSessions: [...excluded.values()].toSorted((left, right) => left.sessionID.localeCompare(right.sessionID)),
@@ -535,6 +539,12 @@ async function applyPrune(
   inventory: Awaited<ReturnType<typeof inventorySnapshot>>,
   directory?: string,
 ) {
+  if (directory !== undefined) {
+    const state = await inspectDirectory(directory)
+    if (state === "exists") return retirementNoop(inventory, "target-exists")
+    if (state !== "missing")
+      return { ...inventory, action: "refused", refusalReasons: [`retirement-target-${state}`], changedRows: 0 }
+  }
   const refusalReasons = [...inventory.reclamation.reasons]
   if (inventory.selectedSessions.length === 0 && directory === undefined) refusalReasons.push("no-eligible-sessions")
   if (refusalReasons.length > 0) return { ...inventory, action: "refused", refusalReasons, changedRows: 0 }
@@ -543,7 +553,9 @@ async function applyPrune(
     const state = targetDirectory === undefined ? "unknown" : await inspectDirectory(targetDirectory)
     if (
       state !== "missing" ||
-      inventory.excludedSessions.some((item) => withinDirectory(item.directoryIdentity ?? undefined, targetDirectory))
+      inventory.excludedSessions.some((item) =>
+        retirementScope(item.directory, item.directoryIdentity ?? undefined, directory!, targetDirectory),
+      )
     ) {
       return {
         ...inventory,
@@ -552,15 +564,7 @@ async function applyPrune(
         changedRows: 0,
       }
     }
-    return {
-      ...inventory,
-      action: "noop",
-      committed: false,
-      changedRows: 0,
-      deletedSessionIDs: [],
-      deletedCounts: { sessions: 0, ownedRows: 0, byTable: {} },
-      reclamation: { ...inventory.reclamation, vacuum: { state: "skipped", reason: "no-deletions" } },
-    }
+    return retirementNoop(inventory, "no-matching-sessions")
   }
   if (inventory.reclamation.allocatedBytes.status !== "measured") {
     return {
@@ -575,6 +579,7 @@ async function applyPrune(
   const deletedByTable: Record<string, number> = {}
   db.exec("BEGIN IMMEDIATE")
   try {
+    await requireMissingTarget(directory)
     const current = await inventorySnapshot(db, filename, cutoff, requested, directory)
     if (!current.reclamation.ready) throw new Error(`revalidation-failed:${current.reclamation.reasons.join(",")}`)
     if (!sameIDs(inventory.deletionScope.sessionIDs, current.deletionScope.sessionIDs)) {
@@ -601,6 +606,7 @@ async function applyPrune(
       if ((await inspectDirectory(session.directory!)) !== "missing")
         throw new Error("session-directory-restored-before-delete")
     }
+    await requireMissingTarget(directory)
     Object.assign(deletedByTable, deleteSessions(db, current.deletionScope.sessionIDs))
     changedRows = Object.values(deletedByTable).reduce((sum, count) => sum + count, 0)
     const afterIntegrity = integrityResult(db)
@@ -618,6 +624,8 @@ async function applyPrune(
     db.exec("COMMIT")
   } catch (error) {
     if (db.inTransaction) db.exec("ROLLBACK")
+    if (error instanceof Error && error.message === "retirement-target-exists")
+      return retirementNoop(inventory, "target-exists")
     return {
       ...inventory,
       action: "refused",
@@ -702,6 +710,61 @@ async function applyPrune(
     },
     ...(reclamationReasons.length === 0 ? {} : { refusalReasons: reclamationReasons }),
   }
+}
+
+async function requireMissingTarget(directory: string | undefined) {
+  if (directory === undefined) return
+  const state = await inspectDirectory(directory)
+  if (state !== "missing") throw new Error(`retirement-target-${state}`)
+}
+
+function retirementNoop(inventory: Awaited<ReturnType<typeof inventorySnapshot>>, reason: string) {
+  const retainedSessions =
+    reason === "target-exists"
+      ? [...inventory.selectedSessions, ...inventory.retainedSessions].map((item) => ({
+          ...item,
+          reasons: [...new Set([...item.reasons, "retirement-target-exists"])],
+        }))
+      : inventory.retainedSessions
+  return {
+    ...inventory,
+    action: "noop",
+    noopReason: reason,
+    retirementTarget:
+      reason === "target-exists" && inventory.retirementTarget
+        ? { ...inventory.retirementTarget, state: "exists" }
+        : inventory.retirementTarget,
+    committed: false,
+    selectedSessions: [],
+    selectedCounts: { sessions: 0, ownedRows: 0 },
+    deletionScope: { ...inventory.deletionScope, sessionIDs: [] },
+    retainedSessions,
+    retainedCounts: {
+      sessions: retainedSessions.length,
+      ownedRows: retainedSessions.reduce(
+        (sum, item) => sum + Object.values(item.ownedRows).reduce((sum, n) => sum + n, 0),
+        0,
+      ),
+    },
+    changedRows: 0,
+    deletedSessionIDs: [],
+    deletedCounts: { sessions: 0, ownedRows: 0, byTable: {} },
+    reclamation: { ...inventory.reclamation, vacuum: { state: "skipped", reason: "no-deletions" } },
+  }
+}
+
+function retirementScope(
+  recorded: string | null,
+  identity: string | undefined,
+  target: string,
+  targetIdentity: string | undefined,
+) {
+  if (identity !== undefined && targetIdentity !== undefined) return withinDirectory(identity, targetIdentity)
+  if (recorded === null || !validDirectory(recorded)) return false
+  return (
+    withinDirectory(path.resolve(recorded), path.resolve(target)) ||
+    withinDirectory(path.resolve(recorded), targetIdentity)
+  )
 }
 
 function checkpointDatabase(db: SqliteAccess) {
