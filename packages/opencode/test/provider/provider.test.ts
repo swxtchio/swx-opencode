@@ -95,10 +95,13 @@ const it = testEffect(LayerNode.compile(LayerNode.group([Provider.node, Env.node
 const smallModelProvider = testEffect(
   LayerNode.compile(LayerNode.group([Provider.node, Env.node, Plugin.node]), [
     [Npm.node, NpmTest.noop],
-    [Plugin.node, Layer.mock(Plugin.Service)({
-      list: () => Effect.succeed([]),
-      trigger: (_name, _input, output) => Effect.succeed(output),
-    })],
+    [
+      Plugin.node,
+      Layer.mock(Plugin.Service)({
+        list: () => Effect.succeed([]),
+        trigger: (_name, _input, output) => Effect.succeed(output),
+      }),
+    ],
   ]),
 )
 const experimentalModels = testEffect(providerLayer({ enableExperimentalModels: true }))

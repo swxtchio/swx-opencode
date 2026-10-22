@@ -1624,9 +1624,7 @@ const layer = Layer.effect(
               modelsDev[providerID]?.npm ??
               "@ai-sdk/openai-compatible"
             const migratedGoogle =
-              providerID === "google" &&
-              configuredApiNpm === "@ai-sdk/openai-compatible" &&
-              isGemini38OrLater(apiID)
+              providerID === "google" && configuredApiNpm === "@ai-sdk/openai-compatible" && isGemini38OrLater(apiID)
             const apiNpm = migratedGoogle ? "@ai-sdk/google" : configuredApiNpm
             if (migratedGoogle) migratedGoogleModelIDs.add(`${providerID}/${modelID}`)
             const name = iife(() => {
@@ -1922,8 +1920,7 @@ const layer = Layer.effect(
         })
 
         const resolvedBaseURL =
-          ProviderTransform.isGoogleCompatGeminiMigrated(model) &&
-          typeof baseURL === "string"
+          ProviderTransform.isGoogleCompatGeminiMigrated(model) && typeof baseURL === "string"
             ? baseURL.replace(/\/openai\/?$/, "")
             : baseURL
         if (resolvedBaseURL !== undefined) options["baseURL"] = resolvedBaseURL

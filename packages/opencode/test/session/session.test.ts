@@ -45,6 +45,7 @@ import { Todo } from "@/session/todo"
 import { DbRetention, type RetentionEvidence, type SqliteAccess } from "@/cli/cmd/db-retention"
 import { applyRetentionFixture } from "../fixture/session-retention"
 import { readExport } from "@/cli/cmd/db-export-usage"
+import { smallSelection } from "../fixture/small-model"
 
 const it = testEffect(
   AppNodeBuilder.build(
@@ -100,6 +101,21 @@ const awaitDeferredEffect = (wait: Effect.Effect<void>, message: string) =>
   Effect.race(wait, Effect.sleep("2 seconds").pipe(Effect.flatMap(() => Effect.fail(new Error(message)))))
 
 const remove = (id: SessionID) => SessionNs.use.remove(id)
+
+it.instance("small-model session state persists independently across sessions and updates", () =>
+  Effect.gen(function* () {
+    const sessions = yield* SessionNs.Service
+    const model = { providerID: ProviderV2.ID.make("test"), id: ModelV2.ID.make("test-model") }
+    const first = yield* sessions.create({ model, smallModel: smallSelection("session-small") })
+    const second = yield* sessions.create({ model, smallModel: smallSelection("other-small") })
+    expect((yield* sessions.get(first.id)).smallModel).toEqual(smallSelection("session-small"))
+    yield* sessions.setSmallModel({ sessionID: first.id, model: smallSelection("dedicated-small") })
+    expect((yield* sessions.get(first.id)).smallModel).toEqual(smallSelection("dedicated-small"))
+    expect((yield* sessions.get(second.id)).smallModel).toEqual(smallSelection("other-small"))
+    expect((yield* sessions.get(first.id)).model).toEqual(model)
+    expect((yield* sessions.get(second.id)).model).toEqual(model)
+  }),
+)
 
 function retentionEvidence(sessionID: string, seq: number, filename: string): RetentionEvidence {
   return {
@@ -317,287 +333,289 @@ describe("step-finish token propagation via event", () => {
 })
 
 describe("Session retention producer path", () => {
-  retentionIt.instance("redacts Session-produced message and part copies and fences the modified aggregate", () =>
-    Effect.gen(function* () {
-      const session = yield* SessionNs.Service
-      const events = yield* EventV2Bridge.Service
-      const { db } = yield* Database.Service
-      const info = yield* session.create({ title: "retention title sentinel" })
-      const messageID = MessageID.ascending()
-      const assistantTime = { created: Date.now(), completed: Date.now() }
-      yield* session.updateMessage({
-        id: messageID,
-        sessionID: info.id,
-        role: "user",
-        time: { created: Date.now() },
-        agent: "user",
-        model: { providerID: "provider-a", modelID: "requested-model" },
-      } as SessionV1.User)
-      const assistantMessageID = MessageID.ascending()
-      yield* session.updateMessage({
-        id: assistantMessageID,
-        sessionID: info.id,
-        role: "assistant",
-        time: assistantTime,
-        parentID: messageID,
-        modelID: ModelV2.ID.make("requested-model"),
-        providerID: ProviderV2.ID.make("firerouter"),
-        mode: "build",
-        agent: "build",
-        path: { cwd: info.directory, root: info.directory },
-        responseModelIDs: ["served-model"],
-        cost: 0.25,
-        tokens: { total: 32, input: 12, output: 17, reasoning: 3, cache: { read: 5, write: 7 } },
-      } as SessionV1.Assistant)
-      yield* session.updatePart({
-        id: PartID.ascending(),
-        sessionID: info.id,
-        messageID: assistantMessageID,
-        type: "text",
-        text: "producer raw sentinel",
-      } as SessionV1.TextPart)
-      yield* session.updatePart({
-        id: PartID.ascending(),
-        sessionID: info.id,
-        messageID: assistantMessageID,
-        type: "step-finish",
-        reason: "stop",
-        responseModelID: "served-model",
-        cost: 0.25,
-        tokens: { total: 32, input: 12, output: 17, reasoning: 3, cache: { read: 5, write: 7 } },
-      } as SessionV1.StepFinishPart)
-      yield* events.publish(SessionEvent.ContextUpdated, {
-        sessionID: SessionV2.ID.make(info.id),
-        messageID: SessionMessage.ID.create(),
-        timestamp: DateTime.makeUnsafe(Date.now()),
-        text: "v2 context sentinel",
-      })
-
-      const exportDirectory = yield* tmpdirScoped()
-      const originalMessageData = yield* db
-        .select({ data: MessageTable.data })
-        .from(MessageTable)
-        .where(eq(MessageTable.id, assistantMessageID))
-        .get()
-      if (!originalMessageData) throw new Error("Session.updateMessage did not project its assistant")
-      const originalMessageTime = JSON.parse(JSON.stringify(originalMessageData.data)).time
-      expect(originalMessageTime).toEqual(assistantTime)
-      const beforeExportDB = yield* exportFixtureDatabase(db, path.join(exportDirectory, "usage-before.sqlite"))
-      yield* Effect.addFinalizer(() => Effect.sync(() => beforeExportDB.close()))
-      const exportBefore = readExport(beforeExportDB)
-
-      const { database: native, result, tree, eventIdentitiesBefore } = yield* applyRetentionFixture(info.id)
-      expect(tree.eligible).toBe(true)
-      expect(tree.aggregates[0]?.rows).toBeGreaterThan(0)
-      expect(result.state).toBe("complete")
-      const retainedPart = JSON.parse(
-        native
-          .query<
-            { data: string },
-            [string]
-          >("SELECT data FROM part WHERE session_id = ? AND json_extract(data, '$.type') = 'step-finish'")
-          .get(info.id)!.data,
-      ) as {
-        responseModelID?: string
-        cost: number
-        tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
-      }
-      expect(retainedPart).toMatchObject({
-        responseModelID: "served-model",
-        cost: 0.25,
-        tokens: { input: 12, output: 17, reasoning: 3, cache: { read: 5, write: 7 } },
-      })
-      const retainedMessage = native
-        .query<{ data: string }, [string]>("SELECT data FROM message WHERE id = ?")
-        .get(assistantMessageID)
-      expect(JSON.parse(retainedMessage!.data).time).toEqual(originalMessageTime)
-      const exportAfter = readExport(native)
-      const usageAxes = (archive: ReturnType<typeof readExport>) =>
-        archive.records.map((record) => ({
-          messages: record["messages"],
-          providerID: record["providerID"],
-          modelID: record["modelID"],
-          servedModelIDs: record["servedModelIDs"],
-          tokens: record["tokens"],
-          reportedCost: record["reportedCost"],
-        }))
-      expect(usageAxes(exportAfter)).toEqual(usageAxes(exportBefore))
-      expect(exportAfter.reportedCostTotal).toBe(exportBefore.reportedCostTotal)
-      expect(exportAfter.check.ok).toBe(exportBefore.check.ok)
-      const rawCopies = [
-        ...native
-          .query<{ data: string }, [string]>("SELECT data FROM event WHERE aggregate_id = ?")
-          .all(info.id)
-          .map((row) => row.data),
-        ...native
-          .query<{ data: string }, [string]>("SELECT data FROM message WHERE session_id = ?")
-          .all(info.id)
-          .map((row) => row.data),
-        ...native
-          .query<{ data: string }, [string]>("SELECT data FROM part WHERE session_id = ?")
-          .all(info.id)
-          .map((row) => row.data),
-        ...native
-          .query<{ data: string }, [string]>("SELECT data FROM session_message WHERE session_id = ?")
-          .all(info.id)
-          .map((row) => row.data),
-        native
-          .query<{ title: string; directory: string }, [string]>("SELECT title, directory FROM session WHERE id = ?")
-          .get(info.id),
-      ]
-      expect(JSON.stringify(rawCopies)).not.toContain("producer raw sentinel")
-      expect(JSON.stringify(rawCopies)).not.toContain("v2 context sentinel")
-      expect(JSON.stringify(rawCopies)).not.toContain("retention title sentinel")
-      expect(native.query("SELECT id, seq FROM event WHERE aggregate_id = ? ORDER BY seq").all(info.id)).toEqual(
-        eventIdentitiesBefore,
-      )
-
-      const historyPage = yield* EventV2.readAggregate(db, {
-        aggregateID: info.id,
-        after: -1,
-        limit: 100,
-        manifest: SessionDurable,
-      }).pipe(Effect.exit)
-      expect(Exit.isFailure(historyPage)).toBe(true)
-      expect(String(historyPage)).toContain(`Aggregate ${info.id} is unreplayable`)
-      const currentCursor = yield* EventV2.latestSequence(db, info.id)
-      const historyAfterCurrentCursor = yield* EventV2.readAggregate(db, {
-        aggregateID: info.id,
-        after: currentCursor,
-        limit: 100,
-        manifest: SessionDurable,
-      }).pipe(Effect.exit)
-      expect(Exit.isFailure(historyAfterCurrentCursor)).toBe(true)
-      expect(String(historyAfterCurrentCursor)).toContain(`Aggregate ${info.id} is unreplayable`)
-      const history = yield* events.durable({ aggregateID: info.id }).pipe(Stream.runCollect, Effect.exit)
-      expect(Exit.isFailure(history)).toBe(true)
-      expect(String(history)).toContain(`Aggregate ${info.id} is unreplayable`)
-      const replayRow = yield* db
-        .select()
-        .from(EventTable)
-        .where(eq(EventTable.aggregate_id, info.id))
-        .orderBy(desc(EventTable.seq))
-        .get()
-      const replay = yield* events
-        .replayAll([
-          {
-            id: replayRow!.id,
-            aggregateID: replayRow!.aggregate_id,
-            seq: replayRow!.seq,
-            type: replayRow!.type,
-            data: replayRow!.data,
-          },
-        ])
-        .pipe(Effect.exit)
-      expect(Exit.isFailure(replay)).toBe(true)
-      expect(String(replay)).toContain(`Aggregate ${info.id} is unreplayable`)
-      const messages = yield* session.messages({ sessionID: info.id }).pipe(Effect.exit)
-      expect(Exit.isFailure(messages)).toBe(true)
-      const projectedPage = yield* MessageV2.page({ sessionID: info.id, limit: 20 }).pipe(Effect.exit)
-      expect(Exit.isFailure(projectedPage)).toBe(true)
-      const projectedSnapshot = yield* MessageV2.snapshot(info.id).pipe(Effect.exit)
-      expect(Exit.isFailure(projectedSnapshot)).toBe(true)
-      const projectedParts = yield* MessageV2.parts(messageID).pipe(Effect.exit)
-      expect(Exit.isFailure(projectedParts)).toBe(true)
-      const v2Session = yield* SessionV2.Service
-      const context = yield* v2Session.context(SessionV2.ID.make(info.id)).pipe(Effect.exit)
-      expect(Exit.isFailure(context)).toBe(true)
-      if (Exit.isFailure(context))
-        expect(Cause.squash(context.cause)).toBeInstanceOf(EventV2.UnreplayableAggregateError)
-      const v2Messages = yield* v2Session.messages({ sessionID: SessionV2.ID.make(info.id) }).pipe(Effect.exit)
-      expect(Exit.isFailure(v2Messages)).toBe(true)
-      const v2Message = yield* v2Session
-        .message({ sessionID: SessionV2.ID.make(info.id), messageID: SessionMessage.ID.make(messageID) })
-        .pipe(Effect.exit)
-      expect(Exit.isFailure(v2Message)).toBe(true)
-
-      const lateWrite = yield* session
-        .updatePart({
+  retentionIt.instance(
+    "redacts Session-produced message and part copies and fences the modified aggregate",
+    () =>
+      Effect.gen(function* () {
+        const session = yield* SessionNs.Service
+        const events = yield* EventV2Bridge.Service
+        const { db } = yield* Database.Service
+        const info = yield* session.create({ title: "retention title sentinel" })
+        const messageID = MessageID.ascending()
+        const assistantTime = { created: Date.now(), completed: Date.now() }
+        yield* session.updateMessage({
+          id: messageID,
+          sessionID: info.id,
+          role: "user",
+          time: { created: Date.now() },
+          agent: "user",
+          model: { providerID: "provider-a", modelID: "requested-model" },
+        } as SessionV1.User)
+        const assistantMessageID = MessageID.ascending()
+        yield* session.updateMessage({
+          id: assistantMessageID,
+          sessionID: info.id,
+          role: "assistant",
+          time: assistantTime,
+          parentID: messageID,
+          modelID: ModelV2.ID.make("requested-model"),
+          providerID: ProviderV2.ID.make("firerouter"),
+          mode: "build",
+          agent: "build",
+          path: { cwd: info.directory, root: info.directory },
+          responseModelIDs: ["served-model"],
+          cost: 0.25,
+          tokens: { total: 32, input: 12, output: 17, reasoning: 3, cache: { read: 5, write: 7 } },
+        } as SessionV1.Assistant)
+        yield* session.updatePart({
           id: PartID.ascending(),
           sessionID: info.id,
-          messageID,
+          messageID: assistantMessageID,
           type: "text",
-          text: "late raw sentinel",
+          text: "producer raw sentinel",
         } as SessionV1.TextPart)
-        .pipe(Effect.exit)
-      expect(Exit.isFailure(lateWrite)).toBe(true)
-      expect(
-        yield* db.select({ id: PartTable.id }).from(PartTable).where(eq(PartTable.session_id, info.id)).all(),
-      ).toHaveLength(2)
-      const queue = yield* SessionQueue.Service
-      const queuedWrite = yield* queue
-        .admit({ sessionID: info.id, delivery: "queue", parts: [{ type: "text", text: "late queue sentinel" }] })
-        .pipe(Effect.exit)
-      expect(Exit.isFailure(queuedWrite)).toBe(true)
-      expect(
-        yield* db
-          .select({ id: SessionPromptQueueTable.id })
-          .from(SessionPromptQueueTable)
-          .where(eq(SessionPromptQueueTable.session_id, info.id))
-          .all(),
-      ).toHaveLength(0)
-      const admittedWrite = yield* v2Session
-        .prompt({
-          sessionID: SessionV2.ID.make(info.id),
-          prompt: Prompt.make({ text: "late V2 input sentinel" }),
-          resume: false,
-        })
-        .pipe(Effect.exit)
-      expect(Exit.isFailure(admittedWrite)).toBe(true)
-      expect(
-        yield* db
-          .select({ id: SessionInputTable.id })
-          .from(SessionInputTable)
-          .where(eq(SessionInputTable.session_id, info.id))
-          .all(),
-      ).toHaveLength(0)
-      const todo = yield* Todo.Service
-      const todoWrite = yield* todo
-        .update({
+        yield* session.updatePart({
+          id: PartID.ascending(),
           sessionID: info.id,
-          todos: [{ content: "late todo sentinel", status: "pending", priority: "high" }],
+          messageID: assistantMessageID,
+          type: "step-finish",
+          reason: "stop",
+          responseModelID: "served-model",
+          cost: 0.25,
+          tokens: { total: 32, input: 12, output: 17, reasoning: 3, cache: { read: 5, write: 7 } },
+        } as SessionV1.StepFinishPart)
+        yield* events.publish(SessionEvent.ContextUpdated, {
+          sessionID: SessionV2.ID.make(info.id),
+          messageID: SessionMessage.ID.create(),
+          timestamp: DateTime.makeUnsafe(Date.now()),
+          text: "v2 context sentinel",
         })
-        .pipe(Effect.exit)
-      expect(Exit.isFailure(todoWrite)).toBe(true)
-      expect(
-        yield* db
-          .select({ position: TodoTable.position })
-          .from(TodoTable)
-          .where(eq(TodoTable.session_id, info.id))
-          .all(),
-      ).toHaveLength(0)
 
-      const other = yield* session.create({})
-      const otherMessageID = MessageID.ascending()
-      yield* session.updateMessage({
-        id: otherMessageID,
-        sessionID: other.id,
-        role: "user",
-        time: { created: Date.now() },
-        agent: "user",
-        model: { providerID: "provider-a", modelID: "requested-model" },
-      } as SessionV1.User)
-      yield* session.updatePart({
-        id: PartID.ascending(),
-        sessionID: other.id,
-        messageID: otherMessageID,
-        type: "text",
-        text: "other session remains writable",
-      } as SessionV1.TextPart)
-      expect(
-        yield* db.select({ id: PartTable.id }).from(PartTable).where(eq(PartTable.session_id, other.id)).all(),
-      ).toHaveLength(1)
+        const exportDirectory = yield* tmpdirScoped()
+        const originalMessageData = yield* db
+          .select({ data: MessageTable.data })
+          .from(MessageTable)
+          .where(eq(MessageTable.id, assistantMessageID))
+          .get()
+        if (!originalMessageData) throw new Error("Session.updateMessage did not project its assistant")
+        const originalMessageTime = JSON.parse(JSON.stringify(originalMessageData.data)).time
+        expect(originalMessageTime).toEqual(assistantTime)
+        const beforeExportDB = yield* exportFixtureDatabase(db, path.join(exportDirectory, "usage-before.sqlite"))
+        yield* Effect.addFinalizer(() => Effect.sync(() => beforeExportDB.close()))
+        const exportBefore = readExport(beforeExportDB)
 
-      yield* session.remove(info.id)
-      expect(yield* db.select().from(SessionTable).where(eq(SessionTable.id, info.id)).get()).toBeUndefined()
-      expect(
-        yield* db
-          .select({ state: EventRetentionTable.state })
-          .from(EventRetentionTable)
-          .where(eq(EventRetentionTable.aggregate_id, info.id))
-          .get(),
-      ).toEqual({ state: "complete" })
-    }),
+        const { database: native, result, tree, eventIdentitiesBefore } = yield* applyRetentionFixture(info.id)
+        expect(tree.eligible).toBe(true)
+        expect(tree.aggregates[0]?.rows).toBeGreaterThan(0)
+        expect(result.state).toBe("complete")
+        const retainedPart = JSON.parse(
+          native
+            .query<
+              { data: string },
+              [string]
+            >("SELECT data FROM part WHERE session_id = ? AND json_extract(data, '$.type') = 'step-finish'")
+            .get(info.id)!.data,
+        ) as {
+          responseModelID?: string
+          cost: number
+          tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
+        }
+        expect(retainedPart).toMatchObject({
+          responseModelID: "served-model",
+          cost: 0.25,
+          tokens: { input: 12, output: 17, reasoning: 3, cache: { read: 5, write: 7 } },
+        })
+        const retainedMessage = native
+          .query<{ data: string }, [string]>("SELECT data FROM message WHERE id = ?")
+          .get(assistantMessageID)
+        expect(JSON.parse(retainedMessage!.data).time).toEqual(originalMessageTime)
+        const exportAfter = readExport(native)
+        const usageAxes = (archive: ReturnType<typeof readExport>) =>
+          archive.records.map((record) => ({
+            messages: record["messages"],
+            providerID: record["providerID"],
+            modelID: record["modelID"],
+            servedModelIDs: record["servedModelIDs"],
+            tokens: record["tokens"],
+            reportedCost: record["reportedCost"],
+          }))
+        expect(usageAxes(exportAfter)).toEqual(usageAxes(exportBefore))
+        expect(exportAfter.reportedCostTotal).toBe(exportBefore.reportedCostTotal)
+        expect(exportAfter.check.ok).toBe(exportBefore.check.ok)
+        const rawCopies = [
+          ...native
+            .query<{ data: string }, [string]>("SELECT data FROM event WHERE aggregate_id = ?")
+            .all(info.id)
+            .map((row) => row.data),
+          ...native
+            .query<{ data: string }, [string]>("SELECT data FROM message WHERE session_id = ?")
+            .all(info.id)
+            .map((row) => row.data),
+          ...native
+            .query<{ data: string }, [string]>("SELECT data FROM part WHERE session_id = ?")
+            .all(info.id)
+            .map((row) => row.data),
+          ...native
+            .query<{ data: string }, [string]>("SELECT data FROM session_message WHERE session_id = ?")
+            .all(info.id)
+            .map((row) => row.data),
+          native
+            .query<{ title: string; directory: string }, [string]>("SELECT title, directory FROM session WHERE id = ?")
+            .get(info.id),
+        ]
+        expect(JSON.stringify(rawCopies)).not.toContain("producer raw sentinel")
+        expect(JSON.stringify(rawCopies)).not.toContain("v2 context sentinel")
+        expect(JSON.stringify(rawCopies)).not.toContain("retention title sentinel")
+        expect(native.query("SELECT id, seq FROM event WHERE aggregate_id = ? ORDER BY seq").all(info.id)).toEqual(
+          eventIdentitiesBefore,
+        )
+
+        const historyPage = yield* EventV2.readAggregate(db, {
+          aggregateID: info.id,
+          after: -1,
+          limit: 100,
+          manifest: SessionDurable,
+        }).pipe(Effect.exit)
+        expect(Exit.isFailure(historyPage)).toBe(true)
+        expect(String(historyPage)).toContain(`Aggregate ${info.id} is unreplayable`)
+        const currentCursor = yield* EventV2.latestSequence(db, info.id)
+        const historyAfterCurrentCursor = yield* EventV2.readAggregate(db, {
+          aggregateID: info.id,
+          after: currentCursor,
+          limit: 100,
+          manifest: SessionDurable,
+        }).pipe(Effect.exit)
+        expect(Exit.isFailure(historyAfterCurrentCursor)).toBe(true)
+        expect(String(historyAfterCurrentCursor)).toContain(`Aggregate ${info.id} is unreplayable`)
+        const history = yield* events.durable({ aggregateID: info.id }).pipe(Stream.runCollect, Effect.exit)
+        expect(Exit.isFailure(history)).toBe(true)
+        expect(String(history)).toContain(`Aggregate ${info.id} is unreplayable`)
+        const replayRow = yield* db
+          .select()
+          .from(EventTable)
+          .where(eq(EventTable.aggregate_id, info.id))
+          .orderBy(desc(EventTable.seq))
+          .get()
+        const replay = yield* events
+          .replayAll([
+            {
+              id: replayRow!.id,
+              aggregateID: replayRow!.aggregate_id,
+              seq: replayRow!.seq,
+              type: replayRow!.type,
+              data: replayRow!.data,
+            },
+          ])
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(replay)).toBe(true)
+        expect(String(replay)).toContain(`Aggregate ${info.id} is unreplayable`)
+        const messages = yield* session.messages({ sessionID: info.id }).pipe(Effect.exit)
+        expect(Exit.isFailure(messages)).toBe(true)
+        const projectedPage = yield* MessageV2.page({ sessionID: info.id, limit: 20 }).pipe(Effect.exit)
+        expect(Exit.isFailure(projectedPage)).toBe(true)
+        const projectedSnapshot = yield* MessageV2.snapshot(info.id).pipe(Effect.exit)
+        expect(Exit.isFailure(projectedSnapshot)).toBe(true)
+        const projectedParts = yield* MessageV2.parts(messageID).pipe(Effect.exit)
+        expect(Exit.isFailure(projectedParts)).toBe(true)
+        const v2Session = yield* SessionV2.Service
+        const context = yield* v2Session.context(SessionV2.ID.make(info.id)).pipe(Effect.exit)
+        expect(Exit.isFailure(context)).toBe(true)
+        if (Exit.isFailure(context))
+          expect(Cause.squash(context.cause)).toBeInstanceOf(EventV2.UnreplayableAggregateError)
+        const v2Messages = yield* v2Session.messages({ sessionID: SessionV2.ID.make(info.id) }).pipe(Effect.exit)
+        expect(Exit.isFailure(v2Messages)).toBe(true)
+        const v2Message = yield* v2Session
+          .message({ sessionID: SessionV2.ID.make(info.id), messageID: SessionMessage.ID.make(messageID) })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(v2Message)).toBe(true)
+
+        const lateWrite = yield* session
+          .updatePart({
+            id: PartID.ascending(),
+            sessionID: info.id,
+            messageID,
+            type: "text",
+            text: "late raw sentinel",
+          } as SessionV1.TextPart)
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(lateWrite)).toBe(true)
+        expect(
+          yield* db.select({ id: PartTable.id }).from(PartTable).where(eq(PartTable.session_id, info.id)).all(),
+        ).toHaveLength(2)
+        const queue = yield* SessionQueue.Service
+        const queuedWrite = yield* queue
+          .admit({ sessionID: info.id, delivery: "queue", parts: [{ type: "text", text: "late queue sentinel" }] })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(queuedWrite)).toBe(true)
+        expect(
+          yield* db
+            .select({ id: SessionPromptQueueTable.id })
+            .from(SessionPromptQueueTable)
+            .where(eq(SessionPromptQueueTable.session_id, info.id))
+            .all(),
+        ).toHaveLength(0)
+        const admittedWrite = yield* v2Session
+          .prompt({
+            sessionID: SessionV2.ID.make(info.id),
+            prompt: Prompt.make({ text: "late V2 input sentinel" }),
+            resume: false,
+          })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(admittedWrite)).toBe(true)
+        expect(
+          yield* db
+            .select({ id: SessionInputTable.id })
+            .from(SessionInputTable)
+            .where(eq(SessionInputTable.session_id, info.id))
+            .all(),
+        ).toHaveLength(0)
+        const todo = yield* Todo.Service
+        const todoWrite = yield* todo
+          .update({
+            sessionID: info.id,
+            todos: [{ content: "late todo sentinel", status: "pending", priority: "high" }],
+          })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(todoWrite)).toBe(true)
+        expect(
+          yield* db
+            .select({ position: TodoTable.position })
+            .from(TodoTable)
+            .where(eq(TodoTable.session_id, info.id))
+            .all(),
+        ).toHaveLength(0)
+
+        const other = yield* session.create({})
+        const otherMessageID = MessageID.ascending()
+        yield* session.updateMessage({
+          id: otherMessageID,
+          sessionID: other.id,
+          role: "user",
+          time: { created: Date.now() },
+          agent: "user",
+          model: { providerID: "provider-a", modelID: "requested-model" },
+        } as SessionV1.User)
+        yield* session.updatePart({
+          id: PartID.ascending(),
+          sessionID: other.id,
+          messageID: otherMessageID,
+          type: "text",
+          text: "other session remains writable",
+        } as SessionV1.TextPart)
+        expect(
+          yield* db.select({ id: PartTable.id }).from(PartTable).where(eq(PartTable.session_id, other.id)).all(),
+        ).toHaveLength(1)
+
+        yield* session.remove(info.id)
+        expect(yield* db.select().from(SessionTable).where(eq(SessionTable.id, info.id)).get()).toBeUndefined()
+        expect(
+          yield* db
+            .select({ state: EventRetentionTable.state })
+            .from(EventRetentionTable)
+            .where(eq(EventRetentionTable.aggregate_id, info.id))
+            .get(),
+        ).toEqual({ state: "complete" })
+      }),
     { timeout: 10_000 },
   )
 
@@ -814,33 +832,21 @@ describe("Session retention producer path", () => {
       const native = yield* exportFixtureDatabase(db, databasePath)
       yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
       const now = Date.now()
-      const queuedProof = retentionEvidence(
-        queued.id,
-        yield* EventV2.latestSequence(db, queued.id),
-        databasePath,
-      )
+      const queuedProof = retentionEvidence(queued.id, yield* EventV2.latestSequence(db, queued.id), databasePath)
       const queuedTree = DbRetention.inventory(native as unknown as SqliteAccess, queuedProof, now).trees.find(
         (item) => item.rootSessionID === queued.id,
       )
       expect(queuedTree?.reasons).toContain("v1-prompt-queue-row-present")
       expect(queuedTree?.eligible).toBe(false)
 
-      const admittedProof = retentionEvidence(
-        admitted.id,
-        yield* EventV2.latestSequence(db, admitted.id),
-        databasePath,
-      )
+      const admittedProof = retentionEvidence(admitted.id, yield* EventV2.latestSequence(db, admitted.id), databasePath)
       const admittedTree = DbRetention.inventory(native as unknown as SqliteAccess, admittedProof, now).trees.find(
         (item) => item.rootSessionID === admitted.id,
       )
       expect(admittedTree?.reasons).toContain("v2-input-pending")
       expect(admittedTree?.eligible).toBe(false)
 
-      const promotedProof = retentionEvidence(
-        promoted.id,
-        yield* EventV2.latestSequence(db, promoted.id),
-        databasePath,
-      )
+      const promotedProof = retentionEvidence(promoted.id, yield* EventV2.latestSequence(db, promoted.id), databasePath)
       const promotedTree = DbRetention.inventory(native as unknown as SqliteAccess, promotedProof, now).trees.find(
         (item) => item.rootSessionID === promoted.id,
       )

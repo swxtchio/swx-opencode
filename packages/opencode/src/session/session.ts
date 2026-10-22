@@ -449,7 +449,10 @@ export interface Interface {
   }) => Effect.Effect<void>
   /** Selects the model a pending prompt runs at when it is delivered (swxtchio/swx-opencode#212). */
   readonly setModel: (input: { sessionID: SessionID; model: NonNullable<Info["model"]> }) => Effect.Effect<void>
-  readonly setSmallModel: (input: { sessionID: SessionID; model: NonNullable<Info["smallModel"]> }) => Effect.Effect<void>
+  readonly setSmallModel: (input: {
+    sessionID: SessionID
+    model: NonNullable<Info["smallModel"]>
+  }) => Effect.Effect<void>
   readonly setPermission: (input: { sessionID: SessionID; permission: PermissionV1.Ruleset }) => Effect.Effect<void>
   readonly setRevert: (input: {
     sessionID: SessionID

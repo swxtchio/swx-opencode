@@ -409,7 +409,13 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: PermissionResponsePayload,
           success: described(Schema.Boolean, "Permission processed successfully"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError, PermissionNotFoundError, AskUnavailableError, AskNotAppliedError],
+          error: [
+            HttpApiError.BadRequest,
+            ApiNotFoundError,
+            PermissionNotFoundError,
+            AskUnavailableError,
+            AskNotAppliedError,
+          ],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "permission.respond",

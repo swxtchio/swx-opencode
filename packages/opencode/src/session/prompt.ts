@@ -325,17 +325,27 @@ const layer = Layer.effect(
       if (!ag) return
       const current = yield* sessions.get(input.session.id).pipe(Effect.orDie)
       const originAgent = yield* agents.get(firstInfo.agent)
-      const smallModel = ag.smallModel ?? originAgent?.smallModel ??
+      const smallModel =
+        ag.smallModel ??
+        originAgent?.smallModel ??
         (current.smallModel ? { providerID: current.smallModel.providerID, modelID: current.smallModel.id } : undefined)
-      const mdl = yield* (ag.model
-        ? provider.getModel(ag.model.providerID, ag.model.modelID)
-        : provider.getSmallModel(input.providerID, { model: smallModel }).pipe(
-            Effect.flatMap((small) => small ? Effect.succeed(small) : provider.getModel(input.providerID, input.modelID)),
-          )).pipe(
-        Effect.tapError((error) => events.publish(Session.Event.Error, {
-          sessionID: input.session.id,
-          error: new NamedError.Unknown({ message: error.message }).toObject(),
-        })),
+      const mdl = yield* (
+        ag.model
+          ? provider.getModel(ag.model.providerID, ag.model.modelID)
+          : provider
+              .getSmallModel(input.providerID, { model: smallModel })
+              .pipe(
+                Effect.flatMap((small) =>
+                  small ? Effect.succeed(small) : provider.getModel(input.providerID, input.modelID),
+                ),
+              )
+      ).pipe(
+        Effect.tapError((error) =>
+          events.publish(Session.Event.Error, {
+            sessionID: input.session.id,
+            error: new NamedError.Unknown({ message: error.message }).toObject(),
+          }),
+        ),
         Effect.orDie,
       )
       const msgs = onlySubtasks
@@ -661,9 +671,7 @@ const layer = Layer.effect(
                 unwritten = false
                 const preview = userShellOutputPreview(output, outputBytes)
                 part.state.metadata = {
-                  output: preview.truncated
-                    ? USER_SHELL_OUTPUT_PREVIEW_MARKER + preview.output
-                    : preview.output,
+                  output: preview.truncated ? USER_SHELL_OUTPUT_PREVIEW_MARKER + preview.output : preview.output,
                 }
                 return sessions.updatePart(part).pipe(Effect.asVoid)
               }),
@@ -1388,10 +1396,7 @@ const layer = Layer.effect(
         // A prompt's model and variant become the session's selection now, and a
         // pending prompt runs at whichever selection is current when it is
         // delivered (swxtchio/swx-opencode#212).
-        if (
-          (input.model || input.variant) &&
-          (classification === "critical" || !dispatch)
-        ) {
+        if ((input.model || input.variant) && (classification === "critical" || !dispatch)) {
           const model = input.model ?? (yield* currentModel(input.sessionID))
           yield* sessions.setModel({
             sessionID: input.sessionID,
@@ -1925,7 +1930,9 @@ const layer = Layer.effect(
             }
 
             if (handle.message.finish === "length" && !handle.message.error) {
-              if (yield* MessageV2.outputLimitExhausted(sessionID).pipe(Effect.provideService(Database.Service, database))) {
+              if (
+                yield* MessageV2.outputLimitExhausted(sessionID).pipe(Effect.provideService(Database.Service, database))
+              ) {
                 yield* processor.finalizeFailure({
                   assistantMessage: handle.message,
                   error: new SessionV1.OutputLengthError({}).toObject(),
