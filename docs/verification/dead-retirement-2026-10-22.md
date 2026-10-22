@@ -1,5 +1,7 @@
 # Dead-worktree reclamation verification — 2026-10-22
 
+This is the pre-review implementation's dated record. [Round-1 verification](dead-retirement-round-1.md) supersedes its no-op compaction-retry behavior and positive-byte-recovery success gate; see `../dead-session-retirement.md` for the current operator contract.
+
 Final production/test source sampled: `1d386c7e934458342badfdf6b24a7277d5f01a06`, reachable through [draft PR #343](https://github.com/swxtchio/swx-opencode/pull/343), including the merge of `swxtch`'s small-model schema/producer change (#342). The earlier independent rehearsal's production source is retained separately in its raw snapshot. The rehearsal driver is committed beside this evidence in that PR. Environment: Linux ARM64, Bun 1.4.2. All database mutation used fresh private stores under the task checkout's `.scratch`.
 
 ## Passing boundary run
