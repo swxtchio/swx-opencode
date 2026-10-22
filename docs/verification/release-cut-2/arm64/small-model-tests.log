@@ -1,0 +1,8 @@
+$ bun test --parallel=2 --timeout 30000 --only-failures test/provider/provider.test.ts test/config/config.test.ts "test/config/v2-compat.test.ts" test/session/prompt.test.ts test/session/compaction.test.ts test/session/session.test.ts test/server/httpapi-session.test.ts -t "small-model|getSmallModel" --timeout "20000"
+bun test v1.4.2 (744846f84) 2x PARALLEL
+
+ 59 pass
+ 632 filtered out
+ 0 fail
+ 136 expect() calls
+Ran 59 tests across 7 files. [17.58s]

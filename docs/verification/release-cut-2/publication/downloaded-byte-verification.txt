@@ -1,0 +1,8 @@
+opencode-linux-arm64.tar.gz: OK
+opencode-linux-x64.tar.gz: OK
+000821fca1887f4c1ce0ff5bf35fa29c2b4b84f52664d37d6ae0f6d92cdc1907  opencode-linux-arm64.tar.gz
+45f8587523b67bd76ae9005c4d023722781976f95ed1ccedf37e44bc3fa47675  opencode-linux-x64.tar.gz
+1a1f3b47cc627c7bc85342ed29f61c3355548a6411bcfab58d4f956906ddfee3  ../published-arm-extracted/opencode
+0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42  ../published-arm-extracted/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so
+7b275496a582568732d0c838e2cda9198e52502350055e1df3599611431c115a  ../published-x64-extracted/opencode
+977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5  ../published-x64-extracted/libfff_c-977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5.so

@@ -1,0 +1,1 @@
+{"home": "/home/byates/fm-llmrouter", "task": "opencode-release-cut-2", "task_id": "opencode-release-cut-2", "what": "native ARM64 source-pinned OpenCode bce37c27 build, packaged probe, focused small-model tests", "owner_box": "vm001", "owner_pid": 3301773, "pid": 3301773, "started_at": "2026-10-22T07:55:36.393701+00:00"}
