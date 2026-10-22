@@ -1271,7 +1271,7 @@ const seedUser = Effect.fn("test.seedUser")(function* (input: Omit<SessionPrompt
 for (const scope of ["session", "parent agent", "child agent", "global", "resumed session"] as const) {
   const recorded = recordSmallModelRequests()
   promptTests(makePrompt({ llm: recorded.layer })).instance(
-    `small-model round-1 TaskTool child ${scope === "resumed session" ? "keeps its host assignment on resume" : `inherits ${scope} selection`} through compaction`,
+    `small-model round-1 TaskTool child ${scope === "resumed session" ? "keeps its host assignment on resume" : scope === "child agent" ? "honors its own agent override" : `inherits ${scope} selection`} through compaction`,
     () => Effect.gen(function* () {
       recorded.requests.length = 0
       const sessions = yield* Session.Service
