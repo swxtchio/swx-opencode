@@ -18,7 +18,7 @@ on:
       - packages/opencode/test/release-probe-tools.test.ts
       - packages/opencode/test/release-probe-wait-absence.test.ts
       - packages/opencode/test/release-probe-wait-socket-only.test.ts
-      - packages/opencode/test/server/httpapi-session.test.ts
+      - packages/opencode/test/server/httpapi-wait-lifecycle.test.ts
   workflow_dispatch:
     inputs:
       release_tag:
@@ -128,7 +128,7 @@ jobs:
             packages/opencode/test/release-probe-tools.test.ts
             packages/opencode/test/release-probe-wait-absence.test.ts
             packages/opencode/test/release-probe-wait-socket-only.test.ts
-            packages/opencode/test/server/httpapi-session.test.ts
+            packages/opencode/test/server/httpapi-wait-lifecycle.test.ts
           )
           tracked_files=()
           untracked_files=()
@@ -155,7 +155,7 @@ jobs:
             bun run typecheck
             bun test test/release-probe-tools.test.ts
             bun test test/release-probe-wait-socket-only.test.ts
-            bun test test/server/httpapi-session.test.ts -t 'logs producer wait registration and resolution for a held HTTP wait'
+            bun test test/server/httpapi-wait-lifecycle.test.ts
           )
           restore_proof_tools
           trap - EXIT
