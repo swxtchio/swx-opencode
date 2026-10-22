@@ -1,5 +1,7 @@
 # Fast-suite observer hardening
 
+The latest execution-time measurements are in [Live executable observation evidence](fast-suite-exec-evidence.md). The dated records here preserve earlier implementation snapshots.
+
 ## Plan
 
 Scope: [swxtchio/swx-opencode#324](https://github.com/swxtchio/swx-opencode/issues/324), including its user-facing documentation advisory. The full suite remains the release gate; fast mode is a merge-gate speedup, not a security boundary.
