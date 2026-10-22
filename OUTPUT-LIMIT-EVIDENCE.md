@@ -87,3 +87,20 @@ The first run added the regressions to the pre-fix production tree and returned 
 The adjudicated bare malformed-call edge is retained in [swxtchio/swx-opencode#340](https://github.com/swxtchio/swx-opencode/issues/340). That issue distinguishes the static adapter/registration finding from a provider reproduction and requires producer-driven repair coverage.
 
 One intermediate focused run failed before its cap check at unchanged `Snapshot.track` with `snapshot tracking could not acquire its per-repo locks`. `/usr/bin/flock` was present, and a direct call to the production `snapshot/maintenance.acquire` against a task-local file returned `acquired`, then released with exit code zero and empty stderr. The isolated changed-behavior run and subsequent handoff run passed with the guard unchanged; those passes do not establish the earlier failure's cause. The observation is retained on #164. One package typecheck was terminated by the harness's 120-second wall-clock bound; a later completed package typecheck exited zero. No test deadline, lock guard or runtime retry policy was relaxed.
+
+## Review fix round 2 (2026-10-22)
+
+Fix tree: `e65ab7313a4675ec25034f639c39d615899cf732`, retained by PR #325's head ref after publication. `SessionSummary.summarize` writes a diff-summary object onto real user messages; the prior role-independent predicate incorrectly removed those inputs from the streak. `MessageV2.outputLimitExhausted` now scopes that exclusion to assistant messages carrying the boolean compaction-summary marker. The limited query and round-1 compaction-control/followup exclusions remain in place.
+
+The new `output-limit resets after the real producer summarizes new user input` regression enables the production `SessionSummary` layer rather than replacing it with the existing fixture's no-op. It first exhausts an old run, admits fresh input, and holds the first fresh provider response until persisted history confirms that the real producer has attached the user summary. It then verifies completion with a renewed allowance. Readiness comes from the produced durable row, not a fixed sleep or a manually constructed summary.
+
+Run from `packages/opencode`:
+
+```sh
+bun test test/session/prompt.test.ts -t 'output-limit|delivers queued machine mail after a content-filter terminal|records aborted errors when prompt is cancelled mid-stream|a provider error parks pending prompts until the next admission|an individual queued prompt retains its agent and session model variant'
+bun typecheck
+```
+
+The focused code-tree run passed 22 tests with 192 assertions and no failures, including repeated capacity compaction, real `noReply` boundaries, fragmented input, exhausted resume and queue/error preservation. Package typecheck exited zero. Root `bun run lint:correctness --quiet` exited zero with warnings and no errors; `git diff --check` passed, the shell lint wrapper remains absent, and `fm-ensure-agents-md.sh .` reported linkage unchanged.
+
+For the bounded red proof, the new producer-driven regression was added before changing the production predicate. `bun test test/session/prompt.test.ts -t 'output-limit resets after the real producer summarizes new user input'` exited nonzero: its old-run cap assertions passed, the real fresh user summary was observed, and the fresh run made one request instead of the expected three. The response gate was released and the loop settled, so the failure was a behavioral assertion rather than a hang. The passing handoff run used the narrowed predicate. No new finding was deferred in this round.
