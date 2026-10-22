@@ -25,6 +25,8 @@ const nodeValues = [
   "--test-coverage-branches", "--test-coverage-exclude", "--test-coverage-functions", "--test-coverage-include",
   "--test-coverage-lines", "--tls-cipher-list", "--tls-keylog", "--trace-event-categories", "--trace-event-file-pattern",
   "--trace-require-module", "--unhandled-rejections", "--use-largepages", "--v8-pool-size", "--watch-kill-signal",
+  "--experimental-package-map", "--experimental-test-tag-filter", "--max-old-space-size-percentage", "--test-global-setup",
+  "--test-isolation", "--test-random-seed", "--test-rerun-failures",
 ]
 const bunBooleans = [
   "--no-orphans", "-u", "--update-snapshots", "--todo", "--only", "--pass-with-no-tests", "--concurrent", "--randomize",
@@ -65,6 +67,9 @@ const nodeBooleans = [
   "--trace-sync-io", "--trace-tls", "--trace-uncaught", "--trace-warnings", "--track-heap-objects", "--use-bundled-ca",
   "--use-openssl-ca", "--use-system-ca", "--v8-options", "-v", "--version", "--watch", "--watch-preserve-output",
   "--zero-fill-buffers",
+  "--allow-inspector", "--allow-openssl-store", "--enable-fips-indicator-events", "--experimental-import-text",
+  "--experimental-storage-inspection", "--experimental-stream-iter", "--no-async-context-frame", "--no-require-module",
+  "--experimental-strip-types", "--no-strip-types", "--permission-audit", "--test-randomize", "--use-env-proxy",
 ]
 type Arity = "value" | "boolean" | "optional" | "number" | "eval" | "evalOptional"
 const tables = {
@@ -78,7 +83,7 @@ const tables = {
   node: new Map<string, Arity>([
     ...[...commonValues, ...nodeValues].map((name): [string, Arity] => [name, "value"]),
     ...nodeBooleans.map((name): [string, Arity] => [name, "boolean"]),
-    ...["--inspect", "--inspect-wait", "--inspect-brk"].map((name): [string, Arity] => [name, "optional"]),
+    ...["--inspect", "--inspect-wait", "--inspect-brk", "--force-fips"].map((name): [string, Arity] => [name, "optional"]),
     ...["-e", "--eval"].map((name): [string, Arity] => [name, "eval"]),
     ...["-p", "--print"].map((name): [string, Arity] => [name, "evalOptional"]),
   ]),

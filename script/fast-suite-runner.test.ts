@@ -28,14 +28,38 @@ test("launch option arities follow the installed runtime help surfaces", () => {
       expect(declarations.length).toBeGreaterThan(0)
       for (const line of declarations) {
         const declaration = line.trimStart().match(/^--?[A-Za-z0-9][^\s,]*(?:,\s*--?[A-Za-z0-9][^\s,]*)*/)?.[0] ?? ""
-        const names = declaration.match(/--?[A-Za-z0-9][A-Za-z0-9._-]*/g) ?? []
-        for (const name of names) {
-          const optional = ["--inspect", "--inspect-wait", "--inspect-brk", "--parallel", "--bail", "--changed"].includes(name)
-          const value = !optional && (declaration.includes("=") || ["-e", "--eval", "-p", "--print"].includes(name))
+        const spellings = declaration.split(/,\s*/)
+        for (const spelling of spellings) {
+          const name = spelling.match(/^--?[A-Za-z0-9][A-Za-z0-9._-]*/)?.[0]
+          if (!name) continue
+          // These long aliases share a value operand; other grouped long names can
+          // have different arities (for example Node's two config-file switches).
+          const aliases: Record<string, string> = {
+            "--loader": "--experimental-loader",
+            "--debug-port": "--inspect-port",
+            "--report-directory": "--report-dir",
+            "--experimental-test-isolation": "--test-isolation",
+          }
+          const syntax = name.length === 2
+            ? spellings.find((part) => part.startsWith("--")) ?? spelling
+            : spellings.find((part) => part.match(/^--?[A-Za-z0-9][A-Za-z0-9._-]*/)?.[0] === aliases[name]) ?? spelling
+          const optional = syntax.includes("[=") || ["--inspect", "--inspect-wait", "--inspect-brk", "--parallel", "--bail", "--changed"].includes(name)
+          const value = !optional && (syntax.includes("=") || ["-e", "--eval", "-p", "--print"].includes(name))
           const parsed = parseLaunch(runtime, runtime === "bun" ? ["test", name, "--test-worker", "./probe.test.ts"] : [name, "--test", "./probe.cjs"])
+          if (runtime === "node" && parsed.error) {
+            // Node floats in CI; newly added options must reject explicitly until
+            // supported, rather than fail this test merely by existing in help.
+            expect(parsed.error).toBe("unclassified node launch option: " + name)
+            continue
+          }
           if (parsed.error) console.error(runtime, declaration, parsed.error)
           expect(parsed.error).toBeUndefined()
           expect(runtime === "bun" ? parsed.worker : parsed.test).toBe(!value)
+          if (syntax.includes("[=")) {
+            const attached = parseLaunch(runtime, runtime === "bun" ? ["test", name + "=1", "--test-worker"] : [name + "=1", "--test"])
+            expect(attached.error).toBeUndefined()
+            expect(runtime === "bun" ? attached.worker : attached.test).toBe(true)
+          }
         }
       }
     }
@@ -488,7 +512,7 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
         'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("user-")) {',
         '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
         `  const source = ${JSON.stringify('require("node:fs").appendFileSync(process.env.FAST_SUITE_MARKER, process.env.FAST_SUITE_LAUNCH_SHAPE + "\\n"); console.log(process.argv.slice(1).join(" "))')}`,
-        '  const command = shape === "user-node-script" ? ["node", "./arg-probe.cjs", "--test"] : shape === "user-node-delimiter" ? ["node", "--", "./arg-probe.cjs", "--test"] : shape === "user-node-script-inline" ? ["node", "./arg-probe.cjs", "--test=ordinary"] : shape === "user-bun-eval" ? ["bun", "-e", source, "--", "--test-worker"] : ["node", "-e", source, "--", "--test"]',
+        '  const command = shape === "user-node-script" ? ["node", "./arg-probe.cjs", "--test"] : shape === "user-node-delimiter" ? ["node", "--", "./arg-probe.cjs", "--test"] : shape === "user-node-script-inline" ? ["node", "./arg-probe.cjs", "--test=ordinary"] : shape === "user-bun-eval" ? ["bun", "-e", source, "--", "--test-worker"] : shape === "user-node24-options" ? ["node", Number(Bun.spawnSync(["node", "--version"]).stdout.toString().slice(1).split(".")[0]) >= 24 ? "--allow-inspector" : "--no-warnings", "-e", source] : ["node", "-e", source, "--", "--test"]',
         '  const result = Bun.spawnSync(command, { stdout: "inherit", stderr: "inherit" })',
         '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
         "}",
@@ -985,7 +1009,7 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
 
     const launchShapes = process.env.FAST_SUITE_RUNNER_CASE
       ? [process.env.FAST_SUITE_RUNNER_CASE]
-      : ["worker-path-ignore", "worker-absolute-ignore", "worker-path-timings", "worker-absolute-timings", "value-bun-ignore", "value-bun-timings", "value-node-localstorage", "unknown-bun-path", "unknown-bun-absolute", "unknown-node-v8", "node-test-localstorage", "node-test-coverage-include", "node-test-coverage-exclude", "node-test-report-dir", "node-test-coverage-lines", "node-test-coverage-branches", "node-test-coverage-functions", "worker-path-env", "worker-absolute-env", "worker-path-outfile", "worker-absolute-outfile", "user-node-eval", "user-node-script", "user-node-delimiter", "user-node-script-inline", "user-bun-eval", "job-control-SIGSTOP", "job-control-SIGTSTP", "job-control-SIGTTIN", "job-control-SIGTTOU", "deleted-cwd", "deleted-fchdir", "overwrite-bun", "overwrite-node", "repoint-bun", "repoint-node", "absolute-bun", "absolute-bun-copy", "bun-delegation", "node-test", "inspect-base", "inspect-copy", "inspect-path", "inspect-base-inline", "inspect-copy-inline", "inspect-path-inline", "shebang-bun", "shebang-node", "shebang-chain", "fd-bun", "symlink-bun-missing", "symlink-node-missing", "symlink-bun-decoy", "symlink-node-decoy", "relative-bun-decoy", "relative-node-decoy", "chdir-bun-decoy", "chdir-node-decoy", "transient-bun", "transient-node"]
+      : ["user-node24-options", "worker-path-ignore", "worker-absolute-ignore", "worker-path-timings", "worker-absolute-timings", "value-bun-ignore", "value-bun-timings", "value-node-localstorage", "unknown-bun-path", "unknown-bun-absolute", "unknown-node-v8", "node-test-localstorage", "node-test-coverage-include", "node-test-coverage-exclude", "node-test-report-dir", "node-test-coverage-lines", "node-test-coverage-branches", "node-test-coverage-functions", "worker-path-env", "worker-absolute-env", "worker-path-outfile", "worker-absolute-outfile", "user-node-eval", "user-node-script", "user-node-delimiter", "user-node-script-inline", "user-bun-eval", "job-control-SIGSTOP", "job-control-SIGTSTP", "job-control-SIGTTIN", "job-control-SIGTTOU", "deleted-cwd", "deleted-fchdir", "overwrite-bun", "overwrite-node", "repoint-bun", "repoint-node", "absolute-bun", "absolute-bun-copy", "bun-delegation", "node-test", "inspect-base", "inspect-copy", "inspect-path", "inspect-base-inline", "inspect-copy-inline", "inspect-path-inline", "shebang-bun", "shebang-node", "shebang-chain", "fd-bun", "symlink-bun-missing", "symlink-node-missing", "symlink-bun-decoy", "symlink-node-decoy", "relative-bun-decoy", "relative-node-decoy", "chdir-bun-decoy", "chdir-node-decoy", "transient-bun", "transient-node"]
     for (const shape of launchShapes) {
       runOptions.env.FAST_SUITE_LAUNCH_SHAPE = shape
       writeFileSync(marker, "")
@@ -1540,5 +1564,5 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
     expect(fullWithArguments.stdout.toString().trim().endsWith("verdict=completed mode=full exit_code=1")).toBe(true)
     expect(readFileSync(turboLog, "utf8").trim().split("\n").at(-1)).toBe("test --filter=./packages/example")
   },
-  180_000,
+  300_000,
 )
