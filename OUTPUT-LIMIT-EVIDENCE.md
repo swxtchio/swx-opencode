@@ -56,3 +56,34 @@ On 2026-10-21, [test run 39533629596](https://github.com/swxtchio/swx-opencode/a
 ## Passing merged-head validation
 
 On 2026-10-21, after merging `swxtch` commit `394afd082f36067387e29c397a11d51b31c1ddb8` into the task branch, head `944b1e57f0e7feda5ff37317773d2834656a616c` passed the focused command above (17 tests), package typecheck and the crew commit-identity gate. [Test run 39536932305](https://github.com/swxtchio/swx-opencode/actions/runs/39536932305) completed successfully with unit and e2e jobs passing; the PR's typecheck check passed as well. This passing run was reported through the PR and review-ready wake. It does not establish or repair the causes of the earlier failures retained in #327/#328. Firstmate still owns review, its final suite gate and merge.
+
+## Review fix round 1 (2026-10-22)
+
+Fix tree: `3ea1c784c1e5cdbe237e0aa8271a6b9ce213823c`, retained by PR #325's head ref after publication. The branch merged `swxtch` baseline `cbfcad62a6` without rewriting the reviewed ancestry. `MessageV2.outputLimitExhausted` owns the limited durable-history query independently of compacted model context; its V1 compaction markers, summaries and synthetic followups correspond to upstream's excluded compaction records. Real `noReply` user input remains part of the upstream streak membership. `SessionProcessor.handleEvent`, case `tool-input-delta`, buffers fragments with their owning call/attempt; `cleanup` uses that buffer in the existing terminal repair-context write. The existing admission and takeover boundaries remain the execution owners.
+
+Run from `packages/opencode`:
+
+```sh
+bun test test/session/prompt.test.ts test/session/processor-effect.test.ts -t 'output-limit|delivers queued machine mail after a content-filter terminal|records aborted errors when prompt is cancelled mid-stream|a provider error parks pending prompts until the next admission|an individual queued prompt retains its agent and session model variant|admits an AI SDK-dispatched tool durably before its plugin hook or body runs|admits the retry of an already-admitted call with the retry.s own input|never lets an execution a retry superseded write metadata into or complete the retried call'
+bun typecheck
+```
+
+The focused code-tree run passed 24 tests with 214 assertions and no failures. The new cases exercise actual automatic capacity compaction twice before classified exhaustion, a fresh input after exhaustion, real `noReply` admission during a running turn, and both completed and incomplete arguments split into single-character provider fragments. Persisted history, repair context, filesystem effects and emitted `PartUpdated` events come from production owners. The existing AI SDK admission and superseded-execution cases passed alongside the queue/error/continuation coverage. Package typecheck exited zero; root `bun run lint:correctness` exited zero with warnings and no errors. `git diff --check` passed; `bin/fm-lint.sh` is absent and `fm-ensure-agents-md.sh .` reported linkage unchanged.
+
+### Bounded red proofs
+
+Run each filter with `bun test test/session/prompt.test.ts -t` from `packages/opencode`:
+
+| Removed behavior | Filter | Observed failure on 2026-10-22 |
+| --- | --- | --- |
+| The durable, compaction-independent streak query, using the pre-fix snapshot/noReply filter instead | `'output-limit preserves exhaustion across repeated capacity compaction'` | The production loop settled after 7 requests instead of the expected 5, consuming the extra summary/continuation sentinels. |
+| Real `noReply` membership, using the pre-fix filter instead | `'output-limit counts real noReply'` | The production loop exhausted after 3 requests instead of completing the 5-request sequence with fresh input. |
+| Buffered fragments, restoring `updateToolCall` on each delta and using persisted pending raw input for the excerpt | `'output-limit buffers fragmented'` | Both final regressions failed: the pending update sequence contained 123/124 cumulative-raw entries instead of the single empty-raw registration. Tool settlement/effect checks had already passed. |
+
+The first run added the regressions to the pre-fix production tree and returned four behavioral failures, without hanging. The final fragmented-input assertions were also rerun against the explicit delta/cleanup reversion and returned two behavioral failures. All mutations were restored before the passing handoff run. Finite provider sentinels expose a renewed allowance as an extra completed request rather than an indefinitely waiting provider.
+
+### Deferred edge and validation interruptions
+
+The adjudicated bare malformed-call edge is retained in [swxtchio/swx-opencode#340](https://github.com/swxtchio/swx-opencode/issues/340). That issue distinguishes the static adapter/registration finding from a provider reproduction and requires producer-driven repair coverage.
+
+One intermediate focused run failed before its cap check at unchanged `Snapshot.track` with `snapshot tracking could not acquire its per-repo locks`. `/usr/bin/flock` was present, and a direct call to the production `snapshot/maintenance.acquire` against a task-local file returned `acquired`, then released with exit code zero and empty stderr. The isolated changed-behavior run and subsequent handoff run passed with the guard unchanged; those passes do not establish the earlier failure's cause. The observation is retained on #164. One package typecheck was terminated by the harness's 120-second wall-clock bound; a later completed package typecheck exited zero. No test deadline, lock guard or runtime retry policy was relaxed.
