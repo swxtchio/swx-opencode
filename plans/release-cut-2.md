@@ -27,4 +27,4 @@ On 2026-10-22, `git fetch origin swxtch` selected immutable source `bce37c276f40
 
 ## Current execution boundary
 
-No candidate has been built or release published by this task. The supplied brief requires a new absolute VM14 write-root grant; the preceding release's disposition is source-limited and cannot authorize this release. ARM execution remains pending that grant and current capacity confirmation.
+The new task-specific VM14 grant was read before staging and workload admission. Both native candidates passed the unchanged packaged acceptance battery, and the carried small-model focused run passed 59 tests with zero failures. `RELEASE-CUT-2-EVIDENCE.md` records this execution checkpoint; publication and verified recipient handoff are the remaining phases.
