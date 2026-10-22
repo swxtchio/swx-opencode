@@ -370,6 +370,28 @@ The model ID in your OpenCode config uses the format `provider/model-id`. For ex
 
 ---
 
+### Small model
+
+Use `small_model` to choose the provider/model for titles and compaction summaries associated with this agent, independently of its primary `model`:
+
+```json title="opencode.json"
+{
+  "small_model": "anthropic/claude-haiku-4-5",
+  "agent": {
+    "build": {
+      "model": "azure/my-primary-deployment",
+      "small_model": "openai/gpt-5-nano"
+    }
+  }
+}
+```
+
+The same `small_model: provider/model-id` key is accepted in agent Markdown frontmatter. It is a model selection, not an additional provider request option. See [Models](/docs/config#models) for effective precedence, dedicated auxiliary-agent overrides, failure behavior and the unconfigured fallback; [`Agent.state`](https://github.com/swxtchio/swx-opencode/blob/swxtch/packages/opencode/src/agent/agent.ts) owns loading into the running agent.
+
+New task sessions inherit the invoking agent/session/global configured selection; a child agent's own `small_model` overrides that inherited selection. Resuming an existing task keeps its stored session assignment. [`TaskTool.execute`](https://github.com/swxtchio/swx-opencode/blob/swxtch/packages/opencode/src/tool/task.ts) owns child creation and resumption.
+
+---
+
 ### Tools (deprecated)
 
 `tools` is **deprecated**. Prefer the agent's [`permission`](#permissions) field for new configs, updates and more fine-grained control.

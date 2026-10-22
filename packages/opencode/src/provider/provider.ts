@@ -1312,7 +1312,10 @@ export interface Interface {
     providerID: ProviderV2.ID,
     query: string[],
   ) => Effect.Effect<{ providerID: ProviderV2.ID; modelID: string } | undefined>
-  readonly getSmallModel: (providerID: ProviderV2.ID) => Effect.Effect<Model | undefined>
+  readonly getSmallModel: (
+    providerID: ProviderV2.ID,
+    input?: { model?: { providerID: ProviderV2.ID; modelID: ModelV2.ID }; infer?: boolean },
+  ) => Effect.Effect<Model | undefined, ModelNotFoundError>
   readonly defaultModel: () => Effect.Effect<{ providerID: ProviderV2.ID; modelID: ModelV2.ID }, DefaultModelError>
 }
 
@@ -1621,9 +1624,7 @@ const layer = Layer.effect(
               modelsDev[providerID]?.npm ??
               "@ai-sdk/openai-compatible"
             const migratedGoogle =
-              providerID === "google" &&
-              configuredApiNpm === "@ai-sdk/openai-compatible" &&
-              isGemini38OrLater(apiID)
+              providerID === "google" && configuredApiNpm === "@ai-sdk/openai-compatible" && isGemini38OrLater(apiID)
             const apiNpm = migratedGoogle ? "@ai-sdk/google" : configuredApiNpm
             if (migratedGoogle) migratedGoogleModelIDs.add(`${providerID}/${modelID}`)
             const name = iife(() => {
@@ -1919,8 +1920,7 @@ const layer = Layer.effect(
         })
 
         const resolvedBaseURL =
-          ProviderTransform.isGoogleCompatGeminiMigrated(model) &&
-          typeof baseURL === "string"
+          ProviderTransform.isGoogleCompatGeminiMigrated(model) && typeof baseURL === "string"
             ? baseURL.replace(/\/openai\/?$/, "")
             : baseURL
         if (resolvedBaseURL !== undefined) options["baseURL"] = resolvedBaseURL
@@ -2082,15 +2082,16 @@ const layer = Layer.effect(
       return undefined
     })
 
-    const getSmallModel = Effect.fn("Provider.getSmallModel")(function* (providerID: ProviderV2.ID) {
+    const getSmallModel = Effect.fn("Provider.getSmallModel")(function* (
+      providerID: ProviderV2.ID,
+      input?: { model?: { providerID: ProviderV2.ID; modelID: ModelV2.ID }; infer?: boolean },
+    ) {
       const cfg = yield* config.get()
-
-      if (cfg.small_model) {
-        const parsed = parseModel(cfg.small_model)
-        return yield* getModel(parsed.providerID, parsed.modelID).pipe(
-          Effect.catchTag("ProviderModelNotFoundError", () => Effect.succeed(undefined)),
-        )
+      const selected = input?.model ?? (cfg.small_model !== undefined ? parseModel(cfg.small_model) : undefined)
+      if (selected) {
+        return yield* getModel(selected.providerID, selected.modelID)
       }
+      if (input?.infer === false) return undefined
 
       const s = yield* InstanceState.get(state)
       const provider = s.providers[providerID]

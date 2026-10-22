@@ -874,6 +874,20 @@ it.instance("treats agent variant as model-scoped setting (not provider option)"
   }),
 )
 
+it.instance("small-model agent config is independent of provider options", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(test.directory, {
+      small_model: "auxiliary/global-small",
+      agent: { build: { model: "test/test-model", small_model: "auxiliary/agent-small", max_tokens: 123 } },
+    })
+    const config = yield* Config.use.get()
+    expect(config.agent?.build?.small_model).toBe("auxiliary/agent-small")
+    expect(config.agent?.build?.options).not.toHaveProperty("small_model")
+    expect(config.agent?.build?.options?.max_tokens).toBe(123)
+  }),
+)
+
 it.instance("handles command configuration", () =>
   Effect.gen(function* () {
     const test = yield* TestInstance
