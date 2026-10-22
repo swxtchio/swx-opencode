@@ -8,13 +8,12 @@
 # together through its scoped test task; packages without a task use `bun run test`.
 # Turbo/Bun own strict env, local config, script options, and one package lifecycle.
 # JUnit-less nonzero exits remain attributed refusals; extra or missing suites are rejected.
-# Fast mode needs Linux strace to audit child execs outside the PATH-resolved Bun shim.
+# Fast mode needs Linux procfs/ptrace and Python 3 to observe child execs outside the Bun shim.
 # Remaining accepted limits (swxtchio/swx-opencode#324): this is not a security boundary;
 # unrecognized interpreter identities, in-process test frameworks, and deliberate observer/report
 # tampering are outside its observation scope. The full suite remains the release gate.
 # In particular, bare Node scripts using node:test without --test remain unobserved.
-# Executable paths and interpreter headers are re-verified in the audit-time filesystem;
-# they are not captured interpreter-byte snapshots from the instant of exec.
+# The observer records the loaded interpreter and kernel-expanded argv at exec stops.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -47,9 +46,9 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     'after a successful test command; hook failures propagate through the task result.' \
     'All captured Bun JUnit reports, including preparation and lifecycle-hook launches, are collected; their observed' \
     'file set must equal the manifest exactly for PATH-resolved Bun test launches; see swxtchio/swx-opencode#324.' \
-    'Fast mode requires Linux strace: unobserved absolute Bun test launches and Node --test launches invalidate the run;' \
-    'Captured process context reconstructs paths; real targets and shebang headers are verified in the audit-time filesystem.' \
-    'Vanished or unverifiable execution targets are refused; this is not an exec-time interpreter-byte snapshot.' \
+    'Fast mode requires Python 3 and working Linux procfs/ptrace; unobserved Bun tests and Node --test invalidate the run.' \
+    'The loaded interpreter identity and kernel-expanded argv are captured while each process is stopped at exec,' \
+    'before user code runs. Failed or incomplete observation is refused; later script/cwd cleanup cannot change these records.' \
     'bun run --bun delegation is refused. This is a merge-gate speedup, not a security boundary; full suite gates releases.' \
     'A nonzero target with no JUnit report is refused with target attribution, not labeled an execution-set mismatch.' \
     'Fast mode refuses if a selected file reports no active test cases.' \
@@ -126,10 +125,10 @@ fi
 report_file="$root/.fast-suite-report.$$.xml"
 trap 'rm -f -- "$report_file" "$config_dir"/*; rmdir -- "$config_dir" 2>/dev/null || true' EXIT
 real_bun="$(command -v bun)"
-if ! command -v strace >/dev/null 2>&1 \
-  || ! strace -f --seccomp-bpf -qq -yy -s 65536 -xx -e trace=execve,execveat,clone,clone3,fork,vfork,chdir,fchdir -o "$config_dir/probe.trace" \
+if ! command -v python3 >/dev/null 2>&1 \
+  || ! python3 "$root/tests/observe-exec.py" "$config_dir/probe.execs" \
     "$real_bun" -p 'process.execPath' > "$config_dir/runtime-bun"; then
-  printf '%s\n' 'tests/run.sh: fast mode requires a working Linux strace process-launch observer' >&2
+  printf '%s\n' 'tests/run.sh: fast mode requires Python 3 and a working Linux procfs/ptrace process-launch observer' >&2
   printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=process-observer-unavailable exit_code=1'
   exit 1
 fi
@@ -598,8 +597,8 @@ for prep_task in "${turbo_prep_tasks[@]}"; do
     esac
   done
   preparation_status=0
-  GITHUB_ACTIONS=false PATH="$config_dir:$PATH" strace -f --seccomp-bpf -qq -yy -s 65536 -xx -e trace=execve,execveat,clone,clone3,fork,vfork,chdir,fchdir \
-    -o "$config_dir/preparation-$prep_task.trace" "$config_dir/bun" turbo run "$prep_task" "${prep_filters[@]}" --force || preparation_status=$?
+  GITHUB_ACTIONS=false PATH="$config_dir:$PATH" python3 "$root/tests/observe-exec.py" \
+    "$config_dir/preparation-$prep_task.execs" "$config_dir/bun" turbo run "$prep_task" "${prep_filters[@]}" --force || preparation_status=$?
   if [ "$preparation_status" -ne 0 ]; then
     printf 'tests/run.sh: Turbo-declared preparation task failed: %s\n' "$prep_task" >&2
     printf '%s\n' 'tests/run.sh: verdict=refused mode=fast reason=turbo-preparation-failed exit_code=1'
@@ -647,12 +646,12 @@ while [ "$index" -lt "$target_count" ]; do
   report_args=(--reporter=junit --reporter-outfile="$report_file")
   test_status=0
   if [ "$has_turbo_task" = 1 ]; then
-    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" strace -f --seccomp-bpf -qq -yy -s 65536 -xx -e trace=execve,execveat,clone,clone3,fork,vfork,chdir,fchdir \
-      -o "$config_dir/package-$index.trace" "$config_dir/bun" turbo run test "--filter=./$package_root" --only --force -- \
+    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" python3 "$root/tests/observe-exec.py" \
+      "$config_dir/package-$index.execs" "$config_dir/bun" turbo run test "--filter=./$package_root" --only --force -- \
       "${report_args[@]}" "${selected_paths[@]}" || test_status=$?
   else
-    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" strace -f --seccomp-bpf -qq -yy -s 65536 -xx -e trace=execve,execveat,clone,clone3,fork,vfork,chdir,fchdir \
-      -o "$config_dir/package-$index.trace" "$config_dir/bun" --cwd="$root/$package_root" run test -- \
+    GITHUB_ACTIONS=false PATH="$config_dir:$PATH" python3 "$root/tests/observe-exec.py" \
+      "$config_dir/package-$index.execs" "$config_dir/bun" --cwd="$root/$package_root" run test -- \
       "${report_args[@]}" "${selected_paths[@]}" || test_status=$?
   fi
   if [ "$test_status" -ne 0 ]; then target_status=$test_status; fi
@@ -725,135 +724,37 @@ done
 # A process outside the PATH shim cannot certify a fast run by omitting its report.
 launch_observation_status=0
 FAST_SUITE_ROOT="$root" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPORT_DIR="$config_dir" FAST_SUITE_MAIN_REPORT="$report_file" bun -e '
-  import { existsSync, realpathSync } from "node:fs"
   import { readdir } from "node:fs/promises"
-  import { basename, dirname, join } from "node:path"
+  import { basename, join } from "node:path"
 
   const directory = process.env.FAST_SUITE_REPORT_DIR
   const runtimeBun = (await Bun.file(join(directory, "runtime-bun")).text()).trim()
-  const entries = await readdir(directory)
-  const resolveTarget = (raw, base) => {
-    if (!raw || (!raw.startsWith("/") && !base)) return undefined
-    let path = raw.startsWith("/") ? "/" : base
-    for (const part of raw.split("/")) {
-      if (!part || part === ".") continue
-      if (part === "..") {
-        path = dirname(path)
-        continue
-      }
-      const target = path + "/" + part
-      if (!existsSync(target)) return undefined
-      path = realpathSync(target)
-    }
-    return path
+  const probe = (await Bun.file(join(directory, "probe.execs")).text()).trim().split("\n").map((line) => JSON.parse(line))
+  const runtime = probe.find((entry) => entry.event === "exec" && entry.executable === runtimeBun)
+  if (!runtime || probe.at(-1)?.event !== "complete") {
+    console.error("tests/run.sh: unavailable runtime executable identity")
+    process.exit(2)
   }
+  const entries = await readdir(directory)
   let invalid = entries.includes("refused-delegation")
-  for (const name of entries.filter((entry) => entry.endsWith(".trace") && entry !== "probe.trace")) {
-    const calls = []
-    const pending = new Map()
-    for (const [index, line] of (await Bun.file(join(directory, name)).text()).split("\n").entries()) {
-      const match = line.match(/^(\d+)\s+(.*)$/)
-      if (!match) continue
-      const pid = match[1]
-      const text = match[2]
-      if (!/^(?:execve(?:at)?|clone3?|fork|vfork|chdir|fchdir)\(/.test(text) && !text.startsWith("<... ")) continue
-      if (text.endsWith("<unfinished ...>")) {
-        pending.set(pid, { text: text.slice(0, -"<unfinished ...>".length), index })
-        continue
-      }
-      const start = pending.get(pid)
-      const call = text.startsWith("<... ") ? (start?.text ?? "") + text.replace(/^<\.\.\. \w+ resumed>/, "") : text
-      pending.delete(pid)
-      const result = call.match(/\)\s+= (\d+)$/)
-      if (!result) continue
-      if (call.includes("...")) {
-        console.error("tests/run.sh: truncated process-launch observation: " + name)
-        invalid = true
-        continue
-      }
-      calls.push({ pid, call, index: start?.index ?? index, result: Number(result[1]) })
+  for (const name of entries.filter((entry) => entry.endsWith(".execs") && entry !== "probe.execs")) {
+    const records = (await Bun.file(join(directory, name)).text()).trim().split("\n").map((line) => JSON.parse(line))
+    const launches = records.filter((entry) => entry.event === "exec")
+    const completion = records.at(-1)
+    if (completion?.event !== "complete" || completion.execCount !== launches.length || !launches.length || records.length !== launches.length + 1) {
+      console.error("tests/run.sh: incomplete process-launch observation: " + name)
+      invalid = true
+      continue
     }
-    const ordered = calls.sort((a, b) => a.index - b.index)
-    const working = new Map()
-    if (ordered.length) working.set(ordered[0].pid, { path: resolveTarget(process.env.FAST_SUITE_ROOT) })
-    for (const entry of ordered) {
-      const call = entry.call
-      const cwd = working.get(entry.pid)
-      if (!cwd) {
-        console.error("tests/run.sh: process has no observed working directory: " + entry.pid)
-        invalid = true
-        continue
-      }
-      if (/^(?:clone3?|fork|vfork)\(/.test(call)) {
-        if (entry.result > 0) working.set(String(entry.result), call.includes("CLONE_FS") ? cwd : { path: cwd.path })
-        continue
-      }
-      const strings = Array.from(call.matchAll(/"((?:\\x[0-9a-f]{2})*)"/g), ([, hex]) => Buffer.from(hex.replaceAll("\\x", ""), "hex").toString())
-      if (/^chdir\(/.test(call)) {
-        cwd.path = resolveTarget(strings[0], cwd.path)
-        if (!cwd.path) {
-          console.error("tests/run.sh: unavailable executed chdir target: " + strings[0])
-          invalid = true
-        }
-        continue
-      }
-      const descriptor = call.match(/^(?:execveat|fchdir)\([^<]*<([^>]+)>/)?.[1]
-      const descriptorPath = descriptor?.startsWith("\\x") ? Buffer.from(descriptor.replaceAll("\\x", ""), "hex").toString() : descriptor
-      if (/^fchdir\(/.test(call)) {
-        cwd.path = resolveTarget(descriptorPath)
-        if (!cwd.path) {
-          console.error("tests/run.sh: unavailable executed fchdir target")
-          invalid = true
-        }
-        continue
-      }
-      if (!/^execve(?:at)?\(/.test(call) || entry.result !== 0) continue
-      working.set(entry.pid, { path: cwd.path })
-      let executable = strings[0]
-      let args = strings.slice(2)
-      if (!executable && descriptorPath?.startsWith("/")) executable = descriptorPath
-      if (!executable) {
-        console.error("tests/run.sh: unobservable executable pathname: " + name)
-        invalid = true
-        continue
-      }
-      const requested = executable
-      executable = resolveTarget(executable, descriptorPath ?? cwd.path)
-      if (!executable) {
-        console.error("tests/run.sh: unavailable executed target: " + requested)
-        invalid = true
-        continue
-      }
-      const interpreters = new Set()
-      while (executable) {
-        const header = await Bun.file(executable).slice(0, 256).text()
-        if (!header.startsWith("#!")) break
-        if (interpreters.has(executable)) {
-          console.error("tests/run.sh: cyclic script interpreter dispatch: " + executable)
-          invalid = true
-          break
-        }
-        interpreters.add(executable)
-        const bang = header.slice(2).split(/[\n\0]/, 1)[0].replace(/[ \t]+$/, "").match(/^[ \t]*([^ \t]+)(?:[ \t]+(.*))?$/)
-        if (!bang || (!bang[1].startsWith("/") && !cwd.path)) {
-          console.error("tests/run.sh: unobservable script interpreter dispatch: " + executable)
-          invalid = true
-          break
-        }
-        args = [...(bang[2] ? [bang[2]] : []), executable, ...args]
-        executable = resolveTarget(bang[1], cwd.path)
-        if (!executable) {
-          console.error("tests/run.sh: unavailable executed interpreter target: " + bang[1])
-          invalid = true
-        }
-      }
+    for (const entry of launches) {
+      const executable = entry.executable
+      const args = entry.argv.slice(1)
       if (basename(executable ?? "") === "node" && args.some((argument) => argument === "--test" || argument.startsWith("--test="))) {
         console.error("tests/run.sh: unobservable Node test launch: " + executable)
         invalid = true
       }
-      if (!executable) continue
-      const configuredBun = existsSync(executable) && realpathSync(executable) === runtimeBun
-      const namedBun = executable.startsWith("/") && basename(executable) === "bun" && executable !== join(directory, "bun") && executable !== process.env.FAST_SUITE_CAPTURE_REAL_BUN
+      const configuredBun = entry.device === runtime.device && entry.inode === runtime.inode
+      const namedBun = executable.startsWith("/") && basename(executable) === "bun"
       if (!configuredBun && !namedBun) continue
       let command = 0
       while (command < args.length && args[command].startsWith("-")) {
@@ -868,10 +769,6 @@ FAST_SUITE_ROOT="$root" FAST_SUITE_CAPTURE_REAL_BUN="$real_bun" FAST_SUITE_REPOR
         console.error("tests/run.sh: unobserved Bun test launch: " + executable)
         invalid = true
       }
-    }
-    if (pending.size > 0) {
-      console.error("tests/run.sh: incomplete process-launch observation: " + name)
-      invalid = true
     }
   }
   if (invalid) process.exit(2)

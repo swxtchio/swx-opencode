@@ -17,6 +17,44 @@ import { dirname, join } from "node:path"
 const scratch = mkdtempSync(join(tmpdir(), "fast-suite-runner-"))
 afterAll(() => rmSync(scratch, { recursive: true, force: true }))
 
+test("exec observer preserves signal exits and execution from a non-leader thread", () => {
+  const observer = join(import.meta.dir, "..", "tests", "observe-exec.py")
+  const signaled = Bun.spawnSync([
+    "python3",
+    observer,
+    join(scratch, "signal.execs"),
+    "python3",
+    "-c",
+    "import os,signal; os.kill(os.getpid(), signal.SIGUSR1)",
+  ])
+  expect(signaled.exitCode).toBe(138)
+  const signalRecords = readFileSync(join(scratch, "signal.execs"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+  expect(signalRecords.at(-1)).toMatchObject({ event: "complete", exitCode: 138, execCount: 1 })
+  const threaded = Bun.spawnSync([
+    "python3",
+    observer,
+    join(scratch, "thread.execs"),
+    "python3",
+    "-c",
+    'import os,threading; t=threading.Thread(target=lambda: os.execv("/usr/bin/printf", ["printf", "thread-exec-ok"])); t.start(); t.join()',
+  ])
+  if (threaded.exitCode !== 0) console.error(threaded.stderr.toString())
+  expect(threaded.exitCode).toBe(0)
+  expect(threaded.stdout.toString()).toBe("thread-exec-ok")
+  const threadRecords = readFileSync(join(scratch, "thread.execs"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+  expect(threadRecords.filter((entry) => entry.event === "exec").at(-1)).toMatchObject({
+    executable: realpathSync("/usr/bin/printf"),
+    argv: ["printf", "thread-exec-ok"],
+  })
+  expect(threadRecords.at(-1)).toMatchObject({ event: "complete", exitCode: 0, execCount: 2 })
+})
+
 // GOAL: compare fast-mode package traces with owning Turbo/package-script runs over exact files;
 // refusal fixtures cover hidden prerequisites, invalid admission metadata, and JUnit scope.
 test(
@@ -187,6 +225,8 @@ ${directSecondPath}
       'import { appendFileSync } from "node:fs"\nappendFileSync(process.env.FAST_SUITE_MARKER!, "script-flag:" + process.argv.at(-1) + "\\n")\n',
     )
     copyFileSync(join(import.meta.dir, "..", "tests", "run.sh"), runner)
+    copyFileSync(join(import.meta.dir, "..", "tests", "observe-exec.py"), join(root, "tests", "observe-exec.py"))
+    const observerSource = readFileSync(join(root, "tests", "observe-exec.py"), "utf8")
     chmodSync(runner, 0o755)
     const runnerSource = readFileSync(runner, "utf8")
     writeFileSync(
@@ -368,8 +408,30 @@ exec "\${FAST_SUITE_REAL_BUN:?}" "$@"
     writeFileSync(
       join(packageRoot, "pretest.ts"),
       [
-        'import { appendFileSync, chmodSync, copyFileSync, rmSync } from "node:fs"',
+        'import { appendFileSync, chmodSync, copyFileSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"',
         'appendFileSync(process.env.FAST_SUITE_HOOK_LOG!, "pretest\\n")',
+        'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("deleted-")) {',
+        '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
+        '  const temporary = mkdtempSync(process.env.FAST_SUITE_ALTERNATE_BUN! + "-cwd-")',
+        `  const source = ${JSON.stringify('import os,sys; fd=os.open(sys.argv[1], os.O_RDONLY); os.fchdir(fd); os.close(fd); os.execve("/usr/bin/true", ["true"], dict(os.environ))')}`,
+        '  const result = shape === "deleted-fchdir" ? Bun.spawnSync(["python3", "-c", source, temporary], { stdout: "inherit", stderr: "inherit" }) : Bun.spawnSync(["/usr/bin/true"], { cwd: temporary, stdout: "inherit", stderr: "inherit" })',
+        '  rmSync(temporary, { recursive: true })',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        '  appendFileSync(process.env.FAST_SUITE_MARKER!, shape + "\\n")',
+        "}",
+        'if (/^(overwrite|repoint)-/.test(process.env.FAST_SUITE_LAUNCH_SHAPE ?? "")) {',
+        '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE!',
+        '  const node = shape.endsWith("node")',
+        '  const source = process.cwd() + (node ? "/shebang-node.cjs" : "/shebang-bun.ts")',
+        '  const temporary = process.env.FAST_SUITE_ALTERNATE_BUN! + "-" + shape + (node ? ".cjs" : ".ts")',
+        '  rmSync(temporary, { force: true })',
+        '  if (shape.startsWith("repoint-")) symlinkSync(source, temporary)',
+        '  if (shape.startsWith("overwrite-")) { copyFileSync(source, temporary); chmodSync(temporary, 0o755) }',
+        '  const result = Bun.spawnSync([temporary], { stdout: "inherit", stderr: "inherit" })',
+        '  if (shape.startsWith("repoint-")) { rmSync(temporary); symlinkSync(process.cwd() + (node ? "/probe-decoy.cjs" : "/probe-decoy.ts"), temporary) }',
+        '  if (shape.startsWith("overwrite-")) writeFileSync(temporary, "// ordinary replacement bytes\\n")',
+        '  if (result.exitCode !== 0) process.exit(result.exitCode ?? 1)',
+        "}",
         'if (process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("symlink-") || process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("relative-") || process.env.FAST_SUITE_LAUNCH_SHAPE?.startsWith("chdir-")) {',
         '  const shape = process.env.FAST_SUITE_LAUNCH_SHAPE',
         '  const extension = shape.includes("node") ? "cjs" : "ts"',
@@ -833,11 +895,24 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
 
     const launchShapes = process.env.FAST_SUITE_RUNNER_CASE
       ? [process.env.FAST_SUITE_RUNNER_CASE]
-      : ["absolute-bun", "absolute-bun-copy", "bun-delegation", "node-test", "inspect-base", "inspect-copy", "inspect-path", "inspect-base-inline", "inspect-copy-inline", "inspect-path-inline", "shebang-bun", "shebang-node", "shebang-chain", "fd-bun", "symlink-bun-missing", "symlink-node-missing", "symlink-bun-decoy", "symlink-node-decoy", "relative-bun-decoy", "relative-node-decoy", "chdir-bun-decoy", "chdir-node-decoy", "transient-bun", "transient-node"]
+      : ["deleted-cwd", "deleted-fchdir", "overwrite-bun", "overwrite-node", "repoint-bun", "repoint-node", "absolute-bun", "absolute-bun-copy", "bun-delegation", "node-test", "inspect-base", "inspect-copy", "inspect-path", "inspect-base-inline", "inspect-copy-inline", "inspect-path-inline", "shebang-bun", "shebang-node", "shebang-chain", "fd-bun", "symlink-bun-missing", "symlink-node-missing", "symlink-bun-decoy", "symlink-node-decoy", "relative-bun-decoy", "relative-node-decoy", "chdir-bun-decoy", "chdir-node-decoy", "transient-bun", "transient-node"]
     for (const shape of launchShapes) {
       runOptions.env.FAST_SUITE_LAUNCH_SHAPE = shape
       writeFileSync(marker, "")
       const launchEscape = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+      if (shape.startsWith("deleted-")) {
+        if (launchEscape.exitCode !== 0) console.error(shape, launchEscape.stdout.toString(), launchEscape.stderr.toString())
+        expect(launchEscape.exitCode).toBe(0)
+        expect(launchEscape.stdout.toString()).toContain("verdict=completed mode=fast target_count=4 exit_code=0")
+        expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual([
+          shape,
+          "direct-configured",
+          "direct-second-configured",
+          "second-configured",
+          "selected-configured",
+        ])
+        continue
+      }
       if (launchEscape.exitCode === 0) console.error(shape, launchEscape.stdout.toString(), readFileSync(marker, "utf8"))
       if (shape === "bun-delegation") {
         expect(readFileSync(marker, "utf8")).not.toContain("unlisted")
@@ -846,7 +921,10 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
       }
       expect(launchEscape.exitCode).toBe(1)
       expect(launchEscape.stdout.toString()).toContain("verdict=refused mode=fast")
-      if (shape.startsWith("inspect-")) expect(readFileSync(marker, "utf8")).toContain("unlisted\n")
+      if (shape.startsWith("inspect-")) {
+        if (!readFileSync(marker, "utf8").includes("unlisted\n")) console.error(shape, launchEscape.stdout.toString(), launchEscape.stderr.toString())
+        expect(readFileSync(marker, "utf8")).toContain("unlisted\n")
+      }
       if (shape.startsWith("inspect-") && !shape.startsWith("inspect-path")) {
         expect(launchEscape.stderr.toString()).toContain("unobserved Bun test launch")
       }
@@ -863,9 +941,9 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
         expect(readFileSync(marker, "utf8")).toContain("unlisted\n")
         expect(launchEscape.stderr.toString()).toContain("unobserved Bun test launch")
       }
-      if (/^(?:symlink|relative|chdir|transient)-/.test(shape)) {
+      if (/^(?:symlink|relative|chdir|transient|overwrite|repoint)-/.test(shape)) {
         expect(readFileSync(marker, "utf8")).toContain(shape.includes("node") ? "shebang-node\n" : "shebang-bun\n")
-        expect(launchEscape.stderr.toString()).toContain(shape.startsWith("transient-") ? "unavailable executed target" : shape.includes("node") ? "unobservable Node test launch" : "unobserved Bun test launch")
+        expect(launchEscape.stderr.toString()).toContain(shape.includes("node") ? "unobservable Node test launch" : "unobserved Bun test launch")
       }
       if (shape === "absolute-bun" || shape === "absolute-bun-copy") {
         expect(launchEscape.stderr.toString()).toContain("unobserved Bun test launch")
@@ -878,6 +956,29 @@ exec "\${FAST_SUITE_REAL_TURBO:?}" "$@"
       }
     }
     runOptions.env.FAST_SUITE_LAUNCH_SHAPE = ""
+
+    const incompleteObserver = observerSource.replace(
+      '            report.write(json.dumps({"event": "complete", "exitCode": root_status, "execCount": count}) + "\\n")',
+      '            if output.endswith("/probe.execs"):\n                report.write(json.dumps({"event": "complete", "exitCode": root_status, "execCount": count}) + "\\n")',
+    )
+    expect(incompleteObserver).not.toBe(observerSource)
+    writeFileSync(join(root, "tests", "observe-exec.py"), incompleteObserver)
+    expect(Bun.spawnSync(["git", "add", "tests/observe-exec.py"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "exercise incomplete observer output"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    writeFileSync(marker, "")
+    const incompleteObservation = Bun.spawnSync(["bash", runner, "--fast"], runOptions)
+    expect(incompleteObservation.exitCode).toBe(1)
+    expect(incompleteObservation.stdout.toString()).toContain("reason=unobservable-test-launch")
+    expect(incompleteObservation.stderr.toString()).toContain("incomplete process-launch observation")
+    expect(readFileSync(marker, "utf8").trim().split("\n").sort()).toEqual([
+      "direct-configured",
+      "direct-second-configured",
+      "second-configured",
+      "selected-configured",
+    ])
+    writeFileSync(join(root, "tests", "observe-exec.py"), observerSource)
+    expect(Bun.spawnSync(["git", "add", "tests/observe-exec.py"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
+    expect(Bun.spawnSync(["git", "commit", "-qm", "restore complete observer output"], { cwd: root, env: gitEnv }).exitCode).toBe(0)
 
     runOptions.env.FAST_SUITE_LAUNCH_SHAPE = "tool-flags"
     writeFileSync(marker, "")
