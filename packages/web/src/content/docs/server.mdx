@@ -183,6 +183,8 @@ For V1 sessions, `POST /session` and `PATCH /session/:id` accept `smallModel` in
 
 Omitting `model` keeps the primary selection; omitting `smallModel` keeps the stored auxiliary selection. The returned session and `GET /session/:id` expose the stored selection. A patch affects subsequent auxiliary work in that session, including pending work when it is delivered. See [Models](/docs/config#models) for agent/session/global precedence and fallback behavior. [`Session.CreateInput` and `Session.setSmallModel`](https://github.com/swxtchio/swx-opencode/blob/swxtch/packages/opencode/src/session/session.ts) own state and persistence; [`UpdatePayload`](https://github.com/swxtchio/swx-opencode/blob/swxtch/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts) owns the update contract.
 
+`POST /session/:id/fork` carries the source session's stored `smallModel` into the fork. [`Session.fork`](https://github.com/swxtchio/swx-opencode/blob/swxtch/packages/opencode/src/session/session.ts) owns this inheritance.
+
 ---
 
 ### Messages

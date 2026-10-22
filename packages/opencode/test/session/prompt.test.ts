@@ -111,6 +111,7 @@ import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { runImport } from "../../src/cli/cmd/import"
 import { ShareNext } from "../../src/share/share-next"
 import { recordSmallModelRequests, smallModelCases, smallModelConfig, smallSelection } from "../fixture/small-model"
+import { TaskTool } from "../../src/tool/task"
 
 const promptTests = <R, E>(layer: Layer.Layer<R, E>) => testEffect(layer, { git: true })
 
@@ -1266,6 +1267,78 @@ const seedUser = Effect.fn("test.seedUser")(function* (input: Omit<SessionPrompt
   yield* sessions.updateMessage(info)
   return { info, parts: message.parts }
 })
+
+for (const scope of ["session", "parent agent", "child agent", "global", "resumed session"] as const) {
+  const recorded = recordSmallModelRequests()
+  promptTests(makePrompt({ llm: recorded.layer })).instance(
+    `small-model round-1 TaskTool child ${scope === "resumed session" ? "keeps its host assignment on resume" : `inherits ${scope} selection`} through compaction`,
+    () => Effect.gen(function* () {
+      recorded.requests.length = 0
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const compact = yield* SessionCompaction.Service
+      const parent = yield* sessions.create({ title: "Pinned", smallModel: scope === "global" ? undefined : smallSelection("session-small") })
+      const message = yield* prompt.prompt({ sessionID: parent.id, agent: "build", parts: [{ type: "text", text: "Prepare a child task" }] })
+      if (message.info.role !== "assistant") throw new Error("parent prompt did not produce an assistant")
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const ctx = {
+        sessionID: parent.id,
+        messageID: message.info.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps: { cancel: prompt.cancel, resolvePromptParts: prompt.resolvePromptParts, prompt: prompt.prompt } },
+        messages: yield* sessions.messages({ sessionID: parent.id }),
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+      const result = yield* def.execute({ description: "child task", prompt: "Explain the task", subagent_type: "general" }, ctx)
+      const id = SessionID.make(result.metadata.sessionId)
+      if (scope === "resumed session") {
+        yield* sessions.setSmallModel({ sessionID: id, model: smallSelection("other-small") })
+        yield* sessions.setSmallModel({ sessionID: parent.id, model: smallSelection("global-small") })
+        const resumed = yield* def.execute({ description: "continue child", prompt: "Continue the task", subagent_type: "general", task_id: id }, ctx)
+        expect(String(resumed.metadata.sessionId)).toBe(String(id))
+      }
+      const child = yield* sessions.get(id)
+      if (!child.model) throw new Error("child prompt did not persist its primary model")
+      expect(String(child.model.providerID)).toBe("azure")
+      const parentID = yield* compact.create({ sessionID: child.id, agent: "general", model: { providerID: child.model.providerID, modelID: child.model.id }, auto: false })
+      yield* compact.process({ sessionID: child.id, parentID, messages: yield* sessions.messages({ sessionID: child.id }), auto: false })
+      expect(recorded.requests.filter((request) => request.sessionID === child.id && request.agent.name === "compaction").map((request) => [String(request.model.providerID), String(request.model.id)])).toEqual([
+        ["auxiliary", scope === "resumed session" ? "other-small" : scope === "child agent" ? "dedicated-small" : scope === "parent agent" ? "agent-small" : scope === "session" ? "session-small" : "global-small"],
+      ])
+      expect(child.smallModel).toEqual(smallSelection(scope === "resumed session" ? "other-small" : scope === "global" ? "global-small" : scope === "session" ? "session-small" : "agent-small"))
+    }),
+    { config: { ...smallModelConfig(), small_model: "auxiliary/global-small", agent: {
+      build: scope === "parent agent" || scope === "child agent" ? { small_model: "auxiliary/agent-small" } : {},
+      general: { model: "azure/test-model", ...(scope === "child agent" ? { small_model: "auxiliary/dedicated-small" } : {}) },
+    } } },
+  )
+}
+
+{
+  const recorded = recordSmallModelRequests()
+  promptTests(makePrompt({ llm: recorded.layer })).instance(
+    "small-model round-1 fork preserves source session selection through compaction",
+    () => Effect.gen(function* () {
+      recorded.requests.length = 0
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const compact = yield* SessionCompaction.Service
+      const parent = yield* sessions.create({ title: "Pinned", smallModel: smallSelection("session-small") })
+      yield* prompt.prompt({ sessionID: parent.id, agent: "build", parts: [{ type: "text", text: "Fork this conversation" }] })
+      const fork = yield* sessions.fork({ sessionID: parent.id })
+      const source = yield* sessions.get(parent.id)
+      if (!source.model) throw new Error("parent prompt did not persist its primary model")
+      const parentID = yield* compact.create({ sessionID: fork.id, agent: "build", model: { providerID: source.model.providerID, modelID: source.model.id }, auto: false })
+      yield* compact.process({ sessionID: fork.id, parentID, messages: yield* sessions.messages({ sessionID: fork.id }), auto: false })
+      expect(recorded.requests.filter((request) => request.sessionID === fork.id && request.agent.name === "compaction").map((request) => [String(request.model.providerID), String(request.model.id)])).toEqual([["auxiliary", "session-small"]])
+      expect((yield* sessions.get(fork.id)).smallModel).toEqual(smallSelection("session-small"))
+    }),
+    { config: { ...smallModelConfig(), small_model: "auxiliary/global-small" } },
+  )
+}
 
 for (const entry of smallModelCases) {
   const recorded = recordSmallModelRequests()

@@ -13,7 +13,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionDurable } from "@opencode-ai/schema/durable-event-manifest"
 import path from "node:path"
-import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
 import { and, desc, eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventRetentionTable, EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
@@ -32,7 +32,7 @@ import { MessageID, PartID, type SessionID } from "../../src/session/schema"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { provideInstance, tmpdirScoped } from "../fixture/fixture"
 import { spanHold } from "../fixture/span-hold"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { GlobalBus } from "@/bus/global"
@@ -116,6 +116,35 @@ it.instance("small-model session state persists independently across sessions an
     expect((yield* sessions.get(second.id)).model).toEqual(model)
   }),
 )
+
+for (const held of ["title", "small-model"] as const) {
+  it.instance(`small-model round-1 concurrent ${held} patch preserves both fields`, () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const { db } = yield* Database.Service
+      const chat = yield* session.create({ title: "initial", smallModel: smallSelection("session-small") })
+      const spans = spanHold()
+      const hold = yield* spans.arm({ name: "Session.get", parent: held === "title" ? "Session.setTitle" : "Session.setSmallModel" })
+      const title = session.setTitle({ sessionID: chat.id, title: "generated title" })
+      const selection = session.setSmallModel({ sessionID: chat.id, model: smallSelection("dedicated-small") })
+      const writer = yield* (held === "title" ? title : selection).pipe(Effect.withTracer(spans.tracer), Effect.forkChild)
+      yield* Effect.addFinalizer(() => hold.disarm.pipe(Effect.andThen(Fiber.interrupt(writer))))
+      yield* awaitWithTimeout(hold.reached, "held setter did not read the Session")
+      yield* awaitWithTimeout(held === "title" ? selection : title, "competing setter did not commit")
+      yield* hold.release
+      yield* awaitWithTimeout(Fiber.join(writer), "stale setter did not reconcile")
+      expect(yield* session.get(chat.id)).toMatchObject({ title: "generated title", smallModel: smallSelection("dedicated-small") })
+      const event = yield* db.select().from(EventTable).where(and(
+        eq(EventTable.aggregate_id, chat.id),
+        eq(EventTable.type, EventV2.versionedType(SessionV1.Event.Updated.type, 1)),
+      )).orderBy(desc(EventTable.seq)).get()
+      if (!event) throw new Error("missing durable Session update")
+      expect(Schema.decodeUnknownSync(SessionV1.Event.Updated.data)(event.data).info).toMatchObject({
+        title: "generated title", smallModel: smallSelection("dedicated-small"),
+      })
+    }),
+  )
+}
 
 function retentionEvidence(sessionID: string, seq: number, filename: string): RetentionEvidence {
   return {

@@ -26,7 +26,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Provider } from "@/provider/provider"
 import * as SessionProcessorModule from "../../src/session/processor"
 import { ProviderTest } from "../fake/provider"
-import { testEffect } from "../lib/effect"
+import { awaitWithTimeout, testEffect } from "../lib/effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { TestConfig } from "../fixture/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -389,6 +389,14 @@ for (const scope of ["global", "agent", "session"] as const) {
         const chat = yield* sessions.create({
           smallModel: scope === "session" ? smallSelection("missing-small") : undefined,
         })
+        const events = yield* EventV2Bridge.Service
+        const failure = yield* Deferred.make<string>()
+        const unsubscribe = yield* events.listen((event) => {
+          if (event.type !== SessionNs.Event.Error.type) return Effect.void
+          const data = Schema.decodeUnknownSync(SessionNs.Event.Error.data)(event.data)
+          return data.sessionID === chat.id ? Deferred.succeed(failure, JSON.stringify(data.error)).pipe(Effect.asVoid) : Effect.void
+        })
+        yield* Effect.addFinalizer(() => unsubscribe)
         const parentID = yield* compact.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
         const exit = yield* compact
           .process({
@@ -400,6 +408,7 @@ for (const scope of ["global", "agent", "session"] as const) {
           .pipe(Effect.exit)
         expect(Exit.isFailure(exit)).toBe(true)
         if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("missing-small")
+        expect(yield* awaitWithTimeout(Deferred.await(failure), "compaction lookup failure was not reported")).toContain("missing-small")
         expect(recorded.requests).toEqual([])
         expect(
           (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "assistant"),

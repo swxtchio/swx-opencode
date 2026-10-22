@@ -14,6 +14,7 @@ import { Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
+import { Provider } from "@/provider/provider"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -153,12 +154,18 @@ export const TaskTool = Tool.define(
           action: "deny" as const,
         })) ?? []),
       ]
+      const inherited = session ? undefined : (
+        (yield* agent.get(ctx.agent))?.smallModel ??
+        (parent.smallModel ? { providerID: parent.smallModel.providerID, modelID: parent.smallModel.id } : undefined) ??
+        (cfg.small_model !== undefined ? Provider.parseModel(cfg.small_model) : undefined)
+      )
       const nextSession =
         session ??
         (yield* sessions.create({
           parentID: ctx.sessionID,
           title: params.description + ` (@${next.name} subagent)`,
           agent: next.name,
+          smallModel: inherited ? { providerID: inherited.providerID, id: inherited.modelID } : undefined,
           permission: [
             ...childPermission,
             ...childToolDenies.filter(
