@@ -249,6 +249,16 @@ export function toLLMEvents(
     case "tool-call":
       return Effect.sync(() => {
         state.toolNames[event.toolCallId] = event.toolName
+        if ("invalid" in event && event.invalid && typeof event.input === "string")
+          return [
+            LLMEvent.toolError({
+              id: event.toolCallId,
+              name: event.toolName,
+              message:
+                "The tool input could not be parsed as JSON, so the call was not executed. Reissue the call with valid JSON arguments.",
+              error: event.error,
+            }),
+          ]
         return [
           LLMEvent.toolCall({
             id: event.toolCallId,

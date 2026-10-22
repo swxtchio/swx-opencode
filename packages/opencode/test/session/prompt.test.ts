@@ -534,11 +534,11 @@ function makePrompt(input?: PromptTestOptions) {
   return LayerNode.compile(promptRoot, replacements)
 }
 
-function makeHttp(input?: PromptTestOptions) {
+function makeHttp(input?: PromptTestOptions & { liveSummary?: boolean }) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
     [Npm.node, promptSdk],
-    [SessionSummary.node, summary],
+    ...(input?.liveSummary ? [] : [[SessionSummary.node, summary] as const]),
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
     [RuntimeFlags.node, runtimeFlags],
@@ -843,6 +843,7 @@ const gatedPlugin = LayerNode.make({
 })
 
 const it = promptTests(makeHttp())
+const liveSummaryPrompt = promptTests(makeHttp({ liveSummary: true }))
 const abruptPrompt = promptTests(makeHttp({ llm: abruptAssistantLLM }))
 const gated = promptTests(
   LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
@@ -3479,8 +3480,478 @@ it.instance(
   60_000,
 )
 
+for (const type of ["text", "reasoning"] as const) {
+  it.instance(
+    `output-limit continues partial ${type} to completion`,
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, sessions, chat } = yield* boot()
+        const partial = type === "text" ? reply().text("Partial work") : reply().reason("Partial work")
+        yield* llm.push(partial.finish("length"), reply().text("Remaining work finished").stop())
+        const result = yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: said("Finish the work"),
+        })
+        expect(yield* llm.calls).toBe(2)
+        expect(result.info).toMatchObject({ role: "assistant", finish: "stop" })
+        expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "Remaining work finished" }))
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        const truncated = messages.find(
+          (message) => message.info.role === "assistant" && message.info.finish === "length",
+        )
+        expect(truncated?.parts).toContainEqual(expect.objectContaining({ type, text: "Partial work" }))
+        expect(truncated?.info.role === "assistant" ? truncated.info.error : undefined).toBeUndefined()
+        const continuation = (yield* llm.inputs)[1]
+        expect(JSON.stringify(continuation?.messages)).toContain("Partial work")
+        expect(lastProviderMessage(continuation)).toMatchObject({
+          role: "user",
+          content:
+            "Your last response hit the output token limit (stop reason: length). Do not apologize, recap, or repeat yourself. Break the remaining work into smaller pieces.",
+        })
+      }),
+    30_000,
+  )
+}
+
+for (const tools of ["none", "completed", "incomplete"] as const) {
+  it.instance(
+    `output-limit caps length stops and preserves exhausted resume (${tools})`,
+    () =>
+      Effect.gen(function* () {
+        const { dir, llm } = yield* useServerConfig(providerCfg)
+        const { prompt, sessions, chat, run } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const status = yield* SessionStatus.Service
+        const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+        const off = yield* events.listen((event) => {
+          if (event.type !== Session.Event.Error.type) return Effect.void
+          const data = Schema.decodeUnknownSync(Session.Event.Error.data)(event.data)
+          if (data.sessionID === chat.id && data.error) errors.push(data.error)
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => off)
+        const marker = path.join(dir, "effects.txt")
+        const truncated = () => {
+          const out = reply().text("Partial work")
+          if (tools === "completed")
+            out.tool("bash", { command: `echo ran >> "${marker}"`, description: "Record an effect" })
+          if (tools === "incomplete")
+            out.pendingTool("bash", {
+              command: `echo forbidden >> "${marker}"`,
+              description: "Never execute incomplete input",
+            })
+          return out.finish("length")
+        }
+        yield* llm.push(truncated(), truncated(), truncated(), reply().text("Unexpected extra request").stop())
+        const root = yield* seedUser({ sessionID: chat.id, agent: "build", model: ref, parts: said("Keep working") })
+        const failed = yield* prompt.loop({ sessionID: chat.id })
+        expect(yield* llm.calls).toBe(3)
+        expect(failed.info).toMatchObject({
+          role: "assistant",
+          finish: "length",
+          error: { name: "MessageOutputLengthError", data: {} },
+        })
+        if (failed.info.role !== "assistant") throw new Error("expected exhausted assistant")
+        expect(failed.info.time.completed).toBeNumber()
+        expect(errors).toContainEqual({ name: "MessageOutputLengthError", data: {} })
+        expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+        expect(yield* run.current(chat.id)).toBeUndefined()
+        const history = yield* sessions.messages({ sessionID: chat.id })
+        const parts = history.flatMap((message) => message.parts).filter((part) => part.type === "tool")
+        if (tools !== "none") expect(parts).toHaveLength(3)
+        if (tools === "completed") {
+          expect(parts.every((part) => part.state.status === "completed")).toBe(true)
+          expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("ran\nran\nran\n")
+        }
+        if (tools === "incomplete") {
+          expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+          expect(
+            parts.every((part) => part.state.status === "error" && part.state.error.includes("output token limit")),
+          ).toBe(true)
+        }
+        yield* llm.reset
+        yield* llm.push(truncated(), reply().text("Resume must not renew the allowance").stop())
+        const resumed = yield* prompt.loop({ sessionID: chat.id, messageID: root.info.id })
+        expect(yield* llm.calls).toBe(1)
+        expect(resumed.info).toMatchObject({ error: { name: "MessageOutputLengthError" } })
+        yield* llm.reset
+        yield* llm.push(truncated(), truncated(), reply().text("New work finished").stop())
+        const fresh = yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: said("Try new work"),
+        })
+        expect(yield* llm.calls).toBe(3)
+        expect(fresh.info).toMatchObject({ finish: "stop" })
+        expect(fresh.info.role === "assistant" ? fresh.info.error : undefined).toBeUndefined()
+      }),
+    30_000,
+  )
+}
+
+liveSummaryPrompt.instance("output-limit resets after the real producer summarizes new user input", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    yield* llm.push(
+      reply().text("Old first partial").finish("length"),
+      reply().text("Old second partial").finish("length"),
+      reply().text("Old exhausted partial").finish("length"),
+      reply().text("Unexpected request beyond the old cap").stop(),
+    )
+    const exhausted = yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("Old work") })
+    expect(yield* llm.calls).toBe(3)
+    expect(exhausted.info).toMatchObject({ error: { name: "MessageOutputLengthError" } })
+
+    yield* llm.reset
+    const gate = yield* Deferred.make<void>()
+    yield* Effect.addFinalizer(() => Deferred.succeed(gate, undefined).pipe(Effect.asVoid))
+    yield* llm.push(
+      reply().wait(deferredAsPromise(gate)).text("Fresh first partial").finish("length"),
+      reply().text("Fresh second partial").finish("length"),
+      reply().text("Fresh work completed").stop(),
+    )
+    const fiber = yield* prompt
+      .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("Fresh summarized work") })
+      .pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "fresh request did not arrive", "10 seconds")
+    // Gate the length response on the real producer's durable user summary, not a fabricated marker.
+    yield* pollWithTimeout(
+      sessions.messages({ sessionID: chat.id }).pipe(
+        Effect.map((messages) => {
+          const user = messages.findLast((message) =>
+            message.parts.some((part) => part.type === "text" && part.text === "Fresh summarized work"),
+          )
+          return user?.info.role === "user" && user.info.summary?.diffs !== undefined ? true : undefined
+        }),
+      ),
+      "the real summary producer did not persist the fresh user summary",
+      "10 seconds",
+    )
+    yield* Deferred.succeed(gate, undefined)
+    const result = yield* awaitWithTimeout(Fiber.join(fiber), "summarized-input recovery did not settle", "10 seconds")
+    expect(yield* llm.calls).toBe(3)
+    expect(result.info).toMatchObject({ finish: "stop" })
+    expect(result.info.role === "assistant" ? result.info.error : undefined).toBeUndefined()
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "Fresh work completed" }))
+  }),
+  30_000,
+)
+
+it.instance("output-limit preserves exhaustion across repeated capacity compaction", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), compaction: { auto: true } }))
+    const { prompt, sessions, chat, run } = yield* boot()
+    const status = yield* SessionStatus.Service
+    yield* llm.push(
+      reply().text("First partial").usage({ input: 90_000, output: 100 }).finish("length"),
+      reply().text("First capacity summary").stop(),
+      reply().text("Second partial").usage({ input: 90_000, output: 100 }).finish("length"),
+      reply().text("Second capacity summary").stop(),
+      reply().text("Exhausted partial").usage({ input: 90_000, output: 100 }).finish("length"),
+      reply().text("Unexpected third summary").stop(),
+      reply().text("Unexpected renewed allowance").stop(),
+    )
+    const result = yield* awaitWithTimeout(
+      prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("Keep working across compaction") }),
+      "compacting output-limit run did not settle",
+      "20 seconds",
+    )
+    expect(yield* llm.calls).toBe(5)
+    expect(result.info).toMatchObject({ finish: "length", error: { name: "MessageOutputLengthError" } })
+    expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+    expect(yield* run.current(chat.id)).toBeUndefined()
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    expect(messages.filter((message) => message.info.role === "assistant" && message.info.summary)).toHaveLength(2)
+    expect(messages.flatMap((message) => message.parts).filter((part) => part.type === "compaction")).toEqual([
+      expect.objectContaining({ auto: true, trigger: "capacity", resume: true }),
+      expect.objectContaining({ auto: true, trigger: "capacity", resume: true }),
+    ])
+    expect(
+      messages.filter((message) =>
+        message.parts.some((part) => part.type === "text" && part.metadata?.compaction_continue === true),
+      ),
+    ).toHaveLength(2)
+    yield* llm.reset
+    yield* llm.push(
+      reply().text("Fresh first partial").finish("length"),
+      reply().text("Fresh second partial").finish("length"),
+      reply().text("Fresh work completed").stop(),
+    )
+    const fresh = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      parts: said("Start new work after exhaustion"),
+    })
+    expect(yield* llm.calls).toBe(3)
+    expect(fresh.info).toMatchObject({ finish: "stop" })
+    expect(fresh.info.role === "assistant" ? fresh.info.error : undefined).toBeUndefined()
+  }),
+  30_000,
+)
+
+it.instance("output-limit counts real noReply input as a streak boundary", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    const gate = yield* Deferred.make<void>()
+    yield* Effect.addFinalizer(() => Deferred.succeed(gate, undefined).pipe(Effect.asVoid))
+    yield* llm.push(
+      reply().text("First partial").finish("length"),
+      reply().wait(deferredAsPromise(gate)).text("Second partial").finish("length"),
+      reply().text("First partial after new input").finish("length"),
+      reply().text("Second partial after new input").finish("length"),
+      reply().text("Finished with the renewed allowance").stop(),
+    )
+    const fiber = yield* prompt
+      .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("Keep working") })
+      .pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(2), "second request did not arrive", "10 seconds")
+    const input = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      noReply: true,
+      parts: said("Additional real user context"),
+    })
+    expect(input.info).toMatchObject({ role: "user", noReply: true })
+    yield* Deferred.succeed(gate, undefined)
+    const result = yield* awaitWithTimeout(Fiber.join(fiber), "new-input continuation did not settle", "10 seconds")
+    expect(yield* llm.calls).toBe(5)
+    expect(result.info).toMatchObject({ finish: "stop" })
+    expect(result.info.role === "assistant" ? result.info.error : undefined).toBeUndefined()
+    expect(JSON.stringify((yield* llm.inputs)[2]?.messages)).toContain("Additional real user context")
+  }),
+  30_000,
+)
+
+for (const complete of [false, true]) {
+  it.instance(`output-limit buffers fragmented tool arguments until settlement (${complete ? "complete" : "incomplete"})`, () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const { prompt, sessions, chat } = yield* boot()
+      const events = yield* EventV2Bridge.Service
+      const pending: string[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== MessageV2.Event.PartUpdated.type) return Effect.void
+        const data = Schema.decodeUnknownSync(MessageV2.Event.PartUpdated.data)(event.data)
+        if (data.part.sessionID === chat.id && data.part.type === "tool" && data.part.state.status === "pending")
+          pending.push(data.part.state.raw)
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => off)
+      const marker = path.join(dir, "fragment-effect.txt")
+      const input = { command: `echo once >> "${marker}"`, description: "Fragmented argument input" }
+      const args = JSON.stringify(input)
+      const streamed = complete ? args : args.slice(0, -1)
+      yield* llm.push(
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-fragments",
+              object: "chat.completion.chunk",
+              created: 1790550000,
+              model: "test-model",
+              choices: [{
+                index: 0,
+                delta: {
+                  role: "assistant",
+                  tool_calls: [{ index: 0, id: "fragmented-call", type: "function", function: { name: "bash", arguments: "" } }],
+                },
+                finish_reason: null,
+              }],
+            },
+            ...Array.from(streamed, (fragment) => ({
+              id: "chatcmpl-fragments",
+              object: "chat.completion.chunk",
+              created: 1790550000,
+              model: "test-model",
+              choices: [{
+                index: 0,
+                delta: { tool_calls: [{ index: 0, function: { arguments: fragment } }] },
+                finish_reason: null,
+              }],
+            })),
+            {
+              id: "chatcmpl-fragments",
+              object: "chat.completion.chunk",
+              created: 1790550000,
+              model: "test-model",
+              choices: [{ index: 0, delta: {}, finish_reason: "length" }],
+            },
+          ],
+        }),
+        reply().text("Finished after fragmented input").stop(),
+      )
+      const result = yield* awaitWithTimeout(
+        prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("Process fragmented arguments") }),
+        "fragmented tool run did not settle",
+        "20 seconds",
+      )
+      expect(yield* llm.calls).toBe(2)
+      expect(result.info).toMatchObject({ finish: "stop" })
+      const tools = (yield* sessions.messages({ sessionID: chat.id }))
+        .flatMap((message) => message.parts)
+        .filter((part) => part.type === "tool")
+      expect(tools).toHaveLength(1)
+      if (complete) {
+        expect(tools[0]?.state).toMatchObject({ status: "completed", input })
+        expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("once\n")
+      }
+      if (!complete) {
+        expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+        expect(tools[0]?.state).toMatchObject({ status: "error", input: {}, error: expect.stringContaining(streamed) })
+        expect(JSON.stringify((yield* llm.inputs)[1]?.messages)).toContain("Input excerpt")
+      }
+      expect(pending).toEqual([""])
+    }),
+    30_000,
+  )
+}
+
+it.instance("output-limit resets the streak on a different finish", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, chat } = yield* boot()
+    yield* llm.push(
+      reply().text("First fragment").finish("length"),
+      reply().text("Second fragment").finish("length"),
+      reply().tool("read", { filePath: "missing-for-reset.txt" }),
+      reply().text("New streak first fragment").finish("length"),
+      reply().text("New streak second fragment").finish("length"),
+      reply().text("Finished after tool boundary").stop(),
+    )
+    const result = yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("Finish with a tool boundary") })
+    expect(yield* llm.calls).toBe(6)
+    expect(result.info).toMatchObject({ role: "assistant", finish: "stop" })
+    expect(result.info.role === "assistant" ? result.info.error : undefined).toBeUndefined()
+    expect(result.parts).toContainEqual(expect.objectContaining({ type: "text", text: "Finished after tool boundary" }))
+  }),
+  30_000,
+)
+
+for (const finish of ["length", "tool_calls"] as const) {
+it.instance(`output-limit repairs incomplete input without replaying completed effects (${finish})`, () =>
+  Effect.gen(function* () {
+    const { dir, llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const marker = path.join(dir, "effects.txt")
+    const input = { command: `echo once >> "${marker}"`, description: "x".repeat(5000) + "omitted-marker" }
+    yield* llm.push(
+      reply().pendingTool("bash", input).finish(finish),
+      reply().tool("bash", input).finish("length"),
+      reply().text("Repair complete").stop(),
+    )
+    const result = yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("Repair incomplete arguments") })
+    expect(yield* llm.calls).toBe(3)
+    expect(result.info).toMatchObject({ role: "assistant", finish: "stop" })
+    expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("once\n")
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const tools = messages.flatMap((message) => message.parts).filter((part) => part.type === "tool")
+    expect(tools).toHaveLength(2)
+    expect(tools[0]?.tool).toBe("bash")
+    if (tools[0]?.state.status !== "error") throw new Error("expected incomplete tool outcome")
+    expect(tools[0].state.input).toEqual({})
+    expect(tools[0].state.error).toContain(finish === "length" ? "output token limit" : "could not be parsed as JSON")
+    expect(tools[0].state.error).toContain("[truncated]")
+    expect(tools[0].state.error.length).toBeLessThan(2500)
+    expect(tools[1]?.state).toMatchObject({ status: "completed", input })
+    expect(JSON.stringify((yield* llm.inputs)[1]?.messages)).toContain(finish === "length" ? "Break large payloads into smaller tool calls" : "Reissue the call with valid JSON arguments")
+    expect(JSON.stringify((yield* llm.inputs)[1]?.messages)).toContain("Input excerpt")
+    expect(JSON.stringify((yield* llm.inputs)[1]?.messages)).not.toContain("omitted-marker")
+    expect(JSON.stringify((yield* llm.inputs)[2]?.messages)).toContain("once")
+    expect(lastProviderMessage((yield* llm.inputs)[1])).toMatchObject({ role: "tool" })
+  }),
+  30_000,
+)
+}
+
+for (const failure of ["provider", "interruption", "content-filter"] as const) {
+  it.instance(`output-limit recovery settles ${failure}`, () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const { prompt, sessions, chat, run } = yield* boot()
+      const events = yield* EventV2Bridge.Service
+      const status = yield* SessionStatus.Service
+      const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = Schema.decodeUnknownSync(Session.Event.Error.data)(event.data)
+        if (data.sessionID === chat.id && data.error) errors.push(data.error)
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => off)
+      yield* llm.push(reply().text("Retained partial").finish("length"))
+      if (failure === "provider") yield* llm.error(400, { error: { message: "Rejected continuation" } })
+      if (failure === "content-filter") yield* llm.push(reply().text("Filtered continuation").contentFilter())
+      if (failure === "interruption") yield* llm.hang
+      const fiber = yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("Continue until settled") }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(
+        Effect.raceFirst(llm.wait(2), Fiber.join(fiber).pipe(Effect.andThen(Effect.die(new Error("run ended before recovery request"))))),
+        "continuation request did not arrive", "10 seconds",
+      )
+      expect(JSON.stringify((yield* llm.inputs)[1]?.messages)).toContain("Retained partial")
+      if (failure === "interruption") yield* prompt.cancel(chat.id)
+      const result = yield* awaitWithTimeout(Fiber.join(fiber), "recovery did not settle", "10 seconds")
+      const expected = failure === "provider" ? "APIError" : failure === "interruption" ? "MessageAbortedError" : "ContentFilterError"
+      expect(result.info).toMatchObject({ role: "assistant", error: { name: expected } })
+      expect(errors.map((error) => error.name)).toContain(expected)
+      expect(yield* llm.calls).toBe(2)
+      expect(yield* status.get(chat.id)).toEqual({ type: "idle" })
+      expect(yield* run.current(chat.id)).toBeUndefined()
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(messages).toHaveLength(3)
+      expect(messages[1]?.parts).toContainEqual(expect.objectContaining({ type: "text", text: "Retained partial" }))
+    }),
+    30_000,
+  )
+}
+
+it.instance("output-limit exhaustion parks queued receipts until new admission", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const queue = yield* SessionQueue.Service
+    const gate = yield* Deferred.make<void>()
+    yield* Effect.addFinalizer(() => Deferred.succeed(gate, undefined).pipe(Effect.asVoid))
+    yield* llm.push(
+      reply().wait(deferredAsPromise(gate)).text("First partial").finish("length"),
+      reply().text("Second partial").finish("length"),
+      reply().text("Exhausted partial").finish("length"),
+      reply().text("Unexpected request beyond cap").stop(),
+    )
+    const root = yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("Keep generating") }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "root request did not arrive", "10 seconds")
+    const sender = yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, requestID: "after-output-limit", parts: said("[fm-from-firstmate]\x1f queued after exhaustion") }).pipe(Effect.forkChild)
+    yield* pollWithTimeout(queue.list(chat.id).pipe(Effect.map((items) => items.length === 1 ? true : undefined)), "mail was not admitted", "10 seconds")
+    yield* Deferred.succeed(gate, undefined)
+    const failed = yield* awaitWithTimeout(Fiber.join(root), "exhaustion did not settle", "10 seconds")
+    expect(failed.info).toMatchObject({ error: { name: "MessageOutputLengthError" } })
+    expect(yield* llm.calls).toBe(3)
+    expect(yield* queue.list(chat.id)).toHaveLength(1)
+    expect(Option.getOrUndefined(yield* queue.receipt(chat.id, "after-output-limit"))).toMatchObject({ state: "pending" })
+    expect(JSON.stringify(yield* llm.inputs)).not.toContain("queued after exhaustion")
+    yield* llm.reset
+    yield* llm.push(reply().text("Fresh input answered").stop(), reply().text("Queued fragment").finish("length"), reply().text("Queued work finished").stop())
+    yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("Start fresh") })
+    yield* awaitWithTimeout(Fiber.join(sender), "queued sender did not settle", "10 seconds")
+    expect(yield* llm.calls).toBe(3)
+    expect(yield* queue.list(chat.id)).toEqual([])
+    const receipt = Option.getOrUndefined(yield* queue.receipt(chat.id, "after-output-limit"))
+    expect(receipt?.state).toBe("delivered")
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    expect(messages.some((message) => message.parts.some((part) => part.type === "text" && part.text === "Queued work finished"))).toBe(true)
+  }),
+  30_000,
+)
+
 it.instance(
-  "delivers queued machine mail after a length terminal",
+  "delivers queued machine mail after bounded output-limit recovery",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
@@ -3493,6 +3964,7 @@ it.instance(
       yield* Effect.gen(function* () {
         yield* llm.push(
           reply().wait(deferredAsPromise(terminal)).text("partial response").finish("length").item(),
+          reply().text("remaining response").stop().item(),
           reply().text("held response").stop().item(),
         )
         const root = yield* seedUser({
@@ -3522,10 +3994,11 @@ it.instance(
         expect(JSON.stringify((yield* llm.inputs)[0]?.messages)).not.toContain("after length finish")
 
         yield* Deferred.succeed(terminal, void 0)
-        yield* awaitWithTimeout(llm.wait(2), "queued turn did not start after length finish", "10 seconds")
+        yield* awaitWithTimeout(llm.wait(2), "length continuation did not start", "10 seconds")
         const request = (yield* llm.inputs)[1]
-        if (!request) throw new Error("expected the held provider request")
-        expect(JSON.stringify(lastProviderMessage(request))).toContain("after length finish")
+        if (!request) throw new Error("expected the continuation request")
+        expect(JSON.stringify(lastProviderMessage(request))).toContain("output token limit")
+        expect(JSON.stringify(request.messages)).not.toContain("after length finish")
         const exit = yield* awaitWithTimeout(Fiber.await(run), "session run did not finish", "10 seconds")
         yield* awaitWithTimeout(Fiber.await(held), "queued machine mail did not return", "10 seconds")
         const messages = yield* sessions.messages({ sessionID: chat.id })
@@ -3537,7 +4010,8 @@ it.instance(
         expect(terminalAssistant?.info.role).toBe("assistant")
         if (terminalAssistant?.info.role === "assistant") expect(terminalAssistant.info.finish).toBe("length")
         expect(yield* queue.list(chat.id)).toEqual([])
-        expect(yield* llm.calls).toBe(2)
+        expect(yield* llm.calls).toBe(3)
+        expect(JSON.stringify(lastProviderMessage((yield* llm.inputs)[2]))).toContain("after length finish")
       }).pipe(Effect.ensuring(Deferred.succeed(terminal, void 0).pipe(Effect.ignore)))
     }),
   60_000,

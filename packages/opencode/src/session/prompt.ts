@@ -72,6 +72,8 @@ const MAX_MCP_RESOURCE_BLOB_BYTES = 10 * 1024 * 1024
 const USER_SHELL_OUTPUT_WRITE_INTERVAL_MS = 500
 const USER_SHELL_RUNNING_OUTPUT_MAX_BYTES = 30_000
 const USER_SHELL_OUTPUT_PREVIEW_MARKER = "...output truncated...\n"
+const CONTINUE_AFTER_OUTPUT_LIMIT =
+  "Your last response hit the output token limit (stop reason: length). Do not apologize, recap, or repeat yourself. Break the remaining work into smaller pieces."
 const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "application/pdf",
   "image/gif",
@@ -1639,7 +1641,7 @@ const layer = Layer.effect(
           if (
             ended ||
             (lastAssistant?.finish &&
-              !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
+              !["tool-calls", "unknown", "length"].includes(lastAssistant.finish) &&
               !hasToolCalls &&
               lastAssistant.parentID === lastUser.id)
           ) {
@@ -1897,6 +1899,9 @@ const layer = Layer.effect(
               system,
               messages: [
                 ...modelMsgs,
+                ...(lastAssistant?.finish === "length" && lastAssistant.parentID === lastUser.id && !hasToolCalls
+                  ? [{ role: "user" as const, content: CONTINUE_AFTER_OUTPUT_LIMIT }]
+                  : []),
                 ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
               ],
               tools,
@@ -1906,6 +1911,17 @@ const layer = Layer.effect(
             if (result === "continue" && handle.compactionTrigger) {
               deferredCompactionTrigger =
                 handle.compactionTrigger === "capacity" ? "capacity" : (deferredCompactionTrigger ?? "threshold")
+            }
+
+            if (handle.message.finish === "length" && !handle.message.error) {
+              if (yield* MessageV2.outputLimitExhausted(sessionID).pipe(Effect.provideService(Database.Service, database))) {
+                yield* processor.finalizeFailure({
+                  assistantMessage: handle.message,
+                  error: new SessionV1.OutputLengthError({}).toObject(),
+                  terminalize: true,
+                })
+                return "break" as const
+              }
             }
 
             if (structured !== undefined) {
@@ -1921,7 +1937,8 @@ const layer = Layer.effect(
               return "continue" as const
             }
 
-            const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
+            const finished =
+              handle.message.finish && !["tool-calls", "unknown", "length"].includes(handle.message.finish)
             if (finished && !handle.message.error) {
               // Surface any content-filter finish (e.g. Anthropic stop_reason:
               // refusal) as an error. These turns may have produced no visible
