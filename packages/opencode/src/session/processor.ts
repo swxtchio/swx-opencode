@@ -111,6 +111,7 @@ type ToolCall = {
   attempt: Attempt
   // The execution the call's owning attempt, or an earlier one, last admitted.
   execution?: Execution
+  raw: string
   inputError?: string
 }
 
@@ -512,7 +513,11 @@ const layer = Layer.effect(
                 readToolCall(input.id).pipe(
                   Effect.tap((match) =>
                     Effect.sync(() => {
-                      if (match) match.call.attempt = attempt
+                      if (match) {
+                        match.call.attempt = attempt
+                        match.call.raw = ""
+                        match.call.inputError = undefined
+                      }
                     }),
                   ),
                 ),
@@ -536,6 +541,7 @@ const layer = Layer.effect(
           sessionID: ctx.assistantMessage.sessionID,
           done: Deferred.makeUnsafe<void>(),
           attempt,
+          raw: "",
         }
         ctx.toolcalls[input.id] = call
         const part = yield* session.updatePart({
@@ -619,14 +625,13 @@ const layer = Layer.effect(
             yield* ensureToolCall(value)
             return
 
-          case "tool-input-delta":
-            yield* ensureToolCall(value)
-            yield* updateToolCall(value.id, (match) =>
-              match.state.status === "pending"
-                ? { ...match, state: { ...match.state, raw: match.state.raw + value.text } }
-                : match,
-            )
+          case "tool-input-delta": {
+            const existing = ctx.toolcalls[value.id]
+            const call = existing?.attempt === ctx.attempt ? existing : (yield* ensureToolCall(value))?.call
+            // Keep fragments with their stream attempt; settlement persists repair context without write amplification.
+            if (call) call.raw += value.text
             return
+          }
 
           case "tool-input-end": {
             yield* ensureToolCall(value)
@@ -984,8 +989,8 @@ const layer = Layer.effect(
                       error:
                         inputFailure && part.state.status === "pending"
                           ? inputError +
-                            (part.state.raw.length
-                              ? `\n\nInput excerpt (first ${Math.min(part.state.raw.length, 2048)} of ${part.state.raw.length} characters):\n${part.state.raw.slice(0, 2048)}${part.state.raw.length > 2048 ? "\n[truncated]" : ""}`
+                            (match.call.raw.length
+                              ? `\n\nInput excerpt (first ${Math.min(match.call.raw.length, 2048)} of ${match.call.raw.length} characters):\n${match.call.raw.slice(0, 2048)}${match.call.raw.length > 2048 ? "\n[truncated]" : ""}`
                               : "")
                           : "Tool execution aborted",
                       metadata: inputFailure ? metadata : { ...metadata, interrupted: true },

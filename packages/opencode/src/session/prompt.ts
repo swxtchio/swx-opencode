@@ -1914,16 +1914,7 @@ const layer = Layer.effect(
             }
 
             if (handle.message.finish === "length" && !handle.message.error) {
-              // Read durable history, including this response, so explicit resume cannot renew the allowance.
-              const recent = (yield* MessageV2.snapshot(sessionID).pipe(
-                Effect.provideService(Database.Service, database),
-              )).messages
-                .filter((message) => message.info.role !== "user" || message.info.noReply !== true)
-                .slice(-3)
-              if (
-                recent.length === 3 &&
-                recent.every((message) => message.info.role === "assistant" && message.info.finish === "length")
-              ) {
+              if (yield* MessageV2.outputLimitExhausted(sessionID).pipe(Effect.provideService(Database.Service, database))) {
                 yield* processor.finalizeFailure({
                   assistantMessage: handle.message,
                   error: new SessionV1.OutputLengthError({}).toObject(),
