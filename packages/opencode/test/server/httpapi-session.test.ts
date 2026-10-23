@@ -382,7 +382,7 @@ function createNativeSession(directory: string, id?: SessionV2.ID) {
   }).pipe(Effect.map(({ data }) => data))
 }
 
-const writeNativeTestProvider = (directory: string, url: string) =>
+const writeNativeTestProvider = (directory: string, url: string, models: string[] = ["test-model"]) =>
   Effect.promise(() =>
     Bun.write(
       path.join(directory, "opencode.json"),
@@ -393,21 +393,31 @@ const writeNativeTestProvider = (directory: string, url: string) =>
             name: "Test",
             api: { type: "aisdk", package: "@ai-sdk/openai-compatible", url, settings: {} },
             request: { body: { apiKey: "test-key" } },
-            models: {
-              "test-model": {
-                name: "Test Model",
-                api: { id: "test-model" },
-                capabilities: { tools: true, input: ["text"], output: ["text"] },
-                limit: { context: 100_000, output: 10_000 },
-                cost: { input: 0, output: 0 },
-              },
-            },
+            models: Object.fromEntries(
+              models.map((id) => [
+                id,
+                {
+                  name: id,
+                  api: { id },
+                  capabilities: { tools: true, input: ["text"], output: ["text"] },
+                  limit: { context: 100_000, output: 10_000 },
+                  cost: { input: 0, output: 0 },
+                },
+              ]),
+            ),
           },
         },
         permissions: [{ action: "read", resource: "*", effect: "allow" }],
       }),
     ),
   ).pipe(Effect.asVoid)
+
+// A native Session's first prompt also sends a title request, which the test server answers on its own.
+const isTitleHit = (hit: { body: Record<string, unknown> }) =>
+  JSON.stringify(hit.body).includes("Generate a title for this conversation")
+const turnCalls = TestLLMServer.use((llm) => llm.hits).pipe(
+  Effect.map((hits) => hits.filter((hit) => !isTitleHit(hit)).length),
+)
 
 const awaitNativeModel = (directory: string) =>
   pollWithTimeout(
@@ -1108,18 +1118,6 @@ describe("session HttpApi", () => {
           git: true,
           init: (directory) => writeNativeTestProvider(directory, llm.url),
         })
-        const legacy = yield* createSession({ title: "v2 compact unavailable" })
-        const compact = yield* request(`/api/session/${legacy.id}/compact`, {
-          method: "POST",
-          headers: { "x-opencode-directory": directory },
-        })
-        expect(compact.status).toBe(503)
-        expect(yield* responseJson(compact)).toEqual({
-          _tag: "ServiceUnavailableError",
-          message: "Session compact is not available yet",
-          service: "session.compact",
-        })
-
         for (const [index, includeDirectory] of [true, false].entries()) {
           const id = SessionV2.ID.make(includeDirectory ? "ses_wait_explicit" : "ses_wait_persisted")
           const session = yield* createNativeSession(directory, id)
@@ -1174,10 +1172,72 @@ describe("session HttpApi", () => {
           expect(single.data).toEqual(assistant)
           expect(history.hasMore).toBe(false)
           expect(history.data.map((event) => event.type)).toContain(SessionEvent.Step.Ended.type)
-          const providerCalls = yield* llm.calls
-          expect(providerCalls).toBe(index + 1)
+          expect(yield* turnCalls).toBe(index + 1)
         }
-        expect(yield* llm.calls).toBe(2)
+        expect(yield* turnCalls).toBe(2)
+      }).pipe(Effect.provide(TestLLMServer.layer)),
+    { git: true, config: { formatter: false, lsp: false } },
+    30_000,
+  )
+
+  it.instance(
+    "runs a V2 session's title and manual compaction on its small model",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({
+          git: true,
+          init: (directory) => writeNativeTestProvider(directory, llm.url, ["test-model", "small-model"]),
+        })
+        yield* awaitNativeModel(directory)
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const created = yield* requestJson<{ data: SessionV2.Info }>("/api/session", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            model: { providerID: "test", id: "test-model" },
+            smallModel: { providerID: "test", id: "small-model" },
+            location: { directory },
+          }),
+        })
+        expect([created.data.smallModel?.providerID, created.data.smallModel?.id].map(String)).toEqual([
+          "test",
+          "small-model",
+        ])
+        const session = created.data
+        const model = (name: string) => (hit: { body: Record<string, unknown> }) => hit.body.model === name
+
+        yield* llm.textMatch(model("test-model"), "Primary reply")
+        yield* requestJson(`/api/session/${session.id}/prompt`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ prompt: { text: "Explain per-session configuration" } }),
+        })
+        const wait = yield* requestJson<{ data: SessionV2.WaitResult }>(`/api/session/${session.id}/wait`, {
+          method: "POST",
+          headers,
+        })
+        expect(wait.data.type).toBe("completed")
+        // The drain settles only after its title, so wait returning confirms the title outcome.
+        expect(
+          (yield* requestJson<{ data: SessionV2.Info }>(`/api/session/${session.id}`, { headers })).data.title,
+        ).toBe("E2E Title")
+        expect((yield* llm.hits).filter(isTitleHit).map((hit) => hit.body.model)).toEqual(["small-model"])
+
+        yield* llm.textMatch(model("small-model"), "## Objective\n- Explain per-session configuration")
+        const compact = yield* request(`/api/session/${session.id}/compact`, { method: "POST", headers })
+        expect(compact.status).toBe(204)
+        const context = yield* requestJson<{ data: SessionMessage.Message[] }>(
+          `/api/session/${session.id}/context`,
+          { headers },
+        )
+        expect(context.data).toMatchObject([
+          { type: "compaction", reason: "manual", summary: "## Objective\n- Explain per-session configuration" },
+        ])
+        expect((yield* llm.inputs).map((input) => input.model).sort()).toEqual(
+          ["small-model", "small-model", "test-model"].sort(),
+        )
+        expect(yield* llm.misses).toEqual([])
       }).pipe(Effect.provide(TestLLMServer.layer)),
     { git: true, config: { formatter: false, lsp: false } },
     30_000,
@@ -1327,8 +1387,7 @@ describe("session HttpApi", () => {
         const allObserved = [...consumed, ...resumedEvents]
         expect(allObserved.map((event) => event.id)).toEqual(allHistory.data.map((event) => event.id))
         expect(new Set(allObserved.map((event) => event.id)).size).toBe(allObserved.length)
-        const providerCalls = yield* llm.calls
-        expect(providerCalls).toBe(2)
+        expect(yield* turnCalls).toBe(2)
       }).pipe(Effect.provide(TestLLMServer.layer)),
     { git: true, config: { formatter: false, lsp: false } },
     60_000,
@@ -1380,8 +1439,7 @@ describe("session HttpApi", () => {
           { headers },
         )
         expect(failedHistory.data.map((event) => event.type)).toContain(SessionEvent.Tool.Failed.type)
-        const providerCalls = yield* llm.calls
-        expect(providerCalls).toBe(2)
+        expect(yield* turnCalls).toBe(2)
       }).pipe(Effect.provide(TestLLMServer.layer)),
     { git: true, config: { formatter: false, lsp: false } },
     30_000,
@@ -1471,8 +1529,7 @@ describe("session HttpApi", () => {
           { headers },
         )
         expect(interruptedHistory.data.map((event) => event.type)).toContain(SessionEvent.Tool.Failed.type)
-        const providerCalls = yield* llm.calls
-        expect(providerCalls).toBe(1)
+        expect(yield* turnCalls).toBe(1)
         yield* Fiber.join(waiting)
       }).pipe(Effect.provide(TestLLMServer.layer)),
     { git: true, config: { formatter: false, lsp: false } },
