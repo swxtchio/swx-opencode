@@ -49,3 +49,15 @@ jail daemon, the egress proxy and the fake provider. It ran `v1-control`, `v2`, 
 mode, and all four passed. In `v2-compact`, the compact answered 204 after its summary request reached the provider
 as a distinct request, and the recorded summary is the provider's content. See
 `docs/verification/v2-small-model-1953/README.md`. Abbe's own compact mode for the rig doc is still pending.
+
+## Release-proof pin
+
+The `release-proof` job overlays `packages/core/src/session.ts`, `session/execution.ts` and
+`session/run-coordinator.ts` onto release source `0ff0dfbc`, which predates #342. #354's revisions of those files
+need core surface that `0ff0dfbc` lacks, so the job now takes them from `cd3f0ce2`, the last revision it passed on.
+#354 changes no wait or join code in them and no probe tooling.
+
+Before the change, the overlay was simulated locally on `0ff0dfbc`: core and opencode typechecked, and the proof
+tests passed, with `release-probe-wait-socket-only` skipped as in CI. The release-proof digest in
+`script/check-workflow-guards.ts` was updated with it. Firstmate accepted the narrowing: a later edit to those files'
+wait code is unproven by this job until the pin is bumped.

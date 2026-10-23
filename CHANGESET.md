@@ -226,6 +226,9 @@ Newest first. Each entry names the upstream range brought in.
     session's small model, else the turn's model.
   - `POST /api/session/:id/compact` replaces its 503 with manual compaction. It is exclusive per session and returns
     204, 409 for a session holding a V1 transcript, or 500 when no summary can be produced.
+  - The `release-proof` job now overlays its three release-wait core files from `cd3f0ce2`, not from the PR head,
+    because their #354 revisions need core surface its release source predates. A later edit to those files' wait
+    code is unproven by that job until the pin is bumped; firstmate accepted this narrowing.
   - See `specs/v2/session.md` and `specs/v2/schema-changelog.md`. _Fork-only._
 - **#348** Add a configurable `message_window` setting for each session's loaded transcript, applying it consistently to message fetch, hydration reconciliation and part cleanup, and live-update trimming; keep recall-backed search independent of the loaded window and document the default and memory trade-off (swxtchio/swx-opencode#65). _Fork-only._
 - **#297** Show the selected Ctrl+r history entry's complete original prompt in a wrapped, page-scrollable preview while

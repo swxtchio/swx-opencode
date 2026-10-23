@@ -116,10 +116,17 @@ jobs:
       - name: Typecheck and test release proof tooling
         run: |
           set -euo pipefail
-          files=(
+          # The release-wait implementation the proof overlays onto the release source, pinned to the last
+          # revision it was proven at: a later revision of these files can depend on core surface the release
+          # predates. Edits to their wait code are unproven here until this pin is bumped (swxtchio/swx-opencode#354).
+          core_wait_pin=cd3f0ce2d5e55944df41fcf43a167f77e40c8483
+          pinned_files=(
             packages/core/src/session.ts
             packages/core/src/session/execution.ts
             packages/core/src/session/run-coordinator.ts
+          )
+          files=(
+            "${pinned_files[@]}"
             packages/opencode/script/release-probe.ts
             packages/opencode/script/release-probe-delay-wait.preload.ts
             packages/opencode/script/release-probe-process.ts
@@ -139,6 +146,7 @@ jobs:
             for file in "${untracked_files[@]}"; do rm -f "source/$file"; done
           }
           trap restore_proof_tools EXIT
+          git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin "$core_wait_pin"
           for file in "${files[@]}"; do
             if git -C source cat-file -e "HEAD:$file" 2>/dev/null; then
               mkdir -p "$backup/$(dirname "$file")"
@@ -147,7 +155,11 @@ jobs:
             else
               untracked_files+=("$file")
             fi
-            cp "$GITHUB_WORKSPACE/$file" "source/$file"
+            if printf '%s\n' "${pinned_files[@]}" | grep -qxF "$file"; then
+              git -C "$GITHUB_WORKSPACE" show "$core_wait_pin:$file" > "source/$file"
+            else
+              cp "$GITHUB_WORKSPACE/$file" "source/$file"
+            fi
           done
           (cd source/packages/core && bun run typecheck)
           (
