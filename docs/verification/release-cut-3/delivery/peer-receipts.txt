@@ -1,0 +1,14 @@
+== p1792773840-2738195-53a3
+/home/byates/fm-llmrouter/state/peer-outbox/p1792773840-2738195-53a3
+transport=terminal
+message_kind=one-way
+payload_sha256=06f6e3bf988114063f6231131045b41b15669c66e331456b358371febc24c584
+phase=sent
+disposition=delivered-no-reply
+== p1792773849-2763976-1834
+/home/byates/fm-llmrouter/state/peer-outbox/p1792773849-2763976-1834
+transport=terminal
+message_kind=one-way
+payload_sha256=ac1d34c7479b958dbdd7df739f3e3dc2df21134e651a232441f72c9329f025f8
+phase=sent
+disposition=delivered-no-reply

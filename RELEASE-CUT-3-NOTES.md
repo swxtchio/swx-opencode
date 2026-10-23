@@ -1,0 +1,54 @@
+# OpenCode fork binary release
+
+Evidence collected 2026-10-23. This release exists to ship [#347](https://github.com/swxtchio/swx-opencode/pull/347), the V2 env-supplied config and egress default-model fix, which Abbe B-16.10 ([swxtchio/swx-abbe#1951](https://github.com/swxtchio/swx-abbe/issues/1951)) adopts to restore DEV chat ([swxtchio/swx-abbe#2030](https://github.com/swxtchio/swx-abbe/issues/2030)). It also carries, through source ancestry, [small-model independence #338](https://github.com/swxtchio/swx-opencode/issues/338) resolved by [#342](https://github.com/swxtchio/swx-opencode/pull/342), [output-limit continuation #325](https://github.com/swxtchio/swx-opencode/pull/325), [fast-suite observer hardening #329](https://github.com/swxtchio/swx-opencode/pull/329), and [published-native V2-history verification #331](https://github.com/swxtchio/swx-opencode/pull/331). Every one of these merge commits passed the required ancestry check against this release's captured source.
+
+Functionality from earlier releases is inherited through source ancestry. The builds, focused tests and native acceptance observations below are new executions for this release. This producer release supplies the artifact for Abbe B-16.10; consumer image adoption, deployment and live-store migration remain downstream duties. The #331 distinction between completed-history restart durability and ambiguous in-flight recovery still applies.
+
+## Release identity
+
+- Tag: `v1.18.32-swxtch.774d90c7`.
+- Immutable source: `774d90c7fb02b9f0962620971630a4f09c1a886b`, captured by `git fetch origin swxtch` at task pickup on 2026-10-23. Later evidence-branch commits are not binary inputs.
+- Version: `1.18.32-swxtch.774d90c7`, printed by both extracted native candidates. This follows `local-release.sh`'s `<packages/opencode/package.json version>-swxtch.<source sha8>` convention, with `OPENCODE_VERSION` pinned for both builds.
+- Required landed commits: #347 `774d90c7fb02b9f0962620971630a4f09c1a886b`; #342 `bce37c276f4070e3c9d343baa61ce5f35ca38dc9`; #329 `9340c4d4a88b3c9f1f5274e69e72bd8c631a5053`; #325 `05a4d4194ca4306ae9f11758f66e56d8fb1cf295`; #331 `cbfcad62a6fe04475dae23545c6296976f53fa5d`. Each passed `git merge-base --is-ancestor <commit> <source>`, both at pickup and in the VM14 source clone.
+- Existing V2-wait ancestry requirement: `git merge-base --is-ancestor 4b87478ddf 774d90c7fb02b9f0962620971630a4f09c1a886b` passed. The selected source's `release-probe-target.ts --candidate` resolved the same tag, source, version and Bun on both builders.
+- Both candidate source trees were unmodified and clean before installation and build, and again after the build and native probe.
+- Actual Bun: `1.4.2` on both builders, matching the selected source's `packageManager`. Selected `bun.lock` SHA-256: `2c6631f22941c4367a66410ae866c07fa8d4d141798dfba728e46d4c3c400151`.
+
+## Build provenance
+
+| Target | Native builder and install | Build command | Actual supplied models.dev snapshot SHA-256 |
+| --- | --- | --- | --- |
+| linux/arm64 | `vm14-001`, Linux `aarch64`, Bun `linux-arm64`; frozen `--os=linux --cpu=arm64` install | `OPENCODE_VERSION=1.18.32-swxtch.774d90c7 bun run packages/opencode/script/build.ts --single --skip-install` | `dbddc622f4de27634523d8115d82c2d24d2b6660a6d197082cd19e1da91a1e64` |
+| linux/x64 | GitHub Actions `ubuntu-latest`, Linux `x86_64`, Bun `linux-x64`; frozen `--os=linux --cpu=x64` install; [run 39983517672](https://github.com/swxtchio/swx-opencode/actions/runs/39983517672), [artifact 12515386562](https://github.com/swxtchio/swx-opencode/actions/runs/39983517672/artifacts/12515386562) | `OPENCODE_VERSION=1.18.32-swxtch.774d90c7 bun run packages/opencode/script/build.ts --single --skip-install` | `713b2cb37cbfe8881f52e9ce305e79226fbb95ad5ba1aba06e192e1ddf3917d9` |
+
+Each builder fetched its own catalog snapshot, so the two snapshots have different digests. Each was consumed through an absolute `MODELS_DEV_API_JSON` selector and retained with its build logs. Build outputs went to task-isolated absolute `OPENCODE_BUILD_DIST` roots. Both release candidates were built from the clean selected source, without overlays or proof instrumentation. The x64 workflow was dispatched from `swxtch` at the release source, so its harness revision is `774d90c7fb02b9f0962620971630a4f09c1a886b`, separately recorded in the candidate provenance. The evidence branch is [draft PR #349](https://github.com/swxtchio/swx-opencode/pull/349). GitHub's Actions transport ZIP digest is `d119880bc50301f8c100b417c52e86080881915b3da672eda6cc6800e8c3d46a`, which is distinct from the release archive digest.
+
+The VM14 build used firstmate's task-specific grant for this source, recorded in `/home/byates/fm-llmrouter/data/opencode-release-cut-3/firstmate-decisions.md`, with staging, install/cache, runtime, transport and proof isolated below `/home/byates/vm14-builds/opencode-release-774d90c7`. The lease convention was read before admitting the workload. The single atomic `ACTIVE` lease was acquired at 2026-10-23T16:35:05Z with owner/task metadata, and a heartbeat ran while the build lived. The final task-process scan found no remaining processes, and `release-lease.sh` confirmed the owner-matched release at 16:41:03Z.
+
+## Release assets
+
+| Target | Archive | Archive SHA-256 | Archive bytes | Extracted executable SHA-256 | Actual FFF sidecar |
+| --- | --- | --- | ---: | --- | --- |
+| linux/arm64 | `opencode-linux-arm64.tar.gz` | `b76f22f3ef849717c773eb1502f21de211d32f134e491bbbfd370a75740d9434` | 64243974 | `74f1e72900f83ca13fc70a20bb24a2d7ca248ea155230012d053ad0ac4436e3f` | `libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so` |
+| linux/x64 | `opencode-linux-x64.tar.gz` | `fc9cce6c1e649f72aa2d6af0de04e9dfe962b27361c3d71fa79e07ba5cca49b8` | 64714546 | `20f3ed62b6d919a5b241212485c2e4ded6c58f8a3e9f4b0e66eca70d396994f9` | `libfff_c-977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5.so` |
+
+Actual packaged sidecar SHA-256: ARM64 `0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42`; x64 `977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5`. Each archive contains exactly `opencode` and its matching named sidecar. Companion assets are `opencode-linux-arm64.tar.gz.sha256` and `opencode-linux-x64.tar.gz.sha256`. Both companions validated against their archives on the native builders and again after transport to the task worktree.
+
+## Runtime verification
+
+- Both exact packaged candidates were extracted and executed on their matching native builders. Each printed `1.18.32-swxtch.774d90c7`. The packaged FFF sidecar loaded, and `debug file search needle-target` returned `src/nested/needle-target.ts`.
+- The unchanged controlled-provider native HTTP acceptance probe established `idle`, admit-only `pending`, `completed`, terminal-tool `failed`, and `interrupted` on both architectures. The completed wait stayed unresolved while the local Bash tool was independently held, and again while the required final provider continuation was independently held, under one producer wait registration.
+- Producer-emitted `session.wait.registered` and `session.wait.resolved` observations bind the same wait ID, session, admitted message and sequence to each held wait and its terminal outcome. Every terminal case below used admitted sequence `1`. The full native JSON and raw server logs were retained.
+- Restart on each builder's same isolated absolute `OPENCODE_DB` preserved the completed user/assistant identities. Exclusive replay after admission sequence `1` returned identical durable event IDs in strictly increasing sequence order `2` through `12`, with no additional page. Completed user/assistant identities: ARM64 `msg_169a2a263001KUrN957oulQLQS` / `msg_169a2a451001PvixpHTvki9sXV`; x64 `msg_1698a547e001d4gzHmFQr2i3gn` / `msg_1698a59eb001itm5ptTQ0jwpe8`.
+- On each builder, two absolute `OPENCODE_DB` selectors over a conflicting `XDG_DATA_HOME` opened distinct physical SQLite stores using `db path` and `db 'SELECT 1'`. The conflicting root contained no database, and the unset selector matched the `latest` channel default. ARM64 stores had device/inode `64770/1076028` and `64770/1076700`; x64 stores had `66305/9986215` and `66305/9986221`.
+- Each native probe recorded two completed-case provider requests, two failed-case requests and one interrupted request, with zero title calls.
+- Source-owned focused tests were rerun at this exact source with Bun `1.4.2`, on the task's x64 development host rather than the native builders. The carried V1 small-model controlled-boundary command from `plans/small-model-verification.md` passed **59 tests with zero failures** across the provider, config, V2-compatibility, prompt, compaction, session and HTTP-session boundaries. #347's own `packages/core` config tests (`config`, `environment`, `provider`, `location-layer`) passed **28 tests with zero failures**. These are source-test runs, separate from the packaged native V2 battery. No new production or release/probe behavior was authored for this release.
+
+| Native target and terminal outcome | Session ID | Admitted message ID | Producer wait ID |
+| --- | --- | --- | --- |
+| ARM64 completed | `ses_e965d5da8ffeJSmrf2hiUl2pV9` | `msg_169a2a263001KUrN957oulQLQS` | `acb6a28b-c5d9-440b-8de5-a92b3ee5be84` |
+| ARM64 failed | `ses_e965d5251ffeoaeH2orFIIhEaq` | `msg_169a2adcb0013kReW12hBD39sI` | `f5e153e2-b1d2-4f7b-a6c8-9b2a0fc3b6e0` |
+| ARM64 interrupted | `ses_e965d49d8ffeH0xPqfBw6dsbIw` | `msg_169a2b636001SWK3mvZYBuelmF` | `d8800283-8c33-4ff4-afc6-6bdbd6a62961` |
+| x64 completed | `ses_e9675ab95ffeasi7O3DEcx9UwF` | `msg_1698a547e001d4gzHmFQr2i3gn` | `12353483-a943-45d4-a2b1-a1e53cc555dd` |
+| x64 failed | `ses_e96759d55ffefz2tAgTi0TPK09` | `msg_1698a62b9001sDIDIQNOoHTGO2` | `1c46f0e1-661d-4f8f-bb38-eb1a8d445a64` |
+| x64 interrupted | `ses_e9675949dffeJNs78cdZCD8bcx` | `msg_1698a6b6e001QFwa40MYXk4v1W` | `32e7ab15-2be0-46ab-a057-17caefed4611` |
