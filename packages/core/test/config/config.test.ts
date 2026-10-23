@@ -26,6 +26,7 @@ function testLayer(
   globalDirectory = path.join(directory, "global"),
   projectDirectory = directory,
   vcs?: Project.Vcs,
+  sources?: Config.Sources,
 ) {
   const locationLayer = Layer.succeed(
     Location.Service,
@@ -39,6 +40,7 @@ function testLayer(
   return AppNodeBuilder.build(LayerNode.group([Config.node, Policy.node]), [
     [Location.node, locationLayer],
     [Global.node, Global.layerWith({ config: globalDirectory })],
+    ...(sources ? [[Config.node, Config.nodeWith(sources)] as const] : []),
   ])
 }
 
@@ -52,6 +54,45 @@ const provider = {
 }
 
 describe("Config", () => {
+  it.live("loads the explicit file and inline content at V1 precedence", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) => {
+        const global = path.join(tmp.path, "global")
+        const project = path.join(tmp.path, "project")
+        const explicit = path.join(tmp.path, "custom.json")
+        return Effect.promise(async () => {
+          await fs.mkdir(global, { recursive: true })
+          await fs.mkdir(path.join(project, ".opencode"), { recursive: true })
+          await fs.writeFile(path.join(global, "opencode.json"), JSON.stringify({ shell: "global" }))
+          await fs.writeFile(explicit, JSON.stringify({ shell: "explicit" }))
+          await fs.writeFile(path.join(project, "opencode.json"), JSON.stringify({ shell: "project" }))
+          await fs.writeFile(path.join(project, ".opencode", "opencode.json"), JSON.stringify({ shell: "dot" }))
+        }).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const config = yield* Config.Service
+              const entries = yield* config.entries()
+              expect(
+                entries.flatMap((entry) => (entry.type === "document" && entry.info.shell ? [entry.info.shell] : [])),
+              ).toEqual(["global", "explicit", "project", "dot", "content"])
+              expect(Config.latest(entries, "shell")).toBe("content")
+            }).pipe(
+              Effect.provide(
+                testLayer(project, global, project, undefined, {
+                  file: explicit,
+                  content: JSON.stringify({ shell: "content" }),
+                }),
+              ),
+            ),
+          ),
+        )
+      }),
+    ),
+  )
+
   it.effect("returns the latest defined scalar from priority-ordered documents", () =>
     Effect.sync(() => {
       const entries = [

@@ -1,11 +1,12 @@
 import fs from "fs/promises"
 import path from "path"
 import { describe, expect } from "bun:test"
-import { DateTime, Effect, Equal, Hash, Schema } from "effect"
+import { DateTime, Effect, Equal, Hash, Layer, Schedule, Schema } from "effect"
 import { Tool } from "@opencode-ai/core/tool/tool"
 import { define } from "@opencode-ai/plugin/v2/effect"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { Catalog } from "@opencode-ai/core/catalog"
+import { Config } from "@opencode-ai/core/config"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { LocationServiceMap } from "@opencode-ai/core/location-services"
@@ -185,6 +186,114 @@ describe("LocationServiceMap", () => {
             providerID: "unavailable",
             modelID: "chat",
           })
+        }),
+      ),
+    ),
+  )
+
+  it.live("resolves a location-only V2 session in the OpenCode jail to its config-declared egress model", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          // The jail's opencode.json: no `model`, one config-declared provider. The image names it with
+          // OPENCODE_CONFIG and the entrypoint renders the proxy values into OPENCODE_CONFIG_CONTENT.
+          const jail = (options: { baseURL: string; apiKey: string }) => ({
+            $schema: "https://opencode.ai/config.json",
+            autoupdate: false,
+            plugin: [],
+            provider: {
+              "swxtch-egress": {
+                npm: "@ai-sdk/openai-compatible",
+                name: "swXtch egress proxy",
+                options,
+                models: { "accounts/fireworks/models/deepseek-v4p1-flash": { name: "DeepSeek V4.1 Flash" } },
+              },
+            },
+          })
+          const file = path.join(dir.path, "jail", "opencode.json")
+          const global = path.join(dir.path, "global")
+          const directory = path.join(dir.path, "agent")
+          yield* Effect.promise(async () => {
+            await fs.mkdir(path.dirname(file), { recursive: true })
+            await fs.mkdir(global, { recursive: true })
+            await fs.mkdir(directory, { recursive: true })
+            await fs.writeFile(
+              file,
+              JSON.stringify(
+                jail({ baseURL: "{env:OPENCODE_PROXY_BASE_URL}", apiKey: "{env:OPENCODE_PROXY_CAPABILITY}" }),
+              ),
+            )
+          })
+          const location = Location.Ref.make({ directory: AbsolutePath.make(directory) })
+          // The recorded models.dev corpus, with the opencode provider's credential-free models.
+          const corpus = yield* Effect.promise(() =>
+            Bun.file(
+              path.join(import.meta.dir, "..", "..", "opencode", "test", "tool", "fixtures", "models-api.json"),
+            ).json(),
+          )
+
+          // Every internal plugin boots against the recorded models.dev corpus, so credential-free catalog
+          // models compete with the egress provider exactly as they do in the jail.
+          const { available, resolved } = yield* Effect.gen(function* () {
+            const catalog = yield* Catalog.Service
+            const models = yield* SessionRunnerModel.Service
+            // The location boots its plugins in the background; wait until the catalog shows the egress provider.
+            yield* catalog.provider
+              .get(ProviderV2.ID.make("swxtch-egress"))
+              .pipe(
+                Effect.repeat({ until: (provider) => provider !== undefined, schedule: Schedule.spaced("1 millis") }),
+                Effect.timeout("10 seconds"),
+              )
+            return {
+              available: yield* catalog.model.available(),
+              resolved: yield* models.resolve(
+                SessionV2.Info.make({
+                  id: SessionV2.ID.make("ses_jail_location_only"),
+                  projectID: ProjectV2.ID.global,
+                  title: "test",
+                  cost: 0,
+                  tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+                  time: { created: DateTime.makeUnsafe(0), updated: DateTime.makeUnsafe(0) },
+                  location,
+                }),
+              ),
+            }
+          }).pipe(
+            Effect.provide(LocationServiceMap.Service.get(location)),
+            Effect.provide(
+              AppNodeBuilder.build(
+                LayerNode.group([ApplicationTools.node, Database.node, EventV2.node, LocationServiceMap.node]),
+                [
+                  [Global.node, Global.layerWith({ config: global })],
+                  [
+                    ModelsDev.node,
+                    Layer.succeed(
+                      ModelsDev.Service,
+                      ModelsDev.Service.of({ get: () => Effect.succeed(corpus), refresh: () => Effect.void }),
+                    ),
+                  ],
+                  [
+                    Config.node,
+                    Config.nodeWith({
+                      file,
+                      content: JSON.stringify(jail({ baseURL: "https://egress.test/v1", apiKey: "capability" })),
+                    }),
+                  ],
+                ],
+              ),
+            ),
+          )
+
+          // Credential-free catalog models are available alongside the egress one.
+          expect(available.some((model) => model.providerID !== "swxtch-egress")).toBe(true)
+          expect(resolved).toMatchObject({
+            provider: "swxtch-egress",
+            id: "accounts/fireworks/models/deepseek-v4p1-flash",
+          })
+          expect(resolved.route.endpoint).toMatchObject({ baseURL: "https://egress.test/v1" })
         }),
       ),
     ),
