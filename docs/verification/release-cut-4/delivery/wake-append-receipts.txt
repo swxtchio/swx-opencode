@@ -1,0 +1,3 @@
+/home/byates/fm-saas/state/opencode-arm-release.wake-events lines 3 -> 4; last-line-matches=yes; file-sha256=15d22a47bfca4a9d28b85bf80f86976136f170823fb52d09b37b7eff9dc83141
+/home/byates/fm-abbe/state/mvp-b16-10.wake-events: not appended; the B-16.10 task mvp-b16-10 has no state/mvp-b16-10.meta or wake log at 2026-10-23T20:12:18Z (backlog still lists it open); reported to firstmate
+notice sha256 039c9a6e08d3d277a30f70a3b4c9384f106fe6022d170f86f1db4c4493f0b3b9 at 2026-10-23T20:12:18Z
