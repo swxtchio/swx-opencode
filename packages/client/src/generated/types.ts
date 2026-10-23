@@ -41,6 +41,14 @@ export type ConflictError = {
 export const isConflictError = (value: unknown): value is ConflictError =>
   typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "ConflictError"
 
+export type UnknownError = {
+  readonly _tag: "UnknownError"
+  readonly message: string
+  readonly ref?: string | undefined
+}
+export const isUnknownError = (value: unknown): value is UnknownError =>
+  typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "UnknownError"
+
 export type ServiceUnavailableError = {
   readonly _tag: "ServiceUnavailableError"
   readonly message: string
@@ -57,14 +65,6 @@ export type MessageNotFoundError = {
 }
 export const isMessageNotFoundError = (value: unknown): value is MessageNotFoundError =>
   typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "MessageNotFoundError"
-
-export type UnknownError = {
-  readonly _tag: "UnknownError"
-  readonly message: string
-  readonly ref?: string | undefined
-}
-export const isUnknownError = (value: unknown): value is UnknownError =>
-  typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "UnknownError"
 
 export type ProviderNotFoundError = {
   readonly _tag: "ProviderNotFoundError"
@@ -238,6 +238,7 @@ export type SessionsListOutput = {
     readonly projectID: string
     readonly agent?: string
     readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+    readonly smallModel?: { readonly id: string; readonly providerID: string }
     readonly cost: number
     readonly tokens: {
       readonly input: number
@@ -271,24 +272,35 @@ export type SessionsCreateInput = {
     readonly id?: string | null
     readonly agent?: string | null
     readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null
+    readonly smallModel?: { readonly id: string; readonly providerID: string } | null
     readonly location?: { readonly directory: string; readonly workspaceID?: string } | null
   }["id"]
   readonly agent?: {
     readonly id?: string | null
     readonly agent?: string | null
     readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null
+    readonly smallModel?: { readonly id: string; readonly providerID: string } | null
     readonly location?: { readonly directory: string; readonly workspaceID?: string } | null
   }["agent"]
   readonly model?: {
     readonly id?: string | null
     readonly agent?: string | null
     readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null
+    readonly smallModel?: { readonly id: string; readonly providerID: string } | null
     readonly location?: { readonly directory: string; readonly workspaceID?: string } | null
   }["model"]
+  readonly smallModel?: {
+    readonly id?: string | null
+    readonly agent?: string | null
+    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null
+    readonly smallModel?: { readonly id: string; readonly providerID: string } | null
+    readonly location?: { readonly directory: string; readonly workspaceID?: string } | null
+  }["smallModel"]
   readonly location?: {
     readonly id?: string | null
     readonly agent?: string | null
     readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null
+    readonly smallModel?: { readonly id: string; readonly providerID: string } | null
     readonly location?: { readonly directory: string; readonly workspaceID?: string } | null
   }["location"]
 }
@@ -300,6 +312,7 @@ export type SessionsCreateOutput = {
     readonly projectID: string
     readonly agent?: string
     readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+    readonly smallModel?: { readonly id: string; readonly providerID: string }
     readonly cost: number
     readonly tokens: {
       readonly input: number
@@ -338,6 +351,7 @@ export type SessionsGetOutput = {
     readonly projectID: string
     readonly agent?: string
     readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+    readonly smallModel?: { readonly id: string; readonly providerID: string }
     readonly cost: number
     readonly tokens: {
       readonly input: number
@@ -716,6 +730,14 @@ export type SessionsHistoryOutput = {
           readonly messageID: string
           readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
         }
+      }
+    | {
+        readonly id: string
+        readonly metadata?: { readonly [x: string]: JsonValue }
+        readonly type: "session.next.titled"
+        readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+        readonly location?: { readonly directory: string; readonly workspaceID?: string }
+        readonly data: { readonly timestamp: number; readonly sessionID: string; readonly title: string }
       }
     | {
         readonly id: string
@@ -1179,6 +1201,14 @@ export type SessionsEventsOutput =
         readonly messageID: string
         readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
       }
+    }
+  | {
+      readonly id: string
+      readonly metadata?: { readonly [x: string]: unknown }
+      readonly type: "session.next.titled"
+      readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+      readonly location?: { readonly directory: string; readonly workspaceID?: string }
+      readonly data: { readonly timestamp: number; readonly sessionID: string; readonly title: string }
     }
   | {
       readonly id: string

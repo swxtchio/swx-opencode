@@ -247,6 +247,7 @@ import type {
   SessionShareResponses,
   SessionShellErrors,
   SessionShellResponses,
+  SessionSmallModel,
   SessionStatusErrors,
   SessionStatusResponses,
   SessionSummarizeErrors,
@@ -6225,6 +6226,7 @@ export class Session3 extends HeyApiClient {
       id?: string
       agent?: string
       model?: ModelRef
+      smallModel?: SessionSmallModel
       location?: LocationRef
     },
     options?: Options<never, ThrowOnError>,
@@ -6237,6 +6239,7 @@ export class Session3 extends HeyApiClient {
             { in: "body", key: "id" },
             { in: "body", key: "agent" },
             { in: "body", key: "model" },
+            { in: "body", key: "smallModel" },
             { in: "body", key: "location" },
           ],
         },
@@ -6407,7 +6410,7 @@ export class Session3 extends HeyApiClient {
   /**
    * Compact session
    *
-   * Compact a session conversation.
+   * Summarize the session's current context on its small model, after any active run. Responds once the summary is recorded, or at once when there is nothing to compact.
    */
   public compact<ThrowOnError extends boolean = false>(
     parameters: {
