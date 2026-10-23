@@ -1,0 +1,15 @@
+2026-10-23T20:05:30Z
+=== v1-control
+client: {"mode": "v1-control", "status": "completed", "model": "accounts/fireworks/models/deepseek-v4p1-flash"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== v2
+client: {"mode": "v2", "session": "ses_e95a149dfffek9zhc28db6cFa4", "admitted_seq": 1, "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.step.started", "session.next.tool.input.started", "session.next.tool.input.ended", "session.next.tool.called", "session.next.tool.failed", "session.next.step.ended"], "steps": [{"type": "session.next.step.started", "model": {"id": "accounts/fireworks/models/deepseek-v4p1-flash", "providerID": "swxtch-egress"}, "error": null}, {"type": "session.next.step.ended", "model": null, "error": null}], "wait": "OpenCodeV2WaitOutcome(status='failed', admitted_seq=1, message_id=None, assistant_message_id='msg_16a5ec980001Radqn6zzcHXS2W', payload={'type': 'failed', 'admittedSeq': 1, 'assistantMessageID': 'msg_16a5ec980001Radqn6zzcHXS2W'})"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== v2-named
+client: {"mode": "v2-named", "session": "ses_e95a109a5ffeErTRK9cRricZbD", "admitted_seq": 1, "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.step.started", "session.next.tool.input.started", "session.next.tool.input.ended", "session.next.tool.called", "session.next.tool.failed", "session.next.step.ended"], "steps": [{"type": "session.next.step.started", "model": {"id": "accounts/fireworks/models/deepseek-v4p1-flash", "providerID": "swxtch-egress", "variant": "default"}, "error": null}, {"type": "session.next.step.ended", "model": null, "error": null}], "wait": "OpenCodeV2WaitOutcome(status='failed', admitted_seq=1, message_id=None, assistant_message_id='msg_16a5f08b6001wnBMKYiJJsIHqs', payload={'type': 'failed', 'admittedSeq': 1, 'assistantMessageID': 'msg_16a5f08b6001wnBMKYiJJsIHqs'})"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+exit=0
+2026-10-23T20:06:21Z

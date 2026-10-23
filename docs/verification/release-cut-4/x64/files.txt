@@ -1,0 +1,2 @@
+/home/runner/work/_temp/candidate-dist/opencode-linux-x64/bin/opencode:                                                                     ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=5afca2666bfab8605a934f1b6231dacae0518a5f, not stripped
+/home/runner/work/_temp/candidate-dist/opencode-linux-x64/bin/libfff_c-977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5.so: ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, stripped

@@ -1,0 +1,10 @@
+opencode-linux-arm64.tar.gz: OK
+opencode-linux-x64.tar.gz: OK
+arm64 archive identical to native-tested candidate
+x64 archive identical to native-tested candidate
+extracted arm64:
+0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42  libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so
+40f0b559143c1fd64d0a7818533f1b499c78f768c46fbf0714906dc729cf6c90  opencode
+extracted x64:
+977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5  libfff_c-977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5.so
+125a8732855e6a9cce3cf2d00526c487944cb8db84a168d47d2a12e57ba2b0b0  opencode
