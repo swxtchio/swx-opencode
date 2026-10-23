@@ -85,6 +85,11 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#350** Run each V2 turn only after its Location's background plugin boot has ended (`PluginInternal.ready`).
+  The jail's adapter prompts a new session at once, so its first turn raced the boot that fills the catalog,
+  agents and tools: it found no model, could not find the named `swxtch-egress` model, or ran on a bundled one,
+  and the egress provider got nothing (swxtchio/swx-abbe#1952 on `v1.18.32-swxtch.774d90c7`). _Fork-only;
+  upstream has the same race._
 - **#347** Load `OPENCODE_CONFIG` and `OPENCODE_CONFIG_CONTENT` in the V2 core config at V1's precedence (global
   directory, explicit file, project files, `.opencode` directories, inline content last), so V2 sessions in the
   OpenCode jail resolve its config-declared `swxtch-egress` provider and configured default model

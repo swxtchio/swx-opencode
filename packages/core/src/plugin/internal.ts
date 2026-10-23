@@ -3,7 +3,7 @@ export * as PluginInternal from "./internal"
 import { makeLocationNode } from "../effect/app-node"
 import { httpClient } from "../effect/app-node-platform"
 import type { PluginContext } from "@opencode-ai/plugin/v2/effect"
-import { Effect, Layer, Scope } from "effect"
+import { Context, Deferred, Effect, Layer, Scope } from "effect"
 import { AgentV2 } from "../agent"
 import { Catalog } from "../catalog"
 import { CommandV2 } from "../command"
@@ -60,7 +60,18 @@ export function define<R>(plugin: Plugin<R>) {
   return plugin
 }
 
-const layer = Layer.effectDiscard(
+export interface Interface {
+  /** Completes once the internal plugin boot has ended, whether it loaded every plugin or failed. */
+  readonly ready: Effect.Effect<void>
+}
+
+export class Service extends Context.Service<Service, Interface>()("@opencode/v2/PluginInternal") {}
+
+/** Test or embedding seam for a Location whose plugins are already loaded. */
+export const readyLayer = Layer.succeed(Service, Service.of({ ready: Effect.void }))
+
+const layer = Layer.effect(
+  Service,
   Effect.gen(function* () {
     const catalog = yield* Catalog.Service
     const commands = yield* CommandV2.Service
@@ -105,6 +116,7 @@ const layer = Layer.effectDiscard(
       return plugin.add(PluginV2.ID.make(loaded.id), loaded.effect)
     }
 
+    const booted = yield* Deferred.make<void>()
     yield* State.batch(
       Effect.gen(function* () {
         yield* add(ConfigReferencePlugin.Plugin)
@@ -120,7 +132,12 @@ const layer = Layer.effectDiscard(
         yield* add(ConfigProviderPlugin.Plugin)
         yield* add(VariantPlugin.Plugin)
       }),
-    ).pipe(Effect.withSpan("PluginInternal.boot"), Effect.forkScoped({ startImmediately: true }))
+    ).pipe(
+      Effect.withSpan("PluginInternal.boot"),
+      Effect.ensuring(Deferred.succeed(booted, undefined)),
+      Effect.forkScoped({ startImmediately: true }),
+    )
+    return Service.of({ ready: Deferred.await(booted) })
   }),
 )
 
@@ -130,7 +147,7 @@ export const locationLayer = layer.pipe(
 )
 
 export const node = makeLocationNode({
-  name: "plugin-internal",
+  service: Service,
   layer,
   deps: [
     Catalog.node,
