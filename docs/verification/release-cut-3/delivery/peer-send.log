@@ -1,0 +1,6 @@
+== /home/byates/fm-abbe
+fm-send warning: this message carries a repo-relative path pointer 'state/mvp-b16-10.wake-events'. A crew's cwd is its own per-task worktree, where data/ and state/ are gitignored and never checked out, so this path will not resolve there and the crew cannot tell a missing file from a wrong path. Send the ABSOLUTE path instead. This is a pointer-check warning only; the requested message WILL still be sent.
+peer-message p1792773840-2738195-53a3 delivered to /home/byates/fm-abbe as an informational notification (no reply owed; terminal outbox history retained after confirmed submit)
+== /home/byates/fm-saas
+fm-send warning: this message carries a repo-relative path pointer 'state/mvp-b16-10.wake-events'. A crew's cwd is its own per-task worktree, where data/ and state/ are gitignored and never checked out, so this path will not resolve there and the crew cannot tell a missing file from a wrong path. Send the ABSOLUTE path instead. This is a pointer-check warning only; the requested message WILL still be sent.
+peer-message p1792773849-2763976-1834 delivered to /home/byates/fm-saas as an informational notification (no reply owed; terminal outbox history retained after confirmed submit)
