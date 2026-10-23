@@ -41,3 +41,11 @@ text it queued.
 
 Existing native HTTP tests that counted every provider call now count only turn calls (`turnCalls`), because a native
 session's first prompt also sends a title request. Each test's expected count is unchanged.
+
+## Jail boundary
+
+Review round 2 built `c0182d4d` natively for arm64 and ran Abbe's jail rig on the unpublished candidate: the real
+jail daemon, the egress proxy and the fake provider. It ran `v1-control`, `v2`, `v2-named` and a `v2-compact` probe
+mode, and all four passed. In `v2-compact`, the compact answered 204 after its summary request reached the provider
+as a distinct request, and the recorded summary is the provider's content. See
+`docs/verification/v2-small-model-1953/README.md`. Abbe's own compact mode for the rig doc is still pending.
