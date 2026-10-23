@@ -1,0 +1,5 @@
+{"home": "/home/byates/fm-llmrouter", "task": "opencode-release-cut-3", "task_id": "opencode-release-cut-3", "what": "native ARM64 source-pinned OpenCode 774d90c7 build and packaged probe", "owner_box": "vm001", "owner_pid": 3106855, "pid": 3106855, "started_at": "2026-10-23T16:35:05Z"}
+released: lease matched home=/home/byates/fm-llmrouter task=opencode-release-cut-3
+exit=0
+ACTIVE-absent
+2026-10-23T16:41:03Z

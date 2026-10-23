@@ -1,0 +1,371 @@
+{
+  "architecture": "arm64",
+  "runtime_arch": "arm64",
+  "version": "1.18.32-swxtch.774d90c7",
+  "database": "/home/byates/vm14-builds/opencode-release-774d90c7/proof/session.sqlite",
+  "version_output": "1.18.32-swxtch.774d90c7",
+  "fff_search": "src/nested/needle-target.ts",
+  "database_selection": {
+    "explicit": [
+      {
+        "selector": "first",
+        "dbPath": "/home/byates/vm14-builds/opencode-release-774d90c7/proof/database-selection/first/selected.sqlite",
+        "query": "1\n1",
+        "size": 372736,
+        "device": 64770,
+        "inode": 1076028
+      },
+      {
+        "selector": "second",
+        "dbPath": "/home/byates/vm14-builds/opencode-release-774d90c7/proof/database-selection/second/selected.sqlite",
+        "query": "1\n1",
+        "size": 372736,
+        "device": 64770,
+        "inode": 1076700
+      }
+    ],
+    "conflicting_xdg_database_opened": false,
+    "unset_latest_channel_path": "/home/byates/vm14-builds/opencode-release-774d90c7/proof/database-selection/unset-xdg/opencode/opencode.db"
+  },
+  "idle": {
+    "sessionID": "ses_e965d5dd7ffeVzG3kAlL4J4iVY",
+    "status": 200,
+    "result": {
+      "type": "idle"
+    }
+  },
+  "pending": {
+    "sessionID": "ses_e965d5dbcffeThiSO1qYzdYK3d",
+    "admission": {
+      "status": 200,
+      "sessionID": "ses_e965d5dbcffeThiSO1qYzdYK3d",
+      "id": "msg_169a2a24e001s4H42lIgj2Ym60",
+      "admittedSeq": 1
+    },
+    "status": 200,
+    "result": {
+      "type": "pending",
+      "admittedSeq": 1,
+      "messageID": "msg_169a2a24e001s4H42lIgj2Ym60"
+    }
+  },
+  "completed": {
+    "sessionID": "ses_e965d5da8ffeJSmrf2hiUl2pV9",
+    "admission": {
+      "status": 200,
+      "sessionID": "ses_e965d5da8ffeJSmrf2hiUl2pV9",
+      "id": "msg_169a2a263001KUrN957oulQLQS",
+      "admittedSeq": 1
+    },
+    "result": {
+      "type": "completed",
+      "admittedSeq": 1,
+      "assistantMessageID": "msg_169a2a451001PvixpHTvki9sXV"
+    },
+    "held_tool_status": "running",
+    "settled_tool_status": "completed",
+    "held_phase_wait_evidence": [
+      {
+        "phase": "the local Bash tool is held",
+        "main_session_id": "ses_e965d5da8ffeJSmrf2hiUl2pV9",
+        "active_status": 200,
+        "active_type": "running",
+        "admission_receipt": {
+          "status": 200,
+          "sessionID": "ses_e965d5da8ffeJSmrf2hiUl2pV9",
+          "id": "msg_169a2a263001KUrN957oulQLQS",
+          "admittedSeq": 1
+        },
+        "producer_message_readback": {
+          "status": 200,
+          "id": "msg_169a2a263001KUrN957oulQLQS",
+          "type": "user"
+        },
+        "producer_wait_registration": {
+          "wait_id": "acb6a28b-c5d9-440b-8de5-a92b3ee5be84",
+          "sessionID": "ses_e965d5da8ffeJSmrf2hiUl2pV9",
+          "messageID": "msg_169a2a263001KUrN957oulQLQS",
+          "admittedSeq": 1,
+          "record": "timestamp=2026-10-23T16:40:28.691Z level=INFO run=bb49a22d message=\"Session wait registered\" event=session.wait.registered wait_id=acb6a28b-c5d9-440b-8de5-a92b3ee5be84 session_id=ses_e965d5da8ffeJSmrf2hiUl2pV9 admitted_seq=1 message_id=msg_169a2a263001KUrN957oulQLQS waiter_count=1"
+        },
+        "main_wait_client_unsettled": true
+      },
+      {
+        "phase": "the final provider continuation is held",
+        "main_session_id": "ses_e965d5da8ffeJSmrf2hiUl2pV9",
+        "active_status": 200,
+        "active_type": "running",
+        "admission_receipt": {
+          "status": 200,
+          "sessionID": "ses_e965d5da8ffeJSmrf2hiUl2pV9",
+          "id": "msg_169a2a263001KUrN957oulQLQS",
+          "admittedSeq": 1
+        },
+        "producer_message_readback": {
+          "status": 200,
+          "id": "msg_169a2a263001KUrN957oulQLQS",
+          "type": "user"
+        },
+        "producer_wait_registration": {
+          "wait_id": "acb6a28b-c5d9-440b-8de5-a92b3ee5be84",
+          "sessionID": "ses_e965d5da8ffeJSmrf2hiUl2pV9",
+          "messageID": "msg_169a2a263001KUrN957oulQLQS",
+          "admittedSeq": 1,
+          "record": "timestamp=2026-10-23T16:40:28.691Z level=INFO run=bb49a22d message=\"Session wait registered\" event=session.wait.registered wait_id=acb6a28b-c5d9-440b-8de5-a92b3ee5be84 session_id=ses_e965d5da8ffeJSmrf2hiUl2pV9 admitted_seq=1 message_id=msg_169a2a263001KUrN957oulQLQS waiter_count=1"
+        },
+        "main_wait_client_unsettled": true
+      }
+    ],
+    "wait_resolution": "timestamp=2026-10-23T16:40:29.050Z level=INFO run=bb49a22d message=\"Session wait resolved\" event=session.wait.resolved wait_id=acb6a28b-c5d9-440b-8de5-a92b3ee5be84 session_id=ses_e965d5da8ffeJSmrf2hiUl2pV9 admitted_seq=1 message_id=msg_169a2a263001KUrN957oulQLQS outcome=completed",
+    "userMessageID": "msg_169a2a263001KUrN957oulQLQS",
+    "assistantMessageID": "msg_169a2a451001PvixpHTvki9sXV",
+    "history": [
+      {
+        "id": "evt_169a2a263002J4qYB6bfgVuKlJ",
+        "seq": 1,
+        "type": "session.next.prompt.admitted"
+      },
+      {
+        "id": "evt_169a2a26f001V1odJgwiDIlwVp",
+        "seq": 2,
+        "type": "session.next.prompted"
+      },
+      {
+        "id": "evt_169a2a2fc002OX6VUBTzII89MB",
+        "seq": 3,
+        "type": "session.next.step.started"
+      },
+      {
+        "id": "evt_169a2a2ff001hVSJGCWqY2v7YK",
+        "seq": 4,
+        "type": "session.next.tool.input.started"
+      },
+      {
+        "id": "evt_169a2a304001vu2lqdMQSYEeF6",
+        "seq": 5,
+        "type": "session.next.tool.input.ended"
+      },
+      {
+        "id": "evt_169a2a307001ZjGVE4xHRchRhL",
+        "seq": 6,
+        "type": "session.next.tool.called"
+      },
+      {
+        "id": "evt_169a2a3b0001u6DJwDcTLmak4M",
+        "seq": 7,
+        "type": "session.next.tool.success"
+      },
+      {
+        "id": "evt_169a2a3c2001R2T9pn9iFJSyCH",
+        "seq": 8,
+        "type": "session.next.step.ended"
+      },
+      {
+        "id": "evt_169a2a452001ykrD5u30Typ3dm",
+        "seq": 9,
+        "type": "session.next.step.started"
+      },
+      {
+        "id": "evt_169a2a453001n6TP2IZ2uMFNgf",
+        "seq": 10,
+        "type": "session.next.text.started"
+      },
+      {
+        "id": "evt_169a2a456001btHMKQb7G0ydt5",
+        "seq": 11,
+        "type": "session.next.text.ended"
+      },
+      {
+        "id": "evt_169a2a464001uhs207eE12hOsR",
+        "seq": 12,
+        "type": "session.next.step.ended"
+      }
+    ],
+    "hasMore": false
+  },
+  "restart": {
+    "userMessageID": "msg_169a2a263001KUrN957oulQLQS",
+    "assistantMessageID": "msg_169a2a451001PvixpHTvki9sXV",
+    "cursor": 1,
+    "exclusiveOrdering": true,
+    "replayedEvents": [
+      {
+        "id": "evt_169a2a26f001V1odJgwiDIlwVp",
+        "seq": 2,
+        "type": "session.next.prompted"
+      },
+      {
+        "id": "evt_169a2a2fc002OX6VUBTzII89MB",
+        "seq": 3,
+        "type": "session.next.step.started"
+      },
+      {
+        "id": "evt_169a2a2ff001hVSJGCWqY2v7YK",
+        "seq": 4,
+        "type": "session.next.tool.input.started"
+      },
+      {
+        "id": "evt_169a2a304001vu2lqdMQSYEeF6",
+        "seq": 5,
+        "type": "session.next.tool.input.ended"
+      },
+      {
+        "id": "evt_169a2a307001ZjGVE4xHRchRhL",
+        "seq": 6,
+        "type": "session.next.tool.called"
+      },
+      {
+        "id": "evt_169a2a3b0001u6DJwDcTLmak4M",
+        "seq": 7,
+        "type": "session.next.tool.success"
+      },
+      {
+        "id": "evt_169a2a3c2001R2T9pn9iFJSyCH",
+        "seq": 8,
+        "type": "session.next.step.ended"
+      },
+      {
+        "id": "evt_169a2a452001ykrD5u30Typ3dm",
+        "seq": 9,
+        "type": "session.next.step.started"
+      },
+      {
+        "id": "evt_169a2a453001n6TP2IZ2uMFNgf",
+        "seq": 10,
+        "type": "session.next.text.started"
+      },
+      {
+        "id": "evt_169a2a456001btHMKQb7G0ydt5",
+        "seq": 11,
+        "type": "session.next.text.ended"
+      },
+      {
+        "id": "evt_169a2a464001uhs207eE12hOsR",
+        "seq": 12,
+        "type": "session.next.step.ended"
+      }
+    ]
+  },
+  "failed": {
+    "sessionID": "ses_e965d5251ffeoaeH2orFIIhEaq",
+    "admission": {
+      "status": 200,
+      "sessionID": "ses_e965d5251ffeoaeH2orFIIhEaq",
+      "id": "msg_169a2adcb0013kReW12hBD39sI",
+      "admittedSeq": 1
+    },
+    "result": {
+      "type": "failed",
+      "admittedSeq": 1,
+      "assistantMessageID": "msg_169a2ae58001OKL2V2mRp1LsZK"
+    },
+    "wait_evidence": {
+      "phase": "the failed tool's provider continuation is held",
+      "main_session_id": "ses_e965d5251ffeoaeH2orFIIhEaq",
+      "active_status": 200,
+      "active_type": "running",
+      "admission_receipt": {
+        "status": 200,
+        "sessionID": "ses_e965d5251ffeoaeH2orFIIhEaq",
+        "id": "msg_169a2adcb0013kReW12hBD39sI",
+        "admittedSeq": 1
+      },
+      "producer_message_readback": {
+        "status": 200,
+        "id": "msg_169a2adcb0013kReW12hBD39sI",
+        "type": "user"
+      },
+      "producer_wait_registration": {
+        "wait_id": "f5e153e2-b1d2-4f7b-a6c8-9b2a0fc3b6e0",
+        "sessionID": "ses_e965d5251ffeoaeH2orFIIhEaq",
+        "messageID": "msg_169a2adcb0013kReW12hBD39sI",
+        "admittedSeq": 1,
+        "record": "timestamp=2026-10-23T16:40:31.768Z level=INFO run=8558644a message=\"Session wait registered\" event=session.wait.registered wait_id=f5e153e2-b1d2-4f7b-a6c8-9b2a0fc3b6e0 session_id=ses_e965d5251ffeoaeH2orFIIhEaq admitted_seq=1 message_id=msg_169a2adcb0013kReW12hBD39sI waiter_count=1"
+      },
+      "main_wait_client_unsettled": true
+    },
+    "wait_resolution": "timestamp=2026-10-23T16:40:32.607Z level=INFO run=8558644a message=\"Session wait resolved\" event=session.wait.resolved wait_id=f5e153e2-b1d2-4f7b-a6c8-9b2a0fc3b6e0 session_id=ses_e965d5251ffeoaeH2orFIIhEaq admitted_seq=1 message_id=msg_169a2adcb0013kReW12hBD39sI outcome=failed",
+    "failed_tool_status": "error",
+    "terminal_event_persisted": true
+  },
+  "interrupted": {
+    "sessionID": "ses_e965d49d8ffeH0xPqfBw6dsbIw",
+    "admission": {
+      "status": 200,
+      "sessionID": "ses_e965d49d8ffeH0xPqfBw6dsbIw",
+      "id": "msg_169a2b636001SWK3mvZYBuelmF",
+      "admittedSeq": 1
+    },
+    "result": {
+      "type": "interrupted",
+      "admittedSeq": 1,
+      "assistantMessageID": "msg_169a2b6c5001NoJ6IoRMywCMJs"
+    },
+    "wait_evidence": {
+      "phase": "the interruptible Bash tool is held",
+      "main_session_id": "ses_e965d49d8ffeH0xPqfBw6dsbIw",
+      "active_status": 200,
+      "active_type": "running",
+      "admission_receipt": {
+        "status": 200,
+        "sessionID": "ses_e965d49d8ffeH0xPqfBw6dsbIw",
+        "id": "msg_169a2b636001SWK3mvZYBuelmF",
+        "admittedSeq": 1
+      },
+      "producer_message_readback": {
+        "status": 200,
+        "id": "msg_169a2b636001SWK3mvZYBuelmF",
+        "type": "user"
+      },
+      "producer_wait_registration": {
+        "wait_id": "d8800283-8c33-4ff4-afc6-6bdbd6a62961",
+        "sessionID": "ses_e965d49d8ffeH0xPqfBw6dsbIw",
+        "messageID": "msg_169a2b636001SWK3mvZYBuelmF",
+        "admittedSeq": 1,
+        "record": "timestamp=2026-10-23T16:40:33.752Z level=INFO run=8558644a message=\"Session wait registered\" event=session.wait.registered wait_id=d8800283-8c33-4ff4-afc6-6bdbd6a62961 session_id=ses_e965d49d8ffeH0xPqfBw6dsbIw admitted_seq=1 message_id=msg_169a2b636001SWK3mvZYBuelmF waiter_count=1"
+      },
+      "main_wait_client_unsettled": true
+    },
+    "wait_resolution": "timestamp=2026-10-23T16:40:34.630Z level=INFO run=8558644a message=\"Session wait resolved\" event=session.wait.resolved wait_id=d8800283-8c33-4ff4-afc6-6bdbd6a62961 session_id=ses_e965d49d8ffeH0xPqfBw6dsbIw admitted_seq=1 message_id=msg_169a2b636001SWK3mvZYBuelmF outcome=interrupted",
+    "tool_cleanup": "Tool execution interrupted",
+    "terminal_event_persisted": true
+  },
+  "provider_requests": {
+    "counts": {
+      "completed": 2,
+      "failed": 2,
+      "interrupted": 1
+    },
+    "completedContinuationStarted": true,
+    "failedContinuationStarted": true,
+    "titleCalls": 0,
+    "otherCalls": 0,
+    "requests": [
+      {
+        "scenario": "completed",
+        "ordinal": 1,
+        "hasToolResult": false
+      },
+      {
+        "scenario": "completed",
+        "ordinal": 2,
+        "hasToolResult": true
+      },
+      {
+        "scenario": "failed",
+        "ordinal": 1,
+        "hasToolResult": false
+      },
+      {
+        "scenario": "failed",
+        "ordinal": 2,
+        "hasToolResult": true
+      },
+      {
+        "scenario": "interrupted",
+        "ordinal": 1,
+        "hasToolResult": false
+      }
+    ]
+  }
+}

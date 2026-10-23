@@ -1,0 +1,7 @@
+{"home": "/home/byates/fm-llmrouter", "task": "opencode-release-cut-3", "task_id": "opencode-release-cut-3", "what": "native ARM64 source-pinned OpenCode 774d90c7 build and packaged probe", "owner_box": "vm001", "owner_pid": 3106855, "pid": 3106855, "started_at": "2026-10-23T16:35:05Z"}
+total 12
+drwxrwxr-x  2 byates byates 4096 2026-10-23 16:35:05.914281450 +0000 .
+drwxrwxr-x 16 byates byates 4096 2026-10-23 16:35:05.581278917 +0000 ..
+-rw-rw-r--  1 byates byates    0 2026-10-23 16:35:05.914281450 +0000 heartbeat
+-rw-rw-r--  1 byates byates  288 2026-10-23 16:35:05.913281443 +0000 lease.json
+acquired at 2026-10-23T16:35:05Z
