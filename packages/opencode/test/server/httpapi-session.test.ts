@@ -1227,10 +1227,9 @@ describe("session HttpApi", () => {
         yield* llm.textMatch(model("small-model"), "## Objective\n- Explain per-session configuration")
         const compact = yield* request(`/api/session/${session.id}/compact`, { method: "POST", headers })
         expect(compact.status).toBe(204)
-        const context = yield* requestJson<{ data: SessionMessage.Message[] }>(
-          `/api/session/${session.id}/context`,
-          { headers },
-        )
+        const context = yield* requestJson<{ data: SessionMessage.Message[] }>(`/api/session/${session.id}/context`, {
+          headers,
+        })
         expect(context.data).toMatchObject([
           { type: "compaction", reason: "manual", summary: "## Objective\n- Explain per-session configuration" },
         ])

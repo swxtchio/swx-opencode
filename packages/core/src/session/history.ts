@@ -67,7 +67,10 @@ const decodeMessageRow = (row: typeof SessionMessageTable.$inferSelect) =>
   )
 
 /** Loads the current context's messages with their sequences, outside a provider turn. */
-export const entries = Effect.fn("SessionHistory.entries")(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
+export const entries = Effect.fn("SessionHistory.entries")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+) {
   const rows = yield* db
     .transaction((tx) =>
       Effect.gen(function* () {

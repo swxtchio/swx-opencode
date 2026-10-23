@@ -162,13 +162,23 @@ export const make = <Key, E>(options: {
     const exclusive = <A, E2>(key: Key, operation: Effect.Effect<A, E2>): Effect.Effect<A, E2> =>
       Effect.uninterruptibleMask((restore) => {
         const entry = active.get(key)
-        if (entry !== undefined) return restore(Deferred.await(entry.done).pipe(Effect.exit, Effect.andThen(exclusive(key, operation))))
+        if (entry !== undefined)
+          return restore(Deferred.await(entry.done).pipe(Effect.exit, Effect.andThen(exclusive(key, operation))))
 
         const next = makeEntry()
         active.set(key, next)
         const result = Deferred.makeUnsafe<A, E2>()
         // The operation's own outcome goes to its caller; the entry settles as a successful execution either way.
-        start(key, next, false, false, operation.pipe(Effect.onExit((exit) => Deferred.done(result, exit)), Effect.ignore))
+        start(
+          key,
+          next,
+          false,
+          false,
+          operation.pipe(
+            Effect.onExit((exit) => Deferred.done(result, exit)),
+            Effect.ignore,
+          ),
+        )
         return restore(Deferred.await(result))
       })
 

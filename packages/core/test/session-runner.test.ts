@@ -5188,7 +5188,9 @@ describe("SessionV2 auxiliary model work", () => {
       yield* addTitleAgent
       auxiliaryModel = smallModel
       const session = yield* SessionV2.Service
-      response = fragmentFixture("text", "text-title", ["<think>naming</think>\nFixing the build\nignored"]).completeEvents
+      response = fragmentFixture("text", "text-title", [
+        "<think>naming</think>\nFixing the build\nignored",
+      ]).completeEvents
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Please fix the build" }), resume: false })
       yield* session.resume(sessionID)
 
@@ -5196,9 +5198,9 @@ describe("SessionV2 auxiliary model work", () => {
       expect(titles).toHaveLength(1)
       expect(String(titles[0].model.id)).toBe("small")
       expect(userTexts(titles[0])).toEqual(["Generate a title for this conversation:\n", "Please fix the build"])
-      expect(requests.filter((request) => !isTitleRequest(request)).map((request) => String(request.model.id))).toEqual([
-        "fake-model",
-      ])
+      expect(requests.filter((request) => !isTitleRequest(request)).map((request) => String(request.model.id))).toEqual(
+        ["fake-model"],
+      )
       expect((yield* session.get(sessionID)).title).toBe("Fixing the build")
       expect(yield* durableTypes).toContain("session.next.titled")
     }),
@@ -5232,7 +5234,11 @@ describe("SessionV2 auxiliary model work", () => {
       yield* setup
       const session = yield* SessionV2.Service
       response = fragmentFixture("text", "text-first", ["Earlier answer"]).completeEvents
-      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Earlier question ".repeat(180) }), resume: false })
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Earlier question ".repeat(180) }),
+        resume: false,
+      })
       yield* session.resume(sessionID)
 
       currentModel = compactModel
