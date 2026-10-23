@@ -92,4 +92,13 @@ The tag-specific and `/releases/latest` APIs both returned release `422267143` w
 
 SaaS's producer/image handoff task remains `opencode-arm-release`, recorded in `/home/byates/fm-saas/data/done-archive.md`. At 2026-10-23T20:12:18Z one verified notice line was appended with `>>` to `/home/byates/fm-saas/state/opencode-arm-release.wake-events`, taking it from 3 to 4 lines. Read-back confirmed the last line equals the notice. A supplemental `bin/fm-send.sh peer:/home/byates/fm-saas --no-reply` notification was delivered as `p1792786351-2011828-449f`, with `phase=sent`, `transport=terminal` and `disposition=delivered-no-reply`.
 
-The Abbe B-16.10 recipient could not be established. `/home/byates/fm-abbe/data/backlog.md` still lists `mvp-b16-10` against swxtchio/swx-abbe#1712, but `/home/byates/fm-abbe/state/` has no `mvp-b16-10.meta` or `mvp-b16-10.wake-events`. The log cut-3 appended to is gone, and no other live Abbe task names B-16.10, #1951 or #2030. No file was created there. Two supplemental `peer:/home/byates/fm-abbe` sends were refused before typing, because the Abbe captain's composer was not provably empty (`pending`, then `unknown`). Nothing was typed and no outbox record was reserved. The Abbe handoff is reported to firstmate as an open gap.
+This task could not establish the Abbe B-16.10 recipient. `/home/byates/fm-abbe/data/backlog.md` still lists `mvp-b16-10` against swxtchio/swx-abbe#1712, but `/home/byates/fm-abbe/state/` has no `mvp-b16-10.meta` or `mvp-b16-10.wake-events`. The log cut-3 appended to is gone, and no other live Abbe task names B-16.10, #1951 or #2030. No file was created there. Two supplemental `peer:/home/byates/fm-abbe` sends were refused before typing, because the Abbe captain's composer was not provably empty (`pending`, then `unknown`). Nothing was typed and no outbox record was reserved.
+
+The Abbe handoff was delivered by firstmate. This task reported the gap, and firstmate resolved it by relaying the notice to Abbe through its own peer channel. Its relay is archived at `/home/byates/fm-llmrouter/data/peer-mail/p1792777340-1942459-70c1-relay.md` (SHA-256 `460bc34f…d5b5`) and copied byte-for-byte to `delivery/firstmate-relay-p1792777340-1942459-70c1.md`. The relay gives:
+
+- the tag, Latest designation, source and #350;
+- both archive URLs, with a pointer to the published `.sha256` companions (it does not quote the hex digests; `delivery/notice.txt` and the release body do);
+- the downloaded-byte check, and the arm64 jail rig pass in all three modes;
+- the x64-rig caveat and the #352 gap.
+
+This task holds no Abbe receipt of its own; delivery rests on firstmate's relay record.

@@ -1,3 +1,4 @@
 /home/byates/fm-saas/state/opencode-arm-release.wake-events lines 3 -> 4; last-line-matches=yes; file-sha256=15d22a47bfca4a9d28b85bf80f86976136f170823fb52d09b37b7eff9dc83141
 /home/byates/fm-abbe/state/mvp-b16-10.wake-events: not appended; the B-16.10 task mvp-b16-10 has no state/mvp-b16-10.meta or wake log at 2026-10-23T20:12:18Z (backlog still lists it open); reported to firstmate
 notice sha256 039c9a6e08d3d277a30f70a3b4c9384f106fe6022d170f86f1db4c4493f0b3b9 at 2026-10-23T20:12:18Z
+/home/byates/fm-abbe: delivered-by-firstmate via its peer channel; relay archived at /home/byates/fm-llmrouter/data/peer-mail/p1792777340-1942459-70c1-relay.md (sha256 460bc34fb5b44e8f7b187b02ec67e23240a6856de965cce9504d609f52a5d5b5, mtime 2026-10-23T20:17Z), copied byte-for-byte to firstmate-relay-p1792777340-1942459-70c1.md; firstmate resolved the open Abbe handoff as option (b)
