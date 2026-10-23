@@ -1,0 +1,13 @@
+== /home/byates/fm-abbe
+
+● FM_SEND FAILED ●
+error: peer pane %123 composer is not provably empty (pending); typing now could fuse the envelope with the peer captain's draft, and a fused line no longer begins with the marker - it would read as the captain's own message (the #413 defect). NOTHING was typed; the refusal preceded outbox reservation, so nothing is left pending. Retry when the peer's composer is empty.
+exit=1
+== /home/byates/fm-saas
+peer-message p1792786351-2011828-449f delivered to /home/byates/fm-saas as an informational notification (no reply owed; terminal outbox history retained after confirmed submit)
+exit=0
+== /home/byates/fm-abbe (retry 2026-10-23T20:13:08Z)
+
+● FM_SEND FAILED ●
+error: peer pane %123 composer is not provably empty (unknown); typing now could fuse the envelope with the peer captain's draft, and a fused line no longer begins with the marker - it would read as the captain's own message (the #413 defect). NOTHING was typed; the refusal preceded outbox reservation, so nothing is left pending. Retry when the peer's composer is empty.
+exit=1
