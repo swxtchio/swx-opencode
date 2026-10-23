@@ -82,10 +82,7 @@ type Input = {
   readonly reason: "auto" | "manual"
 }
 
-/**
- * `skipped` means there was nothing to compact, or the summarizer's context window is unknown for an automatic
- * compaction; `oversized` means the summary request would not fit the summarizer's context window.
- */
+/** `skipped` means there was nothing to compact; `oversized` means the summary request would not fit the summarizer. */
 export type Result = "completed" | "skipped" | "oversized" | "failed"
 
 const estimate = (value: unknown) => Token.estimate(JSON.stringify(value))
@@ -187,10 +184,6 @@ export const buildPrompt = (input: { readonly previousSummary?: string; readonly
 export const make = (dependencies: Dependencies) => {
   const config = settings(dependencies.config)
   const summarize = Effect.fn("SessionCompaction.summarize")(function* (input: Input) {
-    const context = input.model.route.defaults.limits?.context
-    const known = context !== undefined && context > 0
-    // A manual compaction still asks a model whose window is unknown, such as a configured model without a limit.
-    if (!known && input.reason === "auto") return "skipped" as const
     const selected = select(input.entries, config.tokens, input.reason === "manual")
     const previousSummary = input.entries.find((entry) => entry.message.type === "compaction")?.message
     if (!selected || (selected.head.length === 0 && previousSummary?.type !== "compaction")) return "skipped" as const
@@ -202,7 +195,10 @@ export const make = (dependencies: Dependencies) => {
       input.model.route.defaults.limits?.output || SUMMARY_OUTPUT_TOKENS,
       SUMMARY_OUTPUT_TOKENS,
     )
-    if (known && Token.estimate(summaryPrompt) > context - summaryOutput) return "oversized" as const
+    // A summarizer whose window is unknown, such as a configured model without a limit, is asked regardless.
+    const context = input.model.route.defaults.limits?.context
+    if (context !== undefined && context > 0 && Token.estimate(summaryPrompt) > context - summaryOutput)
+      return "oversized" as const
     const messageID = SessionMessage.ID.create()
     yield* dependencies.events.publish(SessionEvent.Compaction.Started, {
       sessionID: input.sessionID,

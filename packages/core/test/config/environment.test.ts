@@ -10,6 +10,7 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Global } from "@opencode-ai/core/global"
 import { Location } from "@opencode-ai/core/location"
+import { AgentV2 } from "@opencode-ai/core/agent"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { PluginV2 } from "@opencode-ai/core/plugin"
 import { PluginHost } from "@opencode-ai/core/plugin/host"
@@ -87,12 +88,13 @@ const loadJail = Effect.fn(function* (content: unknown, global?: unknown) {
   return yield* SessionRunnerModel.Service.pipe(Effect.provide(SessionRunnerModel.locationLayer))
 })
 
-const session = (model?: SessionV2.Info["model"]) =>
+const session = (model?: SessionV2.Info["model"], smallModel?: SessionV2.Info["smallModel"]) =>
   SessionV2.Info.make({
     id: SessionV2.ID.make("ses_jail_egress"),
     projectID: ProjectV2.ID.global,
     title: "test",
     model,
+    smallModel,
     cost: 0,
     tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
     time: { created: DateTime.makeUnsafe(0), updated: DateTime.makeUnsafe(0) },
@@ -140,6 +142,95 @@ describe("environment-supplied config", () => {
 
       expect(resolved).toMatchObject({ provider: providerID, id: modelID })
       expect(resolved.route.endpoint).toMatchObject({ baseURL: rendered.baseURL })
+    }),
+  )
+})
+
+describe("auxiliary models", () => {
+  const smallID = ModelV2.ID.make("accounts/fireworks/models/small-flash")
+  const agentID = ModelV2.ID.make("accounts/fireworks/models/agent-pick")
+  // The jail's provider with two more models, as a pool would configure a conversation's snapshotted small model.
+  const content = {
+    ...jail(rendered),
+    provider: {
+      "swxtch-egress": {
+        ...jail(rendered).provider["swxtch-egress"],
+        models: {
+          [modelID]: { name: "DeepSeek V4.1 Flash" },
+          [smallID]: { name: "Small flash" },
+          [agentID]: { name: "Agent pick" },
+        },
+      },
+    },
+  }
+  const primary = { providerID, id: modelID }
+
+  it.effect("resolves a V2 session's small model at the rendered proxy", () =>
+    Effect.gen(function* () {
+      const models = yield* loadJail(content)
+      const selected = session(primary, { providerID, id: smallID })
+
+      const resolved = yield* models.auxiliary({
+        session: selected,
+        agent: undefined,
+        primary: models.resolve(selected),
+        infer: false,
+      })
+
+      expect(resolved).toMatchObject({ provider: providerID, id: smallID })
+      expect(resolved.route.endpoint).toMatchObject({ baseURL: rendered.baseURL })
+      expect(yield* authorization(resolved)).toBe(`Bearer ${rendered.apiKey}`)
+    }),
+  )
+
+  it.effect("prefers the auxiliary agent's own model over the session small model", () =>
+    Effect.gen(function* () {
+      const models = yield* loadJail(content)
+      const selected = session(primary, { providerID, id: smallID })
+
+      const resolved = yield* models.auxiliary({
+        session: selected,
+        agent: { ...AgentV2.Info.empty(AgentV2.ID.make("title")), model: { providerID, id: agentID } },
+        primary: models.resolve(selected),
+        infer: true,
+      })
+
+      expect(resolved).toMatchObject({ provider: providerID, id: agentID })
+    }),
+  )
+
+  it.effect("falls back to the primary when no small model is selected or inferred", () =>
+    Effect.gen(function* () {
+      const models = yield* loadJail(content)
+      const selected = session(primary)
+
+      for (const infer of [false, true]) {
+        const resolved = yield* models.auxiliary({
+          session: selected,
+          agent: undefined,
+          primary: models.resolve(selected),
+          infer,
+        })
+        expect(resolved).toMatchObject({ provider: providerID, id: modelID })
+      }
+    }),
+  )
+
+  it.effect("fails without a substitute when the session small model is unavailable", () =>
+    Effect.gen(function* () {
+      const models = yield* loadJail(content)
+      const missing = ModelV2.ID.make("accounts/fireworks/models/missing")
+      const selected = session(primary, { providerID, id: missing })
+
+      const failure = yield* models
+        .auxiliary({ session: selected, agent: undefined, primary: models.resolve(selected), infer: true })
+        .pipe(Effect.flip)
+
+      expect(failure).toMatchObject({
+        _tag: "SessionRunnerModel.ModelUnavailableError",
+        providerID,
+        modelID: missing,
+      })
     }),
   )
 })
