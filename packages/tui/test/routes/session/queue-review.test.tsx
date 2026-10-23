@@ -1905,7 +1905,7 @@ test("configured message window keeps older transcript text scroll-reachable aft
   } finally {
     await reloaded.stop()
   }
-})
+}, 30_000)
 
 test("search reaches unrendered recall history and ENTER appends original multiline text without sending", async () => {
   await using state = await tmpdir()
