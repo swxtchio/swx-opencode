@@ -272,6 +272,7 @@ describe("PublicApi OpenAPI v2 errors", () => {
     const responses = spec.paths["/api/session/{sessionID}/compact"]?.post?.responses
 
     expect(componentName(responseRef(responses?.["500"]) ?? "")).toMatch(/^UnknownError\d*$/)
+    expect(componentNames(responses?.["409"])).toContain("ConflictError")
     expect(responses?.["503"]).toBeUndefined()
   })
 

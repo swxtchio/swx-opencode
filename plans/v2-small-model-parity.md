@@ -13,7 +13,8 @@ Authority: swxtchio/swx-abbe#1953 and the assigned task brief. The V1 behaviour 
 
 ## Auxiliary model selection
 
-`SessionRunnerModel` gains one resolver for title and compaction models, in V1's order:
+`SessionRunnerModel` gains one resolver for title and compaction models. It follows V1's order for the scopes V2
+has; V1's agent-level and global `small_model` have no V2 equivalent yet (#355). The order:
 1. the `title` or `compaction` agent's own `model`;
 2. the session's `smallModel`;
 3. for titles only, the catalog's small model for the turn's provider;
@@ -45,7 +46,11 @@ cannot fail an ordinary turn.
   - When the summarizer's context window is unknown (a config model with no `limit`, like the jail's
     egress model), it skips the fit check and sends the request.
   - A completed compaction answers 204. A session with no conversation is a 204 no-op.
-  - A failed summary or an unresolvable model answers a named error instead of 503.
+  - A failed summary or an unresolvable model answers `500 UnknownError` instead of 503.
+  - A session holding a V1 transcript, which V2 history never reads, is refused with `409 ConflictError` rather than
+    summarized without it (review round 1).
+  - An explicit resume requested during a manual compaction starts a drain after it instead of joining it (review
+    round 1).
 
 ## Proof
 

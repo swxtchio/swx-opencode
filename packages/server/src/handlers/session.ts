@@ -182,6 +182,9 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                 }),
               ),
             ),
+            Effect.catchTag("Session.CompactionUnsupportedError", (error) =>
+              Effect.fail(new ConflictError({ message: error.message, resource: error.sessionID })),
+            ),
             Effect.catchTag("Session.CompactionFailedError", (error) => {
               const ref = `err_${crypto.randomUUID().slice(0, 8)}`
               return Effect.logError("failed to compact session", { cause: error, ref }).pipe(

@@ -196,7 +196,7 @@ The V2 runner chooses a model for a session's title and its compaction summaries
 
 A selected model that is not available fails the work instead of being replaced.
 
-`POST /api/session/:id/compact` summarizes the session's current context once any active run ends. It returns `204` when the summary is recorded, or at once when there is nothing to compact. It returns `500` when the model returns no summary or the request does not fit its context window. [`SessionRunnerModel.auxiliary`](https://github.com/swxtchio/swx-opencode/blob/swxtch/packages/core/src/session/runner/model.ts) owns the selection.
+`POST /api/session/:id/compact` summarizes the session's current context once any active run ends. It returns `204` when the summary is recorded, or at once when there is nothing to compact. It returns `409` for a session holding a V1 transcript, which V2 compaction cannot read; use `POST /session/:id/summarize` for those. It returns `500` when the model returns no summary or the request does not fit its context window. [`SessionRunnerModel.auxiliary`](https://github.com/swxtchio/swx-opencode/blob/swxtch/packages/core/src/session/runner/model.ts) owns the selection.
 
 ---
 

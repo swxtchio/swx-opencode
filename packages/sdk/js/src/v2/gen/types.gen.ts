@@ -12688,6 +12688,10 @@ export type V2SessionCompactErrors = {
    */
   404: SessionNotFoundError
   /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
    * UnknownError
    */
   500: UnknownError1

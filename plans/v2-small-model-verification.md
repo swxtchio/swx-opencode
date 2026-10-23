@@ -24,6 +24,14 @@ external kill or a harness timeout.
 | V2 sessions read the stored small model, including a V1 patch | `session/info.ts`: drop `smallModel` from `fromRow` | HTTP: the same test |
 | Compact documents 500, not 503 | `protocol/groups/session.ts`: restore `ServiceUnavailableError` | OpenAPI: documents v2 session compaction failures |
 
+Review round 1 added these, by the same method:
+
+| Removed behaviour | Mutation | Test that failed |
+| --- | --- | --- |
+| An explicit resume during exclusive work drains after it | `run-coordinator.ts`: let `run` join an exclusive entry | coordinator: runs an explicit resume requested during exclusive work; runner: drains an explicit resume requested during a manual compaction |
+| Compaction refuses a session holding a V1 transcript | `runner/llm.ts`: drop the V1 `message` row check | HTTP: refuses V2 compaction of V1-created and native-created sessions |
+| Compact documents its 409 | `protocol/groups/session.ts`: drop `ConflictError` | OpenAPI: documents v2 session compaction failures |
+
 The runner, coordinator and environment tests are in `packages/core/test`. The HTTP and OpenAPI tests are in
 `packages/opencode/test/server`.
 

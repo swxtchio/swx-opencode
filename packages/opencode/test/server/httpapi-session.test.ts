@@ -1257,6 +1257,40 @@ describe("session HttpApi", () => {
   )
 
   it.instance(
+    "refuses V2 compaction of V1-created and native-created sessions holding a V1 transcript",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({
+          git: true,
+          init: (directory) => writeNativeTestProvider(directory, llm.url),
+        })
+        yield* awaitNativeModel(directory)
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const sessions = [
+          yield* createSession({ title: "V1-created transcript" }),
+          yield* createNativeSession(directory, SessionV2.ID.make("ses_compact_mixed")),
+        ]
+        for (const session of sessions) {
+          // The V1 producer writes the transcript V2 history never reads.
+          yield* createTextMessage(session.id, "V1 history")
+          const v1Messages = yield* requestJson<SessionV1.WithParts[]>(
+            pathFor(SessionPaths.messages, { sessionID: session.id }),
+            { headers },
+          )
+          expect(v1Messages.map((message) => message.info.role)).toEqual(["user"])
+
+          const compact = yield* request(`/api/session/${session.id}/compact`, { method: "POST", headers })
+          expect(compact.status).toBe(409)
+          expect(yield* responseJson(compact)).toMatchObject({ _tag: "ConflictError", resource: session.id })
+        }
+        expect(yield* llm.calls).toBe(0)
+      }).pipe(Effect.provide(TestLLMServer.layer)),
+    { git: true, config: { formatter: false, lsp: false } },
+    30_000,
+  )
+
+  it.instance(
     "returns pending for native admit-only work",
     () =>
       Effect.gen(function* () {

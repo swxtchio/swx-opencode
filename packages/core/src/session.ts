@@ -138,12 +138,22 @@ export class PromptConflictError extends Schema.TaggedErrorClass<PromptConflictE
 export const MessageNotFoundError = SessionRevert.MessageNotFoundError
 export type MessageNotFoundError = SessionRevert.MessageNotFoundError
 
+export class CompactionUnsupportedError extends Schema.TaggedErrorClass<CompactionUnsupportedError>()(
+  "Session.CompactionUnsupportedError",
+  { sessionID: SessionSchema.ID },
+) {
+  override get message() {
+    return `Session ${this.sessionID} has a V1 transcript, which V2 compaction cannot read; compact it with POST /session/${this.sessionID}/summarize`
+  }
+}
+
 export type Error =
   | NotFoundError
   | MessageDecodeError
   | OperationUnavailableError
   | PromptConflictError
   | CompactionFailedError
+  | CompactionUnsupportedError
 
 export interface Interface {
   readonly list: (input?: ListInput) => Effect.Effect<SessionSchema.Info[]>
@@ -199,8 +209,13 @@ export interface Interface {
     skill: string
     resume?: boolean
   }) => Effect.Effect<void, OperationUnavailableError>
-  /** Compacts the Session's context now. Completes once a summary is recorded, or when there is nothing to compact. */
-  readonly compact: (input: CompactInput) => Effect.Effect<void, NotFoundError | CompactionFailedError>
+  /**
+   * Compacts the Session's context now. Completes once a summary is recorded, or when there is nothing to compact, and
+   * refuses a Session holding a V1 transcript rather than summarizing only its V2 history.
+   */
+  readonly compact: (
+    input: CompactInput,
+  ) => Effect.Effect<void, NotFoundError | CompactionFailedError | CompactionUnsupportedError>
   readonly wait: (
     id: SessionSchema.ID,
   ) => Effect.Effect<SessionSchema.WaitResult, NotFoundError | OperationUnavailableError>
@@ -730,6 +745,7 @@ const layer = Layer.effect(
               (error) => new CompactionFailedError({ sessionID: input.sessionID, reason: error.message }),
             ),
           )
+        if (outcome === "unsupported") return yield* new CompactionUnsupportedError({ sessionID: input.sessionID })
         if (outcome === "oversized")
           return yield* new CompactionFailedError({
             sessionID: input.sessionID,

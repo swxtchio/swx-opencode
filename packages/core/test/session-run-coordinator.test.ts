@@ -544,4 +544,34 @@ describe("SessionRunCoordinator", () => {
       }),
     ),
   )
+
+  it.effect("runs an explicit resume requested during exclusive work after that work", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const forces: boolean[] = []
+        const operationGate = yield* Deferred.make<void>()
+        const operationStarted = yield* Deferred.make<void>()
+        const coordinator = yield* SessionRunCoordinator.make<string, never>({
+          drain: (_key, force) => Effect.sync(() => forces.push(force)),
+        })
+
+        const operation = yield* coordinator
+          .exclusive(
+            "session",
+            Deferred.succeed(operationStarted, undefined).pipe(Effect.andThen(Deferred.await(operationGate))),
+          )
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(operationStarted)
+        const resumed = yield* coordinator.run("session").pipe(Effect.forkChild)
+        for (let attempt = 0; attempt < 10; attempt++) yield* Effect.yieldNow
+        expect(forces).toEqual([])
+
+        yield* Deferred.succeed(operationGate, undefined)
+        yield* Fiber.join(operation)
+        yield* Fiber.join(resumed)
+        expect(forces).toEqual([true])
+        expect((yield* coordinator.active).has("session")).toBe(false)
+      }),
+    ),
+  )
 })

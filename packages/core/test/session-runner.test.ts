@@ -5354,4 +5354,39 @@ describe("SessionV2 auxiliary model work", () => {
       expect((yield* session.context(sessionID)).map((message) => message.type)).toEqual(["compaction"])
     }),
   )
+
+  it.effect("drains an explicit resume requested during a manual compaction after the compaction", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      response = fragmentFixture("text", "text-answer", ["The answer"]).completeEvents
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "The question" }), resume: false })
+      yield* session.resume(sessionID)
+
+      requests.length = 0
+      response = fragmentFixture("text", "text-summary", ["## Objective\n- Summarized"]).completeEvents
+      const gate = yield* Deferred.make<void>()
+      streamGate = gate
+      streamStarted = yield* Deferred.make<void>()
+      const compaction = yield* session.compact({ sessionID }).pipe(Effect.forkChild)
+      yield* awaitStreamStart(streamStarted)
+      const admitted = yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Follow-up" }),
+        resume: false,
+      })
+      const resumed = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      for (let attempt = 0; attempt < 20; attempt++) yield* Effect.yieldNow
+      expect(requests).toHaveLength(1)
+
+      streamGate = undefined
+      yield* Deferred.succeed(gate, undefined)
+      yield* Fiber.join(compaction)
+      yield* Fiber.join(resumed)
+
+      expect(requests).toHaveLength(2)
+      expect(userTexts(requests[1]).join("\n")).toContain("Follow-up")
+      expect(yield* session.wait(sessionID)).toMatchObject({ type: "completed", admittedSeq: admitted.admittedSeq })
+    }),
+  )
 })

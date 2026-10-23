@@ -6410,7 +6410,7 @@ export class Session3 extends HeyApiClient {
   /**
    * Compact session
    *
-   * Summarize the session's current context on its small model, after any active run. Responds once the summary is recorded, or at once when there is nothing to compact.
+   * Summarize the session's current context on its small model, after any active run. Responds once the summary is recorded, or at once when there is nothing to compact. A session holding a V1 transcript is refused with 409.
    */
   public compact<ThrowOnError extends boolean = false>(
     parameters: {

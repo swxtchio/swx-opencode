@@ -75,10 +75,11 @@ export type Error =
 export interface Interface {
   readonly resolve: (session: SessionSchema.Info) => Effect.Effect<Model, Error>
   /**
-   * Resolves the model a Session's titles or compaction summaries run on, in V1's order: the auxiliary agent's own
-   * model, the Session's small model, the catalog's small model for the primary's provider when `infer` is set, and
-   * then the primary itself, which is resolved only when it is needed. A selection that is configured but does not
-   * resolve fails instead of being substituted.
+   * Resolves the model a Session's titles or compaction summaries run on, in the order V1 uses for the scopes V2 has:
+   * the auxiliary agent's own model, the Session's small model, the catalog's small model for the primary's provider
+   * when `infer` is set, and then the primary itself, which is resolved only when it is needed. V1's agent-level and
+   * global `small_model` have no V2 equivalent yet (#355). A selection that is configured but does not resolve fails
+   * instead of being substituted.
    */
   readonly auxiliary: (input: {
     readonly session: SessionSchema.Info

@@ -227,7 +227,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
       HttpApiEndpoint.post("session.compact", "/api/session/:sessionID/compact", {
         params: { sessionID: Session.ID },
         success: HttpApiSchema.NoContent,
-        error: [SessionNotFoundError, UnknownError],
+        error: [ConflictError, SessionNotFoundError, UnknownError],
       })
         .middleware(sessionLocationMiddleware)
         .annotateMerge(
@@ -235,7 +235,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
             identifier: "v2.session.compact",
             summary: "Compact session",
             description:
-              "Summarize the session's current context on its small model, after any active run. Responds once the summary is recorded, or at once when there is nothing to compact.",
+              "Summarize the session's current context on its small model, after any active run. Responds once the summary is recorded, or at once when there is nothing to compact. A session holding a V1 transcript is refused with 409.",
           }),
         ),
     )
