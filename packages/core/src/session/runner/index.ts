@@ -5,6 +5,7 @@ import { Context, Effect } from "effect"
 import { SessionSchema } from "../schema"
 import type { ContextSnapshotDecodeError, MessageDecodeError } from "../error"
 import { SessionRunnerModel } from "./model"
+import type { SessionCompaction } from "../compaction"
 import type { SystemContext } from "../../system-context/index"
 import type { ToolOutputStore } from "../../tool-output-store"
 
@@ -23,6 +24,8 @@ export interface Interface {
     readonly sessionID: SessionSchema.ID
     readonly force: boolean
   }) => Effect.Effect<void, RunError>
+  /** Compacts the Session's current context once, outside a provider turn. */
+  readonly compact: (sessionID: SessionSchema.ID) => Effect.Effect<SessionCompaction.Result, RunError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SessionRunner") {}

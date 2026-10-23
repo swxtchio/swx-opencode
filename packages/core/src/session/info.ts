@@ -11,6 +11,17 @@ import { SessionTable } from "./sql"
 import { SessionMessage } from "./message"
 import { Snapshot } from "../snapshot"
 
+const defaultTitlePrefix = "New session - "
+
+export function defaultTitle(time: number) {
+  return `${defaultTitlePrefix}${new Date(time).toISOString()}`
+}
+
+/** Whether a Session still carries the title it was created with, which the runner replaces with a generated one. */
+export function isDefaultTitle(title: string) {
+  return new RegExp(`^${defaultTitlePrefix}\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$`).test(title)
+}
+
 export function fromRow(row: typeof SessionTable.$inferSelect): SessionSchema.Info {
   return SessionSchema.Info.make({
     id: SessionSchema.ID.make(row.id),
@@ -24,6 +35,9 @@ export function fromRow(row: typeof SessionTable.$inferSelect): SessionSchema.In
           providerID: ProviderV2.ID.make(row.model.providerID),
           variant: ModelV2.VariantID.make(row.model.variant ?? "default"),
         }
+      : undefined,
+    smallModel: row.small_model
+      ? { id: ModelV2.ID.make(row.small_model.id), providerID: ProviderV2.ID.make(row.small_model.providerID) }
       : undefined,
     cost: row.cost,
     tokens: {

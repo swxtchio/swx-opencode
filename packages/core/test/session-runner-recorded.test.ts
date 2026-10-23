@@ -98,6 +98,7 @@ const execution = Layer.effect(
       join: coordinator.join,
       resume: coordinator.run,
       wake: coordinator.wake,
+      compact: (sessionID) => coordinator.exclusive(sessionID, sessionRunner.compact(sessionID)),
       interrupt: coordinator.interrupt,
     })
   }),

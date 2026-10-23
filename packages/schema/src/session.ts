@@ -5,6 +5,7 @@ import { Agent } from "./agent"
 import { Location } from "./location"
 import { Model } from "./model"
 import { Project } from "./project"
+import { Provider } from "./provider"
 import { DateTimeUtcFromMillis, NonNegativeInt, optional, RelativePath } from "./schema"
 import { SessionEvent } from "./session-event"
 import { SessionID } from "./session-id"
@@ -16,6 +17,13 @@ export type ID = SessionID
 
 export const Event = SessionEvent
 
+// The model a session's titles and compaction summaries run on; the same shape V1 sessions record.
+export const SmallModel = Schema.Struct({
+  id: Model.ID,
+  providerID: Provider.ID,
+}).annotate({ identifier: "Session.SmallModel" })
+export interface SmallModel extends Schema.Schema.Type<typeof SmallModel> {}
+
 export interface Info extends Schema.Schema.Type<typeof Info> {}
 export const Info = Schema.Struct({
   id: ID,
@@ -23,6 +31,7 @@ export const Info = Schema.Struct({
   projectID: Project.ID,
   agent: Agent.ID.pipe(optional),
   model: Model.Ref.pipe(optional),
+  smallModel: SmallModel.pipe(optional),
   cost: Schema.Finite,
   tokens: Schema.Struct({
     input: Schema.Finite,

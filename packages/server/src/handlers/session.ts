@@ -72,6 +72,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
               id: ctx.payload.id,
               agent: ctx.payload.agent,
               model: ctx.payload.model,
+              smallModel: ctx.payload.smallModel,
               location: ctx.payload.location ?? { directory: AbsolutePath.make(process.cwd()) },
             }),
           }
@@ -181,14 +182,12 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                 }),
               ),
             ),
-            Effect.catchTag("Session.OperationUnavailableError", (error) =>
-              Effect.fail(
-                new ServiceUnavailableError({
-                  message: `Session ${error.operation} is not available yet`,
-                  service: `session.${error.operation}`,
-                }),
-              ),
-            ),
+            Effect.catchTag("Session.CompactionFailedError", (error) => {
+              const ref = `err_${crypto.randomUUID().slice(0, 8)}`
+              return Effect.logError("failed to compact session", { cause: error, ref }).pipe(
+                Effect.andThen(Effect.fail(new UnknownError({ message: error.message, ref }))),
+              )
+            }),
           )
           return HttpApiSchema.NoContent.make()
         }),

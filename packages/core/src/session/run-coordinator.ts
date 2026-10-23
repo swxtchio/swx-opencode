@@ -19,6 +19,11 @@ export interface Coordinator<Key, E> {
   readonly join: (key: Key, registration?: WaitRegistration) => Effect.Effect<Exit.Exit<void, E> | undefined>
   /** Registers one coalesced follow-up after newly recorded work. */
   readonly wake: (key: Key) => Effect.Effect<void>
+  /**
+   * Runs `operation` as the key's execution once no drain owns it. A drain never overlaps it, and work recorded while
+   * it runs drains after it.
+   */
+  readonly exclusive: <A, E2>(key: Key, operation: Effect.Effect<A, E2>) => Effect.Effect<A, E2>
   /** Stops active execution and waits for its cleanup. */
   readonly interrupt: (key: Key) => Effect.Effect<void>
 }
@@ -45,13 +50,19 @@ export const make = <Key, E>(options: {
       stopping: false,
     })
 
-    const start = (key: Key, entry: Entry<E>, force: boolean, successor = false) => {
+    const start = (
+      key: Key,
+      entry: Entry<E>,
+      force: boolean,
+      successor = false,
+      work: Effect.Effect<void, E> = Effect.suspend(() => options.drain(key, force)),
+    ) => {
       const ready = Deferred.makeUnsafe<void>()
       const settled = Deferred.makeUnsafe<Exit.Exit<void, E>>()
       entry.settled = settled
       const owner = fork(
         (successor ? Effect.yieldNow : Deferred.await(ready)).pipe(
-          Effect.andThen(Effect.suspend(() => options.drain(key, force))),
+          Effect.andThen(work),
           Effect.onExit((exit) => Effect.sync(() => settle(key, entry, settled, exit))),
           Effect.exit,
           Effect.asVoid,
@@ -148,6 +159,19 @@ export const make = <Key, E>(options: {
         start(key, next, false)
       })
 
+    const exclusive = <A, E2>(key: Key, operation: Effect.Effect<A, E2>): Effect.Effect<A, E2> =>
+      Effect.uninterruptibleMask((restore) => {
+        const entry = active.get(key)
+        if (entry !== undefined) return restore(Deferred.await(entry.done).pipe(Effect.exit, Effect.andThen(exclusive(key, operation))))
+
+        const next = makeEntry()
+        active.set(key, next)
+        const result = Deferred.makeUnsafe<A, E2>()
+        // The operation's own outcome goes to its caller; the entry settles as a successful execution either way.
+        start(key, next, false, false, operation.pipe(Effect.onExit((exit) => Deferred.done(result, exit)), Effect.ignore))
+        return restore(Deferred.await(result))
+      })
+
     const interrupt = (key: Key): Effect.Effect<void> =>
       Effect.suspend(() => {
         const entry = active.get(key)
@@ -157,5 +181,5 @@ export const make = <Key, E>(options: {
         return Fiber.interrupt(entry.owner)
       })
 
-    return { active: Effect.sync(() => new Set(active.keys())), run, join, wake, interrupt }
+    return { active: Effect.sync(() => new Set(active.keys())), run, join, wake, exclusive, interrupt }
   })
