@@ -1181,13 +1181,14 @@ describe("session HttpApi", () => {
   )
 
   it.instance(
-    "runs a V2 session's title and manual compaction on its small model",
+    "runs a V2 session's title and manual compaction on its created and patched small models",
     () =>
       Effect.gen(function* () {
         const llm = yield* TestLLMServer
         const directory = yield* tmpdirScoped({
           git: true,
-          init: (directory) => writeNativeTestProvider(directory, llm.url, ["test-model", "small-model"]),
+          init: (directory) =>
+            writeNativeTestProvider(directory, llm.url, ["test-model", "small-model", "patched-model"]),
         })
         yield* awaitNativeModel(directory)
         const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
@@ -1224,7 +1225,20 @@ describe("session HttpApi", () => {
         ).toBe("E2E Title")
         expect((yield* llm.hits).filter(isTitleHit).map((hit) => hit.body.model)).toEqual(["small-model"])
 
-        yield* llm.textMatch(model("small-model"), "## Objective\n- Explain per-session configuration")
+        // A V1 patch of a V2 session's small model reaches the V2 runner's next auxiliary work.
+        const patched = yield* requestJson<Session.Info>(pathFor(SessionPaths.update, { sessionID: session.id }), {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ smallModel: { providerID: "test", id: "patched-model" } }),
+        })
+        expect(String(patched.smallModel?.id)).toBe("patched-model")
+        expect(
+          String(
+            (yield* requestJson<{ data: SessionV2.Info }>(`/api/session/${session.id}`, { headers })).data.smallModel
+              ?.id,
+          ),
+        ).toBe("patched-model")
+        yield* llm.textMatch(model("patched-model"), "## Objective\n- Explain per-session configuration")
         const compact = yield* request(`/api/session/${session.id}/compact`, { method: "POST", headers })
         expect(compact.status).toBe(204)
         const context = yield* requestJson<{ data: SessionMessage.Message[] }>(`/api/session/${session.id}/context`, {
@@ -1234,7 +1248,7 @@ describe("session HttpApi", () => {
           { type: "compaction", reason: "manual", summary: "## Objective\n- Explain per-session configuration" },
         ])
         expect((yield* llm.inputs).map((input) => input.model).sort()).toEqual(
-          ["small-model", "small-model", "test-model"].sort(),
+          ["patched-model", "small-model", "test-model"].sort(),
         )
         expect(yield* llm.misses).toEqual([])
       }).pipe(Effect.provide(TestLLMServer.layer)),

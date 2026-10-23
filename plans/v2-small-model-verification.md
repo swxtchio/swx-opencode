@@ -20,7 +20,8 @@ external kill or a harness timeout.
 | The resolver reads the session small model | `runner/model.ts`: read only the agent model | environment: resolves a session's small model; fails without a substitute |
 | The agent's model outranks the session small model | `runner/model.ts`: swap the precedence | environment: prefers the auxiliary agent's own model |
 | The resolver falls back to the primary | `runner/model.ts`: fail instead of using the primary | environment: falls back to the primary |
-| V2 create records `smallModel` | `server/handlers/session.ts`: drop the payload field | HTTP: runs a V2 session's title and manual compaction on its small model |
+| V2 create records `smallModel` | `server/handlers/session.ts`: drop the payload field | HTTP: runs a V2 session's title and manual compaction on its created and patched small models |
+| V2 sessions read the stored small model, including a V1 patch | `session/info.ts`: drop `smallModel` from `fromRow` | HTTP: the same test |
 | Compact documents 500, not 503 | `protocol/groups/session.ts`: restore `ServiceUnavailableError` | OpenAPI: documents v2 session compaction failures |
 
 The runner, coordinator and environment tests are in `packages/core/test`. The HTTP and OpenAPI tests are in
