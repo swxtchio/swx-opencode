@@ -140,6 +140,7 @@ async function startSession(
   }
   const requests: string[] = []
   const paths: string[] = []
+  const messageLimits: number[] = []
   const executions: string[] = []
   const selections: unknown[] = []
   const enhancements: EnhancementRequest[] = []
@@ -221,11 +222,14 @@ async function startSession(
       } as Session)
     const messageSessionID = url.pathname.match(/^\/session\/(ses_[^/]+)\/message$/)?.[1]
     if (messageSessionID) {
-      if (url.searchParams.get("limit") === "0") historyReads.push(messageSessionID)
-      if (url.searchParams.get("limit") === "0") {
+      const limit = url.searchParams.get("limit")
+      if (limit === "0") historyReads.push(messageSessionID)
+      if (limit === "0") {
         return json(options.historyMessagesBySession?.[messageSessionID] ?? [])
       }
-      return json(options.messagesBySession?.[messageSessionID] ?? options.messages ?? [transcript])
+      if (limit) messageLimits.push(Number(limit))
+      const messages = options.messagesBySession?.[messageSessionID] ?? options.messages ?? [transcript]
+      return json(limit ? messages.slice(-Number(limit)) : messages)
     }
     if (url.pathname === `/session/${activeSessionID}/queue/release`) return new Response(null, { status: 204 })
     if (url.pathname.startsWith(`/session/${activeSessionID}/queue`)) return json(queue.items)
@@ -306,6 +310,7 @@ async function startSession(
     renderer: setup,
     requests,
     paths,
+    messageLimits,
     historyReads,
     executions,
     selections,
@@ -1854,6 +1859,54 @@ test("history from a new-session submission is owned by the created session", as
   }
 }, 20_000)
 
+test("configured message window keeps older transcript text scroll-reachable after reload", async () => {
+  await using state = await tmpdir()
+  const messageWindow = 130
+  const messages = Array.from({ length: 145 }, (_, index) => {
+    const id = `msg_window_${String(index).padStart(3, "0")}`
+    return {
+      info: { ...transcript.info, id, time: { created: index + 1 } },
+      parts: [
+        {
+          ...transcript.parts[0],
+          id: `prt_${id}`,
+          messageID: id,
+          text: `loaded-window-${String(index).padStart(3, "0")}`,
+        },
+      ],
+    }
+  })
+  const options = {
+    state: state.path,
+    queue: [],
+    messagesBySession: { [sessionID]: messages },
+    tuiConfig: createTuiResolvedConfig({ plugin_enabled: {}, message_window: messageWindow }),
+  }
+  const checkScroll = async (app: Awaited<ReturnType<typeof startSession>>) => {
+    await until(async () => (await screen(app)).join("\n").includes("loaded-window-144"), "the latest message")
+    app.dispatch("session.first")
+    await until(async () => (await screen(app)).join("\n").includes("loaded-window-015"), "the oldest loaded message")
+    const frame = (await screen(app)).join("\n")
+    expect(app.messageLimits).toContain(messageWindow)
+    expect(frame).toContain("loaded-window-015")
+    expect(frame).not.toContain("loaded-window-014")
+  }
+
+  const app = await startSession(options)
+  try {
+    await checkScroll(app)
+  } finally {
+    await app.stop()
+  }
+
+  const reloaded = await startSession(options)
+  try {
+    await checkScroll(reloaded)
+  } finally {
+    await reloaded.stop()
+  }
+}, 30_000)
+
 test("search reaches unrendered recall history and ENTER appends original multiline text without sending", async () => {
   await using state = await tmpdir()
   const original = "older-unrendered-history-token\noriginal second line"
@@ -1880,16 +1933,21 @@ test("search reaches unrendered recall history and ENTER appends original multil
     seeded.prompts.forEach((prompt) => prompt.answer(json(transcript)))
     await seeded.stop()
   }
+  const recalled = promptMessage(seeded.prompts[0]!, sessionID, 0)
   const app = await startSession({
     state: state.path,
     queue: [],
+    messagesBySession: { [sessionID]: [recalled, transcript] },
+    historyMessagesBySession: { [sessionID]: [recalled, transcript] },
     serverConfig: { machine_message_markers: { hold: [{ type: "prefix", value: "CUSTOM-HOLD:" }] } },
+    tuiConfig: createTuiResolvedConfig({ plugin_enabled: {}, message_window: 1 }),
   })
   try {
     await until(
       async () => (await screen(app)).join("\n").includes("already in the transcript"),
       "only the newer loaded transcript",
     )
+    expect(app.messageLimits).toContain(1)
     expect((await screen(app)).join("\n")).not.toContain("older-unrendered-history-token")
     app.renderer.mockInput.pressArrow("up")
     await app.renderer.renderOnce()
