@@ -24,6 +24,7 @@ export const Event = Catalog.Event
 type Data = {
   providers: Map<ProviderV2.ID, ProviderRecord>
   defaultModel?: DefaultModel
+  preferredProviders?: ProviderV2.ID[]
 }
 
 export type Draft = {
@@ -40,6 +41,8 @@ export type Draft = {
     default: {
       get: () => DefaultModel | undefined
       set: (providerID: ProviderV2.ID, modelID: ModelV2.ID) => void
+      /** Providers, in order, whose newest available model is the default when none is set (V1's configured providers). */
+      prefer: (providerIDs: readonly ProviderV2.ID[]) => void
     }
   }
 }
@@ -152,6 +155,9 @@ const layer = Layer.effect(
               set: (providerID, modelID) => {
                 draft.defaultModel = { providerID, modelID }
               },
+              prefer: (providerIDs) => {
+                draft.preferredProviders = [...providerIDs]
+              },
             },
           },
         }
@@ -222,9 +228,14 @@ const layer = Layer.effect(
             }
           }
 
+          // Like V1, the first preferred provider with an available model supplies the default.
+          const available = yield* result.model.available()
+          const preferred = (state.get().preferredProviders ?? [])
+            .map((providerID) => available.filter((model) => model.providerID === providerID))
+            .find((models) => models.length > 0)
           return Option.getOrUndefined(
             pipe(
-              yield* result.model.available(),
+              preferred ?? available,
               Array.sortWith((item) => item.time.released, Order.flip(Order.Number)),
               Array.head,
             ),
