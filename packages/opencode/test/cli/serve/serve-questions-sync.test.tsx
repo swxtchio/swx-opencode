@@ -8,6 +8,7 @@ import path from "node:path"
 import { testRender } from "@opentui/solid"
 import { onMount } from "solid-js"
 import { createOpencodeClient, type GlobalEvent } from "@opencode-ai/sdk/v2"
+import { TuiConfig } from "@opencode-ai/tui/config"
 import { ArgsProvider } from "@opencode-ai/tui/context/args"
 import { ExitProvider } from "@opencode-ai/tui/context/exit"
 import { KVProvider } from "@opencode-ai/tui/context/kv"
@@ -145,21 +146,23 @@ const attach = Effect.fn("attach")(function* (url: string, directory: string) {
       >
         <TuiTerminalEnvironmentProvider value={{ platform: "linux" }}>
           <TuiStartupProvider value={{ skipInitialLoading: false }}>
-            <ArgsProvider>
-              <KVProvider>
-                <SDKProvider url={url} directory={directory} events={relay.source}>
-                  <PermissionProvider>
-                    <ProjectProvider>
-                      <ExitProvider exit={() => {}}>
-                        <SyncProvider>
-                          <Probe />
-                        </SyncProvider>
-                      </ExitProvider>
-                    </ProjectProvider>
-                  </PermissionProvider>
-                </SDKProvider>
-              </KVProvider>
-            </ArgsProvider>
+            <TuiConfig.TuiConfigProvider config={TuiConfig.resolve({}, { terminalSuspend: process.platform !== "win32" })}>
+              <ArgsProvider>
+                <KVProvider>
+                  <SDKProvider url={url} directory={directory} events={relay.source}>
+                    <PermissionProvider>
+                      <ProjectProvider>
+                        <ExitProvider exit={() => {}}>
+                          <SyncProvider>
+                            <Probe />
+                          </SyncProvider>
+                        </ExitProvider>
+                      </ProjectProvider>
+                    </PermissionProvider>
+                  </SDKProvider>
+                </KVProvider>
+              </ArgsProvider>
+            </TuiConfig.TuiConfigProvider>
           </TuiStartupProvider>
         </TuiTerminalEnvironmentProvider>
       </TuiPathsProvider>

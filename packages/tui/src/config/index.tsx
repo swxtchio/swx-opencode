@@ -22,6 +22,10 @@ export const LeaderTimeoutDefault = 2000
 export const LeaderTimeout = Schema.Int.check(Schema.isGreaterThan(0)).annotate({
   description: "Leader key timeout in milliseconds",
 })
+export const MessageWindowDefault = 100
+export const MessageWindow = Schema.Int.check(Schema.isGreaterThan(0)).annotate({
+  description: "Maximum number of messages retained in each session's loaded transcript",
+})
 
 export const ScrollSpeed = Schema.Number.check(Schema.isGreaterThanOrEqualTo(0.001))
 export const ScrollAcceleration = Schema.Struct({
@@ -67,6 +71,7 @@ export const Info = Schema.Struct({
   keybinds: Schema.optional(TuiKeybind.KeybindOverrides),
   plugin: Schema.optional(Schema.Array(PluginSpec)),
   plugin_enabled: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
+  message_window: Schema.optional(MessageWindow),
   leader_timeout: Schema.optional(LeaderTimeout),
   attention: Schema.optional(Attention),
   prompt: Schema.optional(Prompt),
@@ -79,7 +84,10 @@ export const Info = Schema.Struct({
 })
 export type Info = Schema.Schema.Type<typeof Info>
 
-export type Resolved = Omit<Info, "attention" | "keybinds" | "leader_timeout" | "mouse" | "cursor"> & {
+export type Resolved = Omit<
+  Info,
+  "attention" | "keybinds" | "leader_timeout" | "mouse" | "cursor" | "message_window"
+> & {
   attention: {
     enabled: boolean
     notifications: boolean
@@ -90,6 +98,7 @@ export type Resolved = Omit<Info, "attention" | "keybinds" | "leader_timeout" | 
   }
   keybinds: TuiKeybind.BindingLookupView
   leader_timeout: number
+  message_window: number
   mouse: boolean
   cursor?: {
     style: "block" | "underline" | "line" | "default"
@@ -129,6 +138,7 @@ export function resolve(input: Info, options: ResolveOptions): Resolved {
       bindingDefaults: TuiKeybind.bindingDefaults(),
     }),
     leader_timeout: input.leader_timeout ?? LeaderTimeoutDefault,
+    message_window: input.message_window ?? MessageWindowDefault,
     mouse: input.mouse ?? true,
     cursor: input.cursor
       ? {
