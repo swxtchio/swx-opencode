@@ -185,6 +185,19 @@ Omitting `model` keeps the primary selection; omitting `smallModel` keeps the st
 
 `POST /session/:id/fork` carries the source session's stored `smallModel` into the fork. [`Session.fork`](https://github.com/swxtchio/swx-opencode/blob/swxtch/packages/opencode/src/session/session.ts) owns this inheritance.
 
+V2 sessions also accept `smallModel` on `POST /api/session`, in the same shape, and expose it on `GET /api/session/:id`. A V1 `PATCH /session/:id` changes it for a V2 session too.
+
+The V2 runner chooses a model for a session's title and its compaction summaries in this order:
+
+1. the `title` or `compaction` agent's own `model`;
+2. the session's `smallModel`;
+3. for titles only, a small model inferred for the turn's provider;
+4. the turn's model.
+
+A selected model that is not available fails the work instead of being replaced.
+
+`POST /api/session/:id/compact` summarizes the session's current context once any active run ends. It returns `204` when the summary is recorded, or at once when there is nothing to compact. It returns `500` when the model returns no summary or the request does not fit its context window. [`SessionRunnerModel.auxiliary`](https://github.com/swxtchio/swx-opencode/blob/swxtch/packages/core/src/session/runner/model.ts) owns the selection.
+
 ---
 
 ### Messages

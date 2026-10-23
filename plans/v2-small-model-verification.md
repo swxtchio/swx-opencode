@@ -1,6 +1,6 @@
 # V2 small-model regression evidence
 
-Recorded 2026-10-23 on Linux x64 with Bun 1.4.2, against this branch's implementation commit `db91cf891d` and its
+Recorded 2026-10-23 on Linux ARM64 with Bun 1.4.2, against this branch's implementation commit `db91cf891d` and its
 tests. For each test, one production mutation removed the behaviour it guards. The focused test then ran and was
 restored afterwards. Every run ended in an ordinary assertion failure inside the test's own bound. None needed an
 external kill or a harness timeout.

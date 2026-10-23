@@ -218,6 +218,14 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Features
 
+- **#354** V2 sessions reach small-model parity with V1 (swxtchio/swx-abbe#1953):
+  - `POST /api/session` takes `smallModel`.
+  - The V2 runner titles a new session with a new durable `session.next.titled` event.
+  - Automatic and overflow summaries run on the session's auxiliary model: the `compaction` agent's model, else the
+    session's small model, else the turn's model.
+  - `POST /api/session/:id/compact` replaces its 503 with manual compaction. It is exclusive per session and returns
+    204, or 500 when no summary can be produced.
+  - See `specs/v2/session.md` and `specs/v2/schema-changelog.md`. _Fork-only._
 - **#348** Add a configurable `message_window` setting for each session's loaded transcript, applying it consistently to message fetch, hydration reconciliation and part cleanup, and live-update trimming; keep recall-backed search independent of the loaded window and document the default and memory trade-off (swxtchio/swx-opencode#65). _Fork-only._
 - **#297** Show the selected Ctrl+r history entry's complete original prompt in a wrapped, page-scrollable preview while
   keeping all other entries as one-line summaries. ENTER still appends the selected original prompt to the existing

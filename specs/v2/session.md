@@ -118,7 +118,6 @@ Current Context Epoch follow-ups:
 
 - Add configured, remote, and nested instruction sources with explicit precedence and removal semantics.
 - Add durable post-crash continuation recovery for promoted or provider-dispatched work.
-- Add explicit manual compaction on top of automatic request-budget compaction.
 - Add operational metrics for observation latency, unavailable sources, contention, baseline size, and chronological-update growth.
 - Consider watcher-backed per-file caching only if measurements show direct safe-boundary observation is too expensive.
 - Expose plugin-defined Context Sources only after plugin reload and scoped cleanup semantics are designed.
@@ -133,6 +132,12 @@ Compaction keeps the full transcript durable while replacing its active model re
 `session.next.compaction.started.1` durably identifies the attempt. Compaction deltas are live-only progress. `session.next.compaction.ended.1` durably stores the final summary and serialized recent context; only this completed event projects a model-visible compaction message. On the next provider attempt, the runner observes that completed compaction and directly renders a fresh Context Epoch baseline. A failed or interrupted attempt therefore leaves the previous history boundary active.
 
 Repeated compactions update the previous structured summary with newly compacted messages. The runner then reloads projected history and executes the original pending turn.
+
+Whether compaction is due is measured against the turn's model. The summary itself runs on the Session's auxiliary model, resolved only when a summary is due: the `compaction` agent's own model, then the Session's small model, then the turn's model. When the summarizer's context window is unknown, the summary request is sent without a fit check.
+
+A manual compaction (`POST /api/session/:sessionID/compact`) runs through the Session's coordinator as an exclusive operation. It starts only after any active drain settles, and work recorded while it runs drains after it. It summarizes the current context once and does not continue a turn. When the whole conversation fits the keep budget, it summarizes all of it and keeps no recent context, as V1's manual compaction does. A Session with nothing to compact completes without a model request. A summary the model does not return, or one that cannot fit its window, fails the request by name.
+
+The runner titles a root Session that still has its default title when the Session's first turn has exactly one user message and the `title` agent exists. The title runs alongside the drain's first provider turn, on the `title` agent's own model, else the Session's small model, else a small model inferred for the turn's provider, else the turn's model. It is recorded with `session.next.titled.1`. The drain awaits the title before it settles, and a title failure is logged without failing the drain.
 
 When a provider rejects a request as context overflow before durable assistant output or tool execution, the runner attempts one overflow-triggered compaction even when the local estimate did not predict pressure. A completed checkpoint rebuilds the same logical provider turn with one remaining physical attempt. A second overflow, unavailable compaction, or overflow after durable output becomes the ordinary terminal failure; recovery never loops or replays partial side effects. Deterministic old tool-result pruning remains a separate follow-up.
 

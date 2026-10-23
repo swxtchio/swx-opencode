@@ -1,5 +1,12 @@
 # V2 Schema Changelog
 
+## 2026-10-23: Add V2 Session Small Models, Titles and Manual Compaction
+
+- Add optional `smallModel: { providerID, id }` to `POST /api/session` and `Session.Info`, stored in the existing `session.small_model` column. That column was added for V1 sessions, so no migration is needed. A V1 `PATCH /session/:id` with `smallModel` now takes effect for V2 sessions too.
+- Add the durable `session.next.titled.1` event, which records a generated title and projects it onto the Session row. It projects no message. Replaying older history is unaffected.
+- Replace the `503 ServiceUnavailableError` on `POST /api/session/:sessionID/compact` with manual compaction: `204` once a summary is recorded or when there is nothing to compact, and `500 UnknownError` when no summary can be produced. Its events are the existing `session.next.compaction.started.1` and `.ended.1`, with `reason: "manual"`.
+- Regenerate the Promise, Effect and legacy JavaScript client contracts.
+
 ## 2026-10-10: Add Native Session Completion Wait
 
 - Change `POST /api/session/:sessionID/wait` to return `200 { data: Session.WaitResult }` for established idle, pending, completed, failed, and interrupted outcomes; retain `503` when the committed native state cannot establish the outcome.
