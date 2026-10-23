@@ -16,6 +16,7 @@ import { EventV2 } from "../../event"
 import { Location } from "../../location"
 import { ModelV2 } from "../../model"
 import { PermissionV2 } from "../../permission"
+import { PluginInternal } from "../../plugin/internal"
 import { ProviderV2 } from "../../provider"
 import { QuestionV2 } from "../../question"
 import { SystemContext } from "../../system-context/index"
@@ -99,6 +100,7 @@ const layer = Layer.effect(
     const agents = yield* AgentV2.Service
     const tools = yield* ToolRegistry.Service
     const models = yield* SessionRunnerModel.Service
+    const plugins = yield* PluginInternal.Service
     const store = yield* SessionStore.Service
     const location = yield* Location.Service
     const systemContext = yield* SystemContextRegistry.Service
@@ -184,6 +186,9 @@ const layer = Layer.effect(
       const session = yield* getSession(sessionID)
       if (session.location.directory !== location.directory || session.location.workspaceID !== location.workspaceID)
         return yield* Effect.interrupt
+      // The Location boots its plugins in the background, and a drain can start as the Location does: the agent,
+      // model, tools and guidance below are only complete once that boot has ended.
+      yield* plugins.ready
       const agent = yield* agents.select(session.agent)
       const initialized = yield* SessionContextEpoch.initialize(db, loadSystemContext(agent), session.id)
       const toolFibers = yield* FiberSet.make<void, ToolOutputStore.Error>()
@@ -439,6 +444,7 @@ export const node = makeLocationNode({
     AgentV2.node,
     ToolRegistry.node,
     SessionRunnerModel.node,
+    PluginInternal.node,
     SessionStore.node,
     Location.node,
     SystemContextRegistry.node,
