@@ -101,4 +101,11 @@ The Abbe handoff was delivered by firstmate. This task reported the gap, and fir
 - the downloaded-byte check, and the arm64 jail rig pass in all three modes;
 - the x64-rig caveat and the #352 gap.
 
-This task holds no Abbe receipt of its own; delivery rests on firstmate's relay record.
+The relay was also passed to Abbe as `/tmp/opencode/abbe-rel4.md`, which is byte-identical to the archived relay.
+
+No Abbe task wake log was appended. Abbe's captain-level reply `p1792787150-3857348-2b5c` ruled that peer homes never write each other's runtime state. It withdrew the append plan and named two records as the handoff's read-back receipt. Copies of both are under `delivery/`:
+
+1. **Abbe's acknowledgment, `p1792786679-2709706-0cf3`.** Its sender proof record, `/home/byates/fm-abbe/state/peer-proof/p1792786679-2709706-0cf3`, names `from_home=/home/byates/fm-abbe` and `to_home=/home/byates/fm-llmrouter`. It was created at 2026-10-23T20:18:00Z with digest `12ffce3d…59af`. The record holds metadata and a digest only. Its acknowledgment content is as relayed in firstmate's `data/opencode-release-cut-4/fix-round-1-addendum.md`; this task did not read the message body.
+2. **The verbatim citation in Abbe's bump brief.** The brief is `/home/byates/fm-abbe/data/abbe-mvp-design-crew/bump-1951-cd3f0ce2.md`, for crew `abbe-mvp-design-crew`, with SHA-256 `5e9d2835…bdb5`. Line 7 cites `/tmp/opencode/abbe-rel4.md`. Lines 6 and 8 restate the tag, source and #350, and the arm64-only rig pass with x64 not rig-tested. The brief also directs Abbe to run the x64 rig on `abbe-build-001`.
+
+The ruling's own sender proof record, `p1792787150-3857348-2b5c`, was created at 20:25:50Z. This task wrote nothing into `/home/byates/fm-abbe`.
