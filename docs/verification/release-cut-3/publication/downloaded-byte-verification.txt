@@ -1,0 +1,8 @@
+opencode-linux-arm64.tar.gz: OK
+opencode-linux-x64.tar.gz: OK
+arm64 archive cmp identical to native-tested candidate
+x64 archive cmp identical to native-tested candidate
+arm64 74f1e72900f83ca13fc70a20bb24a2d7ca248ea155230012d053ad0ac4436e3f  opencode
+arm64 0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42  libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so
+x64 20f3ed62b6d919a5b241212485c2e4ded6c58f8a3e9f4b0e66eca70d396994f9  opencode
+x64 977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5  libfff_c-977a96fc9911edd8cabacb098e90229c6a2dde7384f3291e5beccaf1ee93fef5.so
