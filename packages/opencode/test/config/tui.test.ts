@@ -157,6 +157,20 @@ it.instance("loads the prompt enhancement model from the dedicated tui config", 
   ),
 )
 
+it.instance("loads the message window from the dedicated tui config", () =>
+  withCleanState(
+    Effect.gen(function* () {
+      const fs = yield* FSUtil.Service
+      const test = yield* TestInstance
+
+      expect((yield* getTuiConfig(test.directory)).message_window).toBe(100)
+      yield* fs.writeJson(path.join(test.directory, "tui.json"), { message_window: 175 })
+
+      expect((yield* getTuiConfig(test.directory)).message_window).toBe(175)
+    }),
+  ),
+)
+
 it.instance("resolves attention config defaults and overrides", () =>
   withCleanState(
     Effect.gen(function* () {

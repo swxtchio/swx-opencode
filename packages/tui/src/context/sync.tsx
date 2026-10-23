@@ -29,6 +29,7 @@ import { useTuiStartup } from "./runtime"
 import { createSimpleContext } from "./helper"
 import { useExit } from "./exit"
 import { useArgs } from "./args"
+import { useTuiConfig } from "../config"
 import { batch, onMount } from "solid-js"
 import path from "path"
 import { useKV } from "./kv"
@@ -84,6 +85,7 @@ export const {
   name: "Sync",
   init: () => {
     const startup = useTuiStartup()
+    const tuiConfig = useTuiConfig()
     const kv = useKV()
     const permission = usePermission()
     const [store, setStore] = createStore<{
@@ -376,7 +378,7 @@ export const {
             }),
           )
           const updated = store.message[event.properties.info.sessionID]
-          if (updated.length > 100) {
+          if (updated.length > tuiConfig.message_window) {
             const oldest = updated[0]
             batch(() => {
               setStore(
@@ -669,7 +671,7 @@ export const {
           const task = (async () => {
             const [session, messages, todo, diff, queue] = await Promise.all([
               sdk.client.session.get({ sessionID }, { throwOnError: true }),
-              sdk.client.session.messages({ sessionID, limit: 100 }),
+              sdk.client.session.messages({ sessionID, limit: tuiConfig.message_window }),
               sdk.client.session.todo({ sessionID }),
               sdk.client.session.diff({ sessionID }),
               sdk.client.session.queue.list({ sessionID }),
@@ -697,8 +699,8 @@ export const {
                   ),
                 )
                 infos.sort(compareMessage)
-                const removed = infos.slice(0, -100)
-                const visible = infos.slice(-100)
+                const removed = infos.slice(0, -tuiConfig.message_window)
+                const visible = infos.slice(-tuiConfig.message_window)
                 const visibleIDs = new Set(visible.map((message) => message.id))
                 for (const message of messages.data ?? []) {
                   if (!visibleIDs.has(message.info.id)) {

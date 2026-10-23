@@ -2,6 +2,7 @@
 import { expect, test } from "bun:test"
 import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../../fixture/fixture"
+import { createTuiResolvedConfig } from "../../../fixture/tui-runtime"
 import { json, mount, wait } from "./sync-fixture"
 
 const sessionID = "ses_hydration_race"
@@ -241,6 +242,105 @@ test("live messages merged during hydration retain the 100 message window", asyn
     expect(sync.data.message[sessionID].at(-1)?.id).toBe(live.id)
     expect(sync.data.message[sessionID].some((message) => message.id === "msg_000")).toBe(false)
     expect(sync.data.part.msg_000).toBeUndefined()
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("configured message window covers fetch, hydration, live updates, and part eviction", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+
+  const messageWindow = 135
+  let resolveMessages!: (response: Response) => void
+  const messages = new Promise<Response>((resolve) => {
+    resolveMessages = resolve
+  })
+  let requested = false
+  let requestedLimit = 0
+  const { app, emit, sync } = await mount(
+    (url) => {
+      if (url.pathname === `/session/${sessionID}`) return json(session)
+      if (url.pathname === `/session/${sessionID}/message`) {
+        requested = true
+        requestedLimit = Number(url.searchParams.get("limit"))
+        return messages
+      }
+      if (url.pathname === `/session/${sessionID}/todo` || url.pathname === `/session/${sessionID}/diff`) return json([])
+      return undefined
+    },
+    tmp.path,
+    true,
+    undefined,
+    createTuiResolvedConfig({ message_window: messageWindow }),
+  )
+
+  try {
+    const hydrate = sync.session.sync(sessionID)
+    await wait(() => requested)
+    const live = {
+      ...assistant,
+      id: "msg_z_live",
+    }
+    emit(global({ id: "evt_live", type: "message.updated", properties: { sessionID, info: live } }))
+    emit(
+      global({
+        id: "evt_live_part",
+        type: "message.part.updated",
+        properties: {
+          sessionID,
+          time: 2,
+          part: { id: "prt_msg_z_live", sessionID, messageID: live.id, type: "text", text: "live part" },
+        },
+      }),
+    )
+    await wait(() => sync.data.part[live.id]?.[0]?.type === "text")
+
+    const history = Array.from({ length: messageWindow }, (_, index) => {
+      const id = `msg_${String(index).padStart(3, "0")}`
+      return {
+        info: { ...assistant, id },
+        parts: [{ id: `prt_${id}`, sessionID, messageID: id, type: "text", text: id }],
+      }
+    })
+    resolveMessages(json(history.slice(-requestedLimit)))
+    await hydrate
+
+    expect(requestedLimit).toBe(messageWindow)
+    expect(sync.data.message[sessionID].map((message) => message.id)).toEqual([
+      ...history.slice(1).map((message) => message.info.id),
+      live.id,
+    ])
+    expect(sync.data.part[history[0]!.info.id]).toBeUndefined()
+    expect(sync.data.part[history[1]!.info.id]?.[0]).toMatchObject({ text: history[1]!.info.id })
+    expect(sync.data.part[live.id]?.[0]).toMatchObject({ text: "live part" })
+
+    const newest = {
+      ...assistant,
+      id: "msg_zz_live",
+    }
+    emit(global({ id: "evt_newest", type: "message.updated", properties: { sessionID, info: newest } }))
+    emit(
+      global({
+        id: "evt_newest_part",
+        type: "message.part.updated",
+        properties: {
+          sessionID,
+          time: 3,
+          part: { id: "prt_msg_zz_live", sessionID, messageID: newest.id, type: "text", text: "newest part" },
+        },
+      }),
+    )
+    await wait(() => sync.data.part[newest.id]?.[0]?.type === "text")
+
+    expect(sync.data.message[sessionID]).toHaveLength(messageWindow)
+    expect(sync.data.message[sessionID].map((message) => message.id)).toEqual([
+      ...history.slice(2).map((message) => message.info.id),
+      live.id,
+      newest.id,
+    ])
+    expect(sync.data.part[history[1]!.info.id]).toBeUndefined()
+    expect(sync.data.part[newest.id]?.[0]).toMatchObject({ text: "newest part" })
   } finally {
     app.renderer.destroy()
   }

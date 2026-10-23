@@ -3,6 +3,7 @@ import { testRender } from "@opentui/solid"
 import type { JSX } from "@opentui/solid"
 import { onMount } from "solid-js"
 import { ArgsProvider } from "../../../../src/context/args"
+import { TuiConfigProvider } from "../../../../src/config"
 import { KVProvider, useKV } from "../../../../src/context/kv"
 import { ProjectProvider, useProject } from "../../../../src/context/project"
 import { SDKProvider } from "../../../../src/context/sdk"
@@ -11,6 +12,7 @@ import { PermissionProvider } from "../../../../src/context/permission"
 import { ExitProvider } from "../../../../src/context/exit"
 import { createEventSource, createFetch, type FetchHandler, directory } from "../../../fixture/tui-sdk"
 import { TestTuiContexts } from "../../../fixture/tui-environment"
+import { createTuiResolvedConfig } from "../../../fixture/tui-runtime"
 export { createEventSource, createFetch, directory, eventSource, json, worktree } from "../../../fixture/tui-sdk"
 
 export async function wait(fn: () => boolean, timeout = 2000) {
@@ -28,6 +30,7 @@ export async function mount(
   state?: string,
   waitForReady = true,
   children?: () => JSX.Element,
+  tuiConfig = createTuiResolvedConfig(),
 ) {
   const calls = createFetch(override)
   const events = createEventSource()
@@ -56,22 +59,24 @@ export async function mount(
 
   const app = await testRender(() => (
     <TestTuiContexts paths={state ? { state } : undefined}>
-      <ArgsProvider>
-        <KVProvider>
-          <SDKProvider url="http://test" directory={directory} fetch={calls.fetch} events={events.source}>
-            <PermissionProvider>
-              <ProjectProvider>
-                <ExitProvider exit={() => {}}>
-                  <SyncProvider>
-                    <Probe />
-                    <Extra />
-                  </SyncProvider>
-                </ExitProvider>
-              </ProjectProvider>
-            </PermissionProvider>
-          </SDKProvider>
-        </KVProvider>
-      </ArgsProvider>
+      <TuiConfigProvider config={tuiConfig}>
+        <ArgsProvider>
+          <KVProvider>
+            <SDKProvider url="http://test" directory={directory} fetch={calls.fetch} events={events.source}>
+              <PermissionProvider>
+                <ProjectProvider>
+                  <ExitProvider exit={() => {}}>
+                    <SyncProvider>
+                      <Probe />
+                      <Extra />
+                    </SyncProvider>
+                  </ExitProvider>
+                </ProjectProvider>
+              </PermissionProvider>
+            </SDKProvider>
+          </KVProvider>
+        </ArgsProvider>
+      </TuiConfigProvider>
     </TestTuiContexts>
   ))
 

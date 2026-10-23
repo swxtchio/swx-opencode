@@ -60,11 +60,21 @@ test("resolves host-neutral defaults", () => {
     sounds: {},
   })
   expect(config.leader_timeout).toBe(LeaderTimeoutDefault)
+  expect(config.message_window).toBe(100)
   expect(config.mouse).toBe(true)
   expect(config.keybinds.has("terminal.suspend")).toBe(true)
   expect(config.keybinds.has("session.list")).toBe(true)
   expect(config.cursor).toBeUndefined()
   expect(config.prompt_enhance_model).toBeUndefined()
+})
+
+test("validates and resolves the loaded message window", () => {
+  expect(decodeInfo({ message_window: 150 })).toMatchObject({ message_window: 150 })
+  expect(() => decodeInfo({ message_window: 0 })).toThrow()
+  expect(() => decodeInfo({ message_window: 1.5 })).toThrow()
+
+  expect(resolve({}, { terminalSuspend: true }).message_window).toBe(100)
+  expect(resolve({ message_window: 150 }, { terminalSuspend: true }).message_window).toBe(150)
 })
 
 test("resolves overrides without mutating input", () => {

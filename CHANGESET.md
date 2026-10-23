@@ -205,6 +205,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Features
 
+- **#348** Add a configurable `message_window` setting for each session's loaded transcript, applying it consistently to message fetch, hydration reconciliation and part cleanup, and live-update trimming; keep recall-backed search independent of the loaded window and document the default and memory trade-off (swxtchio/swx-opencode#65). _Fork-only._
 - **#297** Show the selected Ctrl+r history entry's complete original prompt in a wrapped, page-scrollable preview while
   keeping all other entries as one-line summaries. ENTER still appends the selected original prompt to the existing
   composer draft (swxtchio/swx-opencode#296). _Fork-only._
