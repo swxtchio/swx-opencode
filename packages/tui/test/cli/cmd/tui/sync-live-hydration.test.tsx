@@ -2,6 +2,7 @@
 import { expect, test } from "bun:test"
 import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../../fixture/fixture"
+import { createTuiResolvedConfig } from "../../../fixture/tui-runtime"
 import { json, mount, wait } from "./sync-fixture"
 
 const sessionID = "ses_hydration_race"
@@ -241,6 +242,182 @@ test("live messages merged during hydration retain the 100 message window", asyn
     expect(sync.data.message[sessionID].at(-1)?.id).toBe(live.id)
     expect(sync.data.message[sessionID].some((message) => message.id === "msg_000")).toBe(false)
     expect(sync.data.part.msg_000).toBeUndefined()
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("configured message window reconciles live updates during hydration", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+
+  const messageWindow = 135
+  let resolveMessages!: (response: Response) => void
+  const messages = new Promise<Response>((resolve) => {
+    resolveMessages = resolve
+  })
+  let requested = false
+  let requestedLimit = 0
+  const { app, emit, sync } = await mount(
+    (url) => {
+      if (url.pathname === `/session/${sessionID}`) return json(session)
+      if (url.pathname === `/session/${sessionID}/message`) {
+        requested = true
+        requestedLimit = Number(url.searchParams.get("limit"))
+        return messages
+      }
+      if (url.pathname === `/session/${sessionID}/todo` || url.pathname === `/session/${sessionID}/diff`) return json([])
+      return undefined
+    },
+    tmp.path,
+    true,
+    undefined,
+    createTuiResolvedConfig({ message_window: messageWindow }),
+  )
+
+  try {
+    const hydrate = sync.session.sync(sessionID)
+    await wait(() => requested)
+    const live = {
+      ...assistant,
+      id: "msg_z_live",
+    }
+    emit(global({ id: "evt_live", type: "message.updated", properties: { sessionID, info: live } }))
+    emit(
+      global({
+        id: "evt_live_part",
+        type: "message.part.updated",
+        properties: {
+          sessionID,
+          time: 2,
+          part: { id: "prt_msg_z_live", sessionID, messageID: live.id, type: "text", text: "live part" },
+        },
+      }),
+    )
+    await wait(() => sync.data.part[live.id]?.[0]?.type === "text")
+
+    const history = Array.from({ length: messageWindow }, (_, index) => {
+      const id = `msg_${String(index).padStart(3, "0")}`
+      return {
+        info: { ...assistant, id },
+        parts: [{ id: `prt_${id}`, sessionID, messageID: id, type: "text", text: id }],
+      }
+    })
+    resolveMessages(json(history.slice(-requestedLimit)))
+    await hydrate
+
+    expect(requestedLimit).toBe(messageWindow)
+    expect(sync.data.message[sessionID].map((message) => message.id)).toEqual([
+      ...history.slice(1).map((message) => message.info.id),
+      live.id,
+    ])
+    expect(sync.data.part[history[0]!.info.id]).toBeUndefined()
+    expect(sync.data.part[history[1]!.info.id]?.[0]).toMatchObject({ text: history[1]!.info.id })
+    expect(sync.data.part[live.id]?.[0]).toMatchObject({ text: "live part" })
+
+    const newest = {
+      ...assistant,
+      id: "msg_zz_live",
+    }
+    emit(global({ id: "evt_newest", type: "message.updated", properties: { sessionID, info: newest } }))
+    emit(
+      global({
+        id: "evt_newest_part",
+        type: "message.part.updated",
+        properties: {
+          sessionID,
+          time: 3,
+          part: { id: "prt_msg_zz_live", sessionID, messageID: newest.id, type: "text", text: "newest part" },
+        },
+      }),
+    )
+    await wait(() => sync.data.part[newest.id]?.[0]?.type === "text")
+
+    expect(sync.data.message[sessionID]).toHaveLength(messageWindow)
+    expect(sync.data.message[sessionID].map((message) => message.id)).toEqual([
+      ...history.slice(2).map((message) => message.info.id),
+      live.id,
+      newest.id,
+    ])
+    expect(sync.data.part[history[1]!.info.id]).toBeUndefined()
+    expect(sync.data.part[newest.id]?.[0]).toMatchObject({ text: "newest part" })
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("live growth keeps messages beyond the old cap inside a larger configured window", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+
+  const messageWindow = 130
+  const initial = Array.from({ length: 90 }, (_, index) => {
+    const id = `msg_${String(index).padStart(3, "0")}`
+    return {
+      info: { ...assistant, id },
+      parts: [{ id: `prt_${id}`, sessionID, messageID: id, type: "text", text: id }],
+    }
+  })
+  const live = Array.from({ length: 20 }, (_, index) => {
+    const id = `msg_${String(initial.length + index).padStart(3, "0")}`
+    return {
+      info: { ...assistant, id },
+      part: { id: `prt_${id}`, sessionID, messageID: id, type: "text" as const, text: id },
+    }
+  })
+  let requestedLimit = 0
+  const { app, emit, sync } = await mount(
+    (url) => {
+      if (url.pathname === `/session/${sessionID}`) return json(session)
+      if (url.pathname === `/session/${sessionID}/message`) {
+        requestedLimit = Number(url.searchParams.get("limit"))
+        return json(initial.slice(-requestedLimit))
+      }
+      if (url.pathname === `/session/${sessionID}/todo` || url.pathname === `/session/${sessionID}/diff`) return json([])
+      return undefined
+    },
+    tmp.path,
+    true,
+    undefined,
+    createTuiResolvedConfig({ message_window: messageWindow }),
+  )
+
+  try {
+    await sync.session.sync(sessionID)
+    expect(requestedLimit).toBe(messageWindow)
+    expect(sync.data.message[sessionID]).toHaveLength(initial.length)
+
+    live.forEach((message) => {
+      emit(
+        global({
+          id: `evt_${message.info.id}`,
+          type: "message.updated",
+          properties: { sessionID, info: message.info },
+        }),
+      )
+      emit(
+        global({
+          id: `evt_${message.info.id}_part`,
+          type: "message.part.updated",
+          properties: { sessionID, time: 2, part: message.part },
+        }),
+      )
+    })
+    const oldestPastDefault = initial[9]!
+    const newest = live.at(-1)!
+    await wait(
+      () =>
+        sync.data.message[sessionID]?.length === initial.length + live.length &&
+        sync.data.part[newest.info.id]?.[0]?.type === "text",
+    )
+
+    expect(sync.data.message[sessionID].map((message) => message.id)).toEqual([
+      ...initial.map((message) => message.info.id),
+      ...live.map((message) => message.info.id),
+    ])
+    expect(sync.data.message[sessionID].some((message) => message.id === oldestPastDefault.info.id)).toBe(true)
+    expect(sync.data.part[oldestPastDefault.info.id]?.[0]).toMatchObject({ text: oldestPastDefault.info.id })
+    expect(sync.data.part[newest.info.id]?.[0]).toMatchObject({ text: newest.info.id })
   } finally {
     app.renderer.destroy()
   }
