@@ -339,12 +339,23 @@ describe("LocationServiceMap", () => {
             yield* sessions.resume(session.id).pipe(Effect.exit)
           }).pipe(Effect.provide(jail.layer))
 
-          expect(requests).toHaveLength(1)
-          expect(requests[0]?.model).toMatchObject({
-            provider: "swxtch-egress",
-            id: "accounts/fireworks/models/deepseek-v4p1-flash",
-          })
-          expect(requests[0]?.model.route.endpoint).toMatchObject({ baseURL: "https://egress.test/v1" })
+          // A first prompt also sends a title request, which falls back to the turn's model without a small model.
+          const isTitle = (request: LLMRequest) =>
+            request.messages.some((message) =>
+              message.content.some(
+                (content) =>
+                  content.type === "text" && content.text.startsWith("Generate a title for this conversation"),
+              ),
+            )
+          expect(requests.filter((request) => !isTitle(request))).toHaveLength(1)
+          expect(requests.filter(isTitle)).toHaveLength(1)
+          for (const request of requests) {
+            expect(request.model).toMatchObject({
+              provider: "swxtch-egress",
+              id: "accounts/fireworks/models/deepseek-v4p1-flash",
+            })
+            expect(request.model.route.endpoint).toMatchObject({ baseURL: "https://egress.test/v1" })
+          }
         }),
       ),
     ),
