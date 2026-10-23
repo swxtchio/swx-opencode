@@ -84,6 +84,11 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#347** Load `OPENCODE_CONFIG` and `OPENCODE_CONFIG_CONTENT` in the V2 core config at V1's precedence (global
+  directory, explicit file, project files, `.opencode` directories, inline content last), so V2 sessions in the
+  OpenCode jail resolve its config-declared `swxtch-egress` provider and configured default model
+  (swxtchio/swx-abbe#1952). _Fork-only; upstream `43c08387f1` adds the same sources to its rewritten core config, and
+  a sync bringing it supersedes this._
 - **#342** Add independently configured V1 small models at global, agent and persisted session scopes (swxtchio/swx-opencode#338), wire titles and compaction summaries to the effective selection, and report unresolvable configured models without a substitute request. See the model settings in `packages/web/src/content/docs/config.mdx`. _Fork-only._
 - **#325** Port bounded provider output-limit continuation from `anomalyco/opencode` commit `a3f7f42ac96800aec06fb26365cd482024a52cd1` into V1 execution (swxtchio/swx-opencode#304, output-limit sub-scope). Preserve partial history, tool custody and queue delivery; keep capacity compaction from renewing the allowance and buffer argument fragments until settlement. Expose exhausted continuation through the existing V1 output-length error. _Fork-only V1 port._
 - **#314** Add `Ctrl+f` in the pending-prompt review to give only the selected prepared item steer timing, releasing its confirmed review hold only when no other live holder remains. Consolidating a selected human-composer item now combines the complete ready, delivery- and execution-compatible human set in admission order, preserving original inputs, parts, receipts and constituents. `Ctrl+e` enhances the selected pending prompt through the existing model and transcript context, retaining row identity, order, receipts and non-text parts. A late pre-force renewal triggers a holder-status read rather than being discarded, so the view reflects server-applied lease changes after force. _Fork-only._
