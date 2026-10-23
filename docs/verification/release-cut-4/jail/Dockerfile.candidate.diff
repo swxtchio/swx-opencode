@@ -1,0 +1,8 @@
+81a82
+> COPY jail/opencode-candidate.tar.gz /tmp/opencode-candidate.tar.gz
+84,86c85
+<     curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 60 --speed-limit 1024 --speed-time 60 \
+<         --retry 3 --retry-delay 2 --output "${archive}" \
+<         "https://github.com/swxtchio/swx-opencode/releases/download/${OPENCODE_RELEASE_TAG}/opencode-linux-x64.tar.gz"; \
+---
+>     mv /tmp/opencode-candidate.tar.gz "${archive}"; \

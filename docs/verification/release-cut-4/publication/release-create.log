@@ -1,0 +1,5 @@
+created: ok
+tag: v1.18.32-swxtch.cd3f0ce2
+help[2]:
+  Run `gh-axi release view v1.18.32-swxtch.cd3f0ce2 -R swxtchio/swx-opencode` to view the release
+  Run `gh-axi release upload v1.18.32-swxtch.cd3f0ce2 <files...> -R swxtchio/swx-opencode` to upload assets
