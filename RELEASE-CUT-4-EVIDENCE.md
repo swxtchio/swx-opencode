@@ -109,3 +109,22 @@ No Abbe task wake log was appended. Abbe's captain-level reply `p1792787150-3857
 2. **The verbatim citation in Abbe's bump brief.** The brief is `/home/byates/fm-abbe/data/abbe-mvp-design-crew/bump-1951-cd3f0ce2.md`, for crew `abbe-mvp-design-crew`, with SHA-256 `5e9d2835…bdb5`. Line 7 cites `/tmp/opencode/abbe-rel4.md`. Lines 6 and 8 restate the tag, source and #350, and the arm64-only rig pass with x64 not rig-tested. The brief also directs Abbe to run the x64 rig on `abbe-build-001`.
 
 The ruling's own sender proof record, `p1792787150-3857348-2b5c`, was created at 20:25:50Z. This task wrote nothing into `/home/byates/fm-abbe`.
+
+**Disposition.** Firstmate's disposition, in `/home/byates/fm-llmrouter/data/opencode-release-cut-4/fix-round-2.md`, records the Abbe B-16.10 task wake-log append as **waived** by the Abbe captain's ruling `p1792787150-3857348-2b5c`. Abbe's acknowledgment `p1792786679-2709706-0cf3` and the bump brief's verbatim citation are the read-back.
+
+**Relay identity.** These three files have the same SHA-256, `460bc34fb5b44e8f7b187b02ec67e23240a6856de965cce9504d609f52a5d5b5`, and `cmp` found the first two identical:
+
+- the archived relay `/home/byates/fm-llmrouter/data/peer-mail/p1792777340-1942459-70c1-relay.md`;
+- the committed copy `delivery/firstmate-relay-p1792777340-1942459-70c1.md`;
+- the delivered `/tmp/opencode/abbe-rel4.md`.
+
+The check was rerun at 2026-10-23T20:39Z.
+
+**Producer wake-log record.** At 2026-10-23T20:39:29Z one line was appended with `>>` to this task's `/home/byates/fm-llmrouter/state/opencode-release-cut-4.wake-events`, taking it from 7 to 8 lines. Read-back confirmed that the last line equals the record. That line is retained verbatim as `delivery/producer-delivery-record.txt`, with SHA-256 `2170269b…9dbb`. It carries:
+
+- the release URL and source;
+- both archive URLs, with their SHA-256 values and checksum URLs;
+- the SaaS wake-log append and the SaaS outbox ID `p1792786351-2011828-449f`;
+- the Abbe relay path and its SHA-256;
+- the Abbe acknowledgment `p1792786679-2709706-0cf3` and the bump-brief citation path;
+- the waiver ruling `p1792787150-3857348-2b5c`.
