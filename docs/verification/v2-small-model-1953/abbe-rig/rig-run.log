@@ -1,0 +1,19 @@
+2026-10-23T23:15:57Z
+=== v1-control
+client: {"mode": "v1-control", "status": "completed", "model": "accounts/fireworks/models/deepseek-v4p1-flash"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== v2
+client: {"mode": "v2", "session": "ses_e94f302b5ffeG2O4PTrla8JE2H", "admitted_seq": 1, "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.step.started", "session.next.text.started", "session.next.text.ended", "session.next.step.ended"], "steps": [{"type": "session.next.step.started", "model": {"id": "accounts/fireworks/models/deepseek-v4p1-flash", "providerID": "swxtch-egress"}, "error": null}, {"type": "session.next.step.ended", "model": null, "error": null}], "wait": "OpenCodeV2WaitOutcome(status='completed', admitted_seq=1, message_id=None, assistant_message_id='msg_16b0d0c44001efjiBvO5Ptt9t6', payload={'type': 'completed', 'admittedSeq': 1, 'assistantMessageID': 'msg_16b0d0c44001efjiBvO5Ptt9t6'})"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== v2-named
+client: {"mode": "v2-named", "session": "ses_e94f2c4f8ffeDkUp5IThqx4lJn", "admitted_seq": 1, "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.step.started", "session.next.text.started", "session.next.text.ended", "session.next.step.ended"], "steps": [{"type": "session.next.step.started", "model": {"id": "accounts/fireworks/models/deepseek-v4p1-flash", "providerID": "swxtch-egress", "variant": "default"}, "error": null}, {"type": "session.next.step.ended", "model": null, "error": null}], "wait": "OpenCodeV2WaitOutcome(status='completed', admitted_seq=1, message_id=None, assistant_message_id='msg_16b0d4bc1001rRMMdeTbdBxWHH', payload={'type': 'completed', 'admittedSeq': 1, 'assistantMessageID': 'msg_16b0d4bc1001rRMMdeTbdBxWHH'})"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== compact
+client: {"mode": "compact", "session": "ses_e94f2883cffeo0G676mUdwvRrD", "admitted_seq": 1, "turn": "completed", "compact_status": 204, "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.titled", "session.next.step.started", "session.next.text.started", "session.next.text.ended", "session.next.step.ended", "session.next.compaction.started", "session.next.compaction.ended"], "compactions": [{"type": "session.next.compaction.started", "reason": "manual", "text": ""}, {"type": "session.next.compaction.ended", "reason": "manual", "text": "## Objective\n- Describe an SRT input.\n\n## Progress\n- Answered: an SRT input listens on one UDP port and admits one caller."}]}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True kind=title", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True kind=turn", "REQ3 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True kind=summary transcript=yes"]
+RESULT: PASS
+exit=0
+2026-10-23T23:16:55Z
