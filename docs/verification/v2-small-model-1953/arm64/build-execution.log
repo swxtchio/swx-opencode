@@ -1,0 +1,12 @@
+2026-10-23T22:18:44Z
+Linux vm001 6.8.0-147-generic #147-Ubuntu SMP PREEMPT_DYNAMIC Thu Sep 24 11:39:52 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux
+c0182d4d8c39b52cb954579fd61e89c7e5fab236 Merge origin/swxtch into fm/opencode-v2-smallmodel-1953
+8c13fedb456be070f285966cb02596d3677213b1739b082c0761bae11a560851  /home/byates/fm-worktrees/fm-llmrouter/opencode-v2-smallmodel-1953/swx-opencode/docs/verification/release-cut-4/inputs/models.dev.arm64.json
+opencode
+libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so
+f3959f7897fd47b84edd2ba6130dab22f0bf7b14b172209fe47febf0c995f7a4  /home/byates/fm-worktrees/fm-llmrouter/opencode-v2-smallmodel-1953/swx-opencode/logs/compact-rig/assets/opencode-linux-arm64.tar.gz
+36fa7044d375778011241622c9ae33420ff80a6d2d8fc74f9e8924a39c70e08a  /home/byates/fm-worktrees/fm-llmrouter/opencode-v2-smallmodel-1953/swx-opencode/logs/compact-rig/extracted/opencode
+0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42  /home/byates/fm-worktrees/fm-llmrouter/opencode-v2-smallmodel-1953/swx-opencode/logs/compact-rig/extracted/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so
+1.18.32-swxtch.c0182d4d
+2026-10-23T22:19:53Z
+ARM-BUILD-PASS

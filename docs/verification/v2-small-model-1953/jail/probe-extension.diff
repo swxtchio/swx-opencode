@@ -1,0 +1,49 @@
+15a16,17
+>     v2-compact  v2-named plus smallModel, then wait and POST /api/session/{id}/compact; passes only on a 204 whose
+>                 recorded summary is the fake provider's content (swxtchio/swx-abbe#1953)
+56,59c58,61
+<             body = {
+<                 "location": {"directory": client.directory},
+<                 "model": {"providerID": "swxtch-egress", "id": "accounts/fireworks/models/deepseek-v4p1-flash"},
+<             }
+---
+>             egress = {"providerID": "swxtch-egress", "id": "accounts/fireworks/models/deepseek-v4p1-flash"}
+>             body = {"location": {"directory": client.directory}, "model": egress}
+>             if mode == "v2-compact":
+>                 body["smallModel"] = egress
+88a91,108
+>         if mode == "v2-compact":
+>             out["created_small_model"] = session.get("smallModel")
+>             try:
+>                 compact = client._request("compactSessionV2", f"/api/session/{sid}/compact", method="POST",
+>                                           expected_status=204, include_directory=False,
+>                                           deadline=time.monotonic() + 120)
+>                 out["compact_status"] = getattr(compact, "status", 204)
+>             except oc.OpenCodeError as exc:
+>                 out["compact_error"] = str(exc)[:300]
+>             page = client.get_session_history_v2(sid)
+>             events = page.get("data") if isinstance(page.get("data"), list) else page.get("events", [])
+>             out["after_compact_types"] = [event.get("type") for event in events]
+>             out["compaction"] = [
+>                 {"reason": (event.get("data") or {}).get("reason"), "text": str((event.get("data") or {}).get("text", ""))[:80]}
+>                 for event in events if event.get("type") == "session.next.compaction.ended"
+>             ]
+>             out["title_events"] = [(event.get("data") or {}).get("title") for event in events
+>                                    if event.get("type") == "session.next.titled"]
+118a139,148
+>     if mode == "v2-compact":
+>         try:
+>             line = json.loads((client.stdout.strip().splitlines() or ["{}"])[-1])
+>         except json.JSONDecodeError:
+>             line = {}
+>         passed = (
+>             passed
+>             and line.get("compact_status") == 204
+>             and any("Proposal prepared for review." in item.get("text", "") for item in line.get("compaction", []))
+>         )
+131,132c161,162
+<     modes = sys.argv[1:] or ["v1-control", "v2", "v2-named"]
+<     unknown = [mode for mode in modes if mode not in ("v1-control", "v2", "v2-named")]
+---
+>     modes = sys.argv[1:] or ["v1-control", "v2", "v2-named", "v2-compact"]
+>     unknown = [mode for mode in modes if mode not in ("v1-control", "v2", "v2-named", "v2-compact")]
