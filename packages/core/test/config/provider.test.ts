@@ -151,6 +151,44 @@ describe("ConfigProviderPlugin.Plugin", () => {
     }),
   )
 
+  it.effect("takes the default from the first available config-declared provider when no model is configured", () =>
+    withEnv({ COLD_API_KEY: undefined }, () =>
+      Effect.gen(function* () {
+        const catalog = yield* Catalog.Service
+        // A newer model from a provider the config does not declare.
+        yield* catalog.transform((draft) => {
+          draft.provider.update(ProviderV2.ID.make("newer"), (provider) => {
+            provider.request.body.apiKey = "newer"
+          })
+          draft.model.update(ProviderV2.ID.make("newer"), ModelV2.ID.make("chat"), (model) => {
+            model.time.released = 1_000
+          })
+        })
+        const config = Config.Service.of({
+          entries: () =>
+            Effect.succeed([
+              new Config.Document({
+                type: "document",
+                info: decode({
+                  providers: {
+                    cold: { env: ["COLD_API_KEY"], models: { chat: {} } },
+                    warm: { request: { body: { apiKey: "warm" } }, models: { chat: {} } },
+                  },
+                }),
+              }),
+            ]),
+        })
+
+        yield* addPlugin(config)
+
+        expect(yield* catalog.model.default()).toMatchObject({
+          providerID: ProviderV2.ID.make("warm"),
+          id: ModelV2.ID.make("chat"),
+        })
+      }),
+    ),
+  )
+
   it.effect("loads configured providers and applies later model overrides", () =>
     withEnv({ CUSTOM_API_KEY: "secret" }, () =>
       Effect.gen(function* () {
