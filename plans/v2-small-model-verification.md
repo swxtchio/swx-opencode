@@ -55,9 +55,13 @@ as a distinct request, and the recorded summary is the provider's content. See
 The `release-proof` job overlays `packages/core/src/session.ts`, `session/execution.ts` and
 `session/run-coordinator.ts` onto release source `0ff0dfbc`, which predates #342. #354's revisions of those files
 need core surface that `0ff0dfbc` lacks, so the job now takes them from `cd3f0ce2`, the last revision it passed on.
+The pin is one job-level `CORE_WAIT_PIN`, used by both overlays: the tooling typecheck step and the
+instrumented-binary build step.
 #354 changes no wait or join code in them and no probe tooling.
 
-Before the change, the overlay was simulated locally on `0ff0dfbc`: core and opencode typechecked, and the proof
-tests passed, with `release-probe-wait-socket-only` skipped as in CI. The release-proof digest in
+Both steps were simulated locally on `0ff0dfbc` with the pinned files:
+- core and opencode typechecked, and the proof tests passed, with `release-probe-wait-socket-only` skipped as in
+  CI;
+- `build.ts --single` built and smoke-tested `1.18.32-swxtch.0ff0dfbc`. The release-proof digest in
 `script/check-workflow-guards.ts` was updated with it. Firstmate accepted the narrowing: a later edit to those files'
 wait code is unproven by this job until the pin is bumped.
