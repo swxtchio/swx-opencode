@@ -35,7 +35,7 @@ and compaction call sites in `packages/opencode/src/session/prompt.ts` and
 `packages/opencode/src/session/compaction.ts`. V2 therefore carries the originating agent's
 `small_model` field between the auxiliary agent override and the session/global selections.
 
-Config selection considers only lossless schema paths: strict native V2 decoding, or strict V1 decoding followed by a valid V2 migration. A path that ignores any supplied key is ineligible. Prefer V1 migration when its marker applies and the migration validates; otherwise use native V2. If neither path is eligible, return `ConfigInvalidError` for the source document. `small_model` marks V1 only when strict V1 validation accepts it, which excludes V2-only fields without a shape list. Loader regressions keep the pinned V1 assertion and cover V1 migration, each round's native shared-key repros, and explicit rejection when neither schema can retain the document.
+Firstmate revised the round-four rule on 2026-10-24: restore the base's excess-key tolerance at every depth and add only a V2-only top-level guard against V1 migration. Existing V1 markers retain the base predicate; `small_model` acts as a V1 marker only without V2-only top-level keys. Documents with those V2-only keys use native V2 decoding with the base's ignored-excess behavior. The loader adds no new fatal config errors. Compatibility regressions cover base-accepted top-level and nested excess, legacy keys, and both sides of the migration guard. Shared-shape V1/V2 lossiness without V2-only keys is outside this issue; #359 owns it.
 
 A configured selection that does not resolve fails without a substitute, as in V1.
 Lower-priority invalid selections do not defeat a usable higher-priority choice. The model is
