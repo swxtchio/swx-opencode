@@ -17,6 +17,7 @@ const keys = new Set([
   "autoshare",
   "disabled_providers",
   "enabled_providers",
+  "small_model",
   "mode",
   "agent",
   "provider",
@@ -26,9 +27,21 @@ const keys = new Set([
   "layout",
 ])
 
+const v2OnlyKeys = new Set([
+  "agents",
+  "attachments",
+  "commands",
+  "permissions",
+  "plugins",
+  "providers",
+  "snapshots",
+])
+
 export function isV1(input: unknown) {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return false
-  return Object.keys(input).some((key) => keys.has(key))
+  const topLevel = Object.keys(input)
+  if (topLevel.some((key) => v2OnlyKeys.has(key))) return false
+  return topLevel.some((key) => keys.has(key))
 }
 
 export function migrate(info: typeof ConfigV1.Info.Type) {

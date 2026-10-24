@@ -75,6 +75,12 @@ export type Error =
 
 export interface Interface {
   readonly resolve: (session: SessionSchema.Info) => Effect.Effect<Model, Error>
+  /**
+   * Resolves auxiliary work from the auxiliary agent's model and small model, the originating
+   * agent's small model, the session's small model, then the effective global selection. Titles
+   * may infer a small model before falling back to the turn model. A selected model that cannot
+   * resolve fails without a substitute, and resolution stays lazy until auxiliary work is needed.
+   */
   readonly auxiliary: (input: {
     readonly session: SessionSchema.Info
     readonly agent: AgentV2.Info | undefined

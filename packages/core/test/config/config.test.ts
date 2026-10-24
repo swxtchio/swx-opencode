@@ -110,10 +110,12 @@ describe("Config", () => {
   it.effect("detects v1 configuration from any v1-only top-level key", () =>
     Effect.sync(() => {
       expect(ConfigMigrateV1.isV1({ snapshot: false })).toBe(true)
-      expect(ConfigMigrateV1.isV1({ snapshot: false, agents: {} })).toBe(true)
+      expect(ConfigMigrateV1.isV1({ snapshot: false, agents: {} })).toBe(false)
       expect(ConfigMigrateV1.isV1({ reference: {} })).toBe(true)
       expect(ConfigMigrateV1.isV1({ shell: "/bin/zsh", model: "anthropic/claude" })).toBe(false)
       expect(ConfigMigrateV1.isV1({ references: {} })).toBe(false)
+      expect(ConfigMigrateV1.isV1({ small_model: "auxiliary/models/small", compaction: {} })).toBe(true)
+      expect(ConfigMigrateV1.isV1({ small_model: "auxiliary/models/small", agents: {} })).toBe(false)
     }),
   )
 
@@ -182,6 +184,48 @@ describe("Config", () => {
               expect(document?.info.watcher?.fff).toBe(false)
               expect(document?.info.small_model).toBe("auxiliary/models/global-small")
               expect(document?.info.agents?.build?.small_model).toBe("auxiliary/models/agent-small")
+            }).pipe(Effect.provide(testLayer(tmp.path))),
+          ),
+        ),
+      ),
+    ),
+  )
+
+  it.live("migrates legacy compaction, MCP, and skills beside the small_model marker", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.promise(() =>
+          fs.writeFile(
+            path.join(tmp.path, "opencode.json"),
+            JSON.stringify({
+              small_model: "auxiliary/models/global-small",
+              compaction: { auto: false, preserve_recent_tokens: 1234, reserved: 5678 },
+              mcp: { legacy: { type: "local", command: ["bun", "run", "mcp.ts"] } },
+              skills: { paths: ["/legacy/skills"] },
+            }),
+          ),
+        ).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const config = yield* Config.Service
+              const documents = (yield* config.entries()).filter(
+                (entry): entry is Config.Document => entry.type === "document",
+              )
+              const document = documents.at(-1)
+
+              expect(documents).toHaveLength(1)
+              expect(document?.info.small_model).toBe("auxiliary/models/global-small")
+              expect(document?.info.compaction?.auto).toBe(false)
+              expect(document?.info.compaction?.keep?.tokens).toBe(1234)
+              expect(document?.info.compaction?.buffer).toBe(5678)
+              expect(document?.info.mcp?.servers?.legacy).toMatchObject({
+                type: "local",
+                command: ["bun", "run", "mcp.ts"],
+              })
+              expect(document?.info.skills).toEqual(["/legacy/skills"])
             }).pipe(Effect.provide(testLayer(tmp.path))),
           ),
         ),
@@ -283,7 +327,7 @@ describe("Config", () => {
     ),
   )
 
-  it.live("loads native small_model with providers and agents at location priority", () =>
+  it.live("loads native V2 small_model with providers and agents at location priority", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
