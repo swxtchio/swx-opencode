@@ -107,31 +107,14 @@ describe("Config", () => {
     }),
   )
 
-  it.effect("disambiguates v1 markers from native v2 shapes", () =>
+  it.effect("validates V1 configuration with the V1 schema", () =>
     Effect.sync(() => {
       expect(ConfigMigrateV1.isV1({ snapshot: false })).toBe(true)
       expect(ConfigMigrateV1.isV1({ snapshot: false, agents: {} })).toBe(true)
       expect(ConfigMigrateV1.isV1({ reference: {} })).toBe(true)
-      expect(ConfigMigrateV1.isV1({ shell: "/bin/zsh", model: "anthropic/claude" })).toBe(false)
-      expect(ConfigMigrateV1.isV1({ references: {} })).toBe(false)
+      expect(ConfigMigrateV1.isV1({ shell: "/bin/zsh", model: "anthropic/claude" })).toBe(true)
       expect(ConfigMigrateV1.isV1({ small_model: "auxiliary/models/small", compaction: {} })).toBe(true)
-      expect(ConfigMigrateV1.isV1({ small_model: "auxiliary/models/small", agents: {} })).toBe(false)
-      expect(
-        ConfigMigrateV1.isV1({
-          small_model: "auxiliary/models/small",
-          compaction: { keep: { tokens: 1234 }, buffer: 5678 },
-        }),
-      ).toBe(false)
-      expect(
-        ConfigMigrateV1.isV1({
-          small_model: "auxiliary/models/small",
-          mcp: { servers: { native: { type: "local", command: ["bun"] } } },
-        }),
-      ).toBe(false)
-      expect(
-        ConfigMigrateV1.isV1({ small_model: "auxiliary/models/small", mcp: { timeout: { request: 123 } } }),
-      ).toBe(false)
-      expect(ConfigMigrateV1.isV1({ small_model: "auxiliary/models/small", skills: [] })).toBe(false)
+      expect(ConfigMigrateV1.isV1({ skills: ["/native/skills"] })).toBe(false)
     }),
   )
 
@@ -256,7 +239,7 @@ describe("Config", () => {
     ),
   )
 
-  it.live("loads native V2 shared shapes beside the small_model setting", () =>
+  it.live("loads native V2 MCP servers beside the small_model setting", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
@@ -267,9 +250,7 @@ describe("Config", () => {
             path.join(tmp.path, "opencode.json"),
             JSON.stringify({
               small_model: "native-provider/models/native-small",
-              compaction: { auto: false, keep: { tokens: 1234 }, buffer: 5678 },
-              mcp: { servers: { native: { type: "local", command: ["bun", "run", "mcp.ts"] } } },
-              skills: ["/native/skills"],
+              mcp: { servers: { enabled: { type: "local", command: ["bun", "run", "mcp.ts"] } } },
             }),
           ),
         ).pipe(
@@ -283,12 +264,117 @@ describe("Config", () => {
 
               expect(documents).toHaveLength(1)
               expect(document?.info.small_model).toBe("native-provider/models/native-small")
-              expect(document?.info.compaction?.keep?.tokens).toBe(1234)
-              expect(document?.info.compaction?.buffer).toBe(5678)
-              expect(document?.info.mcp?.servers?.native).toMatchObject({
+              expect(document?.info.mcp?.servers?.enabled).toMatchObject({
                 type: "local",
                 command: ["bun", "run", "mcp.ts"],
               })
+            }).pipe(Effect.provide(testLayer(tmp.path))),
+          ),
+        ),
+      ),
+    ),
+  )
+
+  it.live("loads native V2 compaction beside the small_model setting", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.promise(() =>
+          fs.writeFile(
+            path.join(tmp.path, "opencode.json"),
+            JSON.stringify({
+              small_model: "native-provider/models/native-small",
+              compaction: { auto: false, keep: { tokens: 1234 }, buffer: 5678 },
+            }),
+          ),
+        ).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const config = yield* Config.Service
+              const documents = (yield* config.entries()).filter(
+                (entry): entry is Config.Document => entry.type === "document",
+              )
+              const document = documents.at(-1)
+
+              expect(documents).toHaveLength(1)
+              expect(document?.info.small_model).toBe("native-provider/models/native-small")
+              expect(document?.info.compaction?.auto).toBe(false)
+              expect(document?.info.compaction?.keep?.tokens).toBe(1234)
+              expect(document?.info.compaction?.buffer).toBe(5678)
+            }).pipe(Effect.provide(testLayer(tmp.path))),
+          ),
+        ),
+      ),
+    ),
+  )
+
+  it.live("loads native V2 custom LSP beside the small_model setting", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.promise(() =>
+          fs.writeFile(
+            path.join(tmp.path, "opencode.json"),
+            JSON.stringify({
+              small_model: "native-provider/models/native-small",
+              lsp: {
+                custom: {
+                  command: ["custom-lsp"],
+                  extensions: [".foo"],
+                  initialization: { workspace: { enabled: true } },
+                },
+              },
+            }),
+          ),
+        ).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const config = yield* Config.Service
+              const documents = (yield* config.entries()).filter(
+                (entry): entry is Config.Document => entry.type === "document",
+              )
+              const document = documents.at(-1)
+
+              expect(documents).toHaveLength(1)
+              expect(document?.info.small_model).toBe("native-provider/models/native-small")
+              expect(document?.info.lsp).toMatchObject({
+                custom: {
+                  command: ["custom-lsp"],
+                  extensions: [".foo"],
+                  initialization: { workspace: { enabled: true } },
+                },
+              })
+            }).pipe(Effect.provide(testLayer(tmp.path))),
+          ),
+        ),
+      ),
+    ),
+  )
+
+  it.live("loads native V2 skills beside the small_model setting", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.promise(() =>
+          fs.writeFile(
+            path.join(tmp.path, "opencode.json"),
+            JSON.stringify({ small_model: "native-provider/models/native-small", skills: ["/native/skills"] }),
+          ),
+        ).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const config = yield* Config.Service
+              const document = (yield* config.entries()).findLast(
+                (entry): entry is Config.Document => entry.type === "document",
+              )
+
+              expect(document?.info.small_model).toBe("native-provider/models/native-small")
               expect(document?.info.skills).toEqual(["/native/skills"])
             }).pipe(Effect.provide(testLayer(tmp.path))),
           ),

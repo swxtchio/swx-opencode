@@ -153,16 +153,19 @@ const layerWith = (sources: Sources) =>
       const names = ["opencode.json", "opencode.jsonc"]
       const decodeOptions = { errors: "all", onExcessProperty: "ignore", propertyOrder: "original" } as const
       const decodeInfo = Schema.decodeUnknownOption(Info, decodeOptions)
+      // Fail native validation rather than silently dropping V1-only fields.
+      const decodeNativeInfo = Schema.decodeUnknownOption(Info, { ...decodeOptions, onExcessProperty: "error" })
       const decodeV1Info = Schema.decodeUnknownOption(ConfigV1.Info, decodeOptions)
 
       const parseInfo = (text: string) => {
         const errors: ParseError[] = []
         const input: unknown = parse(text, errors, { allowTrailingComma: true })
         if (errors.length) return
+        const native = decodeNativeInfo(input)
+        if (Option.isSome(native)) return native.value
+        if (!ConfigMigrateV1.isV1(input)) return
         return Option.getOrUndefined(
-          ConfigMigrateV1.isV1(input)
-            ? decodeV1Info(input).pipe(Option.map(ConfigMigrateV1.migrate), Option.flatMap(decodeInfo))
-            : decodeInfo(input),
+          decodeV1Info(input).pipe(Option.map(ConfigMigrateV1.migrate), Option.flatMap(decodeInfo)),
         )
       }
 
