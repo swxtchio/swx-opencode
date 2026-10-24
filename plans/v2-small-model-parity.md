@@ -35,9 +35,7 @@ and compaction call sites in `packages/opencode/src/session/prompt.ts` and
 `packages/opencode/src/session/compaction.ts`. V2 therefore carries the originating agent's
 `small_model` field between the auxiliary agent override and the session/global selections.
 
-`small_model` is a V1 format marker only when a V2-only top-level key is absent. Native V2 keys such
-as `agents`, `providers`, and `permissions` take precedence over the overlapping V1 marker, while
-legacy documents with shared-shape keys such as `compaction`, `mcp`, or `skills` still migrate.
+Existing V1-only markers remain authoritative even when a document also contains a V2-only key, preserving legacy migration such as `permission` alongside `agents`. `small_model` is conditional: it marks V1 only when no V2-only top-level key and no V2-shaped shared key contradict it. Native shared shapes include `compaction.keep` or `buffer`, `mcp.servers` or V2-shaped `timeout`, and array-valued `skills`; V1 uses `preserve_recent_tokens` or `reserved`, root MCP server entries, and object-valued `skills`. Loader regressions cover the pinned V1 marker behavior, V1-only `small_model` documents, and native V2 `small_model` documents using those shared shapes.
 
 A configured selection that does not resolve fails without a substitute, as in V1.
 Lower-priority invalid selections do not defeat a usable higher-priority choice. The model is
