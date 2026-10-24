@@ -35,7 +35,7 @@ and compaction call sites in `packages/opencode/src/session/prompt.ts` and
 `packages/opencode/src/session/compaction.ts`. V2 therefore carries the originating agent's
 `small_model` field between the auxiliary agent override and the session/global selections.
 
-Existing V1-only markers remain authoritative even when a document also contains a V2-only key, preserving legacy migration such as `permission` alongside `agents`. `small_model` is conditional: it marks V1 only when no V2-only top-level key and no V2-shaped shared key contradict it. Native shared shapes include `compaction.keep` or `buffer`, `mcp.servers` or V2-shaped `timeout`, and array-valued `skills`; V1 uses `preserve_recent_tokens` or `reserved`, root MCP server entries, and object-valued `skills`. Loader regressions cover the pinned V1 marker behavior, V1-only `small_model` documents, and native V2 `small_model` documents using those shared shapes.
+Config selection is schema-driven at the loader boundary. Try native V2 `Config.Info` decoding first with excess properties rejected; if it fails, migrate only when V1 config decoding succeeds and the migrated V2 document validates. `small_model` alone does not choose either format, and `ConfigMigrateV1.isV1` reports schema validity rather than format precedence. This preserves V1-only fields through migration and accepts native V2 shared-key structures without enumerated shape checks. Loader regressions keep the pinned V1 assertion and exercise legacy-only `small_model`, genuine V1 migration, and each native V2 shared-key reproduction independently.
 
 A configured selection that does not resolve fails without a substitute, as in V1.
 Lower-priority invalid selections do not defeat a usable higher-priority choice. The model is
