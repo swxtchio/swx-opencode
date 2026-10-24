@@ -43,7 +43,7 @@ export function isV1(input: unknown) {
   return keys.includes("small_model") && !hasV2OnlyKey(input)
 }
 
-export function hasV2OnlyKey(input: unknown) {
+function hasV2OnlyKey(input: unknown) {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return false
   return Object.keys(input).some((key) => v2OnlyKeys.has(key))
 }

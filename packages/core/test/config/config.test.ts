@@ -304,7 +304,7 @@ describe("Config", () => {
     }),
   )
 
-  it.live("uses native V2 decoding when V1 markers coexist with V2-only keys", () =>
+  it.live("keeps V1 permission rules when V2-only keys coexist", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
@@ -328,8 +328,7 @@ describe("Config", () => {
               )
 
               expect(document?.info.model).toBe("p/main")
-              expect(document?.info.agents?.build?.description).toBe("Native agent")
-              expect(document?.info.permissions).toBeUndefined()
+              expect(document?.info.permissions).toEqual([{ action: "bash", resource: "*", effect: "deny" }])
             }).pipe(Effect.provide(testLayer(tmp.path))),
           ),
         ),

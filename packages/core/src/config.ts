@@ -159,9 +159,8 @@ const layerWith = (sources: Sources) =>
         const errors: ParseError[] = []
         const input: unknown = parse(text, errors, { allowTrailingComma: true })
         if (errors.length) return
-        const legacy = ConfigMigrateV1.isV1(input) && !ConfigMigrateV1.hasV2OnlyKey(input)
         return Option.getOrUndefined(
-          legacy
+          ConfigMigrateV1.isV1(input)
             ? decodeV1Info(input).pipe(Option.map(ConfigMigrateV1.migrate), Option.flatMap(decodeInfo))
             : decodeInfo(input),
         )
