@@ -1,0 +1,7 @@
+acquired at 2026-10-24T02:08:54Z
+{"home": "/home/byates/fm-llmrouter", "task": "release-cut-5", "task_id": "release-cut-5", "what": "Abbe jail V2 egress rig on the native-tested OpenCode d7f78881 arm64 candidate (lap 3)", "owner_box": "vm001", "owner_pid": 3966212, "pid": 3966212, "started_at": "2026-10-24T02:08:54Z"}
+total 12
+drwxrwxr-x  2 byates byates 4096 2026-10-24 02:08:55.373984683 +0000 .
+drwxrwxr-x 19 byates byates 4096 2026-10-24 02:08:54.715982126 +0000 ..
+-rw-rw-r--  1 byates byates    0 2026-10-24 02:08:55.373984683 +0000 heartbeat
+-rw-rw-r--  1 byates byates  287 2026-10-24 02:08:55.058983459 +0000 lease.json

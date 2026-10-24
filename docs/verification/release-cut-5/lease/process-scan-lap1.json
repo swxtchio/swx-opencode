@@ -1,0 +1,1 @@
+{"remaining_processes": [{"pid": 1578904, "cmd": "bash -c python3 - <<'PY'\nimport os, json\nroot='/home/byates/vm14-builds/opencode-release-d7f78881'\nme=os.getpid()\nfound=[]\nfor pid in os.listdir('/proc'):\n    if not pid.isdigit() or int(pid)==me: con", "cwd": "/home/byates"}]}
