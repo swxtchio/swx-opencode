@@ -7,7 +7,7 @@ import { ConfigPermissionV1 } from "./permission"
 import { ConfigProviderV1 } from "./provider"
 import { ConfigProviderOptionsV1 } from "./provider-options"
 
-const keys = new Set([
+const v1MarkerKeys = new Set([
   "logLevel",
   "server",
   "command",
@@ -17,7 +17,6 @@ const keys = new Set([
   "autoshare",
   "disabled_providers",
   "enabled_providers",
-  "small_model",
   "mode",
   "agent",
   "provider",
@@ -39,9 +38,33 @@ const v2OnlyKeys = new Set([
 
 export function isV1(input: unknown) {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return false
-  const topLevel = Object.keys(input)
-  if (topLevel.some((key) => v2OnlyKeys.has(key))) return false
-  return topLevel.some((key) => keys.has(key))
+  const info = input as Record<string, unknown>
+  const topLevel = Object.keys(info)
+  // Preserve existing V1 markers; only small_model needs disambiguation against V2 shapes.
+  if (topLevel.some((key) => v1MarkerKeys.has(key))) return true
+  if (!topLevel.includes("small_model")) return false
+  return !topLevel.some((key) => v2OnlyKeys.has(key)) && !hasV2SharedShape(info)
+}
+
+function hasV2SharedShape(info: Record<string, unknown>) {
+  if (Array.isArray(info.skills)) return true
+
+  const compaction = info.compaction
+  if (isRecord(compaction) && ("keep" in compaction || "buffer" in compaction)) return true
+
+  const mcp = info.mcp
+  if (!isRecord(mcp)) return false
+
+  // V1 MCP server names are user-defined, so inspect the value shape at these shared keys.
+  const servers = mcp.servers
+  if (isRecord(servers) && !("type" in servers) && !("enabled" in servers)) return true
+
+  const timeout = mcp.timeout
+  return isRecord(timeout) && !("type" in timeout) && !("enabled" in timeout)
+}
+
+function isRecord(input: unknown): input is Record<string, unknown> {
+  return typeof input === "object" && input !== null && !Array.isArray(input)
 }
 
 export function migrate(info: typeof ConfigV1.Info.Type) {

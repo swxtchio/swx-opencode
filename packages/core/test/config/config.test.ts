@@ -107,15 +107,31 @@ describe("Config", () => {
     }),
   )
 
-  it.effect("detects v1 configuration from any v1-only top-level key", () =>
+  it.effect("disambiguates v1 markers from native v2 shapes", () =>
     Effect.sync(() => {
       expect(ConfigMigrateV1.isV1({ snapshot: false })).toBe(true)
-      expect(ConfigMigrateV1.isV1({ snapshot: false, agents: {} })).toBe(false)
+      expect(ConfigMigrateV1.isV1({ snapshot: false, agents: {} })).toBe(true)
       expect(ConfigMigrateV1.isV1({ reference: {} })).toBe(true)
       expect(ConfigMigrateV1.isV1({ shell: "/bin/zsh", model: "anthropic/claude" })).toBe(false)
       expect(ConfigMigrateV1.isV1({ references: {} })).toBe(false)
       expect(ConfigMigrateV1.isV1({ small_model: "auxiliary/models/small", compaction: {} })).toBe(true)
       expect(ConfigMigrateV1.isV1({ small_model: "auxiliary/models/small", agents: {} })).toBe(false)
+      expect(
+        ConfigMigrateV1.isV1({
+          small_model: "auxiliary/models/small",
+          compaction: { keep: { tokens: 1234 }, buffer: 5678 },
+        }),
+      ).toBe(false)
+      expect(
+        ConfigMigrateV1.isV1({
+          small_model: "auxiliary/models/small",
+          mcp: { servers: { native: { type: "local", command: ["bun"] } } },
+        }),
+      ).toBe(false)
+      expect(
+        ConfigMigrateV1.isV1({ small_model: "auxiliary/models/small", mcp: { timeout: { request: 123 } } }),
+      ).toBe(false)
+      expect(ConfigMigrateV1.isV1({ small_model: "auxiliary/models/small", skills: [] })).toBe(false)
     }),
   )
 
@@ -203,7 +219,10 @@ describe("Config", () => {
             JSON.stringify({
               small_model: "auxiliary/models/global-small",
               compaction: { auto: false, preserve_recent_tokens: 1234, reserved: 5678 },
-              mcp: { legacy: { type: "local", command: ["bun", "run", "mcp.ts"] } },
+              mcp: {
+                legacy: { type: "local", command: ["bun", "run", "mcp.ts"] },
+                servers: { type: "local", command: ["bun", "run", "legacy-mcp.ts"] },
+              },
               skills: { paths: ["/legacy/skills"] },
             }),
           ),
@@ -225,7 +244,82 @@ describe("Config", () => {
                 type: "local",
                 command: ["bun", "run", "mcp.ts"],
               })
+              expect(document?.info.mcp?.servers?.servers).toMatchObject({
+                type: "local",
+                command: ["bun", "run", "legacy-mcp.ts"],
+              })
               expect(document?.info.skills).toEqual(["/legacy/skills"])
+            }).pipe(Effect.provide(testLayer(tmp.path))),
+          ),
+        ),
+      ),
+    ),
+  )
+
+  it.live("loads native V2 shared shapes beside the small_model setting", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.promise(() =>
+          fs.writeFile(
+            path.join(tmp.path, "opencode.json"),
+            JSON.stringify({
+              small_model: "native-provider/models/native-small",
+              compaction: { auto: false, keep: { tokens: 1234 }, buffer: 5678 },
+              mcp: { servers: { native: { type: "local", command: ["bun", "run", "mcp.ts"] } } },
+              skills: ["/native/skills"],
+            }),
+          ),
+        ).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const config = yield* Config.Service
+              const documents = (yield* config.entries()).filter(
+                (entry): entry is Config.Document => entry.type === "document",
+              )
+              const document = documents.at(-1)
+
+              expect(documents).toHaveLength(1)
+              expect(document?.info.small_model).toBe("native-provider/models/native-small")
+              expect(document?.info.compaction?.keep?.tokens).toBe(1234)
+              expect(document?.info.compaction?.buffer).toBe(5678)
+              expect(document?.info.mcp?.servers?.native).toMatchObject({
+                type: "local",
+                command: ["bun", "run", "mcp.ts"],
+              })
+              expect(document?.info.skills).toEqual(["/native/skills"])
+            }).pipe(Effect.provide(testLayer(tmp.path))),
+          ),
+        ),
+      ),
+    ),
+  )
+
+  it.live("migrates V1 permissions beside V2-only agent configuration", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.promise(() =>
+          fs.writeFile(
+            path.join(tmp.path, "opencode.json"),
+            JSON.stringify({
+              permission: { bash: "deny" },
+              agents: { build: { description: "native V2 agent field" } },
+            }),
+          ),
+        ).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const config = yield* Config.Service
+              const document = (yield* config.entries()).findLast(
+                (entry): entry is Config.Document => entry.type === "document",
+              )
+
+              expect(document?.info.permissions).toMatchObject([{ action: "bash", resource: "*", effect: "deny" }])
             }).pipe(Effect.provide(testLayer(tmp.path))),
           ),
         ),
