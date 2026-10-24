@@ -1,23 +1,11 @@
 export * as ConfigMigrateV1 from "./migrate"
 
-import { Option, Schema } from "effect"
 import { ConfigV1 } from "./config"
 import { ConfigAgentV1 } from "./agent"
 import { ConfigMCPV1 } from "./mcp"
 import { ConfigPermissionV1 } from "./permission"
 import { ConfigProviderV1 } from "./provider"
 import { ConfigProviderOptionsV1 } from "./provider-options"
-
-const decodeV1Info = Schema.decodeUnknownOption(ConfigV1.Info, {
-  errors: "all",
-  onExcessProperty: "ignore",
-  propertyOrder: "original",
-})
-const decodeV1StrictInfo = Schema.decodeUnknownOption(ConfigV1.Info, {
-  errors: "all",
-  onExcessProperty: "error",
-  propertyOrder: "original",
-})
 
 const v1MarkerKeys = new Set([
   "logLevel",
@@ -38,12 +26,26 @@ const v1MarkerKeys = new Set([
   "layout",
 ])
 
+const v2OnlyKeys = new Set([
+  "providers",
+  "agents",
+  "permissions",
+  "plugins",
+  "commands",
+  "snapshots",
+  "attachments",
+])
+
 export function isV1(input: unknown) {
-  if (Option.isNone(decodeV1Info(input))) return false
   if (typeof input !== "object" || input === null || Array.isArray(input)) return false
   const keys = Object.keys(input)
   if (keys.some((key) => v1MarkerKeys.has(key))) return true
-  return keys.includes("small_model") && Option.isSome(decodeV1StrictInfo(input))
+  return keys.includes("small_model") && !hasV2OnlyKey(input)
+}
+
+export function hasV2OnlyKey(input: unknown) {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return false
+  return Object.keys(input).some((key) => v2OnlyKeys.has(key))
 }
 
 export function migrate(info: typeof ConfigV1.Info.Type) {

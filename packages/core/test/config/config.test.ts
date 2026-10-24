@@ -1,10 +1,9 @@
 import path from "path"
 import fs from "fs/promises"
 import { describe, expect } from "bun:test"
-import { Cause, Effect, Exit, Layer, Schema } from "effect"
+import { Effect, Layer, Schema } from "effect"
 import { FastCheck } from "effect/testing"
 import { Config } from "@opencode-ai/core/config"
-import { ConfigErrorV1 } from "@opencode-ai/core/v1/config/error"
 import { ConfigProvider } from "@opencode-ai/core/config/provider"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -45,12 +44,21 @@ function testLayer(
   ])
 }
 
-function entriesExit(directory: string) {
-  return Effect.exit(
-    Effect.gen(function* () {
-      const config = yield* Config.Service
-      return yield* config.entries()
-    }).pipe(Effect.provide(testLayer(directory))),
+function loadConfig(input: unknown) {
+  return Effect.acquireRelease(
+    Effect.promise(() => tmpdir()),
+    (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+  ).pipe(
+    Effect.flatMap((tmp) =>
+      Effect.promise(() => fs.writeFile(path.join(tmp.path, "opencode.json"), JSON.stringify(input))).pipe(
+        Effect.andThen(
+          Effect.gen(function* () {
+            const config = yield* Config.Service
+            return (yield* config.entries()).flatMap((entry) => (entry.type === "document" ? [entry.info] : []))
+          }).pipe(Effect.provide(testLayer(tmp.path))),
+        ),
+      ),
+    ),
   )
 }
 
@@ -117,7 +125,7 @@ describe("Config", () => {
     }),
   )
 
-  it.effect("validates V1 configuration with the V1 schema", () =>
+  it.effect("detects V1 markers with the V2-only small_model guard", () =>
     Effect.sync(() => {
       expect(ConfigMigrateV1.isV1({ snapshot: false })).toBe(true)
       expect(ConfigMigrateV1.isV1({ snapshot: false, agents: {} })).toBe(true)
@@ -250,7 +258,53 @@ describe("Config", () => {
     ),
   )
 
-  it.live("loads native V2 MCP servers beside the small_model setting", () =>
+  it.live("keeps base-tolerant config shapes loading", () =>
+    Effect.gen(function* () {
+      const cases = [
+        { input: { model: "p/main", theme: "opencode" }, expected: { model: "p/main" } },
+        { input: { model: "p/main", subagent_depth: 2 }, expected: { model: "p/main" } },
+        { input: { model: "p/main", machine_message_markers: { hold: [] } }, expected: { model: "p/main" } },
+        {
+          input: { model: "p/main", theme: "legacy", provider: { legacy: { name: "legacy" } } },
+          expected: { model: "p/main", providers: { legacy: { name: "legacy" } } },
+        },
+        {
+          input: { model: "p/main", small_model: "p/small", theme: "legacy" },
+          expected: { model: "p/main", small_model: "p/small" },
+        },
+        {
+          input: { model: "p/main", theme: "legacy", keybinds: { leader: "ctrl+x" }, tui: { scroll_speed: 4 } },
+          expected: { model: "p/main" },
+        },
+        {
+          input: { model: "p/main", providers: { p: { name: "p", future_provider_option: true } } },
+          expected: { model: "p/main", providers: { p: { name: "p" } } },
+        },
+        {
+          input: { model: "p/main", agents: { build: { description: "Build", future_agent_option: true } } },
+          expected: { model: "p/main", agents: { build: { description: "Build" } } },
+        },
+        {
+          input: {
+            model: "p/main",
+            mcp: { servers: { local: { type: "local", command: ["native-mcp"], future_server_option: true } } },
+          },
+          expected: { model: "p/main", mcp: { servers: { local: { type: "local", command: ["native-mcp"] } } } },
+        },
+      ]
+
+      yield* Effect.forEach(cases, (fixture) =>
+        loadConfig(fixture.input).pipe(
+          Effect.map((documents) => {
+            expect(documents).toHaveLength(1)
+            expect(documents[0]).toMatchObject(fixture.expected)
+          }),
+        ),
+      )
+    }),
+  )
+
+  it.live("uses native V2 decoding when V1 markers coexist with V2-only keys", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
@@ -260,157 +314,30 @@ describe("Config", () => {
           fs.writeFile(
             path.join(tmp.path, "opencode.json"),
             JSON.stringify({
-              small_model: "native-provider/models/native-small",
-              mcp: { servers: { enabled: { type: "local", command: ["bun", "run", "mcp.ts"] } } },
-            }),
-          ),
-        ).pipe(
-          Effect.andThen(
-            Effect.gen(function* () {
-              const config = yield* Config.Service
-              const documents = (yield* config.entries()).filter(
-                (entry): entry is Config.Document => entry.type === "document",
-              )
-              const document = documents.at(-1)
-
-              expect(documents).toHaveLength(1)
-              expect(document?.info.small_model).toBe("native-provider/models/native-small")
-              expect(document?.info.mcp?.servers?.enabled).toMatchObject({
-                type: "local",
-                command: ["bun", "run", "mcp.ts"],
-              })
-            }).pipe(Effect.provide(testLayer(tmp.path))),
-          ),
-        ),
-      ),
-    ),
-  )
-
-  it.live("loads native V2 compaction beside the small_model setting", () =>
-    Effect.acquireRelease(
-      Effect.promise(() => tmpdir()),
-      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
-    ).pipe(
-      Effect.flatMap((tmp) =>
-        Effect.promise(() =>
-          fs.writeFile(
-            path.join(tmp.path, "opencode.json"),
-            JSON.stringify({
-              small_model: "native-provider/models/native-small",
-              compaction: { auto: false, keep: { tokens: 1234 }, buffer: 5678 },
-            }),
-          ),
-        ).pipe(
-          Effect.andThen(
-            Effect.gen(function* () {
-              const config = yield* Config.Service
-              const documents = (yield* config.entries()).filter(
-                (entry): entry is Config.Document => entry.type === "document",
-              )
-              const document = documents.at(-1)
-
-              expect(documents).toHaveLength(1)
-              expect(document?.info.small_model).toBe("native-provider/models/native-small")
-              expect(document?.info.compaction?.auto).toBe(false)
-              expect(document?.info.compaction?.keep?.tokens).toBe(1234)
-              expect(document?.info.compaction?.buffer).toBe(5678)
-            }).pipe(Effect.provide(testLayer(tmp.path))),
-          ),
-        ),
-      ),
-    ),
-  )
-
-  it.live("loads native custom LSP config without V1 extension requirements", () =>
-    Effect.acquireRelease(
-      Effect.promise(() => tmpdir()),
-      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
-    ).pipe(
-      Effect.flatMap((tmp) =>
-        Effect.promise(() =>
-          fs.writeFile(
-            path.join(tmp.path, "opencode.json"),
-            JSON.stringify({
-              small_model: "native-provider/models/native-small",
-              lsp: { custom: { command: ["custom-lsp"] } },
-            }),
-          ),
-        ).pipe(
-          Effect.andThen(
-            Effect.gen(function* () {
-              const config = yield* Config.Service
-              const document = (yield* config.entries()).findLast(
-                (entry): entry is Config.Document => entry.type === "document",
-              )
-
-              expect(document?.info.small_model).toBe("native-provider/models/native-small")
-              expect(document?.info.lsp).toMatchObject({ custom: { command: ["custom-lsp"] } })
-            }).pipe(Effect.provide(testLayer(tmp.path))),
-          ),
-        ),
-      ),
-    ),
-  )
-
-  it.live("loads native V2 skills beside the small_model setting", () =>
-    Effect.acquireRelease(
-      Effect.promise(() => tmpdir()),
-      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
-    ).pipe(
-      Effect.flatMap((tmp) =>
-        Effect.promise(() =>
-          fs.writeFile(
-            path.join(tmp.path, "opencode.json"),
-            JSON.stringify({ small_model: "native-provider/models/native-small", skills: ["/native/skills"] }),
-          ),
-        ).pipe(
-          Effect.andThen(
-            Effect.gen(function* () {
-              const config = yield* Config.Service
-              const document = (yield* config.entries()).findLast(
-                (entry): entry is Config.Document => entry.type === "document",
-              )
-
-              expect(document?.info.small_model).toBe("native-provider/models/native-small")
-              expect(document?.info.skills).toEqual(["/native/skills"])
-            }).pipe(Effect.provide(testLayer(tmp.path))),
-          ),
-        ),
-      ),
-    ),
-  )
-
-  it.live("rejects V1 permission data beside V2-only agent configuration", () =>
-    Effect.acquireRelease(
-      Effect.promise(() => tmpdir()),
-      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
-    ).pipe(
-      Effect.flatMap((tmp) =>
-        Effect.promise(() =>
-          fs.writeFile(
-            path.join(tmp.path, "opencode.json"),
-            JSON.stringify({
+              model: "p/main",
               permission: { bash: "deny" },
-              agents: { build: { description: "native V2 agent field" } },
+              agents: { build: { description: "Native agent" } },
             }),
           ),
         ).pipe(
           Effect.andThen(
             Effect.gen(function* () {
-              const result = yield* entriesExit(tmp.path)
-              expect(Exit.isFailure(result)).toBe(true)
-              if (Exit.isFailure(result)) {
-                const error = Cause.squash(result.cause)
-                expect(error).toBeInstanceOf(ConfigErrorV1.InvalidError)
-              }
-            }),
+              const config = yield* Config.Service
+              const document = (yield* config.entries()).findLast(
+                (entry): entry is Config.Document => entry.type === "document",
+              )
+
+              expect(document?.info.model).toBe("p/main")
+              expect(document?.info.agents?.build?.description).toBe("Native agent")
+              expect(document?.info.permissions).toBeUndefined()
+            }).pipe(Effect.provide(testLayer(tmp.path))),
           ),
         ),
       ),
     ),
   )
 
-  it.live("rejects native V2 data when no decode path retains its keys", () =>
+  it.live("uses native V2 decoding when small_model accompanies a V2-only key", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
@@ -419,18 +346,22 @@ describe("Config", () => {
         Effect.promise(() =>
           fs.writeFile(
             path.join(tmp.path, "opencode.json"),
-            JSON.stringify({ small_model: "native-provider/models/native-small", agents: { build: null } }),
+            JSON.stringify({
+              small_model: "native-provider/models/native-small",
+              agents: { build: { small_model: "native-provider/models/agent-small" } },
+            }),
           ),
         ).pipe(
           Effect.andThen(
             Effect.gen(function* () {
-              const result = yield* entriesExit(tmp.path)
-              expect(Exit.isFailure(result)).toBe(true)
-              if (Exit.isFailure(result)) {
-                const error = Cause.squash(result.cause)
-                expect(error).toBeInstanceOf(ConfigErrorV1.InvalidError)
-              }
-            }),
+              const config = yield* Config.Service
+              const document = (yield* config.entries()).findLast(
+                (entry): entry is Config.Document => entry.type === "document",
+              )
+
+              expect(document?.info.small_model).toBe("native-provider/models/native-small")
+              expect(document?.info.agents?.build?.small_model).toBe("native-provider/models/agent-small")
+            }).pipe(Effect.provide(testLayer(tmp.path))),
           ),
         ),
       ),
