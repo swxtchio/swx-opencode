@@ -1,0 +1,4 @@
+allowlist: 15:swxtchio/swx-opencode
+remote tag: []
+release view: release not found
+swxtch tip: d7f78881560aa83e9390f0231562fa79639eacd9	refs/heads/swxtch

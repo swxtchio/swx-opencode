@@ -1,0 +1,115 @@
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile.jail.candidate
+#1 transferring dockerfile: 8.99kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 78B done
+#3 DONE 0.0s
+
+#4 [tool-deps 1/6] FROM docker.io/library/debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 64.25MB 0.1s done
+#5 DONE 0.2s
+
+#6 [runtime  2/26] RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update     && apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30         install -y --no-install-recommends ca-certificates curl git python3     && rm -rf /var/lib/apt/lists/*
+#6 CACHED
+
+#7 [runtime  9/26] COPY --chown=root:root jail/opencode.json /jail/opencode.json
+#7 CACHED
+
+#8 [runtime 21/26] COPY --chown=root:root jail/tools/package.json /jail/tool-package.json
+#8 CACHED
+
+#9 [runtime  6/26] COPY jail/opencode-candidate.tar.gz /tmp/opencode-candidate.tar.gz
+#9 CACHED
+
+#10 [runtime 18/26] COPY --chown=root:root jail/tools/kb_capabilities.js /jail/kb_capabilities.js
+#10 CACHED
+
+#11 [tool-deps 6/6] RUN mkdir /tmp/opencode-tools     && cp /tmp/opencode-tools-package.json /tmp/opencode-tools/package.json     && cp /tmp/opencode-tools-package-lock.json /tmp/opencode-tools/package-lock.json     && cp /tmp/opencode-tools-src/propose_netlist.js /tmp/opencode-tools/propose_netlist.js     && cp /tmp/opencode-tools-src/test_propose_netlist.mjs /tmp/opencode-tools/test_propose_netlist.mjs     && cd /tmp/opencode-tools     && npm ci --ignore-scripts --no-audit --no-fund --omit=dev         --fetch-timeout=45000 --fetch-retries=2 --fetch-retry-maxtimeout=10000     && npm test
+#11 CACHED
+
+#12 [tool-deps 2/6] RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update     && apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30         install -y --no-install-recommends ca-certificates nodejs npm     && rm -rf /var/lib/apt/lists/*
+#12 CACHED
+
+#13 [tool-deps 3/6] COPY jail/tools/package.json /tmp/opencode-tools-package.json
+#13 CACHED
+
+#14 [runtime  7/26] RUN set -eu;     archive=/tmp/opencode-linux-arm64.tar.gz;     mv /tmp/opencode-candidate.tar.gz "${archive}";     printf '%s  %s\n' "ce5d212219f3d0534540b46d85337e16d28d57cbbe7efa16584353f62b3171f8" "${archive}" | sha256sum --strict -c -;     install -d -m 0700 /tmp/opencode-release;     tar -xzf "${archive}" -C /tmp/opencode-release --no-same-owner;     install -o root -g root -m 0555 /tmp/opencode-release/opencode /usr/local/bin/opencode;     set -- /tmp/opencode-release/libfff_c-*.so;     if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then         echo "expected one content-addressed OpenCode FFF sidecar" >&2;         exit 1;     fi;     install -o root -g root -m 0555 "$1" /usr/local/bin/;     rm -rf "${archive}" /tmp/opencode-release;     version_home="$(mktemp -d)";     reported="$(env -i HOME="${version_home}" PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/opencode --version)";     rm -rf "${version_home}";     if [ "${reported}" != "1.18.32-swxtch.d7f78881" ]; then         echo "opencode --version reported '${reported}', expected '1.18.32-swxtch.d7f78881'" >&2;         exit 1;     fi;     install -d -o root -g root -m 0755 /home/agent/.opencode
+#14 CACHED
+
+#15 [runtime  8/26] COPY --chown=root:root opencode_server.py /jail/opencode_server.py
+#15 CACHED
+
+#16 [runtime 25/26] COPY --from=tool-deps /tmp/opencode-tools/package-lock.json /jail/tool-package-lock.json
+#16 CACHED
+
+#17 [runtime 17/26] COPY --chown=root:root jail/tools/pipeline_status.js /jail/pipeline_status.js
+#17 CACHED
+
+#18 [runtime  4/26] RUN git -C /workspace/project init --quiet     && touch /workspace/project/.gitignore     && chmod 0444 /workspace/project/.gitignore
+#18 CACHED
+
+#19 [runtime  5/26] WORKDIR /workspace
+#19 CACHED
+
+#20 [runtime 20/26] COPY --chown=root:root jail/tools/propose_netlist.js /jail/propose_netlist.js
+#20 CACHED
+
+#21 [runtime  3/26] RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin agent     && install -d -o root -g root -m 0555 /jail /workspace /workspace/view /workspace/project     && install -d -o root -g root -m 0555 /home/agent/.config/opencode     && install -d -o agent -g agent -m 0755 /home/agent/.local         /home/agent/.local/share /home/agent/.local/state         /home/agent/.cache     && install -d -o agent -g agent -m 0755 /home/agent/.local/share/opencode     && install -d -o agent -g agent -m 0755 /home/agent/.local/state     && install -d -o agent -g agent -m 0755 /home/agent/.cache/opencode
+#21 CACHED
+
+#22 [runtime 12/26] COPY --chown=root:root jail/tools/estimate_price.js /jail/estimate_price.js
+#22 CACHED
+
+#23 [runtime 22/26] RUN install -d -m 0555 /jail/node_modules /jail/node_modules/@opencode-ai
+#23 CACHED
+
+#24 [runtime 23/26] COPY --from=tool-deps /tmp/opencode-tools/node_modules/@opencode-ai/plugin /jail/node_modules/@opencode-ai/plugin
+#24 CACHED
+
+#25 [runtime 15/26] COPY --chown=root:root jail/tools/pipeline_list.js /jail/pipeline_list.js
+#25 CACHED
+
+#26 [runtime 24/26] COPY --from=tool-deps /tmp/opencode-tools/node_modules/zod /jail/node_modules/zod
+#26 CACHED
+
+#27 [runtime 13/26] COPY --chown=root:root jail/tools/execute_browser_action.js /jail/execute_browser_action.js
+#27 CACHED
+
+#28 [runtime 10/26] RUN chmod 0555 /jail/opencode_server.py     && chmod 0444 /jail/opencode.json
+#28 CACHED
+
+#29 [runtime 19/26] COPY --chown=root:root jail/tools/kb_stage_detail.js /jail/kb_stage_detail.js
+#29 CACHED
+
+#30 [runtime 11/26] COPY --chown=root:root jail/tools/navigate_view.js /jail/navigate_view.js
+#30 CACHED
+
+#31 [tool-deps 4/6] COPY jail/tools/package-lock.json /tmp/opencode-tools-package-lock.json
+#31 CACHED
+
+#32 [runtime 16/26] COPY --chown=root:root jail/tools/pipeline_pricing.js /jail/pipeline_pricing.js
+#32 CACHED
+
+#33 [runtime 14/26] COPY --chown=root:root jail/tools/monitoring_view.js /jail/monitoring_view.js
+#33 CACHED
+
+#34 [tool-deps 5/6] COPY jail/tools/ /tmp/opencode-tools-src/
+#34 CACHED
+
+#35 [runtime 26/26] RUN chmod 0555 /jail/propose_netlist.js     && chmod 0444 /jail/tool-package.json /jail/tool-package-lock.json
+#35 CACHED
+
+#36 exporting to image
+#36 exporting layers done
+#36 writing image sha256:d0f39360c459a535c2379c4da24b6f78e784046d263930ba3b81889dc95ee1b8 done
+#36 naming to docker.io/library/opencode-variant-jail:v2-egress-1.18.32-swxtch.d7f78881-candidate done
+#36 DONE 0.0s

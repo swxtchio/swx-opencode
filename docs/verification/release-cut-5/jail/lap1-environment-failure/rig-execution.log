@@ -1,0 +1,15 @@
+2026-10-24T02:05:52Z
+opencode-linux-arm64.tar.gz: OK
+#16 0.442 /tmp/opencode-linux-arm64.tar.gz: OK
+eedd12bb9115d8f4bdd163ff445abe734c8ec386b8985937c41c04952da19eb2  /usr/local/bin/opencode
+0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42  /usr/local/bin/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so
+sha256:d0f39360c459a535c2379c4da24b6f78e784046d263930ba3b81889dc95ee1b8 arm64
+Traceback (most recent call last):
+  File "/home/byates/vm14-builds/opencode-release-d7f78881/rig/jail_v2_egress_probe.py", line 46, in <module>
+    import test_opencode_jail_integration as jail  # noqa: E402  the rig
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/byates/vm14-builds/opencode-release-d7f78881/rig/swx-abbe/components/orch/services/opencode-variant/tests/test_opencode_jail_integration.py", line 27, in <module>
+    import pytest
+ModuleNotFoundError: No module named 'pytest'
+exit=1
+2026-10-24T02:06:12Z

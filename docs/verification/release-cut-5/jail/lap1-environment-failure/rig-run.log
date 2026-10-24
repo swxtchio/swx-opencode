@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "/home/byates/vm14-builds/opencode-release-d7f78881/rig/jail_v2_egress_probe.py", line 46, in <module>
+    import test_opencode_jail_integration as jail  # noqa: E402  the rig
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/byates/vm14-builds/opencode-release-d7f78881/rig/swx-abbe/components/orch/services/opencode-variant/tests/test_opencode_jail_integration.py", line 27, in <module>
+    import pytest
+ModuleNotFoundError: No module named 'pytest'
+exit=1
+2026-10-24T02:06:12Z

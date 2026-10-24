@@ -1,0 +1,25 @@
+2026-10-24T02:08:56Z
+opencode-linux-arm64.tar.gz: OK
+#12 0.387 /tmp/opencode-linux-arm64.tar.gz: OK
+eedd12bb9115d8f4bdd163ff445abe734c8ec386b8985937c41c04952da19eb2  /usr/local/bin/opencode
+0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42  /usr/local/bin/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so
+sha256:e025ddc56785b3a45869d24dc533539fc75936c0088750c386852f5484d6883d arm64
+=== v1-control
+client: {"mode": "v1-control", "status": "completed", "model": "accounts/fireworks/models/deepseek-v4p1-flash"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== v2
+client: {"mode": "v2", "session": "ses_e94544315ffeP9k9kgYX8osYHs", "admitted_seq": 1, "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.step.started", "session.next.text.started", "session.next.text.ended", "session.next.step.ended"], "steps": [{"type": "session.next.step.started", "model": {"id": "accounts/fireworks/models/deepseek-v4p1-flash", "providerID": "swxtch-egress"}, "error": null}, {"type": "session.next.step.ended", "model": null, "error": null}], "wait": "OpenCodeV2WaitOutcome(status='completed', admitted_seq=1, message_id=None, assistant_message_id='msg_16babc6c8001GL792FzWF9huWv', payload={'type': 'completed', 'admittedSeq': 1, 'assistantMessageID': 'msg_16babc6c8001GL792FzWF9huWv'})"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== v2-named
+client: {"mode": "v2-named", "session": "ses_e94542498ffeoL5Rlh1pDBpvJN", "admitted_seq": 1, "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.step.started", "session.next.text.started", "session.next.text.ended", "session.next.step.ended"], "steps": [{"type": "session.next.step.started", "model": {"id": "accounts/fireworks/models/deepseek-v4p1-flash", "providerID": "swxtch-egress", "variant": "default"}, "error": null}, {"type": "session.next.step.ended", "model": null, "error": null}], "wait": "OpenCodeV2WaitOutcome(status='completed', admitted_seq=1, message_id=None, assistant_message_id='msg_16babe51f001Vpu4FNCabxUlOZ', payload={'type': 'completed', 'admittedSeq': 1, 'assistantMessageID': 'msg_16babe51f001Vpu4FNCabxUlOZ'})"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== compact
+client: {"mode": "compact", "session": "ses_e9454059dffesPRrcbk1LneezD", "admitted_seq": 1, "turn": "completed", "compact_status": 204, "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.titled", "session.next.step.started", "session.next.text.started", "session.next.text.ended", "session.next.step.ended", "session.next.compaction.started", "session.next.compaction.ended"], "compactions": [{"type": "session.next.compaction.started", "reason": "manual", "text": ""}, {"type": "session.next.compaction.ended", "reason": "manual", "text": "## Objective\n- Describe an SRT input.\n\n## Progress\n- Answered: an SRT input listens on one UDP port and admits one caller."}]}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True kind=title", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True kind=turn", "REQ3 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True kind=summary transcript=yes"]
+RESULT: PASS
+exit=0
+2026-10-24T02:10:00Z
+RIG-PASS
