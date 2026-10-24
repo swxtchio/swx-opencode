@@ -1,8 +1,8 @@
 # V2 small-model parity
 
-Authority: swxtchio/swx-abbe#1953 and the assigned task brief. The V1 behaviour this matches is #342
-(`plans/small-model-scopes.md`); the V2 follow-up it closes is "Add explicit manual compaction" in
-`specs/v2/session.md`.
+Authority: swxtchio/swx-abbe#1953, swxtchio/swx-opencode#355, and the assigned task brief. The V1
+behaviour this matches is #342 (`plans/small-model-scopes.md`); the V2 follow-up it closes is "Add
+explicit manual compaction" in `specs/v2/session.md`.
 
 ## Create parameter
 
@@ -13,15 +13,26 @@ Authority: swxtchio/swx-abbe#1953 and the assigned task brief. The V1 behaviour 
 
 ## Auxiliary model selection
 
-`SessionRunnerModel` gains one resolver for title and compaction models. It follows V1's order for the scopes V2
-has; V1's agent-level and global `small_model` have no V2 equivalent yet (#355). The order:
-1. the `title` or `compaction` agent's own `model`;
-2. the session's `smallModel`;
-3. for titles only, the catalog's small model for the turn's provider;
-4. the turn's own model.
+`SessionRunnerModel` uses one lazy resolver for titles and summaries. Its order preserves V1's
+agent, session, and global choices while retaining title-only inference:
+
+1. The `title` or `compaction` agent's own `model`.
+2. That auxiliary agent's `small_model`.
+3. The originating primary agent's `small_model`.
+4. The session's `smallModel`.
+5. The effective global `small_model` from location configuration.
+6. For titles only, the catalog's small model for the turn's provider.
+7. The turn's own model.
+
+V1 title and compaction paths consult the originating agent's small model before the session and
+global selections. A title or compaction agent's `model` override cannot express distinct small
+models inherited from different primary agents, so V2 keeps the separate agent-level field.
+V1-format configuration migration and native V2 configuration loading both preserve the global and
+agent selections without losing other settings or location priority.
 
 A configured selection that does not resolve fails without a substitute, as in V1.
-The model is resolved only when a title or summary is about to be requested, so a bad small model
+Lower-priority invalid selections do not defeat a usable higher-priority choice. The model is
+resolved only when a title or summary is about to be requested, so an unusable auxiliary selection
 cannot fail an ordinary turn.
 
 ## Runner title
@@ -54,13 +65,17 @@ cannot fail an ordinary turn.
 
 ## Proof
 
-- Core runner tests cover the title on the auxiliary model, the title gates, the session small model
-  for automatic compaction, and manual compaction (completed, fits-whole, failure, serialized behind
-  an active drain).
-- The opencode HTTP tests cover the real server against `TestLLMServer`: create with `smallModel`,
-  compact reaching the provider and returning 204, and title and summary requests naming the small
-  model.
-- Each new test gets a demonstrated red with its behaviour reverted.
+- Core config tests cover V1 migration, native V2 loading with `providers`, `agents`, and
+  `small_model`, and competing documents at the real loader boundary. Environment tests cover
+  config-to-catalog-to-resolver precedence across providers, including distinct primary-agent
+  small models and no-substitution for an unavailable selected model.
+- Core runner tests cover the selected primary agent on title, automatic, and overflow summaries,
+  plus title gates and manual compaction orchestration.
+- Opencode HTTP tests use the real server and `TestLLMServer` to observe two primary agents selecting
+  different title and manual-summary models, global selection when no session selection exists,
+  primary replies staying on their turn models, and the resulting session title and summary.
+- Each changed behavior test gets a bounded failure with its production behavior removed, then a
+  restored passing run.
 - The jail rig (`jail-v2-egress-rig.md`) gets a `v2-compact` mode for abbe, relayed through
   firstmate: compact after a V2 turn must reach the egress provider and return 204.
 
