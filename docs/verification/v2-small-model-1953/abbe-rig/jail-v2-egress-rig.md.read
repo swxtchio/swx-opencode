@@ -1,0 +1,671 @@
+# Jail-boundary V2 rig: acceptance tests for swxtchio/swx-abbe#1952 and #1953
+
+The rig answers two questions about the Orch OpenCode jail. It runs the real jail daemon behind the
+real egress proxy, and it sends the V2 calls exactly as Abbe's `opencode_client.py` sends them.
+
+- **#1952: does a V2 chat turn reach the `swxtch-egress` provider?** Modes `v1-control`, `v2` and
+  `v2-named` pass only if the fake provider receives the turn's model request. All three pass from
+  `v1.18.32-swxtch.cd3f0ce2`; on `v1.18.32-swxtch.774d90c7` the two V2 modes reached no provider.
+- **#1953: does a V2 compaction complete through the jail?** Mode `compact` passes only if the fake
+  provider receives the summary request and the session records the finished compaction. It is the
+  acceptance proof for #1953's fix, swxtchio/swx-opencode#354. On `cd3f0ce2` it fails: the compact call
+  answers 503. That run is the red baseline in §6.
+
+## What runs
+
+The rig is `_brain_rig` in swx-abbe's
+`components/orch/services/opencode-variant/tests/test_opencode_jail_integration.py`. The probe uses
+it as it is: `compact` passes its own provider through the rig's existing `provider_code=` argument,
+so the rig needs no repository change. The rig puts three containers on a new internal Docker network:
+
+1. **The jail daemon, from the image under test.** The image's own entrypoint
+   (`/jail/opencode_server.py`) reads `OPENCODE_CONFIG=/jail/opencode.json` and renders it with the
+   proxy URL and the session capability, which the rig passes as `OPENCODE_PROXY_BASE_URL` and
+   `OPENCODE_PROXY_CAPABILITY`, into `OPENCODE_CONFIG_CONTENT`. It then execs
+   `opencode serve --pure`.
+2. **The real egress proxy** (`egress_proxy.py`).
+3. **A fake provider.** It answers the proxy's readiness probe and logs each model request as a
+   `REQ<n> /v1/chat/completions model=<model> stream=<bool>` line.
+   - The turn modes use the rig's default provider. Its first answer is a `propose_netlist` tool call
+     and its later answers are text.
+   - `compact` uses the probe's own provider. Every answer is text, streamed when the request asks
+     for a stream, and each line adds `kind=<kind>`:
+     - `kind=summary` for a request whose user text holds a `</conversation>` close tag. OpenCode's
+       compaction prompt wraps the transcript in `<conversation>` tags. Such a line ends
+       `transcript=yes` when that block holds the probe's question and the turn's answer, and
+       `transcript=no` otherwise.
+     - `kind=title` for OpenCode's title prompt ("You are a title generator", "Generate a title for
+       this conversation").
+     - `kind=turn` for every other request.
+
+The client is `opencode_client.OpenCodeClient` itself. It runs in a throwaway container from the same
+image on the rig network, the way the jail integration tests run it. The jail's config, as committed
+(the rig supplies both `{env:…}` values):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "autoupdate": false,
+  "plugin": [],
+  "provider": {
+    "swxtch-egress": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "swXtch egress proxy",
+      "options": {
+        "baseURL": "{env:OPENCODE_PROXY_BASE_URL}",
+        "apiKey": "{env:OPENCODE_PROXY_CAPABILITY}"
+      },
+      "models": {
+        "accounts/fireworks/models/deepseek-v4p1-flash": {
+          "name": "DeepSeek V4.1 Flash"
+        }
+      }
+    }
+  }
+}
+```
+
+It sets no top-level `model` and no `small_model`. A V2 session created without a model relies on
+the catalog's default. A compaction summary runs on the session's small model, which falls back to
+the primary model when none is set.
+
+## Prerequisites
+
+- **Docker** with BuildKit, and network access to github.com while building. The Dockerfile
+  downloads the release asset.
+- **`gh`**, authenticated, to read the release's `.sha256` companion and asset digest.
+- **Python 3.10 or later**, with `pytest` importable, because the rig module imports it.
+- **A swx-abbe checkout.**
+  - Measured at swxtchio/swx-abbe#1951's head, `1c6b3582dab3ecef9081dca516102e4c9786f7f4`. Its
+    Dockerfile pins `v1.18.32-swxtch.cd3f0ce2`.
+  - `main` has the same `_brain_rig(provider_code=...)` signature and the same Dockerfile apart from
+    its pin defaults, which the build below overrides.
+- **On a snap-Docker host,** `TMPDIR` must be a non-hidden directory under `$HOME`, because snap
+  Docker cannot read `/tmp` or hidden directories. The repository checkout must also sit on such a
+  path. Elsewhere the default `TMPDIR` is fine.
+
+## 1. Build the jail image for any release tag
+
+The image is built from the checkout's `jail/Dockerfile.jail`. Only the asset name is swapped to the
+host's architecture. The Dockerfile stops unless the archive matches `OPENCODE_ARCHIVE_SHA256` and
+`opencode --version` prints exactly `OPENCODE_VERSION`. On an amd64 host the `sed` changes nothing.
+To test #1953's fix, set `TAG` to the swx-opencode release that carries swxtchio/swx-opencode#354.
+
+```bash
+cd <swx-abbe checkout>/components/orch/services/opencode-variant
+TAG=v1.18.32-swxtch.cd3f0ce2            # any swxtchio/swx-opencode release tag
+VERSION="${TAG#v}"                       # the version the binary must report
+case "$(uname -m)" in
+  x86_64|amd64)  ASSET=opencode-linux-x64.tar.gz ;;
+  aarch64|arm64) ASSET=opencode-linux-arm64.tar.gz ;;
+esac
+SHA="$(gh release download "$TAG" -R swxtchio/swx-opencode -p "$ASSET.sha256" -O - | cut -d' ' -f1)"
+test "$(gh release view "$TAG" -R swxtchio/swx-opencode --json assets \
+        --jq ".assets[] | select(.name == \"$ASSET\") | .digest")" = "sha256:$SHA"
+sed "s/opencode-linux-x64\.tar\.gz/$ASSET/g" jail/Dockerfile.jail |
+  DOCKER_BUILDKIT=1 docker build --progress=plain -f - \
+    -t "opencode-variant-jail:v2-egress-$VERSION" \
+    --build-arg OPENCODE_RELEASE_TAG="$TAG" \
+    --build-arg OPENCODE_ARCHIVE_SHA256="$SHA" \
+    --build-arg OPENCODE_VERSION="$VERSION" \
+    --build-arg GIT_COMMIT="$(git rev-parse HEAD)" \
+    .
+```
+
+A first build logs `/tmp/<asset>: OK` in the release-install step. For `cd3f0ce2`,
+`VERSION=1.18.32-swxtch.cd3f0ce2`, and the digests are:
+
+| `ASSET` | `SHA` |
+| --- | --- |
+| `opencode-linux-x64.tar.gz` | `650506db6511c7a3069f1ff4e7cf732b2fdab4c7e056ae2fe7fd258d5eeca414` |
+| `opencode-linux-arm64.tar.gz` | `11382c4b6e715e3b2b58628ea96ee53fe0e185361083306313e87ed8913b352f` |
+
+## 2. Save the probe
+
+Save it verbatim. It imports the rig from the checkout, so it may live anywhere.
+
+```bash
+cat > ~/jail_v2_egress_probe.py <<'PROBE'
+#!/usr/bin/env python3
+"""Jail-boundary acceptance probe for swxtchio/swx-abbe#1952 (V2 egress) and #1953 (V2 compaction).
+
+Runs the swx-abbe jail integration rig: the real jail daemon started by the image's own entrypoint,
+the real egress proxy, and a fake provider. The client is opencode_client.OpenCodeClient itself,
+run in a container on the rig's internal network, as the jail integration tests run it.
+
+Usage, from the root of a swx-abbe checkout (or with SWX_ABBE_CHECKOUT set to one):
+    python3 jail_v2_egress_probe.py v1-control v2 v2-named compact
+
+Modes:
+    v1-control  a V1 turn (OpenCodeClient.open_turn); shows the rig's egress path works
+    v2          the V2 calls exactly as opencode_client.py sends them: create_session_v2(), then
+                prompt_session_v2(session, "msg_...", {"text": ...})          <- the #1952 case
+    v2-named    the same create with the session's model named (not sent by opencode_client.py today)
+    compact     a V2 turn as in v2, settled with wait_session_v2, then the V2 compact call,
+                POST /api/session/{id}/compact with no body                    <- the #1953 case
+
+v1-control, v2 and v2-named run on the rig's default provider. They pass when it received a
+chat-completions request for the egress model.
+
+compact runs on this probe's own provider, which answers every request with text and logs what each
+request is: the turn, a title, or a summary request (one whose user text holds OpenCode's
+<conversation> block). It passes only when all of these hold:
+    - the turn reached the provider and wait_session_v2 reported it completed;
+    - the compact call answered 200 or 204;
+    - the provider received a summary request carrying this session's turn;
+    - the session history records a manual session.next.compaction.ended whose text is the
+      provider's summary.
+A 503, and a 204 that asked no model, both fail.
+
+Each mode prints RESULT: PASS or RESULT: FAIL. The exit status is 0 only when every requested mode
+passed.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(os.environ.get("SWX_ABBE_CHECKOUT", ".")).resolve()
+VARIANT = ROOT / "components" / "orch" / "services" / "opencode-variant"
+sys.path[:0] = [str(VARIANT / "tests"), str(VARIANT)]
+
+import test_opencode_jail_integration as jail  # noqa: E402  the rig
+
+MODEL = "accounts/fireworks/models/deepseek-v4p1-flash"
+SIGNAL = f"/v1/chat/completions model={MODEL}"
+MODES = ("v1-control", "v2", "v2-named", "compact")
+
+QUESTION = "Please describe an SRT input."
+ANSWERS = {
+    "turn": "An SRT input listens on one UDP port and admits one caller.",
+    "title": "SRT input description",
+    "summary": "## Objective\n- Describe an SRT input.\n\n## Progress\n"
+               "- Answered: an SRT input listens on one UDP port and admits one caller.",
+}
+
+# The compact mode's provider. Every request gets a text answer, streamed when the request asks
+# for a stream. Each request is logged as REQ<n> <path> model=<id> stream=<bool> kind=<kind>, where
+# kind is "summary" for a request whose user text holds a </conversation> close tag (OpenCode's
+# compaction prompt wraps the transcript in <conversation> tags), "title" for OpenCode's title
+# prompt, and "turn" otherwise. A summary line adds transcript=yes when that block holds this
+# probe's question and the turn's answer.
+COMPACT_PROVIDER = r'''
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+
+IDENTITY = os.environ["PROVIDER_IDENTITY"]
+QUESTION, ANSWERS = json.loads(__CONSTANTS__)
+
+
+def texts(request):
+    found = []
+    for message in request.get("messages") or []:
+        content = message.get("content")
+        if isinstance(content, str):
+            found.append((message.get("role"), content))
+        elif isinstance(content, list):
+            found.extend((message.get("role"), str(part.get("text", "")))
+                         for part in content if isinstance(part, dict))
+    return found
+
+
+def classify(request):
+    found = texts(request)
+    users = [text for role, text in found if role == "user"]
+    if any("</conversation>" in text for text in users):
+        carried = any(QUESTION in text and ANSWERS["turn"] in text for text in users)
+        return "summary", " transcript=" + ("yes" if carried else "no")
+    if any("You are a title generator" in text or "Generate a title for this conversation" in text
+           for _, text in found):
+        return "title", ""
+    return "turn", ""
+
+
+class Handler(BaseHTTPRequestHandler):
+    requests = 0
+
+    def log_message(self, *_args):
+        return
+
+    def _send(self, status, body=b"", content_type="application/json"):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+        authorized = (
+            self.path == "/v1/chat/completions"
+            and self.headers.get("Authorization") == "Bearer fake-vendor-key"
+        )
+        if "swxtch_readiness_probe" in request:
+            if not authorized:
+                self._send(401)
+                return
+            self._send(200, json.dumps({
+                "readiness": {"provider": IDENTITY, "nonce": request["swxtch_readiness_probe"]},
+                "choices": [],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }).encode())
+            return
+        Handler.requests += 1
+        kind, detail = classify(request)
+        model = request.get("model")
+        print("REQ%d %s model=%s stream=%s kind=%s%s" % (
+            Handler.requests, self.path, model, request.get("stream"), kind, detail), flush=True)
+        if not authorized:
+            self._send(401)
+            return
+        answer = ANSWERS[kind]
+        usage = {"prompt_tokens": 10, "completion_tokens": 5}
+        if not request.get("stream"):
+            self._send(200, json.dumps({
+                "id": "chatcmpl-compact-rig", "object": "chat.completion", "created": 1, "model": model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": answer},
+                             "finish_reason": "stop"}],
+                "usage": usage,
+            }).encode())
+            return
+        frames = [
+            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": answer},
+                          "finish_reason": None}], "usage": None},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": usage},
+        ]
+        body = "".join(
+            "data: " + json.dumps({"id": "chatcmpl-compact-rig", "object": "chat.completion.chunk",
+                                   "created": 1, "model": model, **frame}) + "\n\n"
+            for frame in frames
+        ) + "data: [DONE]\n\n"
+        self._send(200, body.encode(), "text/event-stream")
+
+
+ThreadingHTTPServer(("0.0.0.0", 18081), Handler).serve_forever()
+'''.replace("__CONSTANTS__", repr(json.dumps([QUESTION, ANSWERS])))
+
+CLIENT = r'''
+import json, sys, time, urllib.parse, uuid
+sys.path.insert(0, "/src/components/orch/services/opencode-variant")
+import opencode_client as oc
+
+endpoint, password, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+client = oc.OpenCodeClient(endpoint=endpoint, password=password, directory="/workspace/project", timeout=30)
+out = {"mode": mode}
+
+
+def history(sid):
+    events, after = [], None
+    for _ in range(50):
+        page = client.get_session_history_v2(sid, after_seq=after, limit=100)
+        events += page["data"]
+        if not page["hasMore"] or not page["data"]:
+            return events
+        after = page["data"][-1]["durable"]["seq"]
+    return events
+
+
+try:
+    if mode == "v1-control":
+        turn = client.open_turn(session_id="v1-control", message="Please describe an SRT input.")
+        list(turn.events())
+        response = turn.accumulator.build_response()
+        out.update(status=response["status"], model=turn.accumulator.model_id)
+    elif mode == "compact":
+        # POST /api/session  {"location":{"directory":"/workspace/project"}}
+        sid = client.create_session_v2()["id"]
+        out["session"] = sid
+        # POST /api/session/{sid}/prompt  {"id":"msg_...","prompt":{"text":"..."}}
+        receipt = client.prompt_session_v2(sid, "msg_" + uuid.uuid4().hex[:16],
+                                           {"text": "Please describe an SRT input."})
+        out["admitted_seq"] = receipt.admitted_seq
+        # POST /api/session/{sid}/wait  (no body)
+        try:
+            out["turn"] = client.wait_session_v2(receipt, deadline=time.monotonic() + 90).status
+        except oc.OpenCodeError as exc:
+            out["turn_error"] = str(exc)[:300]
+        # POST /api/session/{sid}/compact  (no body), sent as interrupt_session_v2 sends its POST
+        deadline = time.monotonic() + 120
+        try:
+            response = client._request(
+                "compactSessionV2", f"/api/session/{urllib.parse.quote(sid, safe='')}/compact",
+                method="POST", expected_status=(200, 204), include_directory=False, deadline=deadline,
+            )
+            out["compact_status"] = oc._response_status(response)
+            oc._discard_response(response, deadline=deadline)
+        except oc.OpenCodeError as exc:
+            out["compact_status"] = exc.status
+            out["compact_refused"] = str(exc)[:300]
+        # GET /api/session/{sid}/history, every page; once the compact call has succeeded, read
+        # until a compaction has ended (the call answers after the summary is recorded, so the
+        # first read normally has it; 20 s bounds a missing one)
+        until = time.monotonic() + (20 if out.get("compact_status") in (200, 204) else 0)
+        while True:
+            events = history(sid)
+            ended = [e for e in events if e.get("type") == "session.next.compaction.ended"]
+            if ended or time.monotonic() >= until:
+                break
+            time.sleep(1)
+        out["history_types"] = [event.get("type") for event in events]
+        out["compactions"] = [
+            {"type": event.get("type"), "reason": (event.get("data") or {}).get("reason"),
+             "text": str((event.get("data") or {}).get("text", ""))[:400]}
+            for event in events if str(event.get("type", "")).startswith("session.next.compaction.")
+            and not str(event.get("type")).endswith(".delta")
+        ]
+    else:
+        if mode == "v2":
+            # POST /api/session  {"location":{"directory":"/workspace/project"}}
+            session = client.create_session_v2()
+        else:
+            deadline = time.monotonic() + 30
+            body = {
+                "location": {"directory": client.directory},
+                "model": {"providerID": "swxtch-egress", "id": "accounts/fireworks/models/deepseek-v4p1-flash"},
+            }
+            response = client._request("createSessionV2", "/api/session", method="POST", body=body,
+                                       include_directory=False, deadline=deadline)
+            session = oc._v2_data_object(oc._read_json(response, "createSessionV2", deadline=deadline),
+                                         "createSessionV2")
+        sid = session["id"]
+        out["session"] = sid
+        # POST /api/session/{sid}/prompt  {"id":"msg_...","prompt":{"text":"..."}}
+        receipt = client.prompt_session_v2(sid, "msg_" + uuid.uuid4().hex[:16],
+                                           {"text": "Please describe an SRT input."})
+        out["admitted_seq"] = receipt.admitted_seq
+        events = []
+        for _ in range(45):
+            page = client.get_session_history_v2(sid)
+            events = page.get("data") if isinstance(page.get("data"), list) else page.get("events", [])
+            types = [event.get("type", "") for event in events]
+            if any(t.endswith(("step.failed", "step.ended", "step.completed", ".idle")) for t in types):
+                break
+            time.sleep(1)
+        out["history_types"] = [event.get("type") for event in events]
+        out["steps"] = [
+            {"type": event.get("type"), "model": (event.get("data") or {}).get("model"),
+             "error": (event.get("data") or {}).get("error")}
+            for event in events if str(event.get("type", "")).startswith("session.next.step")
+        ]
+        try:
+            outcome = client.wait_session_v2(receipt, deadline=time.monotonic() + 20)
+            out["wait"] = repr(outcome)[:300]
+        except oc.OpenCodeError as exc:
+            out["wait_error"] = str(exc)[:300]
+except oc.OpenCodeError as exc:
+    out["client_error"] = f"{type(exc).__name__}: {exc}"[:400]
+print(json.dumps(out), flush=True)
+'''
+
+
+def compact_verdict(result: dict, requests: list[str]) -> list[str]:
+    """Every unmet compact-mode condition, in the order the calls ran; empty means PASS."""
+    unmet = []
+    if not any(" kind=turn" in line for line in requests):
+        unmet.append("no turn request reached the provider, so the session has no transcript to compact")
+    if result.get("turn") != "completed":
+        unmet.append(f"the turn did not complete: {result.get('turn') or result.get('turn_error') or result.get('client_error')}")
+    if result.get("compact_status") not in (200, 204):
+        unmet.append(f"the compact call answered {result.get('compact_status')}: {result.get('compact_refused')}")
+    summaries = [line for line in requests if " kind=summary" in line]
+    if not summaries:
+        unmet.append("the provider received no summary request")
+    elif not any(line.endswith(" transcript=yes") for line in summaries):
+        unmet.append("no summary request carried this session's turn")
+    ended = [entry for entry in result.get("compactions", [])
+             if entry["type"] == "session.next.compaction.ended" and entry["reason"] == "manual"]
+    if not ended:
+        unmet.append("the history records no completed manual compaction (session.next.compaction.ended)")
+    elif not any(entry["text"] == ANSWERS["summary"] for entry in ended):
+        unmet.append("the recorded compaction text is not the provider's summary")
+    return unmet
+
+
+def run(mode: str) -> bool:
+    network = f"jail-v2-egress-{os.getpid()}-{mode}"
+    rig_options = {"provider_code": COMPACT_PROVIDER} if mode == "compact" else {}
+    subprocess.run(["docker", "network", "create", "--internal", network], check=True, capture_output=True)
+    try:
+        with jail._brain_rig(network, **rig_options) as rig:
+            client = subprocess.run(
+                [
+                    "docker", "run", "--rm", "--network", rig["network"],
+                    "--read-only", "--cap-drop", "ALL", "--tmpfs", "/tmp:rw,size=16m",
+                    "-v", f"{ROOT}:/src:ro", "--entrypoint", "python3", jail.JAIL_IMAGE,
+                    "-c", CLIENT, rig["endpoint"], jail.SERVER_PASSWORD, mode,
+                ],
+                capture_output=True, text=True, timeout=300,
+            )
+            provider = subprocess.run(["docker", "logs", rig["provider"]], capture_output=True, text=True, timeout=15)
+            daemon = subprocess.run(["docker", "logs", rig["name"]], capture_output=True, text=True, timeout=15)
+    finally:
+        subprocess.run(["docker", "network", "rm", network], capture_output=True)
+    requests = [line for line in (provider.stdout + provider.stderr).splitlines() if line.startswith("REQ")]
+    errors = [
+        line for line in (daemon.stdout + daemon.stderr).splitlines()
+        if any(key in line for key in ("Failed to drain", "ModelNotSelected", "ModelUnavailable", "level=ERROR"))
+    ]
+    client_line = (client.stdout.strip().splitlines() or ["<no output>"])[-1]
+    if mode == "compact":
+        try:
+            unmet = compact_verdict(json.loads(client_line), requests)
+        except (ValueError, KeyError, TypeError) as exc:
+            unmet = [f"the client printed no readable result ({type(exc).__name__})"]
+        passed = not unmet
+    else:
+        unmet = []
+        passed = any(SIGNAL in line for line in requests)
+    print(f"=== {mode}")
+    print("client:", client_line)
+    if client.returncode != 0:
+        print("client stderr:", client.stderr.strip()[-800:])
+    print("provider requests:", json.dumps(requests))
+    for line in errors[-5:]:
+        print("daemon:", line[:400])
+    for reason in unmet:
+        print("unmet:", reason)
+    print("RESULT:", "PASS" if passed else "FAIL")
+    return passed
+
+
+if __name__ == "__main__":
+    modes = sys.argv[1:] or ["v1-control", "v2", "v2-named"]
+    unknown = [mode for mode in modes if mode not in MODES]
+    if unknown:
+        sys.exit(f"unknown mode(s): {' '.join(unknown)}")
+    results = [run(mode) for mode in modes]
+    sys.exit(0 if all(results) else 1)
+PROBE
+```
+
+## 3. Start the rig and run
+
+Run it from the checkout's root. Each mode starts its own rig, runs its calls, reads the provider's
+and the daemon's logs, and tears the rig down. A mode takes under a minute.
+
+```bash
+cd <swx-abbe checkout>
+mkdir -p "$HOME/jail-v2-egress-tmp"
+TMPDIR="$HOME/jail-v2-egress-tmp" PYTHONDONTWRITEBYTECODE=1 \
+OPENCODE_VARIANT_JAIL_IMAGE="opencode-variant-jail:v2-egress-$VERSION" \
+OPENCODE_SERVER_PASSWORD=local-rig-password \
+python3 ~/jail_v2_egress_probe.py v1-control v2 v2-named compact
+```
+
+With no mode named, the probe runs `v1-control v2 v2-named`. `OPENCODE_SERVER_PASSWORD` is a
+throwaway local value. The rig gives it to the daemon and the client, and it is a credential for
+nothing else. The fake provider and the proxy use the rig's own fixture values. No real provider or
+key is involved.
+
+## 4. The V2 calls, as `opencode_client.py` sends them
+
+`session_pool.py` calls `create_session_v2()` with no id, then
+`prompt_session_v2(<native session id>, <gateway msg_ id>, {"text": <prompt>})`. Neither call adds a
+`directory` query. On the wire:
+
+```
+POST /api/session
+Authorization: Basic base64("opencode:" + OPENCODE_SERVER_PASSWORD)
+Accept: application/json
+Content-Type: application/json
+
+{"location":{"directory":"/workspace/project"}}
+
+  -> 200 {"data":{"id":"ses_…", …}}
+```
+
+```
+POST /api/session/<ses_…>/prompt
+(the same headers)
+
+{"id":"msg_<16 hex>","prompt":{"text":"Please describe an SRT input."}}
+
+  -> 200 {"data":{"sessionID":"ses_…","id":"msg_…","admittedSeq":1, …}}
+```
+
+`compact` then sends two POSTs with no body, so with no `Content-Type`:
+
+```
+POST /api/session/<ses_…>/wait
+Authorization: Basic base64("opencode:" + OPENCODE_SERVER_PASSWORD)
+Accept: application/json
+
+  -> 200 {"data":{"type":"completed","admittedSeq":1, …}}
+```
+
+```
+POST /api/session/<ses_…>/compact
+(the same headers)
+
+  on cd3f0ce2:  -> 503 ServiceUnavailableError "Session compact is not available yet"
+                   (service "session.compact")
+  with #354:    -> 204 once the summary is recorded
+                -> 204 at once when there is nothing to compact
+                -> 500 UnknownError when the summary fails or would not fit the summarizing model
+```
+
+`wait` is `opencode_client.py`'s `wait_session_v2`. `opencode_client.py` has no compact method yet,
+so the probe sends compact through the client's own `_request`, the way `interrupt_session_v2` sends
+its POST: no body, no `directory` query, and the session id path-quoted. The OpenCode SDK's
+`v2.session.compact` sends the same request.
+
+After the compact call, the probe reads every page of `GET /api/session/<id>/history`. When the
+call succeeded, it keeps reading for up to 20 s, until a `session.next.compaction.ended` event
+appears. The call answers only after the summary is recorded, so the first read normally has it.
+
+The modes:
+- **`v2`** is exactly the create and prompt calls. It is #1952's acceptance case.
+- **`v2-named`** sends the same create with
+  `"model":{"providerID":"swxtch-egress","id":"accounts/fireworks/models/deepseek-v4p1-flash"}`
+  added. That is the shape B-16.7 (swxtchio/swx-abbe#1792) plans to send; `opencode_client.py` does
+  not send it today.
+- **`v1-control`** is a V1 turn (`OpenCodeClient.open_turn`). It shows that the rig's egress path and
+  the provider work, so a V2 failure is V2's own.
+- **`compact`** is create, prompt, wait, compact, then the history read. It is #1953's acceptance case.
+
+The turn modes read the history and call `wait` after the prompt for diagnosis only.
+
+## 5. Success signals
+
+**The turn modes** pass when the fake provider logged a line containing:
+
+```
+/v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash
+```
+
+That line means the turn's model request crossed the jail's wall and the egress proxy and reached
+the provider. **#1952 is fixed at this boundary when `python3 ~/jail_v2_egress_probe.py v1-control v2`
+exits 0.** The client line's `history_types`, `steps` and `wait` are printed for diagnosis and are not
+part of the signal. With the default provider the V2 `wait` reports `failed`: its first answer is a
+`propose_netlist` tool call, which fails in the V2 session (`session.next.tool.failed`).
+
+**`compact`** passes only when all four of these hold:
+1. A `kind=turn` request reached the provider, and `wait` reported the turn `completed`. This means
+   the session has a transcript to compact.
+2. The compact call answered 200 or 204.
+3. The provider received a `kind=summary` request ending `transcript=yes`.
+4. The history holds a `session.next.compaction.ended` with `reason` `manual` whose `text` is the
+   provider's summary.
+
+So a 503 fails, and so does a 204 that asked no model. The probe prints one `unmet:` line for each
+condition that fails. **#1953 is fixed at this boundary when
+`python3 ~/jail_v2_egress_probe.py v1-control compact` exits 0.**
+
+Every mode prints `RESULT: PASS` or `RESULT: FAIL`. The probe exits 0 only when every requested mode
+passed.
+
+## 6. Current outputs
+
+### `v1.18.32-swxtch.cd3f0ce2`: the turn modes pass, and `compact` fails (the red baseline)
+
+Measured on 2026-10-23 from the checkout above. Each box ran under its lease:
+- x64 on abbe-build-001, building the committed pin with no build-arg overrides;
+- arm64 on vm14-001, built as in §1.
+
+On both, `v1-control`, `v2` and `v2-named` pass and `compact` fails. The probe exits 1. The outputs
+below are verbatim; the probe cuts daemon lines at 400 characters.
+
+**x64, abbe-build-001:**
+
+```
+=== v1-control
+client: {"mode": "v1-control", "status": "completed", "model": "accounts/fireworks/models/deepseek-v4p1-flash"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== v2
+client: {"mode": "v2", "session": "ses_e94fba4b1ffe0g8tg15Gokumka", "admitted_seq": 1, "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.step.started", "session.next.tool.input.started", "session.next.tool.input.ended", "session.next.tool.called", "session.next.tool.failed", "session.next.step.ended"], "steps": [{"type": "session.next.step.started", "model": {"id": "accounts/fireworks/models/deepseek-v4p1-flash", "providerID": "swxtch-egress"}, "error": null}, {"type": "session.next.step.ended", "model": null, "error": null}], "wait": "OpenCodeV2WaitOutcome(status='failed', admitted_seq=1, message_id=None, assistant_message_id='msg_16b046a2e0014ujK59lQwiCs3y', payload={'type': 'failed', 'admittedSeq': 1, 'assistantMessageID': 'msg_16b046a2e0014ujK59lQwiCs3y'})"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== v2-named
+client: {"mode": "v2-named", "session": "ses_e94fb810bffezGXFyDbRh4T1Nf", "admitted_seq": 1, "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.step.started", "session.next.tool.input.started", "session.next.tool.input.ended", "session.next.tool.called", "session.next.tool.failed", "session.next.step.ended"], "steps": [{"type": "session.next.step.started", "model": {"id": "accounts/fireworks/models/deepseek-v4p1-flash", "providerID": "swxtch-egress", "variant": "default"}, "error": null}, {"type": "session.next.step.ended", "model": null, "error": null}], "wait": "OpenCodeV2WaitOutcome(status='failed', admitted_seq=1, message_id=None, assistant_message_id='msg_16b048c8a001yVxkvfCXhDH9sW', payload={'type': 'failed', 'admittedSeq': 1, 'assistantMessageID': 'msg_16b048c8a001yVxkvfCXhDH9sW'})"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== compact
+client: {"mode": "compact", "session": "ses_e94fb603dffenSeNBVVvpdD7S3", "admitted_seq": 1, "turn": "completed", "compact_status": 503, "compact_refused": "compactSessionV2 was refused by OpenCode (503): Session compact is not available yet", "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.step.started", "session.next.text.started", "session.next.text.ended", "session.next.step.ended"], "compactions": []}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True kind=turn"]
+unmet: the compact call answered 503: compactSessionV2 was refused by OpenCode (503): Session compact is not available yet
+unmet: the provider received no summary request
+unmet: the history records no completed manual compaction (session.next.compaction.ended)
+RESULT: FAIL
+```
+
+**arm64, vm14-001:**
+
+```
+=== v1-control
+client: {"mode": "v1-control", "status": "completed", "model": "accounts/fireworks/models/deepseek-v4p1-flash"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== v2
+client: {"mode": "v2", "session": "ses_e9537437fffekjVP0hsqI6Y5Pg", "admitted_seq": 1, "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.step.started", "session.next.tool.input.started", "session.next.tool.input.ended", "session.next.tool.called", "session.next.tool.failed", "session.next.step.ended"], "steps": [{"type": "session.next.step.started", "model": {"id": "accounts/fireworks/models/deepseek-v4p1-flash", "providerID": "swxtch-egress"}, "error": null}, {"type": "session.next.step.ended", "model": null, "error": null}], "wait": "OpenCodeV2WaitOutcome(status='failed', admitted_seq=1, message_id=None, assistant_message_id='msg_16ac8c5fe001N9ywFlut9WhPRX', payload={'type': 'failed', 'admittedSeq': 1, 'assistantMessageID': 'msg_16ac8c5fe001N9ywFlut9WhPRX'})"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== v2-named
+client: {"mode": "v2-named", "session": "ses_e953721b4ffe6T8hzAyS542TW3", "admitted_seq": 1, "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.step.started", "session.next.tool.input.started", "session.next.tool.input.ended", "session.next.tool.called", "session.next.tool.failed", "session.next.step.ended"], "steps": [{"type": "session.next.step.started", "model": {"id": "accounts/fireworks/models/deepseek-v4p1-flash", "providerID": "swxtch-egress", "variant": "default"}, "error": null}, {"type": "session.next.step.ended", "model": null, "error": null}], "wait": "OpenCodeV2WaitOutcome(status='failed', admitted_seq=1, message_id=None, assistant_message_id='msg_16ac8e819001nPWORqX2sOJ6ES', payload={'type': 'failed', 'admittedSeq': 1, 'assistantMessageID': 'msg_16ac8e819001nPWORqX2sOJ6ES'})"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== compact
+client: {"mode": "compact", "session": "ses_e95370066ffe07ObguILXO60zn", "admitted_seq": 1, "turn": "completed", "compact_status": 503, "compact_refused": "compactSessionV2 was refused by OpenCode (503): Session compact is not available yet", "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.step.started", "session.next.text.started", "session.next.text.ended", "session.next.step.ended"], "compactions": []}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True kind=turn"]
+unmet: the compact call answered 503: compactSessionV2 was refused by OpenCode (503): Session compact is not available yet
+unmet: the provider received no summary request
+unmet: the history records no completed manual compaction (session.next.compaction.ended)
+RESULT: FAIL
+```
+
+### What `compact` prints when it fails
+
+Each `unmet:` line names one condition from §5:
+
+| Output | Meaning |
+| --- | --- |
+| `unmet: the compact call answered 503: … Session compact is not available yet` | The release has no V2 compaction. That is `cd3f0ce2` and earlier. |
+| `unmet: the compact call answered 500: …` | #354's `CompactionFailedError`: the summary failed, or it would not fit the summarizing model. The daemon logs `failed to compact session`. |
+| `unmet: the provider received no summary request`, with the compact call at 204 | The 204 asked no model: the daemon found nothing to compact. |
+| `unmet: no summary request carried this session's turn` | A summary request arrived, but its `<conversation>` block did not hold this session's question and answer. |
+| `unmet: the history records no completed manual compaction …` | No `session.next.compaction.ended` with `reason` `manual` was recorded within 20 s of the call. |
+| `unmet: the recorded compaction text is not the provider's summary` | A compaction was recorded, but not from the summary the provider sent. |
+| `unmet: no turn request reached the provider …` or `unmet: the turn did not complete: …` | The session never had a transcript, so the compaction result proves nothing. |

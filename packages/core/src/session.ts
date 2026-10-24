@@ -25,7 +25,7 @@ import { InstallationVersion } from "./installation/version"
 import { Slug } from "./util/slug"
 import { ProjectTable } from "./project/sql"
 import path from "path"
-import { fromRow } from "./session/info"
+import { defaultTitle, fromRow } from "./session/info"
 import { SessionRunner } from "./session/runner/index"
 import { SessionStore } from "./session/store"
 import { SessionExecution } from "./session/execution"
@@ -97,6 +97,7 @@ type CreateInput = {
   id?: SessionSchema.ID
   agent?: AgentV2.ID
   model?: ModelV2.Ref
+  smallModel?: SessionSchema.SmallModel
   location: Location.Ref
 }
 
@@ -112,9 +113,21 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Ses
 export class OperationUnavailableError extends Schema.TaggedErrorClass<OperationUnavailableError>()(
   "Session.OperationUnavailableError",
   {
-    operation: Schema.Literals(["move", "shell", "skill", "switchAgent", "compact", "wait"]),
+    operation: Schema.Literals(["move", "shell", "skill", "switchAgent", "wait"]),
   },
 ) {}
+
+export class CompactionFailedError extends Schema.TaggedErrorClass<CompactionFailedError>()(
+  "Session.CompactionFailedError",
+  {
+    sessionID: SessionSchema.ID,
+    reason: Schema.String,
+  },
+) {
+  override get message() {
+    return `Session ${this.sessionID} could not be compacted: ${this.reason}`
+  }
+}
 
 export { ContextSnapshotDecodeError, MessageDecodeError } from "./session/error"
 
@@ -125,7 +138,22 @@ export class PromptConflictError extends Schema.TaggedErrorClass<PromptConflictE
 export const MessageNotFoundError = SessionRevert.MessageNotFoundError
 export type MessageNotFoundError = SessionRevert.MessageNotFoundError
 
-export type Error = NotFoundError | MessageDecodeError | OperationUnavailableError | PromptConflictError
+export class CompactionUnsupportedError extends Schema.TaggedErrorClass<CompactionUnsupportedError>()(
+  "Session.CompactionUnsupportedError",
+  { sessionID: SessionSchema.ID },
+) {
+  override get message() {
+    return `Session ${this.sessionID} has a V1 transcript, which V2 compaction cannot read; compact it with POST /session/${this.sessionID}/summarize`
+  }
+}
+
+export type Error =
+  | NotFoundError
+  | MessageDecodeError
+  | OperationUnavailableError
+  | PromptConflictError
+  | CompactionFailedError
+  | CompactionUnsupportedError
 
 export interface Interface {
   readonly list: (input?: ListInput) => Effect.Effect<SessionSchema.Info[]>
@@ -181,7 +209,13 @@ export interface Interface {
     skill: string
     resume?: boolean
   }) => Effect.Effect<void, OperationUnavailableError>
-  readonly compact: (input: CompactInput) => Effect.Effect<void, NotFoundError | OperationUnavailableError>
+  /**
+   * Compacts the Session's context now. Completes once a summary is recorded, or when there is nothing to compact, and
+   * refuses a Session holding a V1 transcript rather than summarizing only its V2 history.
+   */
+  readonly compact: (
+    input: CompactInput,
+  ) => Effect.Effect<void, NotFoundError | CompactionFailedError | CompactionUnsupportedError>
   readonly wait: (
     id: SessionSchema.ID,
   ) => Effect.Effect<SessionSchema.WaitResult, NotFoundError | OperationUnavailableError>
@@ -495,7 +529,7 @@ const layer = Layer.effect(
           directory: input.location.directory,
           path: path.relative(project.directory, input.location.directory).replaceAll("\\", "/"),
           workspaceID: input.location.workspaceID ? WorkspaceV2.ID.make(input.location.workspaceID) : undefined,
-          title: `New session - ${new Date(now).toISOString()}`,
+          title: defaultTitle(now),
           agent: input.agent,
           model: input.model
             ? {
@@ -504,6 +538,7 @@ const layer = Layer.effect(
                 variant: input.model.variant,
               }
             : undefined,
+          smallModel: input.smallModel,
           cost: 0,
           tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
           time: { created: now, updated: now },
@@ -701,8 +736,26 @@ const layer = Layer.effect(
         })
       }),
       compact: Effect.fn("V2Session.compact")(function* (input) {
+        yield* events.assertWritable(input.sessionID)
         yield* result.get(input.sessionID)
-        return yield* new OperationUnavailableError({ operation: "compact" })
+        const outcome = yield* execution
+          .compact(input.sessionID)
+          .pipe(
+            Effect.mapError(
+              (error) => new CompactionFailedError({ sessionID: input.sessionID, reason: error.message }),
+            ),
+          )
+        if (outcome === "unsupported") return yield* new CompactionUnsupportedError({ sessionID: input.sessionID })
+        if (outcome === "oversized")
+          return yield* new CompactionFailedError({
+            sessionID: input.sessionID,
+            reason: "the summary request exceeds the summarizing model's context window",
+          })
+        if (outcome === "failed")
+          return yield* new CompactionFailedError({
+            sessionID: input.sessionID,
+            reason: "the summarizing model returned no summary",
+          })
       }),
       wait: Effect.fn("V2Session.wait")(function* (sessionID) {
         yield* result.get(sessionID)

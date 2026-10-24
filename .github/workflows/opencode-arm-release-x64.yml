@@ -61,6 +61,11 @@ jobs:
     if: github.repository == 'swxtchio/swx-opencode' && !inputs.candidate
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # The release-wait implementation both overlays put onto the release source, pinned to the last revision it
+      # was proven at: a later revision of these files can depend on core surface the release predates. Edits to
+      # their wait code are unproven here until this pin is bumped (swxtchio/swx-opencode#354).
+      CORE_WAIT_PIN: cd3f0ce2d5e55944df41fcf43a167f77e40c8483
     defaults:
       run:
         shell: bash
@@ -116,10 +121,13 @@ jobs:
       - name: Typecheck and test release proof tooling
         run: |
           set -euo pipefail
-          files=(
+          pinned_files=(
             packages/core/src/session.ts
             packages/core/src/session/execution.ts
             packages/core/src/session/run-coordinator.ts
+          )
+          files=(
+            "${pinned_files[@]}"
             packages/opencode/script/release-probe.ts
             packages/opencode/script/release-probe-delay-wait.preload.ts
             packages/opencode/script/release-probe-process.ts
@@ -139,6 +147,7 @@ jobs:
             for file in "${untracked_files[@]}"; do rm -f "source/$file"; done
           }
           trap restore_proof_tools EXIT
+          git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin "$CORE_WAIT_PIN"
           for file in "${files[@]}"; do
             if git -C source cat-file -e "HEAD:$file" 2>/dev/null; then
               mkdir -p "$backup/$(dirname "$file")"
@@ -147,7 +156,11 @@ jobs:
             else
               untracked_files+=("$file")
             fi
-            cp "$GITHUB_WORKSPACE/$file" "source/$file"
+            if printf '%s\n' "${pinned_files[@]}" | grep -qxF "$file"; then
+              git -C "$GITHUB_WORKSPACE" show "$CORE_WAIT_PIN:$file" > "source/$file"
+            else
+              cp "$GITHUB_WORKSPACE/$file" "source/$file"
+            fi
           done
           (cd source/packages/core && bun run typecheck)
           (
@@ -179,10 +192,11 @@ jobs:
             for file in "${files[@]}"; do cp "$backup/$file" "$file"; done
           }
           trap restore_wait_logger_source EXIT
+          git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin "$CORE_WAIT_PIN"
           for file in "${files[@]}"; do
             mkdir -p "$backup/$(dirname "$file")"
             git show "HEAD:$file" > "$backup/$file"
-            cp "$GITHUB_WORKSPACE/$file" "$file"
+            git -C "$GITHUB_WORKSPACE" show "$CORE_WAIT_PIN:$file" > "$file"
           done
           overlay_hash=$(git diff --binary -- "${files[@]}" | sha256sum)
           printf '%s\n' "${overlay_hash%% *}" > "$RUNNER_TEMP/wait-logging-overlay.sha256"

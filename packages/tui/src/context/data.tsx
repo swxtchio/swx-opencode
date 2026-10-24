@@ -139,6 +139,10 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
             })
           })
           break
+        case "session.next.titled":
+          if (store.session.info[event.data.sessionID])
+            setStore("session", "info", event.data.sessionID, "title", event.data.title)
+          break
         case "session.next.model.switched":
           message.update(event.data.sessionID, (draft) => {
             message.prepend(draft, {

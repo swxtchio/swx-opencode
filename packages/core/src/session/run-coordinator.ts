@@ -19,6 +19,11 @@ export interface Coordinator<Key, E> {
   readonly join: (key: Key, registration?: WaitRegistration) => Effect.Effect<Exit.Exit<void, E> | undefined>
   /** Registers one coalesced follow-up after newly recorded work. */
   readonly wake: (key: Key) => Effect.Effect<void>
+  /**
+   * Runs `operation` as the key's execution once no drain owns it. A drain never overlaps it: work recorded while it
+   * runs drains after it, and an explicit run requested meanwhile starts after it rather than joining it.
+   */
+  readonly exclusive: <A, E2>(key: Key, operation: Effect.Effect<A, E2>) => Effect.Effect<A, E2>
   /** Stops active execution and waits for its cleanup. */
   readonly interrupt: (key: Key) => Effect.Effect<void>
 }
@@ -29,6 +34,8 @@ type Entry<E> = {
   owner?: Fiber.Fiber<void, never>
   pendingWake: boolean
   stopping: boolean
+  // The current execution is exclusive work rather than a drain, so it can never satisfy an explicit resume.
+  exclusive: boolean
 }
 
 export const make = <Key, E>(options: {
@@ -43,15 +50,17 @@ export const make = <Key, E>(options: {
       done: Deferred.makeUnsafe<void, E>(),
       pendingWake: false,
       stopping: false,
+      exclusive: false,
     })
 
-    const start = (key: Key, entry: Entry<E>, force: boolean, successor = false) => {
+    const start = (key: Key, entry: Entry<E>, force: boolean, successor = false, work?: Effect.Effect<void, E>) => {
       const ready = Deferred.makeUnsafe<void>()
       const settled = Deferred.makeUnsafe<Exit.Exit<void, E>>()
       entry.settled = settled
+      entry.exclusive = work !== undefined
       const owner = fork(
         (successor ? Effect.yieldNow : Deferred.await(ready)).pipe(
-          Effect.andThen(Effect.suspend(() => options.drain(key, force))),
+          Effect.andThen(work ?? Effect.suspend(() => options.drain(key, force))),
           Effect.onExit((exit) => Effect.sync(() => settle(key, entry, settled, exit))),
           Effect.exit,
           Effect.asVoid,
@@ -88,6 +97,9 @@ export const make = <Key, E>(options: {
         const entry = active.get(key)
         if (entry !== undefined) {
           if (entry.stopping) return restore(Deferred.await(entry.done).pipe(Effect.andThen(run(key))))
+          // Once the exclusive work settles, the resume starts a drain, or joins the one a wake started after it.
+          if (entry.exclusive && entry.settled)
+            return restore(Deferred.await(entry.settled).pipe(Effect.andThen(run(key))))
           return restore(Deferred.await(entry.done))
         }
 
@@ -148,6 +160,29 @@ export const make = <Key, E>(options: {
         start(key, next, false)
       })
 
+    const exclusive = <A, E2>(key: Key, operation: Effect.Effect<A, E2>): Effect.Effect<A, E2> =>
+      Effect.uninterruptibleMask((restore) => {
+        const entry = active.get(key)
+        if (entry !== undefined)
+          return restore(Deferred.await(entry.done).pipe(Effect.exit, Effect.andThen(exclusive(key, operation))))
+
+        const next = makeEntry()
+        active.set(key, next)
+        const result = Deferred.makeUnsafe<A, E2>()
+        // The operation's own outcome goes to its caller; the entry settles as a successful execution either way.
+        start(
+          key,
+          next,
+          false,
+          false,
+          operation.pipe(
+            Effect.onExit((exit) => Deferred.done(result, exit)),
+            Effect.ignore,
+          ),
+        )
+        return restore(Deferred.await(result))
+      })
+
     const interrupt = (key: Key): Effect.Effect<void> =>
       Effect.suspend(() => {
         const entry = active.get(key)
@@ -157,5 +192,5 @@ export const make = <Key, E>(options: {
         return Fiber.interrupt(entry.owner)
       })
 
-    return { active: Effect.sync(() => new Set(active.keys())), run, join, wake, interrupt }
+    return { active: Effect.sync(() => new Set(active.keys())), run, join, wake, exclusive, interrupt }
   })

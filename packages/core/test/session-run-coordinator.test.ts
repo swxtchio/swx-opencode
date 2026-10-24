@@ -483,4 +483,95 @@ describe("SessionRunCoordinator", () => {
       }),
     ),
   )
+
+  it.effect("runs an exclusive operation after the active drain and drains work woken during it afterwards", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const log: string[] = []
+        const drainGate = yield* Deferred.make<void>()
+        const drainStarted = yield* Deferred.make<void>()
+        const operationGate = yield* Deferred.make<void>()
+        const operationStarted = yield* Deferred.make<void>()
+        const followUp = yield* Deferred.make<void>()
+        const coordinator = yield* SessionRunCoordinator.make<string, never>({
+          drain: () =>
+            Effect.suspend(() => {
+              log.push("drain")
+              if (log.length > 1) return Deferred.succeed(followUp, undefined)
+              return Deferred.succeed(drainStarted, undefined).pipe(Effect.andThen(Deferred.await(drainGate)))
+            }),
+        })
+
+        yield* coordinator.wake("session")
+        yield* Deferred.await(drainStarted)
+        const operation = yield* coordinator
+          .exclusive(
+            "session",
+            Effect.sync(() => log.push("operation")).pipe(
+              Effect.andThen(Deferred.succeed(operationStarted, undefined)),
+              Effect.andThen(Deferred.await(operationGate)),
+              Effect.as("summary"),
+            ),
+          )
+          .pipe(Effect.forkChild)
+        for (let attempt = 0; attempt < 10; attempt++) yield* Effect.yieldNow
+        expect(log).toEqual(["drain"])
+
+        yield* Deferred.succeed(drainGate, undefined)
+        yield* Deferred.await(operationStarted)
+        expect((yield* coordinator.active).has("session")).toBe(true)
+        yield* coordinator.wake("session")
+        for (let attempt = 0; attempt < 10; attempt++) yield* Effect.yieldNow
+        expect(log).toEqual(["drain", "operation"])
+
+        yield* Deferred.succeed(operationGate, undefined)
+        expect(yield* Fiber.join(operation)).toBe("summary")
+        for (let attempt = 0; attempt < 1_000 && !(yield* Deferred.isDone(followUp)); attempt++) yield* Effect.yieldNow
+        expect(log).toEqual(["drain", "operation", "drain"])
+      }),
+    ),
+  )
+
+  it.effect("returns an exclusive operation's failure to its caller and releases the key", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const coordinator = yield* SessionRunCoordinator.make<string, never>({ drain: () => Effect.void })
+
+        const exit = yield* coordinator.exclusive("session", Effect.fail("summary failed")).pipe(Effect.exit)
+
+        expect(exit).toEqual(Exit.fail("summary failed"))
+        expect((yield* coordinator.active).has("session")).toBe(false)
+      }),
+    ),
+  )
+
+  it.effect("runs an explicit resume requested during exclusive work after that work", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const forces: boolean[] = []
+        const operationGate = yield* Deferred.make<void>()
+        const operationStarted = yield* Deferred.make<void>()
+        const coordinator = yield* SessionRunCoordinator.make<string, never>({
+          drain: (_key, force) => Effect.sync(() => forces.push(force)),
+        })
+
+        const operation = yield* coordinator
+          .exclusive(
+            "session",
+            Deferred.succeed(operationStarted, undefined).pipe(Effect.andThen(Deferred.await(operationGate))),
+          )
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(operationStarted)
+        const resumed = yield* coordinator.run("session").pipe(Effect.forkChild)
+        for (let attempt = 0; attempt < 10; attempt++) yield* Effect.yieldNow
+        expect(forces).toEqual([])
+
+        yield* Deferred.succeed(operationGate, undefined)
+        yield* Fiber.join(operation)
+        yield* Fiber.join(resumed)
+        expect(forces).toEqual([true])
+        expect((yield* coordinator.active).has("session")).toBe(false)
+      }),
+    ),
+  )
 })

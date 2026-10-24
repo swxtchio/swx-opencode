@@ -76,9 +76,14 @@ type Dependencies = {
 type Input = {
   readonly sessionID: SessionSchema.ID
   readonly entries: readonly Entry[]
+  /** The model that writes the summary, which is not necessarily the model whose context is being compacted. */
   readonly model: Model
-  readonly request: LLMRequest
+  readonly http: LLMRequest["http"]
+  readonly reason: "auto" | "manual"
 }
+
+/** `skipped` means there was nothing to compact; `oversized` means the summary request would not fit the summarizer. */
+export type Result = "completed" | "skipped" | "oversized" | "failed"
 
 const estimate = (value: unknown) => Token.estimate(JSON.stringify(value))
 
@@ -137,6 +142,7 @@ const settings = (documents: readonly Config.Entry[]) => {
 const select = (
   entries: readonly Entry[],
   tokens: number,
+  manual: boolean,
 ): { readonly head: string; readonly recent: string } | undefined => {
   const conversation = entries
     .filter((entry) => entry.message.type !== "compaction")
@@ -151,6 +157,8 @@ const select = (
     total = next
     split = index
   }
+  // Like V1's, a manual compaction summarizes the whole conversation when all of it fits the kept budget.
+  if (manual && split === 0) return { head: conversation.join("\n\n"), recent: "" }
   return {
     head: conversation.slice(0, split).join("\n\n"),
     recent: conversation.slice(split).join("\n\n"),
@@ -175,25 +183,28 @@ export const buildPrompt = (input: { readonly previousSummary?: string; readonly
 
 export const make = (dependencies: Dependencies) => {
   const config = settings(dependencies.config)
-  const compactAfterOverflow = Effect.fn("SessionCompaction.compactAfterOverflow")(function* (input: Input) {
-    const context = input.model.route.defaults.limits?.context
-    if (context === undefined || context <= 0) return false
-    const output = input.request.generation?.maxTokens ?? input.model.route.defaults.limits?.output ?? 0
-    const selected = select(input.entries, config.tokens)
+  const summarize = Effect.fn("SessionCompaction.summarize")(function* (input: Input) {
+    const selected = select(input.entries, config.tokens, input.reason === "manual")
     const previousSummary = input.entries.find((entry) => entry.message.type === "compaction")?.message
-    if (!selected || (selected.head.length === 0 && previousSummary?.type !== "compaction")) return false
+    if (!selected || (selected.head.length === 0 && previousSummary?.type !== "compaction")) return "skipped" as const
     const summaryPrompt = buildPrompt({
       previousSummary: previousSummary?.type === "compaction" ? previousSummary.summary : undefined,
       context: [previousSummary?.type === "compaction" ? previousSummary.recent : "", selected.head].filter(Boolean),
     })
-    const summaryOutput = Math.min(output || SUMMARY_OUTPUT_TOKENS, SUMMARY_OUTPUT_TOKENS)
-    if (Token.estimate(summaryPrompt) > context - summaryOutput) return false
+    const summaryOutput = Math.min(
+      input.model.route.defaults.limits?.output || SUMMARY_OUTPUT_TOKENS,
+      SUMMARY_OUTPUT_TOKENS,
+    )
+    // A summarizer whose window is unknown, such as a configured model without a limit, is asked regardless.
+    const context = input.model.route.defaults.limits?.context
+    if (context !== undefined && context > 0 && Token.estimate(summaryPrompt) > context - summaryOutput)
+      return "oversized" as const
     const messageID = SessionMessage.ID.create()
     yield* dependencies.events.publish(SessionEvent.Compaction.Started, {
       sessionID: input.sessionID,
       messageID,
       timestamp: yield* DateTime.now,
-      reason: "auto",
+      reason: input.reason,
     })
 
     const chunks: string[] = []
@@ -202,7 +213,7 @@ export const make = (dependencies: Dependencies) => {
       .stream(
         LLM.request({
           model: input.model,
-          http: input.request.http,
+          http: input.http,
           messages: [Message.user(summaryPrompt)],
           tools: [],
           generation: { maxTokens: summaryOutput },
@@ -215,34 +226,35 @@ export const make = (dependencies: Dependencies) => {
           return Effect.void
         }),
         Effect.as(true),
-        Effect.catchTag("LLM.Error", () => Effect.succeed(false)),
+        Effect.catchTag("LLM.Error", (error) =>
+          Effect.logWarning("Session compaction request failed", error).pipe(Effect.as(false)),
+        ),
       )
     const summary = chunks.join("")
-    if (!summarized || failed || !summary.trim()) return false
+    if (!summarized || failed || !summary.trim()) return "failed" as const
     yield* dependencies.events.publish(SessionEvent.Compaction.Ended, {
       sessionID: input.sessionID,
       messageID,
       timestamp: yield* DateTime.now,
-      reason: "auto",
+      reason: input.reason,
       text: summary,
       recent: selected.recent,
     })
-    return true
+    return "completed" as const
   })
-  const compactIfNeeded = Effect.fn("SessionCompaction.compactIfNeeded")(function* (input: Input) {
+  /** Whether automatic compaction is due before sending `request` to `model`. */
+  const due = (input: { readonly model: Model; readonly request: LLMRequest }) => {
     if (!config.auto) return false
     const context = input.model.route.defaults.limits?.context
     if (context === undefined || context <= 0) return false
     const output = input.request.generation?.maxTokens ?? input.model.route.defaults.limits?.output ?? 0
-    if (
-      estimate({ system: input.request.system, messages: input.request.messages, tools: input.request.tools }) <=
+    return (
+      estimate({ system: input.request.system, messages: input.request.messages, tools: input.request.tools }) >
       context - Math.max(output, config.buffer)
     )
-      return false
-    return yield* compactAfterOverflow(input)
-  })
+  }
   return {
-    compactIfNeeded,
-    compactAfterOverflow,
+    due,
+    summarize,
   }
 }

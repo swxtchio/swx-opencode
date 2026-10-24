@@ -8,6 +8,7 @@ import * as OpenAIResponses from "@opencode-ai/llm/protocols/openai-responses"
 import { Auth, type AnyRoute } from "@opencode-ai/llm/route"
 import { Context, Effect, Layer, Schema } from "effect"
 import { produce } from "immer"
+import { AgentV2 } from "../../agent"
 import { Catalog } from "../../catalog"
 import { Credential } from "../../credential"
 import { Integration } from "../../integration"
@@ -73,12 +74,28 @@ export type Error =
 
 export interface Interface {
   readonly resolve: (session: SessionSchema.Info) => Effect.Effect<Model, Error>
+  /**
+   * Resolves the model a Session's titles or compaction summaries run on, in the order V1 uses for the scopes V2 has:
+   * the auxiliary agent's own model, the Session's small model, the catalog's small model for the primary's provider
+   * when `infer` is set, and then the primary itself, which is resolved only when it is needed. V1's agent-level and
+   * global `small_model` have no V2 equivalent yet (#355). A selection that is configured but does not resolve fails
+   * instead of being substituted.
+   */
+  readonly auxiliary: (input: {
+    readonly session: SessionSchema.Info
+    readonly agent: AgentV2.Info | undefined
+    readonly primary: Effect.Effect<Model, Error>
+    readonly infer: boolean
+  }) => Effect.Effect<Model, Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SessionRunnerModel") {}
 
-/** Test or embedding seam for supplying a model resolver directly. */
-export const layerWith = (resolve: Interface["resolve"]) => Layer.succeed(Service, Service.of({ resolve }))
+/** Test or embedding seam for supplying a model resolver directly. Auxiliary work runs on the primary by default. */
+export const layerWith = (
+  resolve: Interface["resolve"],
+  auxiliary: Interface["auxiliary"] = (input) => input.primary,
+) => Layer.succeed(Service, Service.of({ resolve, auxiliary }))
 
 const apiKey = (model: ModelV2.Info, credential?: Credential.Value) => {
   if (credential?.type === "key") return Auth.value(credential.key)
@@ -184,7 +201,34 @@ export const locationLayer = Layer.effect(
   Effect.gen(function* () {
     const catalog = yield* Catalog.Service
     const integrations = yield* Integration.Service
+    const connect = Effect.fn("SessionRunnerModel.connect")(function* (
+      selected: ModelV2.Info,
+      variant: ModelV2.VariantID | undefined,
+    ) {
+      const provider = yield* catalog.provider.get(selected.providerID)
+      const connection = yield* integrations.connection.active(
+        provider?.integrationID ?? Integration.ID.make(selected.providerID),
+      )
+      const credential = connection ? yield* integrations.connection.resolve(connection) : undefined
+      return yield* withVariant(selected, variant).pipe(Effect.flatMap((model) => fromCatalogModel(model, credential)))
+    })
     return Service.of({
+      auxiliary: Effect.fn("SessionRunnerModel.auxiliary")(function* (input) {
+        const configured = input.agent?.model ?? input.session.smallModel
+        if (configured) {
+          const selected = (yield* catalog.model.available()).find(
+            (model) => model.providerID === configured.providerID && model.id === configured.id,
+          )
+          if (!selected)
+            return yield* new ModelUnavailableError({ providerID: configured.providerID, modelID: configured.id })
+          return yield* connect(selected, input.agent?.model?.variant)
+        }
+        if (!input.infer) return yield* input.primary
+        const primary = yield* input.primary
+        const inferred = yield* catalog.model.small(ProviderV2.ID.make(primary.provider))
+        if (inferred && supported(inferred)) return yield* connect(inferred, undefined)
+        return primary
+      }),
       resolve: Effect.fn("SessionRunnerModel.resolve")(function* (session) {
         // Location plugins populate and filter the catalog asynchronously during layer startup.
         const defaultModel = session.model ? undefined : yield* catalog.model.default()
@@ -201,15 +245,7 @@ export const locationLayer = Layer.effect(
             modelID: session.model.id,
           })
         if (!selected) return yield* new ModelNotSelectedError({ sessionID: session.id })
-        const provider = yield* catalog.provider.get(selected.providerID)
-        const connection = yield* integrations.connection.active(
-          provider?.integrationID ?? Integration.ID.make(selected.providerID),
-        )
-        return yield* resolve(
-          session,
-          selected,
-          connection ? yield* integrations.connection.resolve(connection) : undefined,
-        )
+        return yield* connect(selected, session.model?.variant)
       }),
     })
   }),

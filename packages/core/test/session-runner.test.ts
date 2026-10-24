@@ -182,8 +182,10 @@ const echo = Layer.effectDiscard(
 const echoNode = makeLocationNode({ name: "test/session-runner-tools", layer: echo, deps: [ToolRegistry.node] })
 let modelResolveHook = Effect.void
 let currentModel = model
-const models = SessionRunnerModel.layerWith((session) =>
-  modelResolveHook.pipe(Effect.as(session.model?.id === "replacement" ? replacementModel : currentModel)),
+let auxiliaryModel: Model | undefined
+const models = SessionRunnerModel.layerWith(
+  (session) => modelResolveHook.pipe(Effect.as(session.model?.id === "replacement" ? replacementModel : currentModel)),
+  (input) => (auxiliaryModel ? Effect.succeed(auxiliaryModel) : input.primary),
 )
 const systemContextKey = SystemContext.Key.make("test/context")
 let systemBaseline = "Initial context"
@@ -320,6 +322,7 @@ const execution = Layer.effect(
         }),
       resume: coordinator.run,
       wake: coordinator.wake,
+      compact: (sessionID) => coordinator.exclusive(sessionID, sessionRunner.compact(sessionID)),
       interrupt: coordinator.interrupt,
     })
   }),
@@ -414,6 +417,7 @@ const setup = Effect.gen(function* () {
   systemLoadHook = Effect.void
   modelResolveHook = Effect.void
   currentModel = model
+  auxiliaryModel = undefined
   skillBaselines.clear()
   responses = undefined
   streamFailure = undefined
@@ -5155,6 +5159,234 @@ describe("SessionRunnerLLM", () => {
       expect(
         yield* db.select().from(SessionMessageTable).where(eq(SessionMessageTable.session_id, removedID)).all(),
       ).toEqual([])
+    }),
+  )
+})
+
+describe("SessionV2 auxiliary model work", () => {
+  const smallModel = Model.make({ id: "small", provider: "fake", route: OpenAIChat.route })
+  const titleSystem = "Title instructions"
+  const isTitleRequest = (request: LLMRequest) => request.system.some((part) => part.text === titleSystem)
+  const addTitleAgent = Effect.gen(function* () {
+    const agents = yield* AgentV2.Service
+    yield* agents.transform((editor) =>
+      editor.update(AgentV2.ID.make("title"), (agent) => {
+        agent.system = titleSystem
+        agent.mode = "primary"
+        agent.hidden = true
+      }),
+    )
+  })
+  const durableTypes = Effect.gen(function* () {
+    const history = yield* (yield* SessionV2.Service).history({ sessionID, limit: 100 })
+    return history.events.map((event) => event.type)
+  })
+
+  it.effect("titles a new Session from its first prompt on the auxiliary model", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      yield* addTitleAgent
+      auxiliaryModel = smallModel
+      const session = yield* SessionV2.Service
+      response = fragmentFixture("text", "text-title", [
+        "<think>naming</think>\nFixing the build\nignored",
+      ]).completeEvents
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Please fix the build" }), resume: false })
+      yield* session.resume(sessionID)
+
+      const titles = requests.filter(isTitleRequest)
+      expect(titles).toHaveLength(1)
+      expect(String(titles[0].model.id)).toBe("small")
+      expect(userTexts(titles[0])).toEqual(["Generate a title for this conversation:\n", "Please fix the build"])
+      expect(requests.filter((request) => !isTitleRequest(request)).map((request) => String(request.model.id))).toEqual(
+        ["fake-model"],
+      )
+      expect((yield* session.get(sessionID)).title).toBe("Fixing the build")
+      expect(yield* durableTypes).toContain("session.next.titled")
+    }),
+  )
+
+  it.effect("titles only a default-titled Session whose first turn has one prompt", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      yield* addTitleAgent
+      const session = yield* SessionV2.Service
+      response = fragmentFixture("text", "text-answer", ["Answer"]).completeEvents
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
+      yield* session.resume(sessionID)
+      expect(requests).toHaveLength(1)
+      expect(requests.filter(isTitleRequest)).toHaveLength(0)
+
+      // The runner test Session is created with the custom title "test".
+      requests.length = 0
+      yield* insertSession(otherSessionID)
+      yield* session.prompt({ sessionID: otherSessionID, prompt: Prompt.make({ text: "First" }), resume: false })
+      yield* session.resume(otherSessionID)
+      expect(requests).toHaveLength(1)
+      expect(requests.filter(isTitleRequest)).toHaveLength(0)
+      expect((yield* session.get(otherSessionID)).title).toBe("test")
+    }),
+  )
+
+  it.effect("summarizes automatic compaction on the auxiliary model", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      response = fragmentFixture("text", "text-first", ["Earlier answer"]).completeEvents
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Earlier question ".repeat(180) }),
+        resume: false,
+      })
+      yield* session.resume(sessionID)
+
+      currentModel = compactModel
+      auxiliaryModel = smallModel
+      requests.length = 0
+      responses = [
+        fragmentFixture("text", "text-summary", ["## Objective\n- Preserve the task"]).completeEvents,
+        fragmentFixture("text", "text-final", ["Continued"]).completeEvents,
+      ]
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Recent exact request ".repeat(180) }),
+        resume: false,
+      })
+      yield* session.resume(sessionID)
+
+      expect(requests.map((request) => String(request.model.id))).toEqual(["small", "compact"])
+      expect(userTexts(requests[0])[0]).toContain("Earlier question")
+      expect((yield* session.context(sessionID))[0]).toMatchObject({
+        type: "compaction",
+        summary: "## Objective\n- Preserve the task",
+      })
+    }),
+  )
+
+  it.effect("compacts the whole conversation on request on the auxiliary model", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      response = fragmentFixture("text", "text-answer", ["The answer"]).completeEvents
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "The question" }), resume: false })
+      yield* session.resume(sessionID)
+
+      auxiliaryModel = smallModel
+      requests.length = 0
+      response = fragmentFixture("text", "text-summary", ["## Objective\n- Answer the question"]).completeEvents
+      yield* session.compact({ sessionID })
+
+      expect(requests).toHaveLength(1)
+      expect(String(requests[0].model.id)).toBe("small")
+      expect(requests[0].http?.headers).toEqual({ "x-session-affinity": sessionID, "X-Session-Id": sessionID })
+      expect(userTexts(requests[0])[0]).toContain("[User]: The question\n\n[Assistant]: The answer\n</conversation>")
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "compaction", reason: "manual", summary: "## Objective\n- Answer the question", recent: "" },
+      ])
+      expect(yield* session.active).toEqual(new Set())
+    }),
+  )
+
+  it.effect("completes a manual compaction with nothing to compact without asking a model", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+
+      yield* session.compact({ sessionID })
+
+      expect(requests).toHaveLength(0)
+      expect(yield* session.context(sessionID)).toEqual([])
+    }),
+  )
+
+  it.effect("fails a manual compaction whose summary is unavailable or oversized", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      response = fragmentFixture("text", "text-answer", ["The answer ".repeat(400)]).completeEvents
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "The question" }), resume: false })
+      yield* session.resume(sessionID)
+
+      requests.length = 0
+      streamFailure = providerUnavailable()
+      const failed = yield* session.compact({ sessionID }).pipe(Effect.flip)
+      expect(failed).toMatchObject({ _tag: "Session.CompactionFailedError", sessionID })
+      expect(requests).toHaveLength(1)
+
+      requests.length = 0
+      streamFailure = undefined
+      auxiliaryModel = Model.make({
+        id: "tiny",
+        provider: "fake",
+        route: OpenAIChat.route.with({ limits: { context: 200, output: 50 } }),
+      })
+      const oversized = yield* session.compact({ sessionID }).pipe(Effect.flip)
+      expect(oversized).toMatchObject({ _tag: "Session.CompactionFailedError", sessionID })
+      expect(requests).toHaveLength(0)
+      expect((yield* session.context(sessionID)).map((message) => message.type)).toEqual(["user", "assistant"])
+    }),
+  )
+
+  it.effect("runs a manual compaction only after the active drain settles", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      response = fragmentFixture("text", "text-answer", ["Drained answer"]).completeEvents
+      const gate = yield* Deferred.make<void>()
+      streamGate = gate
+      streamStarted = yield* Deferred.make<void>()
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "The question" }), resume: false })
+      const drain = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* awaitStreamStart(streamStarted)
+
+      const compaction = yield* session.compact({ sessionID }).pipe(Effect.forkChild)
+      for (let attempt = 0; attempt < 20; attempt++) yield* Effect.yieldNow
+      expect(requests).toHaveLength(1)
+
+      streamGate = undefined
+      response = fragmentFixture("text", "text-summary", ["## Objective\n- Summarized"]).completeEvents
+      yield* Deferred.succeed(gate, undefined)
+      yield* Fiber.join(drain).pipe(Effect.andThen(Fiber.join(compaction)))
+
+      expect(requests).toHaveLength(2)
+      expect(userTexts(requests[1])[0]).toContain("[Assistant]: Drained answer")
+      expect((yield* session.context(sessionID)).map((message) => message.type)).toEqual(["compaction"])
+    }),
+  )
+
+  it.effect("drains an explicit resume requested during a manual compaction after the compaction", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      response = fragmentFixture("text", "text-answer", ["The answer"]).completeEvents
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "The question" }), resume: false })
+      yield* session.resume(sessionID)
+
+      requests.length = 0
+      response = fragmentFixture("text", "text-summary", ["## Objective\n- Summarized"]).completeEvents
+      const gate = yield* Deferred.make<void>()
+      streamGate = gate
+      streamStarted = yield* Deferred.make<void>()
+      const compaction = yield* session.compact({ sessionID }).pipe(Effect.forkChild)
+      yield* awaitStreamStart(streamStarted)
+      const admitted = yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Follow-up" }),
+        resume: false,
+      })
+      const resumed = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      for (let attempt = 0; attempt < 20; attempt++) yield* Effect.yieldNow
+      expect(requests).toHaveLength(1)
+
+      streamGate = undefined
+      yield* Deferred.succeed(gate, undefined)
+      yield* Fiber.join(compaction)
+      yield* Fiber.join(resumed)
+
+      expect(requests).toHaveLength(2)
+      expect(userTexts(requests[1]).join("\n")).toContain("Follow-up")
+      expect(yield* session.wait(sessionID)).toMatchObject({ type: "completed", admittedSeq: admitted.admittedSeq })
     }),
   )
 })

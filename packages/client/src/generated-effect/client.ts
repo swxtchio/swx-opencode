@@ -62,11 +62,18 @@ type Endpoint3_1Input = {
   readonly id?: Endpoint3_1Request["payload"]["id"]
   readonly agent?: Endpoint3_1Request["payload"]["agent"]
   readonly model?: Endpoint3_1Request["payload"]["model"]
+  readonly smallModel?: Endpoint3_1Request["payload"]["smallModel"]
   readonly location?: Endpoint3_1Request["payload"]["location"]
 }
 const Endpoint3_1 = (raw: RawClient["server.session"]) => (input?: Endpoint3_1Input) =>
   raw["session.create"]({
-    payload: { id: input?.["id"], agent: input?.["agent"], model: input?.["model"], location: input?.["location"] },
+    payload: {
+      id: input?.["id"],
+      agent: input?.["agent"],
+      model: input?.["model"],
+      smallModel: input?.["smallModel"],
+      location: input?.["location"],
+    },
   }).pipe(
     Effect.mapError(mapClientError),
     Effect.map((value) => value.data),

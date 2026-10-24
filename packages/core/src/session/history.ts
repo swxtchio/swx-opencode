@@ -66,7 +66,11 @@ const decodeMessageRow = (row: typeof SessionMessageTable.$inferSelect) =>
     ),
   )
 
-export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
+/** Loads the current context's messages with their sequences, outside a provider turn. */
+export const entries = Effect.fn("SessionHistory.entries")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+) {
   const rows = yield* db
     .transaction((tx) =>
       Effect.gen(function* () {
@@ -87,7 +91,13 @@ export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseServ
       }),
     )
     .pipe(Effect.orDie)
-  return yield* Effect.forEach(rows, decodeMessageRow)
+  return yield* Effect.forEach(rows, (row) =>
+    decodeMessageRow(row).pipe(Effect.map((message) => ({ seq: row.seq, message }))),
+  )
+})
+
+export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
+  return (yield* entries(db, sessionID)).map((entry) => entry.message)
 })
 
 export const loadForRunner = Effect.fn("SessionHistory.loadForRunner")(function* (

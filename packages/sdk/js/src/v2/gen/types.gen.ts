@@ -18,6 +18,7 @@ export type Event =
   | EventMessagePartRemoved
   | EventSessionNextAgentSwitched
   | EventSessionNextModelSwitched
+  | EventSessionNextTitled
   | EventSessionNextMoved
   | EventSessionNextPrompted
   | EventSessionNextPromptAdmitted
@@ -953,6 +954,15 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "session.next.titled"
+        properties: {
+          timestamp: number
+          sessionID: string
+          title: string
+        }
+      }
+    | {
+        id: string
         type: "session.next.moved"
         properties: {
           timestamp: number
@@ -1732,6 +1742,7 @@ export type GlobalEvent = {
     | SyncEventMessagePartRemoved
     | SyncEventSessionNextAgentSwitched
     | SyncEventSessionNextModelSwitched
+    | SyncEventSessionNextTitled
     | SyncEventSessionNextMoved
     | SyncEventSessionNextPrompted
     | SyncEventSessionNextPromptAdmitted
@@ -2954,6 +2965,12 @@ export type ConflictError = {
   resource?: string
 }
 
+export type UnknownError1 = {
+  _tag: "UnknownError"
+  message: string
+  ref?: string
+}
+
 export type ServiceUnavailableError = {
   _tag: "ServiceUnavailableError"
   message: string
@@ -2967,15 +2984,10 @@ export type MessageNotFoundError = {
   message: string
 }
 
-export type UnknownError1 = {
-  _tag: "UnknownError"
-  message: string
-  ref?: string
-}
-
 export type SessionDurableEvent =
   | SessionNextAgentSwitched
   | SessionNextModelSwitched
+  | SessionNextTitled
   | SessionNextMoved
   | SessionNextPrompted
   | SessionNextPromptAdmitted
@@ -3103,6 +3115,7 @@ export type V2Event =
   | MessagePartRemoved
   | SessionNextAgentSwitched
   | SessionNextModelSwitched
+  | SessionNextTitled
   | SessionNextMoved
   | SessionNextPrompted
   | SessionNextPromptAdmitted
@@ -3572,6 +3585,22 @@ export type SyncEventSessionNextModelSwitched = {
       sessionID: string
       messageID: string
       model: ModelRef
+    }
+  }
+}
+
+export type SyncEventSessionNextTitled = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.titled.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      timestamp: number
+      sessionID: string
+      title: string
     }
   }
 }
@@ -4147,12 +4176,18 @@ export type AgentV2Info = {
   permissions: PermissionV2Ruleset
 }
 
+export type SessionSmallModel = {
+  id: string
+  providerID: string
+}
+
 export type SessionV2Info = {
   id: string
   parentID?: string
   projectID: string
   agent?: string
   model?: ModelRef
+  smallModel?: SessionSmallModel
   cost: number
   tokens: {
     input: number
@@ -4469,6 +4504,25 @@ export type SessionNextModelSwitched = {
     sessionID: string
     messageID: string
     model: ModelRef
+  }
+}
+
+export type SessionNextTitled = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.next.titled"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    timestamp: number
+    sessionID: string
+    title: string
   }
 }
 
@@ -6556,6 +6610,16 @@ export type EventSessionNextModelSwitched = {
     sessionID: string
     messageID: string
     model: ModelRef
+  }
+}
+
+export type EventSessionNextTitled = {
+  id: string
+  type: "session.next.titled"
+  properties: {
+    timestamp: number
+    sessionID: string
+    title: string
   }
 }
 
@@ -12379,6 +12443,7 @@ export type V2SessionCreateData = {
     id?: string
     agent?: string
     model?: ModelRef
+    smallModel?: SessionSmallModel
     location?: LocationRef
   }
   path?: never
@@ -12623,9 +12688,13 @@ export type V2SessionCompactErrors = {
    */
   404: SessionNotFoundError
   /**
-   * ServiceUnavailableError
+   * ConflictError
    */
-  503: ServiceUnavailableError
+  409: ConflictError
+  /**
+   * UnknownError
+   */
+  500: UnknownError1
 }
 
 export type V2SessionCompactError = V2SessionCompactErrors[keyof V2SessionCompactErrors]
