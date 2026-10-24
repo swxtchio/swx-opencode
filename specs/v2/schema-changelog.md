@@ -1,5 +1,11 @@
 # V2 Schema Changelog
 
+## 2026-10-24: Add V2 Agent Small Models and Global Auxiliary Selection
+
+- Accept global `small_model` in native V2 configuration and preserve it when migrating V1 configuration. Preserve V1 agent `small_model` in the V2 agent configuration surface.
+- Add optional `smallModel: Model.Ref` to `Agent.Info` responses for the selected agent's auxiliary model. Existing agent list clients can ignore the field; no durable data or migration changes.
+- Regenerate the Promise, Effect and legacy JavaScript client contracts for the agent response shape.
+
 ## 2026-10-23: Add V2 Session Small Models, Titles and Manual Compaction
 
 - Add optional `smallModel: { providerID, id }` to `POST /api/session` and `Session.Info`, stored in the existing `session.small_model` column. That column was added for V1 sessions, so no migration is needed. A V1 `PATCH /session/:id` with `smallModel` now takes effect for V2 sessions too.

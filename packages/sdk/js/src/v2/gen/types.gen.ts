@@ -4166,6 +4166,7 @@ export type PermissionV2Ruleset = Array<PermissionV2Rule>
 export type AgentV2Info = {
   id: string
   model?: ModelRef
+  smallModel?: ModelRef
   request: ProviderRequest
   system?: string
   description?: string

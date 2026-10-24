@@ -12,6 +12,9 @@ export const Color = Schema.Union([
 
 export class Info extends Schema.Class<Info>("ConfigV2.Agent")({
   model: Schema.String.pipe(Schema.optional),
+  small_model: Schema.String.pipe(Schema.optional).annotate({
+    description: "Small model to use for auxiliary work when this agent is selected",
+  }),
   variant: Schema.String.pipe(Schema.optional),
   request: ConfigProvider.Request.pipe(Schema.optional),
   system: Schema.String.pipe(Schema.optional),

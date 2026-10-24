@@ -197,13 +197,24 @@ const layer = Layer.effect(
 
     // Like V1, a title is generated only for a root Session that keeps its default title and has one user message.
     const title = Effect.fn("SessionRunner.title")(
-      function* (session: SessionSchema.Info, primary: Model, context: readonly SessionMessage.Message[]) {
+      function* (
+        session: SessionSchema.Info,
+        primary: Model,
+        originAgent: AgentV2.Info | undefined,
+        context: readonly SessionMessage.Message[],
+      ) {
         if (session.parentID || !isDefaultTitle(session.title)) return
         const users = context.filter((message) => message.type === "user")
         if (users.length !== 1) return
         const agent = yield* auxiliaryAgent("title")
         if (!agent) return
-        const model = yield* models.auxiliary({ session, agent, primary: Effect.succeed(primary), infer: true })
+        const model = yield* models.auxiliary({
+          session,
+          agent,
+          originAgent,
+          primary: Effect.succeed(primary),
+          infer: true,
+        })
         const text = yield* llm
           .stream(
             LLM.request({
@@ -275,7 +286,7 @@ const layer = Layer.effect(
       const context = entries.map((entry) => entry.message)
       if (!drain.titled) {
         drain.titled = true
-        yield* title(session, model, context).pipe(FiberSet.run(drain.titles))
+        yield* title(session, model, agent.info, context).pipe(FiberSet.run(drain.titles))
       }
       const isLastStep = agent.info?.steps !== undefined && currentStep >= agent.info.steps
       const toolMaterialization = isLastStep ? undefined : yield* tools.materialize(agent.info?.permissions)
@@ -297,6 +308,7 @@ const layer = Layer.effect(
           const summarizer = yield* models.auxiliary({
             session,
             agent: yield* auxiliaryAgent("compaction"),
+            originAgent: agent.info,
             primary: Effect.succeed(model),
             infer: false,
           })
@@ -525,9 +537,11 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
       if (legacy) return "unsupported" as const
       yield* plugins.ready
+      const originAgent = yield* agents.select(session.agent)
       const model = yield* models.auxiliary({
         session,
         agent: yield* auxiliaryAgent("compaction"),
+        originAgent: originAgent.info,
         primary: models.resolve(session),
         infer: false,
       })
