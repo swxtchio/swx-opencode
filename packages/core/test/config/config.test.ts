@@ -1,9 +1,10 @@
 import path from "path"
 import fs from "fs/promises"
 import { describe, expect } from "bun:test"
-import { Effect, Layer, Schema } from "effect"
+import { Cause, Effect, Exit, Layer, Schema } from "effect"
 import { FastCheck } from "effect/testing"
 import { Config } from "@opencode-ai/core/config"
+import { ConfigErrorV1 } from "@opencode-ai/core/v1/config/error"
 import { ConfigProvider } from "@opencode-ai/core/config/provider"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -42,6 +43,15 @@ function testLayer(
     [Global.node, Global.layerWith({ config: globalDirectory })],
     ...(sources ? [[Config.node, Config.nodeWith(sources)] as const] : []),
   ])
+}
+
+function entriesExit(directory: string) {
+  return Effect.exit(
+    Effect.gen(function* () {
+      const config = yield* Config.Service
+      return yield* config.entries()
+    }).pipe(Effect.provide(testLayer(directory))),
+  )
 }
 
 const provider = {
@@ -112,8 +122,9 @@ describe("Config", () => {
       expect(ConfigMigrateV1.isV1({ snapshot: false })).toBe(true)
       expect(ConfigMigrateV1.isV1({ snapshot: false, agents: {} })).toBe(true)
       expect(ConfigMigrateV1.isV1({ reference: {} })).toBe(true)
-      expect(ConfigMigrateV1.isV1({ shell: "/bin/zsh", model: "anthropic/claude" })).toBe(true)
+      expect(ConfigMigrateV1.isV1({ shell: "/bin/zsh", model: "anthropic/claude" })).toBe(false)
       expect(ConfigMigrateV1.isV1({ small_model: "auxiliary/models/small", compaction: {} })).toBe(true)
+      expect(ConfigMigrateV1.isV1({ small_model: "auxiliary/models/small", agents: {} })).toBe(false)
       expect(ConfigMigrateV1.isV1({ skills: ["/native/skills"] })).toBe(false)
     }),
   )
@@ -310,7 +321,7 @@ describe("Config", () => {
     ),
   )
 
-  it.live("loads native V2 custom LSP beside the small_model setting", () =>
+  it.live("loads native custom LSP config without V1 extension requirements", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
@@ -321,33 +332,19 @@ describe("Config", () => {
             path.join(tmp.path, "opencode.json"),
             JSON.stringify({
               small_model: "native-provider/models/native-small",
-              lsp: {
-                custom: {
-                  command: ["custom-lsp"],
-                  extensions: [".foo"],
-                  initialization: { workspace: { enabled: true } },
-                },
-              },
+              lsp: { custom: { command: ["custom-lsp"] } },
             }),
           ),
         ).pipe(
           Effect.andThen(
             Effect.gen(function* () {
               const config = yield* Config.Service
-              const documents = (yield* config.entries()).filter(
+              const document = (yield* config.entries()).findLast(
                 (entry): entry is Config.Document => entry.type === "document",
               )
-              const document = documents.at(-1)
 
-              expect(documents).toHaveLength(1)
               expect(document?.info.small_model).toBe("native-provider/models/native-small")
-              expect(document?.info.lsp).toMatchObject({
-                custom: {
-                  command: ["custom-lsp"],
-                  extensions: [".foo"],
-                  initialization: { workspace: { enabled: true } },
-                },
-              })
+              expect(document?.info.lsp).toMatchObject({ custom: { command: ["custom-lsp"] } })
             }).pipe(Effect.provide(testLayer(tmp.path))),
           ),
         ),
@@ -383,7 +380,7 @@ describe("Config", () => {
     ),
   )
 
-  it.live("migrates V1 permissions beside V2-only agent configuration", () =>
+  it.live("rejects V1 permission data beside V2-only agent configuration", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
@@ -400,13 +397,40 @@ describe("Config", () => {
         ).pipe(
           Effect.andThen(
             Effect.gen(function* () {
-              const config = yield* Config.Service
-              const document = (yield* config.entries()).findLast(
-                (entry): entry is Config.Document => entry.type === "document",
-              )
+              const result = yield* entriesExit(tmp.path)
+              expect(Exit.isFailure(result)).toBe(true)
+              if (Exit.isFailure(result)) {
+                const error = Cause.squash(result.cause)
+                expect(error).toBeInstanceOf(ConfigErrorV1.InvalidError)
+              }
+            }),
+          ),
+        ),
+      ),
+    ),
+  )
 
-              expect(document?.info.permissions).toMatchObject([{ action: "bash", resource: "*", effect: "deny" }])
-            }).pipe(Effect.provide(testLayer(tmp.path))),
+  it.live("rejects native V2 data when no decode path retains its keys", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.promise(() =>
+          fs.writeFile(
+            path.join(tmp.path, "opencode.json"),
+            JSON.stringify({ small_model: "native-provider/models/native-small", agents: { build: null } }),
+          ),
+        ).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const result = yield* entriesExit(tmp.path)
+              expect(Exit.isFailure(result)).toBe(true)
+              if (Exit.isFailure(result)) {
+                const error = Cause.squash(result.cause)
+                expect(error).toBeInstanceOf(ConfigErrorV1.InvalidError)
+              }
+            }),
           ),
         ),
       ),

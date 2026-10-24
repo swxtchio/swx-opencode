@@ -13,9 +13,37 @@ const decodeV1Info = Schema.decodeUnknownOption(ConfigV1.Info, {
   onExcessProperty: "ignore",
   propertyOrder: "original",
 })
+const decodeV1StrictInfo = Schema.decodeUnknownOption(ConfigV1.Info, {
+  errors: "all",
+  onExcessProperty: "error",
+  propertyOrder: "original",
+})
+
+const v1MarkerKeys = new Set([
+  "logLevel",
+  "server",
+  "command",
+  "reference",
+  "snapshot",
+  "plugin",
+  "autoshare",
+  "disabled_providers",
+  "enabled_providers",
+  "mode",
+  "agent",
+  "provider",
+  "permission",
+  "tools",
+  "attachment",
+  "layout",
+])
 
 export function isV1(input: unknown) {
-  return Option.isSome(decodeV1Info(input))
+  if (Option.isNone(decodeV1Info(input))) return false
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return false
+  const keys = Object.keys(input)
+  if (keys.some((key) => v1MarkerKeys.has(key))) return true
+  return keys.includes("small_model") && Option.isSome(decodeV1StrictInfo(input))
 }
 
 export function migrate(info: typeof ConfigV1.Info.Type) {

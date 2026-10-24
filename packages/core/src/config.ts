@@ -24,6 +24,7 @@ import { ConfigProvider } from "./config/provider"
 import { ConfigReference } from "./config/reference"
 import { ConfigToolOutput } from "./config/tool-output"
 import { ConfigWatcher } from "./config/watcher"
+import { ConfigErrorV1 } from "./v1/config/error"
 import { ConfigV1 } from "./v1/config/config"
 import { ConfigMigrateV1 } from "./v1/config/migrate"
 
@@ -152,27 +153,32 @@ const layerWith = (sources: Sources) =>
       const policy = yield* Policy.Service
       const names = ["opencode.json", "opencode.jsonc"]
       const decodeOptions = { errors: "all", onExcessProperty: "ignore", propertyOrder: "original" } as const
-      const decodeInfo = Schema.decodeUnknownOption(Info, decodeOptions)
-      // Fail native validation rather than silently dropping V1-only fields.
       const decodeNativeInfo = Schema.decodeUnknownOption(Info, { ...decodeOptions, onExcessProperty: "error" })
-      const decodeV1Info = Schema.decodeUnknownOption(ConfigV1.Info, decodeOptions)
+      const decodeV1StrictInfo = Schema.decodeUnknownOption(ConfigV1.Info, {
+        ...decodeOptions,
+        onExcessProperty: "error",
+      })
 
-      const parseInfo = (text: string) => {
+      const parseInfo = (text: string, source: string) => {
         const errors: ParseError[] = []
         const input: unknown = parse(text, errors, { allowTrailingComma: true })
         if (errors.length) return
         const native = decodeNativeInfo(input)
+        const migrated = ConfigMigrateV1.isV1(input)
+          ? decodeV1StrictInfo(input).pipe(Option.map(ConfigMigrateV1.migrate), Option.flatMap(decodeNativeInfo))
+          : Option.none()
+        if (Option.isSome(migrated)) return migrated.value
         if (Option.isSome(native)) return native.value
-        if (!ConfigMigrateV1.isV1(input)) return
-        return Option.getOrUndefined(
-          decodeV1Info(input).pipe(Option.map(ConfigMigrateV1.migrate), Option.flatMap(decodeInfo)),
-        )
+        throw new ConfigErrorV1.InvalidError({
+          path: source,
+          message: "No V1 or V2 configuration decoder accepts every supplied field.",
+        })
       }
 
       const loadFile = Effect.fnUntraced(function* (filepath: string) {
         const text = yield* fs.readFileStringSafe(filepath)
         if (!text) return
-        const info = parseInfo(text)
+        const info = parseInfo(text, filepath)
         if (!info) return
         return new Document({ type: "document", path: filepath, info })
       })
@@ -215,7 +221,7 @@ const layerWith = (sources: Sources) =>
       )
       const supplementary = yield* Effect.forEach(directories, loadDirectory).pipe(Effect.orDie)
       const explicit = sources.file ? yield* loadFile(path.resolve(sources.file)).pipe(Effect.orDie) : undefined
-      const content = sources.content ? parseInfo(sources.content) : undefined
+      const content = sources.content ? parseInfo(sources.content, "OPENCODE_CONFIG_CONTENT") : undefined
       // Apply general settings first and more specific settings last, in V1's
       // order: global config, the explicit file, project files, `.opencode`
       // files, then inline content.
