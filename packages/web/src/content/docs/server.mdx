@@ -190,9 +190,12 @@ V2 sessions also accept `smallModel` on `POST /api/session`, in the same shape, 
 The V2 runner chooses a model for a session's title and its compaction summaries in this order:
 
 1. the `title` or `compaction` agent's own `model`;
-2. the session's `smallModel`;
-3. for titles only, a small model inferred for the turn's provider;
-4. the turn's model.
+2. that auxiliary agent's `small_model`;
+3. the selected primary agent's `small_model`;
+4. the session's `smallModel`;
+5. the effective global `small_model`;
+6. for titles only, a small model inferred for the turn's provider;
+7. the turn's model.
 
 A selected model that is not available fails the work instead of being replaced.
 

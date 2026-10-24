@@ -165,7 +165,12 @@ describe("Config", () => {
         Effect.promise(() =>
           fs.writeFile(
             path.join(tmp.path, "opencode.json"),
-            JSON.stringify({ snapshot: false, watcher: { fff: false } }),
+            JSON.stringify({
+              snapshot: false,
+              watcher: { fff: false },
+              small_model: "auxiliary/models/global-small",
+              agent: { build: { small_model: "auxiliary/models/agent-small" } },
+            }),
           ),
         ).pipe(
           Effect.flatMap(() =>
@@ -175,6 +180,8 @@ describe("Config", () => {
                 (entry): entry is Config.Document => entry.type === "document",
               )
               expect(document?.info.watcher?.fff).toBe(false)
+              expect(document?.info.small_model).toBe("auxiliary/models/global-small")
+              expect(document?.info.agents?.build?.small_model).toBe("auxiliary/models/agent-small")
             }).pipe(Effect.provide(testLayer(tmp.path))),
           ),
         ),
@@ -273,6 +280,53 @@ describe("Config", () => {
           }).pipe(Effect.provide(testLayer(tmp.path)))
         }),
       ),
+    ),
+  )
+
+  it.live("loads native small_model with providers and agents at location priority", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) => {
+        const global = path.join(tmp.path, "global")
+        const project = path.join(tmp.path, "project")
+        return Effect.promise(async () => {
+          await fs.mkdir(global, { recursive: true })
+          await fs.mkdir(project, { recursive: true })
+          await fs.writeFile(
+            path.join(global, "opencode.json"),
+            JSON.stringify({
+              small_model: "global-provider/models/global-small",
+              providers: { global: provider },
+            }),
+          )
+          await fs.writeFile(
+            path.join(project, "opencode.json"),
+            JSON.stringify({
+              small_model: "local-provider/models/local-small",
+              providers: { local: provider },
+              agents: { build: { small_model: "local-provider/models/agent-small" } },
+            }),
+          )
+        }).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const config = yield* Config.Service
+              const entries = yield* config.entries()
+              const documents = entries.filter((entry): entry is Config.Document => entry.type === "document")
+              const projectDocument = documents.find(
+                (document) => document.path === path.join(project, "opencode.json"),
+              )
+
+              expect(documents).toHaveLength(2)
+              expect(Config.latest(entries, "small_model")).toBe("local-provider/models/local-small")
+              expect(projectDocument?.info.providers?.local).toBeInstanceOf(ConfigProvider.Info)
+              expect(projectDocument?.info.agents?.build?.small_model).toBe("local-provider/models/agent-small")
+            }).pipe(Effect.provide(testLayer(project, global, project))),
+          ),
+        )
+      }),
     ),
   )
 

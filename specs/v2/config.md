@@ -176,7 +176,7 @@ Provider catalog customization and model-choice configuration. The new core work
 | `disabled_providers` | Disable automatically loaded providers            | redesign | Replace with `experimental.policies: [{ effect: "deny", action: "provider.use", resource: "..." }]`.                         |
 | `enabled_providers`  | Restrict enabled providers to an allowlist        | redesign | Replace with ordered `provider.use` allow/deny statements and wildcard resources.                                            |
 | `model`              | Default model selection                           | keep     | Keep as the fallback model when an active session or agent does not specify a model.                                         |
-| `small_model`        | Small/utility model selection                     | remove   | Do not port; its only runtime consumer is title generation, which can use an explicit `title` agent model override.          |
+| `small_model`        | Small/utility model selection                     | keep     | Preserve the global auxiliary model selection for titles and compaction summaries, including V1 migration.                   |
 
 Provider selection rules belong in `experimental.policies` rather than provider entries or repeated top-level provider fields. Initial proposed shape:
 
@@ -207,7 +207,7 @@ Provider configuration uses the plural `providers` key in v2. This intentionally
 
 Keep `model` as the default model fallback. It is application-wide behavior used when an active session or agent has no explicit model selection, so it does not belong inside any individual provider configuration.
 
-Do not port `small_model`. In the current runtime it is only consulted while generating a session title: the `title` agent model wins first, then `small_model`, then automatic/current-model fallback. In v2, users who need a specific title model should configure the `title` agent directly rather than use a separate top-level model setting.
+Keep global `small_model` for V2 title and compaction requests, with the effective location configuration taking precedence as other scalar settings do. It follows the auxiliary agent's explicit `model` and `small_model`, the selected primary agent's `small_model`, and the Session's `smallModel`; titles alone then infer a provider small model before using the turn model. Native V2 documents and migrated V1 documents preserve their other effective settings alongside this key.
 
 Provider, model, variant, and provisional agent `options` are authored as partial patches rather than fully materialized runtime option records. Users should be able to set only the override they need, such as a header or an AI SDK request option; catalog state supplies empty defaults and merges patches in configuration order.
 

@@ -17,7 +17,6 @@ const keys = new Set([
   "autoshare",
   "disabled_providers",
   "enabled_providers",
-  "small_model",
   "mode",
   "agent",
   "provider",
@@ -37,6 +36,7 @@ export function migrate(info: typeof ConfigV1.Info.Type) {
     $schema: info.$schema,
     shell: info.shell,
     model: info.model,
+    small_model: info.small_model,
     default_agent: info.default_agent,
     autoupdate: info.autoupdate,
     share: info.share ?? (info.autoshare ? "auto" : undefined),
@@ -111,6 +111,7 @@ export function migrateAgent(info: ConfigAgentV1.Info) {
   }
   return {
     model: info.model,
+    small_model: info.small_model,
     variant: info.variant,
     request: Object.keys(body).length ? { body } : undefined,
     system: info.prompt,

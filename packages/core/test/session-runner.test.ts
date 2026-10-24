@@ -185,7 +185,12 @@ let currentModel = model
 let auxiliaryModel: Model | undefined
 const models = SessionRunnerModel.layerWith(
   (session) => modelResolveHook.pipe(Effect.as(session.model?.id === "replacement" ? replacementModel : currentModel)),
-  (input) => (auxiliaryModel ? Effect.succeed(auxiliaryModel) : input.primary),
+  (input) => {
+    const selected = input.originAgent?.smallModel
+    if (selected)
+      return Effect.succeed(Model.make({ id: selected.id, provider: selected.providerID, route: OpenAIChat.route }))
+    return auxiliaryModel ? Effect.succeed(auxiliaryModel) : input.primary
+  },
 )
 const systemContextKey = SystemContext.Key.make("test/context")
 let systemBaseline = "Initial context"
@@ -454,6 +459,16 @@ const setupNative = Effect.gen(function* () {
     id: sessionID,
     location: Location.Ref.make({ directory: AbsolutePath.make("/project") }),
   })
+})
+
+const addPrimarySmallModel = Effect.gen(function* () {
+  const agents = yield* AgentV2.Service
+  yield* agents.transform((editor) =>
+    editor.update(AgentV2.ID.make("build"), (agent) => {
+      agent.mode = "primary"
+      agent.smallModel = { id: ModelV2.ID.make("small"), providerID: ProviderV2.ID.make("fake") }
+    }),
+  )
 })
 
 const providerUnavailable = () =>
@@ -2850,6 +2865,7 @@ describe("SessionRunnerLLM", () => {
   it.effect("forces one compaction and retries after provider context overflow", () =>
     Effect.gen(function* () {
       const session = yield* setupOverflowRecovery
+      yield* addPrimarySmallModel
       responses = [
         [
           LLMEvent.stepStart({ index: 0 }),
@@ -2862,6 +2878,7 @@ describe("SessionRunnerLLM", () => {
       yield* session.resume(sessionID)
 
       expect(requests).toHaveLength(3)
+      expect(String(requests[1].model.id)).toBe("small")
       expect(userTexts(requests[1])[0]).toContain("## Objective")
       expect(userTexts(requests[2])[0]).toContain("<summary>\n## Objective\n- Recover overflow\n</summary>")
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -5164,7 +5181,6 @@ describe("SessionRunnerLLM", () => {
 })
 
 describe("SessionV2 auxiliary model work", () => {
-  const smallModel = Model.make({ id: "small", provider: "fake", route: OpenAIChat.route })
   const titleSystem = "Title instructions"
   const isTitleRequest = (request: LLMRequest) => request.system.some((part) => part.text === titleSystem)
   const addTitleAgent = Effect.gen(function* () {
@@ -5186,7 +5202,7 @@ describe("SessionV2 auxiliary model work", () => {
     Effect.gen(function* () {
       yield* setupNative
       yield* addTitleAgent
-      auxiliaryModel = smallModel
+      yield* addPrimarySmallModel
       const session = yield* SessionV2.Service
       response = fragmentFixture("text", "text-title", [
         "<think>naming</think>\nFixing the build\nignored",
@@ -5232,6 +5248,7 @@ describe("SessionV2 auxiliary model work", () => {
   it.effect("summarizes automatic compaction on the auxiliary model", () =>
     Effect.gen(function* () {
       yield* setup
+      yield* addPrimarySmallModel
       const session = yield* SessionV2.Service
       response = fragmentFixture("text", "text-first", ["Earlier answer"]).completeEvents
       yield* session.prompt({
@@ -5242,7 +5259,6 @@ describe("SessionV2 auxiliary model work", () => {
       yield* session.resume(sessionID)
 
       currentModel = compactModel
-      auxiliaryModel = smallModel
       requests.length = 0
       responses = [
         fragmentFixture("text", "text-summary", ["## Objective\n- Preserve the task"]).completeEvents,
@@ -5267,12 +5283,12 @@ describe("SessionV2 auxiliary model work", () => {
   it.effect("compacts the whole conversation on request on the auxiliary model", () =>
     Effect.gen(function* () {
       yield* setupNative
+      yield* addPrimarySmallModel
       const session = yield* SessionV2.Service
       response = fragmentFixture("text", "text-answer", ["The answer"]).completeEvents
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "The question" }), resume: false })
       yield* session.resume(sessionID)
 
-      auxiliaryModel = smallModel
       requests.length = 0
       response = fragmentFixture("text", "text-summary", ["## Objective\n- Answer the question"]).completeEvents
       yield* session.compact({ sessionID })
