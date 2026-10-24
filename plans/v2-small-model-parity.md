@@ -35,7 +35,7 @@ and compaction call sites in `packages/opencode/src/session/prompt.ts` and
 `packages/opencode/src/session/compaction.ts`. V2 therefore carries the originating agent's
 `small_model` field between the auxiliary agent override and the session/global selections.
 
-Config selection is schema-driven at the loader boundary. Try native V2 `Config.Info` decoding first with excess properties rejected; if it fails, migrate only when V1 config decoding succeeds and the migrated V2 document validates. `small_model` alone does not choose either format, and `ConfigMigrateV1.isV1` reports schema validity rather than format precedence. This preserves V1-only fields through migration and accepts native V2 shared-key structures without enumerated shape checks. Loader regressions keep the pinned V1 assertion and exercise legacy-only `small_model`, genuine V1 migration, and each native V2 shared-key reproduction independently.
+Config selection considers only lossless schema paths: strict native V2 decoding, or strict V1 decoding followed by a valid V2 migration. A path that ignores any supplied key is ineligible. Prefer V1 migration when its marker applies and the migration validates; otherwise use native V2. If neither path is eligible, return `ConfigInvalidError` for the source document. `small_model` marks V1 only when strict V1 validation accepts it, which excludes V2-only fields without a shape list. Loader regressions keep the pinned V1 assertion and cover V1 migration, each round's native shared-key repros, and explicit rejection when neither schema can retain the document.
 
 A configured selection that does not resolve fails without a substitute, as in V1.
 Lower-priority invalid selections do not defeat a usable higher-priority choice. The model is
