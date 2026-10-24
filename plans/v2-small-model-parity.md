@@ -35,7 +35,7 @@ and compaction call sites in `packages/opencode/src/session/prompt.ts` and
 `packages/opencode/src/session/compaction.ts`. V2 therefore carries the originating agent's
 `small_model` field between the auxiliary agent override and the session/global selections.
 
-Firstmate revised the round-four rule on 2026-10-24: restore the base's excess-key tolerance at every depth and add only a V2-only top-level guard against V1 migration. Existing V1 markers retain the base predicate; `small_model` acts as a V1 marker only without V2-only top-level keys. Documents with those V2-only keys use native V2 decoding with the base's ignored-excess behavior. The loader adds no new fatal config errors. Compatibility regressions cover base-accepted top-level and nested excess, legacy keys, and both sides of the migration guard. Shared-shape V1/V2 lossiness without V2-only keys is outside this issue; #359 owns it.
+Firstmate revised the rule on 2026-10-24: preserve the base routing for every existing V1 marker, and use the V2-only top-level key check only to decide whether `small_model` by itself marks a V1 document. This keeps migrated V1 permissions, providers, and auxiliary-agent overrides when V2-only keys coexist; `small_model` plus a V2-only key without another V1 marker uses native V2 decoding. Both routes retain the base's ignored-excess behavior. Shared-shape V1/V2 lossiness without V2-only keys is outside this issue; #359 owns it.
 
 A configured selection that does not resolve fails without a substitute, as in V1.
 Lower-priority invalid selections do not defeat a usable higher-priority choice. The model is
