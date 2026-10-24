@@ -30,6 +30,15 @@ models inherited from different primary agents, so V2 keeps the separate agent-l
 V1-format configuration migration and native V2 configuration loading both preserve the global and
 agent selections without losing other settings or location priority.
 
+Firstmate's ruling for #355 on 2026-10-24 chose V1 agent-scope parity after verifying the V1 title
+and compaction call sites in `packages/opencode/src/session/prompt.ts` and
+`packages/opencode/src/session/compaction.ts`. V2 therefore carries the originating agent's
+`small_model` field between the auxiliary agent override and the session/global selections.
+
+`small_model` is a V1 format marker only when a V2-only top-level key is absent. Native V2 keys such
+as `agents`, `providers`, and `permissions` take precedence over the overlapping V1 marker, while
+legacy documents with shared-shape keys such as `compaction`, `mcp`, or `skills` still migrate.
+
 A configured selection that does not resolve fails without a substitute, as in V1.
 Lower-priority invalid selections do not defeat a usable higher-priority choice. The model is
 resolved only when a title or summary is about to be requested, so an unusable auxiliary selection
