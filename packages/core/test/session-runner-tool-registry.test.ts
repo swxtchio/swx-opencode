@@ -1,16 +1,26 @@
 import { describe, expect } from "bun:test"
+import fs from "fs/promises"
+import path from "path"
 import { Tool } from "@opencode-ai/core/tool/tool"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
-import { SessionV2 } from "@opencode-ai/core/session"
+import { Config } from "@opencode-ai/core/config"
+import { Global } from "@opencode-ai/core/global"
+import { Location } from "@opencode-ai/core/location"
+import { PermissionV2 } from "@opencode-ai/core/permission"
+import { ProjectTools } from "@opencode-ai/core/tool/project"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { SessionV2 } from "@opencode-ai/core/session"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { executeTool, settleTool, toolDefinitions } from "./lib/tool"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, SchemaGetter, SchemaIssue, Scope } from "effect"
 import { testEffect } from "./lib/effect"
+import { location } from "./fixture/location"
+import { tmpdir } from "./fixture/tmpdir"
 
 const bounds: ToolOutputStore.BoundInput[] = []
 const retentionFailure = new ToolOutputStore.StorageError({ operation: "write", cause: new Error("disk full") })
@@ -36,6 +46,7 @@ const integrated = testEffect(
     [ToolOutputStore.node, outputStore],
   ]),
 )
+const projectIt = testEffect(Layer.empty)
 const identity = {
   agent: AgentV2.ID.make("build"),
   assistantMessageID: SessionMessage.ID.make("msg_registry"),
@@ -58,7 +69,187 @@ const make = (permission?: string) => {
   return permission ? Tool.withPermission(tool, permission) : tool
 }
 
+const projectToolLayer = (directory: string, requests: PermissionV2.AssertInput[]) => {
+  const projectDirectory = AbsolutePath.make(directory)
+  return AppNodeBuilder.build(LayerNode.group([ToolRegistry.node, ToolRegistry.toolsNode, ProjectTools.node]), [
+    [
+      Location.node,
+      Layer.succeed(
+        Location.Service,
+        Location.Service.of(location(Location.Ref.make({ directory: projectDirectory }), { projectDirectory })),
+      ),
+    ],
+    [Global.node, Global.layerWith({ config: path.join(directory, "global") })],
+    [Config.node, Config.nodeWith({})],
+    [
+      PermissionV2.node,
+      Layer.succeed(
+        PermissionV2.Service,
+        PermissionV2.Service.of({
+          assert: (input) =>
+            Effect.sync(() => {
+              requests.push(input)
+            }),
+          ask: () => Effect.die("unused"),
+          reply: () => Effect.die("unused"),
+          get: () => Effect.succeed(undefined),
+          forSession: () => Effect.succeed([]),
+          list: () => Effect.succeed([]),
+        }),
+      ),
+    ],
+    [ToolOutputStore.node, outputStore],
+  ])
+}
+
 describe("ToolRegistry", () => {
+  void projectIt.effect("discovers plugin modules and settles their validated output through canonical tools", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) => {
+        const permissionRequests: PermissionV2.AssertInput[] = []
+        return Effect.promise(async () => {
+          const opencode = path.join(tmp.path, ".opencode")
+          const tools = path.join(opencode, "tools")
+          const singular = path.join(opencode, "tool")
+          const pluginPackage = path.join(opencode, "node_modules", "@opencode-ai", "plugin")
+          await fs.mkdir(tools, { recursive: true })
+          await fs.mkdir(singular, { recursive: true })
+          await fs.mkdir(path.dirname(pluginPackage), { recursive: true })
+          await fs.symlink(path.resolve(import.meta.dir, "../../plugin"), pluginPackage, "dir")
+          await Bun.write(
+            path.join(tools, "broken.js"),
+            "import { missing } from '@project-tool-dependency-that-is-not-installed'; export default missing",
+          )
+          await Bun.write(
+            path.join(tools, "healthy.js"),
+            [
+              'import { tool } from "@opencode-ai/plugin"',
+              "export const named = tool({ description: 'Named local tool', args: {}, execute: async () => 'named' })",
+              "export default tool({",
+              "  description: 'Echo one validated string',",
+              "  args: { text: tool.schema.string().describe('Text to echo') },",
+              "  async execute({ text }, context) {",
+              "    await context.ask({ permission: 'project.test', patterns: ['workspace'], always: ['workspace'], metadata: { source: 'project-tool' } })",
+              "    context.metadata({ title: 'Context title', metadata: { contextValue: 'kept' } })",
+              "    return { output: JSON.stringify({ text, sessionID: context.sessionID, messageID: context.messageID, agent: context.agent, directory: context.directory, worktree: context.worktree, signalAborted: context.abort.aborted }), metadata: { resultValue: 'kept' }, attachments: [{ type: 'file', mime: 'text/plain', url: 'data:text/plain;base64,b2s=', filename: 'result.txt' }] }",
+              "  },",
+              "})",
+              "",
+            ].join("\n"),
+          )
+          await Bun.write(
+            path.join(singular, "legacy.ts"),
+            [
+              "export default {",
+              "  description: 'Legacy JSON Schema tool',",
+              "  args: { query: { type: 'string', description: 'Search query' } },",
+              "  execute: async ({ query }) => `legacy:${query}`,",
+              "}",
+              "",
+            ].join("\n"),
+          )
+        }).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const projectDirectory = AbsolutePath.make(tmp.path)
+              const toolsService = yield* ProjectTools.Service
+              yield* toolsService.ready
+              const registry = yield* ToolRegistry.Service
+              const materialized = yield* registry.materialize()
+              const names = materialized.definitions.map((definition) => definition.name)
+              expect(names).toContain("healthy")
+              expect(names).toContain("healthy_named")
+              expect(names).toContain("legacy")
+              expect(names).not.toContain("broken")
+              const healthy = materialized.definitions.find((definition) => definition.name === "healthy")
+              expect(healthy?.description).toBe("Echo one validated string")
+              expect(healthy?.inputSchema).toMatchObject({
+                type: "object",
+                properties: { text: { type: "string", description: "Text to echo" } },
+                required: ["text"],
+              })
+              expect(
+                materialized.definitions.find((definition) => definition.name === "legacy")?.inputSchema,
+              ).toMatchObject({
+                type: "object",
+                properties: { query: { type: "string", description: "Search query" } },
+                required: ["query"],
+              })
+              expect(
+                yield* materialized.settle({
+                  sessionID,
+                  ...identity,
+                  call: { type: "tool-call", id: "call-project-tool", name: "healthy", input: { text: 12 } },
+                }),
+              ).toMatchObject({ result: { type: "error", value: expect.stringContaining("Invalid tool input:") } })
+
+              const result = yield* materialized.settle({
+                sessionID,
+                ...identity,
+                call: { type: "tool-call", id: "call-project-tool-valid", name: "healthy", input: { text: "hello" } },
+              })
+              expect(result.output?.structured).toEqual({
+                title: "Context title",
+                output: JSON.stringify({
+                  text: "hello",
+                  sessionID,
+                  messageID: identity.assistantMessageID,
+                  agent: identity.agent,
+                  directory: projectDirectory,
+                  worktree: projectDirectory,
+                  signalAborted: false,
+                }),
+                metadata: { resultValue: "kept", contextValue: "kept" },
+                attachments: [
+                  { type: "file", mime: "text/plain", url: "data:text/plain;base64,b2s=", filename: "result.txt" },
+                ],
+              })
+              expect(result.result.type).toBe("content")
+              expect(
+                yield* materialized.settle({
+                  sessionID,
+                  ...identity,
+                  call: { type: "tool-call", id: "call-project-tool-named", name: "healthy_named", input: {} },
+                }),
+              ).toMatchObject({
+                result: { type: "text", value: "named" },
+                output: { structured: "named", content: [{ type: "text", text: "named" }] },
+              })
+              expect(
+                yield* materialized.settle({
+                  sessionID,
+                  ...identity,
+                  call: { type: "tool-call", id: "call-project-tool-legacy", name: "legacy", input: { query: "find" } },
+                }),
+              ).toMatchObject({
+                result: { type: "text", value: "legacy:find" },
+                output: { structured: "legacy:find", content: [{ type: "text", text: "legacy:find" }] },
+              })
+              expect(permissionRequests).toHaveLength(1)
+              expect(permissionRequests).toMatchObject([
+                {
+                  sessionID,
+                  agent: identity.agent,
+                  action: "project.test",
+                  resources: ["workspace"],
+                  save: ["workspace"],
+                  source: {
+                    type: "tool",
+                    messageID: identity.assistantMessageID,
+                    callID: "call-project-tool-valid",
+                  },
+                },
+              ])
+            }).pipe(Effect.provide(projectToolLayer(tmp.path, permissionRequests))),
+          ),
+        )
+      }),
+    ),
+  )
+
   it.effect("filters disabled tools with edit aliases and ordered wildcard precedence", () =>
     Effect.gen(function* () {
       const service = yield* ToolRegistry.Service

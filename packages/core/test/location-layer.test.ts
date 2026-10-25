@@ -20,6 +20,7 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionExecutionLocal } from "@opencode-ai/core/session/execution/local"
 import { Prompt } from "@opencode-ai/core/session/prompt"
@@ -38,6 +39,7 @@ import { Project } from "../src/project"
 import { Reference } from "../src/reference"
 import { ToolRegistry } from "../src/tool/registry"
 import { ApplicationTools } from "../src/tool/application-tools"
+import { ProjectTools } from "../src/tool/project"
 
 // The OpenCode jail's opencode.json: no `model`, one config-declared provider. The image names it with
 // OPENCODE_CONFIG and the entrypoint renders the proxy values into OPENCODE_CONFIG_CONTENT.
@@ -106,6 +108,31 @@ const jailServices = Effect.fn(function* (root: string, replacements: LayerNode.
 const it = testEffect(
   AppNodeBuilder.build(LayerNode.group([ApplicationTools.node, Database.node, EventV2.node, LocationServiceMap.node])),
 )
+
+async function stageProjectTool(directory: string, marker: string, toolName: string) {
+  const opencode = path.join(directory, ".opencode")
+  const tools = path.join(opencode, "tools")
+  const pluginPackage = path.join(opencode, "node_modules", "@opencode-ai", "plugin")
+  await fs.mkdir(tools, { recursive: true })
+  await fs.mkdir(path.dirname(pluginPackage), { recursive: true })
+  await fs.symlink(path.resolve(import.meta.dir, "../../plugin"), pluginPackage, "dir")
+  await Bun.write(
+    path.join(tools, `${toolName}.js`),
+    [
+      'import { tool } from "@opencode-ai/plugin"',
+      "export default tool({",
+      `  description: 'Tool for ${marker}',`,
+      "  args: {},",
+      `  async execute(_args, context) { return { output: JSON.stringify({ marker: '${marker}', directory: context.directory, worktree: context.worktree }) } },`,
+      "})",
+      "",
+    ].join("\n"),
+  )
+  await Bun.write(
+    path.join(tools, `${toolName}_broken.js`),
+    "import { missing } from '@project-tool-dependency-that-is-not-installed'; export default missing",
+  )
+}
 
 describe("LocationServiceMap", () => {
   it.live("reuses cached services for constructed and decoded location refs", () =>
@@ -357,6 +384,93 @@ describe("LocationServiceMap", () => {
             expect(request.model.route.endpoint).toMatchObject({ baseURL: "https://egress.test/v1" })
           }
         }),
+      ),
+    ),
+  )
+
+  it.live("isolates project tools per Location and rediscovers new modules after Location recreation", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => Promise.all([tmpdir(), tmpdir(), tmpdir()])),
+      (dirs) => Effect.promise(() => Promise.all(dirs.map((dir) => dir[Symbol.asyncDispose]())).then(() => undefined)),
+    ).pipe(
+      Effect.flatMap(([firstDir, secondDir, emptyDir]) =>
+        Effect.promise(async () => {
+          const name = `location_probe_${path.basename(firstDir.path).replaceAll("-", "_")}`
+          await stageProjectTool(firstDir.path, "first", name)
+          await stageProjectTool(secondDir.path, "second", name)
+          return { name, lateName: `${name}_late` }
+        }).pipe(
+          Effect.flatMap(({ name, lateName }) =>
+            Effect.gen(function* () {
+              const locations = yield* LocationServiceMap.Service
+              const materialize = (directory: string, callID: string, toolName = name) =>
+                Effect.gen(function* () {
+                  const ref = Location.Ref.make({ directory: AbsolutePath.make(directory) })
+                  return yield* Effect.gen(function* () {
+                    const projectTools = yield* ProjectTools.Service
+                    yield* projectTools.ready
+                    const location = yield* Location.Service
+                    const registry = yield* ToolRegistry.Service
+                    const materialized = yield* registry.materialize()
+                    const definition = materialized.definitions.find((item) => item.name === toolName)
+                    const settlement = definition
+                      ? yield* materialized.settle({
+                          sessionID: SessionV2.ID.make(`ses_${callID}`),
+                          agent: AgentV2.ID.make("build"),
+                          assistantMessageID: SessionMessage.ID.make(`msg_${callID}`),
+                          call: { type: "tool-call", id: callID, name: toolName, input: {} },
+                        })
+                      : undefined
+                    return {
+                      location,
+                      names: materialized.definitions.map((definition) => definition.name),
+                      settlement,
+                    }
+                  }).pipe(Effect.provide(locations.get(ref)))
+                })
+
+              const first = yield* materialize(firstDir.path, "location_first")
+              const second = yield* materialize(secondDir.path, "location_second")
+              const absent = yield* materialize(emptyDir.path, "location_empty")
+              expect(first.names).toContain(name)
+              expect(second.names).toContain(name)
+              expect(first.names).toContain("read")
+              expect(first.names).not.toContain(`${name}_broken`)
+              expect(absent.names).not.toContain(name)
+              expect(absent.names).toContain("read")
+              expect(JSON.parse((first.settlement?.output?.structured as { output: string }).output)).toEqual({
+                marker: "first",
+                directory: first.location.directory,
+                worktree: first.location.project.directory,
+              })
+              expect(JSON.parse((second.settlement?.output?.structured as { output: string }).output)).toEqual({
+                marker: "second",
+                directory: second.location.directory,
+                worktree: second.location.project.directory,
+              })
+
+              yield* Effect.promise(() =>
+                Bun.write(
+                  path.join(firstDir.path, ".opencode", "tools", `${lateName}.js`),
+                  [
+                    'import { tool } from "@opencode-ai/plugin"',
+                    `export default tool({ description: 'Discovered after recreation', args: {}, execute: async () => '${lateName}' })`,
+                    "",
+                  ].join("\n"),
+                ),
+              )
+              expect((yield* materialize(firstDir.path, "location_first_before_recreate")).names).not.toContain(
+                lateName,
+              )
+              const ref = Location.Ref.make({ directory: AbsolutePath.make(firstDir.path) })
+              yield* locations.invalidate(ref)
+              const recreated = yield* materialize(firstDir.path, "location_first_after_recreate", lateName)
+              expect(recreated.names).toContain(lateName)
+              const late = recreated.settlement
+              expect(late?.result).toMatchObject({ type: "text", value: lateName })
+            }),
+          ),
+        ),
       ),
     ),
   )
