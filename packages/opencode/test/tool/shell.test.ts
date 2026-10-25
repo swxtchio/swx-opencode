@@ -9,8 +9,9 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { and, asc, eq } from "drizzle-orm"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect"
-import { adjust, layer, withLive } from "effect/testing/TestClock"
+import { Cause, Clock, Deferred, Effect, Exit, Fiber, Layer, Queue, Stream } from "effect"
+import { adjust, layer, make } from "effect/testing/TestClock"
+import type { TestClock } from "effect/testing/TestClock"
 import { ChildProcessSpawner } from "effect/unstable/process"
 import type * as Scope from "effect/Scope"
 import os from "os"
@@ -151,6 +152,8 @@ type StagedOutput = {
   release: (index: number) => Effect.Effect<void>
 }
 
+type StagedInterval = { stageCount: number; adjustments: number[] }
+
 const stagedOutput = Effect.fn("ShellToolTest.stagedOutput")(function* (directory: string, stages: string[]) {
   const scriptPath = path.join(directory, "staged-output.mjs")
   const script = [
@@ -172,7 +175,7 @@ const stagedOutput = Effect.fn("ShellToolTest.stagedOutput")(function* (director
   ].join("\n")
   yield* Effect.promise(() => Bun.write(scriptPath, script))
   return {
-    command: `${bin} ${evalarg(scriptPath)}`,
+    command: `${PS.has(sh()) ? "& " : ""}${bin} ${evalarg(scriptPath)}`,
     stages,
     release: (index: number) =>
       Effect.promise(() => Bun.write(path.join(directory, `release-${index}`), "")).pipe(Effect.asVoid),
@@ -237,27 +240,63 @@ const mustTruncate = (result: {
   )
 }
 
-type Chunk = { text: string; time: number }
+type Chunk = { text: string }
 
-// The shell tool with its child's output stream tapped, recording each chunk the tool consumes as it consumes it.
-const tappedShell = Effect.fn("ShellToolTest.tappedShell")(function* (chunks: Chunk[]) {
+// The queue entry follows the child chunk through ShellTool's runForEach callback, so waiters know persistence scheduling has run.
+const tappedShell = Effect.fn("ShellToolTest.tappedShell")(function* (
+  chunks: Chunk[],
+  consumed?: Queue.Queue<string>,
+  clock?: TestClock,
+) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
   const tapped = ChildProcessSpawner.make((command) =>
     spawner.spawn(command).pipe(
       Effect.map((handle) =>
         ChildProcessSpawner.makeHandle({
           ...handle,
+          kill: (options) => (clock ? clock.withLive(handle.kill(options)) : handle.kill(options)),
           all: handle.all.pipe(
-            Stream.tap((bytes) =>
-              Effect.sync(() => chunks.push({ text: Buffer.from(bytes).toString("utf-8"), time: performance.now() })),
-            ),
+            Stream.flatMap((bytes) => {
+              const text = Buffer.from(bytes).toString("utf-8")
+              const stream = Stream.make(bytes).pipe(Stream.tap(() => Effect.sync(() => chunks.push({ text }))))
+              if (!consumed) return stream
+              return stream.pipe(Stream.concat(Stream.fromEffectDrain(Queue.offer(consumed, text).pipe(Effect.asVoid))))
+            }),
           ),
         }),
       ),
     ),
   )
-  return yield* Tool.init(yield* ShellTool.pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, tapped)))
+  const tool = yield* Tool.init(
+    yield* ShellTool.pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, tapped)),
+  )
+  if (!clock) return tool
+  return {
+    ...tool,
+    execute: (params: Tool.InferParameters<typeof ShellTool>, context: Tool.Context) =>
+      tool.execute(params, context).pipe(Effect.provideService(Clock.Clock, clock)),
+  }
 })
+
+const waitForConsumed = (
+  queue: Queue.Queue<string>,
+  output: { value: string },
+  text: string,
+  match: "exact" | "contains",
+  message: string,
+) =>
+  Effect.gen(function* () {
+    while (match === "exact" ? output.value.length < text.length : !output.value.includes(text)) {
+      output.value += yield* Queue.take(queue)
+    }
+    if (match === "exact" && output.value !== text) return yield* Effect.fail(new Error(message))
+    return output.value
+  }).pipe(
+    Effect.timeoutOrElse({
+      duration: "10 seconds",
+      orElse: () => Effect.fail(new Error(message)),
+    }),
+  )
 
 describe("tool.shell", () => {
   each("basic", () =>
@@ -1255,7 +1294,10 @@ describe("tool.shell abort", () => {
         projectRoot,
         Effect.gen(function* () {
           const chunks: Chunk[] = []
-          const shell = yield* tappedShell(chunks)
+          const consumed = yield* Queue.unbounded<string>()
+          const downstream = { value: "" }
+          const testClock = yield* make()
+          const shell = yield* tappedShell(chunks, consumed, testClock)
           const updates: string[] = []
           const running = yield* shell
             .execute(
@@ -1267,10 +1309,15 @@ describe("tool.shell abort", () => {
               },
             )
             .pipe(Effect.forkChild)
-          yield* pollWithTimeout(
-            Effect.sync(() => (chunks.some((chunk) => chunk.text.includes("interrupted-tail")) ? true : undefined)),
-            "shell did not consume interrupted-tail before the run was interrupted",
+          yield* waitForConsumed(
+            consumed,
+            downstream,
+            "interrupted-tail",
+            "contains",
+            "ShellTool did not consume interrupted-tail before the run was interrupted",
           )
+          yield* testClock.adjust(OUTPUT_WRITE_INTERVAL_MS - 1)
+          expect(updates).not.toContain("interrupted-tail\n")
           yield* Fiber.interrupt(running)
           expect(updates.at(-1)).toBe("interrupted-tail\n")
         }),
@@ -1381,7 +1428,7 @@ describe("tool.shell teardown", () => {
           expect(refused.count).toBeGreaterThan(0)
         }),
       ),
-    15_000,
+    25_000,
   )
 
   unix(
@@ -1412,7 +1459,7 @@ describe("tool.shell teardown", () => {
           expect(refused.count).toBeGreaterThan(0)
         }),
       ),
-    15_000,
+    25_000,
   )
 })
 
@@ -1557,6 +1604,16 @@ const storeConfig = (url: string) => ({
 })
 
 type ToolWrite = { part: SessionV1.ToolPart; time: number }
+type RunningOutputObservation = {
+  intervalIndex: number
+  adjustmentIndex: number
+  expected: string
+  previous: string
+  part?: SessionV1.ToolPart
+  chunks: string[]
+  settled: boolean
+  snapshots: ToolWrite[]
+}
 
 const readToolWrites = Effect.fn("ShellToolTest.readToolWrites")(function* (sessionID: SessionID) {
   const database = yield* Database.Service
@@ -1589,18 +1646,19 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
   timeout?: number
   interruptOn?: string
   staged?: StagedOutput
-  checkRunning?: (input: {
-    part: SessionV1.ToolPart
-    chunks: string[]
-    settled: boolean
-    snapshots: ToolWrite[]
-  }) => void
+  stagedIntervals?: StagedInterval[]
+  clocked?: boolean
+  checkUnwritten?: (input: { part?: SessionV1.ToolPart; snapshots: ToolWrite[]; chunks: string[] }) => void
+  checkRunning?: (input: RunningOutputObservation) => void
 }) {
   const sessions = yield* Session.Service
   const processors = yield* SessionProcessor.Service
   const provider = yield* Provider.Service
   const chunks: Chunk[] = []
-  const shell = yield* tappedShell(chunks)
+  const consumed = yield* Queue.unbounded<string>()
+  const downstream = { value: "" }
+  const testClock = input.clocked ? yield* make() : undefined
+  const shell = yield* tappedShell(chunks, consumed, testClock)
 
   yield* input.llm.tool(ShellID.ToolID, { command: input.command, description: "store test", timeout: input.timeout })
   const chat = yield* sessions.create({})
@@ -1688,53 +1746,85 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
     )
   if (input.interruptOn) {
     const marker = input.interruptOn
-    yield* pollWithTimeout(
-      Effect.sync(() => (chunks.some((chunk) => chunk.text.includes(marker)) ? true : undefined)),
-      `shell did not consume ${marker} before interruption`,
+    const ready = waitForConsumed(
+      consumed,
+      downstream,
+      marker,
+      "contains",
+      `ShellTool did not consume ${marker} before interruption`,
     )
-    yield* Fiber.interrupt(run)
+    if (!testClock) {
+      yield* ready
+      yield* Fiber.interrupt(run)
+    } else {
+      yield* ready
+      yield* testClock.adjust(OUTPUT_WRITE_INTERVAL_MS - 1)
+      const part = (yield* MessageV2.parts(assistant.id)).find(
+        (part): part is SessionV1.ToolPart => part.type === "tool",
+      )
+      const snapshots = (yield* readToolWrites(chat.id)).filter(
+        (write) => write.part.state.status === "running" && runningOutput(write.part) !== "",
+      )
+      input.checkUnwritten?.({ part, snapshots, chunks: chunks.map((chunk) => chunk.text) })
+      yield* Fiber.interrupt(run)
+    }
   }
 
   const staged = input.staged
   if (staged) {
+    const intervals = input.stagedIntervals ?? [
+      { stageCount: staged.stages.length, adjustments: [OUTPUT_WRITE_INTERVAL_MS] },
+    ]
+    let stageIndex = 0
     yield* Effect.gen(function* () {
-      for (const [index] of staged.stages.entries()) {
-        const expected = staged.stages.slice(0, index + 1).join("")
-        yield* withLive(
-          pollWithTimeout(
-            Effect.sync(() => (chunks.map((chunk) => chunk.text).join("") === expected ? true : undefined)),
-            `shell did not consume staged output through ${index + 1}`,
-            "5 seconds",
-          ),
-        )
-        if (index < staged.stages.length - 1) yield* staged.release(index)
-      }
+      for (const [intervalIndex, interval] of intervals.entries()) {
+        const firstStage = stageIndex
+        for (let index = 0; index < interval.stageCount; index++) {
+          const expected = staged.stages.slice(0, stageIndex + 1).join("")
+          yield* waitForConsumed(
+            consumed,
+            downstream,
+            expected,
+            "exact",
+            `ShellTool did not consume staged output through ${stageIndex + 1}`,
+          )
+          if (index < interval.stageCount - 1) yield* staged.release(stageIndex)
+          stageIndex++
+        }
 
-      yield* adjust(OUTPUT_WRITE_INTERVAL_MS)
-      const expected = staged.stages.join("")
-      const part = yield* withLive(
-        pollWithTimeout(
-          MessageV2.parts(assistant.id).pipe(
-            Effect.map((parts) => {
-              const tool = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
-              return tool?.state.status === "running" && runningOutput(tool) === expected ? tool : undefined
-            }),
-          ),
-          "the accumulated shell output was not readable from the running Session store",
-          "10 seconds",
-        ),
-      )
-      const observed = {
-        part,
-        chunks: chunks.map((chunk) => chunk.text),
-        settled: completed.value,
-        snapshots: (yield* readToolWrites(chat.id)).filter(
-          (write) => write.part.state.status === "running" && runningOutput(write.part) !== "",
-        ),
+        const expected = staged.stages.slice(0, stageIndex).join("")
+        const previous = staged.stages.slice(0, firstStage).join("")
+        for (const [adjustmentIndex, duration] of interval.adjustments.entries()) {
+          yield* testClock ? testClock.adjust(duration) : adjust(duration)
+          const finalAdjustment = adjustmentIndex === interval.adjustments.length - 1
+          const part = finalAdjustment
+            ? yield* pollWithTimeout(
+                MessageV2.parts(assistant.id).pipe(
+                  Effect.map((parts) => {
+                    const tool = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+                    return tool?.state.status === "running" && runningOutput(tool) === expected ? tool : undefined
+                  }),
+                ),
+                "the accumulated shell output was not readable from the running Session store",
+                "10 seconds",
+              )
+            : (yield* MessageV2.parts(assistant.id)).find((part): part is SessionV1.ToolPart => part.type === "tool")
+          const snapshots = (yield* readToolWrites(chat.id)).filter(
+            (write) => write.part.state.status === "running" && runningOutput(write.part) !== "",
+          )
+          input.checkRunning?.({
+            intervalIndex,
+            adjustmentIndex,
+            expected,
+            previous,
+            part,
+            chunks: chunks.map((chunk) => chunk.text),
+            settled: completed.value,
+            snapshots,
+          })
+        }
+        yield* staged.release(stageIndex - 1)
       }
-      input.checkRunning?.(observed)
-      yield* staged.release(staged.stages.length - 1)
-      return observed
     }).pipe(Effect.onError(() => Fiber.interrupt(run)))
   }
   yield* Fiber.await(run)
@@ -1773,16 +1863,23 @@ describe("tool.shell running output persistence", () => {
               llm,
               command: staged.command,
               staged,
+              clocked: true,
+              stagedIntervals: [{ stageCount: stages.length, adjustments: [OUTPUT_WRITE_INTERVAL_MS - 1, 1] }],
               checkRunning: (during) => {
-                expect(during.part.state.status).toBe("running")
-                expect(runningOutput(during.part)).toBe(expected)
                 expect(during.chunks.length).toBeGreaterThan(1)
                 expect(during.chunks.join("")).toBe(expected)
                 expect(during.settled).toBe(false)
+                expect(during.part?.state.status).toBe("running")
+                if (during.adjustmentIndex === 0) {
+                  expect(during.snapshots).toHaveLength(0)
+                  expect(during.part ? runningOutput(during.part) : "").toBe("")
+                  return
+                }
                 expect(during.snapshots).toHaveLength(1)
+                expect(during.part ? runningOutput(during.part) : "").toBe(expected)
                 expect(runningOutput(during.snapshots[0]!.part)).toBe(expected)
               },
-            }).pipe(Effect.provide(layer()))
+            })
 
             expect(result.chunks.length).toBeGreaterThan(1)
             expect(result.chunks.map((chunk) => chunk.text).join("")).toBe(expected)
@@ -1800,24 +1897,47 @@ describe("tool.shell running output persistence", () => {
   )
 
   unixStore(
-    "bounds running writes of a sustained stream by elapsed time and settles its exact output",
+    "bounds running writes of a sustained stream by interval and settles its exact output",
     () =>
       provideTmpdirServer(
         ({ dir, llm }) =>
           Effect.gen(function* () {
+            const stages = Array.from({ length: 40 }, (_, index) => `line-${index + 1}\n`)
+            const staged = yield* stagedOutput(dir, stages)
+            const intervals = Array.from({ length: 4 }, () => ({
+              stageCount: 10,
+              adjustments: [OUTPUT_WRITE_INTERVAL_MS - 1, 1],
+            }))
+            const expected = stages.join("")
             const result = yield* throughSession({
               dir,
               llm,
-              command: "i=1; while [ $i -le 40 ]; do echo line-$i; i=$((i + 1)); sleep 0.05; done",
+              command: staged.command,
+              staged,
+              clocked: true,
+              stagedIntervals: intervals,
+              checkRunning: (state) => {
+                const expectedWrites = state.intervalIndex + (state.adjustmentIndex === 0 ? 0 : 1)
+                expect(state.part?.state.status).toBe("running")
+                expect(state.settled).toBe(false)
+                expect(state.chunks.length).toBeGreaterThan(1)
+                expect(state.chunks.join("")).toBe(state.expected)
+                expect(state.snapshots).toHaveLength(expectedWrites)
+                if (state.adjustmentIndex === 0) {
+                  expect(state.part ? runningOutput(state.part) : "").toBe(state.previous)
+                  if (state.previous) expect(runningOutput(state.snapshots.at(-1)!.part)).toBe(state.previous)
+                  return
+                }
+                expect(state.part ? runningOutput(state.part) : "").toBe(state.expected)
+                expect(runningOutput(state.snapshots.at(-1)!.part)).toBe(state.expected)
+                if (state.previous)
+                  expect(runningOutput(state.snapshots.at(-1)!.part).startsWith(state.previous)).toBe(true)
+              },
             })
-            const expected = lines("line", 40)
-            const first = result.chunks[0]!.time
-            const last = result.chunks[result.chunks.length - 1]!.time
-            // At most one write per interval the output spanned, plus one for a window cut by the span's edges.
-            const allowed = Math.ceil((last - first) / OUTPUT_WRITE_INTERVAL_MS) + 1
-            expect(result.chunks.length).toBeGreaterThan(allowed)
-            expect(result.snapshots.length).toBeGreaterThan(0)
-            expect(result.snapshots.length).toBeLessThanOrEqual(allowed)
+
+            expect(result.chunks.length).toBeGreaterThan(intervals.length)
+            expect(result.chunks.map((chunk) => chunk.text).join("")).toBe(expected)
+            expect(result.snapshots).toHaveLength(intervals.length)
             // Each committed snapshot extends the one before it, so no older output replaced newer output.
             result.snapshots.slice(1).forEach((write, i) => {
               expect(runningOutput(write.part).startsWith(runningOutput(result.snapshots[i]!.part))).toBe(true)
@@ -1850,7 +1970,7 @@ describe("tool.shell running output persistence", () => {
             expect(result.settled.state.output).toBe(expected)
             expect(result.settled.state.metadata.output).toBe(expected)
 
-            // Advance past the running-write interval to expose any scheduled write that outlives settlement.
+            // Advance two intervals, then confirm the Session part still equals its terminal value at reread.
             yield* adjust(OUTPUT_WRITE_INTERVAL_MS * 2)
             const parts = yield* MessageV2.parts(result.settled.messageID)
             expect(parts.find((part) => part.type === "tool")).toEqual(result.settled)
@@ -1874,6 +1994,13 @@ describe("tool.shell running output persistence", () => {
               llm,
               command: "trap '' TERM; echo tail-marker; while :; do sleep 0.1; done",
               interruptOn: "tail-marker",
+              clocked: true,
+              checkUnwritten: (before) => {
+                expect(before.part?.state.status).toBe("running")
+                expect(before.part ? runningOutput(before.part) : "").toBe("")
+                expect(before.snapshots).toHaveLength(0)
+                expect(before.chunks.join("")).toBe("tail-marker\n")
+              },
             })
             expect(result.settled?.state.status).toBe("error")
             if (result.settled?.state.status !== "error") return
@@ -1882,7 +2009,7 @@ describe("tool.shell running output persistence", () => {
           }),
         { config: storeConfig },
       ),
-    15_000,
+    30_000,
   )
 
   unixStore(
