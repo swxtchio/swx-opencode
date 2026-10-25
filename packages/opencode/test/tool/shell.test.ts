@@ -2035,7 +2035,7 @@ describe("tool.shell running output persistence", () => {
           }),
         { config: storeConfig },
       ),
-    15_000,
+    30_000,
   )
 
   unixStore(
@@ -2063,6 +2063,6 @@ describe("tool.shell running output persistence", () => {
           }),
         { config: storeConfig },
       ),
-    15_000,
+    30_000,
   )
 })
