@@ -9,7 +9,8 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { and, asc, eq } from "drizzle-orm"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schedule, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { adjust, layer, withLive } from "effect/testing/TestClock"
 import { ChildProcessSpawner } from "effect/unstable/process"
 import type * as Scope from "effect/Scope"
 import os from "os"
@@ -26,7 +27,7 @@ import { SessionID, MessageID } from "../../src/session/schema"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Plugin } from "../../src/plugin"
-import { testEffect } from "../lib/effect"
+import { pollWithTimeout, testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceStore } from "@/project/instance-store"
@@ -143,6 +144,41 @@ const fill = (mode: "lines" | "bytes", n: number) => {
   if (PS.has(sh())) return `& ${text}`
   return text
 }
+
+type StagedOutput = {
+  command: string
+  stages: string[]
+  release: (index: number) => Effect.Effect<void>
+}
+
+const stagedOutput = Effect.fn("ShellToolTest.stagedOutput")(function* (directory: string, stages: string[]) {
+  const scriptPath = path.join(directory, "staged-output.mjs")
+  const script = [
+    'import { watch } from "node:fs"',
+    `const directory = ${JSON.stringify(directory)}`,
+    `const stages = ${JSON.stringify(stages)}`,
+    "const waitFor = (name) => new Promise((resolve) => {",
+    "  const watcher = watch(directory, (_event, filename) => {",
+    "    if (String(filename) !== name) return",
+    "    watcher.close()",
+    "    resolve()",
+    "  })",
+    "})",
+    "for (let index = 0; index < stages.length; index++) {",
+    "  const ready = waitFor(`release-${index}`)",
+    "  process.stdout.write(stages[index])",
+    "  await ready",
+    "}",
+  ].join("\n")
+  yield* Effect.promise(() => Bun.write(scriptPath, script))
+  return {
+    command: `${bin} ${evalarg(scriptPath)}`,
+    stages,
+    release: (index: number) =>
+      Effect.promise(() => Bun.write(path.join(directory, `release-${index}`), "")).pipe(Effect.asVoid),
+  } satisfies StagedOutput
+})
+
 const glob = (p: string) =>
   process.platform === "win32" ? Filesystem.normalizePathPattern(p) : p.replaceAll("\\", "/")
 
@@ -213,7 +249,7 @@ const tappedShell = Effect.fn("ShellToolTest.tappedShell")(function* (chunks: Ch
           ...handle,
           all: handle.all.pipe(
             Stream.tap((bytes) =>
-              Effect.sync(() => chunks.push({ text: Buffer.from(bytes).toString("utf-8"), time: Date.now() })),
+              Effect.sync(() => chunks.push({ text: Buffer.from(bytes).toString("utf-8"), time: performance.now() })),
             ),
           ),
         }),
@@ -1152,24 +1188,63 @@ describe("tool.shell abort", () => {
     runIn(
       projectRoot,
       Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        const staged = yield* stagedOutput(tmp, ["first\n", "second\n"])
+        const chunks: Chunk[] = []
+        const shell = yield* tappedShell(chunks)
         const updates: string[] = []
-        // Each pause outlasts the write interval, so each line reaches a running write of its own.
-        const result = yield* run(
-          {
-            command: `echo first && sleep 1 && echo second && sleep 1`,
-          },
-          {
-            ...ctx,
-            metadata: (input) =>
-              Effect.sync(() => {
-                const output = (input.metadata as { output?: string })?.output
-                if (output) updates.push(output)
-              }),
-          },
-        )
-        expect(result.output).toContain("first")
-        expect(result.output).toContain("second")
-        expect(updates.length).toBeGreaterThan(1)
+        const first = Deferred.makeUnsafe<string>()
+        const second = Deferred.makeUnsafe<string>()
+        const settled = { value: false }
+        const expected = staged.stages.join("")
+        // The child cannot reach its next output or exit until the preceding metadata stage is observed.
+        const execution = yield* Effect.gen(function* () {
+          const result = yield* shell.execute(
+            { command: staged.command },
+            {
+              ...ctx,
+              metadata: (input) =>
+                Effect.gen(function* () {
+                  const output = String((input.metadata as { output?: string })?.output ?? "")
+                  if (!output) return
+                  updates.push(output)
+                  if (output === staged.stages[0]) yield* Deferred.succeed(first, output)
+                  if (output === expected) yield* Deferred.succeed(second, output)
+                }),
+            },
+          )
+          settled.value = true
+          return result
+        }).pipe(Effect.forkChild)
+
+        const waitForMetadata = (signal: typeof first, stage: string) =>
+          Deferred.await(signal).pipe(
+            Effect.timeoutOrElse({
+              duration: "10 seconds",
+              orElse: () =>
+                Effect.fail(
+                  new Error(
+                    `${stage} shell metadata stage was not published; consumed ${chunks.map((chunk) => chunk.text).join("")}; metadata ${updates.join(" | ")}`,
+                  ),
+                ),
+            }),
+          )
+
+        expect(yield* waitForMetadata(first, "first")).toBe(staged.stages[0])
+        expect(updates).toEqual([staged.stages[0]])
+        expect(settled.value).toBe(false)
+        yield* staged.release(0)
+
+        expect(yield* waitForMetadata(second, "second")).toBe(expected)
+        expect(updates).toEqual([staged.stages[0], expected])
+        expect(settled.value).toBe(false)
+        yield* staged.release(1)
+
+        const result = yield* Fiber.join(execution)
+        expect(settled.value).toBe(true)
+        expect(result.output).toBe(expected)
+        expect(result.metadata.output).toBe(expected)
+        expect(updates).toEqual([staged.stages[0], expected])
       }),
     ),
   )
@@ -1192,7 +1267,10 @@ describe("tool.shell abort", () => {
               },
             )
             .pipe(Effect.forkChild)
-          while (!chunks.some((chunk) => chunk.text.includes("interrupted-tail"))) yield* Effect.sleep("5 millis")
+          yield* pollWithTimeout(
+            Effect.sync(() => (chunks.some((chunk) => chunk.text.includes("interrupted-tail")) ? true : undefined)),
+            "shell did not consume interrupted-tail before the run was interrupted",
+          )
           yield* Fiber.interrupt(running)
           expect(updates.at(-1)).toBe("interrupted-tail\n")
         }),
@@ -1478,20 +1556,49 @@ const storeConfig = (url: string) => ({
   },
 })
 
-// Runs one shell tool call through a real Session and returns what the store committed for its part, including when
-// each running output first became readable from the store. `interruptOn` interrupts the processor as soon as the
-// shell has consumed a chunk containing that text.
+type ToolWrite = { part: SessionV1.ToolPart; time: number }
+
+const readToolWrites = Effect.fn("ShellToolTest.readToolWrites")(function* (sessionID: SessionID) {
+  const database = yield* Database.Service
+  const updates = yield* database.db
+    .select({ data: EventTable.data })
+    .from(EventTable)
+    .where(
+      and(
+        eq(EventTable.aggregate_id, sessionID),
+        eq(
+          EventTable.type,
+          EventV2.versionedType(SessionV1.Event.PartUpdated.type, SessionV1.Event.PartUpdated.durable!.version),
+        ),
+      ),
+    )
+    .orderBy(asc(EventTable.seq))
+    .all()
+    .pipe(Effect.orDie)
+  return updates
+    .map((row) => row.data as { part: SessionV1.Part; time: number })
+    .filter((data): data is ToolWrite => data.part.type === "tool")
+})
+
+// Runs one shell tool call through a real Session and returns its durable part updates. `interruptOn` waits for a
+// consumed output marker; `staged` keeps the process quiet until its running output is readable from the store.
 const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (input: {
   dir: string
   llm: TestLLMServer["Service"]
   command: string
   timeout?: number
   interruptOn?: string
+  staged?: StagedOutput
+  checkRunning?: (input: {
+    part: SessionV1.ToolPart
+    chunks: string[]
+    settled: boolean
+    snapshots: ToolWrite[]
+  }) => void
 }) {
   const sessions = yield* Session.Service
   const processors = yield* SessionProcessor.Service
   const provider = yield* Provider.Service
-  const database = yield* Database.Service
   const chunks: Chunk[] = []
   const shell = yield* tappedShell(chunks)
 
@@ -1557,6 +1664,7 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
     ),
   )
 
+  const completed = { value: false }
   const run = yield* handle
     .process({
       user: {
@@ -1574,43 +1682,64 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
       messages: [{ role: "user", content: "run the command" }],
       tools,
     })
-    .pipe(Effect.forkChild)
-  const visible: Chunk[] = []
-  const watch = yield* MessageV2.parts(assistant.id).pipe(
-    Effect.map((parts) => {
-      const part = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
-      const output = part ? runningOutput(part) : ""
-      if (output && output !== visible.at(-1)?.text) visible.push({ text: output, time: Date.now() })
-    }),
-    Effect.repeat(Schedule.spaced("10 millis")),
-    Effect.forkChild,
-  )
+    .pipe(
+      Effect.tap(() => Effect.sync(() => void (completed.value = true))),
+      Effect.forkChild,
+    )
   if (input.interruptOn) {
     const marker = input.interruptOn
-    while (!chunks.some((chunk) => chunk.text.includes(marker))) yield* Effect.sleep("5 millis")
+    yield* pollWithTimeout(
+      Effect.sync(() => (chunks.some((chunk) => chunk.text.includes(marker)) ? true : undefined)),
+      `shell did not consume ${marker} before interruption`,
+    )
     yield* Fiber.interrupt(run)
   }
-  yield* Fiber.await(run)
-  yield* Fiber.interrupt(watch)
 
-  const updates = yield* database.db
-    .select({ data: EventTable.data })
-    .from(EventTable)
-    .where(
-      and(
-        eq(EventTable.aggregate_id, chat.id),
-        eq(
-          EventTable.type,
-          EventV2.versionedType(SessionV1.Event.PartUpdated.type, SessionV1.Event.PartUpdated.durable!.version),
+  const staged = input.staged
+  if (staged) {
+    yield* Effect.gen(function* () {
+      for (const [index] of staged.stages.entries()) {
+        const expected = staged.stages.slice(0, index + 1).join("")
+        yield* withLive(
+          pollWithTimeout(
+            Effect.sync(() => (chunks.map((chunk) => chunk.text).join("") === expected ? true : undefined)),
+            `shell did not consume staged output through ${index + 1}`,
+            "5 seconds",
+          ),
+        )
+        if (index < staged.stages.length - 1) yield* staged.release(index)
+      }
+
+      yield* adjust(OUTPUT_WRITE_INTERVAL_MS)
+      const expected = staged.stages.join("")
+      const part = yield* withLive(
+        pollWithTimeout(
+          MessageV2.parts(assistant.id).pipe(
+            Effect.map((parts) => {
+              const tool = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+              return tool?.state.status === "running" && runningOutput(tool) === expected ? tool : undefined
+            }),
+          ),
+          "the accumulated shell output was not readable from the running Session store",
+          "10 seconds",
         ),
-      ),
-    )
-    .orderBy(asc(EventTable.seq))
-    .all()
-    .pipe(Effect.orDie)
-  const writes = updates
-    .map((row) => row.data as { part: SessionV1.Part; time: number })
-    .filter((data): data is { part: SessionV1.ToolPart; time: number } => data.part.type === "tool")
+      )
+      const observed = {
+        part,
+        chunks: chunks.map((chunk) => chunk.text),
+        settled: completed.value,
+        snapshots: (yield* readToolWrites(chat.id)).filter(
+          (write) => write.part.state.status === "running" && runningOutput(write.part) !== "",
+        ),
+      }
+      input.checkRunning?.(observed)
+      yield* staged.release(staged.stages.length - 1)
+      return observed
+    }).pipe(Effect.onError(() => Fiber.interrupt(run)))
+  }
+  yield* Fiber.await(run)
+
+  const writes = yield* readToolWrites(chat.id)
   const parts = yield* MessageV2.parts(assistant.id)
   return {
     chunks,
@@ -1618,7 +1747,6 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
     // A running snapshot carries consumed output; the shell's initialization write carries an empty one.
     snapshots: writes.filter((write) => write.part.state.status === "running" && runningOutput(write.part) !== ""),
     settled: parts.find((part): part is SessionV1.ToolPart => part.type === "tool"),
-    visible,
   }
 })
 
@@ -1637,31 +1765,29 @@ describe("tool.shell running output persistence", () => {
       provideTmpdirServer(
         ({ dir, llm }) =>
           Effect.gen(function* () {
-            const burst = throughSession({
+            const stages = Array.from({ length: 8 }, (_, index) => `burst-${index + 1}\n`)
+            const staged = yield* stagedOutput(dir, stages)
+            const expected = stages.join("")
+            const result = yield* throughSession({
               dir,
               llm,
-              command: "for i in 1 2 3 4 5 6 7 8; do echo burst-$i; sleep 0.02; done; sleep 1.5",
-            })
-            const span = (chunks: Chunk[]) => chunks[chunks.length - 1]!.time - chunks[0]!.time
-            const described = (chunks: Chunk[]) => chunks.length > 1 && span(chunks) < OUTPUT_WRITE_INTERVAL_MS
-            // A loaded host can merge the child's writes into one read or spread them past one interval, neither of
-            // which is the burst this case describes, so the command runs again, a bounded number of times, until it is.
-            let result = yield* burst
-            for (let rerun = 0; rerun < 2 && !described(result.chunks); rerun++) result = yield* burst
-            const expected = lines("burst", 8)
-            // The burst reached the shell as several chunks, all inside one write interval.
+              command: staged.command,
+              staged,
+              checkRunning: (during) => {
+                expect(during.part.state.status).toBe("running")
+                expect(runningOutput(during.part)).toBe(expected)
+                expect(during.chunks.length).toBeGreaterThan(1)
+                expect(during.chunks.join("")).toBe(expected)
+                expect(during.settled).toBe(false)
+                expect(during.snapshots).toHaveLength(1)
+                expect(runningOutput(during.snapshots[0]!.part)).toBe(expected)
+              },
+            }).pipe(Effect.provide(layer()))
+
             expect(result.chunks.length).toBeGreaterThan(1)
             expect(result.chunks.map((chunk) => chunk.text).join("")).toBe(expected)
-            const last = result.chunks[result.chunks.length - 1]!.time
-            expect(span(result.chunks)).toBeLessThan(OUTPUT_WRITE_INTERVAL_MS)
-
             expect(result.snapshots).toHaveLength(1)
             expect(runningOutput(result.snapshots[0]!.part)).toBe(expected)
-            // The quiet tail became readable from the store as running output while the command still ran, within the
-            // interval of the output it carries plus the time to commit it on a loaded host. A publication delayed by
-            // 800 ms, past that slack, fails here.
-            expect(result.visible.map((output) => output.text)).toEqual([expected])
-            expect(result.visible[0]!.time - last).toBeLessThanOrEqual(OUTPUT_WRITE_INTERVAL_MS + 500)
 
             expect(result.settled?.state.status).toBe("completed")
             if (result.settled?.state.status !== "completed") return
@@ -1724,15 +1850,15 @@ describe("tool.shell running output persistence", () => {
             expect(result.settled.state.output).toBe(expected)
             expect(result.settled.state.metadata.output).toBe(expected)
 
-            // Outlast any write that was still scheduled when the command settled.
-            yield* Effect.sleep(OUTPUT_WRITE_INTERVAL_MS * 2)
+            // Advance past the running-write interval to expose any scheduled write that outlives settlement.
+            yield* adjust(OUTPUT_WRITE_INTERVAL_MS * 2)
             const parts = yield* MessageV2.parts(result.settled.messageID)
             expect(parts.find((part) => part.type === "tool")).toEqual(result.settled)
             const terminal = result.writes.findIndex((write) => write.part.state.status === "completed")
             expect(terminal).toBe(result.writes.length - 1)
           }),
         { config: storeConfig },
-      ),
+      ).pipe(Effect.provide(layer())),
     15_000,
   )
 
