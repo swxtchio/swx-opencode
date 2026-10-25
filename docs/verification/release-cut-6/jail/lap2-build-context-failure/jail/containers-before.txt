@@ -1,0 +1,4 @@
+e4f49a27538d32237b4162b712750ad92fa2b264d14c97dabcded68fd651335a swx-ai-chat:latest swx-ai-chat
+5a0993d8000b947fbb0ba83ccd9ba1e12a2fabac04ce8f080837185cdbf69c7a swx-mcp-server:latest swx-mcp-server
+c45f480b773adf0f9a439da4dca1c0ce47569399cf4718b2afdf873ab68fd70b swx-simulate:arm64 swx-simulate
+d0d47a9183206f1bfaf2f3c71756d175d528f33558d6e3f641a628c7f68be41f swx-overlay-app:latest swx-overlay-app

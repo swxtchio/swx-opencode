@@ -1,0 +1,2 @@
+opencode-linux-arm64.tar.gz: OK
+opencode-linux-x64.tar.gz: OK

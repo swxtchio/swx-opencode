@@ -1,0 +1,6 @@
+All four VM14 laps recorded /home/byates/fm-llmrouter and task release-cut-6 in ACTIVE/lease.json, used owner box vm001 and a live owner PID, heartbeated through the checked-in supervise.sh loop, and ended with /home/byates/vm14-leases/release-lease.sh /home/byates/fm-llmrouter release-cut-6 reporting an owner-matched release.
+Lap 1: native arm64 build and probe passed; started 2026-10-25T19:14:05Z; the heartbeat was observed at 2026-10-25 19:15:07Z.
+Lap 2: the first jail preparation stopped before image build because the scratch Dockerfile transformer assumed a two-line download statement; no candidate image, container, or network was created.
+Lap 3: the next jail build stopped before image creation because Docker used the VM14 task root rather than the variant directory as its context; no candidate image, container, or network was created.
+Lap 4: candidate image build, V2 tool acceptance, V1 control, and manual compaction passed; started 2026-10-25T19:27:25Z; heartbeat observed at 2026-10-25 19:28:27Z; the candidate image was removed after the run.
+The final post-lap scan recorded ACTIVE free, no task process, no task image or container, and identical before/after container and network lists. Other pre-existing VM14 containers and networks were left untouched.

@@ -1,0 +1,10 @@
+tag_release_metadata
+423621088	v1.18.32-swxtch.832df553	v1.18.32-swxtch.832df553	832df553518d8bb581952433c72495a472da8c5d	false	false	https://github.com/swxtchio/swx-opencode/releases/tag/v1.18.32-swxtch.832df553
+latest_release_metadata
+423621088	v1.18.32-swxtch.832df553	v1.18.32-swxtch.832df553	832df553518d8bb581952433c72495a472da8c5d	false	false	https://github.com/swxtchio/swx-opencode/releases/tag/v1.18.32-swxtch.832df553
+tag_assets
+opencode-linux-arm64.tar.gz	64244547	sha256:cb28771c648dd31fe9caba5d3cc8657438630afd933dd7a24c4d2612f472be76
+opencode-linux-arm64.tar.gz.sha256	94	sha256:59cdefe3a79e1e8a3ebadadc26790a578e4f7f1cccaada56bf06ba8c20a31ddf
+opencode-linux-x64.tar.gz	64727596	sha256:6156af8b96d6763b889636ee0fe986291edaeb17f9d82cd73270774a05309ae7
+opencode-linux-x64.tar.gz.sha256	92	sha256:ad44ea4c903978d58ca57ad55a42008c9ac92ad6fa8aedc4d5263c48eb7cac6a
+tag_latest_assets=identical

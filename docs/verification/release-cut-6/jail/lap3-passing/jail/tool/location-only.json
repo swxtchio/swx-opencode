@@ -1,0 +1,1064 @@
+{
+  "mode": "location-only",
+  "release_source_commit": "832df553518d8bb581952433c72495a472da8c5d",
+  "consumer_source_commit": "8ac1489e7d3ecad9f9a09431d3df54b6b69ad8e6",
+  "candidate_archive_sha256": "cb28771c648dd31fe9caba5d3cc8657438630afd933dd7a24c4d2612f472be76",
+  "candidate_image_id": "sha256:7fe44c87982662d608539dd672d5266c54b2add349299927687c0aa47af48cc7",
+  "candidate_image": "opencode-variant-jail:v2-egress-1.18.32-swxtch.832df553-candidate",
+  "session_create_request": {
+    "location": {
+      "directory": "/workspace/project"
+    }
+  },
+  "session_create_response": {
+    "id": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+    "projectID": "global",
+    "cost": 0,
+    "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+        "read": 0,
+        "write": 0
+      }
+    },
+    "time": {
+      "created": 1792956483621,
+      "updated": 1792956483621
+    },
+    "title": "New session - 2026-10-25T19:28:03.621Z",
+    "location": {
+      "directory": "/workspace/project"
+    },
+    "subpath": "workspace/project"
+  },
+  "session_id": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+  "user_message_id": "msg_2ea5b9a956a7425d8f3106158079fd49",
+  "request_marker": "RELEASE_CUT_6_LOCATION_ONLY",
+  "admission": {
+    "admittedSeq": 1,
+    "id": "msg_2ea5b9a956a7425d8f3106158079fd49",
+    "sessionID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+    "prompt": {
+      "text": "Prepare one valid draft CNL proposal by calling propose_netlist exactly once. Keep the selected call attached to this user turn. Request marker: RELEASE_CUT_6_LOCATION_ONLY"
+    },
+    "delivery": "steer",
+    "timeCreated": 1792956483686
+  },
+  "wait": {
+    "type": "completed",
+    "admittedSeq": 1,
+    "assistantMessageID": "msg_17488d549001M1PjqXOmrqklRg"
+  },
+  "history": [
+    {
+      "id": "evt_17488c866001r3cViyPrcMidKi",
+      "type": "session.next.prompt.admitted",
+      "durable": {
+        "aggregateID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "seq": 1,
+        "version": 1
+      },
+      "data": {
+        "timestamp": 1792956483686,
+        "sessionID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "messageID": "msg_2ea5b9a956a7425d8f3106158079fd49",
+        "prompt": {
+          "text": "Prepare one valid draft CNL proposal by calling propose_netlist exactly once. Keep the selected call attached to this user turn. Request marker: RELEASE_CUT_6_LOCATION_ONLY"
+        },
+        "delivery": "steer"
+      }
+    },
+    {
+      "id": "evt_17488ce6f001rh1xc0o7NCocIk",
+      "type": "session.next.prompted",
+      "durable": {
+        "aggregateID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "seq": 2,
+        "version": 1
+      },
+      "data": {
+        "timestamp": 1792956483686,
+        "sessionID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "messageID": "msg_2ea5b9a956a7425d8f3106158079fd49",
+        "prompt": {
+          "text": "Prepare one valid draft CNL proposal by calling propose_netlist exactly once. Keep the selected call attached to this user turn. Request marker: RELEASE_CUT_6_LOCATION_ONLY"
+        },
+        "delivery": "steer"
+      }
+    },
+    {
+      "id": "evt_17488d1d4001o4verZZ1fTVurE",
+      "type": "session.next.titled",
+      "durable": {
+        "aggregateID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "seq": 3,
+        "version": 1
+      },
+      "data": {
+        "timestamp": 1792956486100,
+        "sessionID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "title": "Release cut 6 proposal prepared for review."
+      }
+    },
+    {
+      "id": "evt_17488d1dc002PD7y9S0ETjT1M0",
+      "type": "session.next.step.started",
+      "durable": {
+        "aggregateID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "seq": 4,
+        "version": 1
+      },
+      "data": {
+        "timestamp": 1792956486108,
+        "sessionID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "assistantMessageID": "msg_17488d1dc001RC6AItYeItlc4D",
+        "agent": "build",
+        "model": {
+          "id": "accounts/fireworks/models/deepseek-v4p1-flash",
+          "providerID": "swxtch-egress"
+        }
+      }
+    },
+    {
+      "id": "evt_17488d1e2001pdQalcBrahd4c5",
+      "type": "session.next.tool.input.started",
+      "durable": {
+        "aggregateID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "seq": 5,
+        "version": 1
+      },
+      "data": {
+        "timestamp": 1792956486114,
+        "sessionID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "assistantMessageID": "msg_17488d1dc001RC6AItYeItlc4D",
+        "callID": "call_cut6_location_only",
+        "name": "propose_netlist"
+      }
+    },
+    {
+      "id": "evt_17488d1ee001ys4ScAOW4po53t",
+      "type": "session.next.tool.input.ended",
+      "durable": {
+        "aggregateID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "seq": 6,
+        "version": 1
+      },
+      "data": {
+        "timestamp": 1792956486125,
+        "sessionID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "assistantMessageID": "msg_17488d1dc001RC6AItYeItlc4D",
+        "callID": "call_cut6_location_only",
+        "text": "{\"kind\":\"create_pipeline\",\"summary\":\"an SRT input\",\"netlist\":{\"creator\":\"swxtch-netlist-authoring/0.1\",\"pipeline\":{\"attributes\":{\"swxtch.schema_version\":\"swxtch-netlist/0.1\",\"swxtch.netlist.level\":\"draft\",\"swxtch.toolchain\":\"opencode\",\"swxtch.placement.customer_coarse_location\":\"anywhere\"},\"cells\":{\"input\":{\"type\":\"srt_ingest\",\"parameters\":{},\"attributes\":{\"swxtch.cell_ref\":\"input\"},\"port_directions\":{\"flow_out\":\"output\"}},\"output\":{\"type\":\"srt_egress\",\"parameters\":{},\"attributes\":{\"swxtch.cell_ref\":\"output\"},\"port_directions\":{\"flow_in\":\"input\"}}},\"flows\":{\"program\":{\"source\":{\"cell_ref\":\"input\",\"port\":\"flow_out\",\"lane\":0},\"destinations\":[{\"cell_ref\":\"output\",\"port\":\"flow_in\",\"lane\":0}],\"attributes\":{\"swxtch.media_kind\":\"video\"}}}}}}"
+      }
+    },
+    {
+      "id": "evt_17488d1f20017D0kkBxczkKC85",
+      "type": "session.next.tool.called",
+      "durable": {
+        "aggregateID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "seq": 7,
+        "version": 1
+      },
+      "data": {
+        "timestamp": 1792956486130,
+        "sessionID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "assistantMessageID": "msg_17488d1dc001RC6AItYeItlc4D",
+        "callID": "call_cut6_location_only",
+        "tool": "propose_netlist",
+        "input": {
+          "kind": "create_pipeline",
+          "summary": "an SRT input",
+          "netlist": {
+            "creator": "swxtch-netlist-authoring/0.1",
+            "pipeline": {
+              "attributes": {
+                "swxtch.schema_version": "swxtch-netlist/0.1",
+                "swxtch.netlist.level": "draft",
+                "swxtch.toolchain": "opencode",
+                "swxtch.placement.customer_coarse_location": "anywhere"
+              },
+              "cells": {
+                "input": {
+                  "type": "srt_ingest",
+                  "parameters": {},
+                  "attributes": {
+                    "swxtch.cell_ref": "input"
+                  },
+                  "port_directions": {
+                    "flow_out": "output"
+                  }
+                },
+                "output": {
+                  "type": "srt_egress",
+                  "parameters": {},
+                  "attributes": {
+                    "swxtch.cell_ref": "output"
+                  },
+                  "port_directions": {
+                    "flow_in": "input"
+                  }
+                }
+              },
+              "flows": {
+                "program": {
+                  "source": {
+                    "cell_ref": "input",
+                    "port": "flow_out",
+                    "lane": 0
+                  },
+                  "destinations": [
+                    {
+                      "cell_ref": "output",
+                      "port": "flow_in",
+                      "lane": 0
+                    }
+                  ],
+                  "attributes": {
+                    "swxtch.media_kind": "video"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "provider": {
+          "executed": false
+        }
+      }
+    },
+    {
+      "id": "evt_17488d21c001sEOBScM310olA6",
+      "type": "session.next.tool.success",
+      "durable": {
+        "aggregateID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "seq": 8,
+        "version": 1
+      },
+      "data": {
+        "timestamp": 1792956486172,
+        "sessionID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "assistantMessageID": "msg_17488d1dc001RC6AItYeItlc4D",
+        "callID": "call_cut6_location_only",
+        "structured": {
+          "title": "Customer netlist proposal",
+          "output": "{\"kind\":\"create_pipeline\",\"summary\":\"an SRT input\",\"netlist\":{\"creator\":\"swxtch-netlist-authoring/0.1\",\"pipeline\":{\"attributes\":{\"swxtch.schema_version\":\"swxtch-netlist/0.1\",\"swxtch.netlist.level\":\"draft\",\"swxtch.toolchain\":\"opencode\",\"swxtch.placement.customer_coarse_location\":\"anywhere\"},\"cells\":{\"input\":{\"type\":\"srt_ingest\",\"parameters\":{},\"attributes\":{\"swxtch.cell_ref\":\"input\"},\"port_directions\":{\"flow_out\":\"output\"}},\"output\":{\"type\":\"srt_egress\",\"parameters\":{},\"attributes\":{\"swxtch.cell_ref\":\"output\"},\"port_directions\":{\"flow_in\":\"input\"}}},\"flows\":{\"program\":{\"source\":{\"cell_ref\":\"input\",\"port\":\"flow_out\",\"lane\":0},\"destinations\":[{\"cell_ref\":\"output\",\"port\":\"flow_in\",\"lane\":0}],\"attributes\":{\"swxtch.media_kind\":\"video\"}}}}}}"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "{\"kind\":\"create_pipeline\",\"summary\":\"an SRT input\",\"netlist\":{\"creator\":\"swxtch-netlist-authoring/0.1\",\"pipeline\":{\"attributes\":{\"swxtch.schema_version\":\"swxtch-netlist/0.1\",\"swxtch.netlist.level\":\"draft\",\"swxtch.toolchain\":\"opencode\",\"swxtch.placement.customer_coarse_location\":\"anywhere\"},\"cells\":{\"input\":{\"type\":\"srt_ingest\",\"parameters\":{},\"attributes\":{\"swxtch.cell_ref\":\"input\"},\"port_directions\":{\"flow_out\":\"output\"}},\"output\":{\"type\":\"srt_egress\",\"parameters\":{},\"attributes\":{\"swxtch.cell_ref\":\"output\"},\"port_directions\":{\"flow_in\":\"input\"}}},\"flows\":{\"program\":{\"source\":{\"cell_ref\":\"input\",\"port\":\"flow_out\",\"lane\":0},\"destinations\":[{\"cell_ref\":\"output\",\"port\":\"flow_in\",\"lane\":0}],\"attributes\":{\"swxtch.media_kind\":\"video\"}}}}}}"
+          }
+        ],
+        "outputPaths": [],
+        "provider": {
+          "executed": false
+        }
+      }
+    },
+    {
+      "id": "evt_17488d226001N4UXFjtolUgO6h",
+      "type": "session.next.step.ended",
+      "durable": {
+        "aggregateID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "seq": 9,
+        "version": 2
+      },
+      "data": {
+        "timestamp": 1792956486182,
+        "sessionID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "assistantMessageID": "msg_17488d1dc001RC6AItYeItlc4D",
+        "finish": "tool-calls",
+        "cost": 0,
+        "tokens": {
+          "input": 100,
+          "output": 20,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "evt_17488d549002IFdgAEJWWscsc8",
+      "type": "session.next.step.started",
+      "durable": {
+        "aggregateID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "seq": 10,
+        "version": 1
+      },
+      "data": {
+        "timestamp": 1792956486985,
+        "sessionID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "assistantMessageID": "msg_17488d549001M1PjqXOmrqklRg",
+        "agent": "build",
+        "model": {
+          "id": "accounts/fireworks/models/deepseek-v4p1-flash",
+          "providerID": "swxtch-egress"
+        }
+      }
+    },
+    {
+      "id": "evt_17488d54a001KLieTkcoiufaxe",
+      "type": "session.next.text.started",
+      "durable": {
+        "aggregateID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "seq": 11,
+        "version": 1
+      },
+      "data": {
+        "timestamp": 1792956486986,
+        "sessionID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "assistantMessageID": "msg_17488d549001M1PjqXOmrqklRg",
+        "textID": "text-0"
+      }
+    },
+    {
+      "id": "evt_17488d54c001dCCPu4PRR2V034",
+      "type": "session.next.text.ended",
+      "durable": {
+        "aggregateID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "seq": 12,
+        "version": 1
+      },
+      "data": {
+        "timestamp": 1792956486988,
+        "sessionID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "assistantMessageID": "msg_17488d549001M1PjqXOmrqklRg",
+        "textID": "text-0",
+        "text": "Candidate tool execution continued."
+      }
+    },
+    {
+      "id": "evt_17488d54d001stbdshGl5omXMM",
+      "type": "session.next.step.ended",
+      "durable": {
+        "aggregateID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "seq": 13,
+        "version": 2
+      },
+      "data": {
+        "timestamp": 1792956486989,
+        "sessionID": "ses_e8b7737e6ffeKQ5QiRke2UA7Qi",
+        "assistantMessageID": "msg_17488d549001M1PjqXOmrqklRg",
+        "finish": "stop",
+        "cost": 0,
+        "tokens": {
+          "input": 100,
+          "output": 20,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        }
+      }
+    }
+  ],
+  "provider_requests": [
+    {
+      "index": 1,
+      "kind": "title",
+      "model": "accounts/fireworks/models/deepseek-v4p1-flash",
+      "marker_present": true,
+      "selected_call_id": null,
+      "tool_result_ids": [],
+      "request": {
+        "model": "accounts/fireworks/models/deepseek-v4p1-flash",
+        "stream": true,
+        "messages": [
+          {
+            "role": "user",
+            "marker_present": false
+          },
+          {
+            "role": "user",
+            "marker_present": true
+          }
+        ],
+        "tools": []
+      }
+    },
+    {
+      "index": 2,
+      "kind": "turn",
+      "model": "accounts/fireworks/models/deepseek-v4p1-flash",
+      "marker_present": true,
+      "selected_call_id": "call_cut6_location_only",
+      "tool_result_ids": [],
+      "request": {
+        "model": "accounts/fireworks/models/deepseek-v4p1-flash",
+        "stream": true,
+        "messages": [
+          {
+            "role": "user",
+            "marker_present": true
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "propose_netlist",
+              "description": "Submit one advisory swxtch-netlist/0.1 customer proposal; this tool never writes pipeline state.",
+              "parameters": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "create_pipeline",
+                      "replace_netlist"
+                    ]
+                  },
+                  "summary": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "netlist": {
+                    "type": "object",
+                    "properties": {
+                      "creator": {
+                        "type": "string",
+                        "const": "swxtch-netlist-authoring/0.1"
+                      },
+                      "modules": {
+                        "type": "object",
+                        "propertyNames": {
+                          "type": "string"
+                        },
+                        "additionalProperties": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        }
+                      },
+                      "pipeline": {
+                        "type": "object",
+                        "properties": {
+                          "attributes": {
+                            "type": "object",
+                            "properties": {
+                              "swxtch.schema_version": {
+                                "type": "string",
+                                "const": "swxtch-netlist/0.1"
+                              },
+                              "swxtch.netlist.level": {
+                                "type": "string",
+                                "enum": [
+                                  "draft",
+                                  "ready_for_provisioning"
+                                ]
+                              },
+                              "swxtch.toolchain": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "src": {
+                                "type": "string"
+                              },
+                              "swxtch.customer_given_name": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "swxtch.customer_given_description": {
+                                "type": "string",
+                                "maxLength": 4096
+                              },
+                              "swxtch.placement.customer_coarse_location": {
+                                "type": "string"
+                              },
+                              "swxtch.placement.pinned_provider": {
+                                "type": "string"
+                              },
+                              "swxtch.placement.pinned_region": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128
+                              },
+                              "swxtch.placement.pinned_shape": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128
+                              }
+                            },
+                            "required": [
+                              "swxtch.schema_version",
+                              "swxtch.netlist.level",
+                              "swxtch.toolchain"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "cells": {
+                            "type": "object",
+                            "propertyNames": {
+                              "type": "string"
+                            },
+                            "additionalProperties": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "parameters": {
+                                  "type": "object",
+                                  "propertyNames": {
+                                    "type": "string"
+                                  },
+                                  "additionalProperties": {}
+                                },
+                                "attributes": {
+                                  "type": "object",
+                                  "properties": {
+                                    "swxtch.cell_ref": {
+                                      "type": "string",
+                                      "minLength": 1,
+                                      "maxLength": 128,
+                                      "pattern": "^[A-Za-z0-9_-]+$"
+                                    },
+                                    "src": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "swxtch.cell_ref"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "port_directions": {
+                                  "type": "object",
+                                  "propertyNames": {
+                                    "type": "string",
+                                    "minLength": 1
+                                  },
+                                  "additionalProperties": {
+                                    "type": "string",
+                                    "enum": [
+                                      "input",
+                                      "output",
+                                      "inout"
+                                    ]
+                                  }
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "parameters",
+                                "attributes",
+                                "port_directions"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "flows": {
+                            "type": "object",
+                            "propertyNames": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 128,
+                              "pattern": "^[A-Za-z0-9_-]+$"
+                            },
+                            "additionalProperties": {
+                              "type": "object",
+                              "properties": {
+                                "source": {
+                                  "type": "object",
+                                  "properties": {
+                                    "cell_ref": {
+                                      "type": "string",
+                                      "minLength": 1,
+                                      "maxLength": 128,
+                                      "pattern": "^[A-Za-z0-9_-]+$"
+                                    },
+                                    "port": {
+                                      "type": "string",
+                                      "minLength": 1,
+                                      "maxLength": 128,
+                                      "pattern": "^[A-Za-z0-9_-]+$"
+                                    },
+                                    "lane": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    }
+                                  },
+                                  "required": [
+                                    "cell_ref",
+                                    "port",
+                                    "lane"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "destinations": {
+                                  "minItems": 1,
+                                  "type": "array",
+                                  "items": {
+                                    "type": "object",
+                                    "properties": {
+                                      "cell_ref": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 128,
+                                        "pattern": "^[A-Za-z0-9_-]+$"
+                                      },
+                                      "port": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 128,
+                                        "pattern": "^[A-Za-z0-9_-]+$"
+                                      },
+                                      "lane": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 9007199254740991
+                                      }
+                                    },
+                                    "required": [
+                                      "cell_ref",
+                                      "port",
+                                      "lane"
+                                    ],
+                                    "additionalProperties": false
+                                  }
+                                },
+                                "boundary": {
+                                  "description": "Optional platform-derived boundary fact. If supplied for compatibility, this value is ignored and the apply seam derives the authoritative value over it.",
+                                  "type": "object",
+                                  "properties": {
+                                    "ingress": {
+                                      "type": "boolean"
+                                    },
+                                    "egress": {
+                                      "type": "boolean"
+                                    }
+                                  },
+                                  "required": [
+                                    "ingress",
+                                    "egress"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "attributes": {
+                                  "type": "object",
+                                  "properties": {
+                                    "src": {
+                                      "type": "string"
+                                    },
+                                    "swxtch.media_kind": {
+                                      "type": "string",
+                                      "enum": [
+                                        "audio",
+                                        "video",
+                                        "video_audio",
+                                        "events",
+                                        "metrics",
+                                        "structured"
+                                      ]
+                                    },
+                                    "swxtch.customer_given_name": {
+                                      "type": "string",
+                                      "minLength": 1
+                                    }
+                                  },
+                                  "required": [
+                                    "swxtch.media_kind"
+                                  ],
+                                  "additionalProperties": false
+                                }
+                              },
+                              "required": [
+                                "source",
+                                "destinations",
+                                "attributes"
+                              ],
+                              "additionalProperties": false
+                            }
+                          }
+                        },
+                        "required": [
+                          "attributes",
+                          "cells",
+                          "flows"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "creator",
+                      "pipeline"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "kind",
+                  "summary",
+                  "netlist"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "index": 3,
+      "kind": "continuation",
+      "model": "accounts/fireworks/models/deepseek-v4p1-flash",
+      "marker_present": true,
+      "selected_call_id": null,
+      "tool_result_ids": [
+        "call_cut6_location_only"
+      ],
+      "request": {
+        "model": "accounts/fireworks/models/deepseek-v4p1-flash",
+        "stream": true,
+        "messages": [
+          {
+            "role": "user",
+            "marker_present": true
+          },
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "id": "call_cut6_location_only",
+                "type": "function",
+                "function": {
+                  "name": "propose_netlist",
+                  "arguments": "{\"kind\":\"create_pipeline\",\"summary\":\"an SRT input\",\"netlist\":{\"creator\":\"swxtch-netlist-authoring/0.1\",\"pipeline\":{\"attributes\":{\"swxtch.schema_version\":\"swxtch-netlist/0.1\",\"swxtch.netlist.level\":\"draft\",\"swxtch.toolchain\":\"opencode\",\"swxtch.placement.customer_coarse_location\":\"anywhere\"},\"cells\":{\"input\":{\"type\":\"srt_ingest\",\"parameters\":{},\"attributes\":{\"swxtch.cell_ref\":\"input\"},\"port_directions\":{\"flow_out\":\"output\"}},\"output\":{\"type\":\"srt_egress\",\"parameters\":{},\"attributes\":{\"swxtch.cell_ref\":\"output\"},\"port_directions\":{\"flow_in\":\"input\"}}},\"flows\":{\"program\":{\"source\":{\"cell_ref\":\"input\",\"port\":\"flow_out\",\"lane\":0},\"destinations\":[{\"cell_ref\":\"output\",\"port\":\"flow_in\",\"lane\":0}],\"attributes\":{\"swxtch.media_kind\":\"video\"}}}}}}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_cut6_location_only",
+            "content": "{\"kind\":\"create_pipeline\",\"summary\":\"an SRT input\",\"netlist\":{\"creator\":\"swxtch-netlist-authoring/0.1\",\"pipeline\":{\"attributes\":{\"swxtch.schema_version\":\"swxtch-netlist/0.1\",\"swxtch.netlist.level\":\"draft\",\"swxtch.toolchain\":\"opencode\",\"swxtch.placement.customer_coarse_location\":\"anywhere\"},\"cells\":{\"input\":{\"type\":\"srt_ingest\",\"parameters\":{},\"attributes\":{\"swxtch.cell_ref\":\"input\"},\"port_directions\":{\"flow_out\":\"output\"}},\"output\":{\"type\":\"srt_egress\",\"parameters\":{},\"attributes\":{\"swxtch.cell_ref\":\"output\"},\"port_directions\":{\"flow_in\":\"input\"}}},\"flows\":{\"program\":{\"source\":{\"cell_ref\":\"input\",\"port\":\"flow_out\",\"lane\":0},\"destinations\":[{\"cell_ref\":\"output\",\"port\":\"flow_in\",\"lane\":0}],\"attributes\":{\"swxtch.media_kind\":\"video\"}}}}}}"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "propose_netlist",
+              "description": "Submit one advisory swxtch-netlist/0.1 customer proposal; this tool never writes pipeline state.",
+              "parameters": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "create_pipeline",
+                      "replace_netlist"
+                    ]
+                  },
+                  "summary": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "netlist": {
+                    "type": "object",
+                    "properties": {
+                      "creator": {
+                        "type": "string",
+                        "const": "swxtch-netlist-authoring/0.1"
+                      },
+                      "modules": {
+                        "type": "object",
+                        "propertyNames": {
+                          "type": "string"
+                        },
+                        "additionalProperties": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        }
+                      },
+                      "pipeline": {
+                        "type": "object",
+                        "properties": {
+                          "attributes": {
+                            "type": "object",
+                            "properties": {
+                              "swxtch.schema_version": {
+                                "type": "string",
+                                "const": "swxtch-netlist/0.1"
+                              },
+                              "swxtch.netlist.level": {
+                                "type": "string",
+                                "enum": [
+                                  "draft",
+                                  "ready_for_provisioning"
+                                ]
+                              },
+                              "swxtch.toolchain": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "src": {
+                                "type": "string"
+                              },
+                              "swxtch.customer_given_name": {
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "swxtch.customer_given_description": {
+                                "type": "string",
+                                "maxLength": 4096
+                              },
+                              "swxtch.placement.customer_coarse_location": {
+                                "type": "string"
+                              },
+                              "swxtch.placement.pinned_provider": {
+                                "type": "string"
+                              },
+                              "swxtch.placement.pinned_region": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128
+                              },
+                              "swxtch.placement.pinned_shape": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128
+                              }
+                            },
+                            "required": [
+                              "swxtch.schema_version",
+                              "swxtch.netlist.level",
+                              "swxtch.toolchain"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "cells": {
+                            "type": "object",
+                            "propertyNames": {
+                              "type": "string"
+                            },
+                            "additionalProperties": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "parameters": {
+                                  "type": "object",
+                                  "propertyNames": {
+                                    "type": "string"
+                                  },
+                                  "additionalProperties": {}
+                                },
+                                "attributes": {
+                                  "type": "object",
+                                  "properties": {
+                                    "swxtch.cell_ref": {
+                                      "type": "string",
+                                      "minLength": 1,
+                                      "maxLength": 128,
+                                      "pattern": "^[A-Za-z0-9_-]+$"
+                                    },
+                                    "src": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "swxtch.cell_ref"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "port_directions": {
+                                  "type": "object",
+                                  "propertyNames": {
+                                    "type": "string",
+                                    "minLength": 1
+                                  },
+                                  "additionalProperties": {
+                                    "type": "string",
+                                    "enum": [
+                                      "input",
+                                      "output",
+                                      "inout"
+                                    ]
+                                  }
+                                }
+                              },
+                              "required": [
+                                "type",
+                                "parameters",
+                                "attributes",
+                                "port_directions"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "flows": {
+                            "type": "object",
+                            "propertyNames": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 128,
+                              "pattern": "^[A-Za-z0-9_-]+$"
+                            },
+                            "additionalProperties": {
+                              "type": "object",
+                              "properties": {
+                                "source": {
+                                  "type": "object",
+                                  "properties": {
+                                    "cell_ref": {
+                                      "type": "string",
+                                      "minLength": 1,
+                                      "maxLength": 128,
+                                      "pattern": "^[A-Za-z0-9_-]+$"
+                                    },
+                                    "port": {
+                                      "type": "string",
+                                      "minLength": 1,
+                                      "maxLength": 128,
+                                      "pattern": "^[A-Za-z0-9_-]+$"
+                                    },
+                                    "lane": {
+                                      "type": "integer",
+                                      "minimum": 0,
+                                      "maximum": 9007199254740991
+                                    }
+                                  },
+                                  "required": [
+                                    "cell_ref",
+                                    "port",
+                                    "lane"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "destinations": {
+                                  "minItems": 1,
+                                  "type": "array",
+                                  "items": {
+                                    "type": "object",
+                                    "properties": {
+                                      "cell_ref": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 128,
+                                        "pattern": "^[A-Za-z0-9_-]+$"
+                                      },
+                                      "port": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 128,
+                                        "pattern": "^[A-Za-z0-9_-]+$"
+                                      },
+                                      "lane": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 9007199254740991
+                                      }
+                                    },
+                                    "required": [
+                                      "cell_ref",
+                                      "port",
+                                      "lane"
+                                    ],
+                                    "additionalProperties": false
+                                  }
+                                },
+                                "boundary": {
+                                  "description": "Optional platform-derived boundary fact. If supplied for compatibility, this value is ignored and the apply seam derives the authoritative value over it.",
+                                  "type": "object",
+                                  "properties": {
+                                    "ingress": {
+                                      "type": "boolean"
+                                    },
+                                    "egress": {
+                                      "type": "boolean"
+                                    }
+                                  },
+                                  "required": [
+                                    "ingress",
+                                    "egress"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "attributes": {
+                                  "type": "object",
+                                  "properties": {
+                                    "src": {
+                                      "type": "string"
+                                    },
+                                    "swxtch.media_kind": {
+                                      "type": "string",
+                                      "enum": [
+                                        "audio",
+                                        "video",
+                                        "video_audio",
+                                        "events",
+                                        "metrics",
+                                        "structured"
+                                      ]
+                                    },
+                                    "swxtch.customer_given_name": {
+                                      "type": "string",
+                                      "minLength": 1
+                                    }
+                                  },
+                                  "required": [
+                                    "swxtch.media_kind"
+                                  ],
+                                  "additionalProperties": false
+                                }
+                              },
+                              "required": [
+                                "source",
+                                "destinations",
+                                "attributes"
+                              ],
+                              "additionalProperties": false
+                            }
+                          }
+                        },
+                        "required": [
+                          "attributes",
+                          "cells",
+                          "flows"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "creator",
+                      "pipeline"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "kind",
+                  "summary",
+                  "netlist"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "daemon_log": "opencode server listening on http://0.0.0.0:4096\n",
+  "raw_provider_log": {
+    "path": "/home/byates/vm14-builds/opencode-release-832df553/evidence/jail/tool/location-only.provider.log",
+    "sha256": "c8a1207a365c0f9a7aba112e573647fe0363a364234d0466cc7c39c557bf6bad",
+    "public_projection": "request model, turn marker, propose_netlist definition, selected call ID, and matching tool result only"
+  }
+}

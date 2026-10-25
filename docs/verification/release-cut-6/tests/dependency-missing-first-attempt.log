@@ -1,0 +1,14 @@
+bun test v1.4.2 (744846f84)
+
+test/config/config.test.ts:
+
+# Unhandled error between tests
+-------------------------------
+error: Cannot find package 'effect' from '/home/byates/fm-worktrees/fm-llmrouter/release-cut-6/swx-opencode/packages/core/test/config/config.test.ts'
+-------------------------------
+
+
+ 0 pass
+ 1 fail
+ 1 error
+Ran 1 test across 1 file. [17.00ms]
