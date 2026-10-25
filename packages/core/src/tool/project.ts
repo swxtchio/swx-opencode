@@ -1,7 +1,6 @@
 export * as ProjectTools from "./project"
 
 import { Context, Deferred, Effect, Exit, JsonSchema, Layer, Schema, Scope } from "effect"
-import fs from "fs/promises"
 import path from "path"
 import { pathToFileURL } from "url"
 import { z } from "zod"
@@ -53,26 +52,15 @@ const layer = Layer.effect(
           Effect.catch(() => Effect.succeed([])),
         )
         if (files.length === 0) continue
-        const installed = yield* pluginSdkVersion(files[0]!).pipe(Effect.catch(() => Effect.succeed(undefined)))
         const version = InstallationLocal ? undefined : InstallationSdkVersion
-        const satisfied =
-          installed !== undefined &&
-          Npm.reifyReason({
-            declared: [],
-            locked: new Set(),
-            add: [{ name: "@opencode-ai/plugin", version }],
-            installed: () => installed,
-          }) === undefined
-        if (!satisfied) {
-          yield* npm
-            .install(directory.path, { add: [{ name: "@opencode-ai/plugin", version }] })
-            .pipe(
-              Effect.tapError((error) =>
-                Effect.logError("failed to prepare project tool SDK", { path: directory.path, error }),
-              ),
-              Effect.catch(() => Effect.void),
-            )
-        }
+        yield* npm
+          .install(directory.path, { add: [{ name: "@opencode-ai/plugin", version }] })
+          .pipe(
+            Effect.tapError((error) =>
+              Effect.logError("failed to prepare project tool SDK", { path: directory.path, error }),
+            ),
+            Effect.catch(() => Effect.void),
+          )
         for (const file of files) {
           const namespace = path.basename(file, path.extname(file))
           const loaded = yield* Effect.tryPromise({
@@ -350,31 +338,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
-}
-
-function pluginSdkVersion(from: string) {
-  return Effect.tryPromise({
-    try: async () => {
-      let directory = path.dirname(from)
-      while (true) {
-        const manifestPath = path.join(directory, "node_modules", "@opencode-ai", "plugin", "package.json")
-        const manifestText = await fs.readFile(manifestPath, "utf8").catch((error) => {
-          if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined
-          throw error
-        })
-        if (manifestText !== undefined) {
-          const manifest: unknown = JSON.parse(manifestText)
-          if (isRecord(manifest) && manifest.name === "@opencode-ai/plugin") {
-            return typeof manifest.version === "string" ? manifest.version : undefined
-          }
-        }
-        const parent = path.dirname(directory)
-        if (parent === directory) return undefined
-        directory = parent
-      }
-    },
-    catch: errorMessage,
-  })
 }
 
 function importProjectTool(filepath: string, signal: AbortSignal) {

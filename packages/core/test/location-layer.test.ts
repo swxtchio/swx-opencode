@@ -117,6 +117,7 @@ async function stageProjectTool(directory: string, marker: string, toolName: str
   await fs.mkdir(tools, { recursive: true })
   await fs.mkdir(path.dirname(pluginPackage), { recursive: true })
   await fs.symlink(path.resolve(import.meta.dir, "../../plugin"), pluginPackage, "dir")
+  await stageProjectSdk(opencode)
   await Bun.write(
     path.join(tools, `${toolName}.js`),
     [
@@ -132,6 +133,29 @@ async function stageProjectTool(directory: string, marker: string, toolName: str
   await Bun.write(
     path.join(tools, `${toolName}_broken.js`),
     "import { missing } from '@project-tool-dependency-that-is-not-installed'; export default missing",
+  )
+}
+
+async function stageProjectSdk(opencode: string) {
+  const plugin = (await Bun.file(path.resolve(import.meta.dir, "../../plugin/package.json")).json()) as {
+    version: string
+  }
+  const name = "location-layer-project-tools"
+  const dependencies = { "@opencode-ai/plugin": plugin.version }
+  await Bun.write(
+    path.join(opencode, "package.json"),
+    JSON.stringify({ name, private: true, dependencies }),
+  )
+  await Bun.write(
+    path.join(opencode, "package-lock.json"),
+    JSON.stringify({
+      name,
+      lockfileVersion: 3,
+      packages: {
+        "": { name, dependencies },
+        "node_modules/@opencode-ai/plugin": { version: plugin.version },
+      },
+    }),
   )
 }
 
@@ -484,13 +508,15 @@ describe("LocationServiceMap", () => {
       Effect.flatMap((dir) =>
         Effect.gen(function* () {
           const jail = yield* jailServices(dir.path)
-          const tools = path.join(dir.path, "agent", ".opencode", "tools")
+          const opencode = path.join(dir.path, "agent", ".opencode")
+          const tools = path.join(opencode, "tools")
           const aborted = path.join(tools, "aborted")
-          const pluginPackage = path.join(dir.path, "agent", ".opencode", "node_modules", "@opencode-ai", "plugin")
+          const pluginPackage = path.join(opencode, "node_modules", "@opencode-ai", "plugin")
           yield* Effect.promise(async () => {
             await fs.mkdir(tools, { recursive: true })
             await fs.mkdir(path.dirname(pluginPackage), { recursive: true })
             await fs.symlink(path.resolve(import.meta.dir, "../../plugin"), pluginPackage, "dir")
+            await stageProjectSdk(opencode)
             await Bun.write(
               path.join(tools, "ask_permission.js"),
               [

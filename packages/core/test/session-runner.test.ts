@@ -78,9 +78,27 @@ const projectToolName = "runner_project_tool"
 
 beforeAll(async () => {
   await fs.rm(projectDirectory, { recursive: true, force: true })
-  const packageDirectory = path.join(projectDirectory, ".opencode", "node_modules", "@opencode-ai")
+  const opencode = path.join(projectDirectory, ".opencode")
+  const packageDirectory = path.join(opencode, "node_modules", "@opencode-ai")
   await fs.mkdir(packageDirectory, { recursive: true })
   await fs.symlink(path.resolve(import.meta.dir, "../../plugin"), path.join(packageDirectory, "plugin"), "dir")
+  const plugin = (await Bun.file(path.resolve(import.meta.dir, "../../plugin/package.json")).json()) as {
+    version: string
+  }
+  const name = "session-runner-project-tools"
+  const dependencies = { "@opencode-ai/plugin": plugin.version }
+  await Bun.write(path.join(opencode, "package.json"), JSON.stringify({ name, private: true, dependencies }))
+  await Bun.write(
+    path.join(opencode, "package-lock.json"),
+    JSON.stringify({
+      name,
+      lockfileVersion: 3,
+      packages: {
+        "": { name, dependencies },
+        "node_modules/@opencode-ai/plugin": { version: plugin.version },
+      },
+    }),
+  )
 })
 
 afterAll(async () => {

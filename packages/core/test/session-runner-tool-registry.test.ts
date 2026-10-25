@@ -73,7 +73,7 @@ const make = (permission?: string) => {
 const projectToolLayer = (
   directory: string,
   requests: PermissionV2.AssertInput[],
-  install: Npm.Interface["install"] = () => Effect.die("project tool SDK should already be installed"),
+  install: Npm.Interface["install"] = () => Effect.void,
 ) => {
   const projectDirectory = AbsolutePath.make(directory)
   return AppNodeBuilder.build(LayerNode.group([ToolRegistry.node, ToolRegistry.toolsNode, ProjectTools.node]), [
@@ -126,9 +126,6 @@ describe("ToolRegistry", () => {
     ).pipe(
       Effect.flatMap((tmp) => {
         const permissionRequests: PermissionV2.AssertInput[] = []
-        const installRequests: { dir: string; packages: Npm.AddRequest[] }[] = []
-        const install: Npm.Interface["install"] = (dir, input) =>
-          Effect.sync(() => installRequests.push({ dir, packages: input?.add ?? [] })).pipe(Effect.asVoid)
         const toolDirectory = path.join(tmp.path, ".opencode", "tools")
         const pluginPackage = path.join(tmp.path, ".opencode", "node_modules", "@opencode-ai", "plugin")
         const marker = path.join(toolDirectory, "import-started")
@@ -180,8 +177,7 @@ describe("ToolRegistry", () => {
                 }),
               ).toMatchObject({ result: { type: "text", value: "survived" } })
               expect(permissionRequests).toEqual([])
-              expect(installRequests).toEqual([])
-            }).pipe(Effect.provide(projectToolLayer(tmp.path, permissionRequests, install))),
+            }).pipe(Effect.provide(projectToolLayer(tmp.path, permissionRequests))),
           ),
         )
       }),
@@ -241,6 +237,108 @@ describe("ToolRegistry", () => {
                   call: { type: "tool-call", id: "call-fresh-project-tool", name: "fresh", input: { value: "ready" } },
                 }),
               ).toMatchObject({ result: { type: "text", value: "installed:ready" } })
+              expect(permissionRequests).toEqual([])
+            }).pipe(Effect.provide(projectToolLayer(tmp.path, permissionRequests, install))),
+          ),
+        )
+      }),
+    ),
+  )
+
+  projectIt.live("prepares declared local-file dependencies when the plugin SDK is already installed", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) => {
+        const permissionRequests: PermissionV2.AssertInput[] = []
+        const installRequests: { dir: string; packages: Npm.AddRequest[] }[] = []
+        const opencode = path.join(tmp.path, ".opencode")
+        const tools = path.join(opencode, "tools")
+        const localDependencyName = "project-tool-local"
+        const install: Npm.Interface["install"] = (dir, input) =>
+          Effect.promise(async () => {
+            installRequests.push({ dir, packages: input?.add ?? [] })
+            const manifest = (await Bun.file(path.join(dir, "package.json")).json()) as {
+              dependencies: Record<string, string>
+            }
+            if (manifest.dependencies[localDependencyName] !== "file:./local-dependency") return
+            const packagePath = path.join(dir, "node_modules", localDependencyName)
+            await fs.mkdir(path.dirname(packagePath), { recursive: true })
+            await fs.symlink(path.join(dir, "local-dependency"), packagePath, "dir")
+          })
+        return Effect.promise(async () => {
+          const plugin = (await Bun.file(path.resolve(import.meta.dir, "../../plugin/package.json")).json()) as {
+            version: string
+          }
+          const dependencies = {
+            "@opencode-ai/plugin": plugin.version,
+            [localDependencyName]: "file:./local-dependency",
+          }
+          const pluginPackage = path.join(opencode, "node_modules", "@opencode-ai", "plugin")
+          await fs.mkdir(tools, { recursive: true })
+          await fs.mkdir(path.dirname(pluginPackage), { recursive: true })
+          await fs.symlink(path.resolve(import.meta.dir, "../../plugin"), pluginPackage, "dir")
+          await fs.mkdir(path.join(opencode, "local-dependency"), { recursive: true })
+          await Bun.write(
+            path.join(opencode, "package.json"),
+            JSON.stringify({ name: "project-tool-dependencies", private: true, dependencies }),
+          )
+          await Bun.write(
+            path.join(opencode, "package-lock.json"),
+            JSON.stringify({
+              name: "project-tool-dependencies",
+              lockfileVersion: 3,
+              packages: {
+                "": {
+                  name: "project-tool-dependencies",
+                  dependencies: { "@opencode-ai/plugin": plugin.version },
+                },
+                "node_modules/@opencode-ai/plugin": { version: plugin.version },
+              },
+            }),
+          )
+          await Bun.write(
+            path.join(opencode, "local-dependency", "package.json"),
+            JSON.stringify({ name: localDependencyName, type: "module", exports: "./index.js" }),
+          )
+          await Bun.write(path.join(opencode, "local-dependency", "index.js"), 'export const value = "local-file"\n')
+          await Bun.write(
+            path.join(tools, "dirty_dependency.js"),
+            [
+              'import { tool } from "@opencode-ai/plugin"',
+              `import { value } from "${localDependencyName}"`,
+              "export default tool({",
+              "  description: 'Uses a dependency declared with a local file spec',",
+              "  args: { input: tool.schema.string() },",
+              "  execute: async ({ input }) => `${value}:${input}`,",
+              "})",
+              "",
+            ].join("\n"),
+          )
+        }).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const projectTools = yield* ProjectTools.Service
+              yield* projectTools.ready
+              expect(installRequests).toHaveLength(1)
+              expect(installRequests[0]?.dir).toBe(opencode)
+              expect(installRequests[0]?.packages.map((pkg) => pkg.name)).toContain("@opencode-ai/plugin")
+              const registry = yield* ToolRegistry.Service
+              const materialized = yield* registry.materialize()
+              expect(materialized.definitions.map((definition) => definition.name)).toContain("dirty_dependency")
+              expect(
+                yield* materialized.settle({
+                  sessionID,
+                  ...identity,
+                  call: {
+                    type: "tool-call",
+                    id: "call-local-file-dependency",
+                    name: "dirty_dependency",
+                    input: { input: "ready" },
+                  },
+                }),
+              ).toMatchObject({ result: { type: "text", value: "local-file:ready" } })
               expect(permissionRequests).toEqual([])
             }).pipe(Effect.provide(projectToolLayer(tmp.path, permissionRequests, install))),
           ),
