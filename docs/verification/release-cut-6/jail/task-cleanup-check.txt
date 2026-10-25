@@ -1,0 +1,8 @@
+lease=free
+task_processes=none
+task_image=absent
+task_container=absent
+aarch64
+Platforms:        linux/arm64
+networks_unchanged
+containers_unchanged

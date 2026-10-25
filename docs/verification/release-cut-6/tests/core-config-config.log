@@ -1,0 +1,30 @@
+bun test v1.4.2 (744846f84)
+
+test/config/config.test.ts:
+(pass) Config > loads the explicit file and inline content at V1 precedence [58.86ms]
+(pass) Config > returns the latest defined scalar from priority-ordered documents [8.89ms]
+(pass) Config > detects V1 markers with the V2-only small_model guard [0.37ms]
+(pass) Config > migrates arbitrary v1 configuration into valid v2 configuration [1507.61ms]
+(pass) Config > migrates v1 provider setup options into AISDK settings [0.80ms]
+(pass) Config > loads the FFF watcher setting from v1 configuration [25.26ms]
+(pass) Config > migrates legacy compaction, MCP, and skills beside the small_model marker [10.35ms]
+(pass) Config > keeps base-tolerant config shapes loading [38.84ms]
+(pass) Config > keeps V1 permission rules when V2-only keys coexist [6.29ms]
+(pass) Config > uses native V2 decoding when small_model accompanies a V2-only key [6.80ms]
+(pass) Config > migrates v1 command configuration [0.51ms]
+(pass) Config > returns an empty configuration when directory files do not exist [4.15ms]
+(pass) Config > loads opencode JSON and JSONC files from lowest to highest priority [6.98ms]
+(pass) Config > loads native V2 small_model with providers and agents at location priority [18.31ms]
+(pass) Config > does not load legacy config.json files [10.03ms]
+(pass) Config > accepts $schema metadata without writing it into config files [7.50ms]
+(pass) Config > loads supported scalar and resource configuration [10.17ms]
+(pass) Config > migrates the deprecated reference key into references [7.26ms]
+(pass) Config > migrates v1 configuration when a v1-only key is present [10.29ms]
+(pass) Config > ignores an invalid file while loading valid config values [4.42ms]
+(pass) Config > loads policy statements in reverse config order [5.49ms]
+(pass) Config > loads global, ancestor, and .opencode configuration up to the project boundary [9.72ms]
+
+ 22 pass
+ 0 fail
+ 120 expect() calls
+Ran 22 tests across 1 file. [3.07s]

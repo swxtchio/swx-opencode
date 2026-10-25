@@ -1,0 +1,30 @@
+bun test v1.4.2 (744846f84)
+
+test/session-runner-tool-registry.test.ts:
+(pass) ToolRegistry > continues Location discovery after its first ready waiter is interrupted [576.35ms]
+(pass) ToolRegistry > prepares the plugin SDK before importing a fresh project's bare module [28.02ms]
+(pass) ToolRegistry > prepares declared local-file dependencies when the plugin SDK is already installed [20.85ms]
+(pass) ToolRegistry > discovers plugin modules and settles their validated output through canonical tools [23.90ms]
+(pass) ToolRegistry > filters disabled tools with edit aliases and ordered wildcard precedence [6.95ms]
+(pass) ToolRegistry > keeps permission decoration isolated between registrations [1.11ms]
+(pass) ToolRegistry > reuses model definitions across provider turns [5.80ms]
+(pass) ToolRegistry > removes a scoped registration [1.58ms]
+(pass) ToolRegistry > preserves an interrupted registration until its scope closes [8.33ms]
+(pass) ToolRegistry > returns model errors without swallowing interruption or defects [5.41ms]
+(pass) ToolRegistry > propagates retention failures through settlement [2.46ms]
+(pass) ToolRegistry > exposes settlement only through materialization [4.79ms]
+(pass) ToolRegistry > passes complete invocation identity to the canonical handler [3.40ms]
+(pass) ToolRegistry > encodes output and applies generic settlement bounding [1.07ms]
+(pass) ToolRegistry > enforces transformed codecs at execution and projection boundaries [6.74ms]
+(pass) ToolRegistry > executes the unchanged registration advertised for a provider turn [0.88ms]
+(pass) ToolRegistry > rejects a call when its advertised registration was removed [1.58ms]
+(pass) ToolRegistry > rejects only the replaced name from a multi-tool provider turn [3.01ms]
+(pass) ToolRegistry > treats revealing a previous overlay as stale [2.52ms]
+(pass) ToolRegistry > rejects an application call after a Location override is registered [3.12ms]
+(pass) ToolRegistry > rejects a Location call after removal reveals an application registration [0.87ms]
+(pass) ToolRegistry > keeps captured execution running after registration mutation [1.77ms]
+
+ 22 pass
+ 0 fail
+ 67 expect() calls
+Ran 22 tests across 1 file. [1451.00ms]

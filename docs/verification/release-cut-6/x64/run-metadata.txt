@@ -1,0 +1,15 @@
+Run ID: 40224713450
+Run URL: https://github.com/swxtchio/swx-opencode/actions/runs/40224713450
+Artifact URL: https://github.com/swxtchio/swx-opencode/actions/runs/40224713450/artifacts/12610986098
+Workflow: .github/workflows/opencode-arm-release-x64.yml
+Workflow dispatch ref: swxtch
+Workflow event: workflow_dispatch
+Workflow harness head SHA: 832df553518d8bb581952433c72495a472da8c5d
+Selected binary source SHA: 832df553518d8bb581952433c72495a472da8c5d
+Created: 2026-10-25T19:09:58Z
+release-candidate job: 121263533145, success
+release-proof job: 121263534164, skipped
+Candidate artifact ID: 12610986098
+Candidate artifact name: opencode-linux-x64-candidate-40224713450
+Candidate artifact size: 65100038 bytes
+Candidate artifact expiration: 2026-11-08T19:11:46Z

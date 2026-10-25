@@ -1,0 +1,43 @@
+2026-10-25T19:24:38Z
+vm14-001
+Linux vm14-001 6.8.0-147-generic #147-Ubuntu SMP PREEMPT_DYNAMIC Thu Sep 24 11:39:52 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux
+Client:
+ Version:           29.8.0
+ API version:       1.56
+ Go version:        go1.26.8
+ Git commit:        88096ef
+ Built:             Wed Sep 23 15:28:31 2026
+ OS/Arch:           linux/arm64
+ Context:           default
+
+Server:
+ Engine:
+  Version:          29.8.0
+  API version:      1.56 (minimum version 1.40)
+  Go version:       go1.26.8
+  Git commit:       3ce5872
+  Built:            Wed Sep 23 15:29:01 2026
+  OS/Arch:          linux/arm64
+  Experimental:     false
+ containerd:
+  Version:          v2.3.4
+  GitCommit:        db8809540e1a7a9da5d518876894933ff55692ab
+ runc:
+  Version:          1.5.1
+  GitCommit:        
+ docker-init:
+  Version:          0.19.0
+  GitCommit:        de40ad0
+216749ea5b75 abbe-restore-test-3628f6d0b6
+9b2a53143f01 bridge
+845c065c1b0f host
+d8225ecb95d4 none
+0d92f39f3557 swx-ai-chat_swx-network
+e4f49a27538d32237b4162b712750ad92fa2b264d14c97dabcded68fd651335a swx-ai-chat:latest swx-ai-chat
+5a0993d8000b947fbb0ba83ccd9ba1e12a2fabac04ce8f080837185cdbf69c7a swx-mcp-server:latest swx-mcp-server
+c45f480b773adf0f9a439da4dca1c0ce47569399cf4718b2afdf873ab68fd70b swx-simulate:arm64 swx-simulate
+d0d47a9183206f1bfaf2f3c71756d175d528f33558d6e3f641a628c7f68be41f swx-overlay-app:latest swx-overlay-app
+cb28771c648dd31fe9caba5d3cc8657438630afd933dd7a24c4d2612f472be76  /home/byates/vm14-builds/opencode-release-832df553/assets/opencode-linux-arm64.tar.gz
+cb28771c648dd31fe9caba5d3cc8657438630afd933dd7a24c4d2612f472be76  /home/byates/vm14-builds/opencode-release-832df553/consumer/swx-abbe/components/orch/services/opencode-variant/jail/opencode-candidate.tar.gz
+20860ca3657caed0942066506d838cfc2e3777c58dc40d47d3bfc0fd439beb04  /home/byates/vm14-builds/opencode-release-832df553/consumer/swx-abbe/components/orch/services/opencode-variant/jail/Dockerfile.jail
+release download command does not point to the OpenCode asset

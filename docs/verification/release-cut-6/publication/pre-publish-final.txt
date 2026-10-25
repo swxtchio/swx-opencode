@@ -1,0 +1,13 @@
+checked_at=2026-10-25T19:43:29Z
+{"defaultBranchRef":{"name":"swxtch"}}
+832df553518d8bb581952433c72495a472da8c5d	refs/heads/swxtch
+swxtchio/swx-opencode
+source_package_version=1.18.32
+source_bun_pin=bun@1.4.2
+source_code_diff=## fm/release-cut-6...origin/fm/release-cut-6
+?? RELEASE-CUT-6-NOTES.md
+?? docs/verification/release-cut-6/
+arm64_companion=opencode-linux-arm64.tar.gz: OK
+x64_companion=opencode-linux-x64.tar.gz: OK
+remote_tag=absent
+release=absent (NOT_FOUND)

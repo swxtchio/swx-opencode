@@ -1,0 +1,26 @@
+bun test v1.4.2 (744846f84)
+
+test/tool/registry.test.ts:
+(pass) tool.registry > does not expose task_status [888.39ms]
+(pass) tool.registry > does not expose execute unless code mode is enabled [291.72ms]
+(pass) tool.registry > exposes execute when code mode is enabled [272.12ms]
+(pass) tool.registry > does not expose execute when code mode has no visible tools [50.17ms]
+(pass) tool.registry > hides task background parameter unless experimental background subagents are enabled [89.82ms]
+(pass) tool.registry > loads tools from .opencode/tool (singular) [71.09ms]
+(pass) tool.registry > keeps the other tools when one tool file cannot be imported [47.32ms]
+(pass) tool.registry > keeps the other tools when a tool imports cleanly but cannot be registered [47.08ms]
+(pass) tool.registry > still serves the builtin tools when every custom tool file is broken [36.10ms]
+(pass) tool.registry > ignores non-tool exports in .opencode/tool files [26.33ms]
+(pass) tool.registry > tolerates a custom tool exporting null/undefined args (no-args fallback) [102.85ms]
+(pass) tool.registry > tolerates a plugin tool registered with null/undefined args [86.44ms]
+(pass) tool.registry > loads tools from .opencode/tools (plural) [82.30ms]
+(pass) tool.registry > loads Zod-schema custom tools with JSON Schema and validation [107.61ms]
+(pass) tool.registry > preserves Zod arg descriptions from older config-scoped plugin packages [1015.38ms]
+(pass) tool.registry > preserves attachments from structured custom tool results [58.87ms]
+(pass) tool.registry > loads legacy JSON-schema-shaped custom tools with wire schema [33.48ms]
+(pass) tool.registry > loads tools with external dependencies without crashing [32.67ms]
+
+ 18 pass
+ 0 fail
+ 31 expect() calls
+Ran 18 tests across 1 file. [5.58s]

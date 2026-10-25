@@ -1,0 +1,19 @@
+--- /home/byates/vm14-builds/opencode-release-832df553/consumer/swx-abbe/components/orch/services/opencode-variant/jail/Dockerfile.jail	2026-10-25 13:46:19.000000000 +0000
++++ /home/byates/vm14-builds/opencode-release-832df553/consumer/swx-abbe/components/orch/services/opencode-variant/jail/Dockerfile.jail.candidate	2026-10-25 19:26:13.753093102 +0000
+@@ -75,15 +75,13 @@
+ # retries a stalled fetch itself, as apt does above (swxtchio/swx-abbe#553), and
+ # is held to https through the release's redirect. --version gets a throwaway
+ # HOME so nothing it writes stays in the image.
++COPY jail/opencode-candidate.tar.gz /tmp/opencode-linux-arm64.tar.gz
+ RUN set -eu; \
+     if [ "${OPENCODE_RELEASE_PLATFORM}" != "linux/arm64" ]; then \
+         echo "unsupported OpenCode release platform '${OPENCODE_RELEASE_PLATFORM}'" >&2; \
+         exit 1; \
+     fi; \
+     archive=/tmp/opencode-linux-arm64.tar.gz; \
+-    curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 60 --speed-limit 1024 --speed-time 60 \
+-        --retry 3 --retry-delay 2 --output "${archive}" \
+-        "https://github.com/swxtchio/swx-opencode/releases/download/${OPENCODE_RELEASE_TAG}/opencode-linux-arm64.tar.gz"; \
+     printf '%s  %s\n' "${OPENCODE_ARCHIVE_SHA256}" "${archive}" | sha256sum --strict -c -; \
+     install -d -m 0700 /tmp/opencode-release; \
+     tar -xzf "${archive}" -C /tmp/opencode-release --no-same-owner; \

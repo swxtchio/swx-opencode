@@ -1,0 +1,14 @@
+bun test v1.4.2 (744846f84)
+
+test/config/agent.test.ts:
+(pass) ConfigAgentPlugin.Plugin > matches POSIX paths against home-relative permissions [25.29ms]
+(pass) ConfigAgentPlugin.Plugin > matches Windows paths against home-relative permissions [6.97ms]
+(pass) ConfigAgentPlugin.Plugin > applies all global permissions before agent-specific permissions [24.71ms]
+(pass) ConfigAgentPlugin.Plugin > maps configured agent fields and preserves an unspecified model variant [14.93ms]
+(pass) ConfigAgentPlugin.Plugin > removes a built-in agent disabled by configuration [5.55ms]
+(pass) ConfigAgentPlugin.Plugin > loads legacy file-based agents from config directories [24.82ms]
+
+ 6 pass
+ 0 fail
+ 23 expect() calls
+Ran 6 tests across 1 file. [732.00ms]

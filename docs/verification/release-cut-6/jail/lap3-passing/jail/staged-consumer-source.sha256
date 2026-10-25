@@ -1,0 +1,4 @@
+20860ca3657caed0942066506d838cfc2e3777c58dc40d47d3bfc0fd439beb04  /home/byates/vm14-builds/opencode-release-832df553/consumer/swx-abbe/components/orch/services/opencode-variant/jail/Dockerfile.jail
+26fa2df96168504642c254486248da50a7a103d28295e6bb0dbd482e3eaa57f2  /home/byates/vm14-builds/opencode-release-832df553/consumer/swx-abbe/components/orch/services/opencode-variant/opencode_server.py
+ae85968f9efe3e906a49a1caea79d8ba522cb656b11673ee982c7056f5d4270d  /home/byates/vm14-builds/opencode-release-832df553/consumer/swx-abbe/components/orch/services/opencode-variant/jail/tools/propose_netlist.js
+0fc16e72f5a41f12847a6620dc22e68a8f5455abf5bccfd0c18315a3327a176a  /home/byates/vm14-builds/opencode-release-832df553/consumer/swx-abbe/components/orch/services/opencode-variant/tests/test_opencode_jail_integration.py

@@ -1,0 +1,8 @@
+=== v1-control
+client: {"mode": "v1-control", "status": "completed", "model": "accounts/fireworks/models/deepseek-v4p1-flash"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== compact
+client: {"mode": "compact", "session": "ses_e8b76dc93ffe5DauSAk1C0Jbee", "admitted_seq": 1, "turn": "completed", "compact_status": 204, "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.titled", "session.next.step.started", "session.next.text.started", "session.next.text.ended", "session.next.step.ended", "session.next.compaction.started", "session.next.compaction.ended"], "compactions": [{"type": "session.next.compaction.started", "reason": "manual", "text": ""}, {"type": "session.next.compaction.ended", "reason": "manual", "text": "## Objective\n- Describe an SRT input.\n\n## Progress\n- Answered: an SRT input listens on one UDP port and admits one caller."}]}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True kind=title", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True kind=turn", "REQ3 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True kind=summary transcript=yes"]
+RESULT: PASS

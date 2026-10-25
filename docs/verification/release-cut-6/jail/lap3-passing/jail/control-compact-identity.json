@@ -1,0 +1,9 @@
+{
+  "release_source_commit": "832df553518d8bb581952433c72495a472da8c5d",
+  "consumer_source_commit": "8ac1489e7d3ecad9f9a09431d3df54b6b69ad8e6",
+  "candidate_archive_sha256": "cb28771c648dd31fe9caba5d3cc8657438630afd933dd7a24c4d2612f472be76",
+  "candidate_image": "opencode-variant-jail:v2-egress-1.18.32-swxtch.832df553-candidate",
+  "candidate_image_id": "sha256:7fe44c87982662d608539dd672d5266c54b2add349299927687c0aa47af48cc7",
+  "tool_acceptance_exit": 0,
+  "v1_control_and_compaction_exit": 0
+}

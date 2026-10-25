@@ -1,0 +1,15 @@
+selected_source=832df553518d8bb581952433c72495a472da8c5d
+source_package_version=1.18.32
+source_bun_pin=bun@1.4.2
+source_bun_lock_sha256=2c6631f22941c4367a66410ae866c07fa8d4d141798dfba728e46d4c3c400151  bun.lock
+source_commit=832df553518d8bb581952433c72495a472da8c5d
+source_parent=4973723074ed4ba2e778e287eacd3d518cc315d7
+source_subject=feat(core): load project tool modules in V2 (#361)
+abbe_1951_d7_to_opencode_358=ancestor
+opencode_358_to_selected_source=ancestor
+opencode_361_to_abbe_1951_d7=not-ancestor
+opencode_358_to_abbe_1951_d7=not-ancestor
+release_probe_v2_wait_fix_to_selected_source=ancestor
+identity_owner=packages/opencode/script/release-probe-target.ts resolveReleaseIdentity/resolveReleaseTarget
+local_release_derivation=packages/opencode/package.json version + swxtch + selected HEAD sha8
+Abbe_issue_1951_body_read=gh issue view 1951 -R swxtchio/swx-abbe --json body -q .body on 2026-10-25; its body names tag v1.18.32-swxtch.d7f78881 at source d7f78881560aa83e9390f0231562fa79639eacd9
