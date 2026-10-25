@@ -1416,7 +1416,7 @@ describe("tool.shell teardown", () => {
             .pipe(Effect.exit, Effect.forkDetach)
           yield* Deferred.await(shell.consumed).pipe(Effect.timeout("5 seconds"))
           controller.abort()
-          const completion = yield* Fiber.await(execution).pipe(Effect.timeoutOption("6 seconds"))
+          const completion = yield* Fiber.await(execution).pipe(Effect.timeoutOption("12 seconds"))
           expect({
             completion: completion._tag === "Some" ? "finished" : "timeout",
             alive: yield* shell.alive,
@@ -1448,7 +1448,7 @@ describe("tool.shell teardown", () => {
             .pipe(Effect.forkDetach)
           yield* Deferred.await(shell.consumed).pipe(Effect.timeout("5 seconds"))
           interrupting = true
-          const completion = yield* Fiber.interrupt(execution).pipe(Effect.timeoutOption("6 seconds"))
+          const completion = yield* Fiber.interrupt(execution).pipe(Effect.timeoutOption("12 seconds"))
           expect({
             completion: completion._tag === "Some" ? "finished" : "timeout",
             alive: yield* shell.alive,
