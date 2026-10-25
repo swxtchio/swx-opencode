@@ -37,6 +37,9 @@ export class Info extends Schema.Class<Info>("Config.Info")({
   model: Schema.String.pipe(Schema.optional).annotate({
     description: "Default model to use when no session or agent model is selected",
   }),
+  small_model: Schema.String.pipe(Schema.optional).annotate({
+    description: "Global small model to use for auxiliary work when no agent or session selection applies",
+  }),
   default_agent: Schema.String.pipe(Schema.optional).annotate({
     description: "Default primary agent to use when no session agent is selected",
   }),

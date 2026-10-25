@@ -147,6 +147,7 @@ describe("ConfigAgentPlugin.Plugin", () => {
                 agents: {
                   reviewer: {
                     model: "anthropic/claude-sonnet",
+                    small_model: "auxiliary/models/first-small",
                     system: "Review carefully.",
                     description: "Reviews changes",
                     mode: "subagent",
@@ -166,6 +167,7 @@ describe("ConfigAgentPlugin.Plugin", () => {
               info: decode({
                 agents: {
                   reviewer: {
+                    small_model: "auxiliary/models/latest-small",
                     request: {
                       headers: { shared: "last", second: "two" },
                       body: { retries: 2, effort: "high" },
@@ -191,6 +193,7 @@ describe("ConfigAgentPlugin.Plugin", () => {
         color: "warning",
         steps: 12,
         model: { providerID: "anthropic", id: "claude-sonnet", variant: undefined },
+        smallModel: { providerID: "auxiliary", id: "models/latest-small" },
       })
       expect(reviewer.request).toEqual({
         headers: { first: "one", shared: "last", second: "two" },

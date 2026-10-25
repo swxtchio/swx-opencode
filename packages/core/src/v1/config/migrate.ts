@@ -7,7 +7,7 @@ import { ConfigPermissionV1 } from "./permission"
 import { ConfigProviderV1 } from "./provider"
 import { ConfigProviderOptionsV1 } from "./provider-options"
 
-const keys = new Set([
+const v1MarkerKeys = new Set([
   "logLevel",
   "server",
   "command",
@@ -17,7 +17,6 @@ const keys = new Set([
   "autoshare",
   "disabled_providers",
   "enabled_providers",
-  "small_model",
   "mode",
   "agent",
   "provider",
@@ -27,9 +26,26 @@ const keys = new Set([
   "layout",
 ])
 
+const v2OnlyKeys = new Set([
+  "providers",
+  "agents",
+  "permissions",
+  "plugins",
+  "commands",
+  "snapshots",
+  "attachments",
+])
+
 export function isV1(input: unknown) {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return false
-  return Object.keys(input).some((key) => keys.has(key))
+  const keys = Object.keys(input)
+  if (keys.some((key) => v1MarkerKeys.has(key))) return true
+  return keys.includes("small_model") && !hasV2OnlyKey(input)
+}
+
+function hasV2OnlyKey(input: unknown) {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return false
+  return Object.keys(input).some((key) => v2OnlyKeys.has(key))
 }
 
 export function migrate(info: typeof ConfigV1.Info.Type) {
@@ -37,6 +53,7 @@ export function migrate(info: typeof ConfigV1.Info.Type) {
     $schema: info.$schema,
     shell: info.shell,
     model: info.model,
+    small_model: info.small_model,
     default_agent: info.default_agent,
     autoupdate: info.autoupdate,
     share: info.share ?? (info.autoshare ? "auto" : undefined),
@@ -111,6 +128,7 @@ export function migrateAgent(info: ConfigAgentV1.Info) {
   }
   return {
     model: info.model,
+    small_model: info.small_model,
     variant: info.variant,
     request: Object.keys(body).length ? { body } : undefined,
     system: info.prompt,

@@ -382,7 +382,15 @@ function createNativeSession(directory: string, id?: SessionV2.ID) {
   }).pipe(Effect.map(({ data }) => data))
 }
 
-const writeNativeTestProvider = (directory: string, url: string, models: string[] = ["test-model"]) =>
+const writeNativeTestProvider = (
+  directory: string,
+  url: string,
+  models: string[] = ["test-model"],
+  settings: {
+    small_model?: string
+    agents?: Record<string, { mode?: "primary"; small_model?: string }>
+  } = {},
+) =>
   Effect.promise(() =>
     Bun.write(
       path.join(directory, "opencode.json"),
@@ -408,6 +416,7 @@ const writeNativeTestProvider = (directory: string, url: string, models: string[
           },
         },
         permissions: [{ action: "read", resource: "*", effect: "allow" }],
+        ...settings,
       }),
     ),
   ).pipe(Effect.asVoid)
@@ -1250,6 +1259,156 @@ describe("session HttpApi", () => {
         expect((yield* llm.inputs).map((input) => input.model).sort()).toEqual(
           ["patched-model", "small-model", "test-model"].sort(),
         )
+        expect(yield* llm.misses).toEqual([])
+      }).pipe(Effect.provide(TestLLMServer.layer)),
+    { git: true, config: { formatter: false, lsp: false } },
+    30_000,
+  )
+
+  it.instance(
+    "uses global and originating primary-agent small models for V2 title and manual summary requests",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({
+          git: true,
+          init: (directory) =>
+            writeNativeTestProvider(
+              directory,
+              llm.url,
+              ["test-model", "global-small", "primary-one-small", "primary-two-small"],
+              {
+                small_model: "test/global-small",
+                agents: {
+                  "primary-one": { mode: "primary", small_model: "test/primary-one-small" },
+                  "primary-two": { mode: "primary", small_model: "test/primary-two-small" },
+                },
+              },
+            ),
+        })
+        yield* awaitNativeModel(directory)
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const model = (name: string) => (hit: { body: Record<string, unknown> }) => hit.body.model === name
+        const configuredAgents = yield* requestJson<{
+          data: Array<{ id: string; smallModel?: { providerID: string; id: string } }>
+        }>("/api/agent", { headers })
+        expect(configuredAgents.data.find((agent) => agent.id === "primary-one")?.smallModel).toMatchObject({
+          providerID: "test",
+          id: "primary-one-small",
+        })
+        expect(configuredAgents.data.find((agent) => agent.id === "primary-two")?.smallModel).toMatchObject({
+          providerID: "test",
+          id: "primary-two-small",
+        })
+        const cases = [
+          { agent: undefined, name: "global-small", summary: "Global summary" },
+          {
+            agent: "primary-one",
+            name: "primary-one-small",
+            summary: "Primary one summary",
+          },
+          {
+            agent: "primary-two",
+            name: "primary-two-small",
+            summary: "Primary two summary",
+          },
+        ]
+
+        for (const [index, item] of cases.entries()) {
+          const created = yield* requestJson<{ data: SessionV2.Info }>("/api/session", {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              agent: item.agent,
+              model: { providerID: "test", id: "test-model" },
+              location: { directory },
+            }),
+          })
+          const session = created.data
+          const sessionPath = `/api/session/${session.id}`
+          yield* llm.textMatch(model("test-model"), `Primary reply ${index}`)
+          yield* requestJson(`${sessionPath}/prompt`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ prompt: { text: `Question ${index}` } }),
+          })
+          const wait = yield* requestJson<{ data: SessionV2.WaitResult }>(`${sessionPath}/wait`, {
+            method: "POST",
+            headers,
+          })
+          expect(wait.data.type).toBe("completed")
+          expect((yield* requestJson<{ data: SessionV2.Info }>(sessionPath, { headers })).data.title).toBe("E2E Title")
+
+          const titleModels = (yield* llm.hits).filter(isTitleHit).map((hit) => hit.body.model)
+          expect(titleModels.at(-1)).toBe(item.name)
+          const turns = (yield* llm.hits).filter((hit) => !isTitleHit(hit))
+          expect(turns.at(-1)?.body.model).toBe("test-model")
+
+          yield* llm.textMatch((hit) => model(item.name)(hit) && !isTitleHit(hit), `## Objective\n- ${item.summary}`)
+          const compact = yield* request(`${sessionPath}/compact`, { method: "POST", headers })
+          expect(compact.status).toBe(204)
+          const context = yield* requestJson<{ data: SessionMessage.Message[] }>(`${sessionPath}/context`, { headers })
+          expect(context.data).toMatchObject([
+            { type: "compaction", reason: "manual", summary: `## Objective\n- ${item.summary}` },
+          ])
+        }
+
+        const hits = yield* llm.hits
+        expect(
+          hits
+            .filter(isTitleHit)
+            .map((hit) => hit.body.model)
+            .sort(),
+        ).toEqual(["global-small", "primary-one-small", "primary-two-small"].sort())
+        expect(
+          hits
+            .filter((hit) => !isTitleHit(hit))
+            .map((hit) => hit.body.model)
+            .sort(),
+        ).toEqual(
+          ["test-model", "test-model", "test-model", "global-small", "primary-one-small", "primary-two-small"].sort(),
+        )
+        expect(yield* llm.misses).toEqual([])
+      }).pipe(Effect.provide(TestLLMServer.layer)),
+    { git: true, config: { formatter: false, lsp: false } },
+    30_000,
+  )
+
+  it.instance(
+    "keeps a V2 primary turn running when its global small_model is unavailable",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({
+          git: true,
+          init: (directory) =>
+            writeNativeTestProvider(directory, llm.url, ["test-model"], { small_model: "test/missing-small" }),
+        })
+        yield* awaitNativeModel(directory)
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const created = yield* requestJson<{ data: SessionV2.Info }>("/api/session", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ model: { providerID: "test", id: "test-model" }, location: { directory } }),
+        })
+        const sessionPath = `/api/session/${created.data.id}`
+        const model = (name: string) => (hit: { body: Record<string, unknown> }) => hit.body.model === name
+
+        yield* llm.textMatch(model("test-model"), "Primary reply")
+        yield* requestJson(`${sessionPath}/prompt`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ prompt: { text: "Ordinary turn" } }),
+        })
+        const wait = yield* requestJson<{ data: SessionV2.WaitResult }>(`${sessionPath}/wait`, {
+          method: "POST",
+          headers,
+        })
+
+        expect(wait.data.type).toBe("completed")
+        const hits = yield* llm.hits
+        expect(hits.filter(isTitleHit)).toHaveLength(0)
+        expect(hits.map((hit) => hit.body.model)).toEqual(["test-model"])
         expect(yield* llm.misses).toEqual([])
       }).pipe(Effect.provide(TestLLMServer.layer)),
     { git: true, config: { formatter: false, lsp: false } },
