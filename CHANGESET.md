@@ -220,6 +220,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Features
 
+- **#361** Load project-local modules from `.opencode/tool` and `.opencode/tools` through V2 Location config before provider tool materialization; register their canonical tools with Location scope and rediscover them when the Location is recreated. See `packages/core/src/tool/project.ts`. _Fork-only._
 - **#358** Add global and per-agent V2 small-model selection (swxtchio/swx-opencode#355): preserve global `small_model` in native configuration and V1 migration, load agent-level `small_model` into V2 agents, and resolve auxiliary requests through the auxiliary agent, originating primary agent, session, global selection, title inference, and turn model in V1 order. Extend `Agent.Info` with the generated `smallModel` response field. Focused config, resolver, runner and HTTP regressions include removal proofs; see `specs/v2/session.md` and `specs/v2/schema-changelog.md`. _Fork-only._
 - **#354** V2 sessions reach small-model parity with V1 (swxtchio/swx-abbe#1953):
   - `POST /api/session` takes `smallModel`.

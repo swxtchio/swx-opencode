@@ -8,6 +8,7 @@ This folder owns Core's one local tool representation, process and Location regi
 - `application-tools.ts` stores process-scoped application registrations.
 - `tools.ts` exposes the registration-only `Tools.Service` view used by Location producers.
 - `registry.ts` stores only canonical tools, overlays Location registrations over application registrations, derives definitions, invokes tools, and applies generic output bounding.
+- Core tool adapters must not import V1 types from the package root `@opencode-ai/plugin`; use `@opencode-ai/llm` types or local structural contracts because the V1 root export breaks Core's `tsgo` global fetch type resolution.
 
 Do not add a second executable entry type, registry-owned executor, authorization callback, output-path callback, or legacy normalization path.
 
@@ -57,3 +58,10 @@ Producer capture limits are separate. For example, Bash keeps `AppProcess.maxOut
 - Plugin boot has not been redesigned to register canonical tools through `Tools.Service`; do not redesign it as part of leaf migrations.
 - MCP and future Session-scoped registrations still need an explicit canonical registration design.
 - The public Session result shape currently exposes managed `outputPaths`; full storage encapsulation requires a future opaque managed-output reference design.
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project.
+Do not repeat what the codebase already shows; point to the authoritative file or command instead.
+Prefer rewriting or pruning existing entries over appending new ones.
+When updating this file, preserve this bar for all agents and keep entries concise.
