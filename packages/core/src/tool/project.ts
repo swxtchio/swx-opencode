@@ -1,10 +1,10 @@
 export * as ProjectTools from "./project"
 
-import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin"
 import { Context, Effect, JsonSchema, Layer, Schema, Scope } from "effect"
 import path from "path"
 import { pathToFileURL } from "url"
 import { z } from "zod"
+import type { ToolDefinition } from "@opencode-ai/llm"
 import { Config } from "../config"
 import { makeLocationNode } from "../effect/app-node"
 import { Location } from "../location"
@@ -98,7 +98,7 @@ export const node = makeLocationNode({
 })
 
 function fromPlugin(
-  def: ToolDefinition,
+  def: ProjectToolModule,
   project: { readonly directory: string; readonly worktree: string },
   permissions: PermissionV2.Interface,
 ): Tool.AnyTool {
@@ -119,7 +119,7 @@ function fromPlugin(
         const controller = new AbortController()
         let title: string | undefined
         let metadata: Record<string, unknown> | undefined
-        const pluginContext: ToolContext = {
+        const pluginContext: ProjectToolContext = {
           sessionID: context.sessionID,
           messageID: context.assistantMessageID,
           agent: context.agent,
@@ -149,7 +149,7 @@ function fromPlugin(
         }
         const result = yield* Effect.acquireUseRelease(
           Effect.succeed(controller),
-          () => Effect.promise(() => def.execute(input as Parameters<ToolDefinition["execute"]>[0], pluginContext)),
+          () => Effect.promise(() => def.execute(input, pluginContext)),
           (current) => Effect.sync(() => current.abort()),
         )
         if (title === undefined && metadata === undefined) return result
@@ -197,7 +197,43 @@ function fromPlugin(
   })
 }
 
-function isPluginTool(value: unknown): value is ToolDefinition {
+type ProjectToolModule = {
+  readonly args?: Readonly<Record<string, unknown>>
+  readonly description: ToolDefinition["description"]
+  readonly execute: (args: unknown, context: ProjectToolContext) => Promise<ProjectToolResult>
+}
+
+type ProjectToolContext = {
+  readonly sessionID: string
+  readonly messageID: string
+  readonly agent: string
+  readonly directory: string
+  readonly worktree: string
+  readonly abort: AbortSignal
+  readonly metadata: (input: { readonly title?: string; readonly metadata?: Record<string, unknown> }) => void
+  readonly ask: (input: {
+    readonly permission: string
+    readonly patterns: ReadonlyArray<string>
+    readonly always: ReadonlyArray<string>
+    readonly metadata: Record<string, unknown>
+  }) => Promise<void>
+}
+
+type ProjectToolResult =
+  | string
+  | {
+      readonly title?: string
+      readonly output: string
+      readonly metadata?: Record<string, unknown>
+      readonly attachments?: ReadonlyArray<{
+        readonly type: "file"
+        readonly mime: string
+        readonly url: string
+        readonly filename?: string
+      }>
+    }
+
+function isPluginTool(value: unknown): value is ProjectToolModule {
   return typeof value === "object" && value !== null && "args" in value && "description" in value && "execute" in value
 }
 
