@@ -1,13 +1,16 @@
 export * as ProjectTools from "./project"
 
-import { Context, Effect, JsonSchema, Layer, Schema, Scope } from "effect"
+import { Context, Deferred, Effect, Exit, JsonSchema, Layer, Schema, Scope } from "effect"
+import fs from "fs/promises"
 import path from "path"
 import { pathToFileURL } from "url"
 import { z } from "zod"
 import type { ToolDefinition } from "@opencode-ai/llm"
 import { Config } from "../config"
 import { makeLocationNode } from "../effect/app-node"
+import { InstallationLocal, InstallationSdkVersion } from "../installation/version"
 import { Location } from "../location"
+import { Npm } from "../npm"
 import { PermissionV2 } from "../permission"
 import { Glob } from "../util/glob"
 import { Tool } from "./tool"
@@ -25,68 +28,104 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const config = yield* Config.Service
     const location = yield* Location.Service
+    const npm = yield* Npm.Service
     const permissions = yield* PermissionV2.Service
     const tools = yield* Tools.Service
     const scope = yield* Scope.Scope
-    const ready = yield* Effect.cached(
-      Effect.gen(function* () {
-        const entries = yield* config.entries()
-        const directories = entries.filter((entry): entry is Config.Directory => entry.type === "directory")
-        for (const directory of directories) {
-          const files = yield* Effect.try({
-            try: () =>
-              Glob.scanSync("{tool,tools}/*.{js,ts}", {
-                cwd: directory.path,
-                absolute: true,
-                dot: true,
-                symlink: true,
-              }).sort(),
-            catch: errorMessage,
-          }).pipe(
-            Effect.tapError((error) =>
-              Effect.logError("failed to scan project tool directory", { path: directory.path, error }),
-            ),
-            Effect.catch(() => Effect.succeed([])),
-          )
-          for (const file of files) {
-            const namespace = path.basename(file, path.extname(file))
-            const loaded = yield* Effect.tryPromise({
-              try: async () => {
-                const module = await import(pathToFileURL(file).href)
-                return Object.fromEntries(
-                  Object.entries(module).flatMap(([name, value]) =>
-                    isPluginTool(value)
-                      ? [
-                          [
-                            name === "default" ? namespace : `${namespace}_${name}`,
-                            fromPlugin(
-                              value,
-                              { directory: location.directory, worktree: location.project.directory },
-                              permissions,
-                            ),
-                          ],
-                        ]
-                      : [],
-                  ),
-                ) as Record<string, Tool.AnyTool>
-              },
-              catch: errorMessage,
-            }).pipe(
-              Effect.tapError((error) => Effect.logError("failed to load project tool module", { path: file, error })),
-              Effect.catch(() => Effect.succeed(undefined)),
-            )
-            if (!loaded || Object.keys(loaded).length === 0) continue
-            yield* tools.register(loaded).pipe(
+    const booted = yield* Deferred.make<Exit.Exit<void, never>>()
+    const discover = Effect.gen(function* () {
+      const entries = yield* config.entries()
+      const directories = entries.filter((entry): entry is Config.Directory => entry.type === "directory")
+      for (const directory of directories) {
+        const files = yield* Effect.try({
+          try: () =>
+            Glob.scanSync("{tool,tools}/*.{js,ts}", {
+              cwd: directory.path,
+              absolute: true,
+              dot: true,
+              symlink: true,
+            }).sort(),
+          catch: errorMessage,
+        }).pipe(
+          Effect.tapError((error) =>
+            Effect.logError("failed to scan project tool directory", { path: directory.path, error }),
+          ),
+          Effect.catch(() => Effect.succeed([])),
+        )
+        if (files.length === 0) continue
+        const installed = yield* pluginSdkVersion(files[0]!).pipe(Effect.catch(() => Effect.succeed(undefined)))
+        const version = InstallationLocal ? undefined : InstallationSdkVersion
+        const satisfied =
+          installed !== undefined &&
+          Npm.reifyReason({
+            declared: [],
+            locked: new Set(),
+            add: [{ name: "@opencode-ai/plugin", version }],
+            installed: () => installed,
+          }) === undefined
+        if (!satisfied) {
+          yield* npm
+            .install(directory.path, { add: [{ name: "@opencode-ai/plugin", version }] })
+            .pipe(
               Effect.tapError((error) =>
-                Effect.logError("failed to register project tool module", { path: file, error }),
+                Effect.logError("failed to prepare project tool SDK", { path: directory.path, error }),
               ),
               Effect.catch(() => Effect.void),
-              Scope.provide(scope),
             )
-          }
         }
-      }).pipe(Scope.provide(scope)),
+        for (const file of files) {
+          const namespace = path.basename(file, path.extname(file))
+          const loaded = yield* Effect.tryPromise({
+            try: (signal) =>
+              importProjectTool(file, signal).then(
+                (module) =>
+                  Object.fromEntries(
+                    Object.entries(module).flatMap(([name, value]) =>
+                      isPluginTool(value)
+                        ? [
+                            [
+                              name === "default" ? namespace : `${namespace}_${name}`,
+                              fromPlugin(
+                                value,
+                                { directory: location.directory, worktree: location.project.directory },
+                                permissions,
+                              ),
+                            ],
+                          ]
+                        : [],
+                    ),
+                  ) as Record<string, Tool.AnyTool>,
+              ),
+            catch: errorMessage,
+          }).pipe(
+            Effect.tapError((error) => Effect.logError("failed to load project tool module", { path: file, error })),
+            Effect.catch(() => Effect.succeed(undefined)),
+          )
+          if (!loaded || Object.keys(loaded).length === 0) continue
+          yield* tools.register(loaded).pipe(
+            Effect.tapError((error) =>
+              Effect.logError("failed to register project tool module", { path: file, error }),
+            ),
+            Effect.catch(() => Effect.void),
+            Scope.provide(scope),
+          )
+        }
+      }
+    }).pipe(Scope.provide(scope))
+    const start = yield* Effect.cached(
+      Effect.gen(function* () {
+        yield* discover.pipe(
+          Effect.exit,
+          Effect.flatMap((exit) => Deferred.succeed(booted, exit)),
+          Effect.forkScoped({ startImmediately: true }),
+        )
+      }).pipe(Scope.provide(scope), Effect.uninterruptible),
     )
+    const ready = Effect.gen(function* () {
+      yield* start
+      const exit = yield* Deferred.await(booted)
+      return yield* exit
+    })
     return Service.of({ ready })
   }),
 )
@@ -94,7 +133,7 @@ const layer = Layer.effect(
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Config.node, Location.node, PermissionV2.node, ToolRegistry.toolsNode],
+  deps: [Config.node, Location.node, Npm.node, PermissionV2.node, ToolRegistry.toolsNode],
 })
 
 function fromPlugin(
@@ -145,11 +184,17 @@ function fromPlugin(
                   callID: context.toolCallID,
                 },
               }),
+              { signal: controller.signal },
             ),
         }
         const result = yield* Effect.acquireUseRelease(
           Effect.succeed(controller),
-          () => Effect.promise(() => def.execute(input, pluginContext)),
+          () =>
+            Effect.promise((signal) => {
+              const abort = () => controller.abort()
+              signal.addEventListener("abort", abort, { once: true })
+              return def.execute(input, pluginContext).finally(() => signal.removeEventListener("abort", abort))
+            }),
           (current) => Effect.sync(() => current.abort()),
         )
         if (title === undefined && metadata === undefined) return result
@@ -305,4 +350,50 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
+}
+
+function pluginSdkVersion(from: string) {
+  return Effect.tryPromise({
+    try: async () => {
+      let directory = path.dirname(from)
+      while (true) {
+        const manifestPath = path.join(directory, "node_modules", "@opencode-ai", "plugin", "package.json")
+        const manifestText = await fs.readFile(manifestPath, "utf8").catch((error) => {
+          if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined
+          throw error
+        })
+        if (manifestText !== undefined) {
+          const manifest: unknown = JSON.parse(manifestText)
+          if (isRecord(manifest) && manifest.name === "@opencode-ai/plugin") {
+            return typeof manifest.version === "string" ? manifest.version : undefined
+          }
+        }
+        const parent = path.dirname(directory)
+        if (parent === directory) return undefined
+        directory = parent
+      }
+    },
+    catch: errorMessage,
+  })
+}
+
+function importProjectTool(filepath: string, signal: AbortSignal) {
+  if (signal.aborted) return Promise.reject(signal.reason)
+  return new Promise<object>((resolve, reject) => {
+    const aborted = () => {
+      signal.removeEventListener("abort", aborted)
+      reject(signal.reason)
+    }
+    signal.addEventListener("abort", aborted, { once: true })
+    import(pathToFileURL(filepath).href).then(
+      (module) => {
+        signal.removeEventListener("abort", aborted)
+        resolve(module)
+      },
+      (error) => {
+        signal.removeEventListener("abort", aborted)
+        reject(error)
+      },
+    )
+  })
 }

@@ -9,6 +9,7 @@ import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
 import { Config } from "@opencode-ai/core/config"
 import { Global } from "@opencode-ai/core/global"
 import { Location } from "@opencode-ai/core/location"
+import { Npm } from "@opencode-ai/core/npm"
 import { PermissionV2 } from "@opencode-ai/core/permission"
 import { ProjectTools } from "@opencode-ai/core/tool/project"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -69,7 +70,11 @@ const make = (permission?: string) => {
   return permission ? Tool.withPermission(tool, permission) : tool
 }
 
-const projectToolLayer = (directory: string, requests: PermissionV2.AssertInput[]) => {
+const projectToolLayer = (
+  directory: string,
+  requests: PermissionV2.AssertInput[],
+  install: Npm.Interface["install"] = () => Effect.die("project tool SDK should already be installed"),
+) => {
   const projectDirectory = AbsolutePath.make(directory)
   return AppNodeBuilder.build(LayerNode.group([ToolRegistry.node, ToolRegistry.toolsNode, ProjectTools.node]), [
     [
@@ -81,6 +86,17 @@ const projectToolLayer = (directory: string, requests: PermissionV2.AssertInput[
     ],
     [Global.node, Global.layerWith({ config: path.join(directory, "global") })],
     [Config.node, Config.nodeWith({})],
+    [
+      Npm.node,
+      Layer.succeed(
+        Npm.Service,
+        Npm.Service.of({
+          add: () => Effect.die("unused"),
+          install,
+          which: () => Effect.succeed(undefined),
+        }),
+      ),
+    ],
     [
       PermissionV2.node,
       Layer.succeed(
@@ -103,6 +119,136 @@ const projectToolLayer = (directory: string, requests: PermissionV2.AssertInput[
 }
 
 describe("ToolRegistry", () => {
+  projectIt.live("continues Location discovery after its first ready waiter is interrupted", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) => {
+        const permissionRequests: PermissionV2.AssertInput[] = []
+        const installRequests: { dir: string; packages: Npm.AddRequest[] }[] = []
+        const install: Npm.Interface["install"] = (dir, input) =>
+          Effect.sync(() => installRequests.push({ dir, packages: input?.add ?? [] })).pipe(Effect.asVoid)
+        const toolDirectory = path.join(tmp.path, ".opencode", "tools")
+        const pluginPackage = path.join(tmp.path, ".opencode", "node_modules", "@opencode-ai", "plugin")
+        const marker = path.join(toolDirectory, "import-started")
+        const completedMarker = path.join(toolDirectory, "import-completed")
+        return Effect.promise(async () => {
+          await fs.mkdir(toolDirectory, { recursive: true })
+          await fs.mkdir(path.dirname(pluginPackage), { recursive: true })
+          await fs.symlink(path.resolve(import.meta.dir, "../../plugin"), pluginPackage, "dir")
+          await Bun.write(
+            path.join(toolDirectory, "delayed.js"),
+            [
+              'import { writeFile } from "node:fs/promises"',
+              'import { fileURLToPath } from "node:url"',
+              'import { tool } from "@opencode-ai/plugin"',
+              'await writeFile(fileURLToPath(new URL("./import-started", import.meta.url)), "started")',
+              "await new Promise((resolve) => setTimeout(resolve, 500))",
+              'await writeFile(fileURLToPath(new URL("./import-completed", import.meta.url)), "completed")',
+              "export default tool({ description: 'Survives an interrupted discovery waiter', args: {}, execute: async () => 'survived' })",
+              "",
+            ].join("\n"),
+          )
+        }).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const projectTools = yield* ProjectTools.Service
+              const first = yield* projectTools.ready.pipe(Effect.forkChild)
+              const started = yield* Effect.promise(async () => {
+                for (let attempt = 0; attempt < 100; attempt++) {
+                  if (await Bun.file(marker).exists()) return true
+                  await Bun.sleep(5)
+                }
+                return false
+              })
+              expect(started).toBe(true)
+              yield* Fiber.interrupt(first)
+              expect(Exit.isFailure(yield* Fiber.await(first))).toBe(true)
+              expect(yield* Effect.promise(() => Bun.file(completedMarker).exists())).toBe(false)
+
+              yield* projectTools.ready
+              expect(yield* Effect.promise(() => Bun.file(completedMarker).exists())).toBe(true)
+              const registry = yield* ToolRegistry.Service
+              const materialized = yield* registry.materialize()
+              expect(materialized.definitions.map((definition) => definition.name)).toContain("delayed")
+              expect(
+                yield* materialized.settle({
+                  sessionID,
+                  ...identity,
+                  call: { type: "tool-call", id: "call-delayed-after-interrupt", name: "delayed", input: {} },
+                }),
+              ).toMatchObject({ result: { type: "text", value: "survived" } })
+              expect(permissionRequests).toEqual([])
+              expect(installRequests).toEqual([])
+            }).pipe(Effect.provide(projectToolLayer(tmp.path, permissionRequests, install))),
+          ),
+        )
+      }),
+    ),
+  )
+
+  projectIt.live("prepares the plugin SDK before importing a fresh project's bare module", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) => {
+        const permissionRequests: PermissionV2.AssertInput[] = []
+        const installRequests: { dir: string; packages: Npm.AddRequest[] }[] = []
+        const opencode = path.join(tmp.path, ".opencode")
+        const tools = path.join(opencode, "tools")
+        const install: Npm.Interface["install"] = (dir, input) =>
+          Effect.promise(async () => {
+            installRequests.push({ dir, packages: input?.add ?? [] })
+            const pluginPackage = path.join(dir, "node_modules", "@opencode-ai", "plugin")
+            await fs.mkdir(path.dirname(pluginPackage), { recursive: true })
+            const source = path.resolve(import.meta.dir, "../../plugin")
+            await fs.symlink(source, pluginPackage, "dir")
+          })
+        return Effect.promise(async () => {
+          await fs.mkdir(tools, { recursive: true })
+          await Bun.write(
+            path.join(tools, "fresh.js"),
+            [
+              'import { tool } from "@opencode-ai/plugin"',
+              "export default tool({",
+              "  description: 'Tool loaded after SDK preparation',",
+              "  args: { value: tool.schema.string() },",
+              "  execute: async ({ value }) => `installed:${value}`,",
+              "})",
+              "",
+            ].join("\n"),
+          )
+        }).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const projectTools = yield* ProjectTools.Service
+              yield* projectTools.ready
+              const registry = yield* ToolRegistry.Service
+              const materialized = yield* registry.materialize()
+              expect(installRequests).toEqual([
+                {
+                  dir: opencode,
+                  packages: [{ name: "@opencode-ai/plugin", version: undefined }],
+                },
+              ])
+              expect(materialized.definitions.map((definition) => definition.name)).toContain("fresh")
+              expect(
+                yield* materialized.settle({
+                  sessionID,
+                  ...identity,
+                  call: { type: "tool-call", id: "call-fresh-project-tool", name: "fresh", input: { value: "ready" } },
+                }),
+              ).toMatchObject({ result: { type: "text", value: "installed:ready" } })
+              expect(permissionRequests).toEqual([])
+            }).pipe(Effect.provide(projectToolLayer(tmp.path, permissionRequests, install))),
+          ),
+        )
+      }),
+    ),
+  )
+
   void projectIt.effect("discovers plugin modules and settles their validated output through canonical tools", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),

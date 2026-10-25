@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect } from "bun:test"
 import fs from "fs/promises"
+import os from "os"
 import path from "path"
+import { randomUUID } from "crypto"
 import {
   LLMClient,
   LLMError,
@@ -71,7 +73,7 @@ import { asc, eq } from "drizzle-orm"
 import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { testEffect } from "./lib/effect"
 
-const projectDirectory = path.resolve(import.meta.dir, "../../../.work/session-runner-project-tools")
+const projectDirectory = path.join(os.tmpdir(), `session-runner-project-tools-${randomUUID()}`)
 const projectToolName = "runner_project_tool"
 
 beforeAll(async () => {

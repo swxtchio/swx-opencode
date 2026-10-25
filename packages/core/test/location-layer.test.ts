@@ -1,7 +1,7 @@
 import fs from "fs/promises"
 import path from "path"
 import { describe, expect } from "bun:test"
-import { DateTime, Effect, Equal, Hash, Layer, Schema, Stream } from "effect"
+import { Cause, DateTime, Deferred, Effect, Equal, Exit, Fiber, Hash, Layer, Schema, Stream } from "effect"
 import { LLMClient, LLMError, TransportReason, type LLMClientShape, type LLMRequest } from "@opencode-ai/llm"
 import { Tool } from "@opencode-ai/core/tool/tool"
 import { define } from "@opencode-ai/plugin/v2/effect"
@@ -18,6 +18,7 @@ import { PluginInternal } from "@opencode-ai/core/plugin/internal"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { PermissionV2 } from "@opencode-ai/core/permission"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionMessage } from "@opencode-ai/core/session/message"
@@ -471,6 +472,103 @@ describe("LocationServiceMap", () => {
             }),
           ),
         ),
+      ),
+    ),
+  )
+
+  it.live("cancels an outstanding project-tool permission ask with its tool settlement", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          const jail = yield* jailServices(dir.path)
+          const tools = path.join(dir.path, "agent", ".opencode", "tools")
+          const aborted = path.join(tools, "aborted")
+          const pluginPackage = path.join(dir.path, "agent", ".opencode", "node_modules", "@opencode-ai", "plugin")
+          yield* Effect.promise(async () => {
+            await fs.mkdir(tools, { recursive: true })
+            await fs.mkdir(path.dirname(pluginPackage), { recursive: true })
+            await fs.symlink(path.resolve(import.meta.dir, "../../plugin"), pluginPackage, "dir")
+            await Bun.write(
+              path.join(tools, "ask_permission.js"),
+              [
+                'import { writeFile } from "node:fs/promises"',
+                'import { tool } from "@opencode-ai/plugin"',
+                "export default tool({",
+                "  description: 'Wait for project permission before resuming',",
+                "  args: {},",
+                "  async execute(_args, context) {",
+                "    context.abort.addEventListener('abort', () => { void writeFile(new URL('./aborted', import.meta.url), 'aborted') })",
+                "    await context.ask({ permission: 'project.test', patterns: ['workspace'], always: [], metadata: {} })",
+                "    await writeFile(new URL('./continued', import.meta.url), 'resumed')",
+                "    return 'resumed'",
+                "  },",
+                "})",
+                "",
+              ].join("\n"),
+            )
+          })
+          yield* Effect.gen(function* () {
+            const agentID = AgentV2.ID.make("build")
+            const session = yield* (yield* SessionV2.Service).create({
+              location: jail.location,
+              agent: agentID,
+            })
+            const locations = yield* LocationServiceMap.Service
+            const events = yield* EventV2.Service
+            const asked = yield* Deferred.make<PermissionV2.Request>()
+            const unsubscribe = yield* events.listen((event) =>
+              event.type === PermissionV2.Event.Asked.type
+                ? Deferred.succeed(asked, event.data as PermissionV2.Request).pipe(Effect.asVoid)
+                : Effect.void,
+            )
+            yield* Effect.addFinalizer(() => unsubscribe)
+            yield* Effect.gen(function* () {
+              const agents = yield* AgentV2.Service
+              yield* agents.transform((editor) =>
+                editor.update(agentID, (agent) => {
+                  agent.permissions = [{ action: "project.test", resource: "workspace", effect: "ask" }]
+                }),
+              )
+              const projectTools = yield* ProjectTools.Service
+              yield* projectTools.ready
+              const registry = yield* ToolRegistry.Service
+              const materialized = yield* registry.materialize()
+              const fiber = yield* materialized
+                .settle({
+                  sessionID: session.id,
+                  agent: agentID,
+                  assistantMessageID: SessionMessage.ID.make("msg_permission_cancel"),
+                  call: { type: "tool-call", id: "call-permission-cancel", name: "ask_permission", input: {} },
+                })
+                .pipe(Effect.forkChild)
+              const request = yield* Deferred.await(asked)
+              const permissions = yield* PermissionV2.Service
+              expect(yield* permissions.list()).toEqual([request])
+              yield* Fiber.interrupt(fiber)
+              const settlement = yield* Fiber.await(fiber)
+              expect(Exit.isFailure(settlement) && Cause.hasInterrupts(settlement.cause)).toBe(true)
+              let signalAborted = yield* Effect.promise(() => Bun.file(aborted).exists())
+              for (let attempt = 0; attempt < 100 && !signalAborted; attempt++) {
+                yield* Effect.sleep("5 millis")
+                signalAborted = yield* Effect.promise(() => Bun.file(aborted).exists())
+              }
+              expect(signalAborted).toBe(true)
+              let pending = yield* permissions.list()
+              for (let attempt = 0; attempt < 100 && pending.length > 0; attempt++) {
+                yield* Effect.sleep("5 millis")
+                pending = yield* permissions.list()
+              }
+              expect(pending).toEqual([])
+              expect(
+                Exit.isFailure(yield* permissions.reply({ requestID: request.id, reply: "once" }).pipe(Effect.exit)),
+              ).toBe(true)
+              expect(yield* Effect.promise(() => Bun.file(path.join(tools, "continued")).exists())).toBe(false)
+            }).pipe(Effect.provide(locations.get(jail.location)))
+          }).pipe(Effect.provide(jail.layer))
+        }),
       ),
     ),
   )
