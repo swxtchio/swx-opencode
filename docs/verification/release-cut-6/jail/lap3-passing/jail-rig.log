@@ -1,0 +1,86 @@
+2026-10-25T19:27:27Z
+vm14-001
+Linux vm14-001 6.8.0-147-generic #147-Ubuntu SMP PREEMPT_DYNAMIC Thu Sep 24 11:39:52 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux
+Client:
+ Version:           29.8.0
+ API version:       1.56
+ Go version:        go1.26.8
+ Git commit:        88096ef
+ Built:             Wed Sep 23 15:28:31 2026
+ OS/Arch:           linux/arm64
+ Context:           default
+
+Server:
+ Engine:
+  Version:          29.8.0
+  API version:      1.56 (minimum version 1.40)
+  Go version:       go1.26.8
+  Git commit:       3ce5872
+  Built:            Wed Sep 23 15:29:01 2026
+  OS/Arch:          linux/arm64
+  Experimental:     false
+ containerd:
+  Version:          v2.3.4
+  GitCommit:        db8809540e1a7a9da5d518876894933ff55692ab
+ runc:
+  Version:          1.5.1
+  GitCommit:        
+ docker-init:
+  Version:          0.19.0
+  GitCommit:        de40ad0
+216749ea5b75 abbe-restore-test-3628f6d0b6
+9b2a53143f01 bridge
+845c065c1b0f host
+d8225ecb95d4 none
+0d92f39f3557 swx-ai-chat_swx-network
+e4f49a27538d32237b4162b712750ad92fa2b264d14c97dabcded68fd651335a swx-ai-chat:latest swx-ai-chat
+5a0993d8000b947fbb0ba83ccd9ba1e12a2fabac04ce8f080837185cdbf69c7a swx-mcp-server:latest swx-mcp-server
+c45f480b773adf0f9a439da4dca1c0ce47569399cf4718b2afdf873ab68fd70b swx-simulate:arm64 swx-simulate
+d0d47a9183206f1bfaf2f3c71756d175d528f33558d6e3f641a628c7f68be41f swx-overlay-app:latest swx-overlay-app
+cb28771c648dd31fe9caba5d3cc8657438630afd933dd7a24c4d2612f472be76  /home/byates/vm14-builds/opencode-release-832df553/assets/opencode-linux-arm64.tar.gz
+cb28771c648dd31fe9caba5d3cc8657438630afd933dd7a24c4d2612f472be76  /home/byates/vm14-builds/opencode-release-832df553/consumer/swx-abbe/components/orch/services/opencode-variant/jail/opencode-candidate.tar.gz
+20860ca3657caed0942066506d838cfc2e3777c58dc40d47d3bfc0fd439beb04  /home/byates/vm14-builds/opencode-release-832df553/consumer/swx-abbe/components/orch/services/opencode-variant/jail/Dockerfile.jail
+ef8fdbaab0dfc36eca94b50ee4f9d4ed5c75e7f69316c45c9b600b74c066f11b  /home/byates/vm14-builds/opencode-release-832df553/consumer/swx-abbe/components/orch/services/opencode-variant/jail/Dockerfile.jail.candidate
+COPY jail/opencode-candidate.tar.gz /tmp/opencode-linux-arm64.tar.gz
+image build passed
+#12 0.313 /tmp/opencode-linux-arm64.tar.gz: OK
+sha256:7fe44c87982662d608539dd672d5266c54b2add349299927687c0aa47af48cc7
+sha256:7fe44c87982662d608539dd672d5266c54b2add349299927687c0aa47af48cc7 arm64 linux
+c6653bf327b45cefa14bdb49043230b93edb74cf91163650e16b2d761c4977b5  /usr/local/bin/opencode
+0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42  /usr/local/bin/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so
+1.18.32-swxtch.832df553
+c6653bf327b45cefa14bdb49043230b93edb74cf91163650e16b2d761c4977b5  /usr/local/bin/opencode
+0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42  /usr/local/bin/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so
+1.18.32-swxtch.832df553
+exit=0
+exit=0
+..                                                                       [100%]
+2 passed in 16.29s
+=== v1-control
+client: {"mode": "v1-control", "status": "completed", "model": "accounts/fireworks/models/deepseek-v4p1-flash"}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True"]
+RESULT: PASS
+=== compact
+client: {"mode": "compact", "session": "ses_e8b76dc93ffe5DauSAk1C0Jbee", "admitted_seq": 1, "turn": "completed", "compact_status": 204, "history_types": ["session.next.prompt.admitted", "session.next.prompted", "session.next.titled", "session.next.step.started", "session.next.text.started", "session.next.text.ended", "session.next.step.ended", "session.next.compaction.started", "session.next.compaction.ended"], "compactions": [{"type": "session.next.compaction.started", "reason": "manual", "text": ""}, {"type": "session.next.compaction.ended", "reason": "manual", "text": "## Objective\n- Describe an SRT input.\n\n## Progress\n- Answered: an SRT input listens on one UDP port and admits one caller."}]}
+provider requests: ["REQ1 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True kind=title", "REQ2 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True kind=turn", "REQ3 /v1/chat/completions model=accounts/fireworks/models/deepseek-v4p1-flash stream=True kind=summary transcript=yes"]
+RESULT: PASS
+2026-10-25T19:28:31Z
+e4f49a27538d32237b4162b712750ad92fa2b264d14c97dabcded68fd651335a swx-ai-chat:latest swx-ai-chat
+5a0993d8000b947fbb0ba83ccd9ba1e12a2fabac04ce8f080837185cdbf69c7a swx-mcp-server:latest swx-mcp-server
+c45f480b773adf0f9a439da4dca1c0ce47569399cf4718b2afdf873ab68fd70b swx-simulate:arm64 swx-simulate
+d0d47a9183206f1bfaf2f3c71756d175d528f33558d6e3f641a628c7f68be41f swx-overlay-app:latest swx-overlay-app
+216749ea5b75 abbe-restore-test-3628f6d0b6
+9b2a53143f01 bridge
+845c065c1b0f host
+d8225ecb95d4 none
+0d92f39f3557 swx-ai-chat_swx-network
+e4f49a27538d32237b4162b712750ad92fa2b264d14c97dabcded68fd651335a swx-ai-chat:latest swx-ai-chat
+5a0993d8000b947fbb0ba83ccd9ba1e12a2fabac04ce8f080837185cdbf69c7a swx-mcp-server:latest swx-mcp-server
+c45f480b773adf0f9a439da4dca1c0ce47569399cf4718b2afdf873ab68fd70b swx-simulate:arm64 swx-simulate
+d0d47a9183206f1bfaf2f3c71756d175d528f33558d6e3f641a628c7f68be41f swx-overlay-app:latest swx-overlay-app
+216749ea5b75 abbe-restore-test-3628f6d0b6
+9b2a53143f01 bridge
+845c065c1b0f host
+d8225ecb95d4 none
+0d92f39f3557 swx-ai-chat_swx-network
+JAIL-RIG-PASS

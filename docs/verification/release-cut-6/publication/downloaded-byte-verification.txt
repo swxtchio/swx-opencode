@@ -1,0 +1,10 @@
+opencode-linux-arm64.tar.gz: OK
+opencode-linux-x64.tar.gz: OK
+arm64 archive cmp=candidate-identical
+x64 archive cmp=candidate-identical
+arm64 executable cmp=candidate-identical
+arm64 sidecar cmp=candidate-identical
+x64 executable cmp=candidate-identical
+x64 sidecar cmp=candidate-identical
+arm64_archive_entries=candidate-identical
+x64_archive_entries=candidate-identical

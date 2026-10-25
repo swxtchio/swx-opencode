@@ -1,0 +1,10 @@
+checked_at=2026-10-25T19:51:22Z
+worktree_host=vm001
+Linux vm001 6.8.0-147-generic #147-Ubuntu SMP PREEMPT_DYNAMIC Thu Sep 24 11:39:52 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux
+worktree_docker=linux/aarch64
+worktree_buildkit=Platforms:        linux/arm64
+authorized_builder=vm14-001
+Linux vm14-001 6.8.0-147-generic #147-Ubuntu SMP PREEMPT_DYNAMIC Thu Sep 24 11:39:52 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux
+docker=linux/aarch64
+buildkit=Platforms:        linux/arm64
+coverage=arm64 jail only; no x64 jail result claimed

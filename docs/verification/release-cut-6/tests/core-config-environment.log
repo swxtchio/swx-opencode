@@ -1,0 +1,18 @@
+bun test v1.4.2 (744846f84)
+
+test/config/environment.test.ts:
+(pass) environment-supplied config > resolves a V2 session's named jail egress model at the rendered proxy [255.19ms]
+(pass) environment-supplied config > selects the configured egress default for a V2 session that names no model [112.55ms]
+(pass) auxiliary models > prefers a session small model over an unavailable global selection [80.60ms]
+(pass) auxiliary models > prefers the auxiliary agent model over its small_model and other selections [126.67ms]
+(pass) auxiliary models > prefers an auxiliary agent small_model over originating, session, and global selections [93.52ms]
+(pass) auxiliary models > uses distinct originating primary-agent small models before session and global choices [80.18ms]
+(pass) auxiliary models > uses the effective global small model from another provider with its full model ID [67.73ms]
+(pass) auxiliary models > fails without a substitute when the global small_model is unavailable [82.80ms]
+(pass) auxiliary models > falls back to the primary when no small model is selected or inferred [62.01ms]
+(pass) auxiliary models > fails without a substitute when the session small model is unavailable [45.71ms]
+
+ 10 pass
+ 0 fail
+ 20 expect() calls
+Ran 10 tests across 1 file. [1.67s]

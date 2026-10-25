@@ -1,0 +1,10 @@
+Observed 2026-10-25 at pickup.
+Launch cwd and Git top level: /home/byates/fm-worktrees/fm-llmrouter/release-cut-6/swx-opencode
+Branch: fm/release-cut-6
+Initial branch head: 832df553518d8bb581952433c72495a472da8c5d
+Live repository default: swxtch
+Authenticated account: brentyates-swx
+Open PR overlap scan: #366 (unrelated shell-streaming test stabilization); no open PR for release cut 6.
+Assigned release issue: none, as established by the task brief.
+Draft PR: https://github.com/swxtchio/swx-opencode/pull/367, base swxtch, head fm/release-cut-6.
+First comment: Session ID: unknown; Working repo: /home/byates/fm-worktrees/fm-llmrouter/release-cut-6/swx-opencode

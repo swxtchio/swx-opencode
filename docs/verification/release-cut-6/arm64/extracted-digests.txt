@@ -1,0 +1,2 @@
+c6653bf327b45cefa14bdb49043230b93edb74cf91163650e16b2d761c4977b5  docs/verification/release-cut-6/arm64/candidate-extracted/opencode
+0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42  docs/verification/release-cut-6/arm64/candidate-extracted/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so

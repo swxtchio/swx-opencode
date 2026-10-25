@@ -1,0 +1,3 @@
+consumer_commit=8ac1489e7d3ecad9f9a09431d3df54b6b69ad8e6
+consumer_checkout=## main...origin/main
+04cc0ff2c8abd8d7e86ab5ce4b0fe3b0536b398f69d935ca0991e10bd81e193d  /home/byates/fm-abbe/projects/swx-abbe/components/orch/services/opencode-variant/session_pool.py

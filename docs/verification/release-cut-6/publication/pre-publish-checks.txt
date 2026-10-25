@@ -1,0 +1,15 @@
+{"defaultBranchRef":{"name":"swxtch"}}
+repo:
+  name: swx-opencode
+  description: The open source coding agent.
+  branch: swxtch
+  stars: 0
+  forks: 0
+  issues: 136
+  prs: 2
+  visibility: public
+  language: TypeScript
+832df553518d8bb581952433c72495a472da8c5d	refs/heads/swxtch
+swxtchio/swx-opencode
+remote_tag=absent
+release=absent (NOT_FOUND)

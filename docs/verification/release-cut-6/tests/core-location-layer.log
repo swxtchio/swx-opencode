@@ -1,0 +1,16 @@
+bun test v1.4.2 (744846f84)
+
+test/location-layer.test.ts:
+(pass) LocationServiceMap > reuses cached services for constructed and decoded location refs [477.88ms]
+(pass) LocationServiceMap > isolates location state while sharing location policy with catalog [360.50ms]
+(pass) LocationServiceMap > rejects an unavailable selected model during location model resolution [88.77ms]
+(pass) LocationServiceMap > resolves a location-only V2 session in the OpenCode jail to its config-declared egress model [1218.37ms]
+(pass) LocationServiceMap > runs a location-only V2 turn admitted while its location boots on the jail's egress model [855.11ms]
+(pass) LocationServiceMap > isolates project tools per Location and rediscovers new modules after Location recreation [464.12ms]
+(pass) LocationServiceMap > cancels an outstanding project-tool permission ask with its tool settlement [178.32ms]
+(pass) LocationServiceMap > installs public plugins into a location [67.42ms]
+
+ 8 pass
+ 0 fail
+ 37 expect() calls
+Ran 8 tests across 1 file. [4.38s]
