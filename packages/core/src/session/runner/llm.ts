@@ -26,6 +26,7 @@ import { SystemContextRegistry } from "../../system-context/registry"
 import { SkillGuidance } from "../../skill/guidance"
 import { ReferenceGuidance } from "../../reference/guidance"
 import { ToolRegistry } from "../../tool/registry"
+import { ProjectTools } from "../../tool/project"
 import { ToolOutputStore } from "../../tool-output-store"
 import { SessionContextEpoch } from "../context-epoch"
 import { SessionCompaction } from "../compaction"
@@ -114,6 +115,7 @@ const layer = Layer.effect(
     const llm = yield* LLMClient.Service
     const agents = yield* AgentV2.Service
     const tools = yield* ToolRegistry.Service
+    const projectTools = yield* ProjectTools.Service
     const models = yield* SessionRunnerModel.Service
     const plugins = yield* PluginInternal.Service
     const store = yield* SessionStore.Service
@@ -260,9 +262,9 @@ const layer = Layer.effect(
       const session = yield* getSession(sessionID)
       if (session.location.directory !== location.directory || session.location.workspaceID !== location.workspaceID)
         return yield* Effect.interrupt
-      // The Location boots its plugins in the background, and a drain can start as the Location does: the agent,
-      // model, tools and guidance below are only complete once that boot has ended.
+      // Wait for plugin boot and first-use project tool discovery before materializing the provider catalog.
       yield* plugins.ready
+      yield* projectTools.ready
       const agent = yield* agents.select(session.agent)
       const initialized = yield* SessionContextEpoch.initialize(db, loadSystemContext(agent), session.id)
       const toolFibers = yield* FiberSet.make<void, ToolOutputStore.Error>()
@@ -569,6 +571,7 @@ export const node = makeLocationNode({
     llmClient,
     AgentV2.node,
     ToolRegistry.node,
+    ProjectTools.node,
     SessionRunnerModel.node,
     PluginInternal.node,
     SessionStore.node,

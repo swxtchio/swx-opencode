@@ -1,4 +1,8 @@
-import { describe, expect } from "bun:test"
+import { afterAll, beforeAll, describe, expect } from "bun:test"
+import fs from "fs/promises"
+import os from "os"
+import path from "path"
+import { randomUUID } from "crypto"
 import {
   LLMClient,
   LLMError,
@@ -68,6 +72,38 @@ import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Queue, Schema, S
 import { asc, eq } from "drizzle-orm"
 import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { testEffect } from "./lib/effect"
+
+const projectDirectory = path.join(os.tmpdir(), `session-runner-project-tools-${randomUUID()}`)
+const projectToolName = "runner_project_tool"
+
+beforeAll(async () => {
+  await fs.rm(projectDirectory, { recursive: true, force: true })
+  const opencode = path.join(projectDirectory, ".opencode")
+  const packageDirectory = path.join(opencode, "node_modules", "@opencode-ai")
+  await fs.mkdir(packageDirectory, { recursive: true })
+  await fs.symlink(path.resolve(import.meta.dir, "../../plugin"), path.join(packageDirectory, "plugin"), "dir")
+  const plugin = (await Bun.file(path.resolve(import.meta.dir, "../../plugin/package.json")).json()) as {
+    version: string
+  }
+  const name = "session-runner-project-tools"
+  const dependencies = { "@opencode-ai/plugin": plugin.version }
+  await Bun.write(path.join(opencode, "package.json"), JSON.stringify({ name, private: true, dependencies }))
+  await Bun.write(
+    path.join(opencode, "package-lock.json"),
+    JSON.stringify({
+      name,
+      lockfileVersion: 3,
+      packages: {
+        "": { name, dependencies },
+        "node_modules/@opencode-ai/plugin": { version: plugin.version },
+      },
+    }),
+  )
+})
+
+afterAll(async () => {
+  await fs.rm(projectDirectory, { recursive: true, force: true })
+})
 
 const requests: LLMRequest[] = []
 let response: LLMEvent[] = []
@@ -257,6 +293,7 @@ const config = Layer.succeed(
             }),
           }),
         }),
+        new Config.Directory({ type: "directory", path: AbsolutePath.make(path.join(projectDirectory, ".opencode")) }),
       ]),
   }),
 )
@@ -266,7 +303,7 @@ const runnerLayer = AppNodeBuilder.build(SessionRunnerLLM.node, [
   [SessionRunnerModel.node, models],
   [PluginInternal.node, PluginInternal.readyLayer],
   [SystemContextRegistry.node, systemContext],
-  [Location.node, Location.boundNode({ directory: AbsolutePath.make("/project") })],
+  [Location.node, Location.boundNode({ directory: AbsolutePath.make(projectDirectory) })],
   [SkillGuidance.node, skillGuidance],
   [ReferenceGuidance.node, referenceGuidance],
   [PermissionV2.node, permission],
@@ -361,7 +398,7 @@ const it = testEffect(
       [SessionRunnerModel.node, models],
       [PluginInternal.node, PluginInternal.readyLayer],
       [SystemContextRegistry.node, systemContext],
-      [Location.node, Location.boundNode({ directory: AbsolutePath.make("/project") })],
+      [Location.node, Location.boundNode({ directory: AbsolutePath.make(projectDirectory) })],
       [SkillGuidance.node, skillGuidance],
       [ReferenceGuidance.node, referenceGuidance],
       [Snapshot.node, Snapshot.noopLayer],
@@ -383,7 +420,7 @@ const insertSession = (id: SessionV2.ID) =>
         id,
         project_id: Project.ID.global,
         slug: id,
-        directory: "/project",
+        directory: projectDirectory,
         title: "test",
         version: "test",
       })
@@ -443,7 +480,7 @@ const setup = Effect.gen(function* () {
   maxActiveToolExecutions = 0
   yield* db
     .insert(ProjectTable)
-    .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+    .values({ id: Project.ID.global, worktree: AbsolutePath.make(projectDirectory), sandboxes: [] })
     .onConflictDoNothing()
     .run()
     .pipe(Effect.orDie)
@@ -457,7 +494,7 @@ const setupNative = Effect.gen(function* () {
   const session = yield* SessionV2.Service
   return yield* session.create({
     id: sessionID,
-    location: Location.Ref.make({ directory: AbsolutePath.make("/project") }),
+    location: Location.Ref.make({ directory: AbsolutePath.make(projectDirectory) }),
   })
 })
 
@@ -2198,6 +2235,107 @@ const verifyPartialFlushOnInterruption = (kind: FragmentKind) =>
   })
 
 describe("SessionRunnerLLM", () => {
+  it.effect("advertises a discovered project module and persists its successful V2 tool result", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      const session = yield* SessionV2.Service
+      const tools = path.join(projectDirectory, ".opencode", "tools")
+      const modulePath = path.join(tools, `${projectToolName}.js`)
+      yield* Effect.promise(async () => {
+        await fs.mkdir(tools, { recursive: true })
+        await Bun.write(
+          modulePath,
+          [
+            'import { tool } from "@opencode-ai/plugin"',
+            "export default tool({",
+            "  description: 'Read the staged project value',",
+            "  args: { query: tool.schema.string().describe('Project value to read') },",
+            "  async execute({ query }, context) {",
+            "    return { title: 'Project tool result', output: JSON.stringify({ query, sessionID: context.sessionID, messageID: context.messageID, agent: context.agent, directory: context.directory, worktree: context.worktree, signalAborted: context.abort.aborted }), metadata: { producer: 'project' }, attachments: [{ type: 'file', mime: 'text/plain', url: 'data:text/plain;base64,b2s=', filename: 'result.txt' }] }",
+            "  },",
+            "})",
+            "",
+          ].join("\n"),
+        )
+      })
+      yield* Effect.addFinalizer(() => Effect.promise(() => fs.rm(modulePath, { force: true })))
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({
+            id: "call-runner-project-tool",
+            name: projectToolName,
+            input: { query: "staged" },
+          }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        textTurn("text-runner-project-tool", "The project tool result is recorded"),
+      ]
+
+      const admitted = yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Use the staged project tool" }),
+      })
+      const waited = yield* session.wait(sessionID)
+      expect(waited).toMatchObject({ type: "completed", admittedSeq: admitted.admittedSeq })
+      const request = requests.find((item) => item.tools.some((tool) => tool.name === projectToolName))
+      const definition = request?.tools.find((tool) => tool.name === projectToolName)
+      expect(definition).toMatchObject({
+        description: "Read the staged project value",
+        inputSchema: {
+          type: "object",
+          properties: { query: { type: "string", description: "Project value to read" } },
+          required: ["query"],
+        },
+      })
+      const history = yield* session.context(sessionID)
+      const assistant = history.find(
+        (message): message is SessionMessage.Assistant =>
+          message.type === "assistant" &&
+          message.content.some((content) => content.type === "tool" && content.id === "call-runner-project-tool"),
+      )
+      if (!assistant) throw new Error("project tool assistant message was not persisted")
+      const tool = assistant.content.find(
+        (content): content is SessionMessage.AssistantTool =>
+          content.type === "tool" && content.id === "call-runner-project-tool",
+      )
+      if (!tool) throw new Error("project tool outcome was not persisted")
+      expect(tool.state.status).toBe("completed")
+      if (tool.state.status !== "completed") throw new Error("project tool did not complete")
+      expect(tool.state.structured).toMatchObject({
+        title: "Project tool result",
+        metadata: { producer: "project" },
+        attachments: [{ type: "file", mime: "text/plain", url: "data:text/plain;base64,b2s=", filename: "result.txt" }],
+      })
+      const result = tool.state.structured.output
+      if (typeof result !== "string") throw new Error("project tool output was not persisted as text")
+      expect(JSON.parse(result)).toEqual({
+        query: "staged",
+        sessionID,
+        messageID: assistant.id,
+        agent: AgentV2.ID.make("build"),
+        directory: projectDirectory,
+        worktree: projectDirectory,
+        signalAborted: false,
+      })
+      expect(tool.state.content).toEqual([
+        { type: "text", text: result },
+        { type: "file", uri: "data:text/plain;base64,b2s=", mime: "text/plain", name: "result.txt" },
+      ])
+      expect(
+        history.some(
+          (message) =>
+            message.type === "assistant" &&
+            message.content.some(
+              (content) => content.type === "text" && content.text === "The project tool result is recorded",
+            ),
+        ),
+      ).toBe(true)
+      expect(requests.length).toBeGreaterThanOrEqual(2)
+    }),
+  )
+
   it.effect("advertises and executes a globally attached application tool", () =>
     Effect.gen(function* () {
       yield* setup
@@ -2304,39 +2442,41 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
-  it.effect("retries the first provider turn after system context becomes available", () =>
-    Effect.gen(function* () {
-      yield* setup
-      const session = yield* SessionV2.Service
-      const { db } = yield* Database.Service
-      const messageID = SessionMessage.ID.create()
-      systemUnavailable = true
-      yield* session.prompt({ id: messageID, sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
-      requests.length = 0
+  it.effect(
+    "retries the first provider turn after system context becomes available",
+    () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        const { db } = yield* Database.Service
+        const messageID = SessionMessage.ID.create()
+        systemUnavailable = true
+        yield* session.prompt({ id: messageID, sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
+        requests.length = 0
 
-      const exit = yield* session.resume(sessionID).pipe(Effect.exit)
+        const exit = yield* session.resume(sessionID).pipe(Effect.exit)
 
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(SystemContext.InitializationBlocked)
-      expect(requests).toHaveLength(0)
-      expect(yield* SessionInput.hasPending(db, sessionID, "steer")).toBe(true)
-      expect(
-        yield* db
-          .select()
-          .from(SessionContextEpochTable)
-          .where(eq(SessionContextEpochTable.session_id, sessionID))
-          .get(),
-      ).toBeUndefined()
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(SystemContext.InitializationBlocked)
+        expect(requests).toHaveLength(0)
+        expect(yield* SessionInput.hasPending(db, sessionID, "steer")).toBe(true)
+        expect(
+          yield* db
+            .select()
+            .from(SessionContextEpochTable)
+            .where(eq(SessionContextEpochTable.session_id, sessionID))
+            .get(),
+        ).toBeUndefined()
 
-      systemUnavailable = false
-      const started = yield* Deferred.make<void>()
-      streamStartAcks.push(started)
-      yield* session.prompt({ id: messageID, sessionID, prompt: Prompt.make({ text: "First" }) })
-      yield* awaitStreamStart(started)
+        systemUnavailable = false
+        const started = yield* Deferred.make<void>()
+        streamStartAcks.push(started)
+        yield* session.prompt({ id: messageID, sessionID, prompt: Prompt.make({ text: "First" }) })
+        yield* awaitStreamStart(started)
 
-      expect(requests).toHaveLength(1)
-      expect(requests[0]?.messages.map((message) => message.role)).toEqual(["user"])
-    }),
+        expect(requests).toHaveLength(1)
+        expect(requests[0]?.messages.map((message) => message.role)).toEqual(["user"])
+      }),
     { timeout: 10_000 },
   )
 
@@ -5156,7 +5296,7 @@ describe("SessionRunnerLLM", () => {
           id: removedID,
           slug: removedID,
           projectID: Project.ID.global,
-          directory: "/project",
+          directory: projectDirectory,
           title: "test",
           version: "test",
           time: { created: 0, updated: 0 },
