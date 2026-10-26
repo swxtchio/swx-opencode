@@ -297,6 +297,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Tests
 
+- **#366** Make tool.shell metadata and running-output persistence tests wait for emitted and stored state. _Fork-only._
 - **#301** Stage the unrelated plugin inside the disposable config owner, replace symlinked install parents
   without following them, and serialize Config's detached SDK install with the fixture request. Require the consumer
   to resolve and use the workspace SDK `tool` export; preserve a linked source surrogate through injected failure
