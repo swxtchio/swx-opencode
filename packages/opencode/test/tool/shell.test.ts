@@ -247,6 +247,7 @@ const tappedShell = Effect.fn("ShellToolTest.tappedShell")(function* (
   chunks: Chunk[],
   consumed?: Queue.Queue<string>,
   clock?: TestClock,
+  liveKill = true,
 ) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
   const tapped = ChildProcessSpawner.make((command) =>
@@ -254,7 +255,7 @@ const tappedShell = Effect.fn("ShellToolTest.tappedShell")(function* (
       Effect.map((handle) =>
         ChildProcessSpawner.makeHandle({
           ...handle,
-          kill: (options) => (clock ? clock.withLive(handle.kill(options)) : handle.kill(options)),
+          kill: (options) => (clock && liveKill ? clock.withLive(handle.kill(options)) : handle.kill(options)),
           all: handle.all.pipe(
             Stream.flatMap((bytes) => {
               const text = Buffer.from(bytes).toString("utf-8")
@@ -1614,6 +1615,12 @@ type RunningOutputObservation = {
   settled: boolean
   snapshots: ToolWrite[]
 }
+type InterruptOutputObservation = {
+  part?: SessionV1.ToolPart
+  snapshots: ToolWrite[]
+  chunks: string[]
+  completed: boolean
+}
 
 const readToolWrites = Effect.fn("ShellToolTest.readToolWrites")(function* (sessionID: SessionID) {
   const database = yield* Database.Service
@@ -1648,7 +1655,9 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
   staged?: StagedOutput
   stagedIntervals?: StagedInterval[]
   clocked?: boolean
-  checkUnwritten?: (input: { part?: SessionV1.ToolPart; snapshots: ToolWrite[]; chunks: string[] }) => void
+  liveKill?: boolean
+  checkUnwritten?: (input: InterruptOutputObservation) => void
+  checkBeforeInterrupt?: (input: InterruptOutputObservation) => void
   checkRunning?: (input: RunningOutputObservation) => void
 }) {
   const sessions = yield* Session.Service
@@ -1658,7 +1667,7 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
   const consumed = yield* Queue.unbounded<string>()
   const downstream = { value: "" }
   const testClock = input.clocked ? yield* make() : undefined
-  const shell = yield* tappedShell(chunks, consumed, testClock)
+  const shell = yield* tappedShell(chunks, consumed, testClock, input.liveKill)
 
   yield* input.llm.tool(ShellID.ToolID, { command: input.command, description: "store test", timeout: input.timeout })
   const chat = yield* sessions.create({})
@@ -1723,6 +1732,7 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
   )
 
   const completed = { value: false }
+  const interrupted = Deferred.makeUnsafe<void>()
   const run = yield* handle
     .process({
       user: {
@@ -1741,6 +1751,7 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
       tools,
     })
     .pipe(
+      Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
       Effect.tap(() => Effect.sync(() => void (completed.value = true))),
       Effect.forkChild,
     )
@@ -1753,7 +1764,55 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
       "contains",
       `ShellTool did not consume ${marker} before interruption`,
     )
-    if (!testClock) {
+    if (testClock && input.timeout !== undefined) {
+      yield* waitForConsumed(
+        consumed,
+        downstream,
+        "before-timeout\n",
+        "contains",
+        "ShellTool did not consume before-timeout before its test-clock timeout",
+      )
+      yield* testClock.adjust(input.timeout + 100)
+      yield* ready
+      const part = (yield* MessageV2.parts(assistant.id)).find(
+        (part): part is SessionV1.ToolPart => part.type === "tool",
+      )
+      const snapshots = (yield* readToolWrites(chat.id)).filter(
+        (write) => write.part.state.status === "running" && runningOutput(write.part) !== "",
+      )
+      input.checkBeforeInterrupt?.({
+        part,
+        snapshots,
+        chunks: chunks.map((chunk) => chunk.text),
+        completed: completed.value,
+      })
+      const interruption = yield* Fiber.interrupt(run).pipe(Effect.forkChild({ startImmediately: true }))
+      const observedInterruption = Deferred.await(interrupted).pipe(
+        Effect.timeoutOrElse({
+          duration: "6 seconds",
+          orElse: () => Effect.fail(new Error("the timed-out Session run did not observe interruption")),
+        }),
+      )
+      yield* observedInterruption.pipe(
+        Effect.ensuring(
+          testClock
+            .adjust("3 seconds")
+            .pipe(
+              Effect.andThen(
+                Fiber.await(interruption).pipe(
+                  Effect.timeoutOrElse({
+                    duration: "6 seconds",
+                    orElse: () =>
+                      Effect.fail(new Error("the timeout-tail interruption did not settle after force-kill")),
+                  }),
+                ),
+              ),
+              Effect.asVoid,
+            )
+            .pipe(Effect.orDie),
+        ),
+      )
+    } else if (!testClock) {
       yield* ready
       yield* Fiber.interrupt(run)
     } else {
@@ -1765,7 +1824,7 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
       const snapshots = (yield* readToolWrites(chat.id)).filter(
         (write) => write.part.state.status === "running" && runningOutput(write.part) !== "",
       )
-      input.checkUnwritten?.({ part, snapshots, chunks: chunks.map((chunk) => chunk.text) })
+      input.checkUnwritten?.({ part, snapshots, chunks: chunks.map((chunk) => chunk.text), completed: completed.value })
       yield* Fiber.interrupt(run)
     }
   }
@@ -2053,6 +2112,16 @@ describe("tool.shell running output persistence", () => {
                 "trap 'echo timeout-tail; echo abort-marker' TERM; echo before-timeout; while :; do sleep 0.05; done",
               timeout: 1000,
               interruptOn: "abort-marker",
+              clocked: true,
+              liveKill: false,
+              checkBeforeInterrupt: (state) => {
+                expect(state.completed).toBe(false)
+                expect(state.part?.state.status).toBe("running")
+                expect(runningOutput(state.part!)).toContain("before-timeout\n")
+                expect(runningOutput(state.part!)).toContain("timeout-tail\nabort-marker\n")
+                expect(runningOutput(state.snapshots.at(-1)!.part)).toContain("timeout-tail\nabort-marker\n")
+                expect(state.chunks.join("")).toContain("timeout-tail\nabort-marker\n")
+              },
             })
             expect(result.settled?.state.status).toBe("error")
             if (result.settled?.state.status !== "error") return
