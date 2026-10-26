@@ -28,6 +28,20 @@ import launch from "cross-spawn"
 import { makeGlobalNode } from "./effect/app-node"
 import { filesystem, path } from "./effect/app-node-platform"
 
+// An abrupt owner exit skips scoped finalizers, so keep detached groups until cleanup completes or their leader releases them.
+type OwnedProcessGroup = { pid: number; cleanupOwed: boolean }
+type GroupOwner = { value: OwnedProcessGroup | undefined }
+type CleanupRequest = { value: { killSignal: NodeJS.Signals; forceKillAfter: Duration.Input } | undefined }
+
+const groups = new Set<OwnedProcessGroup>()
+let exitHooked = false
+const killGroups = () =>
+  groups.forEach((group) => {
+    try {
+      globalThis.process.kill(-group.pid, "SIGKILL")
+    } catch {}
+  })
+
 const toError = (err: unknown): Error => (err instanceof globalThis.Error ? err : new globalThis.Error(String(err)))
 
 const toTag = (err: NodeJS.ErrnoException): PlatformError.SystemErrorTag => {
@@ -271,7 +285,12 @@ export const make = Effect.gen(function* () {
     return { stdout, stderr, all: Stream.merge(stdout, stderr) }
   }
 
-  const spawn = (command: ChildProcess.StandardCommand, opts: NodeChildProcess.SpawnOptions) =>
+  const spawn = (
+    command: ChildProcess.StandardCommand,
+    opts: NodeChildProcess.SpawnOptions,
+    cleanupRequest: CleanupRequest,
+    groupOwner: GroupOwner,
+  ) =>
     Effect.callback<readonly [NodeChildProcess.ChildProcess, ExitSignal], PlatformError.PlatformError>((resume) => {
       const signal = Deferred.makeUnsafe<readonly [code: number | null, signal: NodeJS.Signals | null]>()
       const proc = launch(command.command, command.args, opts)
@@ -281,6 +300,14 @@ export const make = Effect.gen(function* () {
         resume(Effect.fail(toPlatformError("spawn", err, command)))
       })
       proc.on("exit", (...args) => {
+        const group = groupOwner.value
+        if (group) {
+          const abnormal = args[1] !== null || (args[0] !== null && args[0] !== 0)
+          group.cleanupOwed ||=
+            cleanupRequest.value !== undefined ||
+            (Predicate.isNotUndefined(command.options.forceKillAfter) && abnormal)
+          if (!group.cleanupOwed) groups.delete(group)
+        }
         exit = args
       })
       proc.on("close", (...args) => {
@@ -289,6 +316,15 @@ export const make = Effect.gen(function* () {
         Deferred.doneUnsafe(signal, Exit.succeed(exit ?? args))
       })
       proc.on("spawn", () => {
+        if (opts.detached && globalThis.process.platform !== "win32" && proc.pid !== undefined) {
+          const group = { pid: proc.pid, cleanupOwed: false }
+          groupOwner.value = group
+          groups.add(group)
+          if (!exitHooked) {
+            globalThis.process.once("exit", killGroups)
+            exitHooked = true
+          }
+        }
         resume(Effect.succeed([proc, signal]))
       })
       return Effect.sync(() => {
@@ -408,8 +444,13 @@ export const make = Effect.gen(function* () {
     exitSignal: ExitSignal,
     killSignal: NodeJS.Signals,
     forceKillAfter: Duration.Input,
+    groupOwner: GroupOwner,
     afterSignal = Effect.void,
   ) => {
+    if (groupOwner.value) {
+      groupOwner.value.cleanupOwed = true
+      groups.add(groupOwner.value)
+    }
     const send = (next: NodeJS.Signals) => {
       if (process.platform === "win32") return killGroup(command, proc, next)
       if (command.options.detached === false) return killOne(command, proc, next)
@@ -429,7 +470,15 @@ export const make = Effect.gen(function* () {
           Effect.andThen(waitForCleanupAfterKill(command, proc, exitSignal)),
           Effect.asVoid,
         ),
-    })
+    }).pipe(
+      Effect.andThen(
+        Effect.sync(() => {
+          if (!groupOwner.value) return
+          groups.delete(groupOwner.value)
+          groupOwner.value.cleanupOwed = false
+        }),
+      ),
+    )
   }
 
   const killOne = (
@@ -490,19 +539,23 @@ export const make = Effect.gen(function* () {
           const serr = stdio(command.options, "stderr")
           const extra = fds(command.options)
           const dir = yield* cwd(command.options)
-          const cleanupRequest: {
-            value: { killSignal: NodeJS.Signals; forceKillAfter: Duration.Input } | undefined
-          } = { value: undefined }
+          const cleanupRequest: CleanupRequest = { value: undefined }
+          const groupOwner: GroupOwner = { value: undefined }
 
           const [proc, signal] = yield* Effect.acquireRelease(
-            spawn(command, {
-              cwd: dir,
-              env: env(command.options),
-              stdio: stdios(sin, sout, serr, extra),
-              detached: command.options.detached ?? process.platform !== "win32",
-              shell: command.options.shell,
-              windowsHide: process.platform === "win32",
-            }),
+            spawn(
+              command,
+              {
+                cwd: dir,
+                env: env(command.options),
+                stdio: stdios(sin, sout, serr, extra),
+                detached: command.options.detached ?? process.platform !== "win32",
+                shell: command.options.shell,
+                windowsHide: process.platform === "win32",
+              },
+              cleanupRequest,
+              groupOwner,
+            ),
             Effect.fnUntraced(function* ([proc, signal]) {
               const done = yield* Deferred.isDone(signal)
               const kill = timeout(proc, command, command.options)
@@ -511,7 +564,14 @@ export const make = Effect.gen(function* () {
                 if (process.platform === "win32") return yield* Effect.void
                 const requested = cleanupRequest.value
                 if (requested)
-                  return yield* cleanupGroup(command, proc, signal, requested.killSignal, requested.forceKillAfter)
+                  return yield* cleanupGroup(
+                    command,
+                    proc,
+                    signal,
+                    requested.killSignal,
+                    requested.forceKillAfter,
+                    groupOwner,
+                  )
                 if (Predicate.isNull(code) && Predicate.isNotNull(exitSignal)) {
                   const forceKillAfter = command.options.forceKillAfter
                   if (Predicate.isUndefined(forceKillAfter))
@@ -522,6 +582,7 @@ export const make = Effect.gen(function* () {
                     signal,
                     command.options.killSignal ?? "SIGTERM",
                     forceKillAfter,
+                    groupOwner,
                   )
                 }
                 if (code !== 0 && Predicate.isNotNull(code)) {
@@ -533,6 +594,7 @@ export const make = Effect.gen(function* () {
                     signal,
                     command.options.killSignal ?? "SIGTERM",
                     forceKillAfter,
+                    groupOwner,
                   )
                 }
                 return yield* Effect.void
@@ -556,7 +618,7 @@ export const make = Effect.gen(function* () {
                 )
                 return yield* Effect.ignore(leader)
               }
-              return yield* cleanupGroup(command, proc, signal, sig, forceKillAfter, detach)
+              return yield* cleanupGroup(command, proc, signal, sig, forceKillAfter, groupOwner, detach)
             }),
           )
 
@@ -591,7 +653,7 @@ export const make = Effect.gen(function* () {
                 return send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
               }
               cleanupRequest.value = { killSignal: sig, forceKillAfter }
-              return cleanupGroup(command, proc, signal, sig, forceKillAfter)
+              return cleanupGroup(command, proc, signal, sig, forceKillAfter, groupOwner)
             },
             unref: Effect.sync(() => {
               if (ref) {

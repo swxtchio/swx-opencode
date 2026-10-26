@@ -232,9 +232,15 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
       yield* Effect.addFinalizer(() => Effect.sync(TuiAudio.dispose))
       const shutdown = yield* Deferred.make<unknown>()
       const onSighup = () => destroyRenderer(renderer)
+      const terminal = process.stdin.isTTY || process.stdout.isTTY
       yield* Effect.acquireRelease(
-        Effect.sync(() => process.on("SIGHUP", onSighup)),
-        () => Effect.sync(() => process.off("SIGHUP", onSighup)),
+        Effect.sync(() => {
+          if (terminal) process.on("SIGHUP", onSighup)
+        }),
+        () =>
+          Effect.sync(() => {
+            if (terminal) process.off("SIGHUP", onSighup)
+          }),
       )
       renderer.once("destroy", () => Deferred.doneUnsafe(shutdown, Effect.void))
       const pluginRuntime = createPluginRuntime()
