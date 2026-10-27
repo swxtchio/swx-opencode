@@ -58,6 +58,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const truncate = yield* Truncate.Service
   const flags = yield* RuntimeFlags.Service
 
+  const permissionRuleset = Permission.merge(input.agent.permission, input.session.permission ?? [])
   const context = (
     args: Record<string, unknown>,
     options: ToolExecutionOptions,
@@ -100,12 +101,19 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           ...req,
           sessionID: input.session.id,
           tool: { messageID: input.processor.message.id, callID: options.toolCallId },
-          ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
+          ruleset: permissionRuleset,
         })
         .pipe(
           AskLedger.abortable(options.abortSignal, () => new PermissionV1.RejectedError()),
           Effect.orDie,
         ),
+    assertNotDenied: (req) =>
+      permission.assertNotDenied({
+        ...req,
+        sessionID: input.session.id,
+        tool: { messageID: input.processor.message.id, callID: options.toolCallId },
+        ruleset: permissionRuleset,
+      }),
   })
 
   // Nothing a call runs, its plugin hooks included, may start before its processor has durably admitted it. A call

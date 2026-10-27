@@ -1,31 +1,50 @@
 import { describe, expect } from "bun:test"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
-import { Effect, Layer } from "effect"
+import { Deferred, Effect, Layer } from "effect"
 import { FetchHttpClient, HttpClient } from "effect/unstable/http"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Agent } from "../../src/agent/agent"
+import { EventV2Bridge } from "../../src/event-v2-bridge"
+import { InstanceBootstrap } from "../../src/project/bootstrap"
+import { InstanceStore } from "../../src/project/instance-store"
+import { Permission } from "../../src/permission"
 import { Truncate } from "@/tool/truncate"
-import { WebFetchTool } from "../../src/tool/webfetch"
+import { MAX_REDIRECTS, WebFetchTool } from "../../src/tool/webfetch"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { Tool } from "@/tool/tool"
 import { testEffect } from "../lib/effect"
 
+const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
 const it = testEffect(
-  LayerNode.compile(LayerNode.group([httpClient, Truncate.node, Agent.node]), [
-    [httpClient, FetchHttpClient.layer as Layer.Layer<HttpClient.HttpClient>],
-  ]),
+  LayerNode.compile(
+    LayerNode.group([
+      httpClient,
+      Truncate.node,
+      Agent.node,
+      Permission.node,
+      EventV2Bridge.node,
+      CrossSpawnSpawner.node,
+      InstanceStore.node,
+    ]),
+    [
+      [httpClient, FetchHttpClient.layer as Layer.Layer<HttpClient.HttpClient>],
+      [InstanceStore.bootstrapNode, noopBootstrap],
+    ],
+  ),
 )
 
 const ctx = {
   sessionID: SessionID.make("ses_test"),
   messageID: MessageID.make("msg_message"),
-  callID: "",
+  callID: "call_webfetch_test",
   agent: "build",
   abort: AbortSignal.any([]),
   messages: [],
   metadata: () => Effect.void,
-  ask: () => Effect.void,
 }
+const redirectChecks: string[] = []
 
 const withFetch = <A, E, R>(
   fetch: (req: Request) => Response | Promise<Response>,
@@ -37,13 +56,255 @@ const withFetch = <A, E, R>(
     (server) => Effect.sync(() => server.stop(true)),
   )
 
-const exec = Effect.fn("WebFetchToolTest.exec")(function* (args: Tool.InferParameters<typeof WebFetchTool>) {
+const exec = Effect.fn("WebFetchToolTest.exec")(function* (
+  args: Tool.InferParameters<typeof WebFetchTool>,
+  ruleset: PermissionV1.Ruleset = [{ permission: "webfetch", pattern: "*", action: "allow" }],
+) {
+  const permission = yield* Permission.Service
   const info = yield* WebFetchTool
   const tool = yield* info.init()
-  return yield* tool.execute(args, ctx)
+  return yield* tool.execute(args, {
+    ...ctx,
+    ask: (request) =>
+      permission.ask({
+        ...request,
+        sessionID: ctx.sessionID,
+        tool: { messageID: ctx.messageID, callID: ctx.callID },
+        ruleset,
+      }).pipe(Effect.orDie),
+    assertNotDenied: (request) =>
+      Effect.sync(() => redirectChecks.push(...request.patterns)).pipe(
+        Effect.andThen(
+          permission.assertNotDenied({
+            ...request,
+            sessionID: ctx.sessionID,
+            tool: { messageID: ctx.messageID, callID: ctx.callID },
+            ruleset,
+          }),
+        ),
+      ),
+  })
 })
 
+const expectNoPermissionAsk = <A, E, R>(self: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const permission = yield* Permission.Service
+    const events = yield* EventV2Bridge.Service
+    const asked = yield* Deferred.make<PermissionV1.Request>()
+    const unsubscribe = yield* events.listen((event) =>
+      event.type === Permission.Event.Asked.type
+        ? Deferred.succeed(asked, event.data as PermissionV1.Request).pipe(Effect.asVoid)
+        : Effect.void,
+    )
+    yield* Effect.addFinalizer(() => unsubscribe)
+
+    const outcome = yield* Effect.race(
+      self.pipe(Effect.map((value) => ({ type: "completed" as const, value }))),
+      Deferred.await(asked).pipe(Effect.map((request) => ({ type: "asked" as const, request }))),
+    )
+    if (outcome.type === "asked") return yield* Effect.fail(new Error("Webfetch opened a redirect permission request"))
+    expect(yield* permission.list()).toEqual([])
+    return outcome.value
+  }).pipe(
+    Effect.timeoutOrElse({
+      duration: "5 seconds",
+      orElse: () => Effect.fail(new Error("Webfetch neither completed nor opened a permission request")),
+    }),
+  )
+
 describe("tool.webfetch", () => {
+  it.instance("checks supported relative and absolute redirects before transport", () => {
+    const received: string[] = []
+    return withFetch(
+      (request) => {
+        const pathname = new URL(request.url).pathname
+        received.push(pathname)
+        if (pathname.startsWith("/status/")) {
+          return new Response("", {
+            status: Number(pathname.slice("/status/".length)),
+            headers: { location: "/target" },
+          })
+        }
+        if (pathname === "/absolute") {
+          return new Response("", { status: 302, headers: { location: new URL("/target", request.url).href } })
+        }
+        return new Response("redirect target", { headers: { "content-type": "text/plain" } })
+      },
+      (url) =>
+        Effect.gen(function* () {
+          for (const status of [301, 302, 303, 307, 308]) {
+            received.length = 0
+            redirectChecks.length = 0
+            const start = new URL(`/status/${status}`, url).href
+            const target = new URL("/target", url).href
+            const outcome = yield* Effect.exit(exec({ url: start, format: "text" }))
+
+            expect(outcome._tag).toBe("Success")
+            if (outcome._tag === "Success") expect(outcome.value.output).toBe("redirect target")
+            expect(received).toEqual([`/status/${status}`, "/target"])
+            expect(redirectChecks).toEqual([target])
+          }
+
+          received.length = 0
+          redirectChecks.length = 0
+          const start = new URL("/absolute", url).href
+          const target = new URL("/target", url).href
+          const outcome = yield* Effect.exit(exec({ url: start, format: "text" }))
+
+          expect(outcome._tag).toBe("Success")
+          if (outcome._tag === "Success") expect(outcome.value.output).toBe("redirect target")
+          expect(received).toEqual(["/absolute", "/target"])
+          expect(redirectChecks).toEqual([target])
+          expect(yield* (yield* Permission.Service).list()).toEqual([])
+        }),
+    )
+  })
+
+  it.instance("continues an ask-only redirect without creating a permission request", () => {
+    const received: string[] = []
+    return withFetch(
+      (request) => {
+        const pathname = new URL(request.url).pathname
+        received.push(pathname)
+        return pathname === "/start"
+          ? new Response("", { status: 302, headers: { location: "/target" } })
+          : new Response("ask-only target", { headers: { "content-type": "text/plain" } })
+      },
+      (url) =>
+        Effect.gen(function* () {
+          received.length = 0
+          redirectChecks.length = 0
+          const start = new URL("/start", url).href
+          const target = new URL("/target", url).href
+          const result = yield* expectNoPermissionAsk(
+            exec({ url: start, format: "text" }, [
+              { permission: "webfetch", pattern: "*", action: "allow" },
+              { permission: "webfetch", pattern: target, action: "ask" },
+            ]),
+          )
+
+          expect(result.output).toBe("ask-only target")
+          expect(received).toEqual(["/start", "/target"])
+          expect(redirectChecks).toEqual([target])
+        }),
+    )
+  })
+
+  it.instance("checks a later absolute redirect against deny rules before the server receives it", () => {
+    const received: string[] = []
+    return withFetch(
+      (request) => {
+        const pathname = new URL(request.url).pathname
+        received.push(pathname)
+        if (pathname === "/start") return new Response("", { status: 302, headers: { location: "/middle" } })
+        if (pathname === "/middle") {
+          return new Response("", { status: 307, headers: { location: new URL("/denied", request.url).href } })
+        }
+        return new Response("should not be requested", { headers: { "content-type": "text/plain" } })
+      },
+      (url) =>
+        Effect.gen(function* () {
+          received.length = 0
+          redirectChecks.length = 0
+          const start = new URL("/start", url).href
+          const denied = new URL("/denied", url).href
+          const outcome = yield* expectNoPermissionAsk(
+            Effect.exit(
+              exec({ url: start, format: "text" }, [
+                { permission: "webfetch", pattern: "*", action: "allow" },
+                { permission: "webfetch", pattern: denied, action: "deny" },
+              ]),
+            ),
+          )
+
+          expect(outcome._tag).toBe("Failure")
+          expect(received).toEqual(["/start", "/middle"])
+          expect(redirectChecks).toEqual([new URL("/middle", url).href, denied])
+        }),
+    )
+  })
+
+  it.instance("rejects unsupported redirects and bounds redirect chains", () => {
+    const received: string[] = []
+    let loopRequests = 0
+    return withFetch(
+      (request) => {
+        const pathname = new URL(request.url).pathname
+        received.push(pathname)
+        if (pathname === "/unsupported") {
+          return new Response("", { status: 301, headers: { location: "file:///etc/passwd" } })
+        }
+        if (pathname === "/loop") {
+          loopRequests++
+          if (loopRequests <= MAX_REDIRECTS + 1) {
+            return new Response("", { status: 302, headers: { location: "/loop" } })
+          }
+          return new Response("end", { status: 404 })
+        }
+        return new Response("unexpected", { headers: { "content-type": "text/plain" } })
+      },
+      (url) =>
+        Effect.gen(function* () {
+          received.length = 0
+          redirectChecks.length = 0
+          const unsupported = new URL("/unsupported", url).href
+          const unsupportedResult = yield* expectNoPermissionAsk(Effect.exit(exec({ url: unsupported, format: "text" })))
+
+          expect(unsupportedResult._tag).toBe("Failure")
+          expect(received).toEqual(["/unsupported"])
+          expect(redirectChecks).toEqual([])
+
+          received.length = 0
+          redirectChecks.length = 0
+          loopRequests = 0
+          const loop = new URL("/loop", url).href
+          const loopResult = yield* expectNoPermissionAsk(Effect.exit(exec({ url: loop, format: "text" })))
+
+          expect(loopResult._tag).toBe("Failure")
+          expect(received).toHaveLength(MAX_REDIRECTS + 1)
+          expect(redirectChecks).toHaveLength(MAX_REDIRECTS)
+          expect(yield* (yield* Permission.Service).list()).toEqual([])
+        }),
+    )
+  })
+
+  it.instance("rechecks every redirect after a Cloudflare challenge retry", () => {
+    const received: Array<{ path: string; agent: string | null }> = []
+    return withFetch(
+      (request) => {
+        const pathname = new URL(request.url).pathname
+        const agent = request.headers.get("user-agent")
+        received.push({ path: pathname, agent })
+        if (pathname === "/challenge" && agent !== "opencode") {
+          return new Response("challenge", { status: 403, headers: { "cf-mitigated": "challenge" } })
+        }
+        if (pathname === "/challenge") {
+          return new Response("", { status: 302, headers: { location: new URL("/target", request.url).href } })
+        }
+        return new Response("retried target", { headers: { "content-type": "text/plain" } })
+      },
+      (url) =>
+        Effect.gen(function* () {
+          received.length = 0
+          redirectChecks.length = 0
+          const start = new URL("/challenge", url).href
+          const target = new URL("/target", url).href
+          const result = yield* expectNoPermissionAsk(
+            exec({ url: start, format: "text" }, [
+              { permission: "webfetch", pattern: "*", action: "allow" },
+              { permission: "webfetch", pattern: target, action: "ask" },
+            ]),
+          )
+
+          expect(result.output).toBe("retried target")
+          expect(received.map((request) => request.path)).toEqual(["/challenge", "/challenge", "/target"])
+          expect(received[1]?.agent).toBe("opencode")
+          expect(received[2]?.agent).toBe("opencode")
+          expect(redirectChecks).toEqual([target])
+        }),
+    )
+  })
+
   it.instance("returns image responses as file attachments", () =>
     Effect.gen(function* () {
       const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])

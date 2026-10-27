@@ -92,6 +92,7 @@ export function merge(...rulesets: Permission.Ruleset[]): Permission.Ruleset {
 export interface Interface {
   readonly ask: (input: AssertInput) => EffectRuntime.Effect<AskResult, SessionV2.NotFoundError>
   readonly assert: (input: AssertInput) => EffectRuntime.Effect<void, Error | SessionV2.NotFoundError>
+  readonly assertNotDenied: (input: AssertInput) => EffectRuntime.Effect<void, BlockedError | SessionV2.NotFoundError>
   readonly reply: (input: ReplyInput) => EffectRuntime.Effect<void, NotFoundError>
   readonly get: (id: ID) => EffectRuntime.Effect<Request | undefined>
   readonly forSession: (sessionID: SessionV2.ID) => EffectRuntime.Effect<ReadonlyArray<Request>>
@@ -217,6 +218,12 @@ const layer = Layer.effect(
       ),
     )
 
+    const assertNotDenied = EffectRuntime.fn("PermissionV2.assertNotDenied")(function* (input: AssertInput) {
+      const result = yield* evaluateInput(input)
+      if (result.effect !== "deny") return
+      return yield* new BlockedError({ rules: relevant(input, result.rules) })
+    })
+
     const reply = EffectRuntime.fn("PermissionV2.reply")((input: ReplyInput) =>
       EffectRuntime.uninterruptible(
         EffectRuntime.gen(function* () {
@@ -297,7 +304,7 @@ const layer = Layer.effect(
       return Array.from(pending.values(), (item) => item.request).filter((request) => request.sessionID === sessionID)
     })
 
-    return Service.of({ ask, assert, reply, get, forSession, list })
+    return Service.of({ ask, assert, assertNotDenied, reply, get, forSession, list })
   }),
 )
 

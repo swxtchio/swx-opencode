@@ -1105,6 +1105,52 @@ it.instance(
 )
 
 it.instance(
+  "assertNotDenied - permits ask-only destinations without opening a request",
+  () =>
+    Effect.gen(function* () {
+      const permission = yield* Permission.Service
+      const events = yield* EventV2Bridge.Service
+      const input = {
+        sessionID: SessionID.make("session_deny_only"),
+        permission: "webfetch",
+        patterns: ["https://example.com/target"],
+        metadata: { url: "https://example.com/target" },
+        always: ["*"],
+        ruleset: [{ permission: "webfetch", pattern: "*", action: "ask" }],
+      } satisfies PermissionV1.AskInput
+      const asked = yield* Deferred.make<PermissionV1.Request>()
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === Permission.Event.Asked.type
+          ? Deferred.succeed(asked, event.data as PermissionV1.Request).pipe(Effect.asVoid)
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const outcome = yield* Effect.race(
+        permission.assertNotDenied(input).pipe(Effect.as("continued" as const)),
+        Deferred.await(asked).pipe(Effect.as("asked" as const)),
+      ).pipe(
+        Effect.timeoutOrElse({
+          duration: "1 second",
+          orElse: () => Effect.fail(new Error("deny-only permission check did not finish or ask")),
+        }),
+      )
+      expect(outcome).toBe("continued")
+      expect(yield* list()).toHaveLength(0)
+
+      const error = yield* fail(
+        permission.assertNotDenied({
+          ...input,
+          ruleset: [{ permission: "webfetch", pattern: "*", action: "deny" }],
+        }),
+      )
+      expect(error).toBeInstanceOf(PermissionV1.DeniedError)
+      expect(yield* list()).toHaveLength(0)
+    }),
+  { git: true },
+)
+
+it.instance(
   "ask - allows all patterns when all match allow rules",
   () =>
     Effect.gen(function* () {

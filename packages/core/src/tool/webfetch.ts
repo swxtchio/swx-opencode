@@ -2,7 +2,7 @@ export * as WebFetchTool from "./webfetch"
 
 import { ToolFailure } from "@opencode-ai/llm"
 import { Duration, Effect, Layer, Schema } from "effect"
-import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
+import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Parser } from "htmlparser2"
 import TurndownService from "turndown"
 import { makeLocationNode } from "../effect/app-node"
@@ -86,8 +86,38 @@ const assertHttpUrl = (url: URL) => {
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("URL must use http:// or https://")
 }
 
-const execute = (http: HttpClient.HttpClient, url: string, format: Format, userAgent = browserUserAgent) =>
-  http.execute(request(url, format, userAgent)).pipe(Effect.flatMap(HttpClientResponse.filterStatusOk))
+export const MAX_REDIRECTS = 10
+const redirectStatuses = new Set([301, 302, 303, 307, 308])
+
+// Follows redirects here instead of in fetch so each new URL is checked against the permission rules first.
+const execute = (
+  http: HttpClient.HttpClient,
+  check: (url: string) => Effect.Effect<void, Error>,
+  url: string,
+  format: Format,
+  userAgent = browserUserAgent,
+  redirects = 0,
+): Effect.Effect<HttpClientResponse.HttpClientResponse, Error> =>
+  http.execute(request(url, format, userAgent)).pipe(
+    Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
+    Effect.flatMap((response) => {
+      const location = response.headers.location
+      if (!redirectStatuses.has(response.status) || !location) return HttpClientResponse.filterStatusOk(response)
+      if (redirects >= MAX_REDIRECTS) return Effect.fail(new Error(`Too many redirects (more than ${MAX_REDIRECTS})`))
+      return Effect.gen(function* () {
+        const next = yield* Effect.try({
+          try: () => {
+            const target = new URL(location, url)
+            assertHttpUrl(target)
+            return target.href
+          },
+          catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+        })
+        yield* check(next)
+        return yield* execute(http, check, next, format, userAgent, redirects + 1)
+      })
+    }),
+  )
 
 const collectBody = (response: HttpClientResponse.HttpClientResponse) =>
   collectBoundedResponseBody(
@@ -146,8 +176,19 @@ const layer = Layer.effectDiscard(
               })
 
               const { body, contentType } = yield* Effect.gen(function* () {
-                const response = yield* execute(http, input.url, input.format).pipe(
-                  Effect.catchIf(isCloudflareChallenge, () => execute(http, input.url, input.format, "opencode")),
+                const check = (url: string) =>
+                  permission.assertNotDenied({
+                    action: name,
+                    resources: [url],
+                    metadata: { ...input, url },
+                    sessionID: context.sessionID,
+                    agent: context.agent,
+                    source: { type: "tool", messageID: context.assistantMessageID, callID: context.toolCallID },
+                  })
+                const response = yield* execute(http, check, input.url, input.format).pipe(
+                  Effect.catchIf(isCloudflareChallenge, () =>
+                    execute(http, check, input.url, input.format, "opencode"),
+                  ),
                 )
                 const contentType = response.headers["content-type"] || ""
                 const mime = mimeFrom(contentType)
