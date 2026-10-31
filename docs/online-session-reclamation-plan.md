@@ -10,3 +10,14 @@ Authority: swxtchio/swx-opencode#353, “Ask” and the task brief’s “Need�
 - Reclaim only when the existing store reports incremental auto-vacuum support. Use positive page-bounded vacuum steps with passive checkpoints between them, outside deletion transactions; recheck the caller’s free-space reserve before every mutating step.
 - Emit one JSON result on stdout, keep diagnostics on stderr, and preserve committed progress, completed and remaining Sessions, protected residue, outstanding checkpoint/freelist work, per-batch lock duration, and separate page and filesystem-allocation measurements across failures and retries.
 - The producer contract is published in [issue #353's contract comment](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6537686549), with the round-two correction in the [latest issue comment](https://github.com/swxtchio/swx-opencode/issues/353). Producer-driven CLI tests cover >10k-row adversarially ordered histories, indexed-proof plan refusals, reader-pinned reclaim debt, Session-row byte/capacity limits, bounded partial work, late cross-Session Parts and live-writer progress; `docs/dead-session-retirement.md` and `CHANGESET.md` record the interface.
+
+## Round-three correction sequence
+
+The next fixes preserve the settled no-validation-row-cap contract and keep unbounded historical work out of SQLite writer transactions:
+
+1. Remove whole-table index construction from automatic startup migrations. Provide a resumable, bounded existing-store proof/index preparation path; online inventory refuses until its required proof structures are complete, while fresh stores continue to receive their indexes from the empty schema.
+2. Restore inventory detection for historical cross-Session Part references using bounded, indexed/resumable work. Inventory must refuse before deletion begins; retain the in-lock late-reference guard.
+3. Replace queue-driven alias joins with Session-scoped bounded existence, high-water and keyset proofs. Add work-observing coverage for large alias-free queue histories, and make the activity regression fail if its indexed latest-value seek becomes a whole-history aggregate.
+4. Move the historical event-writer census out of each `BEGIN IMMEDIATE` batch, process it in bounded pages, and bind its result to the durable event fence revalidated under the lock.
+
+Each correction lands with a producer-driven regression in its own commit. After all required findings pass the complete prune suite, Core/OpenCode typechecks, and lint/format checks, update and push the existing draft PR #369 for round-four review.
