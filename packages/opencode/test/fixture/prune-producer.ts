@@ -48,6 +48,7 @@ type Create = {
 
 const input = JSON.parse(serialized) as {
   create?: Create | Create[]
+  bulkMessages?: { sessionID: string; count: number }
   touch?: string
   crossPart?: { sessionID: string; messageID: string }
   queue?: string
@@ -65,6 +66,7 @@ const input = JSON.parse(serialized) as {
   holdSessionID?: string
   hold?: boolean
   holdAfterSignal?: { startFile: string; readyFile: string }
+  readerAfterSignal?: { readyFile: string }
 }
 
 if (input.queueAfterSignal && !input.queueAfterSignal.registerBeforeSignal) {
@@ -105,6 +107,57 @@ const produce = Effect.gen(function* () {
   const todo = yield* Todo.Service
   const events = yield* EventV2Bridge.Service
   const { db } = yield* Database.Service
+  if (input.bulkMessages) {
+    const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
+    yield* Effect.promise(async () => {
+      const bulk = new sqlite.Database(filename)
+      try {
+        const insert = bulk.query(
+          "INSERT INTO message (id, session_id, admission_seq, time_created, time_updated, data) VALUES (?, ?, 0, ?, ?, ?)",
+        )
+        const start = Date.now() - input.bulkMessages!.count - 20_000
+        bulk.transaction(() => {
+          Array.from({ length: input.bulkMessages!.count }, (_, index) => index).forEach((index) => {
+            const timestamp = start + index
+            insert.run(
+              `msg-large-history-${String(index).padStart(6, "0")}`,
+              input.bulkMessages!.sessionID,
+              timestamp,
+              timestamp,
+              JSON.stringify({
+                role: "user",
+                sessionID: input.bulkMessages!.sessionID,
+                time: { created: timestamp, updated: timestamp },
+              }),
+            )
+          })
+        })()
+      } finally {
+        bulk.close()
+      }
+    })
+  }
+  if (input.readerAfterSignal) {
+    const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
+    const reader = new sqlite.Database(filename, { readonly: true })
+    try {
+      reader.exec("BEGIN")
+      reader.query("SELECT count(*) FROM session").get()
+      const readyFile = input.readerAfterSignal.readyFile
+      yield* Effect.promise(async () => {
+        await Bun.write(readyFile, "ready\n")
+        console.log(`PRUNE_READER_READY ${process.pid}`)
+        await new Promise<void>((resolve) => {
+          process.stdin.once("end", resolve)
+          process.stdin.once("close", resolve)
+          process.stdin.resume()
+        })
+      })
+    } finally {
+      if (reader.inTransaction) reader.exec("ROLLBACK")
+      reader.close()
+    }
+  }
   if (input.queueAfterSignal?.registerBeforeSignal) {
     console.log(`PRUNE_REGISTERED ${process.pid}`)
     yield* Effect.promise(async () => {

@@ -1,6 +1,6 @@
 import { afterAll, expect, spyOn, test } from "bun:test"
 import { Database, type SQLQueryBindings } from "bun:sqlite"
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, statfsSync, writeFileSync } from "node:fs"
 import {
   chmod,
   copyFile,
@@ -123,6 +123,7 @@ type Report = {
     bounds?: Record<string, number>
     remainingFreelistPages?: number | null
     remainingWalFrames?: number | null
+    outstanding?: string[]
     steps?: Record<string, unknown>[]
     allocatedBytes?: { status: string; totalBytes?: number }
     allocatedBytesBefore?: { status: string; totalBytes?: number }
@@ -886,35 +887,99 @@ test("online prune bounds one large Session, retries partial progress, and never
   expect(missingRetry.refusalReasons).toContain("session-not-found")
 })
 
-test(
-  "online prune stops evidence work at the per-session validation bound on a durable event stream",
+test.serial(
+  "online prune deletes an event history beyond the former validation cap in keyset batches",
   async () => {
-    const create = { payloadBytes: 512 * 1024, eventCount: 10_000 }
-    await using store = await producedStore([create], { timeout: 180_000 })
+    const create = { payloadBytes: 512 * 1024, eventCount: 10_100 }
+    await using store = await producedStore([create], { timeout: 240_000 })
     const selected = produce(store, { create })
     const sessionID = selected.created[0]!.id
-    const cutoffAt = Date.now() - 5
-    const cutoff = new Date(cutoffAt).toISOString()
-    backdateSession(store.filename, sessionID, cutoffAt - 1_000)
     const before = ownedCounts(store.filename, sessionID)
 
-    const inventory = parseReport(
-      await runCLI(store, ["--online", "--before", cutoff, "--session", sessionID, "--reserve-bytes", "1"], 0, {
-        timeout: 180_000,
-      }),
+    const applied = parseReport(
+      await runCLI(
+        store,
+        [
+          "--online",
+          "--session",
+          sessionID,
+          "--apply",
+          "--reserve-bytes",
+          "1",
+          "--batch-rows",
+          "256",
+          "--max-batches",
+          "100",
+        ],
+        0,
+        { timeout: 300_000 },
+      ),
     )
-    expect(inventory.action).toBe("inventory")
-    expect(inventory.reclamation.bounds?.validationRows).toBe(10_000)
-    expect(inventory.deletionScope.sessionIDs).toEqual([])
-    expect(inventory.skippedSessions?.find((item) => item.sessionID === sessionID)?.reasons).toContain(
-      "session-validation-bound-reached",
-    )
-    expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+    expect(applied.action).toBe("applied")
+    expect(applied.deletedSessionIDs).toEqual([sessionID])
+    expect(applied.changedRows).toBeGreaterThan(10_000)
+    expect(applied.batches!.length).toBeGreaterThan(5)
+    expect(applied.batches!.every((batch) => Number(batch.changedRows) <= 256)).toBe(true)
+    expect(applied.batches!.every((batch) => typeof batch.lockDurationMs === "number")).toBe(true)
+    expect(Object.values(ownedCounts(store.filename, sessionID)).every((count) => count === 0)).toBe(true)
+    expect(before.event).toBeGreaterThan(10_000)
   },
-  { timeout: 180_000 },
+  { timeout: 360_000 },
 )
 
-test("online prune uses the contract reason for bounded hierarchy validation", async () => {
+test.serial(
+  "online prune keyset-pages a large message history by time and ID",
+  async () => {
+    await using store = await producedStore([{ payloadBytes: 128 }])
+    const sessionID = produce(store, { create: { payloadBytes: 128 } }).created[0].id
+    await produceLive(store, { bulkMessages: { sessionID, count: 10_100 } })
+
+    const applied = parseReport(
+      await runCLI(
+        store,
+        [
+          "--online",
+          "--session",
+          sessionID,
+          "--apply",
+          "--reserve-bytes",
+          "1",
+          "--batch-rows",
+          "256",
+          "--max-batches",
+          "100",
+        ],
+        0,
+        { timeout: 180_000 },
+      ),
+    )
+    expect(applied.action).toBe("applied")
+    expect(applied.deletedSessionIDs).toEqual([sessionID])
+    expect(applied.changedRows).toBeGreaterThan(10_100)
+    expect(applied.batches!.length).toBeGreaterThan(5)
+    expect(applied.batches!.every((batch) => Number(batch.changedRows) <= 256)).toBe(true)
+    expect(applied.batches!.every((batch) => typeof batch.lockDurationMs === "number")).toBe(true)
+    expect(Object.values(ownedCounts(store.filename, sessionID)).every((count) => count === 0)).toBe(true)
+  },
+  { timeout: 240_000 },
+)
+
+test("online inventory refuses when message and event keyset-order indexes are missing", async () => {
+  await using store = await producedStore([{ payloadBytes: 128 }])
+  const sessionID = store.metadata[0].created[0].id
+  const db = new Database(store.filename)
+  db.exec("DROP INDEX message_session_time_created_id_idx; DROP INDEX event_aggregate_seq_idx")
+  db.close()
+
+  const inventory = parseReport(await runCLI(store, ["--online", "--session", sessionID, "--reserve-bytes", "1"]))
+  expect(inventory.action).toBe("inventory")
+  expect(inventory.reclamation.ready).toBe(false)
+  expect(inventory.reclamation.reasons).toContain("online-scope-index-unavailable:message.session_id.time_created.id")
+  expect(inventory.reclamation.reasons).toContain("online-scope-index-unavailable:event.aggregate_id.seq")
+  expect(inventory.deletionScope.sessionIDs).toEqual([])
+})
+
+test("online prune still protects parent cycles without a validation-row cap", async () => {
   await using store = await producedStore([{}])
   const sessionID = store.metadata[0].created[0].id
   const db = new Database(store.filename)
@@ -924,9 +989,7 @@ test("online prune uses the contract reason for bounded hierarchy validation", a
   const inventory = parseReport(await runCLI(store, ["--online", "--session", sessionID, "--reserve-bytes", "1"]))
   const reasons = inventory.excludedSessions.find((item) => item.sessionID === sessionID)?.reasons ?? []
   expect(reasons).toContain("parent-cycle")
-  expect(reasons).toContain("session-validation-bound-reached")
-  expect(reasons).not.toContain("session-parent-validation-bound-reached")
-  expect(reasons).not.toContain("session-tree-validation-bound-reached")
+  expect(reasons).not.toContain("session-validation-bound-reached")
   expect(inventory.deletionScope.sessionIDs).toEqual([])
 })
 
@@ -964,6 +1027,92 @@ test("online prune retains a payload row that exceeds the requested byte bound",
   expect(partial.batches?.[0]?.payloadBytes).toBeLessThanOrEqual(1_048_576)
   expect(ownedCounts(store.filename, sessionID).part).toBe(before.part)
   expect(ownedCounts(store.filename, sessionID).session).toBe(1)
+})
+
+test.serial("online prune bounds Session TEXT payload and checks reserve before deleting its row", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const sessionID = store.metadata[0].created[0].id
+  const db = new Database(store.filename)
+  db.query("UPDATE session SET revert = ? WHERE id = ?").run(
+    JSON.stringify({ diff: "x".repeat(3 * 1024 * 1024) }),
+    sessionID,
+  )
+  db.close()
+
+  const sizeBound = await invokeHandler(store, {
+    database: store.filename,
+    online: true,
+    session: [sessionID],
+    apply: true,
+    reserveBytes: 1,
+    batchRows: 64,
+    batchBytes: 2 * 1024 * 1024,
+  })
+  expect(sizeBound.report.action).toBe("failed")
+  expect(sizeBound.report.partialSessionIDs).toEqual([sessionID])
+  expect(sizeBound.report.skippedSessions?.find((item) => item.sessionID === sessionID)?.reasons).toContain(
+    `session-payload-exceeds-batch-byte-bound:session:${sessionID}`,
+  )
+  expect(ownedCounts(store.filename, sessionID).session).toBe(1)
+
+  const update = new Database(store.filename)
+  update
+    .query("UPDATE session SET revert = ? WHERE id = ?")
+    .run(JSON.stringify({ diff: "x".repeat(2 * 1024 * 1024) }), sessionID)
+  update.close()
+  const probe = await invokeHandler(store, {
+    database: store.filename,
+    online: true,
+    session: [sessionID],
+    reserveBytes: 1,
+    batchRows: 1,
+    batchBytes: 4 * 1024 * 1024,
+  })
+  const availableBytes = probe.report.reclamation.availableBytes
+  const plannedPeakBytes = probe.report.reclamation.plannedPeakBytes
+  if (typeof availableBytes !== "number" || typeof plannedPeakBytes !== "number")
+    throw new Error("capacity fixture could not measure free space")
+  const capacityMarginBytes = 64 * 1024 * 1024
+  const reserveBytes = availableBytes - plannedPeakBytes - capacityMarginBytes
+  expect(reserveBytes).toBeGreaterThan(0)
+
+  const fillerPath = path.join(store.directory, "online-session-capacity-filler")
+  const fillerBytes = Math.floor(plannedPeakBytes + capacityMarginBytes - 3 * 1024 * 1024)
+  const original = Database.prototype.exec
+  let injected = false
+  let availableAfterFiller: number | undefined
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+    const result = original.call(this, statement)
+    if (statement === "BEGIN IMMEDIATE" && !injected) {
+      injected = true
+      writeFileSync(fillerPath, "x".repeat(fillerBytes))
+      const filesystem = statfsSync(store.directory)
+      availableAfterFiller = filesystem.bavail * filesystem.bsize
+    }
+    return result
+  })
+  try {
+    const capacityBound = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      apply: true,
+      reserveBytes,
+      batchRows: 1,
+      batchBytes: 4 * 1024 * 1024,
+    })
+    if (!injected) throw new Error(`capacity fixture was not reached: ${JSON.stringify(capacityBound.report)}`)
+    if (availableAfterFiller === undefined) throw new Error("capacity fixture did not measure post-fill free space")
+    expect(availableAfterFiller).toBeLessThan(reserveBytes + 4 * 1024 * 1024)
+    expect(capacityBound.report.action).toBe("refused")
+    expect(capacityBound.report.changedRows).toBe(0)
+    expect(capacityBound.report.refusalReasons).toContain("capacity-reserve-reached")
+    expect(capacityBound.report.remainingSessionIDs).toEqual([sessionID])
+    expect(ownedCounts(store.filename, sessionID).session).toBe(1)
+  } finally {
+    exec.mockRestore()
+    await rm(fillerPath, { force: true })
+  }
 })
 
 test("online prune revalidates and completes a durable event history over several batches", async () => {
@@ -1352,6 +1501,75 @@ test(
   { timeout: 60_000 },
 )
 
+test.serial(
+  "online prune completes multi-batch deletion while a registered reader pins PASSIVE checkpoints",
+  async () => {
+    const create = { payloadBytes: 512 * 1024, eventCount: 600 }
+    await using store = await producedStore([create], { timeout: 90_000 })
+    const sessionID = produce(store, { create }).created[0].id
+    const readyFile = path.join(store.directory, "online-reader-ready")
+    await using reader = startProducer(store, { readerAfterSignal: { readyFile } })
+    let readerReady = false
+    try {
+      await readMatchingLine(reader, "PRUNE_READER_READY ")
+      readerReady = true
+      expect(await Bun.file(readyFile).exists()).toBe(true)
+      const applied = await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        session: [sessionID],
+        apply: true,
+        reserveBytes: 1,
+        batchRows: 64,
+        maxBatches: 100,
+        vacuumPages: 32,
+      })
+      expect(applied.report.action).toBe("failed")
+      expect(applied.report.committed).toBe(true)
+      expect(applied.report.deletedSessionIDs).toEqual([sessionID])
+      expect(applied.report.partialSessionIDs).toEqual([])
+      expect(applied.report.remainingSessionIDs).toEqual([])
+      expect(applied.report.batches!.length).toBeGreaterThan(1)
+      expect(applied.report.reclamation.outstanding).toContain("wal-checkpoint-incomplete")
+      expect(applied.report.reclamation.remainingWalFrames).toBeGreaterThan(0)
+      expect(ownedCounts(store.filename, sessionID).session).toBe(0)
+
+      const reclaimOnly = await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        reclaimOnly: true,
+        apply: true,
+        reserveBytes: 1,
+        vacuumPages: 32,
+      })
+      expect(reclaimOnly.report.action).toBe("failed")
+      expect(reclaimOnly.report.changedRows).toBe(0)
+      expect(reclaimOnly.report.deletedSessionIDs).toEqual([])
+      expect(reclaimOnly.report.reclamation.outstanding).toContain("wal-checkpoint-incomplete")
+      expect(reclaimOnly.report.reclamation.remainingWalFrames).toBeGreaterThan(0)
+    } finally {
+      if (readerReady) {
+        reader.child.stdin.write("release\n")
+        reader.child.stdin.end()
+      }
+      assertChildOutcome(await reader.finish(), 0)
+    }
+
+    const reclaimed = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      reclaimOnly: true,
+      apply: true,
+      reserveBytes: 1,
+      vacuumPages: 32,
+    })
+    expect(reclaimed.report.action).toBe("applied")
+    expect(reclaimed.report.reclamation.remainingWalFrames).toBe(0)
+    expect(reclaimed.report.reclamation.outstanding).toEqual([])
+  },
+  { timeout: 120_000 },
+)
+
 test("online prune revalidates newly admitted work before the first delete transaction", async () => {
   await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
   const selected = produce(store, { create: { payloadBytes: 512 * 1024 } })
@@ -1439,8 +1657,8 @@ test("online prune revalidates newly admitted work before the first delete trans
   }
 })
 
-test(
-  "online prune does not misreport bounded in-lock evidence as changed",
+test.serial(
+  "online prune detects late in-lock rows with the monotonic fence",
   async () => {
     await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
     const sessionID = store.metadata[0].created[0].id
@@ -1472,8 +1690,8 @@ test(
       expect(injected).toBe(true)
       expect(refused.report.action).toBe("refused")
       expect(refused.report.changedRows).toBe(0)
-      expect(reasons).toContain("session-validation-bound-reached")
-      expect(reasons).not.toContain("session-changed-after-inventory")
+      expect(reasons).toContain("session-changed-after-inventory")
+      expect(reasons).not.toContain("session-validation-bound-reached")
       expect(ownedCounts(store.filename, sessionID)).toEqual(before)
     } finally {
       exec.mockRestore()
@@ -1482,8 +1700,8 @@ test(
   { timeout: 60_000 },
 )
 
-test(
-  "online prune does not call a bounded revalidated tree a changed tree",
+test.serial(
+  "online prune detects a new unselected descendant with an indexed tree probe",
   async () => {
     await using store = await producedStore([{}])
     const parentID = produce(store, { create: {} }).created[0].id
@@ -1518,7 +1736,7 @@ test(
       })
       const reasons = applied.report.skippedSessions?.find((item) => item.sessionID === parentID)?.reasons ?? []
       expect(injected).toBe(true)
-      expect(reasons).toContain("session-validation-bound-reached")
+      expect(reasons.some((reason) => reason.startsWith("protected-descendant:"))).toBe(true)
       expect(reasons).not.toContain("session-tree-changed")
       expect(applied.report.remainingSessionIDs).toContain(parentID)
       expect(ownedCounts(store.filename, parentID).session).toBe(1)
