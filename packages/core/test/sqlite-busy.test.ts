@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test"
-import { Database } from "@opencode-ai/core/database/database"
+import { Database } from "../src/database/database"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
-import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, References } from "effect"
 import { isSqlError } from "effect/unstable/sql/SqlError"
 import { SqlClient } from "effect/unstable/sql/SqlClient"
 import { Sqlite } from "../src/database/sqlite"
+import { layer } from "../src/database/sqlite.bun"
 import {
   countStatement,
   newStatementAttempts,
@@ -18,7 +19,7 @@ import { tmpdir } from "./fixture/tmpdir"
 const nodeSqliteDrivers = await import("node:sqlite").then(
   async (nodeSqlite) => ({
     core: await import("../src/database/sqlite.node"),
-    standalone: await import("@opencode-ai/effect-sqlite-node"),
+    standalone: await import("../../effect-sqlite-node/src/index"),
     DatabaseSync: nodeSqlite.DatabaseSync,
   }),
   () => undefined,
@@ -228,6 +229,109 @@ const clientWithAttemptCount = (input: {
     yield* Effect.addFinalizer(() => Effect.sync(() => Object.defineProperty(prototype, "prepare", prepareDescriptor)))
     return Context.get(context, SqlClient)
   })
+
+type SqliteClientType = "bun" | "core-node" | "standalone-node"
+
+const sqliteClientForPermitTest = (clientType: SqliteClientType) =>
+  Effect.gen(function* () {
+    if (clientType === "bun") {
+      const context = yield* Layer.build(layer({ filename: ":memory:", disableWAL: true }))
+      return Context.get(context, SqlClient)
+    }
+
+    const drivers = nodeSqliteDrivers
+    if (!drivers) return yield* Effect.fail(new Error("node:sqlite tests ran without node:sqlite"))
+    if (clientType === "core-node") {
+      const context = yield* Layer.build(drivers.core.layer({ filename: ":memory:" }))
+      return Context.get(context, SqlClient)
+    }
+
+    const context = yield* Layer.build(drivers.standalone.NodeSqliteClient.layer({ filename: ":memory:" }))
+    return Context.get(context, SqlClient)
+  })
+
+const queuedAcquisition = (client: SqlClient, kind: "reserve" | "transaction") =>
+  (kind === "reserve"
+    ? Effect.scoped(Effect.andThen(client.reserve, Effect.yieldNow))
+    : client.withTransaction(Effect.yieldNow)
+  ).pipe(Effect.provideService(References.MaxOpsBeforeYield, 3))
+
+describe("SQLite permit acquisition interruption", () => {
+  for (const clientType of ["bun", "core-node", "standalone-node"] as const) {
+    test.skipIf(clientType !== "bun" && !nodeSqliteDrivers)(
+      `${clientType} releases a queued reserve and transaction after interruption`,
+      async () => {
+        await Effect.runPromise(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const client: SqlClient = yield* sqliteClientForPermitTest(clientType)
+
+              for (const kind of ["reserve", "transaction"] as const) {
+                for (let delay = 0; delay < 32; delay++) {
+                  const holderReady = yield* Deferred.make<void>()
+                  const holderRelease = yield* Deferred.make<void>()
+                  const holder = yield* Effect.scoped(
+                    Effect.gen(function* () {
+                      yield* client.reserve
+                      yield* Deferred.succeed(holderReady, undefined)
+                      yield* Deferred.await(holderRelease)
+                    }),
+                  ).pipe(Effect.forkChild({ startImmediately: true }))
+
+                  yield* Effect.gen(function* () {
+                    yield* Deferred.await(holderReady).pipe(
+                      Effect.timeoutOrElse({
+                        duration: "1 second",
+                        orElse: () => Effect.fail(new Error(`${clientType} holder did not acquire the permit`)),
+                      }),
+                    )
+                    const queued = yield* queuedAcquisition(client, kind).pipe(
+                      Effect.forkChild({ startImmediately: true }),
+                    )
+                    yield* Effect.yieldNow
+                    expect(queued.pollUnsafe()).toBeUndefined()
+
+                    yield* Deferred.succeed(holderRelease, undefined)
+                    yield* Fiber.join(holder).pipe(
+                      Effect.timeoutOrElse({
+                        duration: "1 second",
+                        orElse: () => Effect.fail(new Error(`${clientType} holder did not release the permit`)),
+                      }),
+                    )
+                    for (let step = 0; step < delay; step++) yield* Effect.yieldNow
+                    yield* Fiber.interrupt(queued).pipe(
+                      Effect.timeoutOrElse({
+                        duration: "1 second",
+                        orElse: () =>
+                          Effect.fail(new Error(`${clientType} queued ${kind} did not settle after interruption`)),
+                      }),
+                    )
+                    expect(
+                      yield* client.unsafe("SELECT 3").values.pipe(
+                        Effect.timeoutOrElse({
+                          duration: "1 second",
+                          orElse: () =>
+                            Effect.fail(
+                              new Error(`${clientType} SQL did not proceed after interrupting queued ${kind}`),
+                            ),
+                        }),
+                      ),
+                    ).toEqual([[3]])
+                  }).pipe(
+                    Effect.ensuring(
+                      Deferred.succeed(holderRelease, undefined).pipe(Effect.andThen(Fiber.interrupt(holder))),
+                    ),
+                  )
+                }
+              }
+            }),
+          ),
+        )
+      },
+      20_000,
+    )
+  }
+})
 
 describe("SQLite busy timeout and statement retries", () => {
   test("configures the production connection busy timeout", async () => {

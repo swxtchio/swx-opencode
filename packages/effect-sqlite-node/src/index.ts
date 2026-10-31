@@ -1,12 +1,11 @@
 export * as NodeSqliteClient from "./index"
 
 import { DatabaseSync, type SQLInputValue } from "node:sqlite"
+import { Deferred } from "effect"
 import { identity } from "effect/Function"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
-import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
-import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
@@ -153,14 +152,17 @@ export const make = (
     const semaphore = yield* Semaphore.make(1)
     const connection = yield* makeConnection
     // Keep retries serialized on the native connection, including their backoff interval.
-    const acquirer = Effect.uninterruptibleMask((restore) => {
-      const fiber = Fiber.getCurrent()!
-      const scope = Context.getUnsafe(fiber.context, Scope.Scope)
-      return Effect.as(
-        Effect.tap(restore(semaphore.take(1)), () => Scope.addFinalizer(scope, semaphore.release(1))),
-        connection,
-      )
-    })
+    // The scoped child owns the permit so cancellation can release it during acquisition.
+    const acquirer = Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const acquired = yield* Deferred.make<void>()
+        yield* semaphore
+          .withPermits(1)(Effect.andThen(Deferred.succeed(acquired, undefined), Effect.never))
+          .pipe(Effect.forkScoped)
+        yield* restore(Deferred.await(acquired))
+        return connection
+      }),
+    )
     const transactionAcquirer = acquirer
 
     return Object.assign(
