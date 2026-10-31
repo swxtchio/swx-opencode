@@ -790,10 +790,10 @@ async function onlineInventorySnapshot(
     }
     const cycle = onlineParentCycle(db, item.sessionID, budget)
     if (cycle.cycle) item.reasons.push("parent-cycle")
-    if (cycle.boundReached) item.reasons.push("session-parent-validation-bound-reached")
+    if (cycle.boundReached) item.reasons.push("session-validation-bound-reached")
     const tree = onlineDescendants(db, item.sessionID, budget)
     if (tree.boundReached) {
-      item.reasons.push("session-tree-validation-bound-reached")
+      item.reasons.push("session-validation-bound-reached")
       continue
     }
     item[onlineDescendantFence] = tree.sessionIDs.filter((id) => id !== item.sessionID).toSorted()
@@ -1739,18 +1739,22 @@ async function onlineRevalidateSession(
   for (const reason of evidence.reasons) reasons.add(reason)
   if (cutoff !== undefined && evidence.lastActivity !== undefined && evidence.lastActivity >= cutoff)
     reasons.add("activity-at-or-after-cutoff")
-  if (expectedFence && evidence.fence.data !== expectedFence.data) reasons.add("session-changed-after-inventory")
+  if (expectedFence && evidence.complete && evidence.fence.data !== expectedFence.data)
+    reasons.add("session-changed-after-inventory")
 
   const cycle = onlineParentCycle(db, selected.sessionID, budget)
   if (cycle.cycle) reasons.add("parent-cycle")
-  if (cycle.boundReached) reasons.add("session-parent-validation-bound-reached")
+  if (cycle.boundReached) reasons.add("session-validation-bound-reached")
   const tree = onlineDescendants(db, selected.sessionID, budget)
-  if (tree.boundReached) reasons.add("session-tree-validation-bound-reached")
-  const expectedDescendants = (selected[onlineDescendantFence] ?? []).filter((id) => !completedIDs.has(id))
-  const currentDescendants = tree.sessionIDs.filter((id) => id !== selected.sessionID)
-  if (!sameIDs(currentDescendants, expectedDescendants)) reasons.add("session-tree-changed")
-  const protectedDescendants = currentDescendants.filter((id) => !eligibleIDs.has(id) || skippedIDs.has(id))
-  if (protectedDescendants.length > 0) reasons.add(`protected-descendant:${protectedDescendants.toSorted().join(",")}`)
+  if (tree.boundReached) reasons.add("session-validation-bound-reached")
+  if (!tree.boundReached) {
+    const expectedDescendants = (selected[onlineDescendantFence] ?? []).filter((id) => !completedIDs.has(id))
+    const currentDescendants = tree.sessionIDs.filter((id) => id !== selected.sessionID)
+    if (!sameIDs(currentDescendants, expectedDescendants)) reasons.add("session-tree-changed")
+    const protectedDescendants = currentDescendants.filter((id) => !eligibleIDs.has(id) || skippedIDs.has(id))
+    if (protectedDescendants.length > 0)
+      reasons.add(`protected-descendant:${protectedDescendants.toSorted().join(",")}`)
+  }
 
   const activeEligibleIDs = new Set([...eligibleIDs].filter((id) => !skippedIDs.has(id) && !completedIDs.has(id)))
   const cascade = onlineCrossSessionCascadeFailures(
@@ -1781,6 +1785,7 @@ function onlineSessionEvidence(
   const bounded = () => {
     reasons.add("session-validation-bound-reached")
     return {
+      complete: false,
       lastActivity: undefined,
       reasons: [...reasons].toSorted(),
       fence: { data: "", eventSequence: null, eventOwnerID: null } satisfies OnlineSessionFence,
@@ -1954,6 +1959,7 @@ function onlineSessionEvidence(
   if (Number.isFinite(lastActivity) === false) reasons.add("activity-evidence-unreadable:no-timestamp")
 
   return {
+    complete: true,
     lastActivity: Number.isFinite(lastActivity) ? lastActivity : undefined,
     reasons: [...reasons].toSorted(),
     fence: {

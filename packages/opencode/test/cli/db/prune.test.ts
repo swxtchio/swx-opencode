@@ -914,6 +914,22 @@ test(
   { timeout: 180_000 },
 )
 
+test("online prune uses the contract reason for bounded hierarchy validation", async () => {
+  await using store = await producedStore([{}])
+  const sessionID = store.metadata[0].created[0].id
+  const db = new Database(store.filename)
+  db.query("UPDATE session SET parent_id = ? WHERE id = ?").run(sessionID, sessionID)
+  db.close()
+
+  const inventory = parseReport(await runCLI(store, ["--online", "--session", sessionID, "--reserve-bytes", "1"]))
+  const reasons = inventory.excludedSessions.find((item) => item.sessionID === sessionID)?.reasons ?? []
+  expect(reasons).toContain("parent-cycle")
+  expect(reasons).toContain("session-validation-bound-reached")
+  expect(reasons).not.toContain("session-parent-validation-bound-reached")
+  expect(reasons).not.toContain("session-tree-validation-bound-reached")
+  expect(inventory.deletionScope.sessionIDs).toEqual([])
+})
+
 test("online prune retains a payload row that exceeds the requested byte bound", async () => {
   await using store = await producedStore([{ payloadBytes: 4 * 1024 * 1024 }])
   const selected = produce(store, { create: { payloadBytes: 4 * 1024 * 1024 } })
@@ -1422,6 +1438,96 @@ test("online prune revalidates newly admitted work before the first delete trans
     assertChildOutcome(await producer.finish(), 0)
   }
 })
+
+test(
+  "online prune does not misreport bounded in-lock evidence as changed",
+  async () => {
+    await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+    const sessionID = store.metadata[0].created[0].id
+    const before = ownedCounts(store.filename, sessionID)
+    const original = Database.prototype.exec
+    let injected = false
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+      const result = original.call(this, statement)
+      if (statement === "BEGIN IMMEDIATE" && !injected) {
+        injected = true
+        const insert = this.query(
+          "INSERT INTO todo (session_id, content, status, priority, position, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        Array.from({ length: 10_000 }, (_, index) => index + 1).forEach((position) => {
+          insert.run(sessionID, "bounded revalidation fixture", "pending", "high", position, 0, 0)
+        })
+      }
+      return result
+    })
+    try {
+      const refused = await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        session: [sessionID],
+        apply: true,
+        reserveBytes: 1,
+      })
+      const reasons = refused.report.skippedSessions?.find((item) => item.sessionID === sessionID)?.reasons ?? []
+      expect(injected).toBe(true)
+      expect(refused.report.action).toBe("refused")
+      expect(refused.report.changedRows).toBe(0)
+      expect(reasons).toContain("session-validation-bound-reached")
+      expect(reasons).not.toContain("session-changed-after-inventory")
+      expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+    } finally {
+      exec.mockRestore()
+    }
+  },
+  { timeout: 60_000 },
+)
+
+test(
+  "online prune does not call a bounded revalidated tree a changed tree",
+  async () => {
+    await using store = await producedStore([{}])
+    const parentID = produce(store, { create: {} }).created[0].id
+    const childID = (await produceLive(store, { create: { parentID } })).created[0].id
+    await rm(store.project, { recursive: true, force: true })
+    const original = Database.prototype.exec
+    let injected = false
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+      const result = original.call(this, statement)
+      if (statement === "BEGIN IMMEDIATE" && !injected) {
+        injected = true
+        const projectID = this.query<{ project_id: string }, [string]>(
+          "SELECT project_id FROM session WHERE id = ?",
+        ).get(parentID)!.project_id
+        const insert = this.query(
+          "INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        Array.from({ length: 10_000 }, (_, index) => index).forEach((index) => {
+          const id = `ses-late-descendant-${index}`
+          insert.run(id, projectID, parentID, id, store.project, "late validation descendant", "test", 0, 0)
+        })
+      }
+      return result
+    })
+    try {
+      const applied = await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        session: [parentID, childID],
+        apply: true,
+        reserveBytes: 1,
+      })
+      const reasons = applied.report.skippedSessions?.find((item) => item.sessionID === parentID)?.reasons ?? []
+      expect(injected).toBe(true)
+      expect(reasons).toContain("session-validation-bound-reached")
+      expect(reasons).not.toContain("session-tree-changed")
+      expect(applied.report.remainingSessionIDs).toContain(parentID)
+      expect(ownedCounts(store.filename, parentID).session).toBe(1)
+    } finally {
+      exec.mockRestore()
+    }
+  },
+  { timeout: 60_000 },
+)
 
 test("online prune preserves committed partial progress when reclamation measurement throws", async () => {
   await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
