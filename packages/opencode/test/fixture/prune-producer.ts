@@ -34,6 +34,7 @@ if (!filename || !directory || !serialized) throw new Error("usage: <db> <projec
 type Create = {
   parentID?: string
   payloadBytes?: number
+  eventCount?: number
   pendingV1?: boolean
   preparingV1?: boolean
   withdrawnV1?: boolean
@@ -54,6 +55,9 @@ const input = JSON.parse(serialized) as {
     sessionID: string
     startFile: string
     readyFile: string
+    completedFile?: string
+    registerBeforeSignal?: boolean
+    appendEvent?: boolean
     readinessWriteGate?: { createdFile: string; releaseFile: string }
   }
   preparing?: string
@@ -63,7 +67,7 @@ const input = JSON.parse(serialized) as {
   holdAfterSignal?: { startFile: string; readyFile: string }
 }
 
-if (input.queueAfterSignal) {
+if (input.queueAfterSignal && !input.queueAfterSignal.registerBeforeSignal) {
   console.log("PRUNE_QUEUE_WAITING")
   const deadline = Date.now() + 20_000
   while (!(await Bun.file(input.queueAfterSignal.startFile).exists())) {
@@ -101,6 +105,16 @@ const produce = Effect.gen(function* () {
   const todo = yield* Todo.Service
   const events = yield* EventV2Bridge.Service
   const { db } = yield* Database.Service
+  if (input.queueAfterSignal?.registerBeforeSignal) {
+    console.log(`PRUNE_REGISTERED ${process.pid}`)
+    yield* Effect.promise(async () => {
+      const deadline = Date.now() + 20_000
+      while (!(await Bun.file(input.queueAfterSignal!.startFile).exists())) {
+        if (Date.now() >= deadline) throw new Error("registered prompt producer never received its start signal")
+        await Bun.sleep(5)
+      }
+    })
+  }
   const creates = Array.isArray(input.create) ? input.create : input.create ? [input.create] : []
   const created = yield* Effect.forEach(creates, (create) =>
     Effect.gen(function* () {
@@ -167,6 +181,40 @@ const produce = Effect.gen(function* () {
         agent: "build",
         model: { id: ModelV2.ID.make("requested-model"), providerID: ProviderV2.ID.make("provider-a") },
       })
+      if (create.eventCount) {
+        const callID = `prune-validation-${sessionID}`
+        yield* events.publish(SessionEvent.Tool.Called, {
+          sessionID: SessionV2.ID.make(sessionID),
+          timestamp,
+          assistantMessageID,
+          callID,
+          tool: "prune-validation-fixture",
+          input: {},
+          provider: { executed: false },
+        })
+        yield* Effect.forEach(
+          Array.from({ length: create.eventCount }, (_, index) => index),
+          (index) =>
+            events.publish(SessionEvent.Tool.Progress, {
+              sessionID: SessionV2.ID.make(sessionID),
+              timestamp,
+              assistantMessageID,
+              callID,
+              structured: { step: index },
+              content: [],
+            }),
+          { concurrency: 1 },
+        )
+        yield* events.publish(SessionEvent.Tool.Success, {
+          sessionID: SessionV2.ID.make(sessionID),
+          timestamp,
+          assistantMessageID,
+          callID,
+          structured: { steps: create.eventCount },
+          content: [],
+          provider: { executed: false },
+        })
+      }
       if (!create.unfinished) {
         yield* events.publish(SessionEvent.Step.Ended, {
           sessionID: SessionV2.ID.make(sessionID),
@@ -314,6 +362,19 @@ const produce = Effect.gen(function* () {
       delivery: "queue",
       parts: [{ type: "text", text: "queued work after inventory" }],
     })
+    if (input.queueAfterSignal.appendEvent) {
+      const timestamp = yield* DateTime.now
+      yield* events.publish(SessionEvent.ContextUpdated, {
+        sessionID: SessionV2.ID.make(input.queueAfterSignal.sessionID),
+        messageID: SessionMessage.ID.create(),
+        timestamp,
+        text: "online reclaim concurrent writer acknowledgment",
+      })
+    }
+    if (input.queueAfterSignal.completedFile) {
+      const completedFile = input.queueAfterSignal.completedFile
+      yield* Effect.promise(() => Bun.write(completedFile, "committed\n"))
+    }
   }
 
   if (input.preparing) {

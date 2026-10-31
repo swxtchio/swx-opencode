@@ -1,8 +1,8 @@
-# Commanded local dead-worktree reclamation
+# Commanded Session reclamation
 
-`opencode db prune` inventories the targeted local database by default. `opencode db retire` is its directory-targeted teardown entry point. Consult their `--help` output and `packages/opencode/src/cli/cmd/db-prune.ts` for the current options and decision boundary.
+`opencode db prune` inventories the targeted local database by default. `--online` selects bounded live-store reclamation for explicit Session IDs; without it, prune keeps the offline path. `opencode db retire` remains the directory-targeted offline teardown entry point. Consult `opencode db prune --help`, `packages/opencode/src/cli/cmd/db-prune.ts`, and the [published online producer contract](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6537686549) with its [limit clarification](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6537694254) for the current interface.
 
-## Operator lifecycle
+## Offline lifecycle
 
 Authority: [swxtchio/swx-opencode#237's 2026-10-22 elevation](https://github.com/swxtchio/swx-opencode/issues/237#issuecomment-6330400385) and the agreed procedure in `/home/byates/fm-llmrouter/data/peer-mail/reply-disk-full-2026-10-22.md`, “The safe prune/vacuum path.” This is an explicitly commanded, per-home offline operation. Completing usage capture, normal worktree removal, age, or a merge does not schedule a bulk prune.
 
@@ -15,7 +15,36 @@ Authority: [swxtchio/swx-opencode#237's 2026-10-22 elevation](https://github.com
 
 The consumer checks use the existing Linux process/lock inspection boundary. An uninspectable holder environment or database directory that admits other users refuses apply. SQLite exclusive locking stays on the cleanup connection through the committed deletion, truncate checkpoint, full `VACUUM`, final truncate checkpoint and result measurement. An arriving conflicting consumer cannot successfully read or write during compaction. The operation affects only the named local store; it does not delete remote or cached copies.
 
-## Bulk inventory and apply
+## Online Session reclamation
+
+Use this path when the per-home store must stay available to other OpenCode processes. Name the existing database and every Session explicitly. `--before` is an optional activity filter that only narrows the missing-directory set. Set the reserve from the caller's reviewed capacity policy; the producer checks it again before each delete, vacuum and checkpoint step.
+
+```sh
+DB="/absolute/home/data/opencode/opencode.db"
+SESSION_ID="ses_example"
+RESERVE_BYTES="<caller-selected-positive-bytes>"
+
+opencode db prune --online --database "$DB" --session "$SESSION_ID" \
+  --reserve-bytes "$RESERVE_BYTES"
+
+opencode db prune --online --database "$DB" --session "$SESSION_ID" \
+  --apply --reserve-bytes "$RESERVE_BYTES"
+```
+
+Replace every example value before running it. Inventory is read-only. Review `deletionScope.sessionIDs`, `selectedSessions`, `skippedSessions`, and `reclamation.ready`/`reclamation.reasons` before applying. Existing or uncertain directories, unselected descendants, cross-Session cascades, pending work, live writers, unknown storage ownership, an unregistered holder, or an unsupported auto-vacuum mode do not authorize deletion. A registered process may remain connected when it does not own a selected Session; `db retire` does not enter online mode.
+
+The producer contract is one JSON object on stdout per valid call; diagnostics go to stderr. Inventory exits successfully even when readiness is false, so inspect `reclamation.ready` rather than treating exit zero as apply approval. Apply returns success only when every requested Session is complete and no bounded reclaim work remains. A refused or failed apply exits nonzero; invalid CLI usage exits with usage status and no JSON.
+
+For `action: "failed"` with `committed: true`, rows already reported as changed are committed. Use `deletedSessionIDs`, `partialSessionIDs`, `remainingSessionIDs`, `skippedSessions`, and `batches` to establish exactly what remains; retry only the original explicit scope. A missing Session on a later retry is not evidence that the earlier call deleted it. If deletion is complete but reclaim work remains, continue with the storage-only form, which never deletes or claims a Session:
+
+```sh
+opencode db prune --online --database "$DB" --reclaim-only \
+  --apply --reserve-bytes "$RESERVE_BYTES"
+```
+
+SQLite page/freelist progress and filesystem allocation are separate measurements. Review the per-step checkpoint counters, `remainingFreelistPages`, `remainingWalFrames`, and signed `netAllocatedBytes`; zero, negative, or unavailable allocation change is reported rather than inferred from a freelist decrease. A passive checkpoint can leave frames outstanding while another process holds a reader; the result keeps that work visible for a later reclaim-only retry.
+
+## Offline bulk inventory and apply
 
 Run these from a surviving operator directory, substituting the actual database filename:
 
@@ -46,7 +75,7 @@ Only after the target is confirmed missing is eligibility per session. Eligible 
 
 Repeating a missing-directory target with no matching sessions returns `noop` with `noopReason: "no-matching-sessions"`, no session deletions and vacuum skipped. That observation cannot distinguish a prior completed retirement from a directory that never matched this database; check the reported target and database identities rather than treating no-op as historical confirmation. No-op does not vacuum the whole home database or retry a previously failed vacuum. Full vacuum is tied to an apply that actually deletes rows, and its temporary-space/offline cost scales with the database, not the retired worktree.
 
-## Results and retry
+## Offline results and retry
 
 - `action: "inventory"`: read-only result. Review `selectedSessions` and `excludedSessions`, their recorded directories/normalized identities and per-table `ownedRows`, and the aggregate `selectedCounts`. `retainedSessions` and `retainedCounts` identify protected sessions inside the requested scope, excluding unrelated or activity-filtered sessions. Counts include the session rows as well as their owned history. `changedRows` remains zero.
 - `action: "applied"`: inspect `committed`, `deletedSessionIDs`, `deletedCounts.sessions`, `deletedCounts.ownedRows`, `deletedCounts.byTable` and `changedRows` for the actual committed deletion; inspect `partial`, `retainedSessions` and `retainedCounts` for protected residue. The compaction result lives under `reclamation`: checkpoint, vacuum, final vacuum checkpoint, integrity/foreign-key checks and allocated bytes for the database plus sidecars. Physical reclaim is measured using filesystem allocated blocks, not just SQLite's freelist or logical row sizes. A small retirement can complete successfully without releasing an allocated page; zero or negative measured `reclaimedBytes` is reported honestly rather than turned into a failed deletion.
