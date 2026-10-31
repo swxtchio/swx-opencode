@@ -22,3 +22,13 @@ export const OnlineReclaimBackfillTable = sqliteTable("online_reclaim_backfill",
   high_water: integer().notNull(),
   complete: integer().notNull(),
 })
+
+// Keeps alias lookup scoped by Session without joining across the Session's entire queue history.
+export const OnlineReclaimQueueAliasScopeTable = sqliteTable(
+  "online_reclaim_queue_alias_scope",
+  {
+    alias_rowid: integer().primaryKey(),
+    owner_session_id: text().notNull(),
+  },
+  (table) => [index("online_reclaim_queue_alias_session_rowid_idx").on(table.owner_session_id, table.alias_rowid)],
+)

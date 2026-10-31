@@ -40,6 +40,12 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`online_reclaim_queue_alias_scope\` (
+          \`alias_rowid\` integer PRIMARY KEY,
+          \`owner_session_id\` text NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`event_aggregate_writer\` (
           \`aggregate_id\` text NOT NULL,
           \`writer_id\` text NOT NULL,
@@ -361,6 +367,9 @@ export default {
       )
       yield* tx.run(
         `CREATE INDEX \`online_reclaim_cross_part_child_idx\` ON \`online_reclaim_cross_session_part\` (\`child_session_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`online_reclaim_queue_alias_session_rowid_idx\` ON \`online_reclaim_queue_alias_scope\` (\`owner_session_id\`,\`alias_rowid\`);`,
       )
       yield* tx.run(
         `CREATE INDEX \`event_aggregate_writer_activity_idx\` ON \`event_aggregate_writer\` (\`aggregate_id\`,\`time_last_append\`);`,

@@ -17,7 +17,7 @@ The next fixes preserve the settled no-validation-row-cap contract and keep unbo
 
 1. Remove whole-table index construction from automatic startup migrations. Provide an explicit, resumable offline preparation step for existing stores; online inventory refuses until its required proof structures are complete, while fresh stores continue to receive their indexes from the empty schema. Keep the live online delete/reclaim path bounded after preparation.
 2. Restore inventory detection for historical cross-Session Part references with a trigger-maintained mismatch index and a rowid-keyset backfill capped per transaction. Inventory refuses before deletion begins; retain the in-lock late-reference guard for races after inventory.
-3. Replace queue-driven alias joins with Session-scoped bounded existence, high-water and keyset proofs. Add work-observing coverage for large alias-free queue histories, and make the activity regression fail if its indexed latest-value seek becomes a whole-history aggregate.
+3. Replace queue-driven alias joins with an indexed per-Session alias scope map and rowid keysets. Backfill legacy aliases in 128-row resumable transactions. Exercise a long alias gap through inventory and apply, and make the activity-query VDBE regression fail if its latest-value seek becomes a whole-history aggregate.
 4. Move the historical event-writer census out of each `BEGIN IMMEDIATE` batch, process it in bounded pages, and bind its result to the durable event fence revalidated under the lock.
 
 Each correction lands with a producer-driven regression in its own commit. After all required findings pass the complete prune suite, Core/OpenCode typechecks, and lint/format checks, update and push the existing draft PR #369 for round-four review.

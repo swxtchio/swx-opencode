@@ -14,6 +14,10 @@ export const structureStatements = [
     "parent_session_id" TEXT NOT NULL,
     "child_session_id" TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS "online_reclaim_queue_alias_scope" (
+    "alias_rowid" INTEGER PRIMARY KEY NOT NULL,
+    "owner_session_id" TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS "online_reclaim_backfill" (
     "name" TEXT PRIMARY KEY NOT NULL,
     "cursor" INTEGER NOT NULL,
@@ -53,6 +57,40 @@ export const triggerStatements = [
   BEGIN
     DELETE FROM "online_reclaim_cross_session_part" WHERE "part_id" = OLD."id";
   END`,
+  `CREATE TRIGGER IF NOT EXISTS "online_reclaim_queue_alias_scope_insert"
+  AFTER INSERT ON "session_prompt_queue_alias"
+  BEGIN
+    INSERT INTO "online_reclaim_queue_alias_scope" ("alias_rowid", "owner_session_id")
+    SELECT NEW.rowid, queue."session_id"
+    FROM "session_prompt_queue" queue
+    WHERE queue."id" = NEW."item_id"
+    ON CONFLICT("alias_rowid") DO UPDATE SET "owner_session_id" = excluded."owner_session_id";
+  END`,
+  `CREATE TRIGGER IF NOT EXISTS "online_reclaim_queue_alias_scope_update"
+  AFTER UPDATE OF "item_id" ON "session_prompt_queue_alias"
+  BEGIN
+    DELETE FROM "online_reclaim_queue_alias_scope" WHERE "alias_rowid" = OLD.rowid;
+    INSERT INTO "online_reclaim_queue_alias_scope" ("alias_rowid", "owner_session_id")
+    SELECT NEW.rowid, queue."session_id"
+    FROM "session_prompt_queue" queue
+    WHERE queue."id" = NEW."item_id"
+    ON CONFLICT("alias_rowid") DO UPDATE SET "owner_session_id" = excluded."owner_session_id";
+  END`,
+  `CREATE TRIGGER IF NOT EXISTS "online_reclaim_queue_alias_scope_delete"
+  AFTER DELETE ON "session_prompt_queue_alias"
+  BEGIN
+    DELETE FROM "online_reclaim_queue_alias_scope" WHERE "alias_rowid" = OLD.rowid;
+  END`,
+  `CREATE TRIGGER IF NOT EXISTS "online_reclaim_queue_scope_update"
+  AFTER UPDATE OF "session_id" ON "session_prompt_queue"
+  WHEN NEW."session_id" <> OLD."session_id"
+  BEGIN
+    UPDATE "online_reclaim_queue_alias_scope"
+    SET "owner_session_id" = NEW."session_id"
+    WHERE "alias_rowid" IN (
+      SELECT alias.rowid FROM "session_prompt_queue_alias" alias WHERE alias."item_id" = NEW."id"
+    );
+  END`,
 ] as const
 
 export function install(db: Database, initiallyComplete: boolean) {
@@ -64,29 +102,53 @@ export function install(db: Database, initiallyComplete: boolean) {
       const message = yield* tx.get<{ name: string }>(sql`
         SELECT name FROM sqlite_master WHERE type = 'table' AND name = ${"message"}
       `)
-      if (!part || !message) return
+      const queue = yield* tx.get<{ name: string }>(sql`
+        SELECT name FROM sqlite_master WHERE type = 'table' AND name = ${"session_prompt_queue"}
+      `)
+      const aliases = yield* tx.get<{ name: string }>(sql`
+        SELECT name FROM sqlite_master WHERE type = 'table' AND name = ${"session_prompt_queue_alias"}
+      `)
+      if (!part || !message || !queue || !aliases) return
 
       const existing = yield* tx.get<{ name: string }>(sql`
         SELECT name FROM sqlite_master
         WHERE type = 'table' AND name = ${"online_reclaim_cross_session_part"}
       `)
+      const aliasScope = yield* tx.get<{ name: string }>(sql`
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name = ${"online_reclaim_queue_alias_scope"}
+      `)
       for (const statement of structureStatements) yield* tx.run(statement)
-      if (!existing) {
+      if (!existing)
         for (const index of OnlineReclaimIndexes.definitions.filter(
           (item) => item.table === "online_reclaim_cross_session_part",
         ))
           yield* tx.run(index.statement)
-      }
+      if (!aliasScope)
+        for (const index of OnlineReclaimIndexes.definitions.filter(
+          (item) => item.table === "online_reclaim_queue_alias_scope",
+        ))
+          yield* tx.run(index.statement)
       for (const statement of triggerStatements) yield* tx.run(statement)
       yield* tx.run(sql`
         INSERT OR IGNORE INTO online_reclaim_backfill (name, cursor, high_water, complete)
         VALUES ('cross-session-parts', 0, ${initiallyComplete ? 0 : -1}, ${initiallyComplete ? 1 : 0})
+      `)
+      yield* tx.run(sql`
+        INSERT OR IGNORE INTO online_reclaim_backfill (name, cursor, high_water, complete)
+        VALUES ('queue-alias-scope', 0, ${initiallyComplete ? 0 : -1}, ${initiallyComplete ? 1 : 0})
       `)
       if (!existing && !initiallyComplete)
         yield* tx.run(sql`
           UPDATE online_reclaim_backfill
           SET cursor = 0, high_water = -1, complete = 0
           WHERE name = 'cross-session-parts'
+        `)
+      if (!aliasScope && !initiallyComplete)
+        yield* tx.run(sql`
+          UPDATE online_reclaim_backfill
+          SET cursor = 0, high_water = -1, complete = 0
+          WHERE name = 'queue-alias-scope'
         `)
     }),
   )

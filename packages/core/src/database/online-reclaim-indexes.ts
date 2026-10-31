@@ -167,4 +167,9 @@ export const definitions = [
     name: "online_reclaim_cross_part_child_idx",
     statement: `CREATE INDEX IF NOT EXISTS "online_reclaim_cross_part_child_idx" ON "online_reclaim_cross_session_part" ("child_session_id");`,
   },
+  {
+    table: "online_reclaim_queue_alias_scope",
+    name: "online_reclaim_queue_alias_session_rowid_idx",
+    statement: `CREATE INDEX IF NOT EXISTS "online_reclaim_queue_alias_session_rowid_idx" ON "online_reclaim_queue_alias_scope" ("owner_session_id","alias_rowid");`,
+  },
 ] satisfies readonly { table: string; name: string; statement: string; refreshWhenChanged?: boolean }[]

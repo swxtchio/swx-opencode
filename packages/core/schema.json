@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "6572b217-12e0-40f5-9be2-41327c2aefec",
+  "id": "4ea4b288-4aaf-46e7-844f-117a8ea9084a",
   "prevIds": [
-    "6a27973d-131b-44f4-83ba-2a7e0873e141"
+    "6572b217-12e0-40f5-9be2-41327c2aefec"
   ],
   "ddl": [
     {
@@ -20,6 +20,10 @@
     },
     {
       "name": "online_reclaim_cross_session_part",
+      "entityType": "tables"
+    },
+    {
+      "name": "online_reclaim_queue_alias_scope",
       "entityType": "tables"
     },
     {
@@ -305,6 +309,26 @@
       "name": "child_session_id",
       "entityType": "columns",
       "table": "online_reclaim_cross_session_part"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "alias_rowid",
+      "entityType": "columns",
+      "table": "online_reclaim_queue_alias_scope"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_session_id",
+      "entityType": "columns",
+      "table": "online_reclaim_queue_alias_scope"
     },
     {
       "type": "text",
@@ -2579,6 +2603,15 @@
     },
     {
       "columns": [
+        "alias_rowid"
+      ],
+      "nameExplicit": false,
+      "name": "online_reclaim_queue_alias_scope_pk",
+      "table": "online_reclaim_queue_alias_scope",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
         "writer_id"
       ],
       "nameExplicit": false,
@@ -2784,6 +2817,24 @@
       "name": "online_reclaim_cross_part_child_idx",
       "entityType": "indexes",
       "table": "online_reclaim_cross_session_part"
+    },
+    {
+      "columns": [
+        {
+          "value": "owner_session_id",
+          "isExpression": false
+        },
+        {
+          "value": "alias_rowid",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "online_reclaim_queue_alias_session_rowid_idx",
+      "entityType": "indexes",
+      "table": "online_reclaim_queue_alias_scope"
     },
     {
       "columns": [
