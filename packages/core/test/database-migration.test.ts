@@ -1,5 +1,7 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 import { $ } from "bun"
+import type { SQLQueryBindings } from "bun:sqlite"
+import { existsSync, writeFileSync } from "node:fs"
 import { fileURLToPath } from "url"
 import path from "path"
 import { SqliteClient } from "@effect/sql-sqlite-bun"
@@ -129,14 +131,119 @@ describe("DatabaseMigration", () => {
       }
     })
 
-    const open = () =>
-      Effect.runPromise(
-        inspect.pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped),
-      )
+    const open = () => Effect.runPromise(inspect.pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped))
 
     expect(await open()).toEqual({ auto_vacuum: { auto_vacuum: 2 }, session: { name: "session" } })
     expect(await open()).toEqual({ auto_vacuum: { auto_vacuum: 2 }, session: { name: "session" } })
   }, 30_000)
+
+  test.serial(
+    "installed online proof startup stays read-only across a concurrent commit",
+    async () => {
+      await using tmp = await tmpdir()
+      const filename = path.join(tmp.path, "installed-proof.sqlite")
+      const open = () => Effect.runPromise(Effect.scoped(Layer.build(Database.layerFromPath(filename))))
+      await open()
+
+      const sqlite = await import("bun:sqlite")
+      const setup = new sqlite.Database(filename)
+      setup.exec("CREATE TABLE online_startup_writer_probe (value INTEGER NOT NULL)")
+      setup.query("INSERT INTO online_startup_writer_probe (value) VALUES (0)").run()
+      setup.close()
+      const readyFile = path.join(tmp.path, "writer-ready")
+      const startFile = path.join(tmp.path, "writer-start")
+      const committedFile = path.join(tmp.path, "writer-committed")
+      const writerSource = `
+        import { Database } from "bun:sqlite"
+        const [filename, readyFile, startFile, committedFile] = process.argv.slice(-4)
+        if (!filename || !readyFile || !startFile || !committedFile) throw new Error("writer arguments missing")
+        const db = new Database(filename)
+        await Bun.write(readyFile, "ready\\n")
+        const deadline = Date.now() + 20_000
+        while (!(await Bun.file(startFile).exists())) {
+          if (Date.now() >= deadline) throw new Error("writer did not receive its start signal")
+          await Bun.sleep(5)
+        }
+        db.query("UPDATE online_startup_writer_probe SET value = value + 1").run()
+        await Bun.write(committedFile, "committed\\n")
+        db.close()
+      `
+      const writer = Bun.spawn([process.execPath, "-e", writerSource, filename, readyFile, startFile, committedFile], {
+        cwd: process.cwd(),
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      })
+      const readyDeadline = Date.now() + 20_000
+      while (!(await Bun.file(readyFile).exists())) {
+        if (Date.now() >= readyDeadline) throw new Error("writer process did not become ready")
+        await Bun.sleep(5)
+      }
+      const proofWrites = new Array<string>()
+      const originalQuery = sqlite.Database.prototype.query
+      const originalExec = sqlite.Database.prototype.exec
+      let baseTableReads = 0
+      let writerCommitted = false
+      let writerExit: number | undefined
+      const query = spyOn(sqlite.Database.prototype, "query").mockImplementation(function <
+        ResultType,
+        ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+      >(this: import("bun:sqlite").Database, statement: string) {
+        if (
+          statement.includes("SELECT name FROM sqlite_master") &&
+          statement.includes("type = 'table'") &&
+          statement.includes("name = ?")
+        ) {
+          baseTableReads += 1
+          if (baseTableReads === 2 && !writerCommitted) {
+            writeFileSync(startFile, "start\n")
+            const deadline = Date.now() + 20_000
+            const wait = new Int32Array(new SharedArrayBuffer(4))
+            while (!existsSync(committedFile)) {
+              if (Date.now() >= deadline) throw new Error("concurrent writer did not commit during startup")
+              Atomics.wait(wait, 0, 0, 5)
+            }
+            writerCommitted = true
+          }
+        }
+        if (
+          /^(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)\b/i.test(statement.trimStart()) &&
+          statement.includes("online_reclaim_")
+        )
+          proofWrites.push(statement)
+        return (originalQuery<ResultType, ParamsType>).call(this, statement)
+      })
+      const exec = spyOn(sqlite.Database.prototype, "exec").mockImplementation(function (
+        this: import("bun:sqlite").Database,
+        statement: string,
+      ) {
+        if (
+          /^(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)\b/i.test(statement.trimStart()) &&
+          statement.includes("online_reclaim_")
+        )
+          proofWrites.push(statement)
+        return originalExec.call(this, statement)
+      })
+      try {
+        await open()
+        expect(baseTableReads).toBeGreaterThanOrEqual(2)
+        expect(writerCommitted).toBe(true)
+        expect(proofWrites).toEqual([])
+        const check = new sqlite.Database(filename, { readonly: true })
+        expect(check.query("SELECT value FROM online_startup_writer_probe").get()).toEqual({
+          value: 1,
+        })
+        check.close()
+      } finally {
+        exec.mockRestore()
+        query.mockRestore()
+        if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
+        writerExit = await writer.exited
+      }
+      expect(writerExit).toBe(0)
+    },
+    30_000,
+  )
 
   test("preserves auto vacuum and data while applying a pending migration to an existing database", async () => {
     await using tmp = await tmpdir()
@@ -190,10 +297,7 @@ describe("DatabaseMigration", () => {
         ),
       }
     })
-    const open = () =>
-      Effect.runPromise(
-        inspect.pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped),
-      )
+    const open = () => Effect.runPromise(inspect.pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped))
     const after = {
       auto_vacuum: { auto_vacuum: 1 },
       journal_mode_seen: { mode: "wal" },

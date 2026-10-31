@@ -27,7 +27,11 @@ export function apply(db: Database) {
         // Existing stores can have pending migrations, so apply them in the production WAL mode.
         yield* db.run("PRAGMA journal_mode = WAL")
         yield* applyOnly(db, migrations)
-        yield* OnlineReclaimProof.install(db, false)
+        yield* OnlineReclaimProof.install(db, false).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("online reclaim proof installation deferred; online prune will fail closed", cause),
+          ),
+        )
         return
       }
       if (tables.length > 0) return yield* Effect.die("Database is not empty and has no session table")
@@ -46,7 +50,11 @@ export function apply(db: Database) {
           )
         }),
       )
-      yield* OnlineReclaimProof.install(db, true)
+      yield* OnlineReclaimProof.install(db, true).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("online reclaim proof installation deferred; online prune will fail closed", cause),
+        ),
+      )
     }),
   )
 }
