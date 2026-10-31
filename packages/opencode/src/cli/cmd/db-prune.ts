@@ -1569,17 +1569,19 @@ async function applyOnlineScope(
           options,
           batchNumber,
         )
-        reopenDatabase()
         if (result.state === "empty") {
           if (result.hasRemainingRows) stalled.push(item.sessionID)
+          reopenDatabase()
           continue
         }
         if (result.state === "skipped") {
           skipped.set(item.sessionID, result.reasons ?? ["session-not-eligible"])
+          reopenDatabase()
           continue
         }
         if (result.state === "global-refusal" || result.state === "failed") {
           failureReason = result.reasons?.[0] ?? result.reason ?? "online-delete-batch-failed"
+          reopenDatabase()
           break
         }
 
@@ -1606,18 +1608,17 @@ async function applyOnlineScope(
           remainingSessionIDs: requested.filter((id) => !completed.has(id)).toSorted(),
         })
 
-        const step = await onlineReclaimStep(db, filename, options, pagesRequested)
+        if (result.blockedReason) skipped.set(item.sessionID, [result.blockedReason])
         reopenDatabase()
+        const step = await onlineReclaimStep(db, filename, options, pagesRequested)
         pagesRequested += step.pagesRequested
         committed ||= step.committed
         steps.push(...step.steps.map((record) => ({ batch: batchNumber, sessionID: item.sessionID, ...record })))
         if (step.checkpointState !== "not-attempted") reclaimOutstanding = step.outstanding
+        if (step.reason) failureReason = step.reason
+        reopenDatabase()
         if (step.reason) {
-          failureReason = step.reason
           break
-        }
-        if (result.blockedReason) {
-          skipped.set(item.sessionID, [result.blockedReason])
         }
       }
       if (failureReason) break
@@ -1642,12 +1643,12 @@ async function applyOnlineScope(
     if (!failureReason && committed && remainingPayload.length === 0) {
       reopenDatabase()
       const drained = await onlineReclaimUntilDone(db, filename, options, pagesRequested, reclaimOutstanding)
-      reopenDatabase()
       pagesRequested = drained.pagesRequested
       committed ||= drained.committed
       steps.push(...drained.steps)
       reclaimOutstanding = drained.outstanding
       if (drained.reason) failureReason = drained.reason
+      reopenDatabase()
     }
 
     if (!failureReason && remainingPayload.length === 0) {
@@ -1678,13 +1679,14 @@ async function applyOnlineScope(
           options,
           batchNumber,
         )
-        reopenDatabase()
         if (result.state === "skipped") {
           skipped.set(item.sessionID, result.reasons ?? ["session-not-eligible"])
+          reopenDatabase()
           continue
         }
         if (result.state !== "committed") {
           failureReason = result.reasons?.[0] ?? result.reason ?? "online-session-delete-failed"
+          reopenDatabase()
           break
         }
         committed = true
@@ -1706,14 +1708,15 @@ async function applyOnlineScope(
           deletedSessionIDs: [item.sessionID],
           remainingSessionIDs: requested.filter((id) => !completed.has(id)).toSorted(),
         })
-        const step = await onlineReclaimStep(db, filename, options, pagesRequested)
         reopenDatabase()
+        const step = await onlineReclaimStep(db, filename, options, pagesRequested)
         pagesRequested += step.pagesRequested
         committed ||= step.committed
         steps.push(...step.steps)
         if (step.checkpointState !== "not-attempted") reclaimOutstanding = step.outstanding
+        if (step.reason) failureReason = step.reason
+        reopenDatabase()
         if (step.reason) {
-          failureReason = step.reason
           break
         }
       }
@@ -1722,12 +1725,12 @@ async function applyOnlineScope(
     if (!failureReason && completed.size > 0) {
       reopenDatabase()
       const drained = await onlineReclaimUntilDone(db, filename, options, pagesRequested, reclaimOutstanding)
-      reopenDatabase()
       pagesRequested = drained.pagesRequested
       committed ||= drained.committed
       steps.push(...drained.steps)
       reclaimOutstanding = drained.outstanding
       if (drained.reason) failureReason = drained.reason
+      reopenDatabase()
     }
   } catch (error) {
     failureReason ??= error instanceof Error ? error.message : "online-apply-failed"

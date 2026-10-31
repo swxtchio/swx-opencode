@@ -1946,6 +1946,55 @@ test("online prune preserves committed partial progress when reclamation measure
   }
 })
 
+test.serial("online prune reports committed delete and reclaim before a connection close failure", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  await rm(store.project, { recursive: true })
+  const before = ownedCounts(store.filename, sessionID)
+  const originalExec = Database.prototype.exec
+  const originalClose = Database.prototype.close
+  let vacuumCommitted = false
+  let injected = false
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+    const result = originalExec.call(this, statement)
+    if (statement.startsWith("PRAGMA incremental_vacuum(")) vacuumCommitted = true
+    return result
+  })
+  const close = spyOn(Database.prototype, "close").mockImplementation(function (this: Database) {
+    if (vacuumCommitted && !injected) {
+      injected = true
+      throw new Error("fixture-post-commit-reopen-close")
+    }
+    return originalClose.call(this)
+  })
+  try {
+    const result = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      apply: true,
+      reserveBytes: 1,
+      batchRows: 1,
+    })
+    const after = ownedCounts(store.filename, sessionID)
+    const removedRows = Object.values(before).reduce((sum, count) => sum + count, 0) -
+      Object.values(after).reduce((sum, count) => sum + count, 0)
+    const reportedRows = Object.values(result.report.changedRowsByTable ?? {}).reduce((sum, count) => sum + count, 0)
+    expect(injected).toBe(true)
+    expect(result.report.action).toBe("failed")
+    expect(result.report.committed).toBe(true)
+    expect(result.report.changedRows).toBe(removedRows)
+    expect(reportedRows).toBe(removedRows)
+    expect(result.report.refusalReasons).toContain("fixture-post-commit-reopen-close")
+    expect(result.report.reclamation.steps?.some((step) => Number(step.vacuumPages) > 0)).toBe(true)
+    expect(result.report.partialSessionIDs).toContain(sessionID)
+    expect(after.session).toBe(1)
+  } finally {
+    close.mockRestore()
+    exec.mockRestore()
+  }
+})
+
 test("a post-commit checkpoint failure reports committed deletions", async () => {
   await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
   const old = produce(store, { create: { payloadBytes: 512 * 1024 } })
