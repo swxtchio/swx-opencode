@@ -1765,6 +1765,96 @@ test.serial("online prune preserves a late cross-session Part before deleting it
   }
 })
 
+test.serial("online prune pages the historical writer census outside its delete lock", async () => {
+  await using store = await producedStore([{}])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  const identity = EventWriter.self()
+  await rm(store.project, { recursive: true })
+  const db = new Database(store.filename)
+  db.query("DELETE FROM event_aggregate_writer WHERE aggregate_id = ?").run(sessionID)
+  const process = db.query(
+    `INSERT INTO event_writer_process (writer_id, pid, boot_id, start_ticks, time_registered)
+     VALUES (?, ?, ?, ?, ?)`,
+  )
+  const writer = db.query(
+    `INSERT INTO event_aggregate_writer (aggregate_id, writer_id, time_last_append)
+     VALUES (?, ?, ?)`,
+  )
+  const deadWriters = 600
+  db.transaction(() => {
+    Array.from({ length: deadWriters }, (_, index) => index).forEach((index) => {
+      const writerID = `writer-test-dead-${String(index).padStart(4, "0")}`
+      process.run(writerID, 8_000_000_000 + index, "expired-boot", "1", 0)
+      writer.run(sessionID, writerID, index)
+    })
+    process.run("writer-test-zz-live", identity.pid, identity.bootID, identity.startTicks, Date.now())
+    writer.run(sessionID, "writer-test-zz-live", deadWriters)
+  })()
+  db.close()
+
+  const expectedLivenessReason =
+    identity.bootID && identity.startTicks ? "session-written-by-live-process" : "writer-liveness-unreadable"
+  const writerQueries = new Array<{ statement: string; inTransaction: boolean }>()
+  const originalQuery = Database.prototype.query
+  const query = spyOn(Database.prototype, "query").mockImplementation(function <
+    ReturnType,
+    ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+  >(this: Database, statement: string) {
+    if (
+      statement.includes("FROM event_aggregate_writer writer") &&
+      statement.includes("LEFT JOIN event_writer_process")
+    )
+      writerQueries.push({ statement, inTransaction: this.inTransaction })
+    return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+  })
+  try {
+    const inventory = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      reserveBytes: 1,
+    })
+    expect(inventory.report.action).toBe("inventory")
+    expect(inventory.report.excludedSessions.find((item) => item.sessionID === sessionID)?.reasons).toContain(
+      expectedLivenessReason,
+    )
+    expect(writerQueries).toHaveLength(5)
+    expect(writerQueries.every((item) => !item.inTransaction)).toBe(true)
+    expect(writerQueries.every((item) => item.statement.includes("LIMIT ?"))).toBe(true)
+    expect(writerQueries.slice(1).every((item) => item.statement.includes("writer.writer_id > ?"))).toBe(true)
+
+    const clearWriter = new Database(store.filename)
+    clearWriter
+      .query("DELETE FROM event_aggregate_writer WHERE aggregate_id = ? AND writer_id = ?")
+      .run(sessionID, "writer-test-zz-live")
+    clearWriter.query("DELETE FROM event_writer_process WHERE writer_id = ?").run("writer-test-zz-live")
+    const remaining = clearWriter
+      .query<{ rows: number }, [string]>("SELECT count(*) AS rows FROM event_aggregate_writer WHERE aggregate_id = ?")
+      .get(sessionID)?.rows
+    clearWriter.close()
+    expect(remaining).toBe(deadWriters)
+    writerQueries.length = 0
+
+    const applied = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      apply: true,
+      reserveBytes: 1,
+      batchRows: 1,
+      maxBatches: 1,
+    })
+    expect(applied.report.action).toBe("failed")
+    expect(applied.report.committed).toBe(true)
+    expect(writerQueries).toHaveLength(Math.ceil(deadWriters / 128))
+    expect(writerQueries.every((item) => !item.inTransaction)).toBe(true)
+    expect(writerQueries.every((item) => item.statement.includes("LIMIT ?"))).toBe(true)
+    expect(writerQueries.slice(1).every((item) => item.statement.includes("writer.writer_id > ?"))).toBe(true)
+  } finally {
+    query.mockRestore()
+  }
+})
+
 test(
   "online reclaim releases the write lock between steps so a registered writer commits on another Session",
   async () => {
@@ -1846,6 +1936,83 @@ test(
       exec.mockRestore()
       if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
       if (!writerCompleted) assertChildOutcome(await writer.finish(), 0)
+    }
+  },
+  { timeout: 60_000 },
+)
+
+test.serial(
+  "online prune revalidates the event fence after the paged writer census",
+  async () => {
+    await using store = await producedStore([{}])
+    const sessionID = store.metadata[0]!.created[0]!.id
+    await rm(store.project, { recursive: true })
+    const before = ownedCounts(store.filename, sessionID)
+    const startFile = path.join(store.directory, "writer-fence-start")
+    const committedFile = path.join(store.directory, "writer-fence-committed")
+    const closedFile = path.join(store.directory, "writer-fence-closed")
+    await using writer = startProducer(store, {
+      eventAfterSignal: { sessionID, startFile, committedFile, closedFile },
+    })
+    await readMatchingLine(writer, "PRUNE_EVENT_WAITING")
+
+    const censusQueries = new Array<{ statement: string; inTransaction: boolean }>()
+    const originalExec = Database.prototype.exec
+    const originalQuery = Database.prototype.query
+    let signaled = false
+    let writerClosed = false
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+      if (statement === "BEGIN IMMEDIATE" && !signaled) {
+        signaled = true
+        writeFileSync(startFile, "publish\n")
+        const deadline = Date.now() + 20_000
+        const wait = new Int32Array(new SharedArrayBuffer(4))
+        while (!existsSync(closedFile)) {
+          if (Date.now() >= deadline) throw new Error("late event writer did not publish its close acknowledgment")
+          Atomics.wait(wait, 0, 0, 5)
+        }
+      }
+      return originalExec.call(this, statement)
+    })
+    const query = spyOn(Database.prototype, "query").mockImplementation(function <
+      ReturnType,
+      ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+    >(this: Database, statement: string) {
+      if (
+        statement.includes("FROM event_aggregate_writer writer") &&
+        statement.includes("LEFT JOIN event_writer_process process")
+      )
+        censusQueries.push({ statement, inTransaction: this.inTransaction })
+      return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+    })
+    try {
+      const refused = await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        session: [sessionID],
+        apply: true,
+        reserveBytes: 1,
+        batchRows: 1,
+      })
+      assertChildOutcome(await writer.finish(), 0)
+      writerClosed = true
+      expect(signaled).toBe(true)
+      expect(await Bun.file(committedFile).exists()).toBe(true)
+      expect(refused.report.action).toBe("refused")
+      expect(refused.report.committed).toBe(false)
+      expect(refused.report.changedRows).toBe(0)
+      expect(refused.report.refusalReasons).toContain("session-changed-after-inventory")
+      expect(ownedCounts(store.filename, sessionID).session).toBe(before.session)
+      expect(ownedCounts(store.filename, sessionID).message).toBe(before.message)
+      expect(ownedCounts(store.filename, sessionID).part).toBe(before.part)
+      expect(censusQueries.length).toBeGreaterThan(0)
+      expect(censusQueries.every((item) => !item.inTransaction)).toBe(true)
+      expect(censusQueries.every((item) => item.statement.includes("LIMIT ?"))).toBe(true)
+    } finally {
+      exec.mockRestore()
+      query.mockRestore()
+      if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
+      if (!writerClosed) assertChildOutcome(await writer.finish(), 0)
     }
   },
   { timeout: 60_000 },
@@ -1977,6 +2144,8 @@ test("online prune revalidates newly admitted work before the first delete trans
     }
     return original.call(this, statement)
   })
+  let producerExited = false
+  let producerResult: ChildResult | undefined
   try {
     const refused = await invokeHandler(store, {
       database: store.filename,
@@ -2014,10 +2183,14 @@ test("online prune revalidates newly admitted work before the first delete trans
       if (producerReady) {
         producer.child.stdin.write("release\n")
         producer.child.stdin.end()
+        producerExited = await waitForExit(producer.child, 20_000)
       }
     }
-    assertChildOutcome(await producer.finish(), 0)
+    producerResult = await producer.finish()
   }
+  if (!producerResult) throw new Error("selected-Session producer cleanup returned no result")
+  expect(producerExited).toBe(true)
+  assertChildOutcome(producerResult, 0)
 })
 
 test.serial(

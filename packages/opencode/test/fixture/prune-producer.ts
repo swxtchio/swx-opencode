@@ -50,6 +50,7 @@ const input = JSON.parse(serialized) as {
   create?: Create | Create[]
   bulkMessages?: { sessionID: string; count: number }
   todoAfterSignal?: { sessionID: string; startFile: string; closedFile: string }
+  eventAfterSignal?: { sessionID: string; startFile: string; committedFile: string; closedFile: string }
   touch?: string
   crossPart?: { sessionID: string; messageID: string; completedFile?: string }
   queue?: string
@@ -119,6 +120,25 @@ const produce = Effect.gen(function* () {
   const todo = yield* Todo.Service
   const events = yield* EventV2Bridge.Service
   const { db } = yield* Database.Service
+  if (input.eventAfterSignal) {
+    const event = input.eventAfterSignal
+    console.log("PRUNE_EVENT_WAITING")
+    yield* Effect.promise(async () => {
+      const deadline = Date.now() + 20_000
+      while (!(await Bun.file(event.startFile).exists())) {
+        if (Date.now() >= deadline) throw new Error("late durable-event producer never received its start signal")
+        await Bun.sleep(5)
+      }
+    })
+    const timestamp = yield* DateTime.now
+    yield* events.publish(SessionEvent.ContextUpdated, {
+      sessionID: SessionV2.ID.make(event.sessionID),
+      messageID: SessionMessage.ID.create(),
+      timestamp,
+      text: "online reclaim writer-fence fixture",
+    })
+    yield* Effect.promise(() => Bun.write(event.committedFile, "committed\n"))
+  }
   if (input.bulkMessages) {
     const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
     yield* Effect.promise(async () => {
@@ -532,6 +552,7 @@ const result = await Effect.runPromise(
 if (input.crossPart?.completedFile) await Bun.write(input.crossPart.completedFile, "committed\n")
 if (input.queueAfterSignal?.closedFile) await Bun.write(input.queueAfterSignal.closedFile, "closed\n")
 if (input.todoAfterSignal) await Bun.write(input.todoAfterSignal.closedFile, "closed\n")
+if (input.eventAfterSignal) await Bun.write(input.eventAfterSignal.closedFile, "closed\n")
 if (input.queueAfterSignal)
   await publishReadiness(input.queueAfterSignal.readyFile, { ready: true }, input.queueAfterSignal.readinessWriteGate)
 if (!input.hold) console.log(JSON.stringify(result))

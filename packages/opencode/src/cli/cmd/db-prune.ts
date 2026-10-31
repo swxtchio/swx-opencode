@@ -2366,7 +2366,10 @@ function onlineSessionEvidence(
     (eventSequence !== null && typeof maxEventSequence === "number" && maxEventSequence > eventSequence)
   )
     reasons.add(`event-sequence-unreadable:${sessionID}`)
-  for (const reason of onlineWriterFailures(db, sessionID)) reasons.add(reason)
+  // Page historical owners outside the writer lock; the captured event and row fences catch later appends in-lock.
+  if (includeActivity) {
+    for (const reason of onlineWriterFailures(db, sessionID)) reasons.add(reason)
+  }
 
   return {
     lastActivity: Number.isFinite(lastActivity) ? lastActivity : undefined,
@@ -2599,37 +2602,44 @@ function onlineHolderFailures(db: SqliteAccess, current: ReturnType<typeof scanD
 
 function onlineWriterFailures(db: SqliteAccess, sessionID: string) {
   if (!onlineHasRows(db, "event_aggregate_writer", "aggregate_id = ?", sessionID)) return []
-  const rows = db
-    .query<{ pid: number | null; boot_id: string | null; start_ticks: string | null }, [string]>(
-      `SELECT process.pid, process.boot_id, process.start_ticks
-       FROM event_aggregate_writer writer
-       LEFT JOIN event_writer_process process ON process.writer_id = writer.writer_id
-       WHERE writer.aggregate_id = ?`,
-    )
-    .all(sessionID)
-  const reasons = new Set<string>()
-  for (const row of rows) {
-    if (
-      typeof row.pid !== "number" ||
-      !Number.isSafeInteger(row.pid) ||
-      row.pid <= 0 ||
-      typeof row.boot_id !== "string" ||
-      !row.boot_id ||
-      typeof row.start_ticks !== "string" ||
-      !row.start_ticks
-    ) {
-      reasons.add("writer-liveness-unreadable")
-      continue
+  const pageRows = 128
+  let cursor: string | undefined
+  while (true) {
+    const after = cursor === undefined ? "" : " AND writer.writer_id > ?"
+    const params: SQLQueryBindings[] = cursor === undefined ? [sessionID, pageRows] : [sessionID, cursor, pageRows]
+    const rows = db
+      .query<
+        { writer_id: string; pid: number | null; boot_id: string | null; start_ticks: string | null },
+        SQLQueryBindings[]
+      >(
+        `SELECT writer.writer_id, process.pid, process.boot_id, process.start_ticks
+         FROM event_aggregate_writer writer
+         LEFT JOIN event_writer_process process ON process.writer_id = writer.writer_id
+         WHERE writer.aggregate_id = ?${after}
+         ORDER BY writer.writer_id ASC
+         LIMIT ?`,
+      )
+      .all(...params)
+    for (const row of rows) {
+      if (
+        typeof row.pid !== "number" ||
+        !Number.isSafeInteger(row.pid) ||
+        row.pid <= 0 ||
+        typeof row.boot_id !== "string" ||
+        !row.boot_id ||
+        typeof row.start_ticks !== "string" ||
+        !row.start_ticks
+      )
+        return ["writer-liveness-unreadable"]
+      const current = EventWriter.readIdentity(row.pid)
+      if (!current) continue
+      if (!current.bootID || !current.startTicks) return ["writer-liveness-unreadable"]
+      if (onlineSameProcess(row, current)) return ["session-written-by-live-process"]
     }
-    const current = EventWriter.readIdentity(row.pid)
-    if (!current) continue
-    if (!current.bootID || !current.startTicks) {
-      reasons.add("writer-liveness-unreadable")
-      continue
-    }
-    if (onlineSameProcess(row, current)) reasons.add("session-written-by-live-process")
+    if (rows.length < pageRows) return []
+    cursor = rows.at(-1)?.writer_id
+    if (cursor === undefined) return ["writer-liveness-unreadable"]
   }
-  return [...reasons]
 }
 
 function onlineSameProcess(
@@ -3863,15 +3873,13 @@ function deleteSessions(db: SqliteAccess, sessionIDs: readonly string[]) {
         if (table === "part" && proofTables.has("online_reclaim_cross_session_part"))
           db.query("DELETE FROM online_reclaim_cross_session_part WHERE child_session_id = ?").run(id)
         if (table === "session_prompt_queue_alias" && proofTables.has("online_reclaim_queue_alias_scope"))
-          db
-            .query(
-              `DELETE FROM online_reclaim_queue_alias_scope
+          db.query(
+            `DELETE FROM online_reclaim_queue_alias_scope
                WHERE alias_rowid IN (
                  SELECT alias.rowid FROM session_prompt_queue_alias alias
                  WHERE alias.item_id IN (SELECT id FROM session_prompt_queue WHERE session_id = ?)
                )`,
-            )
-            .run(id)
+          ).run(id)
         return sum + db.query(`DELETE FROM ${quote(table)} WHERE ${scope}`).run(id).changes
       }, 0),
     ]),
