@@ -1850,6 +1850,89 @@ test.serial(
   { timeout: 60_000 },
 )
 
+test.serial("online prune detects a Todo rewrite at or behind a committed cursor", async () => {
+  await using store = await producedStore([{}])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  await rm(store.project, { recursive: true })
+  const startFile = path.join(store.directory, "online-todo-rewrite-start")
+  const closedFile = path.join(store.directory, "online-todo-rewrite-closed")
+  const producer = startProducer(store, { todoAfterSignal: { sessionID, startFile, closedFile } })
+  await readMatchingLine(producer, "PRUNE_TODO_WAITING")
+  const before = new Database(store.filename, { readonly: true })
+  const sessionUpdatedBefore = before.query<{ time_updated: number }, [string]>("SELECT time_updated FROM session WHERE id = ?")
+    .get(sessionID)!.time_updated
+  const eventSequenceBefore = before.query<{ seq: number }, [string]>("SELECT seq FROM event_sequence WHERE aggregate_id = ?")
+    .get(sessionID)!.seq
+  before.close()
+  const originalExec = Database.prototype.exec
+  const originalQuery = Database.prototype.query
+  let todoDeleteIssued = false
+  let injected = false
+  let producerFinished = false
+  const query = spyOn(Database.prototype, "query").mockImplementation(function <
+    ReturnType,
+    ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+  >(this: Database, statement: string) {
+    if (statement.startsWith('DELETE FROM "todo"')) todoDeleteIssued = true
+    return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+  })
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+    const result = originalExec.call(this, statement)
+    if (statement === "COMMIT" && todoDeleteIssued && !injected) {
+      injected = true
+      writeFileSync(startFile, "rewrite\n")
+      const deadline = Date.now() + 20_000
+      const wait = new Int32Array(new SharedArrayBuffer(4))
+      while (!existsSync(closedFile)) {
+        if (Date.now() >= deadline) throw new Error("late Todo producer did not publish its close acknowledgment")
+        Atomics.wait(wait, 0, 0, 5)
+      }
+    }
+    return result
+  })
+  try {
+    const result = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      apply: true,
+      reserveBytes: 1,
+      batchRows: 2,
+      maxBatches: 64,
+    })
+    assertChildOutcome(await producer.finish(), 0)
+    producerFinished = true
+    const after = new Database(store.filename, { readonly: true })
+    const todo = after
+      .query<{ content: string; position: number }, [string]>("SELECT content, position FROM todo WHERE session_id = ?")
+      .get(sessionID)
+    const sessionUpdatedAfter = after
+      .query<{ time_updated: number }, [string]>("SELECT time_updated FROM session WHERE id = ?")
+      .get(sessionID)?.time_updated
+    const eventSequenceAfter = after
+      .query<{ seq: number }, [string]>("SELECT seq FROM event_sequence WHERE aggregate_id = ?")
+      .get(sessionID)?.seq
+    after.close()
+    expect(result.report.skippedSessions?.find((item) => item.sessionID === sessionID)?.reasons).toContain(
+      "session-changed-after-inventory",
+    )
+    expect(todo).toEqual({ content: "Todo rewritten after the deletion cursor", position: 0 })
+    expect(sessionUpdatedAfter).toBe(sessionUpdatedBefore)
+    expect(eventSequenceAfter).toBe(eventSequenceBefore)
+    expect(injected).toBe(true)
+    expect(todoDeleteIssued).toBe(true)
+    expect(result.report.action).toBe("failed")
+    expect(result.report.committed).toBe(true)
+    expect(result.report.deletedSessionIDs).toEqual([])
+    expect(result.report.remainingSessionIDs).toContain(sessionID)
+  } finally {
+    exec.mockRestore()
+    query.mockRestore()
+    if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
+    if (!producerFinished) assertChildOutcome(await producer.finish(), 0)
+  }
+})
+
 test.serial(
   "online prune detects a new unselected descendant with an indexed tree probe",
   async () => {
