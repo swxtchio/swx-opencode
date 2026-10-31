@@ -1,4 +1,5 @@
 import { sqliteTable, text, integer, uniqueIndex, index, primaryKey } from "drizzle-orm/sqlite-core"
+import { sql } from "drizzle-orm"
 import type { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import type { SessionSchema } from "./schema"
 import type { MessageID } from "../v1/session"
@@ -41,6 +42,24 @@ export const SessionPromptQueueTable = sqliteTable(
   (table) => [
     uniqueIndex("session_prompt_queue_session_seq_idx").on(table.session_id, table.seq),
     index("session_prompt_queue_session_delivery_seq_idx").on(table.session_id, table.delivery, table.seq),
+    index("session_prompt_queue_session_open_idx")
+      .on(table.session_id)
+      .where(
+        sql`(${table.time_promoted} IS NULL AND ${table.time_withdrawn} IS NULL) OR ${table.time_preparing} IS NOT NULL`,
+      ),
+    index("session_prompt_queue_session_conflicted_idx")
+      .on(table.session_id)
+      .where(sql`${table.time_promoted} IS NOT NULL AND ${table.time_withdrawn} IS NOT NULL`),
+    index("session_prompt_queue_session_time_created_idx").on(table.session_id, table.time_created),
+    index("session_prompt_queue_session_time_promoted_idx")
+      .on(table.session_id, table.time_promoted)
+      .where(sql`${table.time_promoted} IS NOT NULL`),
+    index("session_prompt_queue_session_time_withdrawn_idx")
+      .on(table.session_id, table.time_withdrawn)
+      .where(sql`${table.time_withdrawn} IS NOT NULL`),
+    index("session_prompt_queue_session_time_preparing_idx")
+      .on(table.session_id, table.time_preparing)
+      .where(sql`${table.time_preparing} IS NOT NULL`),
   ],
 )
 
@@ -113,5 +132,13 @@ export const SessionPromptReceiptTable = sqliteTable(
   (table) => [
     primaryKey({ columns: [table.session_id, table.request_id] }),
     index("session_prompt_receipt_session_item_idx").on(table.session_id, table.item_id),
+    index("session_prompt_receipt_session_pending_idx")
+      .on(table.session_id)
+      .where(sql`${table.state} = 'pending'`),
+    index("session_prompt_receipt_session_invalid_idx")
+      .on(table.session_id)
+      .where(sql`${table.state} NOT IN ('pending', 'withdrawn', 'delivered', 'merged', 'superseded', 'deleted')`),
+    index("session_prompt_receipt_session_time_created_idx").on(table.session_id, table.time_created),
+    index("session_prompt_receipt_session_time_updated_idx").on(table.session_id, table.time_updated),
   ],
 )

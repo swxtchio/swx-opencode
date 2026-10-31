@@ -493,7 +493,7 @@ const onlineFence = Symbol("onlineFence")
 const onlineDescendantFence = Symbol("onlineDescendantFence")
 
 const onlineCursorColumns: Record<string, readonly string[]> = {
-  session_prompt_queue_alias: ["item_id", "rowid"],
+  session_prompt_queue_alias: ["queue_seq", "rowid"],
   message: ["time_created", "id"],
   event: ["seq"],
   todo: ["position"],
@@ -503,6 +503,67 @@ const onlineCursorColumns: Record<string, readonly string[]> = {
   session_prompt_receipt: ["request_id"],
   event_aggregate_writer: ["writer_id"],
 }
+
+const onlineCursorExpressions: Record<string, readonly string[]> = {
+  session_prompt_queue_alias: ["queue.seq", "alias.rowid"],
+}
+
+const onlineActivityOrderColumns: Record<string, Record<string, readonly string[]>> = {
+  session: { time_created: ["rowid"], time_updated: ["rowid"] },
+  message: { time_created: ["time_created", "id"], time_updated: ["time_updated", "id"] },
+  part: {
+    time_created: ["time_created", "id"],
+    time_updated: ["time_updated", "id"],
+  },
+  todo: {
+    time_created: ["time_created", "position"],
+    time_updated: ["time_updated", "position"],
+  },
+  session_message: { time_created: ["time_created", "id"], time_updated: ["time_updated", "id"] },
+  session_input: { time_created: ["time_created"] },
+  session_prompt_queue: {
+    time_created: ["time_created"],
+    time_promoted: ["time_promoted"],
+    time_withdrawn: ["time_withdrawn"],
+    time_preparing: ["time_preparing"],
+  },
+  session_prompt_receipt: { time_created: ["time_created"], time_updated: ["time_updated"] },
+  session_ask: { time_created: ["time_created"], time_settled: ["time_settled"] },
+  session_share: { time_created: ["rowid"], time_updated: ["rowid"] },
+  event_retention: { time_started: ["rowid"], time_updated: ["rowid"] },
+  event_aggregate_writer: { time_last_append: ["time_last_append"] },
+}
+
+const onlineDurableTypeList = [...Durable.keys()].map((type) => `'${type.replaceAll("'", "''")}'`).join(", ")
+
+const onlineWorkPredicates = {
+  messageInvalidJSON: "json_valid(data) = 0",
+  messageIncompleteAssistant:
+    "CASE WHEN json_valid(data) THEN json_extract(data, '$.role') = 'assistant' AND COALESCE(json_type(data, '$.time.completed'), 'null') NOT IN ('integer', 'real') ELSE 0 END",
+  partInvalidJSON: "json_valid(data) = 0",
+  partPendingRunning:
+    "CASE WHEN json_valid(data) THEN json_extract(data, '$.state.status') IN ('pending', 'running') ELSE 0 END",
+  sessionMessageInvalidJSON: "json_valid(data) = 0",
+  sessionMessageIncompleteAssistant:
+    "CASE WHEN json_valid(data) THEN type = 'assistant' AND COALESCE(json_type(data, '$.time.completed'), 'null') NOT IN ('integer', 'real') ELSE 0 END",
+  sessionInputPending: "promoted_seq IS NULL",
+  sessionInputInvalidDelivery: "delivery NOT IN ('steer', 'queue')",
+  sessionPromptQueueOpen: "(time_promoted IS NULL AND time_withdrawn IS NULL) OR time_preparing IS NOT NULL",
+  sessionPromptQueueConflicted: "time_promoted IS NOT NULL AND time_withdrawn IS NOT NULL",
+  sessionPromptReceiptPending: "state = 'pending'",
+  sessionPromptReceiptInvalid: "state NOT IN ('pending', 'withdrawn', 'delivered', 'merged', 'superseded', 'deleted')",
+  sessionAskUnsettled: "time_settled IS NULL",
+  eventUnknownType: `type NOT IN (${onlineDurableTypeList})`,
+} as const
+
+const onlineCrossSessionPartQuery = `
+  SELECT session_id FROM part INDEXED BY part_message_id_session_idx
+  WHERE message_id = ? AND session_id < ?
+  UNION ALL
+  SELECT session_id FROM part INDEXED BY part_message_id_session_idx
+  WHERE message_id = ? AND session_id > ?
+  LIMIT 1
+`
 
 type OnlineSessionSummary = {
   sessionID: string
@@ -621,7 +682,13 @@ async function applyOnlinePrune(
         refusalReasons: ["no-eligible-sessions", ...inventory.excludedSessions.flatMap((item) => item.reasons)],
       }
     }
-    return await applyOnlineScope(db, resolved.filename, cutoff, options.value, inventory)
+    // Inventory prepares indexed proof statements; close that connection before acquiring the writer lock.
+    db.close()
+    db = new sqlite.Database(resolved.filename, { readwrite: true, create: false })
+    db.exec(`PRAGMA busy_timeout = ${onlineBounds.busyTimeout}; PRAGMA foreign_keys = ON`)
+    const applied = await applyOnlineScope(db, resolved.filename, cutoff, options.value, inventory)
+    db = applied.db
+    return applied.report
   } catch (error) {
     const refused = onlineRefusedReport(filename, cutoff, requested, usage, [
       error instanceof Error ? error.message : "online-database-operation-failed",
@@ -726,7 +793,7 @@ async function onlineInventorySnapshot(
   const schemaReasons = [
     ...schema.failures,
     ...schema.unclassifiedTables.map((table) => `unclassified-session-storage:${table}`),
-    ...onlineScopeIndexFailures(db, schema.tables),
+    ...onlineScopeIndexFailures(db, schema),
   ]
   const sessionColumns = schema.columnMap.get("session")
   const canReadSessionScope = ["id", "directory", "parent_id", "time_created", "time_updated"].every((column) =>
@@ -812,16 +879,6 @@ async function onlineInventorySnapshot(
   let dependenciesChanged = true
   while (dependenciesChanged) {
     dependenciesChanged = false
-    const eligibleIDs = selectedSessions.map((item) => item.sessionID)
-    const cascadeReasons =
-      schemaReasons.length === 0 ? onlineCrossSessionCascadeFailures(db, eligibleIDs, new Set(eligibleIDs)) : []
-    for (const result of cascadeReasons) {
-      const candidate = selectedSessions.find((item) => item.sessionID === result.sessionID)
-      if (!candidate) continue
-      selectedSessions.splice(selectedSessions.indexOf(candidate), 1)
-      excludedSessions.push({ ...candidate, reasons: [result.reason] })
-      dependenciesChanged = true
-    }
     const remaining = new Set(selectedSessions.map((item) => item.sessionID))
     for (const candidate of selectedSessions) {
       const protectedDescendant = (candidate[onlineDescendantFence] ?? []).filter((id) => !remaining.has(id))
@@ -919,39 +976,28 @@ function onlineExcludedSession(
   }
 }
 
-function onlinePayloadExpression(table: string, schema: ReturnType<typeof inspectSchema>) {
+function onlinePayloadExpression(table: string, schema: ReturnType<typeof inspectSchema>, qualifier?: string) {
   const columns = [...(schema.columnTypes.get(table) ?? [])]
     .filter(([, type]) => !type || /TEXT|CHAR|CLOB|BLOB/i.test(type))
     .map(([column]) => column)
   if (columns.length === 0) return "0"
-  return columns.map((column) => `coalesce(length(CAST(${quote(column)} AS BLOB)), 0)`).join(" + ")
+  return columns
+    .map((column) => `coalesce(length(CAST(${qualifier ? `${quote(qualifier)}.` : ""}${quote(column)} AS BLOB)), 0)`)
+    .join(" + ")
 }
 
 function onlineCursorPredicate(
   columns: readonly string[],
   cursor: OnlineCursor | undefined,
   position: "after" | "through" = "after",
+  expressions: readonly string[] = columns.map(quote),
 ) {
   if (!cursor) return { sql: "", params: [] as SQLQueryBindings[] }
-  const clauses = new Array<string>()
-  const params = new Array<SQLQueryBindings>()
-  const operator = position === "after" ? ">" : "<"
-  for (const [index, column] of columns.entries()) {
-    const value = cursor[index]
-    if (value === undefined) throw new Error("online-cursor-shape-mismatch")
-    clauses.push(
-      `(${[
-        ...columns.slice(0, index).map((previous) => `${quote(previous)} = ?`),
-        `${quote(column)} ${operator} ?`,
-      ].join(" AND ")})`,
-    )
-    params.push(...cursor.slice(0, index), value)
-  }
-  if (position === "through") {
-    clauses.push(`(${columns.map((column) => `${quote(column)} = ?`).join(" AND ")})`)
-    params.push(...cursor)
-  }
-  return { sql: ` AND (${clauses.join(" OR ")})`, params }
+  if (cursor.length !== expressions.length) throw new Error("online-cursor-shape-mismatch")
+  const left = expressions.length === 1 ? expressions[0]! : `(${expressions.join(", ")})`
+  const right = columns.length === 1 ? "?" : `(${columns.map(() => "?").join(", ")})`
+  const operator = position === "after" ? ">" : "<="
+  return { sql: ` AND ${left} ${operator} ${right}`, params: cursor }
 }
 
 function onlineCursorFromRow(table: string, row: Record<string, unknown>): OnlineCursor {
@@ -960,6 +1006,20 @@ function onlineCursorFromRow(table: string, row: Record<string, unknown>): Onlin
     if (typeof value !== "number" && typeof value !== "string") throw new Error(`online-cursor-unreadable:${table}`)
     return value
   })
+}
+
+function onlineActivityQuery(
+  source: (typeof activitySources)[number],
+  column: (typeof activitySources)[number]["columns"][number],
+) {
+  const order = onlineActivityOrderColumns[source.table]?.[column.name]
+  if (!order) return undefined
+  const name = quote(column.name)
+  return `SELECT ${name} AS activity FROM ${quote(source.table)} WHERE ${quote(source.scope)} = ?${column.optional ? ` AND ${name} IS NOT NULL` : ""} ORDER BY ${order.map((item) => `${quote(item)} DESC`).join(", ")} LIMIT 1`
+}
+
+function onlineWorkQuery(table: string, index: string, scope: string, predicate: string, selection = "rowid") {
+  return `SELECT ${selection} FROM ${quote(table)} INDEXED BY ${quote(index)} WHERE ${quote(scope)} = ? AND (${predicate}) LIMIT 1`
 }
 
 function onlineSelectScope(
@@ -973,11 +1033,21 @@ function onlineSelectScope(
   position: "after" | "through" = "after",
 ) {
   const columns = onlineCursorColumns[table] ?? ["rowid"]
-  const selectedColumns = [...new Set(["rowid", ...columns.filter((column) => column !== "rowid")])]
-  const payload = includePayload ? `, ${onlinePayloadExpression(table, schema)} AS payload_bytes` : ""
-  const keyset = onlineCursorPredicate(columns, cursor, position)
+  const aliasPage = table === "session_prompt_queue_alias"
+  const expressions = onlineCursorExpressions[table] ?? columns.map(quote)
+  const selectedColumns = aliasPage
+    ? "alias.rowid AS rowid, alias.item_id AS item_id, queue.seq AS queue_seq"
+    : [...new Set(["rowid", ...columns.filter((column) => column !== "rowid")])].map(quote).join(", ")
+  const from = aliasPage
+    ? `FROM ${quote(table)} alias JOIN ${quote("session_prompt_queue")} queue ON queue.id = alias.item_id`
+    : `FROM ${quote(table)}`
+  const where = aliasPage ? "queue.session_id = ?" : scope
+  const payload = includePayload
+    ? `, ${onlinePayloadExpression(table, schema, aliasPage ? "alias" : undefined)} AS payload_bytes`
+    : ""
+  const keyset = onlineCursorPredicate(columns, cursor, position, expressions)
   return {
-    query: `SELECT ${selectedColumns.map(quote).join(", ")}${payload} FROM ${quote(table)} WHERE ${scope}${keyset.sql} ORDER BY ${columns.map((column) => `${quote(column)} ${direction}`).join(", ")} LIMIT ?`,
+    query: `SELECT ${selectedColumns}${payload} ${from} WHERE ${where}${keyset.sql} ORDER BY ${expressions.map((column) => `${column} ${direction}`).join(", ")} LIMIT ?`,
     params: [sessionID, ...keyset.params],
   }
 }
@@ -988,6 +1058,9 @@ function onlinePlanSessionBatch(
   options: OnlineOptions,
   schema: ReturnType<typeof inspectSchema>,
   cursors: OnlineCursors,
+  eligibleIDs: ReadonlySet<string>,
+  skippedIDs: ReadonlySet<string>,
+  completedIDs: ReadonlySet<string>,
 ) {
   let remainingRows = options.batchRows
   let remainingBytes = options.batchBytes
@@ -1010,28 +1083,56 @@ function onlinePlanSessionBatch(
     )
       continue
     if (table === "event_sequence" && onlineHasRows(db, "event", "aggregate_id = ?", sessionID)) continue
-    const selected = onlineSelectScope(table, scope, sessionID, schema, cursors.get(table))
+    // Page keys only; size one candidate at a time and debit its bytes before inspecting the next row.
+    const selected = onlineSelectScope(table, scope, sessionID, schema, cursors.get(table), "ASC", false)
     const rows = db
-      .query<{ rowid: number; payload_bytes: number } & Record<string, unknown>, SQLQueryBindings[]>(selected.query)
-      .all(...selected.params, remainingRows + 1)
-    if (rows.length > remainingRows) rows.length = remainingRows
+      .query<{ rowid: number } & Record<string, unknown>, SQLQueryBindings[]>(selected.query)
+      .all(...selected.params, remainingRows)
     const rowids = new Array<number>()
     let selectedBytes = 0
     let nextCursor: OnlineCursor | undefined
     for (const row of rows) {
-      if (!Number.isSafeInteger(row.payload_bytes) || row.payload_bytes < 0) {
+      if (remainingRows <= 0 || remainingBytes <= 0) break
+      if (table === "message") {
+        if (typeof row.id !== "string") {
+          blockedReason = `session-message-id-unreadable:${sessionID}`
+          break
+        }
+        // Check indexed external Part references in this locked batch before a Message can cascade-delete them.
+        const crossSessionPart = db
+          .query<{ session_id: string }, SQLQueryBindings[]>(onlineCrossSessionPartQuery)
+          .get(row.id, sessionID, row.id, sessionID)
+        if (crossSessionPart) {
+          if (
+            !eligibleIDs.has(crossSessionPart.session_id) ||
+            skippedIDs.has(crossSessionPart.session_id) ||
+            completedIDs.has(crossSessionPart.session_id)
+          )
+            blockedReason = `cross-session-cascade:part.message_id:${row.id}:${sessionID}->${crossSessionPart.session_id}`
+          break
+        }
+      }
+      const payloadBytes = db
+        .query<
+          { payload_bytes: number },
+          [number]
+        >(`SELECT ${onlinePayloadExpression(table, schema)} AS payload_bytes FROM ${quote(table)} WHERE rowid = ?`)
+        .get(row.rowid)?.payload_bytes
+      if (typeof payloadBytes !== "number" || !Number.isSafeInteger(payloadBytes) || payloadBytes < 0) {
         blockedReason = `session-payload-size-unreadable:${table}:${sessionID}`
         break
       }
-      if (row.payload_bytes > remainingBytes - selectedBytes) {
-        if (row.payload_bytes > options.batchBytes)
+      if (payloadBytes > remainingBytes) {
+        if (payloadBytes > options.batchBytes)
           blockedReason = `session-payload-exceeds-batch-byte-bound:${table}:${sessionID}`
         else if (rowids.length === 0 && selectedRows === 0)
           blockedReason = `session-payload-exceeds-batch-byte-bound:${table}:${sessionID}`
         break
       }
       rowids.push(row.rowid)
-      selectedBytes += row.payload_bytes
+      selectedBytes += payloadBytes
+      remainingRows -= 1
+      remainingBytes -= payloadBytes
       nextCursor = onlineCursorFromRow(table, row)
     }
     if (rowids.length === 0) {
@@ -1041,8 +1142,6 @@ function onlinePlanSessionBatch(
     if (!nextCursor) throw new Error(`online-cursor-missing:${table}`)
     plan.push({ table, rowids, payloadBytes: selectedBytes, nextCursor })
     selectedRows += rowids.length
-    remainingRows -= rowids.length
-    remainingBytes -= selectedBytes
     payloadBytes += selectedBytes
     if (blockedReason) break
   }
@@ -1062,6 +1161,17 @@ function onlineCommitDeletePlan(db: SqliteAccess, sessionID: string, plan: Retur
 }
 
 function onlineHasRows(db: SqliteAccess, table: string, scope: string, sessionID: string) {
+  if (table === "session_prompt_queue_alias")
+    return Boolean(
+      db
+        .query(
+          `SELECT alias.rowid FROM session_prompt_queue queue
+           JOIN session_prompt_queue_alias alias ON alias.item_id = queue.id
+           WHERE queue.session_id = ?
+           LIMIT 1`,
+        )
+        .get(sessionID),
+    )
   return Boolean(db.query(`SELECT rowid FROM ${quote(table)} WHERE ${scope} LIMIT 1`).get(sessionID))
 }
 
@@ -1156,7 +1266,7 @@ async function onlineDeleteOneBatch(
       }
 
     const schema = inspectSchema(db)
-    const plan = onlinePlanSessionBatch(db, sessionID, options, schema, cursors)
+    const plan = onlinePlanSessionBatch(db, sessionID, options, schema, cursors, eligibleIDs, skippedIDs, completedIDs)
     if (plan.blockedReason && plan.changedRows === 0)
       return {
         state: "skipped",
@@ -1394,12 +1504,20 @@ async function onlineDeleteSessionRow(
 }
 
 async function applyOnlineScope(
-  db: SqliteAccess,
+  initialDB: SqliteAccess,
   filename: string,
   cutoff: number | undefined,
   options: OnlineOptions,
   inventory: OnlinePruneReport,
-): Promise<OnlinePruneReport> {
+): Promise<{ report: OnlinePruneReport; db: SqliteAccess }> {
+  const sqlite = await import("bun:sqlite")
+  let db = initialDB
+  const reopenDatabase = () => {
+    // Drop statements from the previous proof or reclaim step before the next SQLite lock boundary.
+    db.close()
+    db = new sqlite.Database(filename, { readwrite: true, create: false })
+    db.exec(`PRAGMA busy_timeout = ${onlineBounds.busyTimeout}; PRAGMA foreign_keys = ON`)
+  }
   const requested = inventory.explicitSessionIDs ?? []
   const candidates = inventory.selectedSessions
   const eligibleIDs = new Set(candidates.map((item) => item.sessionID))
@@ -1451,6 +1569,7 @@ async function applyOnlineScope(
           options,
           batchNumber,
         )
+        reopenDatabase()
         if (result.state === "empty") {
           if (result.hasRemainingRows) stalled.push(item.sessionID)
           continue
@@ -1488,6 +1607,7 @@ async function applyOnlineScope(
         })
 
         const step = await onlineReclaimStep(db, filename, options, pagesRequested)
+        reopenDatabase()
         pagesRequested += step.pagesRequested
         committed ||= step.committed
         steps.push(...step.steps.map((record) => ({ batch: batchNumber, sessionID: item.sessionID, ...record })))
@@ -1520,7 +1640,9 @@ async function applyOnlineScope(
         !skipped.has(item.sessionID) && !completed.has(item.sessionID) && onlineHasSessionStorage(db, item.sessionID),
     )
     if (!failureReason && committed && remainingPayload.length === 0) {
+      reopenDatabase()
       const drained = await onlineReclaimUntilDone(db, filename, options, pagesRequested, reclaimOutstanding)
+      reopenDatabase()
       pagesRequested = drained.pagesRequested
       committed ||= drained.committed
       steps.push(...drained.steps)
@@ -1556,6 +1678,7 @@ async function applyOnlineScope(
           options,
           batchNumber,
         )
+        reopenDatabase()
         if (result.state === "skipped") {
           skipped.set(item.sessionID, result.reasons ?? ["session-not-eligible"])
           continue
@@ -1584,6 +1707,7 @@ async function applyOnlineScope(
           remainingSessionIDs: requested.filter((id) => !completed.has(id)).toSorted(),
         })
         const step = await onlineReclaimStep(db, filename, options, pagesRequested)
+        reopenDatabase()
         pagesRequested += step.pagesRequested
         committed ||= step.committed
         steps.push(...step.steps)
@@ -1596,7 +1720,9 @@ async function applyOnlineScope(
     }
 
     if (!failureReason && completed.size > 0) {
+      reopenDatabase()
       const drained = await onlineReclaimUntilDone(db, filename, options, pagesRequested, reclaimOutstanding)
+      reopenDatabase()
       pagesRequested = drained.pagesRequested
       committed ||= drained.committed
       steps.push(...drained.steps)
@@ -1667,7 +1793,7 @@ async function applyOnlineScope(
     refusalReasons.push("requested-session-work-incomplete")
   const action =
     remainingSessionIDs.length === 0 && failureReason === undefined ? "applied" : committed ? "failed" : "refused"
-  return {
+  const report: OnlinePruneReport = {
     ...inventory,
     action,
     committed,
@@ -1698,6 +1824,7 @@ async function applyOnlineScope(
       steps: [...inventory.reclamation.steps, ...steps],
     },
   }
+  return { report, db }
 }
 
 function onlineBeginImmediate(db: SqliteAccess) {
@@ -1714,7 +1841,11 @@ function onlineBeginImmediate(db: SqliteAccess) {
 
 function onlineBusy(error: unknown) {
   if (!(error instanceof Error)) return false
-  return error.message.includes("SQLITE_BUSY") || error.message.includes("database is locked")
+  return (
+    error.message.includes("SQLITE_BUSY") ||
+    error.message.includes("database is locked") ||
+    error.message.includes("database table is locked")
+  )
 }
 
 async function onlineRevalidateSession(
@@ -1732,7 +1863,7 @@ async function onlineRevalidateSession(
   const globalReasons = [
     ...schema.failures,
     ...schema.unclassifiedTables.map((table) => `unclassified-session-storage:${table}`),
-    ...onlineScopeIndexFailures(db, schema.tables),
+    ...onlineScopeIndexFailures(db, schema),
     ...(db.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()?.auto_vacuum === 2
       ? []
       : ["incremental-vacuum-unavailable"]),
@@ -1805,44 +1936,11 @@ function onlineSessionEvidence(
   includeActivity: boolean,
 ) {
   const reasons = new Set(onlineSessionWorkFailures(db, sessionID, includeActivity))
-  let lastActivity = Number.NEGATIVE_INFINITY
+  let lastActivity: number | undefined
   if (includeActivity) {
-    for (const source of activitySources) {
-      if (!schema.tables.has(source.table)) {
-        reasons.add(`session-activity-evidence-unavailable:${source.table}`)
-        continue
-      }
-      const columns = schema.columnMap.get(source.table)
-      const missing = source.columns.filter((column) => !column.optional && !columns?.has(column.name))
-      if (missing.length > 0 || !columns?.has(source.scope)) {
-        reasons.add(
-          `session-activity-evidence-unavailable:${source.table}.${missing.map((column) => column.name).join(",")}`,
-        )
-        continue
-      }
-      const timeColumns = source.columns.filter((column) => columns.has(column.name))
-      const expressions = timeColumns.flatMap((column, index) => {
-        const name = quote(column.name)
-        const valid = `typeof(${name}) IN ('integer', 'real')`
-        return [
-          `max(CASE WHEN ${valid} THEN ${name} END) AS newest_${index}`,
-          `sum(CASE WHEN ${valid}${column.optional ? ` OR ${name} IS NULL` : ""} THEN 0 ELSE 1 END) AS invalid_${index}`,
-        ]
-      })
-      const activity = db
-        .query<
-          Record<string, unknown>,
-          [string]
-        >(`SELECT ${expressions.join(", ")} FROM ${quote(source.table)} WHERE ${quote(source.scope)} = ?`)
-        .get(sessionID)
-      for (const [index, column] of timeColumns.entries()) {
-        const value = activity?.[`newest_${index}`]
-        if (typeof value === "number" && Number.isFinite(value)) lastActivity = Math.max(lastActivity, value)
-        if (typeof activity?.[`invalid_${index}`] === "number" && Number(activity[`invalid_${index}`]) > 0)
-          reasons.add(`session-activity-unreadable:${source.table}.${column.name}`)
-      }
-    }
-    if (!Number.isFinite(lastActivity)) reasons.add("activity-evidence-unreadable:no-timestamp")
+    const activity = onlineLastActivity(db, schema, sessionID)
+    lastActivity = activity.lastActivity
+    for (const reason of activity.reasons) reasons.add(reason)
   }
 
   const fence = onlineReadFence(db, schema, sessionID, sessionUpdated)
@@ -1863,69 +1961,131 @@ function onlineSessionEvidence(
   }
 }
 
+function onlineLastActivity(db: SqliteAccess, schema: ReturnType<typeof inspectSchema>, sessionID: string) {
+  const reasons = new Set<string>()
+  let lastActivity = Number.NEGATIVE_INFINITY
+  for (const source of activitySources) {
+    if (!schema.tables.has(source.table)) {
+      reasons.add(`session-activity-evidence-unavailable:${source.table}`)
+      continue
+    }
+    const columns = schema.columnMap.get(source.table)
+    const missing = source.columns.filter((column) => !column.optional && !columns?.has(column.name))
+    if (missing.length > 0 || !columns?.has(source.scope)) {
+      reasons.add(
+        `session-activity-evidence-unavailable:${source.table}.${missing.map((column) => column.name).join(",")}`,
+      )
+      continue
+    }
+    for (const column of source.columns.filter((item) => columns.has(item.name))) {
+      const query = onlineActivityQuery(source, column)
+      if (!query) {
+        reasons.add(`session-activity-order-unavailable:${source.table}.${column.name}`)
+        continue
+      }
+      const latest = db.query<{ activity: unknown }, [string]>(query).get(sessionID)?.activity
+      if (latest === undefined || (latest === null && column.optional)) continue
+      if (typeof latest === "number" && Number.isFinite(latest)) lastActivity = Math.max(lastActivity, latest)
+      else reasons.add(`session-activity-unreadable:${source.table}.${column.name}`)
+    }
+  }
+  if (!Number.isFinite(lastActivity)) reasons.add("activity-evidence-unreadable:no-timestamp")
+  return { lastActivity: Number.isFinite(lastActivity) ? lastActivity : undefined, reasons: [...reasons].toSorted() }
+}
+
 function onlineSessionWorkFailures(db: SqliteAccess, sessionID: string, includeHistoricalChecks: boolean) {
   const reasons = new Set<string>()
-  const hasSession = (table: string, predicate: string) =>
-    onlineHasRows(db, table, `session_id = ? AND (${predicate})`, sessionID)
+  const hasIndex = (table: string, name: string, predicate: string, scope = "session_id") =>
+    Boolean(db.query(onlineWorkQuery(table, name, scope, predicate)).get(sessionID))
   if (onlineHasRows(db, "session", "id = ? AND time_compacting IS NOT NULL", sessionID))
     reasons.add("session-compaction-in-flight")
   if (includeHistoricalChecks) {
-    if (hasSession("message", "NOT json_valid(data)")) reasons.add("session-work-state-unreadable")
+    if (hasIndex("message", "message_session_invalid_json_idx", onlineWorkPredicates.messageInvalidJSON))
+      reasons.add("session-work-state-unreadable")
     if (
-      hasSession(
-        "message",
-        "CASE WHEN json_valid(data) THEN json_extract(data, '$.role') = 'assistant' AND COALESCE(json_type(data, '$.time.completed'), 'null') NOT IN ('integer', 'real') ELSE 0 END",
-      )
+      hasIndex("message", "message_session_incomplete_assistant_idx", onlineWorkPredicates.messageIncompleteAssistant)
     )
       reasons.add("assistant-or-tool-work-in-flight")
-    if (hasSession("part", "NOT json_valid(data)")) reasons.add("session-work-state-unreadable")
-    if (
-      hasSession(
-        "part",
-        "CASE WHEN json_valid(data) THEN json_extract(data, '$.state.status') IN ('pending', 'running') ELSE 0 END",
-      )
-    )
+    if (hasIndex("part", "part_session_invalid_json_idx", onlineWorkPredicates.partInvalidJSON))
+      reasons.add("session-work-state-unreadable")
+    if (hasIndex("part", "part_session_pending_running_idx", onlineWorkPredicates.partPendingRunning))
       reasons.add("assistant-or-tool-work-in-flight")
-    if (hasSession("session_message", "NOT json_valid(data)")) reasons.add("session-work-state-unreadable")
     if (
-      hasSession(
+      hasIndex(
         "session_message",
-        "CASE WHEN json_valid(data) THEN type = 'assistant' AND COALESCE(json_type(data, '$.time.completed'), 'null') NOT IN ('integer', 'real') ELSE 0 END",
+        "session_message_session_invalid_json_idx",
+        onlineWorkPredicates.sessionMessageInvalidJSON,
+      )
+    )
+      reasons.add("session-work-state-unreadable")
+    if (
+      hasIndex(
+        "session_message",
+        "session_message_session_incomplete_assistant_idx",
+        onlineWorkPredicates.sessionMessageIncompleteAssistant,
       )
     )
       reasons.add("assistant-or-tool-work-in-flight")
+    if (
+      hasIndex(
+        "session_input",
+        "session_input_session_invalid_delivery_idx",
+        onlineWorkPredicates.sessionInputInvalidDelivery,
+      )
+    )
+      reasons.add("session-input-state-unreadable")
   }
-  if (hasSession("session_input", "promoted_seq IS NULL")) reasons.add("v2-input-pending")
-  if (hasSession("session_input", "delivery IS NULL OR delivery NOT IN ('steer', 'queue')"))
-    reasons.add("session-input-state-unreadable")
   if (
-    hasSession(
+    hasIndex(
+      "session_input",
+      "session_input_session_pending_delivery_seq_idx",
+      onlineWorkPredicates.sessionInputPending,
+    )
+  )
+    reasons.add("v2-input-pending")
+  if (
+    hasIndex(
       "session_prompt_queue",
-      "(time_promoted IS NULL AND time_withdrawn IS NULL) OR time_preparing IS NOT NULL",
+      "session_prompt_queue_session_open_idx",
+      onlineWorkPredicates.sessionPromptQueueOpen,
     )
   )
     reasons.add("v1-prompt-queue-row-present")
-  if (hasSession("session_prompt_queue", "time_promoted IS NOT NULL AND time_withdrawn IS NOT NULL"))
-    reasons.add("v1-queue-state-unreadable")
-  if (hasSession("session_prompt_receipt", "state = 'pending'")) reasons.add("v1-prompt-receipt-pending")
   if (
-    hasSession(
+    hasIndex(
+      "session_prompt_queue",
+      "session_prompt_queue_session_conflicted_idx",
+      onlineWorkPredicates.sessionPromptQueueConflicted,
+    )
+  )
+    reasons.add("v1-queue-state-unreadable")
+  if (
+    hasIndex(
       "session_prompt_receipt",
-      "state IS NULL OR state NOT IN ('pending', 'withdrawn', 'delivered', 'merged', 'superseded', 'deleted')",
+      "session_prompt_receipt_session_pending_idx",
+      onlineWorkPredicates.sessionPromptReceiptPending,
+    )
+  )
+    reasons.add("v1-prompt-receipt-pending")
+  if (
+    hasIndex(
+      "session_prompt_receipt",
+      "session_prompt_receipt_session_invalid_idx",
+      onlineWorkPredicates.sessionPromptReceiptInvalid,
     )
   )
     reasons.add("session-input-state-unreadable")
-  if (hasSession("session_ask", "time_settled IS NULL")) reasons.add("supervised-ask-pending")
+  if (hasIndex("session_ask", "session_ask_session_unsettled_idx", onlineWorkPredicates.sessionAskUnsettled))
+    reasons.add("supervised-ask-pending")
   if (onlineHasRows(db, "event_retention", "aggregate_id = ? AND state IN ('scanning', 'redacting')", sessionID))
     reasons.add("session-retention-in-flight")
   if (includeHistoricalChecks) {
-    const durableTypes = [...Durable.keys()]
     const unknown = db
       .query<
         { type: string },
-        SQLQueryBindings[]
-      >(`SELECT type FROM event WHERE aggregate_id = ? AND type NOT IN (${durableTypes.map(() => "?").join(", ")}) LIMIT 1`)
-      .get(sessionID, ...durableTypes)
+        [string]
+      >(onlineWorkQuery("event", "event_aggregate_unknown_type_idx", "aggregate_id", onlineWorkPredicates.eventUnknownType, "type"))
+      .get(sessionID)
     if (unknown) reasons.add(`unknown-durable-event-owner:${unknown.type}`)
   }
   return [...reasons]
@@ -2070,7 +2230,8 @@ function onlineSameProcess(
   )
 }
 
-function onlineScopeIndexFailures(db: SqliteAccess, tables: ReadonlySet<string>) {
+function onlineScopeIndexFailures(db: SqliteAccess, schema: ReturnType<typeof inspectSchema>) {
+  const tables = schema.tables
   const required: { table: string; columns: string[] }[] = [
     { table: "session", columns: ["id"] },
     { table: "session", columns: ["parent_id"] },
@@ -2078,12 +2239,14 @@ function onlineScopeIndexFailures(db: SqliteAccess, tables: ReadonlySet<string>)
     { table: "message", columns: ["session_id", "time_created", "id"] },
     { table: "part", columns: ["session_id"] },
     { table: "part", columns: ["message_id"] },
+    { table: "part", columns: ["message_id", "session_id"] },
     { table: "todo", columns: ["session_id"] },
     { table: "todo", columns: ["session_id", "position"] },
     { table: "session_message", columns: ["session_id"] },
     { table: "session_message", columns: ["session_id", "seq"] },
     { table: "session_input", columns: ["session_id"] },
     { table: "session_input", columns: ["session_id", "admitted_seq"] },
+    { table: "session_input", columns: ["session_id", "promoted_seq", "delivery", "admitted_seq"] },
     { table: "session_context_epoch", columns: ["session_id"] },
     { table: "session_prompt_queue", columns: ["session_id"] },
     { table: "session_prompt_queue", columns: ["session_id", "seq"] },
@@ -2115,6 +2278,7 @@ function onlineScopeIndexFailures(db: SqliteAccess, tables: ReadonlySet<string>)
   }
   const rowidOrdered = [
     { table: "part", scope: "session_id" },
+    { table: "todo", scope: "session_id" },
     { table: "session_ask", scope: "session_id" },
     { table: "session_prompt_provenance", scope: "session_id" },
     { table: "session_prompt_queue_alias", scope: "item_id" },
@@ -2155,6 +2319,298 @@ function onlineScopeIndexFailures(db: SqliteAccess, tables: ReadonlySet<string>)
       columns.some((column, position) => indexColumns[position]?.name !== column || indexColumns[position]?.desc !== 0)
     )
       failures.push(`online-keyset-index-unavailable:${table}.${name}`)
+  }
+  const keysetPlans = [
+    { table: "message", cursor: [0, ""] as OnlineCursor, indexes: ["message_session_time_created_id_idx"] },
+    { table: "event", cursor: [0] as OnlineCursor, indexes: ["event_aggregate_seq_idx"] },
+    {
+      table: "session_prompt_queue_alias",
+      cursor: [0, 0] as OnlineCursor,
+      indexes: ["session_prompt_queue_session_seq_idx", "session_prompt_queue_alias_item_idx"],
+    },
+  ]
+  for (const { table, cursor, indexes } of keysetPlans) {
+    if (!tables.has(table)) continue
+    const scope = storageScopes.find((item) => item[0] === table)?.[1]
+    if (!scope) {
+      failures.push(`online-keyset-query-scope-unavailable:${table}`)
+      continue
+    }
+    for (const position of ["after", "through"] as const) {
+      const selected = onlineSelectScope(table, scope, "online-index-probe", schema, cursor, "ASC", false, position)
+      try {
+        const detail = db
+          .query<{ detail: string }, SQLQueryBindings[]>(`EXPLAIN QUERY PLAN ${selected.query}`)
+          .all(...selected.params, 1)
+          .map((item) => item.detail)
+          .join("\n")
+        if (
+          !detail.includes("SEARCH") ||
+          detail.includes("USE TEMP B-TREE") ||
+          detail.includes("MATERIALIZE") ||
+          detail.includes("LIST SUBQUERY") ||
+          indexes.some((name) => !detail.includes(name))
+        )
+          failures.push(`online-keyset-query-plan-unavailable:${table}:${position}`)
+      } catch {
+        failures.push(`online-keyset-query-plan-unavailable:${table}:${position}`)
+      }
+    }
+  }
+  const activityIndexes = [
+    {
+      table: "message",
+      name: "message_session_time_created_id_idx",
+      columns: ["session_id", "time_created", "id"],
+      partial: 0,
+    },
+    {
+      table: "message",
+      name: "message_session_time_updated_id_idx",
+      columns: ["session_id", "time_updated", "id"],
+      partial: 0,
+    },
+    {
+      table: "part",
+      name: "part_session_time_created_id_idx",
+      columns: ["session_id", "time_created", "id"],
+      partial: 0,
+    },
+    {
+      table: "part",
+      name: "part_session_time_updated_id_idx",
+      columns: ["session_id", "time_updated", "id"],
+      partial: 0,
+    },
+    {
+      table: "todo",
+      name: "todo_session_time_created_position_idx",
+      columns: ["session_id", "time_created", "position"],
+      partial: 0,
+    },
+    {
+      table: "todo",
+      name: "todo_session_time_updated_position_idx",
+      columns: ["session_id", "time_updated", "position"],
+      partial: 0,
+    },
+    {
+      table: "session_message",
+      name: "session_message_session_time_created_id_idx",
+      columns: ["session_id", "time_created", "id"],
+      partial: 0,
+    },
+    {
+      table: "session_message",
+      name: "session_message_session_time_updated_id_idx",
+      columns: ["session_id", "time_updated", "id"],
+      partial: 0,
+    },
+    {
+      table: "session_input",
+      name: "session_input_session_time_created_idx",
+      columns: ["session_id", "time_created"],
+      partial: 0,
+    },
+    {
+      table: "session_prompt_queue",
+      name: "session_prompt_queue_session_time_created_idx",
+      columns: ["session_id", "time_created"],
+      partial: 0,
+    },
+    {
+      table: "session_prompt_queue",
+      name: "session_prompt_queue_session_time_promoted_idx",
+      columns: ["session_id", "time_promoted"],
+      partial: 1,
+    },
+    {
+      table: "session_prompt_queue",
+      name: "session_prompt_queue_session_time_withdrawn_idx",
+      columns: ["session_id", "time_withdrawn"],
+      partial: 1,
+    },
+    {
+      table: "session_prompt_queue",
+      name: "session_prompt_queue_session_time_preparing_idx",
+      columns: ["session_id", "time_preparing"],
+      partial: 1,
+    },
+    {
+      table: "session_prompt_receipt",
+      name: "session_prompt_receipt_session_time_created_idx",
+      columns: ["session_id", "time_created"],
+      partial: 0,
+    },
+    {
+      table: "session_prompt_receipt",
+      name: "session_prompt_receipt_session_time_updated_idx",
+      columns: ["session_id", "time_updated"],
+      partial: 0,
+    },
+    {
+      table: "session_ask",
+      name: "session_ask_session_time_created_idx",
+      columns: ["session_id", "time_created"],
+      partial: 0,
+    },
+    {
+      table: "session_ask",
+      name: "session_ask_session_time_settled_idx",
+      columns: ["session_id", "time_settled"],
+      partial: 1,
+    },
+    {
+      table: "event_aggregate_writer",
+      name: "event_aggregate_writer_activity_idx",
+      columns: ["aggregate_id", "time_last_append"],
+      partial: 0,
+    },
+  ]
+  for (const { table, name, columns, partial } of activityIndexes) {
+    if (!tables.has(table)) continue
+    const index = db
+      .query<{ name: string; partial: number }, []>(`PRAGMA index_list(${quote(table)})`)
+      .all()
+      .find((item) => item.name === name && item.partial === partial)
+    const indexColumns = index
+      ? db
+          .query<{ seqno: number; name: string | null; desc: number; key: number }, []>(
+            `PRAGMA index_xinfo(${quote(name)})`,
+          )
+          .all()
+          .filter((item) => item.key === 1)
+          .toSorted((left, right) => left.seqno - right.seqno)
+      : []
+    if (
+      indexColumns.length !== columns.length ||
+      columns.some((column, position) => indexColumns[position]?.name !== column || indexColumns[position]?.desc !== 0)
+    )
+      failures.push(`online-activity-index-unavailable:${table}.${name}`)
+  }
+  for (const source of activitySources) {
+    if (!tables.has(source.table)) continue
+    const columns = schema.columnMap.get(source.table)
+    for (const column of source.columns.filter((item) => columns?.has(item.name))) {
+      const query = onlineActivityQuery(source, column)
+      if (!query) {
+        failures.push(`online-activity-order-unavailable:${source.table}.${column.name}`)
+        continue
+      }
+      try {
+        const detail = db
+          .query<{ detail: string }, [string]>(`EXPLAIN QUERY PLAN ${query}`)
+          .all("online-index-probe")
+          .map((item) => item.detail)
+          .join("\n")
+        if (!detail.includes("SEARCH") || detail.includes("SCAN ") || detail.includes("USE TEMP B-TREE"))
+          failures.push(`online-activity-query-plan-unavailable:${source.table}.${column.name}`)
+      } catch {
+        failures.push(`online-activity-query-plan-unavailable:${source.table}.${column.name}`)
+      }
+    }
+  }
+  const workIndexes: { table: string; name: string; predicate: string; scope?: string; partial?: 0 | 1 }[] = [
+    { table: "message", name: "message_session_invalid_json_idx", predicate: onlineWorkPredicates.messageInvalidJSON },
+    {
+      table: "message",
+      name: "message_session_incomplete_assistant_idx",
+      predicate: onlineWorkPredicates.messageIncompleteAssistant,
+    },
+    { table: "part", name: "part_session_invalid_json_idx", predicate: onlineWorkPredicates.partInvalidJSON },
+    { table: "part", name: "part_session_pending_running_idx", predicate: onlineWorkPredicates.partPendingRunning },
+    {
+      table: "session_message",
+      name: "session_message_session_invalid_json_idx",
+      predicate: onlineWorkPredicates.sessionMessageInvalidJSON,
+    },
+    {
+      table: "session_message",
+      name: "session_message_session_incomplete_assistant_idx",
+      predicate: onlineWorkPredicates.sessionMessageIncompleteAssistant,
+    },
+    {
+      table: "session_input",
+      name: "session_input_session_pending_delivery_seq_idx",
+      predicate: onlineWorkPredicates.sessionInputPending,
+      partial: 0,
+    },
+    {
+      table: "session_input",
+      name: "session_input_session_invalid_delivery_idx",
+      predicate: onlineWorkPredicates.sessionInputInvalidDelivery,
+    },
+    {
+      table: "session_prompt_queue",
+      name: "session_prompt_queue_session_open_idx",
+      predicate: onlineWorkPredicates.sessionPromptQueueOpen,
+    },
+    {
+      table: "session_prompt_queue",
+      name: "session_prompt_queue_session_conflicted_idx",
+      predicate: onlineWorkPredicates.sessionPromptQueueConflicted,
+    },
+    {
+      table: "session_prompt_receipt",
+      name: "session_prompt_receipt_session_pending_idx",
+      predicate: onlineWorkPredicates.sessionPromptReceiptPending,
+    },
+    {
+      table: "session_prompt_receipt",
+      name: "session_prompt_receipt_session_invalid_idx",
+      predicate: onlineWorkPredicates.sessionPromptReceiptInvalid,
+    },
+    {
+      table: "session_ask",
+      name: "session_ask_session_unsettled_idx",
+      predicate: onlineWorkPredicates.sessionAskUnsettled,
+    },
+    {
+      table: "event",
+      name: "event_aggregate_unknown_type_idx",
+      predicate: onlineWorkPredicates.eventUnknownType,
+      scope: "aggregate_id",
+    },
+  ]
+  for (const { table, name, predicate, scope, partial } of workIndexes) {
+    if (!tables.has(table)) continue
+    const scopeColumn = scope ?? "session_id"
+    const index = db
+      .query<{ name: string; partial: number }, []>(`PRAGMA index_list(${quote(table)})`)
+      .all()
+      .find((item) => item.name === name && item.partial === (partial ?? 1))
+    let indexed = false
+    if (index) {
+      try {
+        const plan = db
+          .query<
+            { detail: string },
+            [string]
+          >(`EXPLAIN QUERY PLAN ${onlineWorkQuery(table, name, scopeColumn, predicate)}`)
+          .all("online-index-probe")
+        indexed = plan.some((item) => item.detail.includes(name) && item.detail.includes("SEARCH"))
+      } catch {
+        indexed = false
+      }
+    }
+    if (!indexed) failures.push(`online-work-index-unavailable:${table}.${name}`)
+  }
+  if (tables.has("part")) {
+    try {
+      const detail = db
+        .query<{ detail: string }, [string, string, string, string]>(
+          `EXPLAIN QUERY PLAN ${onlineCrossSessionPartQuery}`,
+        )
+        .all("online-index-probe", "online-index-probe", "online-index-probe", "online-index-probe")
+        .map((item) => item.detail)
+      if (
+        detail.filter((item) => item.includes("SEARCH") && item.includes("part_message_id_session_idx")).length < 2 ||
+        detail.some((item) => item.includes("USE TEMP B-TREE") || item.includes("MATERIALIZE"))
+      )
+        failures.push("online-cross-session-query-plan-unavailable:part.message_id.session_id")
+    } catch {
+      failures.push("online-cross-session-query-plan-unavailable:part.message_id.session_id")
+    }
   }
   return failures
 }
@@ -2201,64 +2657,6 @@ function onlineParentCycle(db: SqliteAccess, sessionID: string) {
     slow = slowParent
     fast = fastGrandparent
   }
-}
-
-function onlineCrossSessionCascadeFailures(
-  db: SqliteAccess,
-  sessionIDs: readonly string[],
-  selectedSessionIDs: ReadonlySet<string>,
-) {
-  const failures = new Map<string, string>()
-  const selected = [...selectedSessionIDs]
-  const selectedValues = selected.length ? `VALUES ${selected.map(() => "(?)").join(", ")}` : "SELECT NULL WHERE 0"
-  const selectedParams = selected.length ? selected : []
-  for (const sessionID of sessionIDs) {
-    const selectedCTE = `WITH selected(id) AS (${selectedValues})`
-    const outgoing = db
-      .query<{ parentSessionID: string; childSessionID: string; messageID: string }, SQLQueryBindings[]>(
-        `${selectedCTE}
-         SELECT message.session_id AS parentSessionID,
-           (SELECT child.session_id FROM part child
-            WHERE child.message_id = message.id AND child.session_id <> message.session_id
-              AND NOT EXISTS (SELECT 1 FROM selected WHERE selected.id = child.session_id)
-            LIMIT 1) AS childSessionID,
-           message.id AS messageID
-         FROM message
-         WHERE message.session_id = ?
-           AND EXISTS (SELECT 1 FROM part child
-             WHERE child.message_id = message.id AND child.session_id <> message.session_id
-               AND NOT EXISTS (SELECT 1 FROM selected WHERE selected.id = child.session_id))
-         LIMIT 1`,
-      )
-      .get(...selectedParams, sessionID)
-    if (outgoing) {
-      failures.set(
-        sessionID,
-        `cross-session-cascade:part.message_id:${outgoing.messageID}:${outgoing.parentSessionID}->${outgoing.childSessionID}`,
-      )
-    }
-    if (failures.has(sessionID)) continue
-    const incoming = db
-      .query<{ parentSessionID: string; childSessionID: string; messageID: string }, SQLQueryBindings[]>(
-        `${selectedCTE}
-         SELECT (SELECT parent.session_id FROM message parent WHERE parent.id = child.message_id) AS parentSessionID,
-           child.session_id AS childSessionID, child.message_id AS messageID
-         FROM part child
-         WHERE child.session_id = ?
-           AND EXISTS (SELECT 1 FROM message parent
-             WHERE parent.id = child.message_id AND parent.session_id <> child.session_id
-               AND NOT EXISTS (SELECT 1 FROM selected WHERE selected.id = parent.session_id))
-         LIMIT 1`,
-      )
-      .get(...selectedParams, sessionID)
-    if (incoming) {
-      failures.set(
-        sessionID,
-        `cross-session-cascade:part.message_id:${incoming.messageID}:${incoming.parentSessionID}->${incoming.childSessionID}`,
-      )
-    }
-  }
-  return [...failures].map(([sessionID, reason]) => ({ sessionID, reason }))
 }
 
 async function onlineAvailableBytes(filename: string) {
@@ -2517,7 +2915,6 @@ async function onlineReclaimOnly(
   const reasons = [
     ...schema.failures,
     ...schema.unclassifiedTables.map((table) => `unclassified-session-storage:${table}`),
-    ...onlineScopeIndexFailures(db, schema.tables),
   ]
   const autoVacuum = db.query<{ auto_vacuum: number }, []>("PRAGMA auto_vacuum").get()?.auto_vacuum
   if (autoVacuum !== 2) reasons.push(`incremental-vacuum-unavailable:${autoVacuum ?? "unreadable"}`)

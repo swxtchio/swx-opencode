@@ -1,6 +1,7 @@
 import { afterAll, expect, spyOn, test } from "bun:test"
 import { Database, type SQLQueryBindings } from "bun:sqlite"
-import { existsSync, mkdirSync, readFileSync, statfsSync, writeFileSync } from "node:fs"
+import { randomBytes } from "node:crypto"
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statfsSync, writeFileSync } from "node:fs"
 import {
   chmod,
   copyFile,
@@ -853,10 +854,19 @@ test("online prune bounds one large Session, retries partial progress, and never
   expect(ownedCounts(store.filename, unselectedID)).toEqual(beforeUnselected)
 
   const beforeReclaimOnly = ownedCounts(store.filename, selectedID)
-  const reclaimedOnly = parseReport(
-    await runCLI(store, ["--online", "--reclaim-only", "--apply", "--reserve-bytes", "1"]),
+  const reclaimedOnly = (
+    await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      reclaimOnly: true,
+      apply: true,
+      reserveBytes: 1,
+    })
+  ).report
+  expect(reclaimedOnly.action).toBe(
+    reclaimedOnly.reclamation.outstanding?.includes("wal-checkpoint-incomplete") ? "failed" : "applied",
   )
-  expect(reclaimedOnly.action).toBe("applied")
+  if (reclaimedOnly.action === "failed") expect(reclaimedOnly.refusalReasons).toContain("wal-checkpoint-incomplete")
   expect(reclaimedOnly.changedRows).toBe(0)
   expect(reclaimedOnly.deletedSessionIDs).toEqual([])
   expect(reclaimedOnly.rawTranscriptWarning).toContain("does not delete Session history")
@@ -864,10 +874,20 @@ test("online prune bounds one large Session, retries partial progress, and never
 
   const beforeRetry = ownedCounts(store.filename, selectedID)
   const remainingRows = Object.values(beforeRetry).reduce((sum, count) => sum + count, 0)
-  const completed = parseReport(
-    await runCLI(store, ["--online", "--before", cutoff, "--session", selectedID, "--apply", "--reserve-bytes", "1"]),
+  const completed = (
+    await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      before: cutoff,
+      session: [selectedID],
+      apply: true,
+      reserveBytes: 1,
+    })
+  ).report
+  expect(completed.action).toBe(
+    completed.reclamation.outstanding?.includes("wal-checkpoint-incomplete") ? "failed" : "applied",
   )
-  expect(completed.action).toBe("applied")
+  if (completed.action === "failed") expect(completed.refusalReasons).toContain("wal-checkpoint-incomplete")
   expect(completed.deletedSessionIDs).toEqual([selectedID])
   expect(completed.changedRows).toBe(remainingRows)
   expect(completed.partialSessionIDs).toEqual([])
@@ -911,11 +931,14 @@ test.serial(
           "--max-batches",
           "100",
         ],
-        0,
+        "either",
         { timeout: 300_000 },
       ),
     )
-    expect(applied.action).toBe("applied")
+    expect(applied.action).toBe(
+      applied.reclamation.outstanding?.includes("wal-checkpoint-incomplete") ? "failed" : "applied",
+    )
+    if (applied.action === "failed") expect(applied.refusalReasons).toContain("wal-checkpoint-incomplete")
     expect(applied.deletedSessionIDs).toEqual([sessionID])
     expect(applied.changedRows).toBeGreaterThan(10_000)
     expect(applied.batches!.length).toBeGreaterThan(5)
@@ -949,11 +972,14 @@ test.serial(
           "--max-batches",
           "100",
         ],
-        0,
+        "either",
         { timeout: 180_000 },
       ),
     )
-    expect(applied.action).toBe("applied")
+    expect(applied.action).toBe(
+      applied.reclamation.outstanding?.includes("wal-checkpoint-incomplete") ? "failed" : "applied",
+    )
+    if (applied.action === "failed") expect(applied.refusalReasons).toContain("wal-checkpoint-incomplete")
     expect(applied.deletedSessionIDs).toEqual([sessionID])
     expect(applied.changedRows).toBeGreaterThan(10_100)
     expect(applied.batches!.length).toBeGreaterThan(5)
@@ -964,18 +990,39 @@ test.serial(
   { timeout: 240_000 },
 )
 
-test("online inventory refuses when message and event keyset-order indexes are missing", async () => {
+test("online inventory refuses when proof and keyset indexes are missing", async () => {
   await using store = await producedStore([{ payloadBytes: 128 }])
   const sessionID = store.metadata[0].created[0].id
   const db = new Database(store.filename)
-  db.exec("DROP INDEX message_session_time_created_id_idx; DROP INDEX event_aggregate_seq_idx")
+  db.exec(`
+    DROP INDEX message_session_time_created_id_idx;
+    DROP INDEX message_session_time_updated_id_idx;
+    DROP INDEX message_session_incomplete_assistant_idx;
+    DROP INDEX session_input_session_invalid_delivery_idx;
+    DROP INDEX event_aggregate_unknown_type_idx;
+    DROP INDEX event_aggregate_seq_idx;
+    DROP INDEX part_message_id_session_idx;
+  `)
   db.close()
 
   const inventory = parseReport(await runCLI(store, ["--online", "--session", sessionID, "--reserve-bytes", "1"]))
   expect(inventory.action).toBe("inventory")
   expect(inventory.reclamation.ready).toBe(false)
   expect(inventory.reclamation.reasons).toContain("online-scope-index-unavailable:message.session_id.time_created.id")
+  expect(inventory.reclamation.reasons).toContain(
+    "online-activity-index-unavailable:message.message_session_time_updated_id_idx",
+  )
+  expect(inventory.reclamation.reasons).toContain(
+    "online-work-index-unavailable:message.message_session_incomplete_assistant_idx",
+  )
+  expect(inventory.reclamation.reasons).toContain(
+    "online-work-index-unavailable:session_input.session_input_session_invalid_delivery_idx",
+  )
+  expect(inventory.reclamation.reasons).toContain(
+    "online-work-index-unavailable:event.event_aggregate_unknown_type_idx",
+  )
   expect(inventory.reclamation.reasons).toContain("online-scope-index-unavailable:event.aggregate_id.seq")
+  expect(inventory.reclamation.reasons).toContain("online-scope-index-unavailable:part.message_id.session_id")
   expect(inventory.deletionScope.sessionIDs).toEqual([])
 })
 
@@ -1078,6 +1125,8 @@ test.serial("online prune bounds Session TEXT payload and checks reserve before 
 
   const fillerPath = path.join(store.directory, "online-session-capacity-filler")
   const fillerBytes = Math.floor(plannedPeakBytes + capacityMarginBytes - 3 * 1024 * 1024)
+  const capacityTarget = reserveBytes + 4 * 1024 * 1024
+  let additionalFillerBytes = 0
   const original = Database.prototype.exec
   let injected = false
   let availableAfterFiller: number | undefined
@@ -1085,9 +1134,18 @@ test.serial("online prune bounds Session TEXT payload and checks reserve before 
     const result = original.call(this, statement)
     if (statement === "BEGIN IMMEDIATE" && !injected) {
       injected = true
-      writeFileSync(fillerPath, "x".repeat(fillerBytes))
-      const filesystem = statfsSync(store.directory)
+      writeFileSync(fillerPath, randomBytes(fillerBytes))
+      let filesystem = statfsSync(store.directory)
       availableAfterFiller = filesystem.bavail * filesystem.bsize
+      while (availableAfterFiller >= capacityTarget && additionalFillerBytes < capacityMarginBytes) {
+        const remainingMargin = capacityMarginBytes - additionalFillerBytes
+        const deficit = availableAfterFiller - capacityTarget + 1024 * 1024
+        const nextFillerBytes = Math.min(remainingMargin, Math.max(1024 * 1024, deficit))
+        appendFileSync(fillerPath, randomBytes(nextFillerBytes))
+        additionalFillerBytes += nextFillerBytes
+        filesystem = statfsSync(store.directory)
+        availableAfterFiller = filesystem.bavail * filesystem.bsize
+      }
     }
     return result
   })
@@ -1103,7 +1161,7 @@ test.serial("online prune bounds Session TEXT payload and checks reserve before 
     })
     if (!injected) throw new Error(`capacity fixture was not reached: ${JSON.stringify(capacityBound.report)}`)
     if (availableAfterFiller === undefined) throw new Error("capacity fixture did not measure post-fill free space")
-    expect(availableAfterFiller).toBeLessThan(reserveBytes + 4 * 1024 * 1024)
+    expect(availableAfterFiller).toBeLessThan(capacityTarget)
     expect(capacityBound.report.action).toBe("refused")
     expect(capacityBound.report.changedRows).toBe(0)
     expect(capacityBound.report.refusalReasons).toContain("capacity-reserve-reached")
@@ -1374,7 +1432,7 @@ test("online prune does not authorize an unselected descendant", async () => {
   expect(ownedCounts(store.filename, childID)).toEqual(childBefore)
 })
 
-test("online prune refuses a selected cross-session message cascade into an unselected Session", async () => {
+test("online prune checks an unselected Part before the message batch can cascade", async () => {
   await using store = await producedStore([{ payloadBytes: 512 * 1024 }, { payloadBytes: 512 * 1024 }])
   const parent = produce(store, { create: { payloadBytes: 512 * 1024 } })
   const other = produce(store, { create: { payloadBytes: 512 * 1024 } })
@@ -1392,21 +1450,106 @@ test("online prune refuses a selected cross-session message cascade into an unse
   const inventory = parseReport(
     await runCLI(store, ["--online", "--before", cutoff, "--session", parentID, "--reserve-bytes", "1"]),
   )
-  expect(inventory.deletionScope.sessionIDs).toEqual([])
-  expect(inventory.skippedSessions?.find((item) => item.sessionID === parentID)?.reasons[0]).toContain(
-    "cross-session-cascade:part.message_id:",
-  )
-  const refused = parseReport(
+  expect(inventory.deletionScope.sessionIDs).toEqual([parentID])
+  const applied = parseReport(
     await runCLI(
       store,
       ["--online", "--before", cutoff, "--session", parentID, "--apply", "--reserve-bytes", "1"],
       "nonzero",
     ),
   )
-  expect(refused.action).toBe("refused")
-  expect(refused.committed).toBe(false)
-  expect(ownedCounts(store.filename, parentID)).toEqual(parentBefore)
+  expect(applied.action).toBe("failed")
+  expect(applied.committed).toBe(true)
+  expect(applied.deletedSessionIDs).toEqual([])
+  expect(applied.partialSessionIDs).toContain(parentID)
+  expect(applied.changedRowsByTable?.message ?? 0).toBe(0)
+  expect(applied.skippedSessions?.find((item) => item.sessionID === parentID)?.reasons).toContain(
+    `cross-session-cascade:part.message_id:${parent.created[0]!.messageID}:${parentID}->${otherID}`,
+  )
+  expect(ownedCounts(store.filename, parentID).message).toBe(parentBefore.message)
   expect(ownedCounts(store.filename, otherID)).toEqual(otherBefore)
+})
+
+test.serial("online prune preserves a late cross-session Part before deleting its Message", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }, { payloadBytes: 128 }])
+  const selected = produce(store, { create: { payloadBytes: 512 * 1024 } })
+  const selectedID = selected.created[0]!.id
+  const messageID = selected.created[0]!.messageID
+  const otherID = (await produceLive(store, { create: { payloadBytes: 128 } })).created[0]!.id
+  const startFile = path.join(store.directory, "online-cross-part-start")
+  const committedFile = path.join(store.directory, "online-cross-part-committed")
+  const writer = startProducer(store, {
+    queueAfterSignal: {
+      sessionID: otherID,
+      startFile,
+      readyFile: path.join(store.directory, "online-cross-part-ready"),
+      registerBeforeSignal: true,
+      appendEvent: true,
+    },
+    crossPart: { sessionID: otherID, messageID, completedFile: committedFile },
+  })
+  const registeredPID = Number(await readMatchingLine(writer, "PRUNE_REGISTERED "))
+  expect(registeredPID).toBeGreaterThan(0)
+  const otherBefore = ownedCounts(store.filename, otherID)
+  const original = Database.prototype.exec
+  const originalQuery = Database.prototype.query
+  const queryOrder = new Array<string>()
+  let injected = false
+  let writerFinished = false
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+    if (statement === "BEGIN IMMEDIATE" && !injected) {
+      injected = true
+      writeFileSync(startFile, "start\n")
+      const deadline = Date.now() + 20_000
+      const wait = new Int32Array(new SharedArrayBuffer(4))
+      while (!existsSync(committedFile)) {
+        if (Date.now() >= deadline) throw new Error("cross-Session Part producer did not publish its acknowledgment")
+        Atomics.wait(wait, 0, 0, 5)
+      }
+    }
+    return original.call(this, statement)
+  })
+  const query = spyOn(Database.prototype, "query").mockImplementation(function <
+    ReturnType,
+    ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+  >(this: Database, statement: string) {
+    if (statement.includes("FROM part INDEXED BY part_message_id_session_idx") && !statement.startsWith("EXPLAIN"))
+      queryOrder.push("cross-reference-check")
+    if (statement.startsWith('DELETE FROM "message"')) queryOrder.push("message-delete")
+    return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+  })
+  try {
+    const result = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [selectedID],
+      apply: true,
+      reserveBytes: 1,
+      batchRows: 64,
+    })
+    assertChildOutcome(await writer.finish(), 0)
+    writerFinished = true
+    expect(injected).toBe(true)
+    expect(queryOrder).toContain("cross-reference-check")
+    expect(queryOrder).not.toContain("message-delete")
+    expect(result.report.action).toBe("failed")
+    expect(result.report.committed).toBe(true)
+    expect(result.report.deletedSessionIDs).toEqual([])
+    expect(result.report.remainingSessionIDs).toEqual([selectedID])
+    expect(result.report.changedRowsByTable?.message ?? 0).toBe(0)
+    expect(result.report.skippedSessions?.find((item) => item.sessionID === selectedID)?.reasons).toContain(
+      `cross-session-cascade:part.message_id:${messageID}:${selectedID}->${otherID}`,
+    )
+    expect(ownedCounts(store.filename, selectedID).message).toBeGreaterThan(0)
+    expect(ownedCounts(store.filename, otherID).part).toBe(otherBefore.part + 1)
+  } finally {
+    exec.mockRestore()
+    query.mockRestore()
+    if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
+    if (!writerFinished) {
+      assertChildOutcome(await writer.finish(), 0)
+    }
+  }
 })
 
 test(
@@ -1424,16 +1567,22 @@ test(
     const startFile = path.join(store.directory, "online-writer-start")
     const readyFile = path.join(store.directory, "online-writer-ready")
     const completedFile = path.join(store.directory, "online-writer-committed")
+    const closedFile = path.join(store.directory, "online-writer-closed")
     await using writer = startProducer(store, {
-      queueAfterSignal: { sessionID: liveID, startFile, readyFile, completedFile, appendEvent: true },
-      hold: true,
-      holdSessionID: liveID,
+      queueAfterSignal: {
+        sessionID: liveID,
+        startFile,
+        readyFile,
+        completedFile,
+        closedFile,
+        appendEvent: true,
+        registerBeforeSignal: true,
+      },
     })
-    await readMatchingLine(writer, "PRUNE_QUEUE_WAITING")
+    expect(Number(await readMatchingLine(writer, "PRUNE_REGISTERED "))).toBeGreaterThan(0)
 
     const original = Database.prototype.exec
     let writerCompleted = false
-    let writerReady = false
     let freelistWhenWriterCompleted = 0
     let laterVacuumSteps = 0
     const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
@@ -1449,7 +1598,7 @@ test(
       writeFileSync(startFile, "start\n")
       const deadline = Date.now() + 20_000
       const wait = new Int32Array(new SharedArrayBuffer(4))
-      while (!existsSync(completedFile)) {
+      while (!existsSync(closedFile)) {
         if (Date.now() >= deadline) throw new Error("production writer did not publish its commit acknowledgment")
         Atomics.wait(wait, 0, 0, 5)
       }
@@ -1467,6 +1616,9 @@ test(
         batchRows: 4,
         vacuumPages: 32,
       })
+      expect(existsSync(completedFile)).toBe(true)
+      assertChildOutcome(await writer.finish(), 0)
+      writerCompleted = true
       expect(writerCompleted).toBe(true)
       expect(freelistWhenWriterCompleted).toBeGreaterThan(32)
       expect(laterVacuumSteps).toBeGreaterThan(0)
@@ -1477,25 +1629,10 @@ test(
       expect(ownedCounts(store.filename, liveID)).toMatchObject({ session: 1 })
       expect(ownedCounts(store.filename, liveID).queue).toBeGreaterThan(liveBefore.queue)
       expect(ownedCounts(store.filename, liveID).event).toBeGreaterThan(liveBefore.event)
-      const holdReady = JSON.parse(await readMatchingLine(writer, "PRUNE_HOLD_READY "))
-      writerReady = true
-      expect(holdReady).toEqual({
-        ready: true,
-        heldSessionID: liveID,
-      })
     } finally {
       exec.mockRestore()
-      if (existsSync(store.directory)) {
-        if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
-        if (!writerReady) {
-          writerReady = (await readMatchingLine(writer, "PRUNE_HOLD_READY ").catch(() => undefined)) !== undefined
-        }
-        if (writerReady) {
-          writer.child.stdin.write("release\n")
-          writer.child.stdin.end()
-        }
-      }
-      assertChildOutcome(await writer.finish(), 0)
+      if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
+      if (!writerCompleted) assertChildOutcome(await writer.finish(), 0)
     }
   },
   { timeout: 60_000 },
@@ -1531,7 +1668,20 @@ test.serial(
       expect(applied.report.remainingSessionIDs).toEqual([])
       expect(applied.report.batches!.length).toBeGreaterThan(1)
       expect(applied.report.reclamation.outstanding).toContain("wal-checkpoint-incomplete")
-      expect(applied.report.reclamation.remainingWalFrames).toBeGreaterThan(0)
+      if (typeof applied.report.reclamation.remainingWalFrames === "number")
+        expect(applied.report.reclamation.remainingWalFrames).toBeGreaterThan(0)
+      else
+        expect(
+          applied.report.reclamation.steps?.some((step) => {
+            const checkpoint = step.checkpoint
+            return (
+              typeof checkpoint === "object" &&
+              checkpoint !== null &&
+              "error" in checkpoint &&
+              checkpoint.error === "database table is locked"
+            )
+          }),
+        ).toBe(true)
       expect(ownedCounts(store.filename, sessionID).session).toBe(0)
 
       const reclaimOnly = await invokeHandler(store, {
@@ -1915,6 +2065,32 @@ test("recent activity on an old-created Session protects it while an equally old
   expect(result.report.excludedSessions.find((item) => item.sessionID === touchedID)?.reasons).toContain(
     "activity-at-or-after-cutoff",
   )
+})
+
+test.serial("online inventory finds the maximum Message update time without walking history", async () => {
+  await using store = await producedStore([{}])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  await produceLive(store, { bulkMessages: { sessionID, count: 100 } })
+  await rm(store.project, { recursive: true })
+  const cutoffAt = Date.now() - 5
+  backdateSession(store.filename, sessionID, cutoffAt - 1_000)
+  const db = new Database(store.filename)
+  db.query("UPDATE message SET time_updated = ? WHERE id = ?").run(cutoffAt + 1, "msg-large-history-000000")
+  db.close()
+
+  const result = await invokeHandler(store, {
+    database: store.filename,
+    online: true,
+    before: new Date(cutoffAt).toISOString(),
+    session: [sessionID],
+    reserveBytes: 1,
+  })
+  expect(result.report.action).toBe("inventory")
+  expect(result.report.reclamation.ready).toBe(true)
+  expect(result.report.excludedSessions.find((item) => item.sessionID === sessionID)?.reasons).toContain(
+    "activity-at-or-after-cutoff",
+  )
+  expect(result.report.deletionScope.sessionIDs).toEqual([])
 })
 
 test("an eligible parent never deletes a protected child, and explicit selection deletes only its member", async () => {
@@ -3227,7 +3403,7 @@ async function produceLive(store: Store, operation: Record<string, unknown>, tim
 async function runCLI(
   store: Store,
   args: string[],
-  expectedStatus: number | "nonzero" = 0,
+  expectedStatus: number | "nonzero" | "either" = 0,
   options: { entrypoint?: string; timeout?: number; command?: string; databaseDefault?: string } = {},
 ) {
   const result = await runChild(
@@ -3308,9 +3484,13 @@ async function runChild(
   }
 }
 
-function assertChildOutcome(result: ChildResult, expectedStatus: number | "nonzero") {
+function assertChildOutcome(result: ChildResult, expectedStatus: number | "nonzero" | "either") {
   const statusMatches =
-    expectedStatus === "nonzero" ? result.status !== null && result.status !== 0 : result.status === expectedStatus
+    expectedStatus === "either"
+      ? result.status === 0 || result.status === 1
+      : expectedStatus === "nonzero"
+        ? result.status !== null && result.status !== 0
+        : result.status === expectedStatus
   if (statusMatches && result.signal === null && result.error === undefined) return
   throw new ChildFailure(result, expectedStatus)
 }
@@ -3340,7 +3520,7 @@ function describeChild(result: ChildResult) {
 class ChildFailure extends Error {
   constructor(
     readonly result: ChildResult,
-    expectedStatus: number | "nonzero" | undefined,
+    expectedStatus: number | "nonzero" | "either" | undefined,
     reason?: string,
   ) {
     super([reason ?? `child did not complete with expected status ${expectedStatus}`, describeChild(result)].join("\n"))

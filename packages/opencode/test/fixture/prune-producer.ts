@@ -50,13 +50,15 @@ const input = JSON.parse(serialized) as {
   create?: Create | Create[]
   bulkMessages?: { sessionID: string; count: number }
   touch?: string
-  crossPart?: { sessionID: string; messageID: string }
+  crossPart?: { sessionID: string; messageID: string; completedFile?: string }
   queue?: string
   queueAfterSignal?: {
     sessionID: string
     startFile: string
     readyFile: string
     completedFile?: string
+    // Published after the producer's scoped database connection is closed.
+    closedFile?: string
     registerBeforeSignal?: boolean
     appendEvent?: boolean
     readinessWriteGate?: { createdFile: string; releaseFile: string }
@@ -118,7 +120,7 @@ const produce = Effect.gen(function* () {
         const start = Date.now() - input.bulkMessages!.count - 20_000
         bulk.transaction(() => {
           Array.from({ length: input.bulkMessages!.count }, (_, index) => index).forEach((index) => {
-            const timestamp = start + index
+            const timestamp = start + input.bulkMessages!.count - index
             insert.run(
               `msg-large-history-${String(index).padStart(6, "0")}`,
               input.bulkMessages!.sessionID,
@@ -510,6 +512,8 @@ const result = await Effect.runPromise(
   }
   throw error
 })
+if (input.crossPart?.completedFile) await Bun.write(input.crossPart.completedFile, "committed\n")
+if (input.queueAfterSignal?.closedFile) await Bun.write(input.queueAfterSignal.closedFile, "closed\n")
 if (input.queueAfterSignal)
   await publishReadiness(input.queueAfterSignal.readyFile, { ready: true }, input.queueAfterSignal.readinessWriteGate)
 if (!input.hold) console.log(JSON.stringify(result))

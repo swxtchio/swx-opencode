@@ -1,4 +1,5 @@
 import { sqliteTable, text, integer, index } from "drizzle-orm/sqlite-core"
+import { sql } from "drizzle-orm"
 import type { SessionAsk } from "@opencode-ai/schema/session-ask"
 import type { QuestionV1 } from "@opencode-ai/schema/question-v1"
 import type { PermissionV1 } from "@opencode-ai/schema/permission-v1"
@@ -36,6 +37,13 @@ export const SessionAskTable = sqliteTable(
   },
   (table) => [
     index("session_ask_session_idx").on(table.session_id),
+    index("session_ask_session_unsettled_idx")
+      .on(table.session_id)
+      .where(sql`${table.time_settled} IS NULL`),
+    index("session_ask_session_time_created_idx").on(table.session_id, table.time_created),
+    index("session_ask_session_time_settled_idx")
+      .on(table.session_id, table.time_settled)
+      .where(sql`${table.time_settled} IS NOT NULL`),
     index("session_ask_directory_settled_idx").on(table.directory, table.time_settled),
   ],
 )

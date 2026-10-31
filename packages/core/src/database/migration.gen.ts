@@ -51,5 +51,7 @@ export const migrations = (
     import("./migration/20261013194721_session_prompt_queue_preparing"),
     import("./migration/20261018005127_session_ask"),
     import("./migration/20261022023441_small-model"),
+    import("./migration/20261031122730_online_reclaim_proof"),
+    import("./migration/20261031131024_online_reclaim_indexed_proofs"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]
