@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "6a27973d-131b-44f4-83ba-2a7e0873e141",
+  "id": "6572b217-12e0-40f5-9be2-41327c2aefec",
   "prevIds": [
-    "ab37fbb9-f192-484b-aaa0-e069a805b11c"
+    "6a27973d-131b-44f4-83ba-2a7e0873e141"
   ],
   "ddl": [
     {
@@ -12,6 +12,14 @@
     },
     {
       "name": "data_migration",
+      "entityType": "tables"
+    },
+    {
+      "name": "online_reclaim_backfill",
+      "entityType": "tables"
+    },
+    {
+      "name": "online_reclaim_cross_session_part",
       "entityType": "tables"
     },
     {
@@ -217,6 +225,86 @@
       "name": "time_completed",
       "entityType": "columns",
       "table": "data_migration"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "name",
+      "entityType": "columns",
+      "table": "online_reclaim_backfill"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "cursor",
+      "entityType": "columns",
+      "table": "online_reclaim_backfill"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "high_water",
+      "entityType": "columns",
+      "table": "online_reclaim_backfill"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "complete",
+      "entityType": "columns",
+      "table": "online_reclaim_backfill"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "part_id",
+      "entityType": "columns",
+      "table": "online_reclaim_cross_session_part"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "message_id",
+      "entityType": "columns",
+      "table": "online_reclaim_cross_session_part"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "parent_session_id",
+      "entityType": "columns",
+      "table": "online_reclaim_cross_session_part"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "child_session_id",
+      "entityType": "columns",
+      "table": "online_reclaim_cross_session_part"
     },
     {
       "type": "text",
@@ -2473,6 +2561,24 @@
     },
     {
       "columns": [
+        "name"
+      ],
+      "nameExplicit": false,
+      "name": "online_reclaim_backfill_pk",
+      "table": "online_reclaim_backfill",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "part_id"
+      ],
+      "nameExplicit": false,
+      "name": "online_reclaim_cross_session_part_pk",
+      "table": "online_reclaim_cross_session_part",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
         "writer_id"
       ],
       "nameExplicit": false,
@@ -2650,6 +2756,34 @@
       "name": "session_share_pk",
       "table": "session_share",
       "entityType": "pks"
+    },
+    {
+      "columns": [
+        {
+          "value": "parent_session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "online_reclaim_cross_part_parent_idx",
+      "entityType": "indexes",
+      "table": "online_reclaim_cross_session_part"
+    },
+    {
+      "columns": [
+        {
+          "value": "child_session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "online_reclaim_cross_part_child_idx",
+      "entityType": "indexes",
+      "table": "online_reclaim_cross_session_part"
     },
     {
       "columns": [
@@ -2959,7 +3093,7 @@
         }
       ],
       "isUnique": false,
-      "where": "\"session_prompt_receipt\".\"state\" IS NULL OR \"session_prompt_receipt\".\"state\" NOT IN ('pending', 'withdrawn', 'delivered', 'merged', 'superseded', 'deleted')",
+      "where": "\"session_prompt_receipt\".\"state\" NOT IN ('pending', 'withdrawn', 'delivered', 'merged', 'superseded', 'deleted')",
       "origin": "manual",
       "name": "session_prompt_receipt_session_invalid_idx",
       "entityType": "indexes",
@@ -3395,7 +3529,7 @@
         }
       ],
       "isUnique": false,
-      "where": "\"session_input\".\"delivery\" IS NULL OR \"session_input\".\"delivery\" NOT IN ('steer', 'queue')",
+      "where": "\"session_input\".\"delivery\" NOT IN ('steer', 'queue')",
       "origin": "manual",
       "name": "session_input_session_invalid_delivery_idx",
       "entityType": "indexes",

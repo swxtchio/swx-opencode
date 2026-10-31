@@ -1,5 +1,6 @@
 import { Database } from "@opencode-ai/core/database/database"
 import { OnlineReclaimIndexes } from "@opencode-ai/core/database/online-reclaim-indexes"
+import { OnlineReclaimProof } from "@opencode-ai/core/database/online-reclaim-proof"
 import { EventWriter } from "@opencode-ai/core/event/writer"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
 import type { SQLQueryBindings } from "bun:sqlite"
@@ -704,6 +705,11 @@ async function prepareOnlineIndexes(filename: string): Promise<OnlineIndexPrepar
   const remainingIndexes = new Set(OnlineReclaimIndexes.definitions.map((index) => index.name))
   try {
     db.exec(`PRAGMA busy_timeout = ${onlineBounds.busyTimeout}; PRAGMA foreign_keys = ON`)
+    for (const statement of OnlineReclaimProof.structureStatements) db.exec(statement)
+    for (const statement of OnlineReclaimProof.triggerStatements) db.exec(statement)
+    db.exec(
+      `INSERT OR IGNORE INTO online_reclaim_backfill (name, cursor, high_water, complete) VALUES ('cross-session-parts', 0, -1, 0)`,
+    )
     const schema = inspectSchema(db)
     const schemaReasons = [
       ...schema.failures,
@@ -753,6 +759,18 @@ async function prepareOnlineIndexes(filename: string): Promise<OnlineIndexPrepar
       remainingIndexes.delete(index.name)
     }
 
+    const backfillFailures = prepareCrossSessionPartProof(db, resolved.filename)
+    if (backfillFailures.length > 0) {
+      remainingIndexes.add("cross-session-parts-backfill")
+      return {
+        action: createdIndexes.length > 0 ? "failed" : "refused",
+        database: resolved.filename,
+        createdIndexes,
+        remainingIndexes: [...remainingIndexes],
+        refusalReasons: backfillFailures,
+      }
+    }
+
     const proofFailures = onlineScopeIndexFailures(db, schema)
     if (proofFailures.length > 0) {
       for (const index of OnlineReclaimIndexes.definitions) {
@@ -795,6 +813,90 @@ function normalizeIndexSQL(value: string) {
     .replace(/;$/, "")
     .trim()
     .toLowerCase()
+}
+
+function prepareCrossSessionPartProof(db: SqliteAccess, filename: string) {
+  const pageRows = 128
+  while (true) {
+    const state = db
+      .query<
+        { cursor: number; high_water: number; complete: number },
+        [string]
+      >("SELECT cursor, high_water, complete FROM online_reclaim_backfill WHERE name = ?")
+      .get("cross-session-parts")
+    if (!state) return ["online-proof-backfill-state-unavailable:cross-session-parts"]
+    if (state.complete === 1) return []
+
+    const holders = scanDatabaseHolders(filename)
+    if (holders.state !== "complete" || holders.pids.length > 0)
+      return holders.state === "complete"
+        ? holders.pids.map((pid) => `database-holder-present:${pid}`)
+        : [`database-holder-scan-unreadable:${holders.reason}`]
+
+    db.exec("BEGIN IMMEDIATE")
+    try {
+      const current = db
+        .query<
+          { cursor: number; high_water: number; complete: number },
+          [string]
+        >("SELECT cursor, high_water, complete FROM online_reclaim_backfill WHERE name = ?")
+        .get("cross-session-parts")
+      if (!current) throw new Error("online-proof-backfill-state-unavailable:cross-session-parts")
+      if (current.complete === 1) {
+        db.exec("COMMIT")
+        return []
+      }
+      if (current.high_water < 0) {
+        const highWater = db
+          .query<{ high_water: number }, []>("SELECT coalesce(max(rowid), 0) AS high_water FROM part")
+          .get()?.high_water
+        if (highWater === undefined) throw new Error("online-proof-backfill-high-water-unavailable:part")
+        db.query("UPDATE online_reclaim_backfill SET high_water = ?, cursor = 0 WHERE name = ?").run(
+          highWater,
+          "cross-session-parts",
+        )
+        db.exec("COMMIT")
+        continue
+      }
+
+      const rows = db
+        .query<{ rowid: number; id: string; message_id: string; session_id: string }, [number, number, number]>(
+          `SELECT rowid, id, message_id, session_id FROM part
+           WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`,
+        )
+        .all(current.cursor, current.high_water, pageRows)
+      const upsert = db.query(
+        `INSERT INTO online_reclaim_cross_session_part (part_id, message_id, parent_session_id, child_session_id)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(part_id) DO UPDATE SET
+           message_id = excluded.message_id,
+           parent_session_id = excluded.parent_session_id,
+           child_session_id = excluded.child_session_id`,
+      )
+      const remove = db.query("DELETE FROM online_reclaim_cross_session_part WHERE part_id = ?")
+      for (const row of rows) {
+        const parent = db
+          .query<{ session_id: string }, [string]>("SELECT session_id FROM message WHERE id = ?")
+          .get(row.message_id)
+        if (!parent) throw new Error(`online-proof-backfill-message-missing:${row.message_id}`)
+        if (parent.session_id !== row.session_id) upsert.run(row.id, row.message_id, parent.session_id, row.session_id)
+        else remove.run(row.id)
+      }
+
+      const cursor = rows.at(-1)?.rowid ?? current.high_water
+      const complete = rows.length === 0 || cursor >= current.high_water
+      db.query("UPDATE online_reclaim_backfill SET cursor = ?, complete = ? WHERE name = ?").run(
+        cursor,
+        complete ? 1 : 0,
+        "cross-session-parts",
+      )
+      db.exec("COMMIT")
+      if (complete) return []
+    } catch (error) {
+      if (db.inTransaction) db.exec("ROLLBACK")
+      throw error
+    }
+  }
 }
 
 async function applyOnlinePrune(
@@ -957,6 +1059,7 @@ async function onlineInventorySnapshot(
   const schemaReasons = [
     ...schema.failures,
     ...schema.unclassifiedTables.map((table) => `unclassified-session-storage:${table}`),
+    ...onlineCrossSessionProofFailures(db),
     ...onlineScopeIndexFailures(db, schema),
   ]
   const sessionColumns = schema.columnMap.get("session")
@@ -1006,6 +1109,7 @@ async function onlineInventorySnapshot(
       schemaReasons.length === 0 ? onlineSessionEvidence(db, schema, sessionID, row.time_updated, true) : undefined
     if (evidence) reasons.push(...evidence.reasons)
     else if (schemaReasons.length > 0) reasons.push("session-evidence-unavailable")
+    if (schemaReasons.length === 0) reasons.push(...onlineCrossSessionCascadeFailures(db, sessionID))
     if (cutoff !== undefined && evidence?.lastActivity !== undefined && evidence.lastActivity >= cutoff)
       reasons.push("activity-at-or-after-cutoff")
     const summary = onlineExcludedSession(
@@ -1337,6 +1441,41 @@ function onlineHasRows(db: SqliteAccess, table: string, scope: string, sessionID
         .get(sessionID),
     )
   return Boolean(db.query(`SELECT rowid FROM ${quote(table)} WHERE ${scope} LIMIT 1`).get(sessionID))
+}
+
+function onlineCrossSessionProofFailures(db: SqliteAccess) {
+  try {
+    const state = db
+      .query<{ complete: number }, [string]>("SELECT complete FROM online_reclaim_backfill WHERE name = ?")
+      .get("cross-session-parts")
+    return state?.complete === 1 ? [] : ["online-proof-backfill-incomplete:cross-session-parts"]
+  } catch {
+    return ["online-proof-backfill-unavailable:cross-session-parts"]
+  }
+}
+
+function onlineCrossSessionCascadeFailures(db: SqliteAccess, sessionID: string) {
+  const parentReference = db
+    .query<{ message_id: string; parent_session_id: string; child_session_id: string }, [string]>(
+      `SELECT message_id, parent_session_id, child_session_id
+       FROM online_reclaim_cross_session_part INDEXED BY online_reclaim_cross_part_parent_idx
+       WHERE parent_session_id = ? LIMIT 1`,
+    )
+    .get(sessionID)
+  const childReference = db
+    .query<{ message_id: string; parent_session_id: string; child_session_id: string }, [string]>(
+      `SELECT message_id, parent_session_id, child_session_id
+       FROM online_reclaim_cross_session_part INDEXED BY online_reclaim_cross_part_child_idx
+       WHERE child_session_id = ? LIMIT 1`,
+    )
+    .get(sessionID)
+  return [parentReference, childReference]
+    .flatMap((row) =>
+      row
+        ? [`cross-session-cascade:part.message_id:${row.message_id}:${row.parent_session_id}->${row.child_session_id}`]
+        : [],
+    )
+    .toSorted()
 }
 
 function onlineHasSessionStorage(db: SqliteAccess, sessionID: string) {
@@ -2521,6 +2660,28 @@ function onlineScopeIndexFailures(db: SqliteAccess, schema: ReturnType<typeof in
           failures.push(`online-keyset-query-plan-unavailable:${table}:${position}`)
       } catch {
         failures.push(`online-keyset-query-plan-unavailable:${table}:${position}`)
+      }
+    }
+  }
+  if (!tables.has("online_reclaim_cross_session_part")) {
+    failures.push("online-cross-session-proof-table-unavailable")
+  } else {
+    for (const { name, column } of [
+      { name: "online_reclaim_cross_part_parent_idx", column: "parent_session_id" },
+      { name: "online_reclaim_cross_part_child_idx", column: "child_session_id" },
+    ]) {
+      try {
+        const detail = db
+          .query<{ detail: string }, [string]>(
+            `EXPLAIN QUERY PLAN SELECT part_id FROM online_reclaim_cross_session_part INDEXED BY ${quote(name)} WHERE ${quote(column)} = ? LIMIT 1`,
+          )
+          .all("online-index-probe")
+          .map((item) => item.detail)
+          .join("\n")
+        if (!detail.includes("SEARCH") || !detail.includes(name))
+          failures.push(`online-cross-session-query-plan-unavailable:${name}`)
+      } catch {
+        failures.push(`online-cross-session-query-plan-unavailable:${name}`)
       }
     }
   }

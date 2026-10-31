@@ -157,4 +157,14 @@ export const definitions = [
     name: "todo_session_time_updated_position_idx",
     statement: `CREATE INDEX IF NOT EXISTS "todo_session_time_updated_position_idx" ON "todo" ("session_id","time_updated","position");`,
   },
+  {
+    table: "online_reclaim_cross_session_part",
+    name: "online_reclaim_cross_part_parent_idx",
+    statement: `CREATE INDEX IF NOT EXISTS "online_reclaim_cross_part_parent_idx" ON "online_reclaim_cross_session_part" ("parent_session_id");`,
+  },
+  {
+    table: "online_reclaim_cross_session_part",
+    name: "online_reclaim_cross_part_child_idx",
+    statement: `CREATE INDEX IF NOT EXISTS "online_reclaim_cross_part_child_idx" ON "online_reclaim_cross_session_part" ("child_session_id");`,
+  },
 ] satisfies readonly { table: string; name: string; statement: string; refreshWhenChanged?: boolean }[]

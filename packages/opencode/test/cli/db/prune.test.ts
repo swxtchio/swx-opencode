@@ -1490,7 +1490,7 @@ test("online prune does not authorize an unselected descendant", async () => {
   expect(ownedCounts(store.filename, childID)).toEqual(childBefore)
 })
 
-test("online prune checks an unselected Part before the message batch can cascade", async () => {
+test("online inventory backfills and refuses historical cross-session Parts before deleting", async () => {
   await using store = await producedStore([{ payloadBytes: 512 * 1024 }, { payloadBytes: 512 * 1024 }])
   const parent = produce(store, { create: { payloadBytes: 512 * 1024 } })
   const other = produce(store, { create: { payloadBytes: 512 * 1024 } })
@@ -1504,11 +1504,36 @@ test("online prune checks an unselected Part before the message batch can cascad
   backdateSession(store.filename, otherID, cutoffAt - 1_000)
   const parentBefore = ownedCounts(store.filename, parentID)
   const otherBefore = ownedCounts(store.filename, otherID)
+  const prepare = new Database(store.filename)
+  prepare
+    .query("DELETE FROM online_reclaim_cross_session_part WHERE message_id = ? AND child_session_id = ?")
+    .run(parent.created[0]!.messageID, otherID)
+  prepare
+    .query(
+      `UPDATE online_reclaim_backfill
+     SET cursor = 0, high_water = (SELECT coalesce(max(rowid), 0) FROM part), complete = 0
+     WHERE name = 'cross-session-parts'`,
+    )
+    .run()
+  prepare.close()
+
+  const pending = parseReport(
+    await runCLI(store, ["--online", "--before", cutoff, "--session", parentID, "--reserve-bytes", "1"]),
+  )
+  expect(pending.reclamation.ready).toBe(false)
+  expect(pending.reclamation.reasons).toContain("online-proof-backfill-incomplete:cross-session-parts")
+
+  const prepared = parseReport(await runCLI(store, ["--database", store.filename, "--prepare-online-indexes"]))
+  expect(prepared.action).toBe("prepared")
 
   const inventory = parseReport(
     await runCLI(store, ["--online", "--before", cutoff, "--session", parentID, "--reserve-bytes", "1"]),
   )
-  expect(inventory.deletionScope.sessionIDs).toEqual([parentID])
+  expect(inventory.reclamation.ready).toBe(true)
+  expect(inventory.deletionScope.sessionIDs).toEqual([])
+  expect(inventory.excludedSessions.find((item) => item.sessionID === parentID)?.reasons).toContain(
+    `cross-session-cascade:part.message_id:${parent.created[0]!.messageID}:${parentID}->${otherID}`,
+  )
   const applied = parseReport(
     await runCLI(
       store,
@@ -1516,12 +1541,13 @@ test("online prune checks an unselected Part before the message batch can cascad
       "nonzero",
     ),
   )
-  expect(applied.action).toBe("failed")
-  expect(applied.committed).toBe(true)
+  expect(applied.action).toBe("refused")
+  expect(applied.committed).toBe(false)
+  expect(applied.changedRows).toBe(0)
   expect(applied.deletedSessionIDs).toEqual([])
-  expect(applied.partialSessionIDs).toContain(parentID)
+  expect(applied.partialSessionIDs).toEqual([])
   expect(applied.changedRowsByTable?.message ?? 0).toBe(0)
-  expect(applied.skippedSessions?.find((item) => item.sessionID === parentID)?.reasons).toContain(
+  expect(applied.refusalReasons).toContain(
     `cross-session-cascade:part.message_id:${parent.created[0]!.messageID}:${parentID}->${otherID}`,
   )
   expect(ownedCounts(store.filename, parentID).message).toBe(parentBefore.message)

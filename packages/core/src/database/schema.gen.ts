@@ -24,6 +24,22 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`online_reclaim_backfill\` (
+          \`name\` text PRIMARY KEY,
+          \`cursor\` integer NOT NULL,
+          \`high_water\` integer NOT NULL,
+          \`complete\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`online_reclaim_cross_session_part\` (
+          \`part_id\` text PRIMARY KEY,
+          \`message_id\` text NOT NULL,
+          \`parent_session_id\` text NOT NULL,
+          \`child_session_id\` text NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`event_aggregate_writer\` (
           \`aggregate_id\` text NOT NULL,
           \`writer_id\` text NOT NULL,
@@ -340,6 +356,12 @@ export default {
           CONSTRAINT \`fk_session_share_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      yield* tx.run(
+        `CREATE INDEX \`online_reclaim_cross_part_parent_idx\` ON \`online_reclaim_cross_session_part\` (\`parent_session_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`online_reclaim_cross_part_child_idx\` ON \`online_reclaim_cross_session_part\` (\`child_session_id\`);`,
+      )
       yield* tx.run(
         `CREATE INDEX \`event_aggregate_writer_activity_idx\` ON \`event_aggregate_writer\` (\`aggregate_id\`,\`time_last_append\`);`,
       )
