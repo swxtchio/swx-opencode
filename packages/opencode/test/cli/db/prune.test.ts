@@ -20,6 +20,7 @@ import {
 import path from "node:path"
 import { Effect } from "effect"
 import { Flag } from "@opencode-ai/core/flag/flag"
+import { OnlineReclaimIndexes } from "@opencode-ai/core/database/online-reclaim-indexes"
 import { EventWriter } from "@opencode-ai/core/event/writer"
 import { PruneCommand } from "@/cli/cmd/db-prune"
 import { MessageV2 } from "@/session/message-v2"
@@ -158,6 +159,8 @@ type Report = {
   skippedSessions?: { sessionID: string; reasons: string[] }[]
   batches?: Record<string, unknown>[]
   sessionProgress?: Record<string, unknown>[]
+  createdIndexes?: string[]
+  remainingIndexes?: string[]
 }
 
 const ownedCounts = (filename: string, sessionID: string) => {
@@ -1026,6 +1029,61 @@ test("online inventory refuses when proof and keyset indexes are missing", async
   expect(inventory.deletionScope.sessionIDs).toEqual([])
 })
 
+test.serial("online proof indexes are prepared offline and are not rebuilt at startup", async () => {
+  await using store = await producedStore([{}])
+  const sessionID = store.metadata[0].created[0].id
+  const setup = new Database(store.filename)
+  setup.exec(OnlineReclaimIndexes.definitions.map((index) => `DROP INDEX IF EXISTS "${index.name}";`).join("\n"))
+  setup.close()
+
+  await produceLive(store, { create: {} })
+  const afterStartup = new Database(store.filename, { readonly: true })
+  const missingAfterStartup = OnlineReclaimIndexes.definitions.filter(
+    (index) =>
+      !afterStartup
+        .query<{ name: string }, [string]>("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(index.name),
+  )
+  afterStartup.close()
+  expect(missingAfterStartup.map((index) => index.name)).toEqual(
+    OnlineReclaimIndexes.definitions.map((index) => index.name),
+  )
+
+  const holder = startProducer(store, {
+    readerAfterSignal: { readyFile: path.join(store.directory, "online-index-prep-reader-ready") },
+  })
+  await readMatchingLine(holder, "PRUNE_READER_READY ")
+  try {
+    const refused = parseReport(
+      await runCLI(store, ["--database", store.filename, "--prepare-online-indexes"], "nonzero"),
+    )
+    expect(refused.action).toBe("refused")
+    expect(refused.refusalReasons).toContain(`database-holder-present:${holder.child.pid}`)
+    expect(refused.createdIndexes).toEqual([])
+  } finally {
+    holder.child.stdin.end()
+    assertChildOutcome(await holder.finish(), 0)
+  }
+
+  const prepared = parseReport(await runCLI(store, ["--database", store.filename, "--prepare-online-indexes"]))
+  expect(prepared.action).toBe("prepared")
+  expect(prepared.createdIndexes).toEqual(OnlineReclaimIndexes.definitions.map((index) => index.name))
+  expect(prepared.remainingIndexes).toEqual([])
+
+  const resumed = parseReport(await runCLI(store, ["--database", store.filename, "--prepare-online-indexes"]))
+  expect(resumed.action).toBe("prepared")
+  expect(resumed.createdIndexes).toEqual([])
+  expect(resumed.remainingIndexes).toEqual([])
+
+  const inventory = await invokeHandler(store, {
+    database: store.filename,
+    online: true,
+    session: [sessionID],
+    reserveBytes: 1,
+  })
+  expect(inventory.report.reclamation.reasons.some((reason) => reason.startsWith("online-"))).toBe(false)
+})
+
 test("online prune still protects parent cycles without a validation-row cap", async () => {
   await using store = await producedStore([{}])
   const sessionID = store.metadata[0].created[0].id
@@ -1859,9 +1917,11 @@ test.serial("online prune detects a Todo rewrite at or behind a committed cursor
   const producer = startProducer(store, { todoAfterSignal: { sessionID, startFile, closedFile } })
   await readMatchingLine(producer, "PRUNE_TODO_WAITING")
   const before = new Database(store.filename, { readonly: true })
-  const sessionUpdatedBefore = before.query<{ time_updated: number }, [string]>("SELECT time_updated FROM session WHERE id = ?")
+  const sessionUpdatedBefore = before
+    .query<{ time_updated: number }, [string]>("SELECT time_updated FROM session WHERE id = ?")
     .get(sessionID)!.time_updated
-  const eventSequenceBefore = before.query<{ seq: number }, [string]>("SELECT seq FROM event_sequence WHERE aggregate_id = ?")
+  const eventSequenceBefore = before
+    .query<{ seq: number }, [string]>("SELECT seq FROM event_sequence WHERE aggregate_id = ?")
     .get(sessionID)!.seq
   before.close()
   const originalExec = Database.prototype.exec
@@ -2060,7 +2120,8 @@ test.serial("online prune reports committed delete and reclaim before a connecti
       batchRows: 1,
     })
     const after = ownedCounts(store.filename, sessionID)
-    const removedRows = Object.values(before).reduce((sum, count) => sum + count, 0) -
+    const removedRows =
+      Object.values(before).reduce((sum, count) => sum + count, 0) -
       Object.values(after).reduce((sum, count) => sum + count, 0)
     const reportedRows = Object.values(result.report.changedRowsByTable ?? {}).reduce((sum, count) => sum + count, 0)
     expect(injected).toBe(true)

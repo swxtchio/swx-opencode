@@ -15,7 +15,7 @@ Authority: swxtchio/swx-opencode#353, “Ask” and the task brief’s “Need�
 
 The next fixes preserve the settled no-validation-row-cap contract and keep unbounded historical work out of SQLite writer transactions:
 
-1. Remove whole-table index construction from automatic startup migrations. Provide a resumable, bounded existing-store proof/index preparation path; online inventory refuses until its required proof structures are complete, while fresh stores continue to receive their indexes from the empty schema.
+1. Remove whole-table index construction from automatic startup migrations. Provide an explicit, resumable offline preparation step for existing stores; online inventory refuses until its required proof structures are complete, while fresh stores continue to receive their indexes from the empty schema. Keep the live online delete/reclaim path bounded after preparation.
 2. Restore inventory detection for historical cross-Session Part references using bounded, indexed/resumable work. Inventory must refuse before deletion begins; retain the in-lock late-reference guard.
 3. Replace queue-driven alias joins with Session-scoped bounded existence, high-water and keyset proofs. Add work-observing coverage for large alias-free queue histories, and make the activity regression fail if its indexed latest-value seek becomes a whole-history aggregate.
 4. Move the historical event-writer census out of each `BEGIN IMMEDIATE` batch, process it in bounded pages, and bind its result to the durable event fence revalidated under the lock.

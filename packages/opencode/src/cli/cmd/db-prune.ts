@@ -1,4 +1,5 @@
 import { Database } from "@opencode-ai/core/database/database"
+import { OnlineReclaimIndexes } from "@opencode-ai/core/database/online-reclaim-indexes"
 import { EventWriter } from "@opencode-ai/core/event/writer"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
 import type { SQLQueryBindings } from "bun:sqlite"
@@ -20,6 +21,7 @@ type PruneArgs = {
   session?: string[]
   apply?: boolean
   online?: boolean
+  prepareOnlineIndexes?: boolean
   reclaimOnly?: boolean
   reserveBytes?: number
   batchRows?: number
@@ -281,6 +283,11 @@ export const PruneCommand = cmd<{}, PruneArgs>({
   describe: "inventory missing-directory local Sessions; --apply deletes them offline unless --online is selected",
   builder: (yargs: Argv) =>
     pruneOptions(yargs)
+      .option("prepare-online-indexes", {
+        type: "boolean",
+        default: false,
+        describe: "prepare existing-store online proof indexes offline; requires --database and stopped database users",
+      })
       .option("online", {
         type: "boolean",
         default: false,
@@ -326,6 +333,32 @@ export const PruneCommand = cmd<{}, PruneArgs>({
     const cutoff = parseCutoff(args.before)
     const requested = normalizeSessionIDs(args.session)
     const usage = measurementReport(args)
+    if (args.prepareOnlineIndexes) {
+      const invalid = [
+        ...(!args.database ? ["index-preparation-requires---database"] : []),
+        ...(args.online ? ["index-preparation-disallows---online"] : []),
+        ...(args.before !== undefined ? ["index-preparation-disallows---before"] : []),
+        ...(requested !== undefined ? ["index-preparation-disallows---session"] : []),
+        ...(args.apply ? ["index-preparation-disallows---apply"] : []),
+        ...(args.reclaimOnly ? ["index-preparation-disallows---reclaim-only"] : []),
+        ...(args.reserveBytes !== undefined ? ["index-preparation-disallows---reserve-bytes"] : []),
+        ...(args.batchRows !== undefined ? ["index-preparation-disallows---batch-rows"] : []),
+        ...(args.batchBytes !== undefined ? ["index-preparation-disallows---batch-bytes"] : []),
+        ...(args.maxBatches !== undefined ? ["index-preparation-disallows---max-batches"] : []),
+        ...(args.vacuumPages !== undefined ? ["index-preparation-disallows---vacuum-pages"] : []),
+        ...(args.maxVacuumPages !== undefined ? ["index-preparation-disallows---max-vacuum-pages"] : []),
+      ]
+      if (invalid.length > 0) {
+        process.stderr.write(`opencode db prune: invalid index preparation usage (${invalid.join(", ")})\n`)
+        process.stderr.write("Run 'opencode db prune --help' for usage.\n")
+        process.exitCode = 2
+        return
+      }
+      const report = await prepareOnlineIndexes(filename)
+      console.log(JSON.stringify(report))
+      process.exitCode = report.action === "prepared" ? 0 : 1
+      return
+    }
     if (args.online) {
       const onlineUsageReasons = [
         ...(args.before !== undefined && cutoff === undefined ? ["invalid-or-missing-cutoff"] : []),
@@ -631,7 +664,138 @@ type OnlinePruneReport = {
   sessionProgress: Record<string, unknown>[]
 }
 
+type OnlineIndexPreparationReport = {
+  action: "prepared" | "refused" | "failed"
+  database: string
+  createdIndexes: string[]
+  remainingIndexes: string[]
+  refusalReasons: string[]
+}
+
 const onlineReclaimMethod = "PRAGMA incremental_vacuum(N) with PRAGMA wal_checkpoint(PASSIVE)"
+
+async function prepareOnlineIndexes(filename: string): Promise<OnlineIndexPreparationReport> {
+  const resolved = await resolveDatabaseFile(filename)
+  if ("reason" in resolved)
+    return {
+      action: "refused",
+      database: filename,
+      createdIndexes: [],
+      remainingIndexes: OnlineReclaimIndexes.definitions.map((index) => index.name),
+      refusalReasons: [resolved.reason ?? "database-file-unreadable"],
+    }
+
+  const holders = scanDatabaseHolders(resolved.filename)
+  if (holders.state !== "complete" || holders.pids.length > 0)
+    return {
+      action: "refused",
+      database: resolved.filename,
+      createdIndexes: [],
+      remainingIndexes: OnlineReclaimIndexes.definitions.map((index) => index.name),
+      refusalReasons:
+        holders.state === "complete"
+          ? holders.pids.map((pid) => `database-holder-present:${pid}`)
+          : [`database-holder-scan-unreadable:${holders.reason}`],
+    }
+
+  const sqlite = await import("bun:sqlite")
+  const db = new sqlite.Database(resolved.filename, { readwrite: true, create: false })
+  const createdIndexes = new Array<string>()
+  const remainingIndexes = new Set(OnlineReclaimIndexes.definitions.map((index) => index.name))
+  try {
+    db.exec(`PRAGMA busy_timeout = ${onlineBounds.busyTimeout}; PRAGMA foreign_keys = ON`)
+    const schema = inspectSchema(db)
+    const schemaReasons = [
+      ...schema.failures,
+      ...schema.unclassifiedTables.map((table) => `unclassified-session-storage:${table}`),
+    ]
+    if (schemaReasons.length > 0)
+      return {
+        action: "refused",
+        database: resolved.filename,
+        createdIndexes,
+        remainingIndexes: [...remainingIndexes],
+        refusalReasons: schemaReasons,
+      }
+
+    for (const index of OnlineReclaimIndexes.definitions) {
+      const existing = db
+        .query<{ sql: string | null }, [string]>("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
+        .get(index.name)
+      const changed =
+        "refreshWhenChanged" in index &&
+        index.refreshWhenChanged &&
+        existing?.sql !== null &&
+        existing?.sql !== undefined &&
+        normalizeIndexSQL(existing.sql) !== normalizeIndexSQL(index.statement)
+      if (existing && !changed) {
+        remainingIndexes.delete(index.name)
+        continue
+      }
+
+      const currentHolders = scanDatabaseHolders(resolved.filename)
+      if (currentHolders.state !== "complete" || currentHolders.pids.length > 0) {
+        return {
+          action: createdIndexes.length > 0 ? "failed" : "refused",
+          database: resolved.filename,
+          createdIndexes,
+          remainingIndexes: [...remainingIndexes],
+          refusalReasons:
+            currentHolders.state === "complete"
+              ? currentHolders.pids.map((pid) => `database-holder-present:${pid}`)
+              : [`database-holder-scan-unreadable:${currentHolders.reason}`],
+        }
+      }
+
+      if (changed) db.exec(`DROP INDEX IF EXISTS ${quote(index.name)}`)
+      db.exec(index.statement)
+      createdIndexes.push(index.name)
+      remainingIndexes.delete(index.name)
+    }
+
+    const proofFailures = onlineScopeIndexFailures(db, schema)
+    if (proofFailures.length > 0) {
+      for (const index of OnlineReclaimIndexes.definitions) {
+        if (proofFailures.some((failure) => failure.includes(index.name))) remainingIndexes.add(index.name)
+      }
+      return {
+        action: "failed",
+        database: resolved.filename,
+        createdIndexes,
+        remainingIndexes: [...remainingIndexes],
+        refusalReasons: proofFailures,
+      }
+    }
+
+    return {
+      action: "prepared",
+      database: resolved.filename,
+      createdIndexes,
+      remainingIndexes: [],
+      refusalReasons: [],
+    }
+  } catch (error) {
+    return {
+      action: "failed",
+      database: resolved.filename,
+      createdIndexes,
+      remainingIndexes: [...remainingIndexes],
+      refusalReasons: [error instanceof Error ? error.message : "online-index-preparation-failed"],
+    }
+  } finally {
+    db.close()
+  }
+}
+
+function normalizeIndexSQL(value: string) {
+  return value
+    .replace(/\bIF\s+NOT\s+EXISTS\b/i, "")
+    .replaceAll(/["`]/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/;$/, "")
+    .trim()
+    .toLowerCase()
+}
 
 async function applyOnlinePrune(
   filename: string,

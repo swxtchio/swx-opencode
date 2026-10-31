@@ -19,10 +19,14 @@ The consumer checks use the existing Linux process/lock inspection boundary. An 
 
 Use this path when the per-home store must stay available to other OpenCode processes. Name the existing database and every Session explicitly. `--before` is an optional activity filter that only narrows the missing-directory set. Set the reserve from the caller's reviewed capacity policy; the producer checks it again before each delete, vacuum and checkpoint step.
 
+Existing stores need the online proof indexes prepared once before online inventory. Whole-table index builds are not run at application startup: stop every OpenCode process using the database, then run `opencode db prune --database "$DB" --prepare-online-indexes`. The command refuses if another database holder is present, creates indexes one at a time, and can be rerun after interruption; each individual index build may take time and disk space proportional to its source table. Keep all database users stopped until it exits. Fresh stores already create these indexes with their empty schema. If preparation is incomplete, online inventory reports the missing proof and remains not ready.
+
 ```sh
 DB="/absolute/home/data/opencode/opencode.db"
 SESSION_ID="ses_example"
 RESERVE_BYTES="<caller-selected-positive-bytes>"
+
+opencode db prune --database "$DB" --prepare-online-indexes
 
 opencode db prune --online --database "$DB" --session "$SESSION_ID" \
   --reserve-bytes "$RESERVE_BYTES"
