@@ -24,6 +24,22 @@ export const structureStatements = [
     "high_water" INTEGER NOT NULL,
     "complete" INTEGER NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS "online_reclaim_stable_backfill" (
+    "name" TEXT PRIMARY KEY NOT NULL,
+    "cursor" TEXT NOT NULL,
+    "cursor_secondary" TEXT NOT NULL,
+    "cursor_started" INTEGER NOT NULL,
+    "high_water" TEXT NOT NULL,
+    "high_water_secondary" TEXT NOT NULL,
+    "high_water_present" INTEGER NOT NULL,
+    "complete" INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS "online_reclaim_writer_lifetime" (
+    "pid" INTEGER NOT NULL,
+    "boot_id" TEXT NOT NULL,
+    "start_ticks" TEXT NOT NULL,
+    PRIMARY KEY ("pid", "boot_id", "start_ticks")
+  )`,
 ] as const
 
 export const triggerStatements = [
@@ -91,6 +107,30 @@ export const triggerStatements = [
       SELECT alias.rowid FROM "session_prompt_queue_alias" alias WHERE alias."item_id" = NEW."id"
     );
   END`,
+  `CREATE TRIGGER IF NOT EXISTS "online_reclaim_writer_lifetime_insert"
+  AFTER INSERT ON "event_writer_process"
+  WHEN NEW."boot_id" IS NOT NULL AND NEW."start_ticks" IS NOT NULL
+  BEGIN
+    INSERT INTO "online_reclaim_writer_lifetime" ("pid", "boot_id", "start_ticks")
+    VALUES (NEW."pid", NEW."boot_id", NEW."start_ticks")
+    ON CONFLICT("pid", "boot_id", "start_ticks") DO NOTHING;
+  END`,
+  `CREATE TRIGGER IF NOT EXISTS "online_reclaim_writer_lifetime_update"
+  AFTER UPDATE OF "pid", "boot_id", "start_ticks" ON "event_writer_process"
+  BEGIN
+    DELETE FROM "online_reclaim_writer_lifetime"
+    WHERE "pid" = OLD."pid" AND "boot_id" = OLD."boot_id" AND "start_ticks" = OLD."start_ticks";
+    INSERT INTO "online_reclaim_writer_lifetime" ("pid", "boot_id", "start_ticks")
+    SELECT NEW."pid", NEW."boot_id", NEW."start_ticks"
+    WHERE NEW."boot_id" IS NOT NULL AND NEW."start_ticks" IS NOT NULL
+    ON CONFLICT("pid", "boot_id", "start_ticks") DO NOTHING;
+  END`,
+  `CREATE TRIGGER IF NOT EXISTS "online_reclaim_writer_lifetime_delete"
+  AFTER DELETE ON "event_writer_process"
+  BEGIN
+    DELETE FROM "online_reclaim_writer_lifetime"
+    WHERE "pid" = OLD."pid" AND "boot_id" = OLD."boot_id" AND "start_ticks" = OLD."start_ticks";
+  END`,
 ] as const
 
 export const requiredTriggerNames = [
@@ -101,13 +141,19 @@ export const requiredTriggerNames = [
   "online_reclaim_queue_alias_scope_update",
   "online_reclaim_queue_alias_scope_delete",
   "online_reclaim_queue_scope_update",
+  "online_reclaim_writer_lifetime_insert",
+  "online_reclaim_writer_lifetime_update",
+  "online_reclaim_writer_lifetime_delete",
 ] as const
 const proofTables = [
   "online_reclaim_cross_session_part",
   "online_reclaim_queue_alias_scope",
   "online_reclaim_backfill",
+  "online_reclaim_stable_backfill",
+  "online_reclaim_writer_lifetime",
 ] as const
 const backfillNames = ["cross-session-parts", "queue-alias-scope"] as const
+const stableBackfillNames = ["event-writer-lifetimes"] as const
 
 export function install(db: Database, initiallyComplete: boolean) {
   return Effect.gen(function* () {
@@ -127,13 +173,18 @@ export function install(db: Database, initiallyComplete: boolean) {
         SELECT type, name FROM sqlite_master WHERE type IN ('table', 'trigger', 'index')
       `)).map((row) => `${row.type}:${row.name}`),
     )
-    if (!objects.has("table:online_reclaim_backfill")) {
+    if (!objects.has("table:online_reclaim_backfill") || !objects.has("table:online_reclaim_stable_backfill")) {
       yield* installMissing(db, initiallyComplete)
       return
     }
     const completedRows = new Set(
       (yield* db.all<{ name: string }>(sql`
         SELECT name FROM online_reclaim_backfill WHERE name IN (${backfillNames[0]}, ${backfillNames[1]})
+      `)).map((row) => row.name),
+    )
+    const completedStableRows = new Set(
+      (yield* db.all<{ name: string }>(sql`
+        SELECT name FROM online_reclaim_stable_backfill WHERE name = ${stableBackfillNames[0]}
       `)).map((row) => row.name),
     )
     const crossHasRows = objects.has("table:online_reclaim_cross_session_part")
@@ -152,6 +203,7 @@ export function install(db: Database, initiallyComplete: boolean) {
       proofTables.every((name) => objects.has(`table:${name}`)) &&
       requiredTriggerNames.every((name) => objects.has(`trigger:${name}`)) &&
       backfillNames.every((name) => completedRows.has(name)) &&
+      stableBackfillNames.every((name) => completedStableRows.has(name)) &&
       !missingEmptyProofIndex
     if (installed) return
 
@@ -199,6 +251,14 @@ function installMissing(db: Database, initiallyComplete: boolean) {
         yield* tx.run(sql`
           INSERT OR IGNORE INTO online_reclaim_backfill (name, cursor, high_water, complete)
           VALUES ('queue-alias-scope', 0, ${initiallyComplete ? 0 : -1}, ${initiallyComplete ? 1 : 0})
+        `)
+        yield* tx.run(sql`
+          INSERT OR IGNORE INTO online_reclaim_stable_backfill (
+            name, cursor, cursor_secondary, cursor_started,
+            high_water, high_water_secondary, high_water_present, complete
+          ) VALUES (
+            ${stableBackfillNames[0]}, '', '', 0, '', '', 0, ${initiallyComplete ? 1 : 0}
+          )
         `)
         if (!crossTable && !initiallyComplete)
           yield* tx.run(sql`

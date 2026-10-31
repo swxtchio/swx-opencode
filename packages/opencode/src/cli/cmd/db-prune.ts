@@ -713,6 +713,12 @@ async function prepareOnlineIndexes(filename: string): Promise<OnlineIndexPrepar
     db.exec(
       `INSERT OR IGNORE INTO online_reclaim_backfill (name, cursor, high_water, complete) VALUES ('queue-alias-scope', 0, -1, 0)`,
     )
+    db.exec(
+      `INSERT OR IGNORE INTO online_reclaim_stable_backfill (
+         name, cursor, cursor_secondary, cursor_started,
+         high_water, high_water_secondary, high_water_present, complete
+       ) VALUES ('event-writer-lifetimes', '', '', 0, '', '', 0, 0)`,
+    )
     const schema = inspectSchema(db)
     const schemaReasons = [
       ...schema.failures,
@@ -783,6 +789,18 @@ async function prepareOnlineIndexes(filename: string): Promise<OnlineIndexPrepar
         createdIndexes,
         remainingIndexes: [...remainingIndexes],
         refusalReasons: aliasBackfillFailures,
+      }
+    }
+
+    const writerBackfillFailures = prepareOnlineWriterLifetimeProof(db)
+    if (writerBackfillFailures.length > 0) {
+      remainingIndexes.add("event-writer-lifetimes-backfill")
+      return {
+        action: createdIndexes.length > 0 ? "failed" : "refused",
+        database: resolved.filename,
+        createdIndexes,
+        remainingIndexes: [...remainingIndexes],
+        refusalReasons: writerBackfillFailures,
       }
     }
 
@@ -996,6 +1014,109 @@ function prepareQueueAliasScopeProof(db: SqliteAccess, filename: string) {
   }
 }
 
+function prepareOnlineWriterLifetimeProof(db: SqliteAccess) {
+  const pageRows = 128
+  const name = "event-writer-lifetimes"
+  while (true) {
+    const state = db
+      .query<
+        {
+          cursor: string
+          cursor_started: number
+          high_water: string
+          high_water_present: number
+          complete: number
+        },
+        [string]
+      >(
+        `SELECT cursor, cursor_started, high_water, high_water_present, complete
+         FROM online_reclaim_stable_backfill WHERE name = ?`,
+      )
+      .get(name)
+    if (!state) return [`online-proof-backfill-state-unavailable:${name}`]
+    if (state.complete === 1) return []
+
+    const acquired = onlineBeginImmediate(db)
+    if (!acquired.started) return [`online-proof-backfill-busy:${name}`]
+    try {
+      const current = db
+        .query<
+          {
+            cursor: string
+            cursor_started: number
+            high_water: string
+            high_water_present: number
+            complete: number
+          },
+          [string]
+        >(
+          `SELECT cursor, cursor_started, high_water, high_water_present, complete
+           FROM online_reclaim_stable_backfill WHERE name = ?`,
+        )
+        .get(name)
+      if (!current) throw new Error(`online-proof-backfill-state-unavailable:${name}`)
+      if (current.complete === 1) {
+        db.exec("COMMIT")
+        return []
+      }
+      if (current.high_water_present !== 1) {
+        const highWater = db
+          .query<
+            { writer_id: string },
+            []
+          >("SELECT writer_id FROM event_writer_process ORDER BY writer_id DESC LIMIT 1")
+          .get()?.writer_id
+        db.query(
+          `UPDATE online_reclaim_stable_backfill
+           SET high_water = ?, high_water_present = 1, complete = ?
+           WHERE name = ?`,
+        ).run(highWater ?? "", highWater === undefined ? 1 : 0, name)
+        db.exec("COMMIT")
+        if (highWater === undefined) return []
+        continue
+      }
+
+      const after = current.cursor_started === 1 ? "writer_id > ? AND writer_id <= ?" : "writer_id <= ?"
+      const params: SQLQueryBindings[] =
+        current.cursor_started === 1 ? [current.cursor, current.high_water, pageRows] : [current.high_water, pageRows]
+      const rows = db
+        .query<
+          { writer_id: string; pid: number; boot_id: string | null; start_ticks: string | null },
+          SQLQueryBindings[]
+        >(
+          `SELECT writer_id, pid, boot_id, start_ticks
+           FROM event_writer_process
+           WHERE ${after}
+           ORDER BY writer_id ASC
+           LIMIT ?`,
+        )
+        .all(...params)
+      const insert = db.query(
+        `INSERT INTO online_reclaim_writer_lifetime (pid, boot_id, start_ticks)
+         VALUES (?, ?, ?)
+         ON CONFLICT(pid, boot_id, start_ticks) DO NOTHING`,
+      )
+      for (const row of rows) {
+        if (!row.boot_id || !row.start_ticks) continue
+        insert.run(row.pid, row.boot_id, row.start_ticks)
+      }
+
+      const cursor = rows.at(-1)?.writer_id ?? current.cursor
+      const complete = rows.length < pageRows || cursor >= current.high_water
+      db.query(
+        `UPDATE online_reclaim_stable_backfill
+         SET cursor = ?, cursor_started = ?, complete = ?
+         WHERE name = ?`,
+      ).run(cursor, rows.length > 0 ? 1 : current.cursor_started, complete ? 1 : 0, name)
+      db.exec("COMMIT")
+      if (complete) return []
+    } catch (error) {
+      if (db.inTransaction) db.exec("ROLLBACK")
+      return [error instanceof Error ? error.message : `online-proof-backfill-failed:${name}`]
+    }
+  }
+}
+
 async function applyOnlinePrune(
   filename: string,
   args: PruneArgs,
@@ -1030,8 +1151,17 @@ async function applyOnlinePrune(
   const sqlite = await import("bun:sqlite")
   let db: SqliteAccess | undefined
   try {
+    if (args.apply) {
+      const { Effect, Layer } = await import("effect")
+      await Effect.runPromise(Effect.scoped(Layer.build(Database.layerFromPath(resolved.filename))))
+    }
     db = new sqlite.Database(resolved.filename, args.apply ? { readwrite: true, create: false } : { readonly: true })
     db.exec(`PRAGMA busy_timeout = ${onlineBounds.busyTimeout}; PRAGMA foreign_keys = ON`)
+    if (args.apply) {
+      const writerProofReasons = prepareOnlineWriterLifetimeProof(db)
+      if (writerProofReasons.length > 0)
+        return onlineRefusedReport(filename, cutoff, requested, usage, writerProofReasons)
+    }
     if (args.reclaimOnly) return await onlineReclaimOnly(db, resolved.filename, options.value, usage)
 
     const inventory = await onlineInventorySnapshot(db, resolved.filename, requested!, cutoff, options.value, usage)
@@ -1554,9 +1684,15 @@ function onlineReclaimBackfillFailures(db: SqliteAccess) {
         .filter((row) => row.complete === 1)
         .map((row) => row.name),
     )
-    return ["cross-session-parts", "queue-alias-scope"].flatMap((name) =>
-      complete.has(name) ? [] : [`online-proof-backfill-incomplete:${name}`],
-    )
+    const writerLifetime = db
+      .query<{ complete: number }, [string]>("SELECT complete FROM online_reclaim_stable_backfill WHERE name = ?")
+      .get("event-writer-lifetimes")
+    return [
+      ...["cross-session-parts", "queue-alias-scope"].flatMap((name) =>
+        complete.has(name) ? [] : [`online-proof-backfill-incomplete:${name}`],
+      ),
+      ...(writerLifetime?.complete === 1 ? [] : ["online-proof-backfill-incomplete:event-writer-lifetimes"]),
+    ]
   } catch {
     return ["online-proof-backfill-unavailable"]
   }
@@ -2580,8 +2716,9 @@ function onlineHolderFailures(db: SqliteAccess, current: ReturnType<typeof scanD
   const reasons = new Set<string>()
   if (current.target === "memory") reasons.add("database-holder-scan-target-mismatch")
   try {
-    const registrations = db.query<{ pid: number; boot_id: string | null; start_ticks: string | null }, [number]>(
-      "SELECT pid, boot_id, start_ticks FROM event_writer_process WHERE pid = ?",
+    const registration = db.query<{ registered: number }, [number, string, string]>(
+      `SELECT 1 AS registered FROM online_reclaim_writer_lifetime
+       WHERE pid = ? AND boot_id = ? AND start_ticks = ? LIMIT 1`,
     )
     for (const pid of current.pids) {
       const identity = EventWriter.readIdentity(pid)
@@ -2590,7 +2727,7 @@ function onlineHolderFailures(db: SqliteAccess, current: ReturnType<typeof scanD
         reasons.add(`database-holder-identity-unreadable:${pid}`)
         continue
       }
-      if (!registrations.all(pid).some((row) => onlineSameProcess(row, identity))) {
+      if (!registration.get(pid, identity.bootID, identity.startTicks)) {
         reasons.add(`unregistered-database-holder:${pid}`)
       }
     }
@@ -2686,6 +2823,7 @@ function onlineScopeIndexFailures(db: SqliteAccess, schema: ReturnType<typeof in
     { table: "event_aggregate_writer", columns: ["aggregate_id", "writer_id"] },
     { table: "event_retention", columns: ["aggregate_id"] },
     { table: "event_aggregate_writer", columns: ["aggregate_id"] },
+    { table: "online_reclaim_writer_lifetime", columns: ["pid", "boot_id", "start_ticks"] },
   ]
   const failures = new Array<string>()
   for (const { table, columns } of required) {

@@ -1855,6 +1855,61 @@ test.serial("online prune pages the historical writer census outside its delete 
   }
 })
 
+test.serial("online holder proof looks up the current process lifetime without scanning PID history", async () => {
+  if (process.platform !== "linux") return
+  await using store = await producedStore([{}])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  const identity = EventWriter.self()
+  if (!identity.bootID || !identity.startTicks) throw new Error("Linux process identity is unavailable")
+  await rm(store.project, { recursive: true })
+
+  const db = new Database(store.filename)
+  const insert = db.query(
+    `INSERT INTO event_writer_process (writer_id, pid, boot_id, start_ticks, time_registered)
+     VALUES (?, ?, ?, ?, ?)`,
+  )
+  const historicalRegistrations = 600
+  db.transaction(() => {
+    Array.from({ length: historicalRegistrations }, (_, index) => index).forEach((index) => {
+      insert.run(`writer-pid-history-${String(index).padStart(4, "0")}`, identity.pid, `old-boot-${index}`, "1", index)
+    })
+    insert.run(EventWriter.id(), identity.pid, identity.bootID, identity.startTicks, Date.now())
+  })()
+  db.close()
+
+  const holderQueries = new Array<{ statement: string; inTransaction: boolean }>()
+  const unboundedPidQueries = new Array<string>()
+  const originalQuery = Database.prototype.query
+  const query = spyOn(Database.prototype, "query").mockImplementation(function <
+    ReturnType,
+    ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+  >(this: Database, statement: string) {
+    if (statement.includes("FROM online_reclaim_writer_lifetime"))
+      holderQueries.push({ statement, inTransaction: this.inTransaction })
+    if (statement.includes("FROM event_writer_process") && statement.includes("WHERE pid = ?"))
+      unboundedPidQueries.push(statement)
+    return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+  })
+  try {
+    const applied = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      apply: true,
+      reserveBytes: 1,
+      batchRows: 1,
+      maxBatches: 1,
+    })
+    expect(applied.report.committed).toBe(true)
+    expect(holderQueries.length).toBeGreaterThan(0)
+    expect(holderQueries.some((item) => item.inTransaction)).toBe(true)
+    expect(holderQueries.every((item) => item.statement.includes("LIMIT 1"))).toBe(true)
+    expect(unboundedPidQueries).toEqual([])
+  } finally {
+    query.mockRestore()
+  }
+})
+
 test(
   "online reclaim releases the write lock between steps so a registered writer commits on another Session",
   async () => {

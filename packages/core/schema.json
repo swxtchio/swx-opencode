@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "4ea4b288-4aaf-46e7-844f-117a8ea9084a",
+  "id": "636aedeb-485e-48ff-bc37-a7ba73f6a58a",
   "prevIds": [
-    "6572b217-12e0-40f5-9be2-41327c2aefec"
+    "4ea4b288-4aaf-46e7-844f-117a8ea9084a"
   ],
   "ddl": [
     {
@@ -24,6 +24,14 @@
     },
     {
       "name": "online_reclaim_queue_alias_scope",
+      "entityType": "tables"
+    },
+    {
+      "name": "online_reclaim_stable_backfill",
+      "entityType": "tables"
+    },
+    {
+      "name": "online_reclaim_writer_lifetime",
       "entityType": "tables"
     },
     {
@@ -329,6 +337,116 @@
       "name": "owner_session_id",
       "entityType": "columns",
       "table": "online_reclaim_queue_alias_scope"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "name",
+      "entityType": "columns",
+      "table": "online_reclaim_stable_backfill"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "cursor",
+      "entityType": "columns",
+      "table": "online_reclaim_stable_backfill"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "cursor_secondary",
+      "entityType": "columns",
+      "table": "online_reclaim_stable_backfill"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "cursor_started",
+      "entityType": "columns",
+      "table": "online_reclaim_stable_backfill"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "high_water",
+      "entityType": "columns",
+      "table": "online_reclaim_stable_backfill"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "high_water_secondary",
+      "entityType": "columns",
+      "table": "online_reclaim_stable_backfill"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "high_water_present",
+      "entityType": "columns",
+      "table": "online_reclaim_stable_backfill"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "complete",
+      "entityType": "columns",
+      "table": "online_reclaim_stable_backfill"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "pid",
+      "entityType": "columns",
+      "table": "online_reclaim_writer_lifetime"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "boot_id",
+      "entityType": "columns",
+      "table": "online_reclaim_writer_lifetime"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "start_ticks",
+      "entityType": "columns",
+      "table": "online_reclaim_writer_lifetime"
     },
     {
       "type": "text",
@@ -2507,6 +2625,17 @@
     },
     {
       "columns": [
+        "pid",
+        "boot_id",
+        "start_ticks"
+      ],
+      "nameExplicit": false,
+      "name": "online_reclaim_writer_lifetime_pk",
+      "entityType": "pks",
+      "table": "online_reclaim_writer_lifetime"
+    },
+    {
+      "columns": [
         "aggregate_id",
         "writer_id"
       ],
@@ -2608,6 +2737,15 @@
       "nameExplicit": false,
       "name": "online_reclaim_queue_alias_scope_pk",
       "table": "online_reclaim_queue_alias_scope",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "name"
+      ],
+      "nameExplicit": false,
+      "name": "online_reclaim_stable_backfill_pk",
+      "table": "online_reclaim_stable_backfill",
       "entityType": "pks"
     },
     {
