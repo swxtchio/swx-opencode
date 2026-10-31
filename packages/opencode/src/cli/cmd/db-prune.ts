@@ -3847,10 +3847,33 @@ function checkpointDatabase(db: SqliteAccess) {
 }
 
 function deleteSessions(db: SqliteAccess, sessionIDs: readonly string[]) {
+  const proofTables = new Set(
+    db
+      .query<{ name: string }, []>(
+        `SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name IN ('online_reclaim_cross_session_part', 'online_reclaim_queue_alias_scope')`,
+      )
+      .all()
+      .map((row) => row.name),
+  )
   return Object.fromEntries(
     storageScopes.map(([table, scope]) => [
       table,
-      sessionIDs.reduce((sum, id) => sum + db.query(`DELETE FROM ${quote(table)} WHERE ${scope}`).run(id).changes, 0),
+      sessionIDs.reduce((sum, id) => {
+        if (table === "part" && proofTables.has("online_reclaim_cross_session_part"))
+          db.query("DELETE FROM online_reclaim_cross_session_part WHERE child_session_id = ?").run(id)
+        if (table === "session_prompt_queue_alias" && proofTables.has("online_reclaim_queue_alias_scope"))
+          db
+            .query(
+              `DELETE FROM online_reclaim_queue_alias_scope
+               WHERE alias_rowid IN (
+                 SELECT alias.rowid FROM session_prompt_queue_alias alias
+                 WHERE alias.item_id IN (SELECT id FROM session_prompt_queue WHERE session_id = ?)
+               )`,
+            )
+            .run(id)
+        return sum + db.query(`DELETE FROM ${quote(table)} WHERE ${scope}`).run(id).changes
+      }, 0),
     ]),
   )
 }
