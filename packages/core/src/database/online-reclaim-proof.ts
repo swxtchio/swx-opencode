@@ -327,7 +327,7 @@ const proofTables = [
   "online_reclaim_cross_part_message",
 ] as const
 const backfillNames = ["cross-session-part-scope"] as const
-const stableBackfillNames = ["event-writer-lifetimes", "queue-alias-owners"] as const
+const stableBackfillNames = ["event-writer-lifetimes", "queue-alias-owners", "cross-session-part-scope"] as const
 
 export function install(db: Database, initiallyComplete: boolean) {
   return Effect.gen(function* () {
@@ -359,7 +359,6 @@ export function install(db: Database, initiallyComplete: boolean) {
     const completedStableRows = new Set(
       (yield* db.all<{ name: string }>(sql`
         SELECT name FROM online_reclaim_stable_backfill
-        WHERE name IN (${stableBackfillNames[0]}, ${stableBackfillNames[1]})
       `)).map((row) => row.name),
     )
     const crossHasRows = objects.has("table:online_reclaim_cross_session_part")
@@ -432,6 +431,9 @@ function installMissing(db: Database, initiallyComplete: boolean) {
           : false
 
         for (const statement of structureStatements) yield* tx.run(statement)
+        const stablePartBackfill = yield* tx.get<{ name: string }>(sql`
+          SELECT name FROM online_reclaim_stable_backfill WHERE name = ${stableBackfillNames[2]}
+        `)
         for (const index of OnlineReclaimIndexes.definitions.filter((item) => {
           if (item.table === "online_reclaim_cross_session_part") return !crossHasRows
           if (item.table === "online_reclaim_queue_alias_scope") return !aliasesHaveRows
@@ -469,18 +471,27 @@ function installMissing(db: Database, initiallyComplete: boolean) {
             ${stableBackfillNames[1]}, '', '', 0, '', '', 0, ${initiallyComplete ? 1 : 0}
           )
         `)
-        if (!scopeTable && !initiallyComplete)
+        yield* tx.run(sql`
+          INSERT OR IGNORE INTO online_reclaim_stable_backfill (
+            name, cursor, cursor_secondary, cursor_started,
+            high_water, high_water_secondary, high_water_present, complete
+          ) VALUES (
+            ${stableBackfillNames[2]}, '', '', 0, '', '', 0, ${initiallyComplete ? 1 : 0}
+          )
+        `)
+        if ((!scopeTable || !stablePartBackfill) && !initiallyComplete) {
+          yield* tx.run(sql`
+            UPDATE online_reclaim_stable_backfill
+            SET cursor = '', cursor_secondary = '', cursor_started = 0,
+                high_water = '', high_water_secondary = '', high_water_present = 0, complete = 0
+            WHERE name = ${stableBackfillNames[2]}
+          `)
           yield* tx.run(sql`
             UPDATE online_reclaim_backfill
             SET cursor = 0, high_water = -1, complete = 0
-            WHERE name = 'cross-session-part-scope'
+            WHERE name IN ('cross-session-part-scope', 'cross-session-parts')
           `)
-        if (!scopeTable && !initiallyComplete)
-          yield* tx.run(sql`
-            UPDATE online_reclaim_backfill
-            SET cursor = 0, high_water = -1, complete = 0
-            WHERE name = 'cross-session-parts'
-          `)
+        }
         if (!aliasTable && !initiallyComplete)
           yield* tx.run(sql`
             UPDATE online_reclaim_backfill

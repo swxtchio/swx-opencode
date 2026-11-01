@@ -642,9 +642,12 @@ function prepareCrossSessionPartProof(db: SqliteAccess, budget: OnlineProofBudge
   while (true) {
     const state = db
       .query<
-        { cursor: number; high_water: number; complete: number },
+        { cursor: string; cursor_started: number; high_water: string; high_water_present: number; complete: number },
         [string]
-      >("SELECT cursor, high_water, complete FROM online_reclaim_backfill WHERE name = ?")
+      >(
+        `SELECT cursor, cursor_started, high_water, high_water_present, complete
+         FROM online_reclaim_stable_backfill WHERE name = ?`,
+      )
       .get(name)
     if (!state) return [`online-proof-backfill-state-unavailable:${name}`]
     if (state.complete === 1) return []
@@ -654,38 +657,48 @@ function prepareCrossSessionPartProof(db: SqliteAccess, budget: OnlineProofBudge
     try {
       const current = db
         .query<
-          { cursor: number; high_water: number; complete: number },
+          { cursor: string; cursor_started: number; high_water: string; high_water_present: number; complete: number },
           [string]
-        >("SELECT cursor, high_water, complete FROM online_reclaim_backfill WHERE name = ?")
+        >(
+          `SELECT cursor, cursor_started, high_water, high_water_present, complete
+           FROM online_reclaim_stable_backfill WHERE name = ?`,
+        )
         .get(name)
       if (!current) throw new Error(`online-proof-backfill-state-unavailable:${name}`)
       if (current.complete === 1) {
         db.exec("COMMIT")
         return []
       }
-      if (current.high_water < 0) {
-        const highWater = db
-          .query<{ high_water: number }, []>("SELECT coalesce(max(rowid), 0) AS high_water FROM part")
-          .get()?.high_water
-        if (highWater === undefined) throw new Error("online-proof-backfill-high-water-unavailable:part")
-        db.query("UPDATE online_reclaim_backfill SET high_water = ?, cursor = 0 WHERE name = ?").run(highWater, name)
+      if (current.high_water_present !== 1) {
+        const highWater = db.query<{ id: string }, []>("SELECT id FROM part ORDER BY id DESC LIMIT 1").get()?.id
+        db.query(
+          `UPDATE online_reclaim_stable_backfill
+           SET high_water = ?, high_water_present = 1, complete = ?
+           WHERE name = ?`,
+        ).run(highWater ?? "", highWater === undefined ? 1 : 0, name)
         db.query(
           `UPDATE online_reclaim_backfill
-           SET high_water = ?, cursor = 0
-           WHERE name = 'cross-session-parts' AND complete = 0`,
-        ).run(highWater)
+           SET cursor = 0, high_water = -1, complete = ?
+           WHERE name IN ('cross-session-part-scope', 'cross-session-parts')`,
+        ).run(highWater === undefined ? 1 : 0)
         db.exec("COMMIT")
         budget.remaining -= 1
         budget.batches += 1
+        if (highWater === undefined) return []
         continue
       }
 
+      const after = current.cursor_started === 1 ? "id > ? AND id <= ?" : "id <= ?"
+      const params: SQLQueryBindings[] =
+        current.cursor_started === 1
+          ? [current.cursor, current.high_water, onlineBounds.proofRows]
+          : [current.high_water, onlineBounds.proofRows]
       const rows = db
-        .query<{ rowid: number; id: string; message_id: string; session_id: string }, [number, number, number]>(
-          `SELECT rowid, id, message_id, session_id FROM part
-           WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`,
+        .query<{ id: string; message_id: string; session_id: string }, SQLQueryBindings[]>(
+          `SELECT id, message_id, session_id FROM part
+           WHERE ${after} ORDER BY id LIMIT ?`,
         )
-        .all(current.cursor, current.high_water, onlineBounds.proofRows)
+        .all(...params)
       const legacyUpsert = db.query(
         `INSERT INTO online_reclaim_cross_session_part (part_id, message_id, parent_session_id, child_session_id)
          VALUES (?, ?, ?, ?)
@@ -737,18 +750,18 @@ function prepareCrossSessionPartProof(db: SqliteAccess, budget: OnlineProofBudge
         messageUpsert.run(row.message_id, row.session_id, row.id, parent.session_id)
       }
 
-      const cursor = rows.at(-1)?.rowid ?? current.high_water
-      const complete = rows.length === 0 || cursor >= current.high_water
-      db.query("UPDATE online_reclaim_backfill SET cursor = ?, complete = ? WHERE name = ?").run(
-        cursor,
-        complete ? 1 : 0,
-        name,
-      )
+      const cursor = rows.at(-1)?.id ?? current.cursor
+      const complete = rows.length < onlineBounds.proofRows
       db.query(
-        `UPDATE online_reclaim_backfill
-         SET cursor = ?, high_water = ?, complete = ?
-         WHERE name = 'cross-session-parts' AND complete = 0`,
-      ).run(cursor, current.high_water, complete ? 1 : 0)
+        `UPDATE online_reclaim_stable_backfill
+         SET cursor = ?, cursor_started = ?, complete = ?
+         WHERE name = ?`,
+      ).run(cursor, rows.length > 0 ? 1 : current.cursor_started, complete ? 1 : 0, name)
+      if (complete)
+        db.query(
+          `UPDATE online_reclaim_backfill SET complete = 1
+           WHERE name IN ('cross-session-part-scope', 'cross-session-parts')`,
+        ).run()
       db.exec("COMMIT")
       budget.remaining -= 1
       budget.batches += 1
@@ -1668,7 +1681,7 @@ function onlineHasRows(db: SqliteAccess, table: string, scope: string, sessionID
 function onlineReclaimBackfillFailures(db: SqliteAccess) {
   try {
     const crossPartScope = db
-      .query<{ complete: number }, [string]>("SELECT complete FROM online_reclaim_backfill WHERE name = ?")
+      .query<{ complete: number }, [string]>("SELECT complete FROM online_reclaim_stable_backfill WHERE name = ?")
       .get("cross-session-part-scope")
     const aliasOwner = db
       .query<{ complete: number }, [string]>("SELECT complete FROM online_reclaim_stable_backfill WHERE name = ?")

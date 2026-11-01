@@ -1137,7 +1137,7 @@ test.serial(
     UPDATE online_reclaim_stable_backfill
     SET cursor = '', cursor_secondary = '', cursor_started = 0,
         high_water = '', high_water_secondary = '', high_water_present = 0, complete = 0
-    WHERE name IN ('queue-alias-owners', 'event-writer-lifetimes');
+    WHERE name IN ('cross-session-part-scope', 'queue-alias-owners', 'event-writer-lifetimes');
   `)
     db.close()
 
@@ -1886,7 +1886,7 @@ test("online prune does not authorize an unselected descendant", async () => {
   expect(ownedCounts(store.filename, childID)).toEqual(childBefore)
 })
 
-test("online inventory backfills and refuses historical cross-session Parts before deleting", async () => {
+test("online inventory resumes the stable Part-ID proof after source rowids move", async () => {
   await using store = await producedStore([{ payloadBytes: 512 * 1024 }, { payloadBytes: 512 * 1024 }])
   const parent = produce(store, { create: { payloadBytes: 512 * 1024 } })
   const other = produce(store, { create: { payloadBytes: 512 * 1024 } })
@@ -1905,6 +1905,18 @@ test("online inventory backfills and refuses historical cross-session Parts befo
     .query<{ id: string }, [string, string]>("SELECT id FROM part WHERE message_id = ? AND session_id = ?")
     .get(parent.created[0]!.messageID, otherID)?.id
   if (!crossPartID) throw new Error("cross-Session Part fixture was not recorded")
+  const previousPart = prepare
+    .query<{ id: string }, [string]>("SELECT id FROM part WHERE id < ? ORDER BY id DESC LIMIT 1")
+    .get(crossPartID)
+  const partHighWater = prepare.query<{ id: string }, []>("SELECT id FROM part ORDER BY id DESC LIMIT 1").get()?.id
+  const previousRowid = previousPart
+    ? prepare.query<{ rowid: number }, [string]>("SELECT rowid FROM part WHERE id = ?").get(previousPart.id)?.rowid
+    : undefined
+  const rowidHighWater = prepare
+    .query<{ high_water: number }, []>("SELECT coalesce(max(rowid), 0) AS high_water FROM part")
+    .get()?.high_water
+  if (!previousPart || !partHighWater || previousRowid === undefined || rowidHighWater === undefined)
+    throw new Error("cross-Session Part cursor fixture was not recorded")
   prepare
     .query("DELETE FROM online_reclaim_cross_session_part WHERE message_id = ? AND child_session_id = ?")
     .run(parent.created[0]!.messageID, otherID)
@@ -1913,10 +1925,23 @@ test("online inventory backfills and refuses historical cross-session Parts befo
   prepare
     .query(
       `UPDATE online_reclaim_backfill
-       SET cursor = 0, high_water = -1, complete = 0
+       SET cursor = ?, high_water = ?, complete = 0
+       WHERE name IN ('cross-session-part-scope', 'cross-session-parts')`,
+    )
+    .run(previousRowid, rowidHighWater)
+  prepare
+    .query(
+      `UPDATE online_reclaim_stable_backfill
+       SET cursor = ?, cursor_secondary = '', cursor_started = 1,
+           high_water = ?, high_water_secondary = '', high_water_present = 1, complete = 0
        WHERE name = 'cross-session-part-scope'`,
     )
-    .run()
+    .run(previousPart.id, partHighWater)
+  const movedRowid = rowidHighWater + 1
+  prepare.query("UPDATE part SET rowid = ? WHERE id = ?").run(movedRowid, crossPartID)
+  expect(
+    prepare.query<{ rowid: number }, [string]>("SELECT rowid FROM part WHERE id = ?").get(crossPartID)?.rowid,
+  ).toBe(movedRowid)
   prepare.close()
 
   const pending = parseReport(
