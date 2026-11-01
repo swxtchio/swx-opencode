@@ -317,6 +317,31 @@ export const make = Effect.gen(function* () {
     })
   }
 
+  const groupAlive = (pid: number) => {
+    if (globalThis.process.platform === "win32") return false
+    try {
+      globalThis.process.kill(-pid, 0)
+      return true
+    } catch (err) {
+      return !(err instanceof globalThis.Error && "code" in err && err.code === "ESRCH")
+    }
+  }
+
+  // A command leader may close on TERM while a resistant descendant keeps its process group alive.
+  const waitForGroup = Effect.fnUntraced(function* (pid: number) {
+    yield* Effect.callback<void>((resume) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const check = () => {
+        if (!groupAlive(pid)) return resume(Effect.void)
+        timer = globalThis.setTimeout(check, 20)
+      }
+      check()
+      return Effect.sync(() => {
+        if (timer) globalThis.clearTimeout(timer)
+      })
+    })
+  })
+
   const killOne = (
     command: ChildProcess.StandardCommand,
     proc: NodeChildProcess.ChildProcess,
@@ -389,8 +414,23 @@ export const make = Effect.gen(function* () {
               const done = yield* Deferred.isDone(signal)
               const kill = timeout(proc, command, command.options)
               if (done) {
-                const [code] = yield* Deferred.await(signal)
+                const [code, exitSignal] = yield* Deferred.await(signal)
                 if (process.platform === "win32") return yield* Effect.void
+                if (Predicate.isNull(code) && Predicate.isNotNull(exitSignal)) {
+                  const send = (s: NodeJS.Signals) =>
+                    Effect.catch(killGroup(command, proc, s), () => Effect.void)
+                  const attempt = send(command.options.killSignal ?? "SIGTERM").pipe(
+                    Effect.andThen(waitForGroup(proc.pid!)),
+                    Effect.asVoid,
+                  )
+                  const escalated = command.options.forceKillAfter
+                    ? Effect.timeoutOrElse(attempt, {
+                        duration: command.options.forceKillAfter,
+                        orElse: () => send("SIGKILL").pipe(Effect.andThen(waitForGroup(proc.pid!)), Effect.asVoid),
+                      })
+                    : attempt
+                  return yield* Effect.ignore(escalated)
+                }
                 if (code !== 0 && Predicate.isNotNull(code)) return yield* Effect.ignore(kill(killGroup))
                 return yield* Effect.void
               }
@@ -405,13 +445,19 @@ export const make = Effect.gen(function* () {
               const detach = Effect.sync(() => proc.stdio.forEach((stream) => stream?.destroy()))
               const attempt = send(sig).pipe(
                 Effect.andThen(detach),
+                Effect.andThen(waitForGroup(proc.pid!)),
                 Effect.andThen(Deferred.await(signal)),
                 Effect.asVoid,
               )
               const escalated = command.options.forceKillAfter
                 ? Effect.timeoutOrElse(attempt, {
                     duration: command.options.forceKillAfter,
-                    orElse: () => send("SIGKILL").pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid),
+                    orElse: () =>
+                      send("SIGKILL").pipe(
+                        Effect.andThen(waitForGroup(proc.pid!)),
+                        Effect.andThen(Deferred.await(signal)),
+                        Effect.asVoid,
+                      ),
                   })
                 : attempt
               return yield* Effect.ignore(escalated)
@@ -444,11 +490,20 @@ export const make = Effect.gen(function* () {
               const sig = opts?.killSignal ?? "SIGTERM"
               const send = (s: NodeJS.Signals) =>
                 Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
-              const attempt = send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
+              const attempt = send(sig).pipe(
+                Effect.andThen(waitForGroup(proc.pid!)),
+                Effect.andThen(Deferred.await(signal)),
+                Effect.asVoid,
+              )
               if (!opts?.forceKillAfter) return attempt
               return Effect.timeoutOrElse(attempt, {
                 duration: opts.forceKillAfter,
-                orElse: () => send("SIGKILL").pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid),
+                orElse: () =>
+                  send("SIGKILL").pipe(
+                    Effect.andThen(waitForGroup(proc.pid!)),
+                    Effect.andThen(Deferred.await(signal)),
+                    Effect.asVoid,
+                  ),
               })
             },
             unref: Effect.sync(() => {
