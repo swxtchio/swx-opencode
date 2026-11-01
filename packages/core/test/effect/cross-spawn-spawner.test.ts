@@ -92,6 +92,15 @@ function sameProcess(identity: EventWriter.ProcessIdentity) {
   return current?.bootID === identity.bootID && current?.startTicks === identity.startTicks
 }
 
+async function processExited(identity: EventWriter.ProcessIdentity, timeout = 5_000) {
+  const end = Date.now() + timeout
+  while (Date.now() < end) {
+    if (!sameProcess(identity)) return true
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  return !sameProcess(identity)
+}
+
 type RecordedProcessGroup = {
   pgid: number | undefined
   members: EventWriter.ProcessIdentity[]
@@ -204,8 +213,8 @@ const processTreeSource = (child: string, onTerm?: string) =>
     "setInterval(() => {}, 10_000)",
   ].join(";\n")
 
-const termExitingParent = (child: string) =>
-  processTreeSource(child, 'process.on("SIGTERM", () => process.exit(0))')
+const termExitingParent = (child: string, exitCode = 0) =>
+  processTreeSource(child, `process.on("SIGTERM", () => process.exit(${exitCode}))`)
 
 const timeoutProbeMode = process.env.SWX_CORE_SPAWNER_TIMEOUT_PROBE === "1"
 const timeoutProbeFile = process.env.SWX_CORE_SPAWNER_TIMEOUT_FILE
@@ -825,6 +834,48 @@ describe("cross-spawn spawner", () => {
           owned: owned.map(sameProcess),
         }).toEqual({ groupAlive: false, owned: [false, false] })
       }),
+    )
+
+    fx.live(
+      "scope release preserves a requested kill after leader exit and kill-fiber interruption",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const run = Effect.fnUntraced(function* (exitCode: number) {
+          const group: RecordedProcessGroup = { pgid: undefined, members: [] }
+          yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(group))
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const handle = yield* js(termExitingParent(resistantDescendant, exitCode))
+              group.pgid = Number(handle.pid)
+              const leader = processIdentity(group.pgid)
+              if (!leader?.bootID || !leader.startTicks)
+                throw new Error("spawned leader has no recorded start identity")
+              group.members.push(leader)
+              recordProcess(group.pgid, leader)
+              const descendant = processIdentity(yield* processTreeReady(handle))
+              if (!descendant?.bootID || !descendant.startTicks)
+                throw new Error("spawned descendant has no recorded start identity")
+              group.members.push(descendant)
+              recordProcess(group.pgid, descendant)
+
+              const killing = yield* handle.kill({ forceKillAfter: "2 seconds" }).pipe(Effect.forkChild)
+              expect(yield* Effect.promise(() => processExited(leader))).toBe(true)
+              expect(sameProcess(descendant)).toBe(true)
+              const interrupted = yield* Fiber.interrupt(killing).pipe(Effect.timeoutOption("1 second"))
+              expect(Option.isSome(interrupted)).toBe(true)
+            }),
+          )
+
+          expect(group.pgid === undefined ? false : groupAlive(group.pgid)).toBe(false)
+          expect(group.members.every((member) => !sameProcess(member))).toBe(true)
+        })
+
+        const zero = yield* Effect.exit(run(0))
+        const nonzero = yield* Effect.exit(run(17))
+        expect({ zero: Exit.isSuccess(zero), nonzero: Exit.isSuccess(nonzero) }).toEqual({ zero: true, nonzero: true })
+      }),
+      20_000,
     )
 
     fx.effect(
