@@ -207,6 +207,9 @@ const processTreeSource = (child: string, onTerm?: string) =>
 const termExitingParent = (child: string) =>
   processTreeSource(child, 'process.on("SIGTERM", () => process.exit(0))')
 
+const timeoutProbeMode = process.env.SWX_CORE_SPAWNER_TIMEOUT_PROBE === "1"
+const timeoutProbeFile = process.env.SWX_CORE_SPAWNER_TIMEOUT_FILE
+
 const processTreeReady = (handle: ChildProcessHandle) =>
   Effect.gen(function* () {
     const ready = yield* Deferred.make<number>()
@@ -597,6 +600,93 @@ describe("cross-spawn spawner", () => {
         })
         yield* Effect.all([run(0), run("0 millis")], { concurrency: 1 })
       }),
+    )
+
+    fx.live(
+      "Bun timeout boundary fixture worker",
+      Effect.gen(function* () {
+        if (!timeoutProbeMode || process.platform === "win32") return
+        if (!timeoutProbeFile) throw new Error("timeout probe file path was not supplied")
+
+        const handle = yield* js(termExitingParent(resistantDescendant))
+        const pgid = Number(handle.pid)
+        const leader = processIdentity(pgid)
+        if (!leader?.bootID || !leader.startTicks) throw new Error("timeout worker leader has no start identity")
+        recordProcess(pgid, leader)
+        const descendant = processIdentity(yield* processTreeReady(handle))
+        if (!descendant?.bootID || !descendant.startTicks) throw new Error("timeout worker child has no start identity")
+        recordProcess(pgid, descendant)
+        if (!sameProcess(leader) || !sameProcess(descendant)) throw new Error("timeout worker fixture was not live")
+        yield* Effect.promise(() => Bun.write(timeoutProbeFile, JSON.stringify({ pgid, members: [leader, descendant] })))
+        yield* Effect.never
+      }),
+      5_000,
+    )
+
+    fx.live(
+      "Bun test timeout cleans a TERM-resistant descendant",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const file = `${process.cwd()}/.cross-spawn-timeout-probe.json`
+        yield* Effect.promise(() => fs.rm(file, { force: true }))
+        yield* Effect.addFinalizer(() => Effect.promise(() => fs.rm(file, { force: true })).pipe(Effect.asVoid))
+        const worker = Bun.spawn(
+          [
+            process.execPath,
+            "test",
+            "--timeout",
+            "15000",
+            "./test/effect/cross-spawn-spawner.test.ts",
+            "-t",
+            "Bun timeout boundary fixture worker",
+          ],
+          {
+            cwd: process.cwd(),
+            env: {
+              ...process.env,
+              SWX_CORE_SPAWNER_TIMEOUT_PROBE: "1",
+              SWX_CORE_SPAWNER_TIMEOUT_FILE: file,
+            },
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "pipe",
+          },
+        )
+        const workerIdentity = processIdentity(worker.pid)
+        if (!workerIdentity?.bootID || !workerIdentity.startTicks) throw new Error("timeout worker has no start identity")
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            if (!sameProcess(workerIdentity)) return
+            try {
+              process.kill(worker.pid, "SIGKILL")
+            } catch {}
+          }),
+        )
+        const output = Promise.all([new Response(worker.stdout).text(), new Response(worker.stderr).text()])
+        const probe = yield* Effect.promise(async () => {
+          const deadline = Date.now() + 10_000
+          while (Date.now() < deadline) {
+            if (await Bun.file(file).exists())
+              return (await Bun.file(file).json()) as { pgid: number; members: EventWriter.ProcessIdentity[] }
+            await new Promise((resolve) => setTimeout(resolve, 20))
+          }
+        })
+        if (!probe) throw new Error("timeout worker did not publish its ready process identities")
+        for (const member of probe.members) recordProcess(probe.pgid, member)
+        yield* Effect.addFinalizer(() =>
+          cleanupRecordedProcessGroup({ pgid: probe.pgid, members: probe.members }),
+        )
+        expect(probe.members.every(sameProcess)).toBe(true)
+
+        const exitCode = yield* Effect.promise(() => worker.exited).pipe(Effect.timeout("12 seconds"))
+        const outputText = (yield* Effect.promise(() => output)).join("\n")
+        expect(exitCode).not.toBe(0)
+        expect(outputText).toContain("timed out after")
+        expect(groupAlive(probe.pgid)).toBe(false)
+        expect(probe.members.every((member) => !sameProcess(member))).toBe(true)
+      }),
+      20_000,
     )
 
     fx.live(
