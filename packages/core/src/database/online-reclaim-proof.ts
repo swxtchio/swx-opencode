@@ -112,8 +112,15 @@ export const triggerStatements = [
   AFTER UPDATE OF "id", "message_id", "session_id" ON "part"
   BEGIN
     DELETE FROM "online_reclaim_cross_session_part" WHERE "part_id" = OLD."id";
-    DELETE FROM "online_reclaim_cross_part_scope" WHERE "part_id" = OLD."id";
-    DELETE FROM "online_reclaim_cross_part_message" WHERE "part_id" = OLD."id";
+    DELETE FROM "online_reclaim_cross_part_scope"
+    WHERE "session_id" = (
+      SELECT "parent_session_id" FROM "online_reclaim_cross_part_scope"
+      WHERE "session_id" = OLD."session_id" AND "part_id" = OLD."id" AND "role" IN ('owned', 'child')
+    ) AND "part_id" = OLD."id" AND "role" = 'parent';
+    DELETE FROM "online_reclaim_cross_part_scope"
+    WHERE "session_id" = OLD."session_id" AND "part_id" = OLD."id" AND "role" IN ('owned', 'child');
+    DELETE FROM "online_reclaim_cross_part_message"
+    WHERE "message_id" = OLD."message_id" AND "child_session_id" = OLD."session_id" AND "part_id" = OLD."id";
     INSERT INTO "online_reclaim_cross_session_part" ("part_id", "message_id", "parent_session_id", "child_session_id")
     SELECT NEW."id", NEW."message_id", message."session_id", NEW."session_id"
     FROM "message" message
@@ -158,16 +165,30 @@ export const triggerStatements = [
   AFTER DELETE ON "part"
   BEGIN
     DELETE FROM "online_reclaim_cross_session_part" WHERE "part_id" = OLD."id";
-    DELETE FROM "online_reclaim_cross_part_scope" WHERE "part_id" = OLD."id";
-    DELETE FROM "online_reclaim_cross_part_message" WHERE "part_id" = OLD."id";
+    DELETE FROM "online_reclaim_cross_part_scope"
+    WHERE "session_id" = (
+      SELECT "parent_session_id" FROM "online_reclaim_cross_part_scope"
+      WHERE "session_id" = OLD."session_id" AND "part_id" = OLD."id" AND "role" IN ('owned', 'child')
+    ) AND "part_id" = OLD."id" AND "role" = 'parent';
+    DELETE FROM "online_reclaim_cross_part_scope"
+    WHERE "session_id" = OLD."session_id" AND "part_id" = OLD."id" AND "role" IN ('owned', 'child');
+    DELETE FROM "online_reclaim_cross_part_message"
+    WHERE "message_id" = OLD."message_id" AND "child_session_id" = OLD."session_id" AND "part_id" = OLD."id";
   END`,
   `CREATE TRIGGER IF NOT EXISTS "online_reclaim_message_cross_update"
   AFTER UPDATE OF "session_id" ON "message"
   WHEN NEW."session_id" <> OLD."session_id"
   BEGIN
-    DELETE FROM "online_reclaim_cross_session_part" WHERE "message_id" = NEW."id";
+    DELETE FROM "online_reclaim_cross_session_part"
+    WHERE "part_id" IN (
+      SELECT "id" FROM "part" INDEXED BY "part_message_id_id_idx" WHERE "message_id" = NEW."id"
+    );
     DELETE FROM "online_reclaim_cross_part_scope"
-    WHERE "part_id" IN (SELECT "id" FROM "part" WHERE "message_id" = NEW."id");
+    WHERE "session_id" = OLD."session_id" AND "role" = 'parent'
+      AND "part_id" IN (
+        SELECT "id" FROM "part" INDEXED BY "part_message_id_session_idx"
+        WHERE "message_id" = NEW."id" AND "session_id" <> OLD."session_id"
+      );
     DELETE FROM "online_reclaim_cross_part_message" WHERE "message_id" = NEW."id";
     INSERT INTO "online_reclaim_cross_session_part" (
       "part_id", "message_id", "parent_session_id", "child_session_id"

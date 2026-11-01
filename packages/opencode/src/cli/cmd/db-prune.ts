@@ -620,10 +620,23 @@ type OnlineProofBudget = { remaining: number; batches: number; rows: number }
 
 const onlineReclaimMethod = "PRAGMA incremental_vacuum(N) with PRAGMA wal_checkpoint(PASSIVE)"
 
-function prepareOnlineProofs(db: SqliteAccess): OnlineProofPreparation {
+async function onlineProofCapacityReason(db: SqliteAccess, filename: string, reserveBytes: number, rows: number) {
+  const state = onlinePageState(db)
+  const available = await onlineAvailableBytes(filename)
+  if (!state) return "database-page-measurement-unavailable"
+  if (available === undefined) return "free-space-measurement-unavailable"
+  if (available < reserveBytes + onlineDeletePeakBytes(Math.max(rows, 1), 0, state.pageSize))
+    return "free-space-reserve-would-be-violated"
+}
+
+async function prepareOnlineProofs(
+  db: SqliteAccess,
+  filename: string,
+  reserveBytes: number,
+): Promise<OnlineProofPreparation> {
   const budget: OnlineProofBudget = { remaining: onlineBounds.proofBatches, batches: 0, rows: 0 }
   for (const prepare of [prepareCrossSessionPartProof, prepareQueueAliasOwnerProof, prepareOnlineWriterLifetimeProof]) {
-    const remaining = prepare(db, budget)
+    const remaining = await prepare(db, budget, filename, reserveBytes)
     if (remaining.length > 0) {
       return {
         complete: false,
@@ -637,7 +650,12 @@ function prepareOnlineProofs(db: SqliteAccess): OnlineProofPreparation {
   return { complete: remaining.length === 0, batches: budget.batches, rows: budget.rows, remaining }
 }
 
-function prepareCrossSessionPartProof(db: SqliteAccess, budget: OnlineProofBudget) {
+async function prepareCrossSessionPartProof(
+  db: SqliteAccess,
+  budget: OnlineProofBudget,
+  filename: string,
+  reserveBytes: number,
+) {
   const name = "cross-session-part-scope"
   while (true) {
     const state = db
@@ -671,6 +689,11 @@ function prepareCrossSessionPartProof(db: SqliteAccess, budget: OnlineProofBudge
       }
       if (current.high_water_present !== 1) {
         const highWater = db.query<{ id: string }, []>("SELECT id FROM part ORDER BY id DESC LIMIT 1").get()?.id
+        const capacityReason = await onlineProofCapacityReason(db, filename, reserveBytes, 1)
+        if (capacityReason) {
+          db.exec("ROLLBACK")
+          return [capacityReason]
+        }
         db.query(
           `UPDATE online_reclaim_stable_backfill
            SET high_water = ?, high_water_present = 1, complete = ?
@@ -699,6 +722,11 @@ function prepareCrossSessionPartProof(db: SqliteAccess, budget: OnlineProofBudge
            WHERE ${after} ORDER BY id LIMIT ?`,
         )
         .all(...params)
+      const capacityReason = await onlineProofCapacityReason(db, filename, reserveBytes, rows.length)
+      if (capacityReason) {
+        db.exec("ROLLBACK")
+        return [capacityReason]
+      }
       const legacyUpsert = db.query(
         `INSERT INTO online_reclaim_cross_session_part (part_id, message_id, parent_session_id, child_session_id)
          VALUES (?, ?, ?, ?)
@@ -708,8 +736,18 @@ function prepareCrossSessionPartProof(db: SqliteAccess, budget: OnlineProofBudge
            child_session_id = excluded.child_session_id`,
       )
       const legacyRemove = db.query("DELETE FROM online_reclaim_cross_session_part WHERE part_id = ?")
-      const removeScope = db.query("DELETE FROM online_reclaim_cross_part_scope WHERE part_id = ?")
-      const removeMessage = db.query("DELETE FROM online_reclaim_cross_part_message WHERE part_id = ?")
+      const removeScopeOwner = db.query(
+        `DELETE FROM online_reclaim_cross_part_scope
+         WHERE session_id = ? AND part_id = ? AND role IN ('owned', 'child')`,
+      )
+      const removeScopeParent = db.query(
+        `DELETE FROM online_reclaim_cross_part_scope
+         WHERE session_id = ? AND part_id = ? AND role = 'parent'`,
+      )
+      const removeMessage = db.query(
+        `DELETE FROM online_reclaim_cross_part_message
+         WHERE message_id = ? AND child_session_id = ? AND part_id = ?`,
+      )
       const scopeUpsert = db.query(
         `INSERT INTO online_reclaim_cross_part_scope (
            session_id, part_id, message_id, parent_session_id, child_session_id, role
@@ -731,8 +769,9 @@ function prepareCrossSessionPartProof(db: SqliteAccess, budget: OnlineProofBudge
           .query<{ session_id: string }, [string]>("SELECT session_id FROM message WHERE id = ?")
           .get(row.message_id)
         if (!parent) throw new Error(`online-proof-backfill-message-missing:${row.message_id}`)
-        removeScope.run(row.id)
-        removeMessage.run(row.id)
+        removeScopeOwner.run(row.session_id, row.id)
+        if (parent.session_id !== row.session_id) removeScopeParent.run(parent.session_id, row.id)
+        removeMessage.run(row.message_id, row.session_id, row.id)
         scopeUpsert.run(
           row.session_id,
           row.id,
@@ -774,7 +813,12 @@ function prepareCrossSessionPartProof(db: SqliteAccess, budget: OnlineProofBudge
   }
 }
 
-function prepareQueueAliasOwnerProof(db: SqliteAccess, budget: OnlineProofBudget) {
+async function prepareQueueAliasOwnerProof(
+  db: SqliteAccess,
+  budget: OnlineProofBudget,
+  filename: string,
+  reserveBytes: number,
+) {
   const name = "queue-alias-owners"
   while (true) {
     const state = db
@@ -831,6 +875,11 @@ function prepareQueueAliasOwnerProof(db: SqliteAccess, budget: OnlineProofBudget
             []
           >("SELECT id, item_id FROM session_prompt_queue_alias ORDER BY id DESC, item_id DESC LIMIT 1")
           .get()
+        const capacityReason = await onlineProofCapacityReason(db, filename, reserveBytes, 1)
+        if (capacityReason) {
+          db.exec("ROLLBACK")
+          return [capacityReason]
+        }
         db.query(
           `UPDATE online_reclaim_stable_backfill
            SET high_water = ?, high_water_secondary = ?, high_water_present = 1, complete = ?
@@ -866,6 +915,11 @@ function prepareQueueAliasOwnerProof(db: SqliteAccess, budget: OnlineProofBudget
            WHERE ${after} ORDER BY id, item_id LIMIT ?`,
         )
         .all(...params)
+      const capacityReason = await onlineProofCapacityReason(db, filename, reserveBytes, rows.length)
+      if (capacityReason) {
+        db.exec("ROLLBACK")
+        return [capacityReason]
+      }
       const ownerUpsert = db.query(
         `INSERT INTO online_reclaim_queue_alias_owner (item_id, alias_id, owner_session_id)
          VALUES (?, ?, ?)
@@ -919,7 +973,12 @@ function prepareQueueAliasOwnerProof(db: SqliteAccess, budget: OnlineProofBudget
   }
 }
 
-function prepareOnlineWriterLifetimeProof(db: SqliteAccess, budget: OnlineProofBudget) {
+async function prepareOnlineWriterLifetimeProof(
+  db: SqliteAccess,
+  budget: OnlineProofBudget,
+  filename: string,
+  reserveBytes: number,
+) {
   const name = "event-writer-lifetimes"
   while (true) {
     const state = db
@@ -971,6 +1030,11 @@ function prepareOnlineWriterLifetimeProof(db: SqliteAccess, budget: OnlineProofB
             []
           >("SELECT writer_id FROM event_writer_process ORDER BY writer_id DESC LIMIT 1")
           .get()?.writer_id
+        const capacityReason = await onlineProofCapacityReason(db, filename, reserveBytes, 1)
+        if (capacityReason) {
+          db.exec("ROLLBACK")
+          return [capacityReason]
+        }
         db.query(
           `UPDATE online_reclaim_stable_backfill
            SET high_water = ?, high_water_present = 1, complete = ?
@@ -1000,6 +1064,11 @@ function prepareOnlineWriterLifetimeProof(db: SqliteAccess, budget: OnlineProofB
            LIMIT ?`,
         )
         .all(...params)
+      const capacityReason = await onlineProofCapacityReason(db, filename, reserveBytes, rows.length)
+      if (capacityReason) {
+        db.exec("ROLLBACK")
+        return [capacityReason]
+      }
       const insert = db.query(
         `INSERT INTO online_reclaim_writer_lifetime (pid, boot_id, start_ticks)
          VALUES (?, ?, ?)
@@ -1069,7 +1138,21 @@ async function applyOnlinePrune(
     }
     db = new sqlite.Database(resolved.filename, args.apply ? { readwrite: true, create: false } : { readonly: true })
     db.exec(`PRAGMA busy_timeout = ${onlineBounds.busyTimeout}; PRAGMA foreign_keys = ON`)
-    const proofPreparation = args.apply && !args.reclaimOnly ? prepareOnlineProofs(db) : undefined
+    const proofPreflight =
+      args.apply && !args.reclaimOnly
+        ? await onlineInventorySnapshot(db, resolved.filename, requested!, cutoff, options.value, usage)
+        : undefined
+    if (proofPreflight) {
+      // An incomplete writer-lifetime map can temporarily report a live holder as unregistered; preparation completes that evidence.
+      const proofGateReasons = proofPreflight.reclamation.reasons.filter(
+        (reason) => !reason.startsWith("online-proof-backfill-") && !reason.startsWith("unregistered-database-holder:"),
+      )
+      if (proofGateReasons.length > 0) return { ...proofPreflight, action: "refused" }
+    }
+    const proofPreparation =
+      args.apply && !args.reclaimOnly
+        ? await prepareOnlineProofs(db, resolved.filename, options.value.reserveBytes!)
+        : undefined
     if (proofPreparation && !proofPreparation.complete)
       return {
         ...onlineRefusedReport(filename, cutoff, requested, usage, proofPreparation.remaining),
@@ -1077,7 +1160,10 @@ async function applyOnlinePrune(
       }
     if (args.reclaimOnly) return await onlineReclaimOnly(db, resolved.filename, options.value, usage)
 
-    const inventory = await onlineInventorySnapshot(db, resolved.filename, requested!, cutoff, options.value, usage)
+    const inventory =
+      proofPreflight && proofPreparation?.complete && proofPreparation.batches === 0
+        ? proofPreflight
+        : await onlineInventorySnapshot(db, resolved.filename, requested!, cutoff, options.value, usage)
     if (!args.apply) return inventory
     const preparedInventory = proofPreparation ? { ...inventory, proofPreparation } : inventory
     if (!preparedInventory.reclamation.ready)
@@ -1618,9 +1704,28 @@ function onlineCommitDeletePlan(db: SqliteAccess, sessionID: string, plan: Retur
     const expected = item.rowids.length + item.partIDs.length + item.aliasKeys.length
     if (item.table === "part") {
       for (const partID of item.partIDs) {
+        const owner = db
+          .query<{ message_id: string; parent_session_id: string; child_session_id: string }, [string, string]>(
+            `SELECT message_id, parent_session_id, child_session_id
+             FROM online_reclaim_cross_part_scope
+             WHERE session_id = ? AND part_id = ? AND role IN ('owned', 'child')`,
+          )
+          .get(sessionID, partID)
+        if (!owner) throw new Error(`online-part-owner-proof-missing:${sessionID}:${partID}`)
         db.query("DELETE FROM online_reclaim_cross_session_part WHERE part_id = ?").run(partID)
-        db.query("DELETE FROM online_reclaim_cross_part_scope WHERE part_id = ?").run(partID)
-        db.query("DELETE FROM online_reclaim_cross_part_message WHERE part_id = ?").run(partID)
+        db.query(
+          `DELETE FROM online_reclaim_cross_part_scope
+           WHERE session_id = ? AND part_id = ? AND role IN ('owned', 'child')`,
+        ).run(sessionID, partID)
+        if (owner.parent_session_id !== sessionID)
+          db.query(
+            `DELETE FROM online_reclaim_cross_part_scope
+             WHERE session_id = ? AND part_id = ? AND role = 'parent'`,
+          ).run(owner.parent_session_id, partID)
+        db.query(
+          `DELETE FROM online_reclaim_cross_part_message
+           WHERE message_id = ? AND child_session_id = ? AND part_id = ?`,
+        ).run(owner.message_id, owner.child_session_id, partID)
       }
     }
     if (item.table === "session_prompt_queue_alias") {

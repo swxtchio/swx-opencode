@@ -18,7 +18,9 @@ import {
   writeFile,
 } from "node:fs/promises"
 import path from "node:path"
-import { Effect } from "effect"
+import { Effect, Layer } from "effect"
+import { OnlineReclaimIndexes } from "@opencode-ai/core/database/online-reclaim-indexes"
+import { OnlineReclaimProof } from "@opencode-ai/core/database/online-reclaim-proof"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { EventWriter } from "@opencode-ai/core/event/writer"
 import { PruneCommand } from "@/cli/cmd/db-prune"
@@ -1189,7 +1191,7 @@ test.serial(
       return result
     })
     try {
-      const result = await invokeHandler(store, {
+      const input = {
         database: store.filename,
         online: true,
         session: [sessionID],
@@ -1197,10 +1199,18 @@ test.serial(
         reserveBytes: 1,
         batchRows: 1,
         maxBatches: 1,
-      })
+      }
+      const first = await invokeHandler(store, input)
       expect(writerSignalled).toBe(true)
       expect(writerClosed).toBe(true)
       expect(readerReady).toContain(String(reader.child.pid))
+      expect(first.report.proofPreparation?.batches).toBeGreaterThan(1)
+      const result = first.report.proofPreparation?.complete ? first : await invokeHandler(store, input)
+      if (!first.report.proofPreparation?.complete) {
+        expect(first.report.action).toBe("refused")
+        expect(first.report.changedRows).toBe(0)
+        expect(first.report.refusalReasons).toContain("online-proof-backfill-busy:cross-session-part-scope")
+      }
       const proofPreparation = result.report.proofPreparation
       expect(proofPreparation).toEqual({
         complete: true,
@@ -1294,6 +1304,72 @@ test.serial(
   },
   120_000,
 )
+
+test.serial("online apply refuses proof preparation before writes when reserve is unavailable", async () => {
+  await using store = await producedStore([{}])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  const coreDatabase = await import("@opencode-ai/core/database/database")
+  await Effect.runPromise(Effect.scoped(Layer.build(coreDatabase.Database.layerFromPath(store.filename))))
+  const db = new Database(store.filename)
+  db.exec(`
+    DELETE FROM online_reclaim_cross_session_part;
+    DELETE FROM online_reclaim_cross_part_scope;
+    DELETE FROM online_reclaim_cross_part_message;
+    DELETE FROM online_reclaim_queue_alias_scope;
+    DELETE FROM online_reclaim_queue_alias_owner;
+    UPDATE online_reclaim_backfill
+    SET cursor = 0, high_water = -1, complete = 0
+    WHERE name IN ('cross-session-part-scope', 'cross-session-parts', 'queue-alias-scope');
+    UPDATE online_reclaim_stable_backfill
+    SET cursor = '', cursor_secondary = '', cursor_started = 0,
+        high_water = '', high_water_secondary = '', high_water_present = 0, complete = 0
+    WHERE name IN ('cross-session-part-scope', 'queue-alias-owners', 'event-writer-lifetimes');
+  `)
+  const before = {
+    legacyParts: db.query("SELECT * FROM online_reclaim_cross_session_part ORDER BY part_id").all(),
+    partScopes: db.query("SELECT * FROM online_reclaim_cross_part_scope ORDER BY session_id, part_id").all(),
+    messageParts: db
+      .query("SELECT * FROM online_reclaim_cross_part_message ORDER BY message_id, child_session_id")
+      .all(),
+    aliasScopes: db.query("SELECT * FROM online_reclaim_queue_alias_scope ORDER BY alias_rowid").all(),
+    aliasOwners: db.query("SELECT * FROM online_reclaim_queue_alias_owner ORDER BY item_id, alias_id").all(),
+    writerLifetimes: db.query("SELECT * FROM online_reclaim_writer_lifetime ORDER BY pid, boot_id, start_ticks").all(),
+    backfills: db.query("SELECT * FROM online_reclaim_backfill ORDER BY name").all(),
+    stableBackfills: db.query("SELECT * FROM online_reclaim_stable_backfill ORDER BY name").all(),
+  }
+  db.close()
+  await rm(store.project, { recursive: true })
+
+  const refused = await invokeHandler(store, {
+    database: store.filename,
+    online: true,
+    session: [sessionID],
+    apply: true,
+    reserveBytes: Number.MAX_SAFE_INTEGER,
+  })
+  expect(refused.report.action).toBe("refused")
+  expect(refused.report.committed).toBe(false)
+  expect(refused.report.changedRows).toBe(0)
+  expect(refused.report.refusalReasons).toContain("free-space-reserve-would-be-violated")
+  expect(refused.report.proofPreparation).toMatchObject({ complete: false, batches: 0, rows: 0 })
+
+  const after = new Database(store.filename, { readonly: true })
+  expect({
+    legacyParts: after.query("SELECT * FROM online_reclaim_cross_session_part ORDER BY part_id").all(),
+    partScopes: after.query("SELECT * FROM online_reclaim_cross_part_scope ORDER BY session_id, part_id").all(),
+    messageParts: after
+      .query("SELECT * FROM online_reclaim_cross_part_message ORDER BY message_id, child_session_id")
+      .all(),
+    aliasScopes: after.query("SELECT * FROM online_reclaim_queue_alias_scope ORDER BY alias_rowid").all(),
+    aliasOwners: after.query("SELECT * FROM online_reclaim_queue_alias_owner ORDER BY item_id, alias_id").all(),
+    writerLifetimes: after
+      .query("SELECT * FROM online_reclaim_writer_lifetime ORDER BY pid, boot_id, start_ticks")
+      .all(),
+    backfills: after.query("SELECT * FROM online_reclaim_backfill ORDER BY name").all(),
+    stableBackfills: after.query("SELECT * FROM online_reclaim_stable_backfill ORDER BY name").all(),
+  }).toEqual(before)
+  after.close()
+})
 
 test.serial("online prune bounds alias proofs across long alias-free and alias-sparse queue histories", async () => {
   await using store = await producedStore([{}])
@@ -1892,43 +1968,53 @@ test("online inventory resumes the stable Part-ID proof after source rowids move
   const other = produce(store, { create: { payloadBytes: 512 * 1024 } })
   const parentID = parent.created[0]!.id
   const otherID = other.created[0]!.id
-  await produceLive(store, { crossPart: { sessionID: otherID, messageID: parent.created[0]!.messageID } })
   await rm(store.project, { recursive: true })
   const cutoffAt = Date.now() - 5
   const cutoff = new Date(cutoffAt).toISOString()
   backdateSession(store.filename, parentID, cutoffAt - 1_000)
   backdateSession(store.filename, otherID, cutoffAt - 1_000)
+  const prepare = new Database(store.filename)
+  prepare.exec("DELETE FROM part")
+  const partIDs = ["part-backfill-a", "part-backfill-b", "part-backfill-c"] as const
+  const partInsert = prepare.query(
+    `INSERT INTO part (rowid, id, message_id, session_id, time_created, time_updated, data)
+     VALUES (?, ?, ?, ?, 0, 0, '{}')`,
+  )
+  partInsert.run(1, partIDs[0], parent.created[0]!.messageID, otherID)
+  partInsert.run(3, partIDs[1], parent.created[0]!.messageID, otherID)
+  partInsert.run(5, partIDs[2], parent.created[0]!.messageID, otherID)
   const parentBefore = ownedCounts(store.filename, parentID)
   const otherBefore = ownedCounts(store.filename, otherID)
-  const prepare = new Database(store.filename)
-  const crossPartID = prepare
-    .query<{ id: string }, [string, string]>("SELECT id FROM part WHERE message_id = ? AND session_id = ?")
-    .get(parent.created[0]!.messageID, otherID)?.id
-  if (!crossPartID) throw new Error("cross-Session Part fixture was not recorded")
-  const previousPart = prepare
-    .query<{ id: string }, [string]>("SELECT id FROM part WHERE id < ? ORDER BY id DESC LIMIT 1")
-    .get(crossPartID)
-  const partHighWater = prepare.query<{ id: string }, []>("SELECT id FROM part ORDER BY id DESC LIMIT 1").get()?.id
-  const previousRowid = previousPart
-    ? prepare.query<{ rowid: number }, [string]>("SELECT rowid FROM part WHERE id = ?").get(previousPart.id)?.rowid
-    : undefined
-  const rowidHighWater = prepare
-    .query<{ high_water: number }, []>("SELECT coalesce(max(rowid), 0) AS high_water FROM part")
-    .get()?.high_water
-  if (!previousPart || !partHighWater || previousRowid === undefined || rowidHighWater === undefined)
-    throw new Error("cross-Session Part cursor fixture was not recorded")
+  prepare.query("DELETE FROM online_reclaim_cross_session_part WHERE part_id = ?").run(partIDs[2])
   prepare
-    .query("DELETE FROM online_reclaim_cross_session_part WHERE message_id = ? AND child_session_id = ?")
-    .run(parent.created[0]!.messageID, otherID)
-  prepare.query("DELETE FROM online_reclaim_cross_part_scope WHERE part_id = ?").run(crossPartID)
-  prepare.query("DELETE FROM online_reclaim_cross_part_message WHERE part_id = ?").run(crossPartID)
+    .query(
+      `DELETE FROM online_reclaim_cross_part_scope
+       WHERE session_id = ? AND part_id = ? AND role IN ('owned', 'child')`,
+    )
+    .run(otherID, partIDs[2])
+  prepare
+    .query(
+      `DELETE FROM online_reclaim_cross_part_scope
+       WHERE session_id = ? AND part_id = ? AND role = 'parent'`,
+    )
+    .run(parentID, partIDs[2])
+  prepare
+    .query(
+      `DELETE FROM online_reclaim_cross_part_message
+       WHERE message_id = ? AND child_session_id = ? AND part_id = ?`,
+    )
+    .run(parent.created[0]!.messageID, otherID, partIDs[2])
+  const rowidCursor = prepare
+    .query<{ rowid: number }, [string]>("SELECT rowid FROM part WHERE id = ?")
+    .get(partIDs[1])?.rowid
+  if (rowidCursor !== 3) throw new Error("Part ROWID cursor fixture did not start at 3")
   prepare
     .query(
       `UPDATE online_reclaim_backfill
-       SET cursor = ?, high_water = ?, complete = 0
+       SET cursor = 3, high_water = 5, complete = 0
        WHERE name IN ('cross-session-part-scope', 'cross-session-parts')`,
     )
-    .run(previousRowid, rowidHighWater)
+    .run()
   prepare
     .query(
       `UPDATE online_reclaim_stable_backfill
@@ -1936,12 +2022,14 @@ test("online inventory resumes the stable Part-ID proof after source rowids move
            high_water = ?, high_water_secondary = '', high_water_present = 1, complete = 0
        WHERE name = 'cross-session-part-scope'`,
     )
-    .run(previousPart.id, partHighWater)
-  const movedRowid = rowidHighWater + 1
-  prepare.query("UPDATE part SET rowid = ? WHERE id = ?").run(movedRowid, crossPartID)
-  expect(
-    prepare.query<{ rowid: number }, [string]>("SELECT rowid FROM part WHERE id = ?").get(crossPartID)?.rowid,
-  ).toBe(movedRowid)
+    .run(partIDs[1], partIDs[2])
+  prepare.exec("UPDATE part SET rowid = rowid + 100")
+  prepare.query("UPDATE part SET rowid = 1 WHERE id = ?").run(partIDs[0])
+  prepare.query("UPDATE part SET rowid = 2 WHERE id = ?").run(partIDs[1])
+  prepare.query("UPDATE part SET rowid = 3 WHERE id = ?").run(partIDs[2])
+  expect(prepare.query<{ rowid: number }, [string]>("SELECT rowid FROM part WHERE id = ?").get(partIDs[2])?.rowid).toBe(
+    3,
+  )
   prepare.close()
 
   const pending = parseReport(
@@ -1981,6 +2069,143 @@ test("online inventory resumes the stable Part-ID proof after source rowids move
   )
   expect(ownedCounts(store.filename, parentID).message).toBe(parentBefore.message)
   expect(ownedCounts(store.filename, otherID)).toEqual(otherBefore)
+})
+
+test.serial("online Part proof-map cleanup stays indexed with unrelated history", async () => {
+  await using store = await producedStore([{}])
+  const db = new Database(store.filename)
+  try {
+    const scopeInsert = db.query(
+      `INSERT INTO online_reclaim_cross_part_scope (
+         session_id, part_id, message_id, parent_session_id, child_session_id, role
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    const messageInsert = db.query(
+      `INSERT INTO online_reclaim_cross_part_message (message_id, child_session_id, part_id, parent_session_id)
+       VALUES (?, ?, ?, ?)`,
+    )
+    const legacyInsert = db.query(
+      `INSERT INTO online_reclaim_cross_session_part (part_id, message_id, parent_session_id, child_session_id)
+       VALUES (?, ?, ?, ?)`,
+    )
+    db.transaction(() =>
+      Array.from({ length: 60_000 }, (_, index) => index).forEach((index) => {
+        const suffix = String(index).padStart(5, "0")
+        const partID = `proof-part-${suffix}`
+        const messageID = `proof-message-${suffix}`
+        const parentID = `proof-parent-${suffix}`
+        const childID = `proof-child-${suffix}`
+        scopeInsert.run(childID, partID, messageID, parentID, childID, "child")
+        scopeInsert.run(parentID, partID, messageID, parentID, childID, "parent")
+        messageInsert.run(messageID, childID, partID, parentID)
+        legacyInsert.run(partID, messageID, parentID, childID)
+      }),
+    )()
+
+    const indexNames = new Set(
+      db
+        .query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'index'")
+        .all()
+        .map((row) => row.name),
+    )
+    expect(
+      OnlineReclaimIndexes.definitions
+        .filter((item) => item.table === "online_reclaim_cross_part_scope")
+        .every((item) => indexNames.has(item.name)),
+    ).toBe(true)
+    const triggers = new Map(
+      db
+        .query<{ name: string; sql: string }, []>("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
+        .all()
+        .map((row) => [row.name, row.sql]),
+    )
+    expect(OnlineReclaimProof.requiredTriggerNames.every((name) => triggers.has(name))).toBe(true)
+    expect(triggers.get("online_reclaim_part_cross_update")).toContain('"session_id" = OLD."session_id"')
+    expect(triggers.get("online_reclaim_part_cross_delete")).toContain('"part_id" = OLD."id" AND "role" = \'parent\'')
+    expect(triggers.get("online_reclaim_message_cross_update")).toContain('INDEXED BY "part_message_id_id_idx"')
+
+    const scopeOwnerPlan = db
+      .query<{ detail: string }, [string, string]>(
+        `EXPLAIN QUERY PLAN DELETE FROM online_reclaim_cross_part_scope
+         WHERE session_id = ? AND part_id = ? AND role IN ('owned', 'child')`,
+      )
+      .all("proof-child-00001", "proof-part-00001")
+      .map((row) => row.detail)
+      .join("\n")
+    const scopeParentPlan = db
+      .query<{ detail: string }, [string, string]>(
+        `EXPLAIN QUERY PLAN DELETE FROM online_reclaim_cross_part_scope
+         WHERE session_id = ? AND part_id = ? AND role = 'parent'`,
+      )
+      .all("proof-parent-00001", "proof-part-00001")
+      .map((row) => row.detail)
+      .join("\n")
+    const scopeTriggerPlan = db
+      .query<{ detail: string }, [string, string, string]>(
+        `EXPLAIN QUERY PLAN DELETE FROM online_reclaim_cross_part_scope
+         WHERE session_id = (
+           SELECT parent_session_id FROM online_reclaim_cross_part_scope
+           WHERE session_id = ? AND part_id = ? AND role IN ('owned', 'child')
+         ) AND part_id = ? AND role = 'parent'`,
+      )
+      .all("proof-child-00001", "proof-part-00001", "proof-part-00001")
+      .map((row) => row.detail)
+      .join("\n")
+    const messagePartPlan = db
+      .query<{ detail: string }, [string, string, string]>(
+        `EXPLAIN QUERY PLAN DELETE FROM online_reclaim_cross_part_message
+         WHERE message_id = ? AND child_session_id = ? AND part_id = ?`,
+      )
+      .all("proof-message-00001", "proof-child-00001", "proof-part-00001")
+      .map((row) => row.detail)
+      .join("\n")
+    const legacyPartPlan = db
+      .query<{ detail: string }, [string]>(
+        `EXPLAIN QUERY PLAN DELETE FROM online_reclaim_cross_session_part WHERE part_id = ?`,
+      )
+      .all("proof-part-00001")
+      .map((row) => row.detail)
+      .join("\n")
+    const messageUpdateLegacyPlan = db
+      .query<{ detail: string }, [string]>(
+        `EXPLAIN QUERY PLAN DELETE FROM online_reclaim_cross_session_part
+         WHERE part_id IN (
+           SELECT id FROM part INDEXED BY part_message_id_id_idx WHERE message_id = ?
+         )`,
+      )
+      .all("msg-large-history-000000")
+      .map((row) => row.detail)
+      .join("\n")
+    const messageUpdateScopePlan = db
+      .query<{ detail: string }, [string, string, string]>(
+        `EXPLAIN QUERY PLAN DELETE FROM online_reclaim_cross_part_scope
+         WHERE session_id = ? AND role = 'parent' AND part_id IN (
+           SELECT id FROM part INDEXED BY part_message_id_session_idx
+           WHERE message_id = ? AND session_id <> ?
+         )`,
+      )
+      .all("proof-parent-00001", "msg-large-history-000000", "proof-parent-00001")
+      .map((row) => row.detail)
+      .join("\n")
+    expect(scopeOwnerPlan).toContain("SEARCH online_reclaim_cross_part_scope")
+    expect(scopeOwnerPlan).not.toContain("SCAN online_reclaim_cross_part_scope")
+    expect(scopeParentPlan).toContain("SEARCH online_reclaim_cross_part_scope")
+    expect(scopeParentPlan).not.toContain("SCAN online_reclaim_cross_part_scope")
+    expect(scopeTriggerPlan).toContain("SEARCH online_reclaim_cross_part_scope")
+    expect(scopeTriggerPlan).not.toContain("SCAN online_reclaim_cross_part_scope")
+    expect(messagePartPlan).toContain("SEARCH online_reclaim_cross_part_message")
+    expect(messagePartPlan).not.toContain("SCAN online_reclaim_cross_part_message")
+    expect(legacyPartPlan).toContain("SEARCH online_reclaim_cross_session_part")
+    expect(legacyPartPlan).not.toContain("SCAN online_reclaim_cross_session_part")
+    expect(messageUpdateLegacyPlan).toContain("part_message_id_id_idx")
+    expect(messageUpdateLegacyPlan).toContain("SEARCH online_reclaim_cross_session_part")
+    expect(messageUpdateLegacyPlan).not.toContain("SCAN online_reclaim_cross_session_part")
+    expect(messageUpdateScopePlan).toContain("part_message_id_session_idx")
+    expect(messageUpdateScopePlan).toContain("SEARCH online_reclaim_cross_part_scope")
+    expect(messageUpdateScopePlan).not.toContain("SCAN online_reclaim_cross_part_scope")
+  } finally {
+    db.close()
+  }
 })
 
 test.serial("online prune preserves a late cross-session Part before deleting its Message", async () => {
