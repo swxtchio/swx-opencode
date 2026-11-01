@@ -402,7 +402,7 @@ Commands:
   opencode db export-usage  export per-session usage as JSONL for archiving; step-finish totals take
                             precedence, with message totals for legacy rows
   opencode db prune         inventory missing-directory local Sessions; --apply deletes them offline
-                            and vacuums the database
+                            unless --online is selected
   opencode db retire        retire a removed worktree's local Sessions; inventory unless --apply is
                             specified
   opencode db retention     inventory Session retention candidates; --apply redacts only trees that
