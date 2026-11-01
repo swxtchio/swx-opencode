@@ -1380,7 +1380,7 @@ test.serial("online apply refuses proof preparation before writes when reserve i
   after.close()
 })
 
-test.serial("online apply censuses a missing live-writer lifetime before the session writer gate", async () => {
+test.serial("online apply refuses unregistered holders before incomplete Part and alias proof writes", async () => {
   if (process.platform !== "linux") return
   await using store = await producedStore([{ payloadBytes: 128 }])
   const sessionID = store.metadata[0]!.created[0]!.id
@@ -1448,9 +1448,69 @@ test.serial("online apply censuses a missing live-writer lifetime before the ses
     missingLifetime
       .query("DELETE FROM online_reclaim_writer_lifetime WHERE pid = ? AND boot_id = ? AND start_ticks = ?")
       .run(writerPID, identity.boot_id, identity.start_ticks)
+    const aliasItemID = "que_unregistered_holder_proof"
+    const aliasID = "alias_unregistered_holder_proof"
+    missingLifetime
+      .query(
+        `INSERT INTO session_prompt_queue (id, session_id, seq, delivery, input, time_created, time_promoted)
+         VALUES (?, ?, (SELECT coalesce(max(seq), 0) + 1 FROM session_prompt_queue WHERE session_id = ?), 'queue', '{}', 0, 1)`,
+      )
+      .run(aliasItemID, sessionID, sessionID)
+    missingLifetime
+      .query("INSERT INTO session_prompt_queue_alias (id, item_id) VALUES (?, ?)")
+      .run(aliasID, aliasItemID)
+    expect(
+      missingLifetime
+        .query<{ complete: number }, [string]>("SELECT complete FROM online_reclaim_stable_backfill WHERE name = ?")
+        .get("event-writer-lifetimes")?.complete,
+    ).toBe(1)
+    expect(
+      missingLifetime
+        .query("SELECT 1 FROM online_reclaim_queue_alias_owner WHERE item_id = ? AND alias_id = ?")
+        .get(aliasItemID, aliasID),
+    ).toBeTruthy()
+    missingLifetime.exec(`
+      DELETE FROM online_reclaim_cross_session_part;
+      DELETE FROM online_reclaim_cross_part_scope;
+      DELETE FROM online_reclaim_cross_part_message;
+      DELETE FROM online_reclaim_queue_alias_scope;
+      DELETE FROM online_reclaim_queue_alias_owner;
+      UPDATE online_reclaim_backfill
+      SET cursor = 0, high_water = -1, complete = 0
+      WHERE name IN ('cross-session-part-scope', 'cross-session-parts');
+      UPDATE online_reclaim_backfill
+      SET cursor = 0, high_water = (SELECT coalesce(max(rowid), 0) FROM session_prompt_queue_alias), complete = 0
+      WHERE name = 'queue-alias-scope';
+      UPDATE online_reclaim_stable_backfill
+      SET cursor = '', cursor_secondary = '', cursor_started = 0,
+          high_water = '', high_water_secondary = '', high_water_present = 0, complete = 0
+      WHERE name IN ('cross-session-part-scope', 'queue-alias-owners');
+    `)
+    expect(missingLifetime.query("SELECT 1 FROM part WHERE session_id = ? LIMIT 1").get(sessionID)).toBeTruthy()
+    expect(missingLifetime.query("SELECT 1 FROM session_prompt_queue_alias WHERE id = ?").get(aliasID)).toBeTruthy()
+    expect(
+      missingLifetime
+        .query<{ name: string; complete: number }, []>(
+          `SELECT name, complete FROM online_reclaim_stable_backfill
+           WHERE name IN ('cross-session-part-scope', 'queue-alias-owners', 'event-writer-lifetimes')
+           ORDER BY name`,
+        )
+        .all(),
+    ).toEqual([
+      { name: "cross-session-part-scope", complete: 0 },
+      { name: "event-writer-lifetimes", complete: 1 },
+      { name: "queue-alias-owners", complete: 0 },
+    ])
     const proofState = {
       writerLifetimes: missingLifetime
         .query("SELECT * FROM online_reclaim_writer_lifetime ORDER BY pid, boot_id, start_ticks")
+        .all(),
+      partScopes: missingLifetime
+        .query("SELECT * FROM online_reclaim_cross_part_scope ORDER BY session_id, part_id")
+        .all(),
+      aliasScopes: missingLifetime.query("SELECT * FROM online_reclaim_queue_alias_scope ORDER BY alias_rowid").all(),
+      aliasOwners: missingLifetime
+        .query("SELECT * FROM online_reclaim_queue_alias_owner ORDER BY item_id, alias_id")
         .all(),
       backfills: missingLifetime.query("SELECT * FROM online_reclaim_backfill ORDER BY name").all(),
       stableBackfills: missingLifetime.query("SELECT * FROM online_reclaim_stable_backfill ORDER BY name").all(),
@@ -1472,12 +1532,33 @@ test.serial("online apply censuses a missing live-writer lifetime before the ses
     })()
     expect(proofTransactions).toEqual([])
     expect(holderRefused.report.action).toBe("refused")
+    expect(holderRefused.report.reclamation.reasons).toContain(`unregistered-database-holder:${writerPID}`)
+    expect(
+      holderRefused.report.reclamation.reasons.filter(
+        (reason) => !reason.startsWith("online-proof-backfill-incomplete:"),
+      ),
+    ).toEqual([`unregistered-database-holder:${writerPID}`])
     expect(holderRefused.report.refusalReasons).toContain(`unregistered-database-holder:${writerPID}`)
-    expect(holderRefused.report.proofPreparation).toMatchObject({ complete: true, batches: 0, rows: 0 })
+    expect(holderRefused.report.proofPreparation).toMatchObject({ complete: false, batches: 0, rows: 0 })
+    expect(holderRefused.report.proofPreparation?.remaining).toContain(
+      "online-proof-backfill-incomplete:cross-session-part-scope",
+    )
+    expect(holderRefused.report.proofPreparation?.remaining).toContain(
+      "online-proof-backfill-incomplete:queue-alias-owners",
+    )
     const afterHolderRefusal = new Database(store.filename, { readonly: true })
     expect({
       writerLifetimes: afterHolderRefusal
         .query("SELECT * FROM online_reclaim_writer_lifetime ORDER BY pid, boot_id, start_ticks")
+        .all(),
+      partScopes: afterHolderRefusal
+        .query("SELECT * FROM online_reclaim_cross_part_scope ORDER BY session_id, part_id")
+        .all(),
+      aliasScopes: afterHolderRefusal
+        .query("SELECT * FROM online_reclaim_queue_alias_scope ORDER BY alias_rowid")
+        .all(),
+      aliasOwners: afterHolderRefusal
+        .query("SELECT * FROM online_reclaim_queue_alias_owner ORDER BY item_id, alias_id")
         .all(),
       backfills: afterHolderRefusal.query("SELECT * FROM online_reclaim_backfill ORDER BY name").all(),
       stableBackfills: afterHolderRefusal.query("SELECT * FROM online_reclaim_stable_backfill ORDER BY name").all(),
