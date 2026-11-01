@@ -329,11 +329,13 @@ export const make = Effect.gen(function* () {
   }
 
   // A command leader may close on TERM while a resistant descendant keeps its process group alive.
-  const waitForGroup = Effect.fnUntraced(function* (pid: number) {
-    yield* Effect.callback<void>((resume) => {
+  const waitForGroup = Effect.fnUntraced(function* (pid: number, timeout?: Duration.Input) {
+    const deadline = Predicate.isUndefined(timeout) ? undefined : Date.now() + Duration.toMillis(timeout)
+    return yield* Effect.callback<boolean>((resume) => {
       let timer: ReturnType<typeof setTimeout> | undefined
       const check = () => {
-        if (!groupAlive(pid)) return resume(Effect.void)
+        if (!groupAlive(pid)) return resume(Effect.succeed(true))
+        if (deadline !== undefined && Date.now() >= deadline) return resume(Effect.succeed(false))
         timer = globalThis.setTimeout(check, 20)
       }
       check()
@@ -341,6 +343,42 @@ export const make = Effect.gen(function* () {
         if (timer) globalThis.clearTimeout(timer)
       })
     })
+  })
+
+  const groupMembers = (command: ChildProcess.StandardCommand, pgid: number) =>
+    Effect.callback<ReadonlyArray<number>, PlatformError.PlatformError>((resume) => {
+      const child = NodeChildProcess.execFile(
+        "ps",
+        ["-e", "-o", "pid=,pgid="],
+        { windowsHide: process.platform === "win32" },
+        (err, stdout) => {
+          if (err) return resume(Effect.fail(toPlatformError("kill", toError(err), command)))
+          return resume(
+            Effect.succeed(
+              stdout
+                .split("\n")
+                .flatMap((line) => {
+                  const [pid, group] = line.trim().split(/\s+/).map(Number)
+                  return pid && group === pgid ? [pid] : []
+                }),
+            ),
+          )
+        },
+      )
+      return Effect.sync(() => child.kill())
+    })
+
+  const waitForGroupAfterKill = Effect.fnUntraced(function* (
+    command: ChildProcess.StandardCommand,
+    proc: NodeChildProcess.ChildProcess,
+  ) {
+    if (yield* waitForGroup(proc.pid!, Duration.seconds(5))) return
+    const members = yield* groupMembers(command, proc.pid!).pipe(Effect.catch(() => Effect.succeed([])))
+    return yield* Effect.die(
+      new Error(
+        `SIGKILL did not terminate process group ${proc.pid}; surviving members: ${members.length ? members.join(", ") : "unavailable"}`,
+      ),
+    )
   })
 
   const cleanupGroup = (
@@ -353,7 +391,7 @@ export const make = Effect.gen(function* () {
     const attempt = send(signal).pipe(Effect.andThen(waitForGroup(proc.pid!)))
     return Effect.timeoutOrElse(attempt, {
       duration: forceKillAfter,
-      orElse: () => send("SIGKILL").pipe(Effect.andThen(waitForGroup(proc.pid!)), Effect.asVoid),
+      orElse: () => send("SIGKILL").pipe(Effect.andThen(waitForGroupAfterKill(command, proc)), Effect.asVoid),
     })
   }
 
@@ -435,17 +473,12 @@ export const make = Effect.gen(function* () {
                 const [code, exitSignal] = yield* Deferred.await(signal)
                 if (process.platform === "win32") return yield* Effect.void
                 const requested = cleanupRequest.value
-                if (requested)
-                  return yield* Effect.ignore(
-                    cleanupGroup(command, proc, requested.killSignal, requested.forceKillAfter),
-                  )
+                if (requested) return yield* cleanupGroup(command, proc, requested.killSignal, requested.forceKillAfter)
                 if (Predicate.isNull(code) && Predicate.isNotNull(exitSignal)) {
                   const forceKillAfter = command.options.forceKillAfter
                   if (Predicate.isUndefined(forceKillAfter))
                     return yield* Effect.ignore(killGroup(command, proc, command.options.killSignal ?? "SIGTERM"))
-                  return yield* Effect.ignore(
-                    cleanupGroup(command, proc, command.options.killSignal ?? "SIGTERM", forceKillAfter),
-                  )
+                  return yield* cleanupGroup(command, proc, command.options.killSignal ?? "SIGTERM", forceKillAfter)
                 }
                 if (code !== 0 && Predicate.isNotNull(code)) return yield* Effect.ignore(kill(killGroup))
                 return yield* Effect.void
@@ -474,12 +507,12 @@ export const make = Effect.gen(function* () {
                 duration: forceKillAfter,
                 orElse: () =>
                   send("SIGKILL").pipe(
-                    Effect.andThen(waitForGroup(proc.pid!)),
+                    Effect.andThen(waitForGroupAfterKill(command, proc)),
                     Effect.andThen(Deferred.await(signal)),
                     Effect.asVoid,
                   ),
               })
-              return yield* Effect.ignore(escalated)
+              return yield* escalated.pipe(Effect.orDie)
             }),
           )
 
