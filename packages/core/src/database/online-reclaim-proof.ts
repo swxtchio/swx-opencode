@@ -186,7 +186,7 @@ export const triggerStatements = [
     DELETE FROM "online_reclaim_cross_part_scope"
     WHERE "session_id" = OLD."session_id" AND "role" = 'parent'
       AND "part_id" IN (
-        SELECT "id" FROM "part" INDEXED BY "part_message_id_session_idx"
+        SELECT "id" FROM "part" INDEXED BY "part_message_id_id_idx"
         WHERE "message_id" = NEW."id" AND "session_id" <> OLD."session_id"
       );
     DELETE FROM "online_reclaim_cross_part_message" WHERE "message_id" = NEW."id";
