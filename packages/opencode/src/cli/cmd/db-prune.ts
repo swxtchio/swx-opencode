@@ -3767,7 +3767,11 @@ function deleteSessions(db: SqliteAccess, sessionIDs: readonly string[]) {
                  WHERE alias.item_id IN (SELECT id FROM session_prompt_queue WHERE session_id = ?)
                )`,
           ).run(id)
-        return sum + db.query(`DELETE FROM ${quote(table)} WHERE ${scope}`).run(id).changes
+        const rows = db
+          .query<{ rows: number }, [string]>(`SELECT count(*) AS rows FROM ${quote(table)} WHERE ${scope}`)
+          .get(id)!.rows
+        db.query(`DELETE FROM ${quote(table)} WHERE ${scope}`).run(id)
+        return sum + rows
       }, 0),
     ]),
   )
