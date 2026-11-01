@@ -1144,8 +1144,14 @@ async function applyOnlinePrune(
         : undefined
     if (proofPreflight) {
       // An incomplete writer-lifetime map can temporarily report a live holder as unregistered; preparation completes that evidence.
+      const writerLifetimeNeedsBackfill =
+        proofPreflight.proofPreparation?.remaining.includes(
+          "online-proof-backfill-incomplete:event-writer-lifetimes",
+        ) ?? false
       const proofGateReasons = proofPreflight.reclamation.reasons.filter(
-        (reason) => !reason.startsWith("online-proof-backfill-") && !reason.startsWith("unregistered-database-holder:"),
+        (reason) =>
+          !reason.startsWith("online-proof-backfill-") &&
+          !(writerLifetimeNeedsBackfill && reason.startsWith("unregistered-database-holder:")),
       )
       if (proofGateReasons.length > 0) return { ...proofPreflight, action: "refused" }
     }
