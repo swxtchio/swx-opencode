@@ -867,7 +867,7 @@ test("online prune bounds one large Session, retries partial progress, and never
     })
   ).report
   expect(["applied", "failed", "refused"]).toContain(reclaimedOnly.action)
-  if (reclaimedOnly.action !== "applied") expect(reclaimedOnly.refusalReasons.length).toBeGreaterThan(0)
+  if (reclaimedOnly.action !== "applied") expect(reclaimedOnly.refusalReasons?.length ?? 0).toBeGreaterThan(0)
   expect(reclaimedOnly.changedRows).toBe(0)
   expect(reclaimedOnly.deletedSessionIDs).toEqual([])
   expect(reclaimedOnly.rawTranscriptWarning).toContain("does not delete Session history")
@@ -886,7 +886,7 @@ test("online prune bounds one large Session, retries partial progress, and never
     })
   ).report
   expect(["applied", "failed"]).toContain(completed.action)
-  if (completed.action === "failed") expect(completed.refusalReasons.length).toBeGreaterThan(0)
+  if (completed.action === "failed") expect(completed.refusalReasons?.length ?? 0).toBeGreaterThan(0)
   expect(completed.deletedSessionIDs).toEqual([selectedID])
   expect(completed.changedRows).toBe(remainingRows)
   expect(completed.partialSessionIDs).toEqual([])
