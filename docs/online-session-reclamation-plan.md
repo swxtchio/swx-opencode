@@ -2,6 +2,8 @@
 
 Authority: swxtchio/swx-opencode#353, its [published producer contract](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6537686549), and the [round-two correction](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6541481027), together with the task brief's “Need” and “Constraints.” This plan resolves the implementation boundary; the shipped CLI and its output remain authoritative for behavior.
 
+The proof-preparation and preflight contract is further clarified by the [round-five correction](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6553050249) and [round-six correction](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6555341679).
+
 ## Plan
 
 - Add `opencode db prune --online` as a separate owner from the existing offline prune and retire paths.
@@ -23,5 +25,9 @@ The round-four corrections preserve the no-validation-row-cap contract and make 
 ## Round-five contract clarification
 
 The fixed proof-preparation bound is 128 source rows per proof transaction and 128 proof transactions per invocation (at most 16,384 source rows); no CLI option changes it. A read-only capacity and holder-inspection preflight runs before proof writes; if it refuses, `proofPreparation` shows zero batches and rows and the proof state is unchanged. Reserve preflight reports `free-space-reserve-would-be-violated` or `free-space-measurement-unavailable`; the reserve is rechecked before every proof transaction. A mid-pass reserve refusal reports `free-space-reserve-would-be-violated`, rolls back that page, and preserves earlier committed progress. Incomplete, busy, and unavailable proof state refuses deletion with exit 1. Retry the same explicit online apply scope to resume; proof progress is reported separately from deleted-row `committed` status. See `docs/dead-session-retirement.md` for the exact reason strings and JSON shape. The in-lock current-holder identity check remains; the historical per-Session writer census is outside the lock and locked writes are guarded by event-sequence and row fences.
+
+## Round-six trigger and preflight correction
+
+The Message cross-update trigger uses only migrated `part_message_id_id_idx`, not fresh-schema-only `part_message_id_session_idx`; existing stores need no source-index build. An `unregistered-database-holder:<pid>` is deferred only while `event-writer-lifetimes` backfill is incomplete. Apply completes that census, reruns holder and selected-Session writer checks, and refuses deletion if a holder remains unregistered, preserving proof progress. Capacity and holder preflight refusals happen before proof writes; a mid-pass reserve refusal rolls back only that page and preserves earlier proof batches. See the [round-six contract correction](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6555341679).
 
 Each correction lands with a producer-driven regression in its own commit. After all required findings pass the complete prune suite, Core/OpenCode typechecks, and lint/format checks, update and push the draft PR for review.
