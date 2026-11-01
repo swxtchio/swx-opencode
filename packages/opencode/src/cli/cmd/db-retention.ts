@@ -358,7 +358,19 @@ const requiredRetentionTables = new Set([
   "session_prompt_receipt",
 ])
 // Alias hashes contain no input copy; their queue foreign key owns lifecycle and normal consume removes them.
-const classifiedSessionTables = new Set([...requiredRetentionTables, "session_prompt_queue_alias"])
+const onlineReclaimProofTables = [
+  "online_reclaim_cross_session_part",
+  "online_reclaim_queue_alias_scope",
+  "online_reclaim_backfill",
+  "online_reclaim_stable_backfill",
+  "online_reclaim_writer_lifetime",
+  "online_reclaim_queue_alias_owner",
+  "online_reclaim_cross_part_scope",
+  "online_reclaim_cross_part_message",
+] as const
+// These are structural identities and cursors, not payload copies. Redaction keeps the source rows and maps intact;
+// Part, queue-alias and writer lifecycle triggers clean the maps when those source rows are deleted.
+const classifiedSessionTables = new Set([...requiredRetentionTables, "session_prompt_queue_alias", ...onlineReclaimProofTables])
 
 // Every producer timestamp a Session tree carries. Event rows have no timestamp, so appends are
 // timed by event_aggregate_writer, which the EventV2 commit writes with each append.

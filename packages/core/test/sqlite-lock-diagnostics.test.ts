@@ -321,9 +321,10 @@ describe("SQLite lock retry exhaustion diagnostics", () => {
             )
             const filename = path.join(tmp.path, "begin-exhausted.sqlite")
             const attempts = newStatementAttempts()
-            yield* patchBunQuery((sql) => sql === "begin immediate", attempts)
             const db = yield* productionDatabase(filename)
             yield* db.run("CREATE TABLE hold_test (id INTEGER PRIMARY KEY)")
+            // Exclude startup migrations and proof installation; count only the contended transaction below.
+            yield* patchBunQuery((sql) => sql === "begin immediate", attempts)
             yield* inProcessHolder(filename)
 
             const startedAt = performance.now()
