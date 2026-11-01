@@ -1,6 +1,6 @@
 # Commanded Session reclamation
 
-`opencode db prune` inventories the targeted local database by default. `--online` selects bounded live-store reclamation for explicit Session IDs; without it, prune keeps the offline path. `opencode db retire` remains the directory-targeted offline teardown entry point. Consult `opencode db prune --help`, `packages/opencode/src/cli/cmd/db-prune.ts`, the [published online producer contract](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6537686549), its [limit clarification](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6537694254), and the [round-two correction](https://github.com/swxtchio/swx-opencode/issues/353) for the current interface.
+`opencode db prune` inventories the targeted local database by default. `--online` selects bounded live-store reclamation for explicit Session IDs; without it, prune keeps the offline path. `opencode db retire` remains the directory-targeted offline teardown entry point. Consult `opencode db prune --help`, `packages/opencode/src/cli/cmd/db-prune.ts`, the [published producer contract](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6537686549), its [limit clarification](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6537694254), the [round-two correction](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6541481027), and the [online reclamation plan](online-session-reclamation-plan.md) for the current interface.
 
 ## Offline lifecycle
 
@@ -19,14 +19,29 @@ The consumer checks use the existing Linux process/lock inspection boundary. An 
 
 Use this path when the per-home store must stay available to other OpenCode processes. Name the existing database and every Session explicitly. `--before` is an optional activity filter that only narrows the missing-directory set. Set the reserve from the caller's reviewed capacity policy; the producer checks it again before each delete, vacuum and checkpoint step.
 
-Existing stores need the online proof indexes, historical cross-Session Part census, and queue-alias owner map prepared once before online inventory. Whole-table index builds are not run at application startup: stop every OpenCode process using the database, then run `opencode db prune --database "$DB" --prepare-online-indexes`. The command refuses if another database holder is present, creates indexes one at a time, and resumes the Part and alias censuses by rowid in transactions capped at 128 source rows; rerun after interruption. Each individual index build may take time and disk space proportional to its source table. Keep all database users stopped until it exits. Fresh stores install the trigger-maintained proof tables with empty, complete baselines. If preparation is incomplete, online inventory reports the missing proof and remains not ready.
+Existing stores become proof-ready through the same online `--apply` route. It advances trigger-maintained cross-Session Part, stable queue-alias-owner, and writer-lifetime proofs before inventory or deletion. Each proof transaction handles at most 128 source rows, and one invocation performs at most 128 proof transactions, releasing SQLite's writer lock between them. No whole-table source index is built, and other database users may remain live. If the proof pass reaches its bound, the result names incomplete proofs in `refusalReasons` and reports `proofPreparation` progress; retry the same explicit online apply command. No Session rows are deleted until every proof is complete. Read-only inventory remains read-only and reports incomplete proofs as not ready. Fresh stores install the trigger-maintained proof tables with empty, complete baselines.
+
+The bounded-refusal fields have this shape; other standard report fields are omitted here:
+
+```json
+{
+  "action": "refused",
+  "committed": false,
+  "changedRows": 0,
+  "refusalReasons": ["online-proof-backfill-incomplete:event-writer-lifetimes"],
+  "proofPreparation": {
+    "complete": false,
+    "batches": 128,
+    "rows": 16256,
+    "remaining": ["online-proof-backfill-incomplete:event-writer-lifetimes"]
+  }
+}
+```
 
 ```sh
 DB="/absolute/home/data/opencode/opencode.db"
 SESSION_ID="ses_example"
 RESERVE_BYTES="<caller-selected-positive-bytes>"
-
-opencode db prune --database "$DB" --prepare-online-indexes
 
 opencode db prune --online --database "$DB" --session "$SESSION_ID" \
   --reserve-bytes "$RESERVE_BYTES"
@@ -35,9 +50,11 @@ opencode db prune --online --database "$DB" --session "$SESSION_ID" \
   --apply --reserve-bytes "$RESERVE_BYTES"
 ```
 
-Replace every example value before running it. Inventory is read-only. Review `deletionScope.sessionIDs`, `selectedSessions`, `skippedSessions`, and `reclamation.ready`/`reclamation.reasons` before applying. There is no per-Session validation-row cap; `--batch-rows` and `--batch-bytes` bound each transaction, and byte accounting includes every TEXT/BLOB column of each owned row, including the final Session row. Existing or uncertain directories, unselected descendants, cross-Session cascades, pending work, live writers, unknown storage ownership, an unregistered holder, or an unsupported auto-vacuum mode do not authorize deletion. Historical cross-Session Part references are reported during inventory through the prepared indexed proof; apply also rechecks actual Part references by indexed Message ID inside each write batch. A reference arriving after inventory can leave committed partial progress with its Message and Part preserved. A registered process may remain connected when it does not own a selected Session; `db retire` does not enter online mode.
+Replace every example value before running it. Inventory is read-only. Review `deletionScope.sessionIDs`, `selectedSessions`, `skippedSessions`, and `reclamation.ready`/`reclamation.reasons` before applying. If inventory reports an incomplete proof, an explicit apply advances that same proof path in bounded batches; if more pages remain, retry the same command after reviewing `proofPreparation`. There is no per-Session validation-row cap; `--batch-rows` and `--batch-bytes` bound each delete transaction, and byte accounting includes every TEXT/BLOB column of each owned row, including the final Session row. Existing or uncertain directories, unselected descendants, cross-Session cascades, pending work, live writers, unknown storage ownership, an unregistered holder, or an unsupported auto-vacuum mode do not authorize deletion. Historical cross-Session Part references are reported during inventory through the trigger-maintained Part scope proof; apply also rechecks actual Part references through the indexed Message proof inside each write batch. A reference arriving after inventory can leave committed partial progress with its Message and Part preserved. A registered process may remain connected when it does not own a selected Session; `db retire` does not enter online mode.
 
 The producer contract is one JSON object on stdout per valid call; diagnostics go to stderr. Inventory exits successfully even when readiness is false, so inspect `reclamation.ready` rather than treating exit zero as apply approval. A reader-pinned or table-locked passive checkpoint is recorded in `reclamation.outstanding` and does not stop further Session deletion; once deletion finishes, outstanding WAL or freelist work makes the apply incomplete. A refused or failed apply exits nonzero; invalid CLI usage exits with usage status and no JSON.
+
+When a bounded proof pass returns `action: "refused"`, its `proofPreparation` batches and row count report committed proof metadata separately; `committed` reports delete/reclaim work, and no Session rows were deleted. Retry the same explicit apply scope while keeping the other database users live.
 
 For `action: "failed"` with `committed: true`, rows already reported as changed are committed. Use `deletedSessionIDs`, `partialSessionIDs`, `remainingSessionIDs`, `skippedSessions`, and `batches` to establish exactly what remains; retry only the original explicit scope. A missing Session on a later retry is not evidence that the earlier call deleted it. If deletion is complete but reclaim work remains, continue with the storage-only form, which never deletes or claims a Session:
 

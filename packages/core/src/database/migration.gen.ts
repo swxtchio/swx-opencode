@@ -54,5 +54,6 @@ export const migrations = (
     import("./migration/20261031173718_online_reclaim_cross_session_proof"),
     import("./migration/20261031175424_online_reclaim_queue_alias_scope"),
     import("./migration/20261031224838_chunky_stepford_cuckoos"),
+    import("./migration/20261031233939_quiet_blur"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

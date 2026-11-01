@@ -20,7 +20,6 @@ import {
 import path from "node:path"
 import { Effect } from "effect"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { OnlineReclaimIndexes } from "@opencode-ai/core/database/online-reclaim-indexes"
 import { EventWriter } from "@opencode-ai/core/event/writer"
 import { PruneCommand } from "@/cli/cmd/db-prune"
 import { MessageV2 } from "@/session/message-v2"
@@ -159,8 +158,7 @@ type Report = {
   skippedSessions?: { sessionID: string; reasons: string[] }[]
   batches?: Record<string, unknown>[]
   sessionProgress?: Record<string, unknown>[]
-  createdIndexes?: string[]
-  remainingIndexes?: string[]
+  proofPreparation?: { complete: boolean; batches: number; rows: number; remaining: string[] }
 }
 
 const ownedCounts = (filename: string, sessionID: string) => {
@@ -959,121 +957,121 @@ test.serial(
     await using store = await producedStore([{ payloadBytes: 128 }])
     const sessionID = produce(store, { create: { payloadBytes: 128 } }).created[0].id
     await produceLive(store, { bulkMessages: { sessionID, count: 10_100 } })
+    await rm(store.project, { recursive: true, force: true })
 
-    const applied = parseReport(
-      await runCLI(
-        store,
-        [
-          "--online",
-          "--session",
-          sessionID,
-          "--apply",
-          "--reserve-bytes",
-          "1",
-          "--batch-rows",
-          "256",
-          "--max-batches",
-          "100",
-        ],
-        "either",
-        { timeout: 180_000 },
-      ),
+    const messagePages = new Array<string>()
+    const originalQuery = Database.prototype.query
+    const query = spyOn(Database.prototype, "query").mockImplementation(function <
+      ReturnType,
+      ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+    >(this: Database, statement: string) {
+      if (
+        statement.startsWith("SELECT") &&
+        statement.includes('FROM "message"') &&
+        statement.includes('ORDER BY "time_created" ASC, "id" ASC')
+      )
+        messagePages.push(statement)
+      return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+    })
+    const result = await (async () => {
+      try {
+        return await invokeHandler(store, {
+          database: store.filename,
+          online: true,
+          session: [sessionID],
+          apply: true,
+          reserveBytes: 1,
+          batchRows: 256,
+          maxBatches: 100,
+        })
+      } finally {
+        query.mockRestore()
+      }
+    })()
+    expect(result.report.action).toBe(
+      result.report.reclamation.outstanding?.includes("wal-checkpoint-incomplete") ? "failed" : "applied",
     )
-    expect(applied.action).toBe(
-      applied.reclamation.outstanding?.includes("wal-checkpoint-incomplete") ? "failed" : "applied",
+    if (result.report.action === "failed") expect(result.report.refusalReasons).toContain("wal-checkpoint-incomplete")
+    expect(result.report.deletedSessionIDs).toEqual([sessionID])
+    expect(result.report.changedRows).toBeGreaterThan(10_100)
+    expect(result.report.batches!.length).toBeGreaterThan(5)
+    expect(result.report.batches!.every((batch) => Number(batch.changedRows) <= 256)).toBe(true)
+    expect(result.report.batches!.every((batch) => typeof batch.lockDurationMs === "number")).toBe(true)
+    expect(messagePages.some((statement) => statement.includes('("time_created", "id") > (?, ?)'))).toBe(true)
+    expect(messagePages.every((statement) => statement.includes('ORDER BY "time_created" ASC, "id" ASC LIMIT ?'))).toBe(
+      true,
     )
-    if (applied.action === "failed") expect(applied.refusalReasons).toContain("wal-checkpoint-incomplete")
-    expect(applied.deletedSessionIDs).toEqual([sessionID])
-    expect(applied.changedRows).toBeGreaterThan(10_100)
-    expect(applied.batches!.length).toBeGreaterThan(5)
-    expect(applied.batches!.every((batch) => Number(batch.changedRows) <= 256)).toBe(true)
-    expect(applied.batches!.every((batch) => typeof batch.lockDurationMs === "number")).toBe(true)
     expect(Object.values(ownedCounts(store.filename, sessionID)).every((count) => count === 0)).toBe(true)
   },
   { timeout: 240_000 },
 )
 
-test("online inventory refuses when proof and keyset indexes are missing", async () => {
+test("online inventory does not require offline activity and work indexes", async () => {
   await using store = await producedStore([{ payloadBytes: 128 }])
   const sessionID = store.metadata[0].created[0].id
   const db = new Database(store.filename)
   db.exec(`
-    DROP INDEX message_session_time_created_id_idx;
-    DROP INDEX message_session_time_updated_id_idx;
-    DROP INDEX message_session_incomplete_assistant_idx;
-    DROP INDEX session_input_session_invalid_delivery_idx;
-    DROP INDEX event_aggregate_unknown_type_idx;
-    DROP INDEX event_aggregate_seq_idx;
-    DROP INDEX part_message_id_session_idx;
+    DROP INDEX IF EXISTS message_session_time_updated_id_idx;
+    DROP INDEX IF EXISTS message_session_invalid_json_idx;
+    DROP INDEX IF EXISTS message_session_incomplete_assistant_idx;
+    DROP INDEX IF EXISTS part_session_time_created_id_idx;
+    DROP INDEX IF EXISTS part_session_time_updated_id_idx;
+    DROP INDEX IF EXISTS part_session_invalid_json_idx;
+    DROP INDEX IF EXISTS part_session_pending_running_idx;
+    DROP INDEX IF EXISTS part_session_idx;
+    DROP INDEX IF EXISTS part_message_id_session_idx;
+    DROP INDEX IF EXISTS session_prompt_queue_alias_item_idx;
+    DROP INDEX IF EXISTS todo_session_time_created_position_idx;
+    DROP INDEX IF EXISTS todo_session_time_updated_position_idx;
+    DROP INDEX IF EXISTS session_message_session_time_updated_id_idx;
+    DROP INDEX IF EXISTS session_message_session_invalid_json_idx;
+    DROP INDEX IF EXISTS session_message_session_incomplete_assistant_idx;
+    DROP INDEX IF EXISTS session_input_session_time_created_idx;
+    DROP INDEX IF EXISTS session_input_session_invalid_delivery_idx;
+    DROP INDEX IF EXISTS session_prompt_queue_session_open_idx;
+    DROP INDEX IF EXISTS session_prompt_queue_session_conflicted_idx;
+    DROP INDEX IF EXISTS session_prompt_queue_session_time_created_idx;
+    DROP INDEX IF EXISTS session_prompt_queue_session_time_promoted_idx;
+    DROP INDEX IF EXISTS session_prompt_queue_session_time_withdrawn_idx;
+    DROP INDEX IF EXISTS session_prompt_queue_session_time_preparing_idx;
+    DROP INDEX IF EXISTS session_prompt_receipt_session_pending_idx;
+    DROP INDEX IF EXISTS session_prompt_receipt_session_invalid_idx;
+    DROP INDEX IF EXISTS session_prompt_receipt_session_time_created_idx;
+    DROP INDEX IF EXISTS session_prompt_receipt_session_time_updated_idx;
+    DROP INDEX IF EXISTS session_ask_session_unsettled_idx;
+    DROP INDEX IF EXISTS session_ask_session_time_created_idx;
+    DROP INDEX IF EXISTS session_ask_session_time_settled_idx;
+    DROP INDEX IF EXISTS event_aggregate_unknown_type_idx;
+    DROP INDEX IF EXISTS event_aggregate_writer_activity_idx;
   `)
   db.close()
 
   const inventory = parseReport(await runCLI(store, ["--online", "--session", sessionID, "--reserve-bytes", "1"]))
   expect(inventory.action).toBe("inventory")
-  expect(inventory.reclamation.ready).toBe(false)
-  expect(inventory.reclamation.reasons).toContain("online-scope-index-unavailable:message.session_id.time_created.id")
-  expect(inventory.reclamation.reasons).toContain(
-    "online-activity-index-unavailable:message.message_session_time_updated_id_idx",
-  )
-  expect(inventory.reclamation.reasons).toContain(
-    "online-work-index-unavailable:message.message_session_incomplete_assistant_idx",
-  )
-  expect(inventory.reclamation.reasons).toContain(
-    "online-work-index-unavailable:session_input.session_input_session_invalid_delivery_idx",
-  )
-  expect(inventory.reclamation.reasons).toContain(
-    "online-work-index-unavailable:event.event_aggregate_unknown_type_idx",
-  )
-  expect(inventory.reclamation.reasons).toContain("online-scope-index-unavailable:event.aggregate_id.seq")
-  expect(inventory.reclamation.reasons).toContain("online-scope-index-unavailable:part.message_id.session_id")
-  expect(inventory.deletionScope.sessionIDs).toEqual([])
+  expect(inventory.reclamation.ready).toBe(true)
+  expect(inventory.reclamation.reasons).toEqual([])
+  expect(inventory.deletionScope.sessionIDs).toEqual([sessionID])
 })
 
-test.serial("online proof indexes are prepared offline and are not rebuilt at startup", async () => {
+test("online unknown-event ownership uses the current manifest without its partial source index", async () => {
   await using store = await producedStore([{}])
-  const sessionID = store.metadata[0].created[0].id
-  const setup = new Database(store.filename)
-  setup.exec(OnlineReclaimIndexes.definitions.map((index) => `DROP INDEX IF EXISTS "${index.name}";`).join("\n"))
-  setup.close()
-
-  await produceLive(store, { create: {} })
-  const afterStartup = new Database(store.filename, { readonly: true })
-  const missingAfterStartup = OnlineReclaimIndexes.definitions.filter(
-    (index) =>
-      !afterStartup
-        .query<{ name: string }, [string]>("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
-        .get(index.name),
+  const sessionID = store.metadata[0]!.created[0]!.id
+  const unknownType = "fixture.unknown.durable.owner"
+  const db = new Database(store.filename)
+  const nextSequence = db
+    .query<{ seq: number }, [string]>("SELECT coalesce(max(seq), 0) + 1 AS seq FROM event WHERE aggregate_id = ?")
+    .get(sessionID)!.seq
+  db.query("INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)").run(
+    "unknown-online-owner-event",
+    sessionID,
+    nextSequence,
+    unknownType,
+    "{}",
   )
-  afterStartup.close()
-  expect(missingAfterStartup.map((index) => index.name)).toEqual(
-    OnlineReclaimIndexes.definitions.map((index) => index.name),
-  )
-
-  const holder = startProducer(store, {
-    readerAfterSignal: { readyFile: path.join(store.directory, "online-index-prep-reader-ready") },
-  })
-  await readMatchingLine(holder, "PRUNE_READER_READY ")
-  try {
-    const refused = parseReport(
-      await runCLI(store, ["--database", store.filename, "--prepare-online-indexes"], "nonzero"),
-    )
-    expect(refused.action).toBe("refused")
-    expect(refused.refusalReasons).toContain(`database-holder-present:${holder.child.pid}`)
-    expect(refused.createdIndexes).toEqual([])
-  } finally {
-    holder.child.stdin.end()
-    assertChildOutcome(await holder.finish(), 0)
-  }
-
-  const prepared = parseReport(await runCLI(store, ["--database", store.filename, "--prepare-online-indexes"]))
-  expect(prepared.action).toBe("prepared")
-  expect(prepared.createdIndexes).toEqual(OnlineReclaimIndexes.definitions.map((index) => index.name))
-  expect(prepared.remainingIndexes).toEqual([])
-
-  const resumed = parseReport(await runCLI(store, ["--database", store.filename, "--prepare-online-indexes"]))
-  expect(resumed.action).toBe("prepared")
-  expect(resumed.createdIndexes).toEqual([])
-  expect(resumed.remainingIndexes).toEqual([])
+  db.query("UPDATE event_sequence SET seq = ? WHERE aggregate_id = ?").run(nextSequence, sessionID)
+  db.exec("DROP INDEX IF EXISTS event_aggregate_unknown_type_idx")
+  db.close()
+  await rm(store.project, { recursive: true })
 
   const inventory = await invokeHandler(store, {
     database: store.filename,
@@ -1081,8 +1079,221 @@ test.serial("online proof indexes are prepared offline and are not rebuilt at st
     session: [sessionID],
     reserveBytes: 1,
   })
-  expect(inventory.report.reclamation.reasons.some((reason) => reason.startsWith("online-"))).toBe(false)
+  expect(inventory.report.reclamation.ready).toBe(true)
+  expect(inventory.report.excludedSessions.find((item) => item.sessionID === sessionID)?.reasons).toContain(
+    `unknown-durable-event-owner:${unknownType}`,
+  )
 })
+
+test.serial(
+  "online apply advances bounded proof pages while a live writer commits",
+  async () => {
+    if (process.platform !== "linux") return
+    await using store = await producedStore([{}, {}])
+    const sessionID = store.metadata[0]!.created[0]!.id
+    const peerID = store.metadata[1]!.created[0]!.id
+    const messageID = store.metadata[0]!.created[0]!.messageID
+    const db = new Database(store.filename)
+    const queueInsert = db.query(
+      `INSERT INTO session_prompt_queue (id, session_id, seq, delivery, input, time_created, time_promoted)
+     VALUES (?, ?, ?, 'queue', '{}', 0, 1)`,
+    )
+    const aliasInsert = db.query("INSERT INTO session_prompt_queue_alias (id, item_id) VALUES (?, ?)")
+    const partInsert = db.query(
+      `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+     VALUES (?, ?, ?, 0, 0, '{}')`,
+    )
+    const writerInsert = db.query(
+      `INSERT INTO event_writer_process (writer_id, pid, boot_id, start_ticks, time_registered)
+     VALUES (?, ?, ?, ?, ?)`,
+    )
+    db.transaction(() => {
+      Array.from({ length: 300 }, (_, index) => index).forEach((index) => {
+        const queueID = `que_live_proof_${String(index).padStart(4, "0")}`
+        queueInsert.run(queueID, sessionID, 400_000 + index)
+        aliasInsert.run(`alias_live_proof_${String(index).padStart(4, "0")}`, queueID)
+        partInsert.run(`part_live_proof_${String(index).padStart(4, "0")}`, messageID, sessionID)
+        writerInsert.run(`writer_live_proof_${String(index).padStart(4, "0")}`, 900_000 + index, "old-boot", "1", index)
+      })
+      partInsert.run("part_live_proof_cross", messageID, peerID)
+    })()
+    const before = ownedCounts(store.filename, sessionID)
+    db.exec(`
+    DELETE FROM online_reclaim_cross_session_part;
+    DELETE FROM online_reclaim_cross_part_scope;
+    DELETE FROM online_reclaim_cross_part_message;
+    DELETE FROM online_reclaim_queue_alias_scope;
+    DELETE FROM online_reclaim_queue_alias_owner;
+    DELETE FROM online_reclaim_writer_lifetime;
+    UPDATE online_reclaim_backfill
+    SET cursor = 0, high_water = -1, complete = 0
+    WHERE name = 'cross-session-part-scope';
+    UPDATE online_reclaim_backfill
+    SET cursor = 0, high_water = -1, complete = 0
+    WHERE name = 'cross-session-parts';
+    UPDATE online_reclaim_backfill
+    SET cursor = 0, high_water = (SELECT coalesce(max(rowid), 0) FROM session_prompt_queue_alias), complete = 0
+    WHERE name = 'queue-alias-scope';
+    UPDATE online_reclaim_stable_backfill
+    SET cursor = '', cursor_secondary = '', cursor_started = 0,
+        high_water = '', high_water_secondary = '', high_water_present = 0, complete = 0
+    WHERE name IN ('queue-alias-owners', 'event-writer-lifetimes');
+  `)
+    db.close()
+
+    const reader = startProducer(store, {
+      readerAfterSignal: { readyFile: path.join(store.directory, "online-proof-live-reader-ready") },
+    })
+    const readerReady = await readMatchingLine(reader, "PRUNE_READER_READY ")
+    const startFile = path.join(store.directory, "online-proof-live-writer-start")
+    const writerClosedFile = path.join(store.directory, "online-proof-live-writer-closed")
+    const writer = startProducer(store, {
+      queueAfterSignal: {
+        sessionID: peerID,
+        startFile,
+        readyFile: path.join(store.directory, "online-proof-live-writer-ready"),
+        closedFile: writerClosedFile,
+        registerBeforeSignal: true,
+        appendEvent: true,
+      },
+    })
+    await readMatchingLine(writer, "PRUNE_REGISTERED ")
+
+    const originalQuery = Database.prototype.query
+    const originalExec = Database.prototype.exec
+    let proofWriteSeen = false
+    let writerSignalled = false
+    let writerClosed = false
+    const sourceIndexBuilds = new Array<string>()
+    const query = spyOn(Database.prototype, "query").mockImplementation(function <
+      ReturnType,
+      ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+    >(this: Database, statement: string) {
+      if (statement.includes("INSERT INTO online_reclaim_cross_part_scope")) proofWriteSeen = true
+      return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+    })
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+      const result = originalExec.call(this, statement)
+      if (/^CREATE\s+(?:UNIQUE\s+)?INDEX\b/i.test(statement.trimStart())) sourceIndexBuilds.push(statement)
+      if (statement === "COMMIT" && proofWriteSeen && !writerSignalled) {
+        writerSignalled = true
+        writeFileSync(startFile, "start\n")
+        const deadline = Date.now() + 20_000
+        const wait = new Int32Array(new SharedArrayBuffer(4))
+        while (!existsSync(writerClosedFile)) {
+          if (Date.now() >= deadline) throw new Error("live proof producer did not commit after the proof batch")
+          Atomics.wait(wait, 0, 0, 5)
+        }
+        writerClosed = true
+      }
+      return result
+    })
+    try {
+      const result = await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        session: [sessionID],
+        apply: true,
+        reserveBytes: 1,
+        batchRows: 1,
+        maxBatches: 1,
+      })
+      expect(writerSignalled).toBe(true)
+      expect(writerClosed).toBe(true)
+      expect(readerReady).toContain(String(reader.child.pid))
+      const proofPreparation = result.report.proofPreparation
+      expect(proofPreparation).toEqual({
+        complete: true,
+        batches: expect.any(Number),
+        rows: expect.any(Number),
+        remaining: [],
+      })
+      if (!proofPreparation) throw new Error("online apply did not report proof preparation progress")
+      expect(proofPreparation.batches).toBeGreaterThan(1)
+      expect(proofPreparation.rows).toBeGreaterThan(600)
+      expect(sourceIndexBuilds).toEqual([])
+      expect(result.report.changedRows).toBe(0)
+      expect(result.report.refusalReasons).toContain("no-eligible-sessions")
+      expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+    } finally {
+      exec.mockRestore()
+      query.mockRestore()
+      if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
+      assertChildOutcome(await writer.finish(), 0)
+      reader.child.stdin.end()
+      assertChildOutcome(await reader.finish(), 0)
+    }
+  },
+  60_000,
+)
+
+test.serial(
+  "online apply caps proof batches and resumes the same existing-store census",
+  async () => {
+    await using store = await producedStore([{}])
+    const sessionID = store.metadata[0]!.created[0]!.id
+    const db = new Database(store.filename)
+    const insert = db.query(
+      `INSERT INTO event_writer_process (writer_id, pid, boot_id, start_ticks, time_registered)
+     VALUES (?, ?, ?, ?, ?)`,
+    )
+    db.transaction(() =>
+      Array.from({ length: 20_000 }, (_, index) => index).forEach((index) => {
+        insert.run(
+          `zzzz_online_proof_history_${String(index).padStart(5, "0")}`,
+          1_000_000 + index,
+          "old-boot",
+          "1",
+          index,
+        )
+      }),
+    )()
+    db.query(
+      `INSERT INTO session_prompt_queue (id, session_id, seq, delivery, input, time_created)
+     VALUES ('que_online_proof_gate', ?, 900_000, 'queue', '{}', 0)`,
+    ).run(sessionID)
+    db.exec(`
+    DELETE FROM online_reclaim_writer_lifetime;
+    UPDATE online_reclaim_stable_backfill
+    SET cursor = '', cursor_secondary = '', cursor_started = 0,
+        high_water = '', high_water_secondary = '', high_water_present = 0, complete = 0
+    WHERE name = 'event-writer-lifetimes';
+  `)
+    db.close()
+    const before = ownedCounts(store.filename, sessionID)
+
+    const first = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      apply: true,
+      reserveBytes: 1,
+    })
+    expect(first.report.action).toBe("refused")
+    expect(first.report.committed).toBe(false)
+    expect(first.report.changedRows).toBe(0)
+    expect(first.report.proofPreparation?.complete).toBe(false)
+    expect(first.report.proofPreparation?.batches).toBe(128)
+    expect(first.report.proofPreparation?.rows).toBeLessThanOrEqual(16_384)
+    expect(first.report.refusalReasons).toContain("online-proof-backfill-incomplete:event-writer-lifetimes")
+    expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+
+    const second = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      apply: true,
+      reserveBytes: 1,
+    })
+    expect(second.report.proofPreparation?.complete).toBe(true)
+    expect(second.report.proofPreparation?.batches).toBeLessThan(128)
+    expect(second.report.action).toBe("refused")
+    expect(second.report.committed).toBe(false)
+    expect(second.report.changedRows).toBe(0)
+    expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+  },
+  120_000,
+)
 
 test.serial("online prune bounds alias proofs across long alias-free and alias-sparse queue histories", async () => {
   await using store = await producedStore([{}])
@@ -1104,6 +1315,17 @@ test.serial("online prune bounds alias proofs across long alias-free and alias-s
      VALUES (?, ?, 1)
      ON CONFLICT(session_id) DO UPDATE SET seq = excluded.seq, aliases_indexed = 1`,
   ).run(sessionID, firstSequence + queueRows - 1)
+  const openQueueRows = db
+    .query<
+      { id: string; time_promoted: number | null; time_withdrawn: number | null; time_preparing: number | null },
+      [string]
+    >(
+      `SELECT id, time_promoted, time_withdrawn, time_preparing FROM session_prompt_queue
+       WHERE session_id = ? AND ((time_promoted IS NULL AND time_withdrawn IS NULL) OR time_preparing IS NOT NULL)
+       LIMIT 2`,
+    )
+    .all(sessionID)
+  if (openQueueRows.length > 0) throw new Error(JSON.stringify(openQueueRows))
   db.close()
   await rm(store.project, { recursive: true })
 
@@ -1128,10 +1350,14 @@ test.serial("online prune bounds alias proofs across long alias-free and alias-s
     )
     .run()
   alias
+    .query("DELETE FROM online_reclaim_queue_alias_owner WHERE item_id = ? AND alias_id = ?")
+    .run(lastQueueID, "prt_alias_long_gap")
+  alias
     .query(
-      `UPDATE online_reclaim_backfill
-       SET cursor = 0, high_water = (SELECT max(rowid) FROM session_prompt_queue_alias), complete = 0
-       WHERE name = 'queue-alias-scope'`,
+      `UPDATE online_reclaim_stable_backfill
+       SET cursor = '', cursor_secondary = '', cursor_started = 0,
+           high_water = '', high_water_secondary = '', high_water_present = 0, complete = 0
+       WHERE name = 'queue-alias-owners'`,
     )
     .run()
   alias.close()
@@ -1143,22 +1369,50 @@ test.serial("online prune bounds alias proofs across long alias-free and alias-s
     reserveBytes: 1,
   })
   expect(pending.report.reclamation.ready).toBe(false)
-  expect(pending.report.reclamation.reasons).toContain("online-proof-backfill-incomplete:queue-alias-scope")
-  const prepared = parseReport(await runCLI(store, ["--database", store.filename, "--prepare-online-indexes"]))
-  expect(prepared.action).toBe("prepared")
+  expect(pending.report.reclamation.reasons).toContain("online-proof-backfill-incomplete:queue-alias-owners")
+  const gateQueueID = "que_alias_proof_pending_gate"
+  const gate = new Database(store.filename)
+  gate
+    .query(
+      `INSERT INTO session_prompt_queue (id, session_id, seq, delivery, input, time_created)
+       VALUES (?, ?, ?, 'queue', '{}', 0)`,
+    )
+    .run(gateQueueID, sessionID, firstSequence + queueRows)
+  gate.close()
+  await mkdir(store.project, { recursive: true })
+  const appliedProof = await invokeHandler(store, {
+    database: store.filename,
+    online: true,
+    session: [sessionID],
+    apply: true,
+    reserveBytes: 1,
+    batchRows: 1,
+    maxBatches: 2,
+  })
+  expect(appliedProof.report.proofPreparation?.complete).toBe(true)
   const proof = new Database(store.filename)
   const aliasRow = proof
-    .query<{ alias_rowid: number; mapped_rowid: number; owner_session_id: string }, [string]>(
-      `SELECT alias.rowid AS alias_rowid, scope.alias_rowid AS mapped_rowid, scope.owner_session_id
+    .query<
+      { alias_id: string; item_id: string; owner_alias_id: string; owner_item_id: string; owner_session_id: string },
+      [string]
+    >(
+      `SELECT alias.id AS alias_id, alias.item_id AS item_id,
+              owner.alias_id AS owner_alias_id, owner.item_id AS owner_item_id, owner.owner_session_id
        FROM session_prompt_queue_alias alias
-       JOIN online_reclaim_queue_alias_scope scope ON scope.alias_rowid = alias.rowid
+       JOIN online_reclaim_queue_alias_owner owner
+         ON owner.alias_id = alias.id AND owner.item_id = alias.item_id
        WHERE alias.item_id = ?`,
     )
     .get(lastQueueID)
   if (!aliasRow) throw new Error("prepared alias census omitted its owner-scoped row")
   expect(aliasRow.owner_session_id).toBe(sessionID)
-  expect(aliasRow.mapped_rowid).toBe(aliasRow.alias_rowid)
+  expect(aliasRow.owner_alias_id).toBe(aliasRow.alias_id)
+  expect(aliasRow.owner_item_id).toBe(aliasRow.item_id)
   proof.close()
+  await rm(store.project, { recursive: true, force: true })
+  const releaseGate = new Database(store.filename)
+  releaseGate.query("UPDATE session_prompt_queue SET time_promoted = 1 WHERE id = ?").run(gateQueueID)
+  releaseGate.close()
 
   const aliasStatements = new Array<string>()
   const originalQuery = Database.prototype.query
@@ -1166,7 +1420,11 @@ test.serial("online prune bounds alias proofs across long alias-free and alias-s
     ReturnType,
     ParamsType extends SQLQueryBindings | SQLQueryBindings[],
   >(this: Database, statement: string) {
-    if (statement.startsWith("SELECT") && statement.includes("online_reclaim_queue_alias_scope"))
+    if (
+      statement.startsWith("SELECT") &&
+      statement.includes("online_reclaim_queue_alias_owner") &&
+      statement.includes("owner_session_id = ?")
+    )
       aliasStatements.push(statement)
     return (originalQuery<ReturnType, ParamsType>).call(this, statement)
   })
@@ -1190,10 +1448,12 @@ test.serial("online prune bounds alias proofs across long alias-free and alias-s
   expect(result.report.committed).toBe(true)
   expect(result.report.changedRowsByTable?.session_prompt_queue).toBe(1)
   expect(result.report.changedRowsByTable?.session_prompt_queue_alias).toBe(1)
-  expect(aliasStatements.some((statement) => statement.includes("SELECT alias_rowid"))).toBe(true)
+  expect(
+    aliasStatements.some((statement) => statement.includes("scope.item_id") && statement.includes("scope.alias_id")),
+  ).toBe(true)
   expect(aliasStatements.some((statement) => statement.includes('JOIN "session_prompt_queue_alias" alias'))).toBe(true)
   expect(aliasStatements.every((statement) => !statement.includes("JOIN session_prompt_queue queue"))).toBe(true)
-  expect(aliasStatements.some((statement) => statement.includes("scope.alias_rowid <= ?"))).toBe(true)
+  expect(aliasStatements.every((statement) => !statement.includes("scope.alias_rowid"))).toBe(true)
 
   const explain = new Database(store.filename, { readonly: true })
   try {
@@ -1205,7 +1465,7 @@ test.serial("online prune bounds alias proofs across long alias-free and alias-s
         .query<{ detail: string }, SQLQueryBindings[]>(`EXPLAIN QUERY PLAN ${statement}`)
         .all(...bindings)
         .map((row) => row.detail)
-      expect(details.some((detail) => detail.includes("online_reclaim_queue_alias_session_rowid_idx"))).toBe(true)
+      expect(details.some((detail) => detail.includes("online_reclaim_queue_alias_owner_session_idx"))).toBe(true)
       expect(details.some((detail) => detail.includes("session_prompt_queue_session_seq_idx"))).toBe(false)
     }
   } finally {
@@ -1368,32 +1628,39 @@ test("online prune revalidates and completes a durable event history over severa
   const cutoffAt = Date.now() - 5
   const cutoff = new Date(cutoffAt).toISOString()
   backdateSession(store.filename, sessionID, cutoffAt - 1_000)
+  await rm(store.project, { recursive: true })
 
-  const applied = parseReport(
-    await runCLI(
-      store,
-      [
-        "--online",
-        "--before",
-        cutoff,
-        "--session",
-        sessionID,
-        "--apply",
-        "--reserve-bytes",
-        "1",
-        "--batch-rows",
-        "256",
-        "--max-batches",
-        "10",
-      ],
-      0,
-      { timeout: 90_000 },
-    ),
-  )
-  expect(applied.action).toBe("applied")
-  expect(applied.deletedSessionIDs).toEqual([sessionID])
-  expect(applied.batches!.length).toBeGreaterThan(1)
-  expect(applied.batches!.every((batch) => Number(batch.changedRows) <= 256)).toBe(true)
+  const sequenceRevalidations = new Array<{ inTransaction: boolean }>()
+  const originalQuery = Database.prototype.query
+  const query = spyOn(Database.prototype, "query").mockImplementation(function <
+    ReturnType,
+    ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+  >(this: Database, statement: string) {
+    if (statement.includes("SELECT seq, owner_id FROM event_sequence"))
+      sequenceRevalidations.push({ inTransaction: this.inTransaction })
+    return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+  })
+  const applied = await (async () => {
+    try {
+      return await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        before: cutoff,
+        session: [sessionID],
+        apply: true,
+        reserveBytes: 1,
+        batchRows: 256,
+        maxBatches: 10,
+      })
+    } finally {
+      query.mockRestore()
+    }
+  })()
+  expect(applied.report.action).toBe("applied")
+  expect(applied.report.deletedSessionIDs).toEqual([sessionID])
+  expect(applied.report.batches!.length).toBeGreaterThan(1)
+  expect(applied.report.batches!.every((batch) => Number(batch.changedRows) <= 256)).toBe(true)
+  expect(sequenceRevalidations.filter((item) => item.inTransaction).length).toBeGreaterThan(1)
   expect(Object.values(ownedCounts(store.filename, sessionID)).every((count) => count === 0)).toBe(true)
 })
 
@@ -1634,14 +1901,20 @@ test("online inventory backfills and refuses historical cross-session Parts befo
   const parentBefore = ownedCounts(store.filename, parentID)
   const otherBefore = ownedCounts(store.filename, otherID)
   const prepare = new Database(store.filename)
+  const crossPartID = prepare
+    .query<{ id: string }, [string, string]>("SELECT id FROM part WHERE message_id = ? AND session_id = ?")
+    .get(parent.created[0]!.messageID, otherID)?.id
+  if (!crossPartID) throw new Error("cross-Session Part fixture was not recorded")
   prepare
     .query("DELETE FROM online_reclaim_cross_session_part WHERE message_id = ? AND child_session_id = ?")
     .run(parent.created[0]!.messageID, otherID)
+  prepare.query("DELETE FROM online_reclaim_cross_part_scope WHERE part_id = ?").run(crossPartID)
+  prepare.query("DELETE FROM online_reclaim_cross_part_message WHERE part_id = ?").run(crossPartID)
   prepare
     .query(
       `UPDATE online_reclaim_backfill
-     SET cursor = 0, high_water = (SELECT coalesce(max(rowid), 0) FROM part), complete = 0
-     WHERE name = 'cross-session-parts'`,
+       SET cursor = 0, high_water = -1, complete = 0
+       WHERE name = 'cross-session-part-scope'`,
     )
     .run()
   prepare.close()
@@ -1650,10 +1923,22 @@ test("online inventory backfills and refuses historical cross-session Parts befo
     await runCLI(store, ["--online", "--before", cutoff, "--session", parentID, "--reserve-bytes", "1"]),
   )
   expect(pending.reclamation.ready).toBe(false)
-  expect(pending.reclamation.reasons).toContain("online-proof-backfill-incomplete:cross-session-parts")
+  expect(pending.reclamation.reasons).toContain("online-proof-backfill-incomplete:cross-session-part-scope")
 
-  const prepared = parseReport(await runCLI(store, ["--database", store.filename, "--prepare-online-indexes"]))
-  expect(prepared.action).toBe("prepared")
+  const applied = parseReport(
+    await runCLI(
+      store,
+      ["--online", "--before", cutoff, "--session", parentID, "--apply", "--reserve-bytes", "1"],
+      "nonzero",
+    ),
+  )
+  expect(applied.proofPreparation?.complete).toBe(true)
+  expect(applied.action).toBe("refused")
+  expect(applied.committed).toBe(false)
+  expect(applied.changedRows).toBe(0)
+  expect(applied.refusalReasons).toContain(
+    `cross-session-cascade:part.message_id:${parent.created[0]!.messageID}:${parentID}->${otherID}`,
+  )
 
   const inventory = parseReport(
     await runCLI(store, ["--online", "--before", cutoff, "--session", parentID, "--reserve-bytes", "1"]),
@@ -1663,16 +1948,6 @@ test("online inventory backfills and refuses historical cross-session Parts befo
   expect(inventory.excludedSessions.find((item) => item.sessionID === parentID)?.reasons).toContain(
     `cross-session-cascade:part.message_id:${parent.created[0]!.messageID}:${parentID}->${otherID}`,
   )
-  const applied = parseReport(
-    await runCLI(
-      store,
-      ["--online", "--before", cutoff, "--session", parentID, "--apply", "--reserve-bytes", "1"],
-      "nonzero",
-    ),
-  )
-  expect(applied.action).toBe("refused")
-  expect(applied.committed).toBe(false)
-  expect(applied.changedRows).toBe(0)
   expect(applied.deletedSessionIDs).toEqual([])
   expect(applied.partialSessionIDs).toEqual([])
   expect(applied.changedRowsByTable?.message ?? 0).toBe(0)
@@ -1726,7 +2001,7 @@ test.serial("online prune preserves a late cross-session Part before deleting it
     ReturnType,
     ParamsType extends SQLQueryBindings | SQLQueryBindings[],
   >(this: Database, statement: string) {
-    if (statement.includes("FROM part INDEXED BY part_message_id_session_idx") && !statement.startsWith("EXPLAIN"))
+    if (statement.includes("FROM online_reclaim_cross_part_message") && !statement.startsWith("EXPLAIN"))
       queryOrder.push("cross-reference-check")
     if (statement.startsWith('DELETE FROM "message"')) queryOrder.push("message-delete")
     return (originalQuery<ReturnType, ParamsType>).call(this, statement)
@@ -2643,7 +2918,7 @@ test("recent activity on an old-created Session protects it while an equally old
   )
 })
 
-test.serial("online inventory finds the maximum Message update time without walking history", async () => {
+test.serial("online inventory finds maximum Message activity through its Session index", async () => {
   await using store = await producedStore([{}])
   const sessionID = store.metadata[0]!.created[0]!.id
   await produceLive(store, { bulkMessages: { sessionID, count: 100 } })
@@ -2660,7 +2935,10 @@ test.serial("online inventory finds the maximum Message update time without walk
     ReturnType,
     ParamsType extends SQLQueryBindings | SQLQueryBindings[],
   >(this: Database, statement: string) {
-    if (!statement.startsWith("EXPLAIN") && statement.startsWith('SELECT "time_updated" AS activity FROM "message"'))
+    if (
+      !statement.startsWith("EXPLAIN") &&
+      statement.startsWith('SELECT max("time_updated") AS activity FROM "message"')
+    )
       activityStatements.push(statement)
     return (originalQuery<ReturnType, ParamsType>).call(this, statement)
   })
@@ -2677,18 +2955,25 @@ test.serial("online inventory finds the maximum Message update time without walk
       query.mockRestore()
     }
   })()
-  const activityStatement = activityStatements.find((statement) => statement.includes('ORDER BY "time_updated" DESC'))
-  if (!activityStatement) throw new Error("inventory did not execute the Message update-time seek")
-  const bytecode = new Database(store.filename, { readonly: true })
-  const opcodes = bytecode
+  const activityStatement = activityStatements[0]
+  if (!activityStatement) throw new Error("inventory did not execute the Message update-time aggregate")
+  const plan = new Database(store.filename, { readonly: true })
+  const details = plan
     .query<{ opcode: string }, [string]>(`EXPLAIN ${activityStatement}`)
-    .all("online-index-probe")
+    .all(sessionID)
     .map((row) => row.opcode)
-  bytecode.close()
-  expect(activityStatement).toContain("LIMIT 1")
-  expect(opcodes).toContain("DecrJumpZero")
-  expect(opcodes).not.toContain("AggStep")
-  expect(opcodes).not.toContain("Next")
+  const queryPlan = plan
+    .query<{ detail: string }, [string]>(`EXPLAIN QUERY PLAN ${activityStatement}`)
+    .all(sessionID)
+    .map((row) => row.detail)
+    .join("\n")
+  plan.close()
+  expect(activityStatement).toContain("HAVING count(*) > 0")
+  expect(details).toContain("AggStep")
+  expect(queryPlan).toContain("SEARCH message USING")
+  expect(queryPlan).toContain("message_session_time_updated_id_idx")
+  expect(queryPlan).not.toContain("SCAN message")
+  expect(queryPlan).not.toContain("USE TEMP B-TREE")
   expect(result.report.action).toBe("inventory")
   expect(result.report.reclamation.ready).toBe(true)
   expect(result.report.excludedSessions.find((item) => item.sessionID === sessionID)?.reasons).toContain(

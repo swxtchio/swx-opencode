@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "636aedeb-485e-48ff-bc37-a7ba73f6a58a",
+  "id": "d248ded2-2167-49a1-8dcf-086819912d45",
   "prevIds": [
-    "4ea4b288-4aaf-46e7-844f-117a8ea9084a"
+    "636aedeb-485e-48ff-bc37-a7ba73f6a58a"
   ],
   "ddl": [
     {
@@ -19,7 +19,19 @@
       "entityType": "tables"
     },
     {
+      "name": "online_reclaim_cross_part_message",
+      "entityType": "tables"
+    },
+    {
+      "name": "online_reclaim_cross_part_scope",
+      "entityType": "tables"
+    },
+    {
       "name": "online_reclaim_cross_session_part",
+      "entityType": "tables"
+    },
+    {
+      "name": "online_reclaim_queue_alias_owner",
       "entityType": "tables"
     },
     {
@@ -280,6 +292,106 @@
     },
     {
       "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "message_id",
+      "entityType": "columns",
+      "table": "online_reclaim_cross_part_message"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "child_session_id",
+      "entityType": "columns",
+      "table": "online_reclaim_cross_part_message"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "part_id",
+      "entityType": "columns",
+      "table": "online_reclaim_cross_part_message"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "parent_session_id",
+      "entityType": "columns",
+      "table": "online_reclaim_cross_part_message"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "online_reclaim_cross_part_scope"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "part_id",
+      "entityType": "columns",
+      "table": "online_reclaim_cross_part_scope"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "message_id",
+      "entityType": "columns",
+      "table": "online_reclaim_cross_part_scope"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "parent_session_id",
+      "entityType": "columns",
+      "table": "online_reclaim_cross_part_scope"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "child_session_id",
+      "entityType": "columns",
+      "table": "online_reclaim_cross_part_scope"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "role",
+      "entityType": "columns",
+      "table": "online_reclaim_cross_part_scope"
+    },
+    {
+      "type": "text",
       "notNull": false,
       "autoincrement": false,
       "default": null,
@@ -317,6 +429,36 @@
       "name": "child_session_id",
       "entityType": "columns",
       "table": "online_reclaim_cross_session_part"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "item_id",
+      "entityType": "columns",
+      "table": "online_reclaim_queue_alias_owner"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "alias_id",
+      "entityType": "columns",
+      "table": "online_reclaim_queue_alias_owner"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_session_id",
+      "entityType": "columns",
+      "table": "online_reclaim_queue_alias_owner"
     },
     {
       "type": "integer",
@@ -2625,6 +2767,37 @@
     },
     {
       "columns": [
+        "message_id",
+        "child_session_id",
+        "part_id"
+      ],
+      "nameExplicit": false,
+      "name": "online_reclaim_cross_part_message_pk",
+      "entityType": "pks",
+      "table": "online_reclaim_cross_part_message"
+    },
+    {
+      "columns": [
+        "session_id",
+        "part_id"
+      ],
+      "nameExplicit": false,
+      "name": "online_reclaim_cross_part_scope_pk",
+      "entityType": "pks",
+      "table": "online_reclaim_cross_part_scope"
+    },
+    {
+      "columns": [
+        "item_id",
+        "alias_id"
+      ],
+      "nameExplicit": false,
+      "name": "online_reclaim_queue_alias_owner_pk",
+      "entityType": "pks",
+      "table": "online_reclaim_queue_alias_owner"
+    },
+    {
+      "columns": [
         "pid",
         "boot_id",
         "start_ticks"
@@ -2931,6 +3104,42 @@
     {
       "columns": [
         {
+          "value": "session_id",
+          "isExpression": false
+        },
+        {
+          "value": "part_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"online_reclaim_cross_part_scope\".\"role\" IN ('owned', 'child')",
+      "origin": "manual",
+      "name": "online_reclaim_cross_part_scope_owner_idx",
+      "entityType": "indexes",
+      "table": "online_reclaim_cross_part_scope"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        },
+        {
+          "value": "part_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"online_reclaim_cross_part_scope\".\"role\" IN ('parent', 'child')",
+      "origin": "manual",
+      "name": "online_reclaim_cross_part_scope_cross_idx",
+      "entityType": "indexes",
+      "table": "online_reclaim_cross_part_scope"
+    },
+    {
+      "columns": [
+        {
           "value": "parent_session_id",
           "isExpression": false
         }
@@ -2955,6 +3164,28 @@
       "name": "online_reclaim_cross_part_child_idx",
       "entityType": "indexes",
       "table": "online_reclaim_cross_session_part"
+    },
+    {
+      "columns": [
+        {
+          "value": "owner_session_id",
+          "isExpression": false
+        },
+        {
+          "value": "item_id",
+          "isExpression": false
+        },
+        {
+          "value": "alias_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "online_reclaim_queue_alias_owner_session_idx",
+      "entityType": "indexes",
+      "table": "online_reclaim_queue_alias_owner"
     },
     {
       "columns": [
