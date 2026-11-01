@@ -856,6 +856,7 @@ test("online prune bounds one large Session, retries partial progress, and never
   expect(ownedCounts(store.filename, selectedID)).not.toEqual(beforeSelected)
   expect(ownedCounts(store.filename, unselectedID)).toEqual(beforeUnselected)
 
+  const transientReclamationReasons = new Set(["wal-checkpoint-incomplete"])
   const beforeReclaimOnly = ownedCounts(store.filename, selectedID)
   const reclaimedOnly = (
     await invokeHandler(store, {
@@ -866,8 +867,12 @@ test("online prune bounds one large Session, retries partial progress, and never
       reserveBytes: 1,
     })
   ).report
-  expect(["applied", "failed", "refused"]).toContain(reclaimedOnly.action)
-  if (reclaimedOnly.action !== "applied") expect(reclaimedOnly.refusalReasons?.length ?? 0).toBeGreaterThan(0)
+  const reclaimOnlyWasTransient =
+    reclaimedOnly.action === "failed" &&
+    reclaimedOnly.refusalReasons?.length === 1 &&
+    transientReclamationReasons.has(reclaimedOnly.refusalReasons[0] ?? "")
+  if (reclaimedOnly.action !== "applied" && !reclaimOnlyWasTransient)
+    throw new Error(`unexpected reclaim-only report: ${JSON.stringify(reclaimedOnly, null, 2)}`)
   expect(reclaimedOnly.changedRows).toBe(0)
   expect(reclaimedOnly.deletedSessionIDs).toEqual([])
   expect(reclaimedOnly.rawTranscriptWarning).toContain("does not delete Session history")
@@ -885,8 +890,12 @@ test("online prune bounds one large Session, retries partial progress, and never
       reserveBytes: 1,
     })
   ).report
-  expect(["applied", "failed"]).toContain(completed.action)
-  if (completed.action === "failed") expect(completed.refusalReasons?.length ?? 0).toBeGreaterThan(0)
+  const completionWasTransient =
+    completed.action === "failed" &&
+    completed.refusalReasons?.length === 1 &&
+    transientReclamationReasons.has(completed.refusalReasons[0] ?? "")
+  if (completed.action !== "applied" && !completionWasTransient)
+    throw new Error(`unexpected completed prune report: ${JSON.stringify(completed, null, 2)}`)
   expect(completed.deletedSessionIDs).toEqual([selectedID])
   expect(completed.changedRows).toBe(remainingRows)
   expect(completed.partialSessionIDs).toEqual([])
