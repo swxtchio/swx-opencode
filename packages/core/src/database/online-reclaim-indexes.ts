@@ -33,4 +33,4 @@ export const definitions = [
     name: "online_reclaim_cross_part_scope_cross_idx",
     statement: `CREATE INDEX IF NOT EXISTS "online_reclaim_cross_part_scope_cross_idx" ON "online_reclaim_cross_part_scope" ("session_id","part_id") WHERE "role" IN ('parent', 'child');`,
   },
-] satisfies readonly { table: string; name: string; statement: string; refreshWhenChanged?: boolean }[]
+] satisfies readonly { table: string; name: string; statement: string }[]

@@ -11,7 +11,7 @@ Authority: swxtchio/swx-opencode#353, its [published producer contract](https://
 - Emit one JSON result on stdout, keep diagnostics on stderr, and preserve committed progress, completed and remaining Sessions, protected residue, outstanding checkpoint/freelist work, per-batch lock duration, and separate page and filesystem-allocation measurements across failures and retries.
 - The producer contract is published in [issue #353](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6537686549), with its [limit clarification](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6537694254) and [round-two correction](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6541481027); implementation guidance is recorded in `docs/dead-session-retirement.md` and `CHANGESET.md`. Producer-driven CLI tests cover >10k-row adversarially ordered histories, indexed-proof plan refusals, reader-pinned reclaim debt, Session-row byte/capacity limits, bounded partial work, late cross-Session Parts and live-writer progress.
 
-## Round-three correction sequence
+## Round-four correction sequence
 
 The round-four corrections preserve the no-validation-row-cap contract and make existing-store proof preparation live-safe:
 
