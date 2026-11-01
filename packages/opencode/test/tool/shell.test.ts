@@ -301,6 +301,15 @@ const observeShellOutput = (group: ShellProcessGroup) => {
   group.observed = true
 }
 
+const recordDescendant = Effect.fnUntraced(function* (group: ShellProcessGroup, pidFile: string) {
+  const pid = Number(yield* Effect.promise(() => Bun.file(pidFile).text()))
+  if (!Number.isSafeInteger(pid) || pid <= 0 || !processGroupMembers(group.pgid).includes(pid)) return false
+  const identity = startIdentity(pid)
+  if (!identity || identity !== startIdentity(pid)) return false
+  group.members.set(pid, identity)
+  return true
+})
+
 const recordProcessGroup = (pid: number) => {
   const group = shellProcessGroups.get(pid) ?? { pgid: pid, members: new Map<number, string>(), observed: false }
   shellProcessGroups.set(pid, group)
@@ -1795,6 +1804,7 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
   clocked?: boolean
   liveKill?: boolean
   trackProcessGroup?: boolean
+  descendantPIDFile?: string
   checkUnwritten?: (input: InterruptOutputObservation) => void
   checkBeforeInterrupt?: (input: InterruptOutputObservation) => void
   checkRunning?: (input: RunningOutputObservation) => void
@@ -1807,6 +1817,7 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
   const downstream = { value: "" }
   const testClock = input.clocked ? yield* make() : undefined
   const shell = yield* tappedShell(chunks, consumed, testClock, input.liveKill, input.trackProcessGroup)
+  const descendantObserved = { value: false }
 
   yield* input.llm.tool(ShellID.ToolID, { command: input.command, description: "store test", timeout: input.timeout })
   const chat = yield* sessions.create({})
@@ -1913,6 +1924,9 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
       )
       yield* testClock.adjust(input.timeout + 100)
       yield* ready
+      const processGroup = shell.processGroup.value
+      if (input.descendantPIDFile && processGroup)
+        descendantObserved.value = yield* recordDescendant(processGroup, input.descendantPIDFile)
       const part = (yield* MessageV2.parts(assistant.id)).find(
         (part): part is SessionV1.ToolPart => part.type === "tool",
       )
@@ -1953,9 +1967,15 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
       )
     } else if (!testClock) {
       yield* ready
+      const processGroup = shell.processGroup.value
+      if (input.descendantPIDFile && processGroup)
+        descendantObserved.value = yield* recordDescendant(processGroup, input.descendantPIDFile)
       yield* Fiber.interrupt(run)
     } else {
       yield* ready
+      const processGroup = shell.processGroup.value
+      if (input.descendantPIDFile && processGroup)
+        descendantObserved.value = yield* recordDescendant(processGroup, input.descendantPIDFile)
       yield* testClock.adjust(OUTPUT_WRITE_INTERVAL_MS - 1)
       const part = (yield* MessageV2.parts(assistant.id)).find(
         (part): part is SessionV1.ToolPart => part.type === "tool",
@@ -2040,7 +2060,7 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
     // A running snapshot carries consumed output; the shell's initialization write carries an empty one.
     snapshots: writes.filter((write) => write.part.state.status === "running" && runningOutput(write.part) !== ""),
     settled: parts.find((part): part is SessionV1.ToolPart => part.type === "tool"),
-    observedDescendant: processGroup ? processGroup.members.size > 1 : false,
+    observedDescendant: descendantObserved.value,
     processGroupEmpty: processGroup ? processGroupMembers(processGroup.pgid).length === 0 : true,
   }
 })
@@ -2194,13 +2214,15 @@ describe("tool.shell running output persistence", () => {
         ({ dir, llm }) =>
           Effect.gen(function* () {
             // Ignoring SIGTERM keeps the command running past cleanup's wait, so cleanup settles it from the store.
+            const descendantPIDFile = path.join(dir, "tail-child.pid")
             const result = yield* throughSession({
               dir,
               llm,
-              command: "trap '' TERM; echo tail-marker; while :; do sleep 0.1; done",
+              command: `trap 'trap - TERM; kill -TERM $$' TERM; sh -c 'trap "" TERM; exec sleep 1000' </dev/null >/dev/null 2>&1 & child=$!; printf '%s' "$child" > ${squote(descendantPIDFile)}; echo tail-marker; wait`,
               interruptOn: "tail-marker",
               clocked: true,
               trackProcessGroup: true,
+              descendantPIDFile,
               checkUnwritten: (before) => {
                 expect(before.part?.state.status).toBe("running")
                 expect(before.part ? runningOutput(before.part) : "").toBe("")
@@ -2212,6 +2234,7 @@ describe("tool.shell running output persistence", () => {
             if (result.settled?.state.status !== "error") return
             expect(result.settled.state.metadata?.interrupted).toBe(true)
             expect(result.settled.state.metadata?.output).toBe("tail-marker\n")
+            expect(result.observedDescendant).toBe(true)
             expect(result.processGroupEmpty).toBe(true)
           }),
         { config: storeConfig },
@@ -2226,13 +2249,14 @@ describe("tool.shell running output persistence", () => {
         ({ dir, llm }) =>
           Effect.gen(function* () {
             // The SIGTERM handler writes after the abort's own write, and the command outlives cleanup's wait.
+            const descendantPIDFile = path.join(dir, "term-tail-child.pid")
             const result = yield* throughSession({
               dir,
               llm,
-              command:
-                "trap 'echo term-tail; exit 0' TERM; sh -c 'trap \"\" TERM; exec sleep 1000' </dev/null >/dev/null 2>&1 & echo tail-marker; while :; do sleep 0.05; done",
+              command: `trap 'echo term-tail; exit 0' TERM; sh -c 'trap "" TERM; exec sleep 1000' </dev/null >/dev/null 2>&1 & child=$!; printf '%s' "$child" > ${squote(descendantPIDFile)}; echo tail-marker; wait`,
               interruptOn: "tail-marker",
               trackProcessGroup: true,
+              descendantPIDFile,
             })
             expect(result.observedDescendant).toBe(true)
             expect(result.processGroupEmpty).toBe(true)
@@ -2257,16 +2281,17 @@ describe("tool.shell running output persistence", () => {
           Effect.gen(function* () {
             // The timeout starts the kill, and the interruption arrives during it: the marker comes from the SIGTERM
             // handler, and the command outlives cleanup's wait.
+            const descendantPIDFile = path.join(dir, "timeout-tail-child.pid")
             const result = yield* throughSession({
               dir,
               llm,
-              command:
-                "trap 'echo timeout-tail; echo abort-marker; exit 0' TERM; sh -c 'trap \"\" TERM; exec sleep 1000' </dev/null >/dev/null 2>&1 & echo before-timeout; while :; do sleep 0.05; done",
+              command: `trap 'echo timeout-tail; echo abort-marker; exit 0' TERM; sh -c 'trap "" TERM; exec sleep 1000' </dev/null >/dev/null 2>&1 & child=$!; printf '%s' "$child" > ${squote(descendantPIDFile)}; echo before-timeout; wait`,
               timeout: 1000,
               interruptOn: "abort-marker",
               clocked: true,
               liveKill: false,
               trackProcessGroup: true,
+              descendantPIDFile,
               checkBeforeInterrupt: (state) => {
                 expect(state.completed).toBe(false)
                 expect(state.part?.state.status).toBe("running")
