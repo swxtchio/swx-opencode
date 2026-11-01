@@ -480,7 +480,11 @@ export const make = Effect.gen(function* () {
                     return yield* Effect.ignore(killGroup(command, proc, command.options.killSignal ?? "SIGTERM"))
                   return yield* cleanupGroup(command, proc, command.options.killSignal ?? "SIGTERM", forceKillAfter)
                 }
-                if (code !== 0 && Predicate.isNotNull(code)) return yield* Effect.ignore(kill(killGroup))
+                if (code !== 0 && Predicate.isNotNull(code)) {
+                  const forceKillAfter = command.options.forceKillAfter
+                  if (Predicate.isUndefined(forceKillAfter)) return yield* Effect.ignore(kill(killGroup))
+                  return yield* cleanupGroup(command, proc, command.options.killSignal ?? "SIGTERM", forceKillAfter)
+                }
                 return yield* Effect.void
               }
               const send = (s: NodeJS.Signals) =>

@@ -3,7 +3,7 @@ import fs from "node:fs/promises"
 import { readFileSync, readdirSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { Deferred, Duration, Effect, Exit, Fiber, Option, Stream } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Option, Stream } from "effect"
 import type * as PlatformError from "effect/PlatformError"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import type { ChildProcessHandle } from "effect/unstable/process/ChildProcessSpawner"
@@ -447,16 +447,17 @@ describe("cross-spawn spawner", () => {
         const group: RecordedProcessGroup = { pgid: undefined, members: [] }
         yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(group))
         const handle = yield* js(termExitingParent(resistantDescendant))
-        group.pgid = Number(handle.pid)
-        const leader = processIdentity(group.pgid)
+        const pgid = Number(handle.pid)
+        group.pgid = pgid
+        const leader = processIdentity(pgid)
         if (!leader?.bootID || !leader.startTicks) throw new Error("spawned leader has no recorded start identity")
         group.members.push(leader)
-        recordProcess(group.pgid, leader)
+        recordProcess(pgid, leader)
         const descendant = processIdentity(yield* processTreeReady(handle))
         if (!descendant?.bootID || !descendant.startTicks)
           throw new Error("spawned descendant has no recorded start identity")
         group.members.push(descendant)
-        recordProcess(group.pgid, descendant)
+        recordProcess(pgid, descendant)
         expect({ leader: sameProcess(leader), descendant: sameProcess(descendant) }).toEqual({
           leader: true,
           descendant: true,
@@ -609,6 +610,51 @@ describe("cross-spawn spawner", () => {
         })
         yield* Effect.all([run(0), run("0 millis")], { concurrency: 1 })
       }),
+    )
+
+    fx.live(
+      "reports group members when SIGKILL does not remove them within the final bound",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const group: RecordedProcessGroup = { pgid: undefined, members: [] }
+        yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(group))
+        const handle = yield* js(termExitingParent(resistantDescendant))
+        const pgid = Number(handle.pid)
+        group.pgid = pgid
+        const leader = processIdentity(pgid)
+        if (!leader?.bootID || !leader.startTicks) throw new Error("spawned leader has no recorded start identity")
+        group.members.push(leader)
+        recordProcess(pgid, leader)
+        const descendant = processIdentity(yield* processTreeReady(handle))
+        if (!descendant?.bootID || !descendant.startTicks)
+          throw new Error("spawned descendant has no recorded start identity")
+        group.members.push(descendant)
+        recordProcess(pgid, descendant)
+        expect({ leader: sameProcess(leader), descendant: sameProcess(descendant) }).toEqual({
+          leader: true,
+          descendant: true,
+        })
+
+        const originalKill = process.kill.bind(process)
+        const rejectSignal = { value: true }
+        const patchedKill: typeof process.kill = (pid, signal) => {
+          if (rejectSignal.value && pid === -pgid && signal === "SIGKILL") {
+            rejectSignal.value = false
+            throw Object.assign(new Error("injected SIGKILL permission denial"), { code: "EPERM" })
+          }
+          return originalKill(pid, signal)
+        }
+        yield* Effect.addFinalizer(() => Effect.sync(() => void (process.kill = originalKill)))
+        process.kill = patchedKill
+
+        const started = Date.now()
+        const exit = yield* Effect.exit(handle.kill({ forceKillAfter: 0 }))
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(Date.now() - started).toBeLessThan(7_000)
+        if (Exit.isFailure(exit)) expect(Cause.prettyErrors(exit.cause).join("\n")).toContain(String(descendant.pid))
+      }),
+      15_000,
     )
 
     fx.live(
