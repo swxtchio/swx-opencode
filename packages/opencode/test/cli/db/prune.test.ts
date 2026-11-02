@@ -3608,6 +3608,31 @@ for (const mode of ["offline", "online"] as const) {
   })
 }
 
+test("offline apply refuses an invalid captured Session ID without changing rows", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  const before = ownedCounts(store.filename, sessionID)
+  const result = parseReport(
+    await runRawCLI(
+      store,
+      [
+        "--session",
+        sessionID,
+        "--apply",
+        "--usage-capture-status",
+        "confirmed",
+        "--usage-capture-session",
+        " ",
+      ],
+      1,
+    ),
+  )
+  expect(result.action).toBe("refused")
+  expect(result.changedRows).toBe(0)
+  expect(result.refusalReasons).toContain("usage-capture-scope-invalid")
+  expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+})
+
 test("db retire requires complete caller capture confirmation and leaves inventory ungated", async () => {
   await using store = await createStore()
   const created = await produceLive(store, { create: {} })

@@ -284,12 +284,14 @@ const pruneOptions = (yargs: Argv) =>
     .option("usage-capture-status", {
       type: "string",
       default: "unknown",
-      describe: "caller confirmation state for durable usage capture; only confirmed permits Session deletion",
+      describe:
+        "caller confirmation for --apply; only confirmed with IDs covering deletionScope.sessionIDs permits Session deletion; inventory and --reclaim-only are ungated",
     })
     .option("usage-capture-session", {
       type: "array",
       string: true,
-      describe: "Session ID durably captured by the caller; repeat for every Session in the deletion scope",
+      describe:
+        "durably captured Session ID; repeat for every deletionScope.sessionIDs ID on --apply; inventory and --reclaim-only are ungated",
     })
 
 export const PruneCommand = cmd<{}, PruneArgs>({
