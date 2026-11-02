@@ -5070,7 +5070,16 @@ async function produceLive(store: Store, operation: Record<string, unknown>, tim
     },
   )
   assertChildOutcome(result, 0)
-  return parseRequiredJSON<ProducerResult>(result, "prune producer", result.stdout.trim().split("\n").at(-1) ?? "")
+  const produced = parseRequiredJSON<ProducerResult>(
+    result,
+    "prune producer",
+    result.stdout.trim().split("\n").at(-1) ?? "",
+  )
+  if (produced.created.length > 0) {
+    // Spread Store views share this array, so the trusted CLI wrappers see every live-produced Session ID.
+    store.metadata.push(produced)
+  }
+  return produced
 }
 
 // These wrappers model existing preservation tests' trusted caller; capture-gate regressions use the raw helpers.

@@ -66,7 +66,12 @@ try {
   const entrypoint = path.join(packageRoot, "src/index.ts")
   const inventory = JSON.parse(run([entrypoint, "db", "prune", "--database", filename]))
   assert.equal(inventory.selectedCounts.sessions, 1)
-  const applied = JSON.parse(run([entrypoint, "db", "prune", "--database", filename, "--apply"]))
+  const captureArgs = [
+    "--usage-capture-status",
+    "confirmed",
+    ...inventory.deletionScope.sessionIDs.flatMap((sessionID: string) => ["--usage-capture-session", sessionID]),
+  ]
+  const applied = JSON.parse(run([entrypoint, "db", "prune", "--database", filename, "--apply", ...captureArgs]))
   assert.equal(applied.action, "applied")
   assert.deepEqual(applied.deletedCounts, {
     sessions: inventory.selectedCounts.sessions,
