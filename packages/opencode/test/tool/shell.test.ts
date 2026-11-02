@@ -250,6 +250,9 @@ type ShellProcessGroup = {
   observed: boolean
 }
 
+const ownsProcessIdentity = (recorded: string | undefined, current: string | undefined) =>
+  recorded !== undefined && current !== undefined && recorded === current
+
 const shellProcessGroups = new Map<number, ShellProcessGroup>()
 
 const startIdentity = (pid: number) => {
@@ -287,7 +290,7 @@ const processGroupMembers = (pgid: number) => {
 }
 
 const observeProcessGroup = (group: ShellProcessGroup, members = processGroupMembers(group.pgid)) => {
-  if (!members.some((pid) => group.members.get(pid) === startIdentity(pid))) return
+  if (!members.some((pid) => ownsProcessIdentity(group.members.get(pid), startIdentity(pid)))) return
   for (const pid of members) {
     if (group.members.has(pid)) continue
     const identity = startIdentity(pid)
@@ -320,7 +323,7 @@ const recordProcessGroup = (pid: number) => {
 }
 
 const ownedProcessGroupMembers = (group: ShellProcessGroup, members = processGroupMembers(group.pgid)) =>
-  members.filter((pid) => group.members.get(pid) === startIdentity(pid))
+  members.filter((pid) => ownsProcessIdentity(group.members.get(pid), startIdentity(pid)))
 
 const waitForProcessGroupExit = async (group: ShellProcessGroup, timeout = 250) => {
   const deadline = Date.now() + timeout
@@ -362,6 +365,17 @@ afterEach(async () => {
     remaining: [],
   })
 })
+
+it.live(
+  "does not own a process without a matching recorded start identity",
+  Effect.sync(() => {
+    expect(ownsProcessIdentity(undefined, undefined)).toBe(false)
+    expect(ownsProcessIdentity(undefined, "current-start")).toBe(false)
+    expect(ownsProcessIdentity("recorded-start", undefined)).toBe(false)
+    expect(ownsProcessIdentity("recorded-start", "different-start")).toBe(false)
+    expect(ownsProcessIdentity("recorded-start", "recorded-start")).toBe(true)
+  }),
+)
 
 // The queue entry follows the child chunk through ShellTool's runForEach callback, so waiters know persistence scheduling has run.
 const tappedShell = Effect.fn("ShellToolTest.tappedShell")(function* (
