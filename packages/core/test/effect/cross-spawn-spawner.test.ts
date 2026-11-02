@@ -204,34 +204,69 @@ afterEach(async () => {
 
 const resistantDescendant =
   'process.on("SIGTERM", () => {}); process.stdout.write("ready"); setInterval(() => {}, 10_000)'
+const silentResistantDescendant = 'process.on("SIGTERM", () => {}); setInterval(() => {}, 10_000)'
 
-const processTreeSource = (child: string, onTerm?: string) =>
+const processTreeSource = (child: string, onTerm?: string, ownershipFile?: string) =>
   [
     ...(onTerm ? [onTerm] : []),
     `const child = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(child)}], { stdio: ["ignore", "pipe", "ignore"] })`,
+    ...(ownershipFile
+      ? [`require("node:fs").writeFileSync(${JSON.stringify(ownershipFile)}, JSON.stringify({ pgid: process.pid, child: child.pid }))`]
+      : []),
+    'process.stdout.write(`child-started:${child.pid}\\n`)',
     'child.stdout.once("data", () => process.stdout.write(`child-ready:${child.pid}\\n`))',
     "setInterval(() => {}, 10_000)",
   ].join(";\n")
 
-const termExitingParent = (child: string, exitCode = 0) =>
-  processTreeSource(child, `process.on("SIGTERM", () => process.exit(${exitCode}))`)
+const termExitingParent = (child: string, exitCode = 0, ownershipFile?: string) =>
+  processTreeSource(child, `process.on("SIGTERM", () => process.exit(${exitCode}))`, ownershipFile)
 
-const timeoutProbeMode = process.env.SWX_CORE_SPAWNER_TIMEOUT_PROBE === "1"
-const timeoutProbeFile = process.env.SWX_CORE_SPAWNER_TIMEOUT_FILE
+const timeoutProbeMode = process.env.SWX_CORE_SPAWNER_PROBE_MODE ?? ""
+const timeoutProbeOwnerFile = process.env.SWX_CORE_SPAWNER_OWNER_FILE
+const timeoutProbeFile = process.env.SWX_CORE_SPAWNER_PROBE_FILE
+const timeoutProbeReadyFile = process.env.SWX_CORE_SPAWNER_READY_FILE
 
-const processTreeReady = (handle: ChildProcessHandle) =>
+const processTreeReady = (
+  handle: ChildProcessHandle,
+  pgid: number,
+  onStarted?: (identity: EventWriter.ProcessIdentity) => Effect.Effect<void>,
+  readinessTimeout: Duration.Input = "5 seconds",
+) =>
   Effect.gen(function* () {
+    const childStarted = yield* Deferred.make<number>()
     const ready = yield* Deferred.make<number>()
     let output = ""
     yield* Effect.forkScoped(
       Stream.runForEach(Stream.decodeText(handle.stdout), (chunk) => {
         output += chunk
+        const started = output.match(/child-started:(\d+)/)
         const match = output.match(/child-ready:(\d+)/)
-        if (!match) return Effect.void
-        return Deferred.succeed(ready, Number(match[1])).pipe(Effect.asVoid)
+        return Effect.gen(function* () {
+          if (started) yield* Deferred.succeed(childStarted, Number(started[1]))
+          if (match) yield* Deferred.succeed(ready, Number(match[1]))
+        })
       }),
     )
-    return yield* Deferred.await(ready).pipe(Effect.timeout("5 seconds"))
+    const childPID = yield* Deferred.await(childStarted).pipe(Effect.timeout("5 seconds"))
+    const identity = yield* Effect.promise(async () => {
+      const deadline = Date.now() + 5_000
+      while (Date.now() < deadline) {
+        const current = processIdentity(childPID)
+        if (current) return current
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+      throw new Error("spawned descendant has no recorded start identity")
+    })
+    recordProcess(pgid, identity)
+    if (onStarted) yield* onStarted(identity)
+    const readyPID = yield* Deferred.await(ready).pipe(
+      Effect.timeoutOrElse({
+        duration: readinessTimeout,
+        orElse: () => Effect.fail(new Error("child readiness marker was not produced after a recorded child")),
+      }),
+    )
+    if (readyPID !== childPID) return yield* Effect.fail(new Error("child readiness PID did not match its recorded identity"))
+    return identity
   })
 
 describe("cross-spawn spawner", () => {
@@ -453,7 +488,7 @@ describe("cross-spawn spawner", () => {
         if (!leader?.bootID || !leader.startTicks) throw new Error("spawned leader has no recorded start identity")
         group.members.push(leader)
         recordProcess(pgid, leader)
-        const descendant = processIdentity(yield* processTreeReady(handle))
+        const descendant = yield* processTreeReady(handle, pgid)
         if (!descendant?.bootID || !descendant.startTicks)
           throw new Error("spawned descendant has no recorded start identity")
         group.members.push(descendant)
@@ -483,16 +518,17 @@ describe("cross-spawn spawner", () => {
         yield* Effect.scoped(
           Effect.gen(function* () {
             const handle = yield* js(termExitingParent(resistantDescendant))
-            group.pgid = Number(handle.pid)
-            const leader = processIdentity(group.pgid)
+            const pgid = Number(handle.pid)
+            group.pgid = pgid
+            const leader = processIdentity(pgid)
             if (!leader?.bootID || !leader.startTicks) throw new Error("spawned leader has no recorded start identity")
             group.members.push(leader)
-            recordProcess(group.pgid, leader)
-            const descendant = processIdentity(yield* processTreeReady(handle))
+            recordProcess(pgid, leader)
+            const descendant = yield* processTreeReady(handle, pgid)
             if (!descendant?.bootID || !descendant.startTicks)
               throw new Error("spawned descendant has no recorded start identity")
             group.members.push(descendant)
-            recordProcess(group.pgid, descendant)
+            recordProcess(pgid, descendant)
             expect({ leader: sameProcess(leader), descendant: sameProcess(descendant) }).toEqual({
               leader: true,
               descendant: true,
@@ -586,16 +622,17 @@ describe("cross-spawn spawner", () => {
           const group: RecordedProcessGroup = { pgid: undefined, members: [] }
           yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(group))
           const handle = yield* js(termExitingParent(resistantDescendant))
-          group.pgid = Number(handle.pid)
-          const leader = processIdentity(group.pgid)
+          const pgid = Number(handle.pid)
+          group.pgid = pgid
+          const leader = processIdentity(pgid)
           if (!leader?.bootID || !leader.startTicks) throw new Error("spawned leader has no recorded start identity")
           group.members.push(leader)
-          recordProcess(group.pgid, leader)
-          const descendant = processIdentity(yield* processTreeReady(handle))
+          recordProcess(pgid, leader)
+          const descendant = yield* processTreeReady(handle, pgid)
           if (!descendant?.bootID || !descendant.startTicks)
             throw new Error("spawned descendant has no recorded start identity")
           group.members.push(descendant)
-          recordProcess(group.pgid, descendant)
+          recordProcess(pgid, descendant)
           expect({ leader: sameProcess(leader), descendant: sameProcess(descendant) }).toEqual({
             leader: true,
             descendant: true,
@@ -652,7 +689,7 @@ describe("cross-spawn spawner", () => {
         if (!leader?.bootID || !leader.startTicks) throw new Error("spawned leader has no recorded start identity")
         group.members.push(leader)
         recordProcess(pgid, leader)
-        const descendant = processIdentity(yield* processTreeReady(handle))
+        const descendant = yield* processTreeReady(handle, pgid)
         if (!descendant?.bootID || !descendant.startTicks)
           throw new Error("spawned descendant has no recorded start identity")
         group.members.push(descendant)
@@ -684,90 +721,138 @@ describe("cross-spawn spawner", () => {
     )
 
     fx.live(
-      "Bun timeout boundary fixture worker",
+      "Core process-tree boundary worker",
       Effect.gen(function* () {
         if (!timeoutProbeMode || process.platform === "win32") return
-        if (!timeoutProbeFile) throw new Error("timeout probe file path was not supplied")
+        if (!timeoutProbeOwnerFile || !timeoutProbeFile || !timeoutProbeReadyFile)
+          throw new Error("process-tree probe paths were not supplied")
 
-        const handle = yield* js(termExitingParent(resistantDescendant))
+        const child = timeoutProbeMode === "readiness" ? silentResistantDescendant : resistantDescendant
+        const handle = yield* js(termExitingParent(child, 0, timeoutProbeOwnerFile))
         const pgid = Number(handle.pid)
         const leader = processIdentity(pgid)
         if (!leader?.bootID || !leader.startTicks) throw new Error("timeout worker leader has no start identity")
         recordProcess(pgid, leader)
-        const descendant = processIdentity(yield* processTreeReady(handle))
-        if (!descendant?.bootID || !descendant.startTicks) throw new Error("timeout worker child has no start identity")
-        recordProcess(pgid, descendant)
+        const descendant = yield* processTreeReady(
+          handle,
+          pgid,
+          (identity) => Effect.promise(() => Bun.write(timeoutProbeFile, JSON.stringify({ pgid, members: [leader, identity] }))).pipe(Effect.asVoid),
+          timeoutProbeMode === "readiness" ? "1 second" : "5 seconds",
+        )
         if (!sameProcess(leader) || !sameProcess(descendant)) throw new Error("timeout worker fixture was not live")
-        yield* Effect.promise(() => Bun.write(timeoutProbeFile, JSON.stringify({ pgid, members: [leader, descendant] })))
-        yield* Effect.never
+        if (timeoutProbeMode === "timeout") {
+          yield* Effect.promise(() => Bun.write(timeoutProbeReadyFile, "ready"))
+          yield* Effect.never
+        }
       }),
-      5_000,
+      timeoutProbeMode === "timeout" ? 5_000 : 15_000,
     )
 
     fx.live(
-      "Bun test timeout cleans a TERM-resistant descendant",
+      "Core fixture cleanup handles Bun timeouts and readiness failures",
       Effect.gen(function* () {
         if (process.platform === "win32") return
 
-        const file = `${process.cwd()}/.cross-spawn-timeout-probe.json`
-        yield* Effect.promise(() => fs.rm(file, { force: true }))
-        yield* Effect.addFinalizer(() => Effect.promise(() => fs.rm(file, { force: true })).pipe(Effect.asVoid))
-        const worker = Bun.spawn(
-          [
-            process.execPath,
-            "test",
-            "--timeout",
-            "15000",
-            "./test/effect/cross-spawn-spawner.test.ts",
-            "-t",
-            "Bun timeout boundary fixture worker",
-          ],
-          {
-            cwd: process.cwd(),
-            env: {
-              ...process.env,
-              SWX_CORE_SPAWNER_TIMEOUT_PROBE: "1",
-              SWX_CORE_SPAWNER_TIMEOUT_FILE: file,
-            },
-            stdin: "ignore",
-            stdout: "pipe",
-            stderr: "pipe",
-          },
-        )
-        const workerIdentity = processIdentity(worker.pid)
-        if (!workerIdentity?.bootID || !workerIdentity.startTicks) throw new Error("timeout worker has no start identity")
-        yield* Effect.addFinalizer(() =>
-          Effect.sync(() => {
-            if (!sameProcess(workerIdentity)) return
-            try {
-              process.kill(worker.pid, "SIGKILL")
-            } catch {}
-          }),
-        )
-        const output = Promise.all([new Response(worker.stdout).text(), new Response(worker.stderr).text()])
-        const probe = yield* Effect.promise(async () => {
-          const deadline = Date.now() + 10_000
-          while (Date.now() < deadline) {
-            if (await Bun.file(file).exists())
-              return (await Bun.file(file).json()) as { pgid: number; members: EventWriter.ProcessIdentity[] }
-            await new Promise((resolve) => setTimeout(resolve, 20))
-          }
-        })
-        if (!probe) throw new Error("timeout worker did not publish its ready process identities")
-        for (const member of probe.members) recordProcess(probe.pgid, member)
-        yield* Effect.addFinalizer(() =>
-          cleanupRecordedProcessGroup({ pgid: probe.pgid, members: probe.members }),
-        )
-        expect(probe.members.every(sameProcess)).toBe(true)
+        const run = Effect.fnUntraced(function* (mode: "timeout" | "readiness") {
+          const stem = `.cross-spawn-${mode}-${process.pid}`
+          const ownerFile = path.join(process.cwd(), `${stem}-owner.json`)
+          const identityFile = path.join(process.cwd(), `${stem}-identity.json`)
+          const readyFile = path.join(process.cwd(), `${stem}-ready`)
+          const files = [ownerFile, identityFile, readyFile]
+          yield* Effect.promise(() => Promise.all(files.map((file) => fs.rm(file, { force: true }))))
+          yield* Effect.addFinalizer(() =>
+            Effect.promise(() => Promise.all(files.map((file) => fs.rm(file, { force: true })))).pipe(Effect.asVoid),
+          )
 
-        const exitCode = yield* Effect.promise(() => worker.exited).pipe(Effect.timeout("12 seconds"))
-        const outputText = (yield* Effect.promise(() => output)).join("\n")
-        expect(exitCode).not.toBe(0)
-        expect(outputText).toContain("timed out after")
-        expect(groupAlive(probe.pgid)).toBe(false)
-        expect(probe.members.every((member) => !sameProcess(member))).toBe(true)
+          const worker = Bun.spawn(
+            [
+              process.execPath,
+              "test",
+              "--timeout",
+              "20000",
+              "./test/effect/cross-spawn-spawner.test.ts",
+              "-t",
+              "Core process-tree boundary worker",
+            ],
+            {
+              cwd: process.cwd(),
+              env: {
+                ...process.env,
+                SWX_CORE_SPAWNER_PROBE_MODE: mode,
+                SWX_CORE_SPAWNER_OWNER_FILE: ownerFile,
+                SWX_CORE_SPAWNER_PROBE_FILE: identityFile,
+                SWX_CORE_SPAWNER_READY_FILE: readyFile,
+              },
+              stdin: "ignore",
+              stdout: "pipe",
+              stderr: "pipe",
+            },
+          )
+          const workerIdentity = processIdentity(worker.pid)
+          if (!workerIdentity?.bootID || !workerIdentity.startTicks)
+            throw new Error("process-tree worker has no start identity")
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              if (!sameProcess(workerIdentity)) return
+              try {
+                process.kill(worker.pid, "SIGKILL")
+              } catch {}
+            }),
+          )
+          const output = Promise.all([new Response(worker.stdout).text(), new Response(worker.stderr).text()])
+          const owner = yield* Effect.promise(async () => {
+            const deadline = Date.now() + 10_000
+            while (Date.now() < deadline) {
+              if (await Bun.file(ownerFile).exists()) {
+                const value = (await Bun.file(ownerFile).json()) as { pgid: number; child: number }
+                const leader = processIdentity(value.pgid)
+                const descendant = processIdentity(value.child)
+                if (leader?.bootID && leader.startTicks && descendant?.bootID && descendant.startTicks) return value
+              }
+              await new Promise((resolve) => setTimeout(resolve, 20))
+            }
+          })
+          if (!owner) throw new Error("process-tree worker did not publish producer PIDs")
+          const leader = processIdentity(owner.pgid)
+          const descendant = processIdentity(owner.child)
+          if (!leader?.bootID || !leader.startTicks || !descendant?.bootID || !descendant.startTicks)
+            throw new Error("producer PIDs have no readable start identity")
+          recordProcess(owner.pgid, leader)
+          recordProcess(owner.pgid, descendant)
+          const ownership: RecordedProcessGroup = { pgid: owner.pgid, members: [leader, descendant] }
+          yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(ownership))
+          expect({ leader: sameProcess(leader), descendant: sameProcess(descendant) }).toEqual({
+            leader: true,
+            descendant: true,
+          })
+
+          if (mode === "timeout") {
+            yield* Effect.promise(async () => {
+              const deadline = Date.now() + 5_000
+              while (Date.now() < deadline) {
+                if (await Bun.file(readyFile).exists()) return
+                await new Promise((resolve) => setTimeout(resolve, 20))
+              }
+              throw new Error("timeout worker did not publish its child-ready signal")
+            })
+          }
+
+          const exitCode = yield* Effect.promise(() => worker.exited).pipe(Effect.timeout("15 seconds"))
+          const outputText = (yield* Effect.promise(() => output)).join("\n")
+          expect(exitCode).not.toBe(0)
+          expect(outputText).toContain(
+            mode === "timeout" ? "timed out after" : "child readiness marker was not produced after a recorded child",
+          )
+          expect(groupAlive(owner.pgid)).toBe(false)
+          expect(ownership.members.every((member) => !sameProcess(member))).toBe(true)
+
+          if (mode === "readiness") expect(yield* Effect.promise(() => Bun.file(identityFile).exists())).toBe(true)
+        })
+
+        yield* run("timeout")
+        yield* run("readiness")
       }),
-      20_000,
+      30_000,
     )
 
     fx.live(
@@ -792,7 +877,7 @@ describe("cross-spawn spawner", () => {
           }).pipe(Effect.asVoid),
         )
 
-        const descendant = processIdentity(yield* processTreeReady(handle))
+        const descendant = yield* processTreeReady(handle, pgid)
         if (!descendant?.bootID || !descendant.startTicks) throw new Error("spawned descendant has no recorded start identity")
         owned.push(descendant)
         recordProcess(pgid, descendant)
@@ -837,7 +922,7 @@ describe("cross-spawn spawner", () => {
             if (!leader?.bootID || !leader.startTicks) throw new Error("spawned leader has no recorded start identity")
             owned.push(leader)
             recordProcess(pgid, leader)
-            const descendant = processIdentity(yield* processTreeReady(handle))
+            const descendant = yield* processTreeReady(handle, pgid)
             if (!descendant?.bootID || !descendant.startTicks)
               throw new Error("spawned descendant has no recorded start identity")
             owned.push(descendant)
@@ -884,7 +969,7 @@ describe("cross-spawn spawner", () => {
             if (!leader?.bootID || !leader.startTicks) throw new Error("spawned leader has no recorded start identity")
             owned.push(leader)
             recordProcess(pgid, leader)
-            const descendant = processIdentity(yield* processTreeReady(handle))
+            const descendant = yield* processTreeReady(handle, pgid)
             if (!descendant?.bootID || !descendant.startTicks)
               throw new Error("spawned descendant has no recorded start identity")
             owned.push(descendant)
@@ -925,7 +1010,7 @@ describe("cross-spawn spawner", () => {
                 throw new Error("spawned leader has no recorded start identity")
               group.members.push(leader)
               recordProcess(group.pgid, leader)
-              const descendant = processIdentity(yield* processTreeReady(handle))
+              const descendant = yield* processTreeReady(handle, group.pgid!)
               if (!descendant?.bootID || !descendant.startTicks)
                 throw new Error("spawned descendant has no recorded start identity")
               group.members.push(descendant)
