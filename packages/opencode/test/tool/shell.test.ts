@@ -1,9 +1,10 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { describe, expect } from "bun:test"
+import { afterEach, describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
+import { EventWriter } from "@opencode-ai/core/event/writer"
 import { EventTable } from "@opencode-ai/core/event/sql"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -14,6 +15,8 @@ import { adjust, layer, make } from "effect/testing/TestClock"
 import type { TestClock } from "effect/testing/TestClock"
 import { ChildProcessSpawner } from "effect/unstable/process"
 import type * as Scope from "effect/Scope"
+import fs from "node:fs/promises"
+import { readFileSync, readdirSync } from "node:fs"
 import os from "os"
 import path from "path"
 import { Config } from "@/config/config"
@@ -109,6 +112,31 @@ Shell.acceptable.reset()
 const quote = (text: string) => `"${text}"`
 const squote = (text: string) => `'${text}'`
 const projectRoot = path.join(__dirname, "../..")
+
+const writeAtomically = (filename: string, contents: string) =>
+  Effect.promise(async () => {
+    const temporary = `${filename}.tmp`
+    await Bun.write(temporary, contents)
+    await fs.rename(temporary, filename)
+  })
+
+const atomicWriteSource = (filename: string, contents: string) =>
+  `(()=>{const fs=require("node:fs");const temporary=${JSON.stringify(filename)}+".tmp";fs.writeFileSync(temporary,${contents});fs.renameSync(temporary,${JSON.stringify(filename)})})()`
+
+const positivePID = (value: number) => Number.isSafeInteger(value) && value > 0
+
+const readPositivePID = async (filename: string, timeout = 5_000) => {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    try {
+      const pid = Number((await Bun.file(filename).text()).trim())
+      if (positivePID(pid)) return pid
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  throw new Error("fixture PID was not atomically published as a positive integer")
+}
+
 const bin = quote(process.execPath.replaceAll("\\", "/"))
 const bash = (() => {
   const shell = Shell.acceptable()
@@ -173,12 +201,11 @@ const stagedOutput = Effect.fn("ShellToolTest.stagedOutput")(function* (director
     "  await ready",
     "}",
   ].join("\n")
-  yield* Effect.promise(() => Bun.write(scriptPath, script))
+  yield* writeAtomically(scriptPath, script)
   return {
     command: `${PS.has(sh()) ? "& " : ""}${bin} ${evalarg(scriptPath)}`,
     stages,
-    release: (index: number) =>
-      Effect.promise(() => Bun.write(path.join(directory, `release-${index}`), "")).pipe(Effect.asVoid),
+    release: (index: number) => writeAtomically(path.join(directory, `release-${index}`), "").pipe(Effect.asVoid),
   } satisfies StagedOutput
 })
 
@@ -242,40 +269,205 @@ const mustTruncate = (result: {
 
 type Chunk = { text: string }
 
+type ShellProcessGroup = {
+  pgid: number
+  members: Map<number, string>
+  observed: boolean
+}
+
+const ownsProcessIdentity = (recorded: string | undefined, current: string | undefined) =>
+  recorded !== undefined && current !== undefined && recorded === current
+
+const shellProcessGroups = new Map<number, ShellProcessGroup>()
+
+const startIdentity = (pid: number) => {
+  const identity = EventWriter.readIdentity(pid)
+  if (identity?.bootID && identity.startTicks) return `${identity.bootID}:${identity.startTicks}`
+  const result = Bun.spawnSync(["ps", "-p", String(pid), "-o", "lstart="])
+  const started = result.stdout.toString().trim()
+  return result.exitCode === 0 && started ? started : undefined
+}
+
+const processGroupMembers = (pgid: number) => {
+  if (process.platform === "linux") {
+    return readdirSync("/proc").flatMap((entry) => {
+      if (!/^\d+$/.test(entry)) return []
+      const pid = Number(entry)
+      let stat: string
+      try {
+        stat = readFileSync(`/proc/${pid}/stat`, "utf8")
+      } catch {
+        return []
+      }
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ")
+      return Number(fields[2]) === pgid ? [pid] : []
+    })
+  }
+  const result = Bun.spawnSync(["ps", "-e", "-o", "pid=,pgid="])
+  if (result.exitCode !== 0) throw new Error(`could not inspect process group ${pgid}`)
+  return result.stdout
+    .toString()
+    .split("\n")
+    .flatMap((line) => {
+      const [pid, group] = line.trim().split(/\s+/).map(Number)
+      return pid && group === pgid ? [pid] : []
+    })
+}
+
+const observeProcessGroup = (group: ShellProcessGroup, members = processGroupMembers(group.pgid)) => {
+  if (!members.some((pid) => ownsProcessIdentity(group.members.get(pid), startIdentity(pid)))) return
+  for (const pid of members) {
+    if (group.members.has(pid)) continue
+    const identity = startIdentity(pid)
+    if (identity) group.members.set(pid, identity)
+  }
+}
+
+const observeShellOutput = (group: ShellProcessGroup) => {
+  if (group.observed) return
+  observeProcessGroup(group)
+  group.observed = true
+}
+
+const recordDescendant = Effect.fnUntraced(function* (group: ShellProcessGroup, pidFile: string) {
+  const pid = yield* Effect.promise(() => readPositivePID(pidFile))
+  if (!processGroupMembers(group.pgid).includes(pid)) return false
+  const identity = startIdentity(pid)
+  if (!identity || identity !== startIdentity(pid)) return false
+  group.members.set(pid, identity)
+  return true
+})
+
+const recordProcessGroup = (pid: number) => {
+  const group = shellProcessGroups.get(pid) ?? { pgid: pid, members: new Map<number, string>(), observed: false }
+  shellProcessGroups.set(pid, group)
+  const identity = startIdentity(pid)
+  if (!identity) throw new Error(`could not record the start identity for shell PID ${pid}`)
+  group.members.set(pid, identity)
+  return group
+}
+
+const ownedProcessGroupMembers = (group: ShellProcessGroup, members = processGroupMembers(group.pgid)) =>
+  members.filter((pid) => ownsProcessIdentity(group.members.get(pid), startIdentity(pid)))
+
+const waitForProcessGroupExit = async (group: ShellProcessGroup, timeout = 250) => {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    if (processGroupMembers(group.pgid).length === 0) return []
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  return processGroupMembers(group.pgid)
+}
+
+afterEach(async () => {
+  const groups = Array.from(shellProcessGroups.values())
+  const survivors: Array<{ group: ShellProcessGroup; pids: number[] }> = []
+  let remaining: number[] = []
+  try {
+    for (const group of groups) {
+      const members = await waitForProcessGroupExit(group)
+      if (members.length > 0) survivors.push({ group, pids: ownedProcessGroupMembers(group) })
+    }
+  } finally {
+    for (const survivor of survivors) {
+      const group = survivor.group
+      const members = processGroupMembers(group.pgid)
+      if (members.length === 0) continue
+      observeProcessGroup(group, members)
+      // The recorded member identity anchors the group ID before cleanup, even if descendants churn between snapshots.
+      if (ownedProcessGroupMembers(group, members).length > 0) {
+        try {
+          process.kill(-group.pgid, "SIGKILL")
+        } catch {}
+      }
+      await waitForProcessGroupExit(group, 5_000)
+    }
+    remaining = survivors.flatMap((survivor) => processGroupMembers(survivor.group.pgid))
+    shellProcessGroups.clear()
+  }
+  expect({
+    survivors: survivors.map((survivor) => ({ pgid: survivor.group.pgid, pids: survivor.pids })),
+    remaining,
+  }).toEqual({
+    survivors: [],
+    remaining: [],
+  })
+})
+
+it.live(
+  "does not own a process without a matching recorded start identity",
+  Effect.sync(() => {
+    expect(ownsProcessIdentity(undefined, undefined)).toBe(false)
+    expect(ownsProcessIdentity(undefined, "current-start")).toBe(false)
+    expect(ownsProcessIdentity("recorded-start", undefined)).toBe(false)
+    expect(ownsProcessIdentity("recorded-start", "different-start")).toBe(false)
+    expect(ownsProcessIdentity("recorded-start", "recorded-start")).toBe(true)
+  }),
+)
+
 // The queue entry follows the child chunk through ShellTool's runForEach callback, so waiters know persistence scheduling has run.
 const tappedShell = Effect.fn("ShellToolTest.tappedShell")(function* (
   chunks: Chunk[],
   consumed?: Queue.Queue<string>,
   clock?: TestClock,
   liveKill = true,
+  trackProcessGroup = false,
 ) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+  const processGroup = { value: undefined as ShellProcessGroup | undefined }
+  const killCalls = { started: 0, completed: 0 }
+  const killCompletions = yield* Queue.unbounded<void>()
   const tapped = ChildProcessSpawner.make((command) =>
     spawner.spawn(command).pipe(
       Effect.map((handle) =>
-        ChildProcessSpawner.makeHandle({
-          ...handle,
-          kill: (options) => (clock && liveKill ? clock.withLive(handle.kill(options)) : handle.kill(options)),
-          all: handle.all.pipe(
-            Stream.flatMap((bytes) => {
-              const text = Buffer.from(bytes).toString("utf-8")
-              const stream = Stream.make(bytes).pipe(Stream.tap(() => Effect.sync(() => chunks.push({ text }))))
-              if (!consumed) return stream
-              return stream.pipe(Stream.concat(Stream.fromEffectDrain(Queue.offer(consumed, text).pipe(Effect.asVoid))))
-            }),
-          ),
-        }),
+        (() => {
+          if (trackProcessGroup) processGroup.value = recordProcessGroup(Number(handle.pid))
+          return ChildProcessSpawner.makeHandle({
+            ...handle,
+            kill: (options) => {
+              killCalls.started++
+              const complete = Effect.sync(() => void killCalls.completed++).pipe(
+                Effect.andThen(Queue.offer(killCompletions, undefined)),
+                Effect.asVoid,
+              )
+              return (clock && liveKill ? clock.withLive(handle.kill(options)) : handle.kill(options)).pipe(
+                Effect.ensuring(complete),
+              )
+            },
+            all: handle.all.pipe(
+              Stream.flatMap((bytes) => {
+                const text = Buffer.from(bytes).toString("utf-8")
+                const stream = Stream.make(bytes).pipe(
+                  Stream.tap(() =>
+                    Effect.sync(() => {
+                      if (trackProcessGroup && processGroup.value) observeShellOutput(processGroup.value)
+                      chunks.push({ text })
+                    }),
+                  ),
+                )
+                if (!consumed) return stream
+                return stream.pipe(
+                  Stream.concat(Stream.fromEffectDrain(Queue.offer(consumed, text).pipe(Effect.asVoid))),
+                )
+              }),
+            ),
+          })
+        })(),
       ),
     ),
   )
   const tool = yield* Tool.init(
     yield* ShellTool.pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, tapped)),
   )
-  if (!clock) return tool
   return {
     ...tool,
+    processGroup,
+    killCalls,
+    killCompletions,
     execute: (params: Tool.InferParameters<typeof ShellTool>, context: Tool.Context) =>
-      tool.execute(params, context).pipe(Effect.provideService(Clock.Clock, clock)),
+      clock
+        ? tool.execute(params, context).pipe(Effect.provideService(Clock.Clock, clock))
+        : tool.execute(params, context),
   }
 })
 
@@ -467,7 +659,7 @@ describe("tool.shell permissions", () => {
           { label: "bash", shell: bash },
           Effect.gen(function* () {
             const outerTmp = yield* tmpdirScoped()
-            yield* Effect.promise(() => Bun.write(path.join(outerTmp, "outside.txt"), "x"))
+            yield* writeAtomically(path.join(outerTmp, "outside.txt"), "x")
             yield* runIn(
               projectRoot,
               Effect.gen(function* () {
@@ -996,7 +1188,7 @@ describe("tool.shell permissions", () => {
   each("asks for external_directory permission when file arg is outside project", () =>
     Effect.gen(function* () {
       const outerTmp = yield* tmpdirScoped()
-      yield* Effect.promise(() => Bun.write(path.join(outerTmp, "outside.txt"), "x"))
+      yield* writeAtomically(path.join(outerTmp, "outside.txt"), "x")
       const tmp = yield* tmpdirScoped()
       yield* runIn(
         tmp,
@@ -1030,7 +1222,7 @@ describe("tool.shell permissions", () => {
   each("does not ask for external_directory permission when rm inside project", () =>
     Effect.gen(function* () {
       const tmp = yield* tmpdirScoped()
-      yield* Effect.promise(() => Bun.write(path.join(tmp, "tmpfile"), "x"))
+      yield* writeAtomically(path.join(tmp, "tmpfile"), "x")
       yield* runIn(
         tmp,
         Effect.gen(function* () {
@@ -1333,43 +1525,34 @@ const sigtermResistant = Effect.fn("ShellToolTest.sigtermResistant")(function* (
   const dir = yield* tmpdirScoped()
   const pidFile = path.join(dir, "pid")
   const consumed = Deferred.makeUnsafe<void>()
+  const processGroup = { value: undefined as ShellProcessGroup | undefined }
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
   const signalling = ChildProcessSpawner.make((command) =>
     spawner.spawn(command).pipe(
       Effect.map((handle) =>
-        ChildProcessSpawner.makeHandle({
-          ...handle,
-          all: handle.all.pipe(
-            Stream.flatMap((chunk) =>
-              Stream.make(chunk).pipe(Stream.concat(Stream.fromEffectDrain(Deferred.succeed(consumed, undefined)))),
+        (() => {
+          processGroup.value = recordProcessGroup(Number(handle.pid))
+          return ChildProcessSpawner.makeHandle({
+            ...handle,
+            all: handle.all.pipe(
+              Stream.flatMap((chunk) =>
+                Stream.make(chunk).pipe(Stream.concat(Stream.fromEffectDrain(Deferred.succeed(consumed, undefined)))),
+              ),
             ),
-          ),
-        }),
+          })
+        })(),
       ),
     ),
   )
   const tool = yield* Tool.init(
     yield* ShellTool.pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, signalling)),
   )
-  const program = `process.on("SIGTERM", () => {}); require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); console.log("ready"); setInterval(() => {}, 1000)`
-  const pid = Effect.promise(() => Bun.file(pidFile).text()).pipe(Effect.map(Number))
-  // Reaps the command whatever the case leaves behind, so a run held open by it can end.
-  yield* Effect.addFinalizer(() =>
-    pid.pipe(
-      Effect.flatMap((value) =>
-        Effect.sync(() => {
-          for (const target of [-value, value])
-            try {
-              process.kill(target, "SIGKILL")
-            } catch {}
-        }),
-      ),
-      Effect.ignore,
-    ),
-  )
+  const program = `process.on("SIGTERM", () => {}); ${atomicWriteSource(pidFile, "String(process.pid)")}; console.log("ready"); setInterval(() => {}, 1000)`
+  const pid = Effect.promise(() => readPositivePID(pidFile))
   return {
     tool,
     consumed,
+    processGroup,
     command: `exec ${bin} -e ${squote(program)}`,
     alive: pid.pipe(
       Effect.map((value) => {
@@ -1381,6 +1564,10 @@ const sigtermResistant = Effect.fn("ShellToolTest.sigtermResistant")(function* (
         }
       }),
     ),
+    groupAlive: Effect.sync(() => {
+      const group = processGroup.value
+      return group ? processGroupMembers(group.pgid).length > 0 : false
+    }),
   }
 })
 
@@ -1421,9 +1608,11 @@ describe("tool.shell teardown", () => {
           expect({
             completion: completion._tag === "Some" ? "finished" : "timeout",
             alive: yield* shell.alive,
+            groupAlive: yield* shell.groupAlive,
           }).toEqual({
             completion: "finished",
             alive: false,
+            groupAlive: false,
           })
           // The abort's write of the consumed output was the one refused.
           expect(refused.count).toBeGreaterThan(0)
@@ -1453,9 +1642,11 @@ describe("tool.shell teardown", () => {
           expect({
             completion: completion._tag === "Some" ? "finished" : "timeout",
             alive: yield* shell.alive,
+            groupAlive: yield* shell.groupAlive,
           }).toEqual({
             completion: "finished",
             alive: false,
+            groupAlive: false,
           })
           expect(refused.count).toBeGreaterThan(0)
         }),
@@ -1656,6 +1847,8 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
   stagedIntervals?: StagedInterval[]
   clocked?: boolean
   liveKill?: boolean
+  trackProcessGroup?: boolean
+  descendantPIDFile?: string
   checkUnwritten?: (input: InterruptOutputObservation) => void
   checkBeforeInterrupt?: (input: InterruptOutputObservation) => void
   checkRunning?: (input: RunningOutputObservation) => void
@@ -1667,7 +1860,8 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
   const consumed = yield* Queue.unbounded<string>()
   const downstream = { value: "" }
   const testClock = input.clocked ? yield* make() : undefined
-  const shell = yield* tappedShell(chunks, consumed, testClock, input.liveKill)
+  const shell = yield* tappedShell(chunks, consumed, testClock, input.liveKill, input.trackProcessGroup)
+  const descendantObserved = { value: false }
 
   yield* input.llm.tool(ShellID.ToolID, { command: input.command, description: "store test", timeout: input.timeout })
   const chat = yield* sessions.create({})
@@ -1774,6 +1968,9 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
       )
       yield* testClock.adjust(input.timeout + 100)
       yield* ready
+      const processGroup = shell.processGroup.value
+      if (input.descendantPIDFile && processGroup)
+        descendantObserved.value = yield* recordDescendant(processGroup, input.descendantPIDFile)
       const part = (yield* MessageV2.parts(assistant.id)).find(
         (part): part is SessionV1.ToolPart => part.type === "tool",
       )
@@ -1814,9 +2011,15 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
       )
     } else if (!testClock) {
       yield* ready
+      const processGroup = shell.processGroup.value
+      if (input.descendantPIDFile && processGroup)
+        descendantObserved.value = yield* recordDescendant(processGroup, input.descendantPIDFile)
       yield* Fiber.interrupt(run)
     } else {
       yield* ready
+      const processGroup = shell.processGroup.value
+      if (input.descendantPIDFile && processGroup)
+        descendantObserved.value = yield* recordDescendant(processGroup, input.descendantPIDFile)
       yield* testClock.adjust(OUTPUT_WRITE_INTERVAL_MS - 1)
       const part = (yield* MessageV2.parts(assistant.id)).find(
         (part): part is SessionV1.ToolPart => part.type === "tool",
@@ -1887,7 +2090,12 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
     }).pipe(Effect.onError(() => Fiber.interrupt(run)))
   }
   yield* Fiber.await(run)
+  yield* Effect.gen(function* () {
+    while (shell.killCalls.completed < shell.killCalls.started) yield* Queue.take(shell.killCompletions)
+  })
 
+  const processGroup = input.trackProcessGroup ? shell.processGroup.value : undefined
+  if (input.trackProcessGroup && !processGroup) throw new Error("ShellTool did not register the spawned process group")
   const writes = yield* readToolWrites(chat.id)
   const parts = yield* MessageV2.parts(assistant.id)
   return {
@@ -1896,6 +2104,8 @@ const throughSession = Effect.fn("ShellToolTest.throughSession")(function* (inpu
     // A running snapshot carries consumed output; the shell's initialization write carries an empty one.
     snapshots: writes.filter((write) => write.part.state.status === "running" && runningOutput(write.part) !== ""),
     settled: parts.find((part): part is SessionV1.ToolPart => part.type === "tool"),
+    observedDescendant: descendantObserved.value,
+    processGroupEmpty: processGroup ? processGroupMembers(processGroup.pgid).length === 0 : true,
   }
 })
 
@@ -2048,12 +2258,15 @@ describe("tool.shell running output persistence", () => {
         ({ dir, llm }) =>
           Effect.gen(function* () {
             // Ignoring SIGTERM keeps the command running past cleanup's wait, so cleanup settles it from the store.
+            const descendantPIDFile = path.join(dir, "tail-child.pid")
             const result = yield* throughSession({
               dir,
               llm,
-              command: "trap '' TERM; echo tail-marker; while :; do sleep 0.1; done",
+              command: `trap 'trap - TERM; kill -TERM $$' TERM; sh -c 'trap "" TERM; exec sleep 1000' </dev/null >/dev/null 2>&1 & child=$!; printf '%s' "$child" > ${squote(descendantPIDFile)}; echo tail-marker; wait`,
               interruptOn: "tail-marker",
               clocked: true,
+              trackProcessGroup: true,
+              descendantPIDFile,
               checkUnwritten: (before) => {
                 expect(before.part?.state.status).toBe("running")
                 expect(before.part ? runningOutput(before.part) : "").toBe("")
@@ -2065,6 +2278,8 @@ describe("tool.shell running output persistence", () => {
             if (result.settled?.state.status !== "error") return
             expect(result.settled.state.metadata?.interrupted).toBe(true)
             expect(result.settled.state.metadata?.output).toBe("tail-marker\n")
+            expect(result.observedDescendant).toBe(true)
+            expect(result.processGroupEmpty).toBe(true)
           }),
         { config: storeConfig },
       ),
@@ -2078,12 +2293,17 @@ describe("tool.shell running output persistence", () => {
         ({ dir, llm }) =>
           Effect.gen(function* () {
             // The SIGTERM handler writes after the abort's own write, and the command outlives cleanup's wait.
+            const descendantPIDFile = path.join(dir, "term-tail-child.pid")
             const result = yield* throughSession({
               dir,
               llm,
-              command: "trap 'echo term-tail' TERM; echo tail-marker; while :; do sleep 0.05; done",
+              command: `trap 'echo term-tail; exit 0' TERM; sh -c 'trap "" TERM; exec sleep 1000' </dev/null >/dev/null 2>&1 & child=$!; printf '%s' "$child" > ${squote(descendantPIDFile)}; echo tail-marker; wait`,
               interruptOn: "tail-marker",
+              trackProcessGroup: true,
+              descendantPIDFile,
             })
+            expect(result.observedDescendant).toBe(true)
+            expect(result.processGroupEmpty).toBe(true)
             expect(result.chunks.map((chunk) => chunk.text).join("")).toContain("term-tail\n")
             expect(result.settled?.state.status).toBe("error")
             if (result.settled?.state.status !== "error") return
@@ -2105,15 +2325,17 @@ describe("tool.shell running output persistence", () => {
           Effect.gen(function* () {
             // The timeout starts the kill, and the interruption arrives during it: the marker comes from the SIGTERM
             // handler, and the command outlives cleanup's wait.
+            const descendantPIDFile = path.join(dir, "timeout-tail-child.pid")
             const result = yield* throughSession({
               dir,
               llm,
-              command:
-                "trap 'echo timeout-tail; echo abort-marker' TERM; echo before-timeout; while :; do sleep 0.05; done",
+              command: `trap 'echo timeout-tail; echo abort-marker; exit 0' TERM; sh -c 'trap "" TERM; exec sleep 1000' </dev/null >/dev/null 2>&1 & child=$!; printf '%s' "$child" > ${squote(descendantPIDFile)}; echo before-timeout; wait`,
               timeout: 1000,
               interruptOn: "abort-marker",
               clocked: true,
               liveKill: false,
+              trackProcessGroup: true,
+              descendantPIDFile,
               checkBeforeInterrupt: (state) => {
                 expect(state.completed).toBe(false)
                 expect(state.part?.state.status).toBe("running")
@@ -2129,6 +2351,8 @@ describe("tool.shell running output persistence", () => {
             const output = String(result.settled.state.metadata?.output)
             expect(output.startsWith("before-timeout\n")).toBe(true)
             expect(output).toContain("timeout-tail\nabort-marker\n")
+            expect(result.observedDescendant).toBe(true)
+            expect(result.processGroupEmpty).toBe(true)
           }),
         { config: storeConfig },
       ),
