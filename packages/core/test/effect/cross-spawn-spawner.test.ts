@@ -206,20 +206,47 @@ const resistantDescendant =
   'process.on("SIGTERM", () => {}); process.stdout.write("ready"); setInterval(() => {}, 10_000)'
 const silentResistantDescendant = 'process.on("SIGTERM", () => {}); setInterval(() => {}, 10_000)'
 
-const processTreeSource = (child: string, onTerm?: string, ownershipFile?: string) =>
-  [
+const processTreeSource = (
+  child: string,
+  onTerm?: string,
+  ownershipFile?: string,
+  publishChildStarted = true,
+  readyFile?: string,
+) => {
+  const childReady = readyFile
+    ? [
+        'child.stdout.once("data", () => {',
+        'process.stdout.write(`child-ready:${child.pid}\\n`)',
+        `require("node:fs").writeFileSync(${JSON.stringify(readyFile)}, "ready")`,
+        "})",
+      ].join("; ")
+    : 'child.stdout.once("data", () => process.stdout.write(`child-ready:${child.pid}\\n`))'
+  return [
     ...(onTerm ? [onTerm] : []),
     `const child = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(child)}], { stdio: ["ignore", "pipe", "ignore"] })`,
     ...(ownershipFile
       ? [`require("node:fs").writeFileSync(${JSON.stringify(ownershipFile)}, JSON.stringify({ pgid: process.pid, child: child.pid }))`]
       : []),
-    'process.stdout.write(`child-started:${child.pid}\\n`)',
-    'child.stdout.once("data", () => process.stdout.write(`child-ready:${child.pid}\\n`))',
+    ...(publishChildStarted ? ['process.stdout.write(`child-started:${child.pid}\\n`)'] : []),
+    childReady,
     "setInterval(() => {}, 10_000)",
   ].join(";\n")
+}
 
-const termExitingParent = (child: string, exitCode = 0, ownershipFile?: string) =>
-  processTreeSource(child, `process.on("SIGTERM", () => process.exit(${exitCode}))`, ownershipFile)
+const termExitingParent = (
+  child: string,
+  exitCode = 0,
+  ownershipFile?: string,
+  publishChildStarted = true,
+  readyFile?: string,
+) =>
+  processTreeSource(
+    child,
+    `process.on("SIGTERM", () => process.exit(${exitCode}))`,
+    ownershipFile,
+    publishChildStarted,
+    readyFile,
+  )
 
 const timeoutProbeMode = process.env.SWX_CORE_SPAWNER_PROBE_MODE ?? ""
 const timeoutProbeOwnerFile = process.env.SWX_CORE_SPAWNER_OWNER_FILE
@@ -233,6 +260,11 @@ const processTreeReady = (
   readinessTimeout: Duration.Input = "5 seconds",
 ) =>
   Effect.gen(function* () {
+    const group = ownedProcessGroups.get(pgid)
+    if (!group) throw new Error(`process group ${pgid} was not recorded before readiness wait`)
+    yield* Effect.addFinalizer(() => Effect.sync(() => observeProcessGroup(group)))
+    observeProcessGroup(group)
+
     const childStarted = yield* Deferred.make<number>()
     const ready = yield* Deferred.make<number>()
     let output = ""
@@ -247,7 +279,12 @@ const processTreeReady = (
         })
       }),
     )
-    const childPID = yield* Deferred.await(childStarted).pipe(Effect.timeout("5 seconds"))
+    const childPID = yield* Deferred.await(childStarted).pipe(
+      Effect.timeoutOrElse({
+        duration: "5 seconds",
+        orElse: () => Effect.fail(new Error("child-started identity marker was not observed")),
+      }),
+    )
     const identity = yield* Effect.promise(async () => {
       const deadline = Date.now() + 5_000
       while (Date.now() < deadline) {
@@ -728,7 +765,10 @@ describe("cross-spawn spawner", () => {
           throw new Error("process-tree probe paths were not supplied")
 
         const child = timeoutProbeMode === "readiness" ? silentResistantDescendant : resistantDescendant
-        const handle = yield* js(termExitingParent(child, 0, timeoutProbeOwnerFile))
+        const publishChildStarted = timeoutProbeMode !== "child-started"
+        const handle = yield* js(
+          termExitingParent(child, 0, timeoutProbeOwnerFile, publishChildStarted, timeoutProbeReadyFile),
+        )
         const pgid = Number(handle.pid)
         const leader = processIdentity(pgid)
         if (!leader?.bootID || !leader.startTicks) throw new Error("timeout worker leader has no start identity")
@@ -753,7 +793,7 @@ describe("cross-spawn spawner", () => {
       Effect.gen(function* () {
         if (process.platform === "win32") return
 
-        const run = Effect.fnUntraced(function* (mode: "timeout" | "readiness") {
+        const run = Effect.fnUntraced(function* (mode: "timeout" | "readiness" | "child-started") {
           const stem = `.cross-spawn-${mode}-${process.pid}`
           const ownerFile = path.join(process.cwd(), `${stem}-owner.json`)
           const identityFile = path.join(process.cwd(), `${stem}-identity.json`)
@@ -826,14 +866,14 @@ describe("cross-spawn spawner", () => {
             descendant: true,
           })
 
-          if (mode === "timeout") {
+          if (mode !== "readiness") {
             yield* Effect.promise(async () => {
               const deadline = Date.now() + 5_000
               while (Date.now() < deadline) {
                 if (await Bun.file(readyFile).exists()) return
                 await new Promise((resolve) => setTimeout(resolve, 20))
               }
-              throw new Error("timeout worker did not publish its child-ready signal")
+              throw new Error("process-tree worker did not publish its child-ready signal")
             })
           }
 
@@ -841,16 +881,21 @@ describe("cross-spawn spawner", () => {
           const outputText = (yield* Effect.promise(() => output)).join("\n")
           expect(exitCode).not.toBe(0)
           expect(outputText).toContain(
-            mode === "timeout" ? "timed out after" : "child readiness marker was not produced after a recorded child",
+            mode === "timeout"
+              ? "timed out after"
+              : mode === "readiness"
+                ? "child readiness marker was not produced after a recorded child"
+                : "child-started identity marker was not observed",
           )
           expect(groupAlive(owner.pgid)).toBe(false)
           expect(ownership.members.every((member) => !sameProcess(member))).toBe(true)
 
-          if (mode === "readiness") expect(yield* Effect.promise(() => Bun.file(identityFile).exists())).toBe(true)
+          expect(yield* Effect.promise(() => Bun.file(identityFile).exists())).toBe(mode !== "child-started")
         })
 
         yield* run("timeout")
         yield* run("readiness")
+        yield* run("child-started")
       }),
       30_000,
     )
